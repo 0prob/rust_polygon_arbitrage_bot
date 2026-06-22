@@ -1,0 +1,34 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Secrets & local config
+.env
+.env.*
+!.env.example
+config.local.toml
+
+# Profiling & benchmarks
+flamegraph*.svg
+perf.data
+perf.data.old
+*.profraw
+
+# Criterion benchmark reports
+/target/criterion/
+
+# Code intelligence / doc generators (regenerable)
+graphify-rs-out/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Symlens index (local, regenerable)
+.symlens/
