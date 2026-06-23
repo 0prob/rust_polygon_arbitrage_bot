@@ -5,6 +5,9 @@ use smallvec::SmallVec;
 /// Stack-backed edge list for typical ≤6-hop arb routes.
 pub type CycleEdges = SmallVec<[Edge; 6]>;
 
+/// Stack-backed hop amount buffer for typical ≤6-hop simulation traces.
+pub type HopAmounts = SmallVec<[U256; 7]>;
+
 use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -187,7 +190,7 @@ pub struct RouteSimulationResult {
     pub amount_out: U256,
     pub profit: U256,
     pub profitable: bool,
-    pub hop_amounts: Vec<U256>,
+    pub hop_amounts: HopAmounts,
     pub total_gas: u32,
     pub hop_count: u32,
 }

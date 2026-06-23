@@ -16,7 +16,6 @@
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::needless_pass_by_value,
     clippy::return_self_not_must_use,
     clippy::manual_checked_ops,
     clippy::unnecessary_wraps,
@@ -25,11 +24,8 @@
     clippy::unreadable_literal,
     clippy::unnested_or_patterns,
     clippy::map_unwrap_or,
-    clippy::redundant_closure_for_method_calls,
-    clippy::explicit_iter_loop,
     clippy::match_same_arms,
     clippy::ignored_unit_patterns,
-    clippy::assigning_clones,
     clippy::used_underscore_binding,
 )]
 

@@ -23,12 +23,19 @@ const MAX_INVALID_FETCHES: u32 = 30;
 
 #[derive(Default)]
 struct DiscoveryState {
-    discovered: Vec<DiscoveredPool>,
+    discovered: Arc<Vec<DiscoveredPool>>,
     token_metas: Vec<TokenMeta>,
     discovery_cursor: DiscoveryCursor,
     last_discovery_ms: u64,
     hot_addresses: Vec<Address>,
     invalid_fetch_count: HashMap<Address, u32>,
+}
+
+impl DiscoveryState {
+    fn rebuild_discovered(&mut self, new_pools: Vec<DiscoveredPool>, cursor: DiscoveryCursor) {
+        self.discovered = Arc::new(new_pools);
+        self.discovery_cursor = cursor;
+    }
 }
 
 pub struct StateRefreshService {
@@ -68,8 +75,12 @@ impl StateRefreshService {
     }
 
     /// All discovered pools that passed `is_routable_pool` at ingest time.
-    pub fn discovered_pools(&self) -> Vec<DiscoveredPool> {
-        self.discovery_state.read().discovered.clone()
+    pub fn discovered_pools(&self) -> Arc<Vec<DiscoveredPool>> {
+        Arc::clone(&self.discovery_state.read().discovered)
+    }
+
+    pub fn discovered_pools_raw(&self) -> Vec<DiscoveredPool> {
+        (*self.discovery_state.read().discovered).clone()
     }
 
     pub fn routable_pool_count(&self) -> usize {
@@ -98,22 +109,25 @@ impl StateRefreshService {
 
         let added = {
             let mut state = self.discovery_state.write();
+            let start_len = state.discovered.len();
             let mut seen: std::collections::HashSet<_> = state
                 .discovered
                 .iter()
                 .map(|p| p.pool_key.clone())
                 .collect();
             let mut added = 0usize;
+            let mut new_discovered = Vec::with_capacity(start_len + result.pools.len());
+            new_discovered.extend_from_slice(&state.discovered);
             for pool in result.pools {
                 if !crate::services::discovery::is_routable_pool(&pool) {
                     continue;
                 }
                 if seen.insert(pool.pool_key.clone()) {
-                    state.discovered.push(pool);
+                    new_discovered.push(pool);
                     added += 1;
                 }
             }
-            state.discovery_cursor = result.cursor.clone();
+            state.rebuild_discovered(new_discovered, result.cursor.clone());
             added
         };
 
@@ -196,8 +210,14 @@ impl StateRefreshService {
         }
 
         let before = state.discovered.len();
-        state.discovered.retain(|p| !to_remove.contains(&p.address));
-        let removed = before - state.discovered.len();
+        let retained: Vec<DiscoveredPool> = state
+            .discovered
+            .iter()
+            .filter(|p| !to_remove.contains(&p.address))
+            .cloned()
+            .collect();
+        let removed = before - retained.len();
+        state.discovered = Arc::new(retained);
 
         for addr in &to_remove {
             state.invalid_fetch_count.remove(addr);

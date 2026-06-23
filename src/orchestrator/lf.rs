@@ -66,13 +66,32 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     let max_hops = ctx.config.routing.max_hops;
     let finder = ctx.config.routing.cycle_finder;
 
-    let (_graph, mut capped, cycles_from_cache) = {
-        let mut graph_cache = ctx.graph_cache.lock();
-        let graph = graph_cache.get_or_build(&ctx.cache, &arena, &pool_metas);
-        if let Some(cached) = graph_cache.try_get_cached(&ctx.cache, &pool_metas) {
+    let (_graph, mut capped, cycles_from_cache) = tokio::task::block_in_place(|| {
+        let graph = {
+            let gc = ctx.graph_cache.lock();
+            if gc.needs_rebuild(&ctx.cache, pool_metas.len()) {
+                let pools_copy = pool_metas.clone();
+                let arena_copy = arena.clone();
+                drop(gc);
+                let new_g = Arc::new(crate::pipeline::graph::build_graph(&arena_copy, &pools_copy));
+                ctx.graph_cache.lock().store(Arc::clone(&new_g), None, &ctx.cache, pool_metas.len());
+                new_g
+            } else if let Some(g) = gc.graph() {
+                g
+            } else {
+                drop(gc);
+                let new_g = Arc::new(crate::pipeline::graph::build_graph(&arena, &pool_metas));
+                ctx.graph_cache.lock().store(Arc::clone(&new_g), None, &ctx.cache, pool_metas.len());
+                new_g
+            }
+        };
+
+        let gc = ctx.graph_cache.lock();
+        if let Some(cached) = gc.get_cached_cycles(&ctx.cache, pool_metas.len()) {
             debug!(count = cached.len(), "cycle cache hit");
             (graph, (*cached).clone(), true)
         } else {
+            drop(gc);
             let passes = vec![
                 CycleSearchPass {
                     max_hops: max_hops.min(3),
@@ -96,10 +115,10 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
                 CycleFinderKind::Dfs => find_cycles_multi_pass(&arena, &graph, &passes),
             };
             let finalized = finalize_enumerated_cycles(&arena, result, max_paths);
-            graph_cache.store_cycles(Arc::new(finalized.clone()));
+            ctx.graph_cache.lock().store(graph.clone(), Some(Arc::new(finalized.clone())), &ctx.cache, pool_metas.len());
             (graph, finalized, false)
         }
-    };
+    });
 
     let decimals = ctx.refresh.token_decimals_map();
     let mut cycle_tokens_set = rustc_hash::FxHashSet::default();

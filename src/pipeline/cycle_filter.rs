@@ -5,33 +5,38 @@ use crate::pipeline::spot_price::SPOT_PROBE;
 use crate::pipeline::types::{compare_cycle_score, route_fingerprint};
 
 /// Drop cycles that fail an atomic round-trip probe simulation (fast unprofitability filter).
+/// Sorts by score first so the most promising cycles are simulated early, and stops
+/// early once `max_keep` survivors are found among the top candidates.
 pub fn prefilter_cycles_by_atomic_sim(
     arena: &StateArena,
-    cycles: Vec<FoundCycle>,
+    mut cycles: Vec<FoundCycle>,
     max_keep: usize,
 ) -> Vec<FoundCycle> {
     if cycles.is_empty() {
         return cycles;
     }
-    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(cycles.len().min(max_keep));
-    for cycle in cycles {
+    cycles.sort_by(compare_cycle_score);
+    let sim_candidates = cycles.len().min(max_keep.saturating_mul(3).max(max_keep + 100));
+    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
+    for cycle in cycles.drain(..sim_candidates) {
         let profitable = simulate_route_minimal(arena, &cycle.edges, SPOT_PROBE)
             .map(|sim| sim.profit > ruint::aliases::U256::ZERO)
             .unwrap_or(false);
         if profitable || cycle.score < 0.0 {
             survivors.push(cycle);
+            if survivors.len() >= max_keep {
+                break;
+            }
         }
-    }
-    if survivors.len() > max_keep {
-        survivors.sort_by(compare_cycle_score);
-        survivors.truncate(max_keep);
     }
     survivors
 }
 
 /// Deduplicate by route fingerprint, keeping the best-scored variant.
 pub fn dedupe_cycles_by_fingerprint(cycles: Vec<FoundCycle>) -> Vec<FoundCycle> {
-    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
+    let cap = cycles.len();
+    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(cap, Default::default());
     for cycle in cycles {
         let key = route_fingerprint(&cycle.edges);
         match best.get(&key) {

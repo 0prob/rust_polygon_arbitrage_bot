@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::types::FoundCycle;
-use crate::pipeline::arena::StateArena;
-use crate::pipeline::graph::build_graph;
-use crate::pipeline::types::{PoolMeta, RoutingGraph};
+use crate::pipeline::types::RoutingGraph;
 use crate::services::state_cache::StateCache;
 
 static REBUILD_INTERVAL: AtomicU64 = AtomicU64::new(60);
@@ -31,38 +29,23 @@ impl GraphCache {
         Self::default()
     }
 
-    pub fn get_or_build(
-        &mut self,
-        cache: &StateCache,
-        arena: &StateArena,
-        pools: &[PoolMeta],
-    ) -> Arc<RoutingGraph> {
-        let fp = pool_fingerprint(cache, pools.len());
-        let force_rebuild = self.lf_pass_count.is_multiple_of(full_rebuild_interval())
+    pub fn needs_rebuild(&self, cache: &StateCache, pool_count: usize) -> bool {
+        let fp = pool_fingerprint(cache, pool_count);
+        self.lf_pass_count.is_multiple_of(full_rebuild_interval())
             || self.graph.is_none()
-            || self.pool_fingerprint != fp;
-
-        if force_rebuild {
-            self.graph = Some(Arc::new(build_graph(arena, pools)));
-            self.pool_fingerprint = fp;
-            self.cycles = None;
-        }
-        self.lf_pass_count += 1;
-        match self.graph.as_ref() {
-            Some(graph) => Arc::clone(graph),
-            None => {
-                tracing::error!("graph cache missing graph after rebuild");
-                Arc::new(build_graph(arena, pools))
-            }
-        }
+            || self.pool_fingerprint != fp
     }
 
-    pub fn try_get_cached(
-        &self,
-        cache: &StateCache,
-        pools: &[PoolMeta],
-    ) -> Option<Arc<Vec<FoundCycle>>> {
-        let fp = pool_fingerprint(cache, pools.len());
+    pub fn store(&mut self, graph: Arc<RoutingGraph>, cycles: Option<Arc<Vec<FoundCycle>>>, cache: &StateCache, pool_count: usize) {
+        let fp = pool_fingerprint(cache, pool_count);
+        self.graph = Some(graph);
+        self.pool_fingerprint = fp;
+        self.cycles = cycles;
+        self.lf_pass_count += 1;
+    }
+
+    pub fn get_cached_cycles(&self, cache: &StateCache, pool_count: usize) -> Option<Arc<Vec<FoundCycle>>> {
+        let fp = pool_fingerprint(cache, pool_count);
         if fp == self.pool_fingerprint {
             self.cycles.as_ref().map(Arc::clone)
         } else {
@@ -70,12 +53,12 @@ impl GraphCache {
         }
     }
 
-    pub fn store_cycles(&mut self, cycles: Arc<Vec<FoundCycle>>) {
-        self.cycles = Some(cycles);
-    }
-
     pub fn lf_pass_count(&self) -> u64 {
         self.lf_pass_count
+    }
+
+    pub fn graph(&self) -> Option<Arc<RoutingGraph>> {
+        self.graph.as_ref().map(Arc::clone)
     }
 }
 
@@ -91,10 +74,14 @@ pub fn pool_fingerprint(cache: &StateCache, pool_count: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::core::types::{PoolState, ProtocolType, V2PoolState};
-    use crate::pipeline::graph::pool_meta_from_pair;
-    use crate::services::state_cache::StateCache;
+    use crate::pipeline::arena::StateArena;
+    use crate::pipeline::graph::{build_graph, pool_meta_from_pair};
     use alloy::primitives::Address;
     use ruint::aliases::U256;
+
+    fn make_state_cache() -> StateCache {
+        StateCache::default()
+    }
 
     #[test]
     fn reuses_graph_when_pool_set_unchanged() {
@@ -129,11 +116,18 @@ mod tests {
             t1,
             Some(30),
         )];
-        let g1 = cache.get_or_build(&state_cache, &arena, &pools);
-        let g2 = cache.get_or_build(&state_cache, &arena, &pools);
-        assert_eq!(g1.token_count, g2.token_count);
-        assert!(Arc::ptr_eq(&g1, &g2));
-        assert_eq!(cache.lf_pass_count(), 2);
+
+        // First call — should rebuild
+        assert!(cache.needs_rebuild(&state_cache, pools.len()));
+        let g = Arc::new(build_graph(&arena, &pools));
+        cache.store(Arc::clone(&g), None, &state_cache, pools.len());
+
+        // Second call — should reuse
+        assert!(!cache.needs_rebuild(&state_cache, pools.len()));
+        let g2 = cache.graph().unwrap();
+        assert_eq!(g.token_count, g2.token_count);
+        assert!(Arc::ptr_eq(&g, &g2));
+        assert_eq!(cache.lf_pass_count(), 1);
     }
 
     #[test]
@@ -153,8 +147,13 @@ mod tests {
             Some(30),
         )];
         state_cache.insert(addr, PoolState::Invalid);
-        let g_invalid = cache.get_or_build(&state_cache, &arena, &pools);
-        assert!(g_invalid.adjacency.iter().all(|a| a.is_empty()));
+
+        assert!(cache.needs_rebuild(&state_cache, pools.len()));
+        let g_invalid = Arc::new(build_graph(&arena, &pools));
+        cache.store(g_invalid, None, &state_cache, pools.len());
+
+        let cached = cache.graph().unwrap();
+        assert!(cached.adjacency.iter().all(|a| a.is_empty()));
 
         let reserve = U256::from(1_000_000u128) * U256::from(10u128).pow(U256::from(18));
         let tradable = PoolState::V2(V2PoolState {
@@ -165,9 +164,14 @@ mod tests {
         });
         arena.register_pool(addr, tradable.clone());
         state_cache.insert(addr, tradable);
-        let g_tradable = cache.get_or_build(&state_cache, &arena, &pools);
+
+        // Fingerprint changed — should trigger rebuild
+        assert!(cache.needs_rebuild(&state_cache, pools.len()));
+        let g_tradable = Arc::new(build_graph(&arena, &pools));
+        cache.store(g_tradable, None, &state_cache, pools.len());
+        let cached2 = cache.graph().unwrap();
         assert_eq!(
-            g_tradable.adjacency.iter().map(|a| a.len()).sum::<usize>(),
+            cached2.adjacency.iter().map(|a| a.len()).sum::<usize>(),
             2
         );
     }

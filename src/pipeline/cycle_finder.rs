@@ -68,6 +68,14 @@ struct Collector {
     cycles: Vec<FoundCycle>,
 }
 
+fn max_pool_index(adj: &[Vec<GraphEdge>]) -> usize {
+    adj.iter()
+        .flat_map(|edges| edges.iter().map(|ge| ge.edge.pool_index.0 as usize))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
 fn collect_cycles_dfs(
     prep: &ActiveGraph<'_>,
     hop_limit: u32,
@@ -76,18 +84,18 @@ fn collect_cycles_dfs(
     collector: &mut Collector,
     seen: &mut rustc_hash::FxHashSet<u64>,
     used_tokens: &mut [bool],
+    pool_state: &mut [u8],
     pass_start: usize,
     start_tokens: &[TokenIndex],
 ) {
     let hop_cap = hop_limit.min(HOP_CAP);
-    let mut used_pools = rustc_hash::FxHashSet::default();
 
     fn dfs(
         prep: &ActiveGraph<'_>,
         start: TokenIndex,
         curr: TokenIndex,
         path: &mut Vec<Edge>,
-        used_pools: &mut rustc_hash::FxHashSet<u32>,
+        pool_state: &mut [u8],
         used_tokens: &mut [bool],
         hops: u32,
         log_w: f64,
@@ -140,10 +148,11 @@ fn collect_cycles_dfs(
         used_tokens[curr.0 as usize] = true;
 
         for ge in next_edges {
-            let pool_id = ge.edge.pool_index.0;
-            if !used_pools.insert(pool_id) {
+            let pool_id = ge.edge.pool_index.0 as usize;
+            if pool_state[pool_id] != 0 {
                 continue;
             }
+            pool_state[pool_id] = 1;
 
             path.push(ge.edge);
             dfs(
@@ -151,7 +160,7 @@ fn collect_cycles_dfs(
                 start,
                 ge.edge.token_out,
                 path,
-                used_pools,
+                pool_state,
                 used_tokens,
                 hops + 1,
                 log_w + ge.log_weight,
@@ -164,7 +173,7 @@ fn collect_cycles_dfs(
                 seen,
             );
             path.pop();
-            used_pools.remove(&pool_id);
+            pool_state[pool_id] = 0;
 
             if budget.tick() || collector.cycles.len() - pass_start >= max_cycles {
                 break;
@@ -192,15 +201,15 @@ fn collect_cycles_dfs(
             if budget.tick() || collector.cycles.len() - pass_start >= max_cycles {
                 break;
             }
-            let pool_id = ge.edge.pool_index.0;
-            used_pools.insert(pool_id);
+            let pool_id = ge.edge.pool_index.0 as usize;
+            pool_state[pool_id] = 1;
             path.push(ge.edge);
             dfs(
                 prep,
                 *start,
                 ge.edge.token_out,
                 &mut path,
-                &mut used_pools,
+                pool_state,
                 used_tokens,
                 1,
                 ge.log_weight,
@@ -213,7 +222,7 @@ fn collect_cycles_dfs(
                 seen,
             );
             path.pop();
-            used_pools.remove(&pool_id);
+            pool_state[pool_id] = 0;
         }
 
         used_tokens[start.0 as usize] = false;
@@ -258,7 +267,8 @@ fn collect_cycles_dfs_single_start(
     budget: &SharedCycleBudget,
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
-    let mut used_pools = rustc_hash::FxHashSet::default();
+    let pool_slot_count = max_pool_index(prep.adjacency);
+    let mut pool_state = vec![0u8; pool_slot_count];
     let mut used_tokens = vec![false; prep.adjacency.len()];
     let mut path = Vec::with_capacity(hop_cap as usize);
     let mut cycles = Vec::new();
@@ -269,7 +279,7 @@ fn collect_cycles_dfs_single_start(
         start: TokenIndex,
         curr: TokenIndex,
         path: &mut Vec<Edge>,
-        used_pools: &mut rustc_hash::FxHashSet<u32>,
+        pool_state: &mut [u8],
         used_tokens: &mut [bool],
         hops: u32,
         log_w: f64,
@@ -321,10 +331,11 @@ fn collect_cycles_dfs_single_start(
             if budget.tick() || cycles.len() >= max_cycles {
                 break;
             }
-            let pool_id = ge.edge.pool_index.0;
-            if !used_pools.insert(pool_id) {
+            let pool_id = ge.edge.pool_index.0 as usize;
+            if pool_state[pool_id] != 0 {
                 continue;
             }
+            pool_state[pool_id] = 1;
 
             path.push(ge.edge);
             dfs(
@@ -332,7 +343,7 @@ fn collect_cycles_dfs_single_start(
                 start,
                 ge.edge.token_out,
                 path,
-                used_pools,
+                pool_state,
                 used_tokens,
                 hops + 1,
                 log_w + ge.log_weight,
@@ -344,7 +355,7 @@ fn collect_cycles_dfs_single_start(
                 seen,
             );
             path.pop();
-            used_pools.remove(&pool_id);
+            pool_state[pool_id] = 0;
         }
 
         used_tokens[curr.0 as usize] = false;
@@ -360,15 +371,15 @@ fn collect_cycles_dfs_single_start(
         if budget.tick() || cycles.len() >= max_cycles {
             break;
         }
-        let pool_id = ge.edge.pool_index.0;
-        used_pools.insert(pool_id);
+        let pool_id = ge.edge.pool_index.0 as usize;
+        pool_state[pool_id] = 1;
         path.push(ge.edge);
         dfs(
             prep,
             start,
             ge.edge.token_out,
             &mut path,
-            &mut used_pools,
+            &mut pool_state,
             &mut used_tokens,
             1,
             ge.log_weight,
@@ -380,7 +391,7 @@ fn collect_cycles_dfs_single_start(
             &mut seen,
         );
         path.pop();
-        used_pools.remove(&pool_id);
+        pool_state[pool_id] = 0;
     }
     used_tokens[start.0 as usize] = false;
     cycles
@@ -504,6 +515,8 @@ pub fn find_cycles_multi_pass(
     };
     let mut seen = rustc_hash::FxHashSet::default();
     let mut used_tokens = vec![false; prep.adjacency.len()];
+    let pool_slot_count = max_pool_index(prep.adjacency);
+    let mut pool_state = vec![0u8; pool_slot_count];
 
     for pass in passes {
         if budget.tick() {
@@ -518,6 +531,7 @@ pub fn find_cycles_multi_pass(
             &mut collector,
             &mut seen,
             &mut used_tokens,
+            &mut pool_state,
             pass_start,
             &prep.start_tokens,
         );

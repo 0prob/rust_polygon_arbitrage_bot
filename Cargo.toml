@@ -76,6 +76,14 @@ harness = false
 name = "hf_tick"
 harness = false
 
+[[bench]]
+name = "cycle_filter"
+harness = false
+
+[[bench]]
+name = "negative_cycle"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

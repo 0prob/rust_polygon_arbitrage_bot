@@ -1,4 +1,5 @@
 use ruint::aliases::U256;
+use smallvec::SmallVec;
 use tracing::instrument;
 
 use crate::core::math::balancer::simulate_balancer_swap;
@@ -209,7 +210,7 @@ pub fn simulate_route_detailed(
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
-    let mut hop_amounts = vec![U256::ZERO; hop_count + 1];
+    let mut hop_amounts: SmallVec<[U256; 7]> = smallvec::smallvec![U256::ZERO; hop_count + 1];
     hop_amounts[0] = amount_in;
     let mut total_gas = 0u32;
     let mut current = amount_in;

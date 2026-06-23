@@ -19,7 +19,7 @@ pub struct HfSnapshot {
     pub token_decimals: HashMap<alloy::primitives::Address, u8>,
     pub pool_metas: Vec<PoolMeta>,
     pub arena: StateArena,
-    pub discovered_pools: Vec<DiscoveredPool>,
+    pub discovered_pools: Arc<Vec<DiscoveredPool>>,
 }
 
 impl Default for HfSnapshot {
@@ -31,7 +31,7 @@ impl Default for HfSnapshot {
             token_decimals: HashMap::new(),
             pool_metas: Vec::new(),
             arena: StateArena::new(),
-            discovered_pools: Vec::new(),
+            discovered_pools: Arc::new(Vec::new()),
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use smallvec::SmallVec;
 
 use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
 use crate::pipeline::cycle_finder::clamp_fee_bps;
@@ -27,17 +27,19 @@ pub fn is_simple_cycle(edges: &[Edge]) -> bool {
     if edges.last().map(|e| e.token_out) != Some(start) {
         return false;
     }
-    let mut pools = HashSet::new();
-    let mut intermediates = HashSet::new();
+    let mut pools: SmallVec<[u32; 8]> = SmallVec::new();
+    let mut intermediates: SmallVec<[u32; 8]> = SmallVec::new();
     for (i, e) in edges.iter().enumerate() {
-        if !pools.insert(e.pool_index.0) {
+        if pools.contains(&e.pool_index.0) {
             return false;
         }
+        pools.push(e.pool_index.0);
         if i < edges.len() - 1 {
             let mid = e.token_out;
-            if mid == start || !intermediates.insert(mid.0) {
+            if mid == start || intermediates.contains(&mid.0) {
                 return false;
             }
+            intermediates.push(mid.0);
         }
     }
     true
@@ -103,12 +105,13 @@ pub fn collect_negative_cycles_from_source(
                 continue;
             }
 
-            let mut visited = rustc_hash::FxHashSet::default();
+            let mut visited: SmallVec<[TokenIndex; 8]> = SmallVec::new();
             let mut curr = Some(TokenIndex(u_idx as u32));
             while let Some(c) = curr {
-                if !visited.insert(c) {
+                if visited.contains(&c) {
                     break;
                 }
+                visited.push(c);
                 curr = pred_node[c.0 as usize];
             }
             let Some(cycle_start) = curr else {
