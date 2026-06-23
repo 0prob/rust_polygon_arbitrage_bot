@@ -94,14 +94,12 @@ mod tests {
 
     fn base_config(mode: &str) -> AppConfig {
         AppConfig {
-            chain_id: 137,
             hasura_url: "http://localhost:8080/v1/graphql".to_string(),
             hasura_secret: None,
             discovery_interval_ms: 60_000,
             lf_interval_ms: 1_000,
             hf_interval_ms: 200,
             max_multicall_calls: 800,
-            envio_api_token: None,
             rpc: RpcConfig::default(),
             routing: RoutingConfig::default(),
             execution: ExecutionConfig {

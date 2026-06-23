@@ -78,8 +78,7 @@ impl RpcPool {
     }
 
     fn connect_http(&self, url: &str) -> anyhow::Result<impl Provider<Ethereum> + Clone> {
-        Ok(ProviderBuilder::new().connect_reqwest(
-            self.http.clone(),
+        Ok(ProviderBuilder::new().connect_http(
             url.parse().map_err(anyhow::Error::msg)?,
         ))
     }
@@ -93,8 +92,7 @@ impl RpcPool {
 
     pub fn connect_simulation(&self) -> anyhow::Result<impl Provider<Ethereum> + Clone> {
         let url = self.simulation_url()?;
-        Ok(ProviderBuilder::new().connect_reqwest(
-            self.http.clone(),
+        Ok(ProviderBuilder::new().connect_http(
             url.parse().map_err(anyhow::Error::msg)?,
         ))
     }

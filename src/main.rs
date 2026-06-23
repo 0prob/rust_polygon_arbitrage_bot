@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use rpbot::config::{AppConfig, WalletSecrets};
+use rpbot::core::constants::POLYGON_CHAIN_ID;
 use rpbot::orchestrator::{RuntimeContext, run_pass_loop};
 
 fn tokio_console_enabled() -> bool {
@@ -79,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     config.validate(&wallet).context("invalid configuration")?;
 
     info!(
-        chain_id = config.chain_id,
+        chain_id = POLYGON_CHAIN_ID,
         dry_run = config.is_dry_run(),
         wallet_configured = wallet.has_signer(),
         private_rpc = config.rpc.private_rpc_url.is_some(),

@@ -22,6 +22,15 @@
     clippy::unnecessary_wraps,
     clippy::manual_let_else,
     clippy::single_match_else,
+    clippy::unreadable_literal,
+    clippy::unnested_or_patterns,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure_for_method_calls,
+    clippy::explicit_iter_loop,
+    clippy::match_same_arms,
+    clippy::ignored_unit_patterns,
+    clippy::assigning_clones,
+    clippy::used_underscore_binding,
 )]
 
 pub mod abis;

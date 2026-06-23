@@ -6,14 +6,8 @@ use figment::{
 use ruint::aliases::U256;
 use serde::Deserialize;
 
-use crate::core::constants::POLYGON_CHAIN_ID;
-
-pub mod extractors;
 pub mod routing;
 pub mod wallet;
-pub use extractors::{
-    DiscoveryConfigView, ExecutionConfigView, OracleConfigView, RoutingConfigView, RpcConfigView,
-};
 pub use routing::CycleFinderKind;
 pub use wallet::WalletSecrets;
 
@@ -138,8 +132,6 @@ pub struct PipelineConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
-    #[serde(default = "default_chain_id")]
-    pub chain_id: u64,
     #[serde(default = "default_hasura_url")]
     pub hasura_url: String,
     #[serde(default)]
@@ -152,8 +144,6 @@ pub struct AppConfig {
     pub hf_interval_ms: u64,
     #[serde(default = "default_max_multicall_calls")]
     pub max_multicall_calls: u32,
-    #[serde(default)]
-    pub envio_api_token: Option<String>,
     #[serde(default)]
     pub rpc: RpcConfig,
     #[serde(default)]
@@ -231,9 +221,6 @@ impl Default for PipelineConfig {
     }
 }
 
-fn default_chain_id() -> u64 {
-    POLYGON_CHAIN_ID
-}
 fn default_hasura_url() -> String {
     "http://localhost:8080/v1/graphql".to_string()
 }
@@ -545,9 +532,6 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
     if let Some(raw) = env_var("MAX_MULTICALL_CALLS") {
         config.max_multicall_calls = raw.parse()?;
     }
-    if let Some(raw) = env_var("CHAIN_ID") {
-        config.chain_id = raw.parse()?;
-    }
 
     if config.rpc.execution_rpc_url.is_empty() {
         if let Some(url) = env_var("EXECUTION_RPC_URL") {
@@ -567,10 +551,6 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
         && let Some(key) = env_var("PRIVATE_KEY")
     {
         config.execution.private_key = Some(key);
-    }
-
-    if config.envio_api_token.is_none() {
-        config.envio_api_token = env_var("ENVIO_API_TOKEN");
     }
 
     if config.hasura_secret.is_none() {
@@ -700,14 +680,12 @@ mod tests {
         }
 
         let mut config = AppConfig {
-            chain_id: default_chain_id(),
             hasura_url: default_hasura_url(),
             hasura_secret: None,
             discovery_interval_ms: default_discovery_interval_ms(),
             lf_interval_ms: default_lf_interval_ms(),
             hf_interval_ms: default_hf_interval_ms(),
             max_multicall_calls: default_max_multicall_calls(),
-            envio_api_token: None,
             rpc: RpcConfig::default(),
             routing: RoutingConfig::default(),
             execution: ExecutionConfig::default(),
@@ -746,14 +724,12 @@ mod tests {
         }
 
         let mut config = AppConfig {
-            chain_id: default_chain_id(),
             hasura_url: default_hasura_url(),
             hasura_secret: None,
             discovery_interval_ms: default_discovery_interval_ms(),
             lf_interval_ms: default_lf_interval_ms(),
             hf_interval_ms: default_hf_interval_ms(),
             max_multicall_calls: default_max_multicall_calls(),
-            envio_api_token: None,
             rpc: RpcConfig::default(),
             routing: RoutingConfig::default(),
             execution: ExecutionConfig::default(),
