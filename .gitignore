@@ -3,11 +3,22 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
 # Secrets & local config
 .env
 .env.*
 !.env.example
 config.local.toml
+
+# Runtime data & journals
+opportunities.jsonl
+*.jsonl
 
 # Profiling & benchmarks
 flamegraph*.svg
@@ -20,10 +31,12 @@ perf.data.old
 
 # Code intelligence / doc generators (regenerable)
 graphify-rs-out/
+graphify-out/
 
 # IDE & OS
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -32,3 +45,6 @@ Thumbs.db
 
 # Symlens index (local, regenerable)
 .symlens/
+
+# Logs
+*.log

@@ -117,6 +117,13 @@ RUSTFLAGS='--cfg tokio_unstable' cargo build --features tokio-console --release
 TOKIO_CONSOLE=1 cargo run --release
 ```
 
+## Project docs
+
+- **`doc/ARCHITECTURE.md`** — Detailed architecture deep-dive (graphify-generated)
+- **`doc/MEMORIES.md`** — Knowledge graph context and project memory
+- **`docs/superpowers/plans/`** — Development plans and design specs
+- **`graphify-out/`, `graphify-rs-out/`** — Regenerable knowledge graph outputs (gitignored)
+
 ## Architecture
 
 ```
