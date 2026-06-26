@@ -1,7 +1,6 @@
 # Polarb (rpbot) — System Architecture Master Map
 
 > Polygon mainnet MEV arbitrage bot. Rust 2024, Tokio async runtime, jemalloc global allocator.
-> TypeScript-specific rules from the review brief are mapped to Rust equivalents throughout.
 
 ---
 

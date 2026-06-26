@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use super::gas::u256_to_u128;
 use super::nonce::NonceManager;
 use super::receipt::ReceiptData;
-use super::submit::{SubmitFees, bump_fees, FEE_BUMP_BPS};
+use super::submit::{FEE_BUMP_BPS, SubmitFees, bump_fees};
 
 #[derive(Debug)]
 pub enum NonceRecoveryOutcome {
@@ -31,7 +31,12 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
     fees: &SubmitFees,
     gas_limit: u64,
 ) -> NonceRecoveryOutcome {
-    if let Some(r) = provider.get_transaction_receipt(tx_hash).await.ok().flatten() {
+    if let Some(r) = provider
+        .get_transaction_receipt(tx_hash)
+        .await
+        .ok()
+        .flatten()
+    {
         return NonceRecoveryOutcome::Mined(ReceiptData {
             success: r.status(),
             gas_used: r.gas_used,
@@ -62,7 +67,9 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
         .nonce(nonce)
         .gas_limit(gas_limit.min(21_000))
         .max_fee_per_gas(u256_to_u128(bumped.max_fee_per_gas).unwrap_or(u128::MAX))
-        .max_priority_fee_per_gas(u256_to_u128(bumped.max_priority_fee_per_gas).unwrap_or(u128::MAX));
+        .max_priority_fee_per_gas(
+            u256_to_u128(bumped.max_priority_fee_per_gas).unwrap_or(u128::MAX),
+        );
 
     match provider.send_transaction(cancel_tx).await {
         Ok(pending) => {

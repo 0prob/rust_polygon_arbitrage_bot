@@ -48,8 +48,11 @@ pub struct MinimalSimResult {
 pub struct OptimizationResult {
     pub optimal_input: ruint::aliases::U256,
     pub expected_gross: ruint::aliases::U256,
+    /// Gross token profit at `optimal_input` (before gas/fees).
     pub net_profit: ruint::aliases::U256,
     pub total_gas: u32,
+    /// Brent search lower bound used for sanity pinning checks.
+    pub search_low: ruint::aliases::U256,
 }
 
 impl RoutingGraph {
@@ -75,6 +78,31 @@ pub fn route_fingerprint(edges: &[Edge]) -> u64 {
         e.token_in.0.hash(&mut h);
         e.token_out.0.hash(&mut h);
         e.zero_for_one.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Sorted pool-index set for cache invalidation when route pool membership changes.
+pub fn pool_set_fingerprint(edges: &[Edge]) -> u64 {
+    hash_sorted_pool_indices(edges.iter().map(|e| e.pool_index))
+}
+
+pub fn union_pool_set_fingerprint(cycles: &[FoundCycle]) -> u64 {
+    hash_sorted_pool_indices(
+        cycles
+            .iter()
+            .flat_map(|c| c.edges.iter().map(|e| e.pool_index)),
+    )
+}
+
+fn hash_sorted_pool_indices(indices: impl Iterator<Item = PoolIndex>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut pools: Vec<PoolIndex> = indices.collect();
+    pools.sort_by_key(|p| p.0);
+    pools.dedup_by_key(|p| p.0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in pools {
+        p.0.hash(&mut h);
     }
     h.finish()
 }

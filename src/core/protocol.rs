@@ -1,5 +1,31 @@
 use crate::core::types::ProtocolType;
 
+/// Map Hasura `protocol` + optional `poolType` to a simulation protocol family.
+pub fn resolve_protocol_from_hasura(protocol: &str, pool_type: Option<&str>) -> ProtocolType {
+    let base = normalize_protocol(protocol);
+    match base {
+        ProtocolType::CurveStable | ProtocolType::CurveCrypto => {
+            if pool_type.is_some_and(|t| t.contains("crypto")) {
+                ProtocolType::CurveCrypto
+            } else {
+                ProtocolType::CurveStable
+            }
+        }
+        _ => base,
+    }
+}
+
+/// Normalize Balancer `poolType` hints from Hasura (`stable` vs `weighted`).
+pub fn normalize_balancer_pool_type(pool_type: Option<&str>) -> Option<String> {
+    pool_type.map(|t| {
+        if t.contains("stable") {
+            "stable".to_string()
+        } else {
+            "weighted".to_string()
+        }
+    })
+}
+
 /// Map raw HyperIndex protocol labels to simulation protocol families.
 pub fn normalize_protocol(raw: &str) -> ProtocolType {
     let u = raw.to_ascii_uppercase();
@@ -100,8 +126,6 @@ mod tests {
         "DODO_V2",
         "UNISWAP_V4",
         "WOOFI",
-        "UNKNOWN_V2",
-        "UNKNOWN_V3",
     ];
 
     #[test]
@@ -141,5 +165,37 @@ mod tests {
     #[test]
     fn converts_kyber_elastic_units() {
         assert_eq!(fee_to_bps("KYBERSWAP_ELASTIC", Some(300)), 30);
+    }
+
+    #[test]
+    fn resolve_curve_pool_type_from_hasura() {
+        assert_eq!(
+            resolve_protocol_from_hasura("CURVE", Some("crypto")),
+            ProtocolType::CurveCrypto
+        );
+        assert_eq!(
+            resolve_protocol_from_hasura("CURVE", Some("crypto_ng")),
+            ProtocolType::CurveCrypto
+        );
+        assert_eq!(
+            resolve_protocol_from_hasura("CURVE", Some("stable_ng")),
+            ProtocolType::CurveStable
+        );
+        assert_eq!(
+            resolve_protocol_from_hasura("UNISWAP_V3", Some("crypto")),
+            ProtocolType::UniswapV3
+        );
+    }
+
+    #[test]
+    fn normalize_balancer_pool_type_hint() {
+        assert_eq!(
+            normalize_balancer_pool_type(Some("stable")).as_deref(),
+            Some("stable")
+        );
+        assert_eq!(
+            normalize_balancer_pool_type(Some("weighted")).as_deref(),
+            Some("weighted")
+        );
     }
 }

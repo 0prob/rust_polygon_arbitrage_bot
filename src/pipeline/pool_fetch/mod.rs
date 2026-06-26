@@ -6,11 +6,13 @@ use std::sync::Arc;
 use alloy::network::Ethereum;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
 use tracing::debug;
+use tracing::warn;
 
-use crate::abis::{IWoofiPool, IWooracle};
+use crate::abis::{IBalancerPool, IWoofiPool, IWooracle};
 use crate::core::types::{PoolState, ProtocolType, WoofiBaseTokenState, WoofiPoolState};
-use crate::pipeline::multicall::execute_multicall;
+use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 use crate::services::discovery::DiscoveredPool;
 use crate::services::state_cache::StateCache;
 
@@ -65,6 +67,44 @@ async fn fetch_woofi_pool<P: Provider<Ethereum>>(
     }))
 }
 
+async fn hydrate_balancer_pool_ids<P: Provider<Ethereum>>(
+    provider: &P,
+    pools: &mut [DiscoveredPool],
+) {
+    // Always refresh from chain — indexer pool_id may use the wrong byte layout.
+    let indices: Vec<usize> = pools
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.protocol == ProtocolType::BalancerV2)
+        .map(|(i, _)| i)
+        .collect();
+    if indices.is_empty() {
+        return;
+    }
+
+    let items: Vec<MulticallItem> = indices
+        .iter()
+        .map(|&i| MulticallItem {
+            target: pools[i].address,
+            data: encode_call(&IBalancerPool::getPoolIdCall {}),
+        })
+        .collect();
+
+    let Ok(results) = execute_multicall(&provider, &items).await else {
+        warn!("balancer getPoolId multicall failed");
+        return;
+    };
+
+    for (j, &i) in indices.iter().enumerate() {
+        let Some(bytes) = results.get(j).and_then(|r| r.as_ref()) else {
+            continue;
+        };
+        if let Ok(id) = IBalancerPool::getPoolIdCall::abi_decode_returns(bytes) {
+            pools[i].pool_id = Some(id);
+        }
+    }
+}
+
 pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone>(
     provider: P,
     cache: Arc<StateCache>,
@@ -72,11 +112,14 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone>(
     max_multicall_calls: usize,
 ) -> usize {
     let max_calls = max_multicall_calls.max(1);
+    let mut enriched: Vec<DiscoveredPool> = pools.iter().map(|p| (*p).clone()).collect();
+    hydrate_balancer_pool_ids(&provider, &mut enriched).await;
+
     let mut plans = Vec::new();
     let mut woofi_targets = Vec::new();
-    for pool in pools {
+    for pool in &enriched {
         match pool.protocol {
-            ProtocolType::Woofi => woofi_targets.push(*pool),
+            ProtocolType::Woofi => woofi_targets.push(pool),
             _ => {
                 if let Some(plan) = build_plan(pool) {
                     plans.push(plan);
@@ -145,8 +188,12 @@ async fn execute_plan_batch<P: Provider<Ethereum>>(
         spans.push((plan, start, items.len()));
     }
 
-    let Ok(results) = execute_multicall(provider, &items).await else {
-        return 0;
+    let results = match execute_multicall(provider, &items).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, plans = plans.len(), calls = items.len(), "multicall pool fetch failed");
+            return 0;
+        }
     };
 
     let mut updated = 0usize;

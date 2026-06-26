@@ -8,7 +8,7 @@ use crate::services::execution::calldata::{
     RouteEncodeConfig, build_arb_calldata, build_calldata_hops, encode_route,
 };
 use crate::services::execution::gas::buffer_gas_limit;
-use crate::services::execution::profit::{on_chain_min_profit_for_route, slippage_adjusted};
+use crate::services::execution::profit::on_chain_min_profit_for_route;
 
 #[derive(Debug, Clone)]
 pub struct CandidateExecution {
@@ -90,9 +90,9 @@ pub fn build_execution_candidate(
         deadline,
     };
     let executor_calls = encode_route(arena, &hops, config.executor_address, encode_cfg)?;
-    let profit_basis = slippage_adjusted(evaluated.result.profit, config.slippage_bps)
-        .unwrap_or(evaluated.result.profit);
-    let min_profit = on_chain_min_profit_for_route(profit_basis, config.slippage_bps);
+    // `on_chain_min_profit_for_route` applies slippage once; do not pre-adjust gross profit.
+    let min_profit =
+        on_chain_min_profit_for_route(evaluated.result.profit, config.slippage_bps);
 
     let use_aave = matches!(config.flash_loan_source, FlashLoanSource::AaveV3);
     let built = build_arb_calldata(

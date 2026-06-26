@@ -1,10 +1,10 @@
 use std::hint::black_box;
 
 use alloy::primitives::Address;
+use criterion::{Criterion, criterion_group, criterion_main};
 use rpbot::core::types::{Edge, PoolState, ProtocolType, V2PoolState};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::local_sim::simulate_route_minimal;
-use criterion::{Criterion, criterion_group, criterion_main};
 use ruint::aliases::U256;
 
 fn bench_v2_triangle_sim(c: &mut Criterion) {

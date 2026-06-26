@@ -12,6 +12,7 @@ pub mod local_sim;
 pub mod multicall;
 pub mod negative_cycle;
 pub mod pool_fetch;
+pub mod sim_sanity;
 pub mod spot_price;
 pub mod ternary;
 pub mod tick_fetch;

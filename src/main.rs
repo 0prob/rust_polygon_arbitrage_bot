@@ -13,13 +13,11 @@ use rpbot::core::constants::POLYGON_CHAIN_ID;
 use rpbot::orchestrator::{RuntimeContext, run_pass_loop};
 
 fn tokio_console_enabled() -> bool {
-    std::env::var("TOKIO_CONSOLE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    std::env::var("TOKIO_CONSOLE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn json_logs_enabled() -> bool {
-    std::env::var("TRACING_JSON")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    std::env::var("TRACING_JSON").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn init_tracing() {
@@ -103,7 +101,10 @@ async fn main() -> anyhow::Result<()> {
         info!("ENVIO_API_TOKEN not set — hypersync disabled");
     }
 
-    let ctx = Arc::new(RuntimeContext::new(config, wallet, hypersync).context("failed to initialize runtime context")?);
+    let ctx = Arc::new(
+        RuntimeContext::new(config, wallet, hypersync)
+            .context("failed to initialize runtime context")?,
+    );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let loop_ctx = ctx.clone();

@@ -45,11 +45,9 @@ pub fn cycle_has_long_tail(arena: &StateArena, cycle: &FoundCycle) -> bool {
         tokens.insert(e.token_in);
         tokens.insert(e.token_out);
     }
-    tokens.iter().any(|&t| {
-        arena
-            .token_address(t)
-            .is_some_and(|a| !is_major_token(&a))
-    })
+    tokens
+        .iter()
+        .any(|&t| arena.token_address(t).is_some_and(|a| !is_major_token(&a)))
 }
 
 pub fn protocol_label_for_edge(edge: &Edge, pool_metas: &[PoolMeta]) -> String {
@@ -59,11 +57,7 @@ pub fn protocol_label_for_edge(edge: &Edge, pool_metas: &[PoolMeta]) -> String {
     protocol_short_label(edge.protocol, raw)
 }
 
-pub fn compact_route(
-    arena: &StateArena,
-    cycle: &FoundCycle,
-    pool_metas: &[PoolMeta],
-) -> String {
+pub fn compact_route(arena: &StateArena, cycle: &FoundCycle, pool_metas: &[PoolMeta]) -> String {
     let mut parts = Vec::with_capacity(cycle.edges.len() * 2 + 1);
     parts.push(token_label(arena, cycle.start_token));
     for edge in &cycle.edges {

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GraphCache — Community 105</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+#sidebar { width: 320px; min-width: 320px; background: #1a1a2e; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #2a2a4a; }
+#sidebar h2 { font-size: 18px; color: #EDC948; margin-bottom: 4px; }
+#sidebar h3 { font-size: 14px; color: #9ca3af; margin-bottom: 8px; }
+.nav-link { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; color: #e0e0e0; text-decoration: none; }
+.nav-link:hover { background: #2a2a4a; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+#graph-container { flex: 1; position: relative; }
+#search { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #3a3a5a; background: #0f0f1a; color: #e0e0e0; font-size: 14px; }
+#search:focus { outline: none; border-color: #EDC948; }
+#info-panel { background: #0f0f1a; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; min-height: 100px; }
+#info-panel .prop { color: #9ca3af; }
+#info-panel .val { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+    <div>
+        <h2>GraphCache</h2>
+        <p style="font-size:12px;color:#666;">10 nodes · Community 105</p>
+    </div>
+    <input id="search" type="text" placeholder="Search nodes…" />
+    <div>
+        <h3>Node Info</h3>
+        <div id="info-panel"><i style="color:#666">Click a node to see details</i></div>
+    </div>
+    <div>
+        <h3>Navigation</h3>
+        <a href="index.html" class="nav-link" style="font-weight:bold;">← Overview</a><a href="community_148.html" class="nav-link"><span class="legend-dot" style="background:#9C755F"></span>set_graph_rebuild_interval() (5 links)</a><a href="community_41.html" class="nav-link"><span class="legend-dot" style="background:#F28E2B"></span>pool_fingerprint() (2 links)</a>
+    </div>
+</div>
+<div id="graph-container"></div>
+<script>
+(function() {
+    var nodesData = [{id:"src_pipeline_graph_cache_rs_full_rebuild_interval",label:"full_rebuild_interval()",title:"full_rebuild_interval()\nType: Function\nFile: ./src/pipeline/graph_cache.rs\nDegree: 2",color:"#EDC948",size:13.7},{id:"src_pipeline_graph_cache_rs_graphcache",label:"GraphCache",title:"GraphCache\nType: Struct\nFile: ./src/pipeline/graph_cache.rs\nDegree: 12",color:"#EDC948",size:21.9},{id:"src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild",label:".needs_connectivity_rebuild()",title:".needs_connectivity_rebuild()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 4",color:"#EDC948",size:16.0},{id:"src_pipeline_graph_cache_rs_graphcache_needs_cycle_refind",label:".needs_cycle_refind()",title:".needs_cycle_refind()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 2",color:"#EDC948",size:13.7},{id:"src_pipeline_graph_cache_rs_graphcache_can_rescore_cycles",label:".can_rescore_cycles()",title:".can_rescore_cycles()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 2",color:"#EDC948",size:13.7},{id:"src_pipeline_graph_cache_rs_graphcache_lf_pass_count",label:".lf_pass_count()",title:".lf_pass_count()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 1",color:"#EDC948",size:12.0},{id:"src_pipeline_graph_cache_rs_graphcache_graph",label:".graph()",title:".graph()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 1",color:"#EDC948",size:12.0},{id:"src_pipeline_graph_cache_rs_graphcache_cycles",label:".cycles()",title:".cycles()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 1",color:"#EDC948",size:12.0},{id:"src_pipeline_graph_cache_rs_graphcache_state_generation",label:".state_generation()",title:".state_generation()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 1",color:"#EDC948",size:12.0},{id:"src_pipeline_graph_cache_rs_graphcache_rescore_cached_cycles",label:".rescore_cached_cycles()",title:".rescore_cached_cycles()\nType: Method\nFile: ./src/pipeline/graph_cache.rs\nDegree: 3",color:"#EDC948",size:14.9}];
+    var edgesData = [{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_needs_cycle_refind",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_needs_cycle_refind\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_can_rescore_cycles",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_can_rescore_cycles\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_lf_pass_count",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_lf_pass_count\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_graph",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_graph\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_cycles",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_cycles\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_state_generation",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_state_generation\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache",to:"src_pipeline_graph_cache_rs_graphcache_rescore_cached_cycles",label:"defines",dashes:false,title:"defines: src_pipeline_graph_cache_rs_graphcache → src_pipeline_graph_cache_rs_graphcache_rescore_cached_cycles\nConfidence: Extracted"},{from:"src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild",to:"src_pipeline_graph_cache_rs_full_rebuild_interval",label:"calls",dashes:true,title:"calls: src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild → src_pipeline_graph_cache_rs_full_rebuild_interval\nConfidence: Inferred"},{from:"src_pipeline_graph_cache_rs_graphcache_needs_cycle_refind",to:"src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild",label:"calls",dashes:true,title:"calls: src_pipeline_graph_cache_rs_graphcache_needs_cycle_refind → src_pipeline_graph_cache_rs_graphcache_needs_connectivity_rebuild\nConfidence: Inferred"},{from:"src_pipeline_graph_cache_rs_graphcache_rescore_cached_cycles",to:"src_pipeline_graph_cache_rs_graphcache_can_rescore_cycles",label:"calls",dashes:true,title:"calls: src_pipeline_graph_cache_rs_graphcache_rescore_cached_cycles → src_pipeline_graph_cache_rs_graphcache_can_rescore_cycles\nConfidence: Inferred"}];
+    var container = document.getElementById('graph-container');
+    var nodes = new vis.DataSet(nodesData);
+    var edges = new vis.DataSet(edgesData);
+    var options = {
+        physics: {solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:120,springConstant:0.08,damping:0.4,avoidOverlap:0.5},stabilization:{iterations:200}},
+        nodes: { shape: 'dot', font: { color: '#e0e0e0', size: 12 }, borderWidth: 2 },
+        edges: { color: { color: '#4a4a6a', highlight: '#EDC948', hover: '#EDC948' }, font: { color: '#888', size: 10 }, arrows: { to: { enabled: false } }, smooth: { type: 'continuous' } },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true }
+    };
+    var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    network.on('stabilizationIterationsDone', function() { network.setOptions({ physics: { enabled: false } }); });
+    network.on('click', function(params) {
+        var panel = document.getElementById('info-panel');
+        if (params.nodes.length > 0) {
+            var node = nodes.get(params.nodes[0]);
+            if (node) {
+                panel.innerHTML = '<div><span class="prop">Label:</span> <span class="val">' + node.label + '</span></div><div><span class="prop">ID:</span> <span class="val">' + node.id + '</span></div>';
+                network.focus(params.nodes[0], { scale: 1.2, animation: true });
+            }
+        }
+    });
+    var searchEl = document.getElementById('search');
+    var sTimer = null;
+    searchEl.addEventListener('input', function() {
+        clearTimeout(sTimer);
+        sTimer = setTimeout(function() {
+            var term = searchEl.value.toLowerCase();
+            var updates = [];
+            nodes.forEach(function(n) {
+                var h = term && !n.label.toLowerCase().includes(term);
+                if (n.hidden !== h) { updates.push({ id: n.id, hidden: h }); }
+            });
+            if (updates.length > 0) { nodes.update(updates); }
+        }, 200);
+    });
+})();
+</script>
+</body>
+</html>

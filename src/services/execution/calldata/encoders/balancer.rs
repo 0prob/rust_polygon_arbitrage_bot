@@ -26,7 +26,7 @@ pub fn encode_balancer_hop(
     deadline: U256,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     let vault: Address = BALANCER_VAULT;
-    let pool_id = resolve_balancer_pool_id(hop.pool_address, hop.pool_id);
+    let pool_id = resolve_balancer_pool_id(hop.pool_address, hop.pool_id)?;
     let quoted_out = quote_hop_for_execution(arena, hop).unwrap_or(hop.amount_out);
     let limit = slippage_adjusted(quoted_out, slippage_bps)
         .ok_or_else(|| anyhow::anyhow!("balancer hop min out is zero"))?;
@@ -115,10 +115,10 @@ mod tests {
         let result = encode_balancer_hop(&hop, recipient, &arena, 50, U256::from(1000000));
         let calls = result.unwrap();
 
-        // First call should be approval to executor
+        // First call should approve the vault on the token contract
         assert_eq!(
-            calls[0].target, recipient,
-            "First call should target executor"
+            calls[0].target, hop.token_in,
+            "First call should target token_in"
         );
         assert_eq!(
             calls[0].value,
@@ -137,7 +137,7 @@ mod tests {
         let calls = result.unwrap();
 
         // Second call should be to vault
-let vault = BALANCER_VAULT;
+        let vault = BALANCER_VAULT;
         assert_eq!(
             calls[1].target, vault,
             "Second call should target Balancer Vault"

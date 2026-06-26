@@ -1,6 +1,6 @@
-use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
+use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::spot_price::compute_edge_log_weight_with_state;
+use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, edge_log_weight_from_spot};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
 
 const DEFAULT_FEE_BPS: u32 = 30;
@@ -76,7 +76,7 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
     for meta in pools {
         let tradable = arena
             .pool_state(meta.pool_index)
-            .map(|s| s.is_tradable())
+            .map(PoolState::is_tradable)
             .unwrap_or(false);
         if !tradable {
             continue;
@@ -102,26 +102,88 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
         };
 
         for edge in edges {
-            let weight = compute_edge_log_weight_with_state(arena, &edge, None);
             graph.add_edge(
                 edge.token_in,
                 GraphEdge {
                     edge,
-                    log_weight: weight,
+                    log_weight: 0.0,
                 },
             );
         }
     }
 
+    rescore_graph_in_place(arena, &mut graph);
+    graph
+}
+
+/// Recompute edge log-weights from current pool states without rebuilding adjacency.
+pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
+    let mut spot_table = SpotTable::new(arena.pool_count());
+    rescore_adjacency(arena, &mut graph.adjacency, &mut spot_table);
+}
+
+/// Recompute log-weights only for edges touching the given pools (differential update).
+pub fn rescore_pools_in_place(
+    arena: &StateArena,
+    graph: &mut RoutingGraph,
+    pools: &[PoolIndex],
+) -> usize {
+    if pools.is_empty() {
+        return 0;
+    }
+    let mut spot_table = SpotTable::new(arena.pool_count());
+    let mut touched = 0usize;
+    let pool_set: rustc_hash::FxHashSet<u32> = pools.iter().map(|p| p.0).collect();
     for adj in &mut graph.adjacency {
+        for ge in adj.iter_mut() {
+            if !pool_set.contains(&ge.edge.pool_index.0) {
+                continue;
+            }
+            touched += rescore_graph_edge(arena, ge, &mut spot_table);
+        }
         adj.sort_by(|a, b| {
             a.log_weight
                 .partial_cmp(&b.log_weight)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+    touched
+}
 
-    graph
+fn rescore_adjacency(
+    arena: &StateArena,
+    adjacency: &mut [Vec<GraphEdge>],
+    spot_table: &mut SpotTable,
+) {
+    for adj in adjacency.iter_mut() {
+        for ge in adj.iter_mut() {
+            rescore_graph_edge(arena, ge, spot_table);
+        }
+        adj.sort_by(|a, b| {
+            a.log_weight
+                .partial_cmp(&b.log_weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+}
+
+#[inline]
+fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut SpotTable) -> usize {
+    let tradable = arena
+        .pool_state(ge.edge.pool_index)
+        .map(PoolState::is_tradable)
+        .unwrap_or(false);
+    if !tradable {
+        ge.log_weight = 15.0;
+        return 1;
+    }
+    let spot = spot_table.ensure_edge(arena, &ge.edge);
+    ge.log_weight = if spot <= 0.0 {
+        compute_edge_log_weight(ge.edge.fee_bps)
+    } else {
+        edge_log_weight_from_spot(spot, ge.edge.fee_bps)
+    };
+    1
 }
 
 pub fn pool_meta_from_pair(

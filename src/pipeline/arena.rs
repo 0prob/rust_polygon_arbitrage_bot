@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use rustc_hash::FxHashMap;
 
-use crate::core::types::{PoolIndex, PoolState, TokenIndex};
+use crate::core::types::{PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::services::discovery::{DiscoveredPool, discovered_to_pool_meta};
 use crate::services::state_cache::StateCache;
 
@@ -160,7 +160,14 @@ impl StateArena {
                 .map(|addr| self.register_token(*addr))
                 .collect();
             let pool_index = self.register_pool(pool.address, (*state).clone());
-            metas.push(discovered_to_pool_meta(pool, pool_index, &token_indices));
+            let mut meta = discovered_to_pool_meta(pool, pool_index, &token_indices);
+            if pool.protocol == ProtocolType::BalancerV2
+                && let PoolState::Balancer(b) = state.as_ref()
+                && let Some(id) = b.pool_id
+            {
+                meta.pool_id = Some(id);
+            }
+            metas.push(meta);
         }
         metas
     }

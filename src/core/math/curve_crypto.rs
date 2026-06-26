@@ -20,7 +20,7 @@ fn sort_desc(values: &[U256]) -> Vec<U256> {
 
 fn geometric_mean(x: &[U256]) -> U256 {
     let n = U256::from(x.len());
-    if x.iter().any(|v| v.is_zero()) {
+    if x.iter().any(U256::is_zero) {
         return U256::ZERO;
     }
     let mut d = x[0];
@@ -52,7 +52,7 @@ fn compute_k0(xp: &[U256], d: U256, n: U256) -> U256 {
 
 pub fn curve_crypto_newton_d(ann: U256, gamma: U256, xp: &[U256]) -> NewtonResult {
     let n = U256::from(xp.len());
-    if xp.len() < 2 || ann.is_zero() || gamma.is_zero() || xp.iter().any(|x| x.is_zero()) {
+    if xp.len() < 2 || ann.is_zero() || gamma.is_zero() || xp.iter().any(U256::is_zero) {
         return NewtonResult {
             value: U256::ZERO,
             converged: false,

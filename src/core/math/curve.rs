@@ -8,7 +8,7 @@ const A_PRECISION: U256 = U256::from_limbs([100, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 255;
 
 fn get_d(xp: &[U256], a: U256) -> Option<U256> {
-    if a.is_zero() || xp.len() < 2 || xp.iter().any(|x| x.is_zero()) {
+    if a.is_zero() || xp.len() < 2 || xp.iter().any(U256::is_zero) {
         return None;
     }
 
@@ -131,7 +131,7 @@ pub fn get_curve_stable_amount_out(
     }
 
     let xp = to_xp(&state.balances, &rates);
-    if xp.iter().any(|x| x.is_zero()) {
+    if xp.iter().any(U256::is_zero) {
         return U256::ZERO;
     }
 

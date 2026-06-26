@@ -69,15 +69,12 @@ fn load_key_material(config: &mut AppConfig) -> anyhow::Result<Option<Zeroizing<
     }
 
     if config.execution.private_key.is_none()
-        && let Some(key) = env_var("PRIVATE_KEY") {
-            config.execution.private_key = Some(key);
-        }
+        && let Some(key) = env_var("PRIVATE_KEY")
+    {
+        config.execution.private_key = Some(key);
+    }
 
-    Ok(config
-        .execution
-        .private_key
-        .take()
-        .map(Zeroizing::new))
+    Ok(config.execution.private_key.take().map(Zeroizing::new))
 }
 
 fn env_var(key: &str) -> Option<String> {

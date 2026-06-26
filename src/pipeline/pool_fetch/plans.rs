@@ -47,6 +47,7 @@ pub(super) struct FetchPoolInfo {
     pub fee_bps: u32,
     pub tick_spacing: Option<i32>,
     pub pool_id: Option<FixedBytes<32>>,
+    pub pool_type: Option<String>,
 }
 
 impl From<&DiscoveredPool> for FetchPoolInfo {
@@ -58,6 +59,7 @@ impl From<&DiscoveredPool> for FetchPoolInfo {
             fee_bps: p.fee_bps,
             tick_spacing: p.tick_spacing,
             pool_id: p.pool_id,
+            pool_type: p.pool_type.clone(),
         }
     }
 }
@@ -222,6 +224,10 @@ fn build_curve_plan(plan: &mut PoolFetchPlan) {
 
 fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
     let Some(pool_id) = plan.pool.pool_id else {
+        tracing::warn!(
+            addr = %plan.pool.address,
+            "balancer pool missing pool_id — skipping vault fetch"
+        );
         return false;
     };
     let vault = BALANCER_VAULT;

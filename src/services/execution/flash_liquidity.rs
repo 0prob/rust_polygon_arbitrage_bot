@@ -19,11 +19,13 @@ use crate::core::types::{
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
+use crate::pipeline::sim_sanity::{SimSanityInput, check_sim_sanity};
 use crate::pipeline::ternary::optimize_cycle;
-use crate::services::execution::profit::{
-    ProfitEvalContext, ProfitThresholds, RouteProfitParams, assess_profit, build_assess_input,
-};
 use crate::services::execution::flash_policy::FlashLoanPolicy;
+use crate::services::execution::profit::{
+    ProfitEvalContext, ProfitThresholds, RouteProfitParams, assess_route_profit,
+};
+use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -179,10 +181,124 @@ fn decode_balance(bytes: Option<&Option<alloy::primitives::Bytes>>) -> RU256 {
         .unwrap_or(RU256::ZERO)
 }
 
+/// True when the route swaps through the Balancer vault (not just pool flash liquidity).
+pub fn route_uses_balancer_vault_swap(cycle: &FoundCycle) -> bool {
+    cycle
+        .edges
+        .iter()
+        .any(|e| e.protocol == ProtocolType::BalancerV2)
+}
+
+/// Rotate a closed cycle so the first hop borrows `new_start`.
+pub fn rotate_cycle_to_start(cycle: &FoundCycle, new_start: TokenIndex) -> Option<FoundCycle> {
+    let n = cycle.edges.len();
+    if n == 0 {
+        return None;
+    }
+    let k = cycle.edges.iter().position(|e| e.token_in == new_start)?;
+    let mut edges = cycle.edges.clone();
+    edges.rotate_left(k);
+    if edges.last().is_some_and(|e| e.token_out == new_start) {
+        Some(FoundCycle {
+            start_token: new_start,
+            edges,
+            ..cycle.clone()
+        })
+    } else {
+        None
+    }
+}
+
+/// True when any hop token is listed on Aave V3 (flash borrow candidate).
+pub fn cycle_has_aave_listed_token(
+    cycle: &FoundCycle,
+    arena: &StateArena,
+    flash_liquidity: &FlashLiquidityCache,
+) -> bool {
+    for edge in &cycle.edges {
+        let Some(addr) = arena.token_address(edge.token_in) else {
+            continue;
+        };
+        if flash_liquidity.snapshot(addr).aave_listed {
+            return true;
+        }
+    }
+    false
+}
+
+/// Balancer vault swaps require an Aave-listed token somewhere in the cycle for flash borrow.
+pub fn balancer_route_flash_feasible(
+    cycle: &FoundCycle,
+    arena: &StateArena,
+    flash_liquidity: &FlashLiquidityCache,
+) -> bool {
+    if !route_uses_balancer_vault_swap(cycle) {
+        return true;
+    }
+    cycle_has_aave_listed_token(cycle, arena, flash_liquidity)
+}
+/// Balancer vault swaps forbid Balancer flash loans (BAL#400). Prefer an Aave-listed token
+/// already present in the cycle as the flash borrow asset.
+pub fn prefer_aave_flash_start(
+    cycle: &FoundCycle,
+    arena: &StateArena,
+    flash_liquidity: &FlashLiquidityCache,
+) -> FoundCycle {
+    if !route_uses_balancer_vault_swap(cycle) {
+        return cycle.clone();
+    }
+
+    let mut candidates: Vec<(RU256, TokenIndex)> = Vec::new();
+    for edge in &cycle.edges {
+        let token = edge.token_in;
+        if candidates.iter().any(|(_, t)| *t == token) {
+            continue;
+        }
+        let Some(addr) = arena.token_address(token) else {
+            continue;
+        };
+        let liq = flash_liquidity.snapshot(addr);
+        if liq.aave_listed {
+            candidates.push((liq.aave, token));
+        }
+    }
+
+    let Some((_, best)) = candidates.into_iter().max_by_key(|(aave, _)| *aave) else {
+        return cycle.clone();
+    };
+
+    if best == cycle.start_token {
+        return cycle.clone();
+    }
+
+    let rotated = rotate_cycle_to_start(cycle, best).unwrap_or_else(|| {
+        debug!(
+            from = cycle.start_token.0,
+            to = best.0,
+            "cycle rotation failed — keeping original start token"
+        );
+        cycle.clone()
+    });
+    // #region agent log
+    crate::debug_agent::log(
+        "H-E",
+        "flash_liquidity.rs:prefer_aave_flash_start",
+        "rotated_flash_start_for_balancer_route",
+        serde_json::json!({
+            "route_fingerprint": crate::pipeline::types::route_fingerprint(&cycle.edges),
+            "original_start": cycle.start_token.0,
+            "new_start": best.0,
+        }),
+    );
+    // #endregion
+    rotated
+}
+
 pub fn plan_flash_loan(
     policy: FlashLoanPolicy,
     amount_in: RU256,
     liquidity: TokenFlashLiquidity,
+    forbid_balancer_flash: bool,
 ) -> FlashPlan {
     if amount_in.is_zero() {
         return FlashPlan {
@@ -192,12 +308,32 @@ pub fn plan_flash_loan(
         };
     }
 
+    if forbid_balancer_flash {
+        return match policy {
+            FlashLoanPolicy::BalancerOnly => FlashPlan {
+                source: FlashLoanSource::Balancer,
+                action: FlashPlanAction::Reject,
+                cap: RU256::ZERO,
+            },
+            FlashLoanPolicy::Auto | FlashLoanPolicy::AaveOnly => {
+                // Balancer vault flash + vault.swap reverts with BAL#400 (reentrancy).
+                // Use Aave flash and let dry-run validate reserve support for the token.
+                FlashPlan {
+                    source: FlashLoanSource::AaveV3,
+                    action: FlashPlanAction::Direct,
+                    cap: amount_in,
+                }
+            }
+        };
+    }
+
     match policy {
-        FlashLoanPolicy::Auto => plan_auto(amount_in, liquidity),
+        FlashLoanPolicy::Auto => plan_auto(amount_in, liquidity, true),
         FlashLoanPolicy::BalancerOnly => plan_single(
             FlashLoanSource::Balancer,
             amount_in,
             liquidity.balancer,
+            true,
         ),
         FlashLoanPolicy::AaveOnly => {
             if !liquidity.aave_listed {
@@ -207,13 +343,17 @@ pub fn plan_flash_loan(
                     cap: RU256::ZERO,
                 };
             }
-            plan_single(FlashLoanSource::AaveV3, amount_in, liquidity.aave)
+            plan_single(FlashLoanSource::AaveV3, amount_in, liquidity.aave, false)
         }
     }
 }
 
-fn plan_auto(amount_in: RU256, liquidity: TokenFlashLiquidity) -> FlashPlan {
-    if liquidity.balancer >= amount_in {
+fn plan_auto(
+    amount_in: RU256,
+    liquidity: TokenFlashLiquidity,
+    allow_balancer: bool,
+) -> FlashPlan {
+    if allow_balancer && liquidity.balancer >= amount_in {
         return FlashPlan {
             source: FlashLoanSource::Balancer,
             action: FlashPlanAction::Direct,
@@ -227,7 +367,11 @@ fn plan_auto(amount_in: RU256, liquidity: TokenFlashLiquidity) -> FlashPlan {
             cap: amount_in,
         };
     }
-    let cap = liquidity.balancer.max(liquidity.aave);
+    let cap = if allow_balancer {
+        liquidity.balancer.max(liquidity.aave)
+    } else {
+        liquidity.aave
+    };
     if cap.is_zero() {
         return FlashPlan {
             source: FlashLoanSource::Balancer,
@@ -235,7 +379,7 @@ fn plan_auto(amount_in: RU256, liquidity: TokenFlashLiquidity) -> FlashPlan {
             cap: RU256::ZERO,
         };
     }
-    let source = if liquidity.balancer >= liquidity.aave {
+    let source = if allow_balancer && liquidity.balancer >= liquidity.aave {
         FlashLoanSource::Balancer
     } else {
         FlashLoanSource::AaveV3
@@ -247,7 +391,12 @@ fn plan_auto(amount_in: RU256, liquidity: TokenFlashLiquidity) -> FlashPlan {
     }
 }
 
-fn plan_single(source: FlashLoanSource, amount_in: RU256, available: RU256) -> FlashPlan {
+fn plan_single(
+    source: FlashLoanSource,
+    amount_in: RU256,
+    available: RU256,
+    defer_zero: bool,
+) -> FlashPlan {
     if available >= amount_in {
         FlashPlan {
             source,
@@ -255,10 +404,19 @@ fn plan_single(source: FlashLoanSource, amount_in: RU256, available: RU256) -> F
             cap: amount_in,
         }
     } else if available.is_zero() {
-        FlashPlan {
-            source,
-            action: FlashPlanAction::Reject,
-            cap: RU256::ZERO,
+        if defer_zero && matches!(source, FlashLoanSource::Balancer) {
+            // Vault ERC20 balance is often zero even when pool flash loans work.
+            FlashPlan {
+                source,
+                action: FlashPlanAction::Direct,
+                cap: amount_in,
+            }
+        } else {
+            FlashPlan {
+                source,
+                action: FlashPlanAction::Reject,
+                cap: RU256::ZERO,
+            }
         }
     } else {
         FlashPlan {
@@ -309,7 +467,7 @@ pub struct PreparedDispatch {
     pub liquidity_cap_applied: bool,
 }
 
-pub fn prepare_evaluated_route(input: PrepareDispatchInput<'_>) -> Option<PreparedDispatch> {
+pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<PreparedDispatch> {
     let flash_token = input
         .arena
         .token_address(input.evaluated.cycle.start_token)?;
@@ -326,7 +484,8 @@ pub fn prepare_evaluated_route(input: PrepareDispatchInput<'_>) -> Option<Prepar
             liquidity.balancer = route_cap;
         }
     }
-    let plan = plan_flash_loan(input.policy, amount_in, liquidity);
+    let forbid_balancer_flash = route_uses_balancer_vault_swap(&input.evaluated.cycle);
+    let plan = plan_flash_loan(input.policy, amount_in, liquidity, forbid_balancer_flash);
 
     match plan.action {
         FlashPlanAction::Reject => {
@@ -382,7 +541,7 @@ pub fn prepare_evaluated_route(input: PrepareDispatchInput<'_>) -> Option<Prepar
 }
 
 fn reoptimize_capped(
-    input: PrepareDispatchInput<'_>,
+    input: &PrepareDispatchInput<'_>,
     source: FlashLoanSource,
     cap: RU256,
 ) -> Option<PreparedDispatch> {
@@ -404,38 +563,40 @@ fn reoptimize_capped(
         Some(input.max_flash_loan_usd),
         Some(input.brent_iters),
         Some(cap),
-        Some(&profit_ctx),
+        &profit_ctx,
+        None,
     )?;
     let optimal_input = opt.optimal_input.min(cap);
-    let sim = simulate_route_detailed(
-        input.arena,
-        &input.evaluated.cycle.edges,
-        optimal_input,
-    )?;
+    let sim = simulate_route_detailed(input.arena, &input.evaluated.cycle.edges, optimal_input)?;
     if sim.profit.is_zero() {
         return None;
     }
+    if !capped_sim_passes_sanity(input, &sim, cap, opt.search_low) {
+        return None;
+    }
 
-    let assessment = assess_profit(build_assess_input(
+    let route = RouteProfitParams {
+        gross_profit: sim.profit,
+        amount_in: sim.amount_in,
+        gas_units: sim.total_gas,
+        hop_count: input.evaluated.cycle.hop_count,
+        slippage_bps: input.slippage_bps,
+        flash_loan_source: source,
+    };
+    let thresholds = ProfitThresholds {
+        min_profit_matic_wei: input.min_profit_matic,
+        min_profit_roi_bps: input.min_profit_roi_bps,
+        safety_multiplier_bps: input.safety_multiplier_bps,
+    };
+    let assessment = assess_route_profit(
         input.evaluated.cycle.start_token,
         input.arena,
-        RouteProfitParams {
-            gross_profit: sim.profit,
-            amount_in: sim.amount_in,
-            gas_units: sim.total_gas,
-            hop_count: input.evaluated.cycle.hop_count,
-            slippage_bps: input.slippage_bps,
-            flash_loan_source: source,
-        },
+        &route,
         input.token_to_matic_rates,
         input.token_decimals,
         input.gas_price,
-        ProfitThresholds {
-            min_profit_matic_wei: input.min_profit_matic,
-            min_profit_roi_bps: input.min_profit_roi_bps,
-            safety_multiplier_bps: input.safety_multiplier_bps,
-        },
-    ));
+        &thresholds,
+    );
 
     debug!(
         route_fingerprint = crate::pipeline::types::route_fingerprint(&input.evaluated.cycle.edges),
@@ -459,6 +620,48 @@ fn reoptimize_capped(
     })
 }
 
+fn capped_sim_passes_sanity(
+    input: &PrepareDispatchInput<'_>,
+    sim: &crate::core::types::RouteSimulationResult,
+    cap: RU256,
+    search_low: RU256,
+) -> bool {
+    let token_to_matic_rate = resolve_token_to_matic_rate(
+        input.evaluated.cycle.start_token,
+        input.arena,
+        input.token_to_matic_rates,
+    );
+    if token_to_matic_rate < crate::core::constants::MIN_TOKEN_TO_MATIC_RATE {
+        return false;
+    }
+    let token_decimals = resolve_token_decimals_for_index(
+        input.evaluated.cycle.start_token,
+        input.arena,
+        input.token_decimals,
+    );
+    match check_sim_sanity(SimSanityInput {
+        amount_in: sim.amount_in,
+        gross_profit: sim.profit,
+        search_low,
+        token_decimals,
+        token_to_matic_rate,
+    }) {
+        Ok(()) => true,
+        Err(reason) => {
+            debug!(
+                route_fingerprint =
+                    crate::pipeline::types::route_fingerprint(&input.evaluated.cycle.edges),
+                amount_in = %sim.amount_in,
+                gross_profit = %sim.profit,
+                cap = %cap,
+                ?reason,
+                "capped re-optimize rejected — sanity check"
+            );
+            false
+        }
+    }
+}
+
 fn reassess_route(
     evaluated: &EvaluatedRoute,
     source: FlashLoanSource,
@@ -471,37 +674,64 @@ fn reassess_route(
     token_decimals: &HashMap<Address, u8>,
     arena: &StateArena,
 ) -> Option<ProfitAssessment> {
-    Some(assess_profit(build_assess_input(
+    let route = RouteProfitParams {
+        gross_profit: evaluated.result.profit,
+        amount_in: evaluated.result.amount_in,
+        gas_units: evaluated.result.total_gas,
+        hop_count: evaluated.cycle.hop_count,
+        slippage_bps,
+        flash_loan_source: source,
+    };
+    let thresholds = ProfitThresholds {
+        min_profit_matic_wei: min_profit_matic,
+        min_profit_roi_bps,
+        safety_multiplier_bps,
+    };
+    Some(assess_route_profit(
         evaluated.cycle.start_token,
         arena,
-        RouteProfitParams {
-            gross_profit: evaluated.result.profit,
-            amount_in: evaluated.result.amount_in,
-            gas_units: evaluated.result.total_gas,
-            hop_count: evaluated.cycle.hop_count,
-            slippage_bps,
-            flash_loan_source: source,
-        },
+        &route,
         token_to_matic_rates,
         token_decimals,
         gas_price,
-        ProfitThresholds {
-            min_profit_matic_wei: min_profit_matic,
-            min_profit_roi_bps,
-            safety_multiplier_bps,
-        },
-    )))
+        &thresholds,
+    ))
+}
+
+fn push_flash_token(
+    arena: &StateArena,
+    token: TokenIndex,
+    seen: &mut rustc_hash::FxHashSet<Address>,
+    out: &mut Vec<Address>,
+) {
+    if let Some(addr) = arena.token_address(token)
+        && seen.insert(addr)
+    {
+        out.push(addr);
+    }
+}
+
+/// Tokens whose flash liquidity must be cached before eval/dispatch.
+pub fn collect_flash_tokens_for_cycle(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    seen: &mut rustc_hash::FxHashSet<Address>,
+    out: &mut Vec<Address>,
+) {
+    if route_uses_balancer_vault_swap(cycle) {
+        for edge in &cycle.edges {
+            push_flash_token(arena, edge.token_in, seen, out);
+        }
+    } else {
+        push_flash_token(arena, cycle.start_token, seen, out);
+    }
 }
 
 pub fn collect_flash_tokens(arena: &StateArena, routes: &[EvaluatedRoute]) -> Vec<Address> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut out = Vec::new();
     for route in routes {
-        if let Some(addr) = arena.token_address(route.cycle.start_token)
-            && seen.insert(addr)
-        {
-            out.push(addr);
-        }
+        collect_flash_tokens_for_cycle(arena, &route.cycle, &mut seen, &mut out);
     }
     out
 }
@@ -524,6 +754,7 @@ mod tests {
             FlashLoanPolicy::Auto,
             RU256::from(1_000u64),
             liq(2_000, 5_000, true),
+            false,
         );
         assert_eq!(plan.source, FlashLoanSource::Balancer);
         assert_eq!(plan.action, FlashPlanAction::Direct);
@@ -535,6 +766,19 @@ mod tests {
             FlashLoanPolicy::Auto,
             RU256::from(4_000u64),
             liq(1_000, 5_000, true),
+            false,
+        );
+        assert_eq!(plan.source, FlashLoanSource::AaveV3);
+        assert_eq!(plan.action, FlashPlanAction::Direct);
+    }
+
+    #[test]
+    fn auto_skips_balancer_flash_when_vault_swap_in_route() {
+        let plan = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            RU256::from(1_000u64),
+            liq(2_000, 0, false),
+            true,
         );
         assert_eq!(plan.source, FlashLoanSource::AaveV3);
         assert_eq!(plan.action, FlashPlanAction::Direct);
@@ -546,6 +790,7 @@ mod tests {
             FlashLoanPolicy::Auto,
             RU256::from(10_000u64),
             liq(3_000, 7_000, true),
+            false,
         );
         assert_eq!(plan.source, FlashLoanSource::AaveV3);
         assert_eq!(plan.action, FlashPlanAction::CapAndReoptimize);
@@ -554,11 +799,7 @@ mod tests {
 
     #[test]
     fn auto_rejects_when_no_liquidity() {
-        let plan = plan_flash_loan(
-            FlashLoanPolicy::Auto,
-            RU256::from(100u64),
-            liq(0, 0, true),
-        );
+        let plan = plan_flash_loan(FlashLoanPolicy::Auto, RU256::from(100u64), liq(0, 0, true), false);
         assert_eq!(plan.action, FlashPlanAction::Reject);
     }
 
@@ -568,6 +809,7 @@ mod tests {
             FlashLoanPolicy::BalancerOnly,
             RU256::from(2_000u64),
             liq(500, 9_000, true),
+            false,
         );
         assert_eq!(plan.source, FlashLoanSource::Balancer);
         assert_eq!(plan.action, FlashPlanAction::CapAndReoptimize);
@@ -575,13 +817,46 @@ mod tests {
     }
 
     #[test]
-    fn balancer_only_rejects_when_vault_and_route_cap_zero() {
+    fn balancer_only_defers_when_vault_balance_zero() {
         let plan = plan_flash_loan(
             FlashLoanPolicy::BalancerOnly,
             RU256::from(6_735_261_273_796_695_416u64),
             liq(0, 0, false),
+            false,
         );
         assert_eq!(plan.source, FlashLoanSource::Balancer);
-        assert_eq!(plan.action, FlashPlanAction::Reject);
+        assert_eq!(plan.action, FlashPlanAction::Direct);
+    }
+
+    #[test]
+    fn rotate_cycle_reorders_edges_to_new_start() {
+        use crate::core::types::Edge;
+        use smallvec::smallvec;
+
+        let t0 = TokenIndex(0);
+        let t1 = TokenIndex(1);
+        let t2 = TokenIndex(2);
+        let mk = |tin, tout| Edge {
+            pool_index: crate::core::types::PoolIndex(1),
+            token_in: tin,
+            token_out: tout,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let cycle = FoundCycle {
+            start_token: t0,
+            edges: smallvec![mk(t0, t1), mk(t1, t2), mk(t2, t0)],
+            hop_count: 3,
+            log_weight: -0.1,
+            cumulative_fee_bps: 90,
+            score: -0.1,
+        };
+        let rotated = rotate_cycle_to_start(&cycle, t1).expect("rotation");
+        assert_eq!(rotated.start_token, t1);
+        assert_eq!(rotated.edges[0].token_in, t1);
+        assert_eq!(rotated.edges[2].token_out, t1);
     }
 }

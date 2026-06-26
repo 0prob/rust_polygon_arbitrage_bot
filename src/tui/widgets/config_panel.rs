@@ -16,13 +16,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let mode = if c.dry_run { "DRY-RUN" } else { "LIVE" };
-    let mode_style = if c.dry_run { Theme::warn() } else { Theme::loss() };
+    let mode_style = if c.dry_run {
+        Theme::warn()
+    } else {
+        Theme::loss()
+    };
 
     let lines = vec![
-        Line::from(vec![
-            Span::raw("Mode: "),
-            Span::styled(mode, mode_style),
-        ]),
+        Line::from(vec![Span::raw("Mode: "), Span::styled(mode, mode_style)]),
         Line::from(format!("Cycle finder: {}", c.cycle_finder)),
         Line::from(format!("Max hops: {}", c.max_hops)),
         Line::from(format!("Max cycles: {}", c.max_cycles)),

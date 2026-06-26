@@ -21,6 +21,8 @@ const HOP_CAP: u32 = 8;
 const DFS_BUDGET_CHECK_INTERVAL: u32 = 4096;
 /// Prune DFS branches once log-weight exceeds this (spot-weighted graphs only).
 const LOG_WEIGHT_PRUNE_THRESHOLD: f64 = 0.0;
+/// Edges rescored to this weight are non-tradable — skip during enumeration.
+const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
 /// Minimum hub starts before sharding DFS across rayon workers.
 const PARALLEL_DFS_MIN_STARTS: usize = 8;
 
@@ -35,7 +37,7 @@ fn edges_from_path(path: &[Edge]) -> CycleEdges {
 
 /// Major-token-first + high out-degree hubs for DFS start order.
 pub fn prioritize_cycle_start_tokens(graph: &RoutingGraph) -> Vec<TokenIndex> {
-    prioritize_cycle_start_tokens_from_out_degrees(graph.adjacency.iter().map(|adj| adj.len()))
+    prioritize_cycle_start_tokens_from_out_degrees(graph.adjacency.iter().map(Vec::len))
 }
 
 pub(crate) fn prioritize_cycle_start_tokens_from_out_degrees(
@@ -57,7 +59,7 @@ struct ActiveGraph<'a> {
 
 fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph<'_> {
     let start_tokens =
-        prioritize_cycle_start_tokens_from_out_degrees(graph.adjacency.iter().map(|adj| adj.len()));
+        prioritize_cycle_start_tokens_from_out_degrees(graph.adjacency.iter().map(Vec::len));
     ActiveGraph {
         adjacency: &graph.adjacency,
         start_tokens,
@@ -139,6 +141,9 @@ fn collect_cycles_dfs(
         if used_tokens[curr.0 as usize] || hops >= hop_cap {
             return;
         }
+        if hops >= 1 && log_w > LOG_WEIGHT_PRUNE_THRESHOLD {
+            return;
+        }
 
         let next_edges = match prep.adjacency.get(curr.0 as usize) {
             Some(e) if !e.is_empty() => e,
@@ -148,8 +153,15 @@ fn collect_cycles_dfs(
         used_tokens[curr.0 as usize] = true;
 
         for ge in next_edges {
+            if ge.log_weight >= DEAD_EDGE_LOG_WEIGHT {
+                continue;
+            }
             let pool_id = ge.edge.pool_index.0 as usize;
             if pool_state[pool_id] != 0 {
+                continue;
+            }
+            let next_log_w = log_w + ge.log_weight;
+            if next_log_w > LOG_WEIGHT_PRUNE_THRESHOLD {
                 continue;
             }
             pool_state[pool_id] = 1;
@@ -163,7 +175,7 @@ fn collect_cycles_dfs(
                 pool_state,
                 used_tokens,
                 hops + 1,
-                log_w + ge.log_weight,
+                next_log_w,
                 cum_fee + clamp_fee_bps(ge.edge.fee_bps),
                 hop_cap,
                 max_cycles,
@@ -200,6 +212,9 @@ fn collect_cycles_dfs(
         for ge in first_edges {
             if budget.tick() || collector.cycles.len() - pass_start >= max_cycles {
                 break;
+            }
+            if ge.log_weight >= DEAD_EDGE_LOG_WEIGHT {
+                continue;
             }
             let pool_id = ge.edge.pool_index.0 as usize;
             pool_state[pool_id] = 1;
@@ -319,6 +334,9 @@ fn collect_cycles_dfs_single_start(
         if used_tokens[curr.0 as usize] || hops >= hop_cap {
             return;
         }
+        if hops >= 1 && log_w > LOG_WEIGHT_PRUNE_THRESHOLD {
+            return;
+        }
 
         let next_edges = match prep.adjacency.get(curr.0 as usize) {
             Some(e) if !e.is_empty() => e,
@@ -331,8 +349,15 @@ fn collect_cycles_dfs_single_start(
             if budget.tick() || cycles.len() >= max_cycles {
                 break;
             }
+            if ge.log_weight >= DEAD_EDGE_LOG_WEIGHT {
+                continue;
+            }
             let pool_id = ge.edge.pool_index.0 as usize;
             if pool_state[pool_id] != 0 {
+                continue;
+            }
+            let next_log_w = log_w + ge.log_weight;
+            if next_log_w > LOG_WEIGHT_PRUNE_THRESHOLD {
                 continue;
             }
             pool_state[pool_id] = 1;
@@ -346,7 +371,7 @@ fn collect_cycles_dfs_single_start(
                 pool_state,
                 used_tokens,
                 hops + 1,
-                log_w + ge.log_weight,
+                next_log_w,
                 cum_fee + clamp_fee_bps(ge.edge.fee_bps),
                 hop_cap,
                 max_cycles,
@@ -370,6 +395,9 @@ fn collect_cycles_dfs_single_start(
     for ge in first_edges {
         if budget.tick() || cycles.len() >= max_cycles {
             break;
+        }
+        if ge.log_weight >= DEAD_EDGE_LOG_WEIGHT {
+            continue;
         }
         let pool_id = ge.edge.pool_index.0 as usize;
         pool_state[pool_id] = 1;
@@ -398,7 +426,7 @@ fn collect_cycles_dfs_single_start(
 }
 
 fn collect_cycles_dfs_parallel(
-    graph: Arc<RoutingGraph>,
+    graph: &RoutingGraph,
     hop_limit: u32,
     max_cycles: usize,
     start_tokens: &[TokenIndex],
@@ -416,13 +444,7 @@ fn collect_cycles_dfs_parallel(
                 adjacency: &graph.adjacency,
                 start_tokens: Vec::new(),
             };
-            collect_cycles_dfs_single_start(
-                &prep,
-                *start,
-                hop_limit,
-                per_shard,
-                budget.as_ref(),
-            )
+            collect_cycles_dfs_single_start(&prep, *start, hop_limit, per_shard, budget.as_ref())
         })
         .collect();
 
@@ -475,6 +497,22 @@ pub fn find_cycles(
 }
 
 pub fn find_cycles_multi_pass(
+    arena: &StateArena,
+    graph: &RoutingGraph,
+    passes: &[CycleSearchPass],
+) -> Vec<FoundCycle> {
+    find_cycles_multi_pass_impl(arena, graph, passes)
+}
+
+pub fn find_cycles_multi_pass_arc(
+    arena: &StateArena,
+    graph: &Arc<RoutingGraph>,
+    passes: &[CycleSearchPass],
+) -> Vec<FoundCycle> {
+    find_cycles_multi_pass_impl(arena, graph.as_ref(), passes)
+}
+
+fn find_cycles_multi_pass_impl(
     _arena: &StateArena,
     graph: &RoutingGraph,
     passes: &[CycleSearchPass],
@@ -487,11 +525,10 @@ pub fn find_cycles_multi_pass(
     let use_parallel = prep.start_tokens.len() >= PARALLEL_DFS_MIN_STARTS;
 
     if use_parallel {
-        let shared_graph = Arc::new(graph.clone());
         let mut all = Vec::new();
         for pass in passes {
             let mut shard = collect_cycles_dfs_parallel(
-                Arc::clone(&shared_graph),
+                graph,
                 pass.max_hops,
                 pass.max_cycles.min(MAX_CYCLES_PER_PASS),
                 &prep.start_tokens,

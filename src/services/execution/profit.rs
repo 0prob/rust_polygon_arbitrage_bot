@@ -112,10 +112,11 @@ impl ProfitEvalContext {
     ) -> Self {
         let token_to_matic_rate =
             resolve_token_to_matic_rate(cycle_start, arena, token_to_matic_rates);
-        let token_decimals = arena
-            .token_address(cycle_start)
-            .and_then(|a| token_decimals.get(&a).copied())
-            .unwrap_or(18);
+        let token_decimals = crate::services::oracle::resolve_token_decimals_for_index(
+            cycle_start,
+            arena,
+            token_decimals,
+        );
         Self {
             gas_price,
             flash_source,
@@ -145,11 +146,11 @@ pub struct ProfitThresholds {
 pub fn build_assess_input(
     cycle_start: TokenIndex,
     arena: &StateArena,
-    route: RouteProfitParams,
+    route: &RouteProfitParams,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
     token_decimals: &HashMap<Address, u8>,
     gas_price: U256,
-    thresholds: ProfitThresholds,
+    thresholds: &ProfitThresholds,
 ) -> AssessProfitInput {
     AssessProfitInput {
         gross_profit: route.gross_profit,
@@ -157,10 +158,11 @@ pub fn build_assess_input(
         gas_units: route.gas_units,
         gas_price_wei: gas_price,
         token_to_matic_rate: resolve_token_to_matic_rate(cycle_start, arena, token_to_matic_rates),
-        token_decimals: arena
-            .token_address(cycle_start)
-            .and_then(|a| token_decimals.get(&a).copied())
-            .unwrap_or(18),
+        token_decimals: crate::services::oracle::resolve_token_decimals_for_index(
+            cycle_start,
+            arena,
+            token_decimals,
+        ),
         hop_count: route.hop_count,
         min_profit_matic_wei: thresholds.min_profit_matic_wei,
         min_profit_roi_bps: thresholds.min_profit_roi_bps,
@@ -170,12 +172,33 @@ pub fn build_assess_input(
     }
 }
 
+/// Single entry point for route profitability after simulation.
+pub fn assess_route_profit(
+    cycle_start: TokenIndex,
+    arena: &StateArena,
+    route: &RouteProfitParams,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+    token_decimals: &HashMap<Address, u8>,
+    gas_price: U256,
+    thresholds: &ProfitThresholds,
+) -> ProfitAssessment {
+    assess_profit(&build_assess_input(
+        cycle_start,
+        arena,
+        route,
+        token_to_matic_rates,
+        token_decimals,
+        gas_price,
+        thresholds,
+    ))
+}
+
 pub fn net_profit_after_gas_from_sim(
     sim: &MinimalSimResult,
     amount_in: U256,
     ctx: &ProfitEvalContext,
 ) -> U256 {
-    assess_profit(AssessProfitInput {
+    assess_profit(&AssessProfitInput {
         gross_profit: sim.profit,
         amount_in,
         gas_units: sim.total_gas,
@@ -202,17 +225,16 @@ pub fn net_profit_after_gas_from_sim(
         net_profit_matic_wei = tracing::field::Empty,
     )
 )]
-pub fn assess_profit(input: AssessProfitInput) -> ProfitAssessment {
+pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     let flash_fee_bps = flash_loan_fee_bps(input.flash_loan_source);
     let flash_loan_fee = (input.amount_in * U256::from(flash_fee_bps)) / BPS_SCALE;
 
-    // Slippage conservatively reduces expected gross profit, not borrow size.
-    let slippage_deduction = (input.gross_profit * U256::from(input.slippage_bps)) / BPS_SCALE;
+    // Align off-chain assessment with on-chain min-out / min-profit encoding.
+    let adjusted_gross =
+        slippage_adjusted(input.gross_profit, input.slippage_bps).unwrap_or(input.gross_profit);
+    let slippage_deduction = input.gross_profit.saturating_sub(adjusted_gross);
 
-    let net_before_gas = input
-        .gross_profit
-        .saturating_sub(flash_loan_fee)
-        .saturating_sub(slippage_deduction);
+    let net_before_gas = adjusted_gross.saturating_sub(flash_loan_fee);
 
     let gas_cost_wei = U256::from(input.gas_units) * input.gas_price_wei;
     // Worst-case revert loss for flash arb is gas spent (borrow repays on revert).
@@ -335,18 +357,34 @@ mod tests {
         input.amount_in = U256::from(100_000_000u64); // 100 USDC
         input.gross_profit = U256::from(1_000_000u64); // 1 USDC profit
         input.token_to_matic_rate = U256::from(1_428_571_428_571_428_571u64); // 1 USDC ≈ 1.428 MATIC
-        let a = assess_profit(input);
+        let a = assess_profit(&input);
         // Gas cost should not exceed profit for 6-decimals (old bug would have)
-        assert!(a.gas_cost_in_tokens < a.gross_profit, "6-dec gas cost {} should be < profit {}", a.gas_cost_in_tokens, a.gross_profit);
+        assert!(
+            a.gas_cost_in_tokens < a.gross_profit,
+            "6-dec gas cost {} should be < profit {}",
+            a.gas_cost_in_tokens,
+            a.gross_profit
+        );
         // MATIC conversion should be sensible
         assert!(a.net_profit_after_gas_matic_wei > U256::ZERO);
+    }
+
+    #[test]
+    fn on_chain_min_profit_for_route_applies_slippage_once() {
+        let gross = U256::from(10_000u64);
+        let once = on_chain_min_profit_for_route(gross, 100);
+        let twice = on_chain_min_profit(
+            slippage_adjusted(gross, 100).expect("slippage"),
+        );
+        assert_eq!(once, twice);
+        assert!(once < on_chain_min_profit(gross));
     }
 
     #[test]
     fn rate_failure_rejects_trade() {
         let mut input = default_input();
         input.token_to_matic_rate = U256::from(100u64); // Below MIN_TOKEN_TO_MATIC_RATE
-        let a = assess_profit(input);
+        let a = assess_profit(&input);
         assert!(!a.should_execute);
         assert!(a.reject_reason.is_some());
         assert!(a.reject_reason.unwrap().contains("rate"));
@@ -360,11 +398,13 @@ mod tests {
         input.gas_price_wei = U256::from(100_000_000_000u64); // 100 gwei
         // Low safety multiplier should pass, high should fail
         input.safety_multiplier_bps = 1; // 0.01% — essentially no safety
-        let a_low = assess_profit(input.clone());
+        let a_low = assess_profit(&input);
         input.safety_multiplier_bps = 100_000; // 10x — absurdly high
-        let a_high = assess_profit(input);
-        assert!(a_low.should_execute || !a_high.should_execute,
-            "low safety should be more permissive than high safety");
+        let a_high = assess_profit(&input);
+        assert!(
+            a_low.should_execute || !a_high.should_execute,
+            "low safety should be more permissive than high safety"
+        );
     }
 
     #[test]
@@ -372,7 +412,7 @@ mod tests {
         let mut input = default_input();
         input.gas_units = 0;
         input.gas_price_wei = U256::ZERO;
-        let a = assess_profit(input);
+        let a = assess_profit(&input);
         assert_eq!(a.revert_penalty, U256::ZERO);
         assert_eq!(a.gas_cost_wei, U256::ZERO);
     }
@@ -393,8 +433,33 @@ mod tests {
             flash_loan_source: FlashLoanSource::Balancer,
             safety_multiplier_bps: DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS,
         };
-        let a = assess_profit(input);
+        let a = assess_profit(&input);
         assert_eq!(a.slippage_deduction, U256::from(10u64));
+    }
+
+    #[test]
+    fn assess_profit_slippage_matches_slippage_adjusted() {
+        let gross = U256::from(10_000u64);
+        let slippage_bps = 250u64;
+        let input = AssessProfitInput {
+            gross_profit: gross,
+            amount_in: U256::from(1_000_000u64),
+            gas_units: 0,
+            gas_price_wei: U256::ZERO,
+            token_to_matic_rate: U256::from(1_000_000_000_000_000_000u64),
+            token_decimals: 18,
+            hop_count: 2,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            slippage_bps,
+            flash_loan_source: FlashLoanSource::Balancer,
+            safety_multiplier_bps: DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS,
+        };
+        let a = assess_profit(&input);
+        let expected_deduction = gross.saturating_sub(
+            slippage_adjusted(gross, slippage_bps).expect("slippage"),
+        );
+        assert_eq!(a.slippage_deduction, expected_deduction);
     }
 
     #[test]
@@ -413,7 +478,7 @@ mod tests {
             flash_loan_source: FlashLoanSource::Balancer,
             safety_multiplier_bps: DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS,
         };
-        let a = assess_profit(input);
+        let a = assess_profit(&input);
         assert!(!a.should_execute);
     }
 }

@@ -9,9 +9,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::prioritize_cycle_start_tokens_from_out_degrees;
 use crate::pipeline::types::PoolMeta;
 use crate::tui::app::{BotStatus, TradeStatus};
-use crate::tui::route_viz::{
-    cycle_to_ui_opportunity, token_label,
-};
+use crate::tui::route_viz::{cycle_to_ui_opportunity, token_label};
 use crate::tui::update::{
     GraphStatsSnapshot, ScannerMetrics, UiOpportunity, UiUpdate, alert_info, trade_from_outcome,
 };
@@ -140,19 +138,18 @@ pub fn build_graph_stats(
         })
         .collect();
 
-    let hubs: Vec<(String, usize)> = prioritize_cycle_start_tokens_from_out_degrees(
-        out_degrees.iter().copied(),
-    )
-    .into_iter()
-    .take(12)
-    .filter_map(|t| {
-        let deg = out_degrees.get(t.0 as usize).copied().unwrap_or(0);
-        if deg == 0 {
-            return None;
-        }
-        Some((token_label(arena, t), deg))
-    })
-    .collect();
+    let hubs: Vec<(String, usize)> =
+        prioritize_cycle_start_tokens_from_out_degrees(out_degrees.iter().copied())
+            .into_iter()
+            .take(12)
+            .filter_map(|t| {
+                let deg = out_degrees.get(t.0 as usize).copied().unwrap_or(0);
+                if deg == 0 {
+                    return None;
+                }
+                Some((token_label(arena, t), deg))
+            })
+            .collect();
 
     let mut protocol_counts: HashMap<String, usize> = HashMap::new();
     for meta in pool_metas {

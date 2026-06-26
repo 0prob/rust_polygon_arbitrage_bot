@@ -8,11 +8,12 @@ use alloy::sol_types::SolCall;
 use reqwest::Client;
 use ruint::aliases::U256;
 use rustc_hash::FxHashMap;
+use tracing::{debug, warn};
 
 use crate::abis::IChainlinkAggregator;
 use crate::core::constants::{RATE_PRECISION, WMATIC};
-use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 use crate::error::ArbError;
+use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 
 const CHAINLINK_USD_DECIMALS: u32 = 8;
 
@@ -86,7 +87,6 @@ struct PriceEntry {
 pub struct PriceOracle {
     http: Client,
     pyth_hermes_url: String,
-    enabled: bool,
     matic_usd: parking_lot::RwLock<Option<PriceEntry>>,
     token_usd: parking_lot::RwLock<FxHashMap<Address, PriceEntry>>,
     /// Raw Chainlink USD answers (8 decimals) for integer profit conversion.
@@ -94,23 +94,20 @@ pub struct PriceOracle {
 }
 
 impl PriceOracle {
-    pub fn new(enabled: bool, pyth_hermes_url: String) -> Result<Self, ArbError> {
+    pub fn new(pyth_hermes_url: String) -> Result<Self, ArbError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(4)
             .build()
             .map_err(|e| ArbError::HttpClient(format!("oracle reqwest: {e}")))?;
         Ok(Self {
             http,
             pyth_hermes_url,
-            enabled,
             matic_usd: parking_lot::RwLock::new(None),
             token_usd: parking_lot::RwLock::new(FxHashMap::default()),
             chainlink_usd_raw: parking_lot::RwLock::new(FxHashMap::default()),
         })
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     fn fresh(entry: &PriceEntry) -> bool {
@@ -125,9 +122,6 @@ impl PriceOracle {
             {
                 return entry.value;
             }
-        }
-        if !self.enabled {
-            return DEFAULT_MATIC_USD;
         }
         let wmatic = WMATIC;
         if let Some(feed) = chainlink_feed(&wmatic)
@@ -144,6 +138,9 @@ impl PriceOracle {
                 });
                 return usd;
             }
+            debug!("Chainlink MATIC/USD read failed — trying Pyth");
+        } else if provider.is_none() {
+            debug!("no state RPC for Chainlink MATIC/USD — trying Pyth");
         }
         if let Ok(prices) = self.fetch_pyth(&["Crypto.MATIC/USD"]).await
             && let Some(usd) = prices.get("Crypto.MATIC/USD").copied()
@@ -155,11 +152,97 @@ impl PriceOracle {
             });
             return usd;
         }
-        self.matic_usd
-            .read()
-            .as_ref()
-            .map(|e| e.value)
-            .unwrap_or(DEFAULT_MATIC_USD)
+        if let Some(stale) = self.matic_usd.read().as_ref().map(|e| e.value) {
+            warn!("oracle using stale MATIC/USD — Chainlink and Pyth unavailable");
+            return stale;
+        }
+        warn!(
+            matic_usd = DEFAULT_MATIC_USD,
+            "oracle using default MATIC/USD — Chainlink and Pyth unavailable"
+        );
+        DEFAULT_MATIC_USD
+    }
+
+    /// Pyth + cache only — no Chainlink RPC required.
+    pub async fn get_matic_usd_offline(&self) -> f64 {
+        {
+            let cache = self.matic_usd.read();
+            if let Some(entry) = cache.as_ref()
+                && Self::fresh(entry)
+            {
+                return entry.value;
+            }
+        }
+        if let Ok(prices) = self.fetch_pyth(&["Crypto.MATIC/USD"]).await
+            && let Some(usd) = prices.get("Crypto.MATIC/USD").copied()
+            && usd > 0.0
+        {
+            self.matic_usd.write().replace(PriceEntry {
+                value: usd,
+                updated_at: Instant::now(),
+            });
+            return usd;
+        }
+        if let Some(stale) = self.matic_usd.read().as_ref().map(|e| e.value) {
+            warn!("oracle using stale MATIC/USD — Pyth unavailable");
+            return stale;
+        }
+        warn!(
+            matic_usd = DEFAULT_MATIC_USD,
+            "oracle using default MATIC/USD — Pyth unavailable"
+        );
+        DEFAULT_MATIC_USD
+    }
+
+    pub async fn prefetch_token_usd_offline(&self, tokens: &[Address]) {
+        let mut need = Vec::new();
+        {
+            let cache = self.token_usd.read();
+            for token in tokens {
+                if let Some(entry) = cache.get(token)
+                    && Self::fresh(entry)
+                {
+                    continue;
+                }
+                if pyth_feed(token).is_some() {
+                    need.push(*token);
+                }
+            }
+        }
+        if need.is_empty() {
+            return;
+        }
+        let mut pyth_ids: FxHashMap<&'static str, Vec<Address>> = FxHashMap::default();
+        for token in &need {
+            if let Some(id) = pyth_feed(token) {
+                pyth_ids.entry(id).or_default().push(*token);
+            }
+        }
+        if pyth_ids.is_empty() {
+            return;
+        }
+        let ids: Vec<&str> = pyth_ids.keys().copied().collect();
+        if let Ok(prices) = self.fetch_pyth(&ids).await {
+            let now = Instant::now();
+            let mut cache = self.token_usd.write();
+            for (id, tokens) in pyth_ids {
+                let Some(usd) = prices.get(id).copied() else {
+                    continue;
+                };
+                if usd <= 0.0 {
+                    continue;
+                }
+                for token in tokens {
+                    cache.insert(
+                        token,
+                        PriceEntry {
+                            value: usd,
+                            updated_at: now,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     pub async fn prefetch_token_usd<P: Provider<Ethereum>>(
@@ -167,9 +250,6 @@ impl PriceOracle {
         tokens: &[Address],
         provider: Option<&P>,
     ) {
-        if !self.enabled {
-            return;
-        }
         let mut need = Vec::new();
         {
             let cache = self.token_usd.read();
@@ -274,6 +354,21 @@ impl PriceOracle {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        match self.fetch_pyth_once(ids).await {
+            Ok(prices) if !prices.is_empty() => Ok(prices),
+            first => {
+                if let Err(e) = &first {
+                    debug!(error = %e, "Pyth Hermes request failed — retrying once");
+                }
+                self.fetch_pyth_once(ids).await
+            }
+        }
+    }
+
+    async fn fetch_pyth_once(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, f64>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut url = reqwest::Url::parse(&format!(
             "{}/v2/updates/price/latest",
             self.pyth_hermes_url.trim_end_matches('/')
@@ -284,7 +379,7 @@ impl PriceOracle {
                 pairs.append_pair("ids[]", id);
             }
         }
-        let resp = self.http.get(url).send().await?;
+        let resp = self.http.get(url).send().await?.error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
         let mut out = HashMap::new();
         let Some(parsed) = body.get("parsed").and_then(|v| v.as_array()) else {
@@ -298,8 +393,14 @@ impl PriceOracle {
                 .pointer("/price/price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| item.pointer("/price/price").and_then(|v| v.as_f64()));
-            let expo = match item.pointer("/price/expo").and_then(|v| v.as_i64()) {
+                .or_else(|| {
+                    item.pointer("/price/price")
+                        .and_then(serde_json::Value::as_f64)
+                });
+            let expo = match item
+                .pointer("/price/expo")
+                .and_then(serde_json::Value::as_i64)
+            {
                 Some(e) => e as i32,
                 None => continue,
             };
@@ -322,11 +423,7 @@ impl PriceOracle {
         let token_raw = self.chainlink_usd_raw.read().get(token).copied()?;
         let matic_raw = self.chainlink_usd_raw.read().get(&WMATIC).copied()?;
         let rate = chainlink_usd_to_matic_rate_per_unit(token_raw, matic_raw);
-        if rate.is_zero() {
-            None
-        } else {
-            Some(rate)
-        }
+        if rate.is_zero() { None } else { Some(rate) }
     }
 }
 

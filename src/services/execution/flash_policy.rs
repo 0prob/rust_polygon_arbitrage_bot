@@ -44,7 +44,10 @@ mod tests {
     fn parse_flash_policy_variants() {
         assert_eq!(parse_flash_policy("auto"), FlashLoanPolicy::Auto);
         assert_eq!(parse_flash_policy("AAVE"), FlashLoanPolicy::AaveOnly);
-        assert_eq!(parse_flash_policy("BALANCER"), FlashLoanPolicy::BalancerOnly);
+        assert_eq!(
+            parse_flash_policy("BALANCER"),
+            FlashLoanPolicy::BalancerOnly
+        );
     }
 
     #[test]

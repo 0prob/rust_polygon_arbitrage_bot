@@ -96,12 +96,12 @@ impl HyperSyncService {
             return Ok(None);
         };
         let success = matches!(tx.status, Some(TransactionStatus::Success));
-        let gas_used = tx.gas_used.map(quantity_to_u64).unwrap_or(0);
+        let gas_used = tx.gas_used.as_ref().map(quantity_to_u64).unwrap_or(0);
         Ok(Some((success, gas_used)))
     }
 }
 
-fn quantity_to_u64(q: hypersync_client::format::Quantity) -> u64 {
+fn quantity_to_u64(q: &hypersync_client::format::Quantity) -> u64 {
     let bytes = q.as_ref();
     let mut buf = [0u8; 8];
     let start = 8usize.saturating_sub(bytes.len());
@@ -125,24 +125,24 @@ mod tests {
     #[test]
     fn quantity_zero() {
         let q = hypersync_client::format::Quantity::from(0u64);
-        assert_eq!(quantity_to_u64(q), 0);
+        assert_eq!(quantity_to_u64(&q), 0);
     }
 
     #[test]
     fn quantity_max_u64() {
         let q = hypersync_client::format::Quantity::from(u64::MAX);
-        assert_eq!(quantity_to_u64(q), u64::MAX);
+        assert_eq!(quantity_to_u64(&q), u64::MAX);
     }
 
     #[test]
     fn quantity_small_value() {
         let q = hypersync_client::format::Quantity::from(42u64);
-        assert_eq!(quantity_to_u64(q), 42);
+        assert_eq!(quantity_to_u64(&q), 42);
     }
 
     #[test]
     fn quantity_large_value() {
         let q = hypersync_client::format::Quantity::from(1_000_000u64);
-        assert_eq!(quantity_to_u64(q), 1_000_000);
+        assert_eq!(quantity_to_u64(&q), 1_000_000);
     }
 }

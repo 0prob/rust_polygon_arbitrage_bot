@@ -43,12 +43,12 @@ pub async fn execute_multicall<P: Provider<Ethereum>>(
         .collect())
 }
 
-pub fn chunk_items(items: Vec<MulticallItem>, max_calls: usize) -> Vec<Vec<MulticallItem>> {
+pub fn chunk_items(items: &[MulticallItem], max_calls: usize) -> Vec<Vec<MulticallItem>> {
     if items.is_empty() {
         return Vec::new();
     }
     let max = max_calls.max(1);
-    items.chunks(max).map(|c| c.to_vec()).collect()
+    items.chunks(max).map(<[MulticallItem]>::to_vec).collect()
 }
 
 pub fn encode_call<C: SolCall>(call: &C) -> Bytes {

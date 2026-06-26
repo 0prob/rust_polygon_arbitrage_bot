@@ -27,6 +27,7 @@ sol! {
     interface IERC20 {
         event Transfer(address indexed from, address indexed to, uint256 value);
         function transfer(address to, uint256 amount) external returns (bool);
+        function approve(address spender, uint256 amount) external returns (bool);
     }
 
     #[sol(rpc)]
@@ -189,6 +190,7 @@ sol! {
 
     #[sol(rpc)]
     interface IBalancerPool {
+        function getPoolId() external view returns (bytes32);
         function getSwapFeePercentage() external view returns (uint256);
         function getNormalizedWeights() external view returns (uint256[]);
         function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision);

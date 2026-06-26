@@ -35,3 +35,7 @@ pub const FEE_PIPS_SCALE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
 pub const RATE_PRECISION: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 /// Reject opportunities when the token/MATIC rate rounds to zero or is untrustworthy.
 pub const MIN_TOKEN_TO_MATIC_RATE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
+/// Minimum borrow size expressed as ~1 MATIC of notional (wei, 18 decimals).
+pub const MIN_ECONOMIC_VALUE_MATIC_WEI: u128 = 10u128.pow(18);
+/// Reject simulations whose gross profit exceeds this ROI (bps of `amount_in`).
+pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 10_000;

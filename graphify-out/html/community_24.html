@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spawn_snapshot_poller() — Community 24</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+#sidebar { width: 320px; min-width: 320px; background: #1a1a2e; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #2a2a4a; }
+#sidebar h2 { font-size: 18px; color: #59A14F; margin-bottom: 4px; }
+#sidebar h3 { font-size: 14px; color: #9ca3af; margin-bottom: 8px; }
+.nav-link { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; color: #e0e0e0; text-decoration: none; }
+.nav-link:hover { background: #2a2a4a; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+#graph-container { flex: 1; position: relative; }
+#search { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #3a3a5a; background: #0f0f1a; color: #e0e0e0; font-size: 14px; }
+#search:focus { outline: none; border-color: #59A14F; }
+#info-panel { background: #0f0f1a; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; min-height: 100px; }
+#info-panel .prop { color: #9ca3af; }
+#info-panel .val { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+    <div>
+        <h2>spawn_snapshot_poller()</h2>
+        <p style="font-size:12px;color:#666;">19 nodes · Community 24</p>
+    </div>
+    <input id="search" type="text" placeholder="Search nodes…" />
+    <div>
+        <h3>Node Info</h3>
+        <div id="info-panel"><i style="color:#666">Click a node to see details</i></div>
+    </div>
+    <div>
+        <h3>Navigation</h3>
+        <a href="index.html" class="nav-link" style="font-weight:bold;">← Overview</a>
+    </div>
+</div>
+<div id="graph-container"></div>
+<script>
+(function() {
+    var nodesData = [{id:"src_tui_run_rs",label:"run",title:"run\nType: File\nFile: ./src/tui/run.rs\nDegree: 18",color:"#59A14F",size:25.0},{id:"src_tui_run_rs_import_std_io",label:"std::io",title:"std::io\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_std_time_duration",label:"std::time::Duration",title:"std::time::Duration\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_anyhow_context",label:"anyhow::Context",title:"anyhow::Context\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crossterm_event_self_event_keyeventkind",label:"crossterm::event::{self, Event, KeyEventKind}",title:"crossterm::event::{self, Event, KeyEventKind}\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crossterm_execute",label:"crossterm::execute",title:"crossterm::execute\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crossterm_terminal_enteralternatescreen_leavealternatescreen_disable_raw_mode_enable_raw_mode",label:"crossterm::terminal::{\n    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,\n}",title:"crossterm::terminal::{\n    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,\n}\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_ratatui_terminal",label:"ratatui::Terminal",title:"ratatui::Terminal\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_ratatui_backend_crosstermbackend",label:"ratatui::backend::CrosstermBackend",title:"ratatui::backend::CrosstermBackend\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_tokio_sync_mpsc",label:"tokio::sync::mpsc",title:"tokio::sync::mpsc\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_tokio_time",label:"tokio::time",title:"tokio::time\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crate_tui_app_app_botstatus",label:"crate::tui::app::{App, BotStatus}",title:"crate::tui::app::{App, BotStatus}\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crate_tui_bridge_uibridge",label:"crate::tui::bridge::UiBridge",title:"crate::tui::bridge::UiBridge\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crate_tui_events_handle_key",label:"crate::tui::events::handle_key",title:"crate::tui::events::handle_key\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crate_tui_update_uiupdate",label:"crate::tui::update::UiUpdate",title:"crate::tui::update::UiUpdate\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_import_crate_tui_widgets",label:"crate::tui::widgets",title:"crate::tui::widgets\nType: Module\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_run_tui",label:"run_tui()",title:"run_tui()\nType: Function\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_apply_update",label:"apply_update()",title:"apply_update()\nType: Function\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0},{id:"src_tui_run_rs_spawn_snapshot_poller",label:"spawn_snapshot_poller()",title:"spawn_snapshot_poller()\nType: Function\nFile: ./src/tui/run.rs\nDegree: 1",color:"#59A14F",size:12.0}];
+    var edgesData = [{from:"src_tui_run_rs",to:"src_tui_run_rs_import_std_io",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_std_io\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_std_time_duration",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_std_time_duration\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_anyhow_context",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_anyhow_context\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crossterm_event_self_event_keyeventkind",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crossterm_event_self_event_keyeventkind\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crossterm_execute",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crossterm_execute\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crossterm_terminal_enteralternatescreen_leavealternatescreen_disable_raw_mode_enable_raw_mode",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crossterm_terminal_enteralternatescreen_leavealternatescreen_disable_raw_mode_enable_raw_mode\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_ratatui_terminal",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_ratatui_terminal\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_ratatui_backend_crosstermbackend",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_ratatui_backend_crosstermbackend\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_tokio_sync_mpsc",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_tokio_sync_mpsc\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_tokio_time",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_tokio_time\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crate_tui_app_app_botstatus",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crate_tui_app_app_botstatus\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crate_tui_bridge_uibridge",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crate_tui_bridge_uibridge\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crate_tui_events_handle_key",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crate_tui_events_handle_key\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crate_tui_update_uiupdate",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crate_tui_update_uiupdate\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_import_crate_tui_widgets",label:"imports",dashes:false,title:"imports: src_tui_run_rs → src_tui_run_rs_import_crate_tui_widgets\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_run_tui",label:"defines",dashes:false,title:"defines: src_tui_run_rs → src_tui_run_rs_run_tui\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_apply_update",label:"defines",dashes:false,title:"defines: src_tui_run_rs → src_tui_run_rs_apply_update\nConfidence: Extracted"},{from:"src_tui_run_rs",to:"src_tui_run_rs_spawn_snapshot_poller",label:"defines",dashes:false,title:"defines: src_tui_run_rs → src_tui_run_rs_spawn_snapshot_poller\nConfidence: Extracted"}];
+    var container = document.getElementById('graph-container');
+    var nodes = new vis.DataSet(nodesData);
+    var edges = new vis.DataSet(edgesData);
+    var options = {
+        physics: {solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:120,springConstant:0.08,damping:0.4,avoidOverlap:0.5},stabilization:{iterations:200}},
+        nodes: { shape: 'dot', font: { color: '#e0e0e0', size: 12 }, borderWidth: 2 },
+        edges: { color: { color: '#4a4a6a', highlight: '#59A14F', hover: '#59A14F' }, font: { color: '#888', size: 10 }, arrows: { to: { enabled: false } }, smooth: { type: 'continuous' } },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true }
+    };
+    var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    network.on('stabilizationIterationsDone', function() { network.setOptions({ physics: { enabled: false } }); });
+    network.on('click', function(params) {
+        var panel = document.getElementById('info-panel');
+        if (params.nodes.length > 0) {
+            var node = nodes.get(params.nodes[0]);
+            if (node) {
+                panel.innerHTML = '<div><span class="prop">Label:</span> <span class="val">' + node.label + '</span></div><div><span class="prop">ID:</span> <span class="val">' + node.id + '</span></div>';
+                network.focus(params.nodes[0], { scale: 1.2, animation: true });
+            }
+        }
+    });
+    var searchEl = document.getElementById('search');
+    var sTimer = null;
+    searchEl.addEventListener('input', function() {
+        clearTimeout(sTimer);
+        sTimer = setTimeout(function() {
+            var term = searchEl.value.toLowerCase();
+            var updates = [];
+            nodes.forEach(function(n) {
+                var h = term && !n.label.toLowerCase().includes(term);
+                if (n.hidden !== h) { updates.push({ id: n.id, hidden: h }); }
+            });
+            if (updates.length > 0) { nodes.update(updates); }
+        }, 200);
+    });
+})();
+</script>
+</body>
+</html>

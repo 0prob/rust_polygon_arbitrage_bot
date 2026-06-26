@@ -23,7 +23,10 @@ fn render_metrics(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let lines = vec![
-        Line::from(format!("Last search: {} ms (target <1000)", m.last_search_ms)),
+        Line::from(format!(
+            "Last search: {} ms (target <1000)",
+            m.last_search_ms
+        )),
         Line::from(format!("BF sources used: {}", m.bf_sources_used)),
         Line::from(format!(
             "Pass limited: {}  Pass full: {}",
@@ -59,7 +62,10 @@ fn render_logs(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let text = if lines.is_empty() {
-        vec![Line::from(Span::styled("Waiting for pipeline events…", Theme::muted()))]
+        vec![Line::from(Span::styled(
+            "Waiting for pipeline events…",
+            Theme::muted(),
+        ))]
     } else {
         lines
     };

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::orchestrator::hf::HfTickResult;
 use crate::orchestrator::ui_hook::PipelineUiHook;
 use crate::tui::UiBridge;

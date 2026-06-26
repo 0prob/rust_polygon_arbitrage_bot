@@ -257,7 +257,7 @@ impl StreamAddressSet {
         if *guard == addrs {
             return false;
         }
-        *guard = addrs.clone();
+        guard.clone_from(&addrs);
         let _ = self.addr_tx.send(addrs);
         true
     }
@@ -273,40 +273,85 @@ impl Default for StreamAddressSet {
     }
 }
 
-/// Build the top-N streamable pool addresses from discovery + cycle hot set.
+/// Build the top-N streamable pool addresses ranked by cycle hot-set membership,
+/// graph edge centrality, and recent WSS patch activity.
 pub fn select_stream_targets(
     discovered: &[crate::services::discovery::DiscoveredPool],
     hot: &[Address],
+    graph: Option<&crate::pipeline::types::RoutingGraph>,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    arena: &crate::pipeline::arena::StateArena,
+    partial_cache: &PartialPoolCache,
     cap: usize,
+    now_ms: u64,
 ) -> Vec<Address> {
-    use rustc_hash::FxHashSet;
+    use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-    let mut out = Vec::with_capacity(cap.min(discovered.len()));
+    if cap == 0 {
+        return Vec::new();
+    }
+
+    let hot_set: FxHashSet<Address> = hot.iter().copied().collect();
+    let addr_to_pool = arena.address_to_pool();
+
+    let mut edge_counts: FxHashMap<Address, u32> =
+        FxHashMap::with_capacity_and_hasher(pool_metas.len(), FxBuildHasher);
+    for meta in pool_metas {
+        if let Some(addr) = arena.pool_address(meta.pool_index) {
+            edge_counts.entry(addr).or_insert(0);
+        }
+    }
+    if let Some(graph) = graph {
+        for edges in &graph.adjacency {
+            for ge in edges {
+                if let Some(addr) = arena.pool_address(ge.edge.pool_index) {
+                    *edge_counts.entry(addr).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let mut scored: Vec<(u64, Address)> = discovered
+        .iter()
+        .filter(|p| is_streamable_protocol(p.protocol))
+        .map(|pool| {
+            let centrality = edge_counts.get(&pool.address).copied().unwrap_or(0) as u64;
+            let cycle_hot = u64::from(hot_set.contains(&pool.address)) * 10_000;
+            let activity = partial_cache
+                .get(&pool.address)
+                .map(|s| s.patched_at_ms)
+                .unwrap_or(0);
+            let recency = activity.saturating_sub(now_ms.saturating_sub(300_000));
+            let score = cycle_hot
+                .saturating_add(centrality.saturating_mul(100))
+                .saturating_add(recency / 1000);
+            (score, pool.address)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut out = Vec::with_capacity(cap.min(scored.len()));
     let mut seen = FxHashSet::default();
+    for (_, addr) in scored {
+        if out.len() >= cap {
+            break;
+        }
+        if seen.insert(addr) {
+            out.push(addr);
+        }
+    }
 
+    // Ensure cycle-hot pools are always included even if discovery metadata lags.
     for addr in hot {
         if out.len() >= cap {
             break;
         }
-        if seen.insert(*addr) {
+        if seen.insert(*addr) && addr_to_pool.contains_key(addr) {
             out.push(*addr);
         }
     }
 
-    let mut candidates: Vec<_> = discovered
-        .iter()
-        .filter(|p| is_streamable_protocol(p.protocol))
-        .collect();
-    candidates.sort_by_key(|p| std::cmp::Reverse(p.created_block));
-
-    for pool in candidates {
-        if out.len() >= cap {
-            break;
-        }
-        if seen.insert(pool.address) {
-            out.push(pool.address);
-        }
-    }
     out
 }
 

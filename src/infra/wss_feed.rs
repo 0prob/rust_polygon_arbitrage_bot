@@ -62,7 +62,7 @@ impl PoolLogFeed {
                         if *self.shutdown.borrow() { break; }
                     }
                     _ = addr_rx.changed() => {
-                        current_addrs = addr_rx.borrow().clone();
+                        current_addrs.clone_from(&addr_rx.borrow());
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
@@ -89,7 +89,7 @@ impl PoolLogFeed {
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS)) => {}
                 _ = addr_rx.changed() => {
-                    current_addrs = addr_rx.borrow().clone();
+                    current_addrs.clone_from(&addr_rx.borrow());
                 }
             }
         }
@@ -112,7 +112,10 @@ impl PoolLogFeed {
             subs.push(sub);
         }
 
-        let mut merged = futures::stream::select_all(subs.into_iter().map(|sub| sub.into_stream()));
+        let mut merged = futures::stream::select_all(
+            subs.into_iter()
+                .map(alloy::pubsub::Subscription::into_stream),
+        );
 
         loop {
             tokio::select! {
@@ -136,10 +139,7 @@ impl PoolLogFeed {
         let topic0 = log.topics().first().copied().unwrap_or(B256::ZERO);
         let data = log.data().data.as_ref();
         let ts = now_ms();
-        if self
-            .partial
-            .apply_log(pool, topic0, data, ts)
-        {
+        if self.partial.apply_log(pool, topic0, data, ts) {
             self.metrics.record_stream_log();
             debug!(pool = %pool, "partial cache patched from WSS log");
         }

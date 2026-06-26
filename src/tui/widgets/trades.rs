@@ -17,31 +17,30 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ])
     .style(Theme::header());
 
-    let rows: Vec<Row> = app
-        .trades
-        .iter()
-        .rev()
-        .take(area.height.saturating_sub(4) as usize)
-        .map(|t| {
-            let status_style = match t.status {
-                crate::tui::app::TradeStatus::Confirmed => Theme::profit(),
-                crate::tui::app::TradeStatus::Reverted | crate::tui::app::TradeStatus::Failed => {
-                    Theme::loss()
-                }
-                _ => Theme::muted(),
-            };
-            Row::new(vec![
-                Cell::from(format!("{:08x}", t.fingerprint & 0xffff_ffff)),
-                Cell::from(truncate_str(&t.route_summary, 32)),
-                Cell::from(format!("{}", t.hops)),
-                Cell::from(t.profit_native.clone()),
-                Cell::from(format!("${:.2}", t.profit_usd)).style(Theme::profit()),
-                Cell::from(format!("{}", t.gas_used)),
-                Cell::from(t.status.label()).style(status_style),
-                Cell::from(t.tx_hash.clone().unwrap_or_else(|| "—".into())),
-            ])
-        })
-        .collect();
+    let rows: Vec<Row> =
+        app.trades
+            .iter()
+            .rev()
+            .take(area.height.saturating_sub(4) as usize)
+            .map(|t| {
+                let status_style = match t.status {
+                    crate::tui::app::TradeStatus::Confirmed => Theme::profit(),
+                    crate::tui::app::TradeStatus::Reverted
+                    | crate::tui::app::TradeStatus::Failed => Theme::loss(),
+                    _ => Theme::muted(),
+                };
+                Row::new(vec![
+                    Cell::from(format!("{:08x}", t.fingerprint & 0xffff_ffff)),
+                    Cell::from(truncate_str(&t.route_summary, 32)),
+                    Cell::from(format!("{}", t.hops)),
+                    Cell::from(t.profit_native.clone()),
+                    Cell::from(format!("${:.2}", t.profit_usd)).style(Theme::profit()),
+                    Cell::from(format!("{}", t.gas_used)),
+                    Cell::from(t.status.label()).style(status_style),
+                    Cell::from(t.tx_hash.clone().unwrap_or_else(|| "—".into())),
+                ])
+            })
+            .collect();
 
     let table = Table::new(
         rows,

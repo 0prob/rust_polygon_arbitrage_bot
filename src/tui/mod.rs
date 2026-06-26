@@ -11,6 +11,7 @@ pub mod layout;
 pub mod mock;
 pub mod route_viz;
 pub mod run;
+pub mod terminal;
 pub mod text;
 pub mod theme;
 pub mod update;

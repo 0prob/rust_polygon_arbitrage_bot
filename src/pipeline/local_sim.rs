@@ -155,6 +155,37 @@ pub fn simulate_hop_amount_out(state: &PoolState, edge: &Edge, amount_in: U256) 
     simulate_hop(state, edge, amount_in).map(|h| h.amount_out)
 }
 
+/// Reject CL routes sized above `spot_probe` when tick data is missing (shallow sim).
+pub fn route_cl_fidelity_ok(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount_in: U256,
+    spot_probe: U256,
+) -> bool {
+    if amount_in <= spot_probe {
+        return true;
+    }
+    for edge in edges {
+        if !matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            continue;
+        }
+        let Some(state) = arena.pool_state(edge.pool_index) else {
+            return false;
+        };
+        let ticks_missing = match state {
+            PoolState::V3(s) | PoolState::V4(s) => s.ticks.is_empty(),
+            _ => false,
+        };
+        if ticks_missing {
+            return false;
+        }
+    }
+    true
+}
+
 /// Fast round-trip simulation for Brent / profit probes (no path metadata).
 #[cfg_attr(
     feature = "trace-sim",

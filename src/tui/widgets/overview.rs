@@ -20,13 +20,37 @@ fn render_kpis(f: &mut Frame, area: Rect, app: &App) {
     let m = &app.metrics;
     let _g = &app.graph_stats;
 
-    let items: [( &str, String, ratatui::style::Style); 6] = [
-        ("Neg Cycles", format!("{}", m.negative_cycles), Theme::profit()),
-        ("Executed", format!("{}", m.routes_executed), Theme::accent()),
-        ("Win Rate", format!("{:.1}%", m.win_rate_pct), Theme::profit()),
+    let items: [(&str, String, ratatui::style::Style); 6] = [
+        (
+            "Neg Cycles",
+            format!("{}", m.negative_cycles),
+            Theme::profit(),
+        ),
+        (
+            "Executed",
+            format!("{}", m.routes_executed),
+            Theme::accent(),
+        ),
+        (
+            "Win Rate",
+            format!("{:.1}%", m.win_rate_pct),
+            Theme::profit(),
+        ),
         ("Avg Hops", format!("{:.1}", m.avg_hops), Theme::muted()),
-        ("Avg Profit", format!("${:.2}", m.avg_profit_usd), Theme::profit()),
-        ("Search ms", format!("{}", m.last_search_ms), if m.last_search_ms < 1000 { Theme::profit() } else { Theme::warn() }),
+        (
+            "Avg Profit",
+            format!("${:.2}", m.avg_profit_usd),
+            Theme::profit(),
+        ),
+        (
+            "Search ms",
+            format!("{}", m.last_search_ms),
+            if m.last_search_ms < 1000 {
+                Theme::profit()
+            } else {
+                Theme::warn()
+            },
+        ),
     ];
 
     for (i, card) in cards.iter().enumerate().take(6) {

@@ -9,7 +9,11 @@ use crate::tui::theme::Theme;
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let status_style = Theme::status_style(app.status);
     let pnl = app.metrics.global_pnl_usd;
-    let pnl_style = if pnl >= 0.0 { Theme::profit() } else { Theme::loss() };
+    let pnl_style = if pnl >= 0.0 {
+        Theme::profit()
+    } else {
+        Theme::loss()
+    };
 
     let line = Line::from(vec![
         Span::styled(" polarb ", Theme::title()),

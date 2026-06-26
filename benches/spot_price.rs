@@ -1,13 +1,13 @@
 use std::hint::black_box;
 
 use alloy::primitives::Address;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rpbot::core::types::{Edge, FoundCycle, PoolState, ProtocolType, V2PoolState};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_finder::find_cycles_multi_pass;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair};
 use rpbot::pipeline::spot_price::{compute_spot_price, rescore_cycles_by_spot_price};
 use rpbot::pipeline::types::CycleSearchPass;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ruint::aliases::U256;
 
 const POOL_COUNT: usize = 64;

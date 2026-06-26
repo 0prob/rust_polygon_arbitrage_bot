@@ -9,7 +9,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Cycle search** — Hybrid parallel DFS + Johnson hub search + Bellman-Ford (default), or `dfs` / `johnson` / `bellman-ford` alone; spot-weighted adjacency graph, atomic probe prefilter, graph/cycle caching.
 - **Pool discovery** — Hasura GraphQL feed from HyperIndex; periodic refresh and dead-pool pruning.
 - **State refresh** — Archival RPC multicall for reserves, V3 ticks (TickLens), V4 storage slots, and protocol-specific fields.
-- **Profit scoring** — Optional Chainlink + Pyth oracle enrichment (token → MATIC rates), gas oracle, flash-loan fee deduction, slippage buffer, circuit breaker. Min-profit threshold is MATIC-denominated (`MIN_PROFIT_MATIC_WEI`; also accepts `MIN_PROFIT_WEI` as fallback).
+- **Profit scoring** — Optional Chainlink + Pyth oracle enrichment (token → MATIC rates), gas oracle, flash-loan fee deduction, slippage buffer, circuit breaker. Min-profit threshold is MATIC-denominated (`MIN_PROFIT_MATIC_WEI`).
 - **Flash-loan routing** — `FLASH_LOAN_SOURCE=auto` (default) uses a Balancer-first waterfall: on-chain liquidity checks per token, Aave fallback, and cap-and-reoptimize when borrow size exceeds provider liquidity. HF eval uses pessimistic Aave fees in auto mode.
 - **Execution** — Dry-run simulation or live submit via Huff `ArbExecutor`; optional MEV-protected `PRIVATE_RPC_URL`, profit-scaled priority fees, nonce management, route cooldown/quarantine, receipt polling.
 - **HyperSync** (optional) — Block head feed and receipt lookups when `ENVIO_API_TOKEN` is set.
@@ -27,14 +27,24 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 
 - **Rust** nightly (uses `-Zthreads` in `.cargo/config.toml` and edition 2024)
 - **Polygon RPC** — archival endpoint recommended for pool-state reads (`STATE_RPC_URL`)
-- **Envio indexer** — Hasura endpoint serving pool/token metadata (`HASURA_URL`, `HASURA_SECRET`)
+- **Envio indexer** — Hasura endpoint from `/home/x/arb/h` (`HASURA_URL`, `HASURA_SECRET`; start with `cd ../h && bun run dev`)
 - **Live execution** — deployed Huff executor (`https://github.com/0prob/solidity_and_huff_evm_contract`), Foundry for deploy script
 
 ## Setup
 
+Start the HyperIndex discovery feed (sibling repo):
+
+```bash
+cd ../h && bun install && cp .env.example .env   # first time only
+cd ../h && bun run dev
+```
+
+Configure the bot:
+
 ```bash
 cp .env.example .env
 # Edit .env — see comments in .env.example for all options
+# Ensure HASURA_SECRET and ENVIO_API_TOKEN match ../h/.env
 ```
 
 Minimum to run in dry-run mode:
@@ -98,7 +108,7 @@ cargo bench                            # cycle_finder, local_sim, spot_price, hf
 cargo flamegraph --bin flame_profile -- routing   # requires cargo-flamegraph
 ```
 
-Calldata parity tests in `tests/calldata_parity.rs` verify encoding against TypeScript fixtures.
+Calldata golden tests in `tests/calldata_parity.rs` verify route encoding and executor selectors.
 
 Optional tokio-console task introspection:
 
@@ -118,8 +128,8 @@ pass_loop
 ├── LF background (discovery → multicall refresh → graph → cycles → snapshot)
 │       └── updates WSS subscription target set (top V2/V3 pools)
 ├── WSS feed (filtered Sync/Swap logs → partial cache patches)
-└── HF (interval + stream-triggered)
-        └── prefetch skipped on stream ticks when HF_SKIP_PREFETCH_ON_STREAM=1
+└── HF (interval + block trigger + stream-triggered)
+        └── prefetch skipped on stream ticks (stream patches already fresh)
         └── dry-run / submit via private RPC or bloXroute BDN
 ```
 

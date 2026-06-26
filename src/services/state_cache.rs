@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::Address;
-use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::core::types::PoolState;
+use crate::core::types::{PoolIndex, PoolState};
 
 const DEFAULT_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_INVALID_RETRY_TTL: Duration = Duration::from_secs(30);
@@ -28,6 +28,8 @@ pub struct StateCache {
     stale_tradable_ttl: Duration,
     eviction_counter: AtomicU64,
     generation: AtomicU64,
+    /// Pools touched since last graph partial-rescore drain.
+    dirty: ParkingMutex<FxHashSet<Address>>,
 }
 
 impl Default for StateCache {
@@ -46,7 +48,24 @@ impl StateCache {
             stale_tradable_ttl: DEFAULT_STALE_TRADABLE_TTL,
             eviction_counter: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            dirty: ParkingMutex::new(FxHashSet::default()),
         }
+    }
+
+    fn mark_dirty(&self, address: Address) {
+        self.dirty.lock().insert(address);
+    }
+
+    /// Resolve dirty pool addresses to arena indices and clear the dirty set.
+    pub fn take_dirty_pool_indices(
+        &self,
+        address_to_pool: &FxHashMap<Address, PoolIndex>,
+    ) -> Vec<PoolIndex> {
+        let addresses: Vec<Address> = self.dirty.lock().drain().collect();
+        addresses
+            .into_iter()
+            .filter_map(|addr| address_to_pool.get(&addr).copied())
+            .collect()
     }
 
     pub fn with_ttls(mut self, invalid_retry: Duration, stale_tradable: Duration) -> Self {
@@ -99,11 +118,7 @@ impl StateCache {
     }
 
     /// Apply an in-place mutation when a full pool entry already exists.
-    pub fn patch_pool(
-        &self,
-        address: Address,
-        mut f: impl FnMut(&mut PoolState),
-    ) -> bool {
+    pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState)) -> bool {
         let mut guard = self.inner.write();
         let Some(entry) = guard.get_mut(&address) else {
             return false;
@@ -113,15 +128,14 @@ impl StateCache {
         entry.state = Arc::new(state);
         entry.updated_at = Instant::now();
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty(address);
         true
     }
 
     pub fn insert(&self, address: Address, state: PoolState) {
         let mut guard = self.inner.write();
         if guard.len() >= self.max_entries && !guard.contains_key(&address) {
-            let count = self
-                .eviction_counter
-                .fetch_add(1, Ordering::Relaxed);
+            let count = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
             if count.is_multiple_of(EVICT_INTERVAL) {
                 guard.retain(|_, v| v.updated_at.elapsed() <= self.ttl);
             }
@@ -139,6 +153,7 @@ impl StateCache {
             },
         );
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.mark_dirty(address);
     }
 
     pub fn addresses(&self) -> Vec<Address> {

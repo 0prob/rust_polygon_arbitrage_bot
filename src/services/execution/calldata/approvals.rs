@@ -1,22 +1,22 @@
 use alloy::primitives::{Address, U256};
-
-use crate::abis::{ExecutorCall, IArbExecutor};
 use alloy::sol_types::SolCall;
 
-#[allow(dead_code)]
+use crate::abis::{ExecutorCall, IArbExecutor, IERC20};
+
+/// Approve `spender` to pull `amount` of `token` from the executor during route execution.
+///
+/// Uses a direct ERC-20 `approve` on the token contract (executor is `msg.sender` inside
+/// `EXECUTE_CALLS`). Avoids Huff `approveIfNeeded`, which reverts on some Polygon tokens
+/// despite direct `approve` succeeding.
 pub(crate) fn encode_approve_if_needed(
-    executor: Address,
+    _executor: Address,
     token: Address,
     spender: Address,
     amount: U256,
 ) -> ExecutorCall {
-    let call = IArbExecutor::approveIfNeededCall {
-        token,
-        spender,
-        amount,
-    };
+    let call = IERC20::approveCall { spender, amount };
     ExecutorCall {
-        target: executor,
+        target: token,
         value: U256::ZERO,
         data: call.abi_encode().into(),
     }
@@ -44,7 +44,7 @@ mod tests {
 
         let call = encode_approve_if_needed(executor, token, spender, amount);
 
-        assert_eq!(call.target, executor, "Approval target should be executor");
+        assert_eq!(call.target, token, "Approval target should be token contract");
         assert_eq!(call.value, U256::ZERO, "Approval should have no ETH value");
         assert!(!call.data.is_empty(), "Approval data should not be empty");
     }

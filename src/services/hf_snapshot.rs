@@ -15,8 +15,8 @@ use crate::services::discovery::DiscoveredPool;
 pub struct HfSnapshot {
     pub generation: u64,
     pub cycles: Vec<FoundCycle>,
-    pub token_to_matic_rates: FxHashMap<TokenIndex, U256>,
-    pub token_decimals: HashMap<alloy::primitives::Address, u8>,
+    pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
+    pub token_decimals: Arc<HashMap<alloy::primitives::Address, u8>>,
     pub pool_metas: Vec<PoolMeta>,
     pub arena: StateArena,
     pub discovered_pools: Arc<Vec<DiscoveredPool>>,
@@ -27,8 +27,8 @@ impl Default for HfSnapshot {
         Self {
             generation: 0,
             cycles: Vec::new(),
-            token_to_matic_rates: FxHashMap::default(),
-            token_decimals: HashMap::new(),
+            token_to_matic_rates: Arc::new(FxHashMap::default()),
+            token_decimals: Arc::new(HashMap::new()),
             pool_metas: Vec::new(),
             arena: StateArena::new(),
             discovered_pools: Arc::new(Vec::new()),

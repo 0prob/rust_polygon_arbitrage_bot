@@ -5,15 +5,15 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::{AppConfig, WalletSecrets};
-use crate::infra::hypersync::HyperSyncService;
 use crate::error::ArbError;
+use crate::infra::hypersync::HyperSyncService;
 use crate::infra::metrics::PipelineMetrics;
 use crate::infra::rpc::RpcPool;
 use crate::infra::wss_feed::spawn_pool_log_feed;
 use crate::orchestrator::hf::{HfContext, run_hf_tick};
 use crate::orchestrator::lf::{LfContext, spawn_lf_background};
 use crate::orchestrator::ui_hook::{SharedUiHook, noop_ui_hook};
-use crate::pipeline::graph_cache::{set_graph_rebuild_interval, GraphCache};
+use crate::pipeline::graph_cache::{GraphCache, set_graph_rebuild_interval};
 use crate::services::execution::ExecutionService;
 use crate::services::execution::GasOracle;
 use crate::services::hf_snapshot::SnapshotStore;
@@ -65,10 +65,7 @@ impl RuntimeContext {
             std::time::Duration::from_secs(config.execution.circuit_breaker_cooldown_secs),
         ));
         let gas_oracle = Arc::new(GasOracle::default());
-        let price_oracle = Arc::new(PriceOracle::new(
-            config.oracle.enabled,
-            config.oracle.pyth_hermes_url.clone(),
-        )?);
+        let price_oracle = Arc::new(PriceOracle::new(config.oracle.pyth_hermes_url.clone())?);
         Ok(Self {
             config,
             wallet,
@@ -145,7 +142,8 @@ async fn run_hf_tick_logged(ctx: Arc<HfContext>, stream_triggered: bool) {
         .await
     {
         Ok(result) => {
-            ctx.metrics.record_hf_tick(result.elapsed_ms, result.profitable_count);
+            ctx.metrics
+                .record_hf_tick(result.elapsed_ms, result.profitable_count);
             if result.profitable_count > 0 {
                 debug!(
                     cycles = result.cycles_considered,
@@ -178,9 +176,7 @@ pub async fn run_pass_loop(
             lf_interval_ms = ctx.config.lf_interval_ms,
             hf_interval_ms = ctx.config.hf_interval_ms,
             dry_run = ctx.config.is_dry_run(),
-            hf_trigger_on_block = ctx.config.pipeline.hf_trigger_on_block,
             stream_enabled = ctx.config.pipeline.stream_enabled,
-            hf_trigger_on_stream = ctx.config.pipeline.hf_trigger_on_stream,
             private_submit = ctx.rpc.private_url().is_some(),
             require_private_submit = ctx.config.execution.require_private_submit,
             "pass loop starting"
@@ -229,22 +225,13 @@ pub async fn run_pass_loop(
                 info!("gas oracle polling started");
             }
 
-            spawn_operator_balance_monitor(
-                ctx.clone(),
-                url.to_string(),
-                shutdown.clone(),
-            );
+            spawn_operator_balance_monitor(&ctx, url.to_string(), shutdown.clone());
         }
 
-        let block_hf = ctx.config.pipeline.hf_trigger_on_block;
-        let mut height_rx = if block_hf {
-            ctx.hypersync.as_ref().map(|hs| {
-                info!("HF block trigger enabled via HyperSync height stream");
-                hs.stream_height()
-            })
-        } else {
-            None
-        };
+        let mut height_rx = ctx.hypersync.as_ref().map(|hs| {
+            info!("HF block trigger enabled via HyperSync height stream");
+            hs.stream_height()
+        });
 
         let lf_shutdown = shutdown.clone();
         let _lf_handle = spawn_lf_background(
@@ -263,33 +250,31 @@ pub async fn run_pass_loop(
             shutdown.clone(),
         );
 
-        let stream_hf = ctx.config.pipeline.stream_enabled && ctx.config.pipeline.hf_trigger_on_stream;
+        let stream_hf = ctx.config.pipeline.stream_enabled;
         let mut stream_rx = if stream_hf {
             Some(ctx.partial_cache.trigger().subscribe())
         } else {
             None
         };
 
-        let spawn_hf_tick = |hf_ctx: Arc<HfContext>, hf_inflight: Arc<Semaphore>, stream_triggered: bool| {
-            let permit = match hf_inflight.try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    hf_ctx.metrics.record_hf_skipped();
-                    debug!("hf tick skipped — previous tick still running");
-                    return;
-                }
+        let spawn_hf_tick =
+            |hf_ctx: Arc<HfContext>, hf_inflight: Arc<Semaphore>, stream_triggered: bool| {
+                let permit = match hf_inflight.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        hf_ctx.metrics.record_hf_skipped();
+                        debug!("hf tick skipped — previous tick still running");
+                        return;
+                    }
+                };
+                tokio::spawn(async move {
+                    if stream_triggered {
+                        hf_ctx.partial_cache.trigger().take_stream_triggered();
+                    }
+                    run_hf_tick_logged(hf_ctx, stream_triggered).await;
+                    drop(permit);
+                });
             };
-            tokio::spawn(async move {
-                if stream_triggered {
-                    hf_ctx
-                        .partial_cache
-                        .trigger()
-                        .take_stream_triggered();
-                }
-                run_hf_tick_logged(hf_ctx, stream_triggered).await;
-                drop(permit);
-            });
-        };
 
         loop {
             tokio::select! {
@@ -307,7 +292,7 @@ pub async fn run_pass_loop(
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                }, if block_hf => {
+                }, if height_rx.is_some() => {
                     if event.is_some() {
                         hf_ctx.metrics.record_block_triggered_hf();
                         spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), false);
@@ -332,7 +317,7 @@ pub async fn run_pass_loop(
 }
 
 fn spawn_operator_balance_monitor(
-    ctx: Arc<RuntimeContext>,
+    ctx: &Arc<RuntimeContext>,
     rpc_url: String,
     mut shutdown: watch::Receiver<bool>,
 ) {

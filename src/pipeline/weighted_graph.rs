@@ -1,4 +1,4 @@
-use crate::core::types::{Edge, TokenIndex};
+use crate::core::types::{Edge, PoolState, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight_with_table};
 use crate::pipeline::types::RoutingGraph;
@@ -10,14 +10,17 @@ pub struct WeightedEdge {
 }
 
 /// Build weighted adjacency from precomputed graph log weights (no SpotTable rebuild).
-pub fn build_weighted_adjacency(arena: &StateArena, graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> {
+pub fn build_weighted_adjacency(
+    arena: &StateArena,
+    graph: &RoutingGraph,
+) -> Vec<Vec<WeightedEdge>> {
     let mut out = vec![Vec::new(); graph.token_count as usize];
     for (from_idx, edges) in graph.adjacency.iter().enumerate() {
         let mut list = Vec::with_capacity(edges.len());
         for ge in edges {
             let tradable = arena
                 .pool_state(ge.edge.pool_index)
-                .map(|s| s.is_tradable())
+                .map(PoolState::is_tradable)
                 .unwrap_or(false);
             if !tradable {
                 continue;
@@ -44,7 +47,7 @@ pub fn build_weighted_adjacency_rescored(
         for ge in edges {
             let tradable = arena
                 .pool_state(ge.edge.pool_index)
-                .map(|s| s.is_tradable())
+                .map(PoolState::is_tradable)
                 .unwrap_or(false);
             if !tradable {
                 continue;
@@ -87,10 +90,7 @@ pub fn compute_bf_potentials(adj: &[Vec<WeightedEdge>], token_count: usize) -> V
 }
 
 /// Johnson reweight: w'(u,v) = w(u,v) + h[u] - h[v].
-pub fn reweight_adjacency(
-    adj: &[Vec<WeightedEdge>],
-    potentials: &[f64],
-) -> Vec<Vec<WeightedEdge>> {
+pub fn reweight_adjacency(adj: &[Vec<WeightedEdge>], potentials: &[f64]) -> Vec<Vec<WeightedEdge>> {
     adj.iter()
         .enumerate()
         .map(|(u_idx, edges)| {
@@ -112,7 +112,7 @@ pub fn reweight_adjacency(
 
 pub fn select_hub_tokens(adj: &[Vec<WeightedEdge>], max_hubs: usize) -> Vec<TokenIndex> {
     crate::pipeline::cycle_finder::prioritize_cycle_start_tokens_from_out_degrees(
-        adj.iter().map(|edges| edges.len()),
+        adj.iter().map(Vec::len),
     )
     .into_iter()
     .take(max_hubs)

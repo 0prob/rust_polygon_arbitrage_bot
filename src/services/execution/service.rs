@@ -29,9 +29,7 @@ use crate::services::execution::profit_logs::parse_transfer_profit;
 use crate::services::execution::receipt::ReceiptPoller;
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
-use crate::services::execution::submit::{
-    resolve_submit_fees_with_profit, submit_with_recovery,
-};
+use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit_with_recovery};
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
@@ -43,7 +41,7 @@ pub struct ExecutionService {
     quarantine: RwLock<HashMap<u64, Instant>>,
     fail_counts: RwLock<HashMap<u64, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
-    pub flash_liquidity: FlashLiquidityCache,
+    pub flash_liquidity: Arc<FlashLiquidityCache>,
     pub circuit_breaker: CircuitBreaker,
 }
 
@@ -87,7 +85,7 @@ impl ExecutionService {
 
     pub fn with_circuit_breaker_cooldown(cooldown: std::time::Duration) -> Self {
         Self {
-            flash_liquidity: FlashLiquidityCache::new(),
+            flash_liquidity: Arc::new(FlashLiquidityCache::new()),
             circuit_breaker: CircuitBreaker::new(cooldown),
             ..Self::default()
         }
@@ -194,7 +192,7 @@ impl ExecutionService {
         let gas_units = candidate
             .simulated_gas
             .max(u32::try_from(dry_run_gas).unwrap_or(u32::MAX));
-        Some(assess_profit(AssessProfitInput {
+        Some(assess_profit(&AssessProfitInput {
             gross_profit: candidate.gross_profit,
             amount_in: candidate.amount_in,
             gas_units,
@@ -266,6 +264,20 @@ impl ExecutionService {
         let dry = dry_run_candidate(sim_provider, candidate, operator)
             .instrument(dry_span)
             .await;
+        // #region agent log
+        crate::debug_agent::log(
+            "H-C",
+            "service.rs:process_candidate",
+            "dry_run_result",
+            serde_json::json!({
+                "route_fingerprint": fp,
+                "success": dry.success,
+                "gas_used": dry.gas_used,
+                "error": dry.error,
+                "flash_loan_source": format!("{:?}", candidate.flash_loan_source),
+            }),
+        );
+        // #endregion
         if !dry.success {
             self.quarantine_route(fp, now);
             self.circuit_breaker.record_failure(
@@ -279,9 +291,14 @@ impl ExecutionService {
         }
 
         let gas_used = dry.gas_used.unwrap_or(0);
+        gas_oracle.record_sim_observed(candidate.simulated_gas, gas_used);
+        if gas_used > 0 {
+            gas_oracle.record_route_gas(candidate.route_fingerprint, gas_used as u32);
+        }
         let gas_price = gas_oracle.conservative_gas_price();
 
-        if !Self::reassess_after_dry_run(candidate, gas_used, gas_price) {
+        let dry_pass = Self::reassess_after_dry_run(candidate, gas_used, gas_price);
+        if !dry_pass {
             info!(
                 route_fingerprint = fp,
                 dry_run_gas = gas_used,
@@ -333,7 +350,10 @@ impl ExecutionService {
         }
 
         if !wallet.has_signer() {
-            warn!(route = fp, "live mode requires PRIVATE_KEY or PRIVATE_KEY_FILE");
+            warn!(
+                route = fp,
+                "live mode requires PRIVATE_KEY or PRIVATE_KEY_FILE"
+            );
             tracing::Span::current().record("outcome", "skipped_no_wallet");
             return ExecutionOutcome::SkippedNoWallet;
         }
@@ -411,33 +431,39 @@ impl ExecutionService {
         );
         record_candidate(&submit_span, candidate);
 
-        let tx_hash =
-            match submit_with_recovery(&submit_provider, &nonce_mgr, candidate, nonce, fees, final_gas)
-                .instrument(submit_span)
-                .await
-            {
-                Ok(hash) => hash,
-                Err(e) => {
-                    match classify_submit_error(&e) {
-                        SubmitAction::InsufficientFunds => {
-                            nonce_mgr.release(nonce);
-                            self.quarantine_route(fp, now);
-                        }
-                        SubmitAction::ResyncAndRetry => {
-                            nonce_mgr.release(nonce);
-                            self.quarantine_route_soft(fp, now);
-                        }
-                        _ => {
-                            nonce_mgr.release(nonce);
-                            self.quarantine_route(fp, now);
-                        }
+        let tx_hash = match submit_with_recovery(
+            &submit_provider,
+            &nonce_mgr,
+            candidate,
+            nonce,
+            fees,
+            final_gas,
+        )
+        .instrument(submit_span)
+        .await
+        {
+            Ok(hash) => hash,
+            Err(e) => {
+                match classify_submit_error(&e) {
+                    SubmitAction::InsufficientFunds => {
+                        nonce_mgr.release(nonce);
+                        self.quarantine_route(fp, now);
                     }
-                    tracing::Span::current().record("outcome", "submit_failed");
-                    return ExecutionOutcome::SubmitFailed {
-                        reason: e.to_string(),
-                    };
+                    SubmitAction::ResyncAndRetry => {
+                        nonce_mgr.release(nonce);
+                        self.quarantine_route_soft(fp, now);
+                    }
+                    _ => {
+                        nonce_mgr.release(nonce);
+                        self.quarantine_route(fp, now);
+                    }
                 }
-            };
+                tracing::Span::current().record("outcome", "submit_failed");
+                return ExecutionOutcome::SubmitFailed {
+                    reason: e.to_string(),
+                };
+            }
+        };
 
         let poller = ReceiptPoller::new(
             Duration::from_millis(config.execution.receipt_timeout_ms),
@@ -460,7 +486,13 @@ impl ExecutionService {
             }
 
             match recover_after_receipt_timeout(
-                &submit_provider, &nonce_mgr, operator, tx_hash, nonce, &fees, final_gas,
+                &submit_provider,
+                &nonce_mgr,
+                operator,
+                tx_hash,
+                nonce,
+                &fees,
+                final_gas,
             )
             .await
             {
@@ -471,7 +503,7 @@ impl ExecutionService {
                         &nonce_mgr,
                         nonce,
                         &tx_hash_str,
-                        receipt,
+                        &receipt,
                         candidate,
                         final_gas,
                         gas_used,
@@ -509,7 +541,7 @@ impl ExecutionService {
             &nonce_mgr,
             nonce,
             &tx_hash_str,
-            receipt,
+            &receipt,
             candidate,
             final_gas,
             gas_used,
@@ -525,7 +557,7 @@ impl ExecutionService {
         nonce_mgr: &NonceManager,
         nonce: u64,
         tx_hash_str: &str,
-        receipt: crate::services::execution::receipt::ReceiptData,
+        receipt: &crate::services::execution::receipt::ReceiptData,
         candidate: &CandidateExecution,
         final_gas: u64,
         dry_run_gas: u64,
@@ -559,7 +591,8 @@ impl ExecutionService {
 
         if !receipt.success {
             self.quarantine_route(fp, now);
-            self.circuit_breaker.record_failure(max_global_failures, "reverted");
+            self.circuit_breaker
+                .record_failure(max_global_failures, "reverted");
             if let Some(a) = Self::reassess_assessment(candidate, receipt.gas_used, gas_price) {
                 log_opportunity_outcome(
                     fp,

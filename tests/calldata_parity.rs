@@ -1,6 +1,4 @@
-//! Golden calldata parity tests against the TypeScript bot fixtures
-//! (`/home/x/arb/t/src/services/execution/calldata/index.test.ts`).
-//! Regenerate goldens: `bun -e '...'` in the TS repo (see module docs in calldata.rs).
+//! Golden calldata tests for route encoding and ArbExecutor wrapper selectors.
 
 use std::str::FromStr;
 
@@ -45,7 +43,7 @@ fn test_encode_cfg() -> RouteEncodeConfig {
 }
 
 #[test]
-fn route_hash_matches_ts_simple_fixture() {
+fn route_hash_matches_golden_simple() {
     let calls = vec![
         ExecutorCall {
             target: addr("0x0000000000000000000000000000000000000a01"),
@@ -67,7 +65,7 @@ fn route_hash_matches_ts_simple_fixture() {
 }
 
 #[test]
-fn multi_hop_v2_matches_ts_fixture() {
+fn multi_hop_v2_matches_golden() {
     let executor = addr("0x0000000000000000000000000000000000000001");
     let pool_a = addr("0x0000000000000000000000000000000000000a01");
     let pool_b = addr("0x0000000000000000000000000000000000000b01");
@@ -145,7 +143,7 @@ fn multi_hop_v2_matches_ts_fixture() {
 }
 
 #[test]
-fn execute_arb_wrapper_matches_ts_fixture() {
+fn execute_arb_wrapper_matches_golden() {
     let executor = addr("0x0000000000000000000000000000000000000001");
     let token_a = addr("0x000000000000000000000000000000000000aaaa");
     let pool_a = addr("0x0000000000000000000000000000000000000a01");
@@ -182,7 +180,7 @@ fn execute_arb_wrapper_matches_ts_fixture() {
 }
 
 #[test]
-fn v4_single_hop_matches_ts_fixture() {
+fn v4_single_hop_matches_golden() {
     let executor = addr("0x0000000000000000000000000000000000000001");
     let pool = addr("0x0000000000000000000000000000000000000a01");
     let token_a = addr("0x000000000000000000000000000000000000aaaa");
@@ -227,12 +225,12 @@ fn v4_single_hop_matches_ts_fixture() {
     assert_eq!(calls.len(), 2);
     assert_eq!(
         compute_route_hash(&calls),
-        FixedBytes::from_str("0x73a19c09f7ea5ea710d373e0b2dd249b878d2a9a6773c3837ee7e25874babeaf")
+        FixedBytes::from_str("0xfe97d9b3acab5a086bf0ad05954f665116ec892781ca18a9b075cf470e4b1b3f")
             .unwrap()
     );
 
     let golden = [
-        "0xfad6b994000000000000000000000000000000000000000000000000000000000000aaaa00000000000000000000000067366782805870060151383f4bbff9dab53e5cd60000000000000000000000000000000000000000000000000de0b6b3a7640000",
+        "0x095ea7b300000000000000000000000067366782805870060151383f4bbff9dab53e5cd60000000000000000000000000000000000000000000000000de0b6b3a7640000",
         "0x8154831900000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000aaaa000000000000000000000000000000000000000000000000000000000000bbbb0000000000000000000000000000000000000000000000000000000000000bb8000000000000000000000000000000000000000000000000000000000000003c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001fffffffffffffffffffffffffffffffffffffffffffffffff21f494c589c000000000000000000000000000000000000000000000000000000000001000276a4",
     ];
     for (call, hex) in calls.iter().zip(golden) {
@@ -244,7 +242,7 @@ fn v4_single_hop_matches_ts_fixture() {
 }
 
 #[test]
-fn kyber_single_hop_matches_ts_fixture() {
+fn kyber_single_hop_matches_golden() {
     let executor = addr("0x0000000000000000000000000000000000000001");
     let pool = addr("0x0000000000000000000000000000000000000a01");
     let token_a = addr("0x000000000000000000000000000000000000aaaa");

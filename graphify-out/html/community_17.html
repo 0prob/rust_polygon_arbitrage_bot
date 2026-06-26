@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pass_loop — Community 17</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+#sidebar { width: 320px; min-width: 320px; background: #1a1a2e; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #2a2a4a; }
+#sidebar h2 { font-size: 18px; color: #FF9DA7; margin-bottom: 4px; }
+#sidebar h3 { font-size: 14px; color: #9ca3af; margin-bottom: 8px; }
+.nav-link { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; color: #e0e0e0; text-decoration: none; }
+.nav-link:hover { background: #2a2a4a; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+#graph-container { flex: 1; position: relative; }
+#search { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #3a3a5a; background: #0f0f1a; color: #e0e0e0; font-size: 14px; }
+#search:focus { outline: none; border-color: #FF9DA7; }
+#info-panel { background: #0f0f1a; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; min-height: 100px; }
+#info-panel .prop { color: #9ca3af; }
+#info-panel .val { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+    <div>
+        <h2>pass_loop</h2>
+        <p style="font-size:12px;color:#666;">22 nodes · Community 17</p>
+    </div>
+    <input id="search" type="text" placeholder="Search nodes…" />
+    <div>
+        <h3>Node Info</h3>
+        <div id="info-panel"><i style="color:#666">Click a node to see details</i></div>
+    </div>
+    <div>
+        <h3>Navigation</h3>
+        <a href="index.html" class="nav-link" style="font-weight:bold;">← Overview</a><a href="community_113.html" class="nav-link"><span class="legend-dot" style="background:#76B7B2"></span>spawn_operator_balance_monitor() (4 links)</a>
+    </div>
+</div>
+<div id="graph-container"></div>
+<script>
+(function() {
+    var nodesData = [{id:"src_orchestrator_pass_loop_rs",label:"pass_loop",title:"pass_loop\nType: File\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 25",color:"#FF9DA7",size:28.0},{id:"src_orchestrator_pass_loop_rs_import_std_sync_arc",label:"std::sync::Arc",title:"std::sync::Arc\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_tokio_sync_mutex_semaphore_watch",label:"tokio::sync::{Mutex, Semaphore, watch}",title:"tokio::sync::{Mutex, Semaphore, watch}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_tokio_time_duration_missedtickbehavior_interval",label:"tokio::time::{Duration, MissedTickBehavior, interval}",title:"tokio::time::{Duration, MissedTickBehavior, interval}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_tracing_instrument_debug_error_info_warn",label:"tracing::{Instrument, debug, error, info, warn}",title:"tracing::{Instrument, debug, error, info, warn}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_config_appconfig_walletsecrets",label:"crate::config::{AppConfig, WalletSecrets}",title:"crate::config::{AppConfig, WalletSecrets}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_infra_hypersync_hypersyncservice",label:"crate::infra::hypersync::HyperSyncService",title:"crate::infra::hypersync::HyperSyncService\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_error_arberror",label:"crate::error::ArbError",title:"crate::error::ArbError\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_infra_metrics_pipelinemetrics",label:"crate::infra::metrics::PipelineMetrics",title:"crate::infra::metrics::PipelineMetrics\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_infra_rpc_rpcpool",label:"crate::infra::rpc::RpcPool",title:"crate::infra::rpc::RpcPool\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_infra_wss_feed_spawn_pool_log_feed",label:"crate::infra::wss_feed::spawn_pool_log_feed",title:"crate::infra::wss_feed::spawn_pool_log_feed\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_hf_hfcontext_run_hf_tick",label:"crate::orchestrator::hf::{HfContext, run_hf_tick}",title:"crate::orchestrator::hf::{HfContext, run_hf_tick}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_lf_lfcontext_spawn_lf_background",label:"crate::orchestrator::lf::{LfContext, spawn_lf_background}",title:"crate::orchestrator::lf::{LfContext, spawn_lf_background}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_ui_hook_shareduihook_noop_ui_hook",label:"crate::orchestrator::ui_hook::{SharedUiHook, noop_ui_hook}",title:"crate::orchestrator::ui_hook::{SharedUiHook, noop_ui_hook}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_pipeline_graph_cache_set_graph_rebuild_interval_graphcache",label:"crate::pipeline::graph_cache::{set_graph_rebuild_interval, GraphCache}",title:"crate::pipeline::graph_cache::{set_graph_rebuild_interval, GraphCache}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_execution_executionservice",label:"crate::services::execution::ExecutionService",title:"crate::services::execution::ExecutionService\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_execution_gasoracle",label:"crate::services::execution::GasOracle",title:"crate::services::execution::GasOracle\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_hf_snapshot_snapshotstore",label:"crate::services::hf_snapshot::SnapshotStore",title:"crate::services::hf_snapshot::SnapshotStore\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_oracle_price_oracle_priceoracle",label:"crate::services::oracle::price_oracle::PriceOracle",title:"crate::services::oracle::price_oracle::PriceOracle\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_partial_cache_partialpoolcache_streamaddressset",label:"crate::services::partial_cache::{PartialPoolCache, StreamAddressSet}",title:"crate::services::partial_cache::{PartialPoolCache, StreamAddressSet}\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_state_cache_statecache",label:"crate::services::state_cache::StateCache",title:"crate::services::state_cache::StateCache\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_orchestrator_pass_loop_rs_import_crate_services_state_refresh_staterefreshservice",label:"crate::services::state_refresh::StateRefreshService",title:"crate::services::state_refresh::StateRefreshService\nType: Module\nFile: ./src/orchestrator/pass_loop.rs\nDegree: 1",color:"#FF9DA7",size:12.0}];
+    var edgesData = [{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_std_sync_arc",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_std_sync_arc\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_tokio_sync_mutex_semaphore_watch",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_tokio_sync_mutex_semaphore_watch\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_tokio_time_duration_missedtickbehavior_interval",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_tokio_time_duration_missedtickbehavior_interval\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_tracing_instrument_debug_error_info_warn",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_tracing_instrument_debug_error_info_warn\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_config_appconfig_walletsecrets",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_config_appconfig_walletsecrets\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_infra_hypersync_hypersyncservice",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_infra_hypersync_hypersyncservice\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_error_arberror",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_error_arberror\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_infra_metrics_pipelinemetrics",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_infra_metrics_pipelinemetrics\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_infra_rpc_rpcpool",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_infra_rpc_rpcpool\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_infra_wss_feed_spawn_pool_log_feed",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_infra_wss_feed_spawn_pool_log_feed\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_hf_hfcontext_run_hf_tick",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_orchestrator_hf_hfcontext_run_hf_tick\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_lf_lfcontext_spawn_lf_background",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_orchestrator_lf_lfcontext_spawn_lf_background\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_orchestrator_ui_hook_shareduihook_noop_ui_hook",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_orchestrator_ui_hook_shareduihook_noop_ui_hook\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_pipeline_graph_cache_set_graph_rebuild_interval_graphcache",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_pipeline_graph_cache_set_graph_rebuild_interval_graphcache\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_execution_executionservice",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_execution_executionservice\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_execution_gasoracle",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_execution_gasoracle\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_hf_snapshot_snapshotstore",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_hf_snapshot_snapshotstore\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_oracle_price_oracle_priceoracle",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_oracle_price_oracle_priceoracle\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_partial_cache_partialpoolcache_streamaddressset",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_partial_cache_partialpoolcache_streamaddressset\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_state_cache_statecache",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_state_cache_statecache\nConfidence: Extracted"},{from:"src_orchestrator_pass_loop_rs",to:"src_orchestrator_pass_loop_rs_import_crate_services_state_refresh_staterefreshservice",label:"imports",dashes:false,title:"imports: src_orchestrator_pass_loop_rs → src_orchestrator_pass_loop_rs_import_crate_services_state_refresh_staterefreshservice\nConfidence: Extracted"}];
+    var container = document.getElementById('graph-container');
+    var nodes = new vis.DataSet(nodesData);
+    var edges = new vis.DataSet(edgesData);
+    var options = {
+        physics: {solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:120,springConstant:0.08,damping:0.4,avoidOverlap:0.5},stabilization:{iterations:200}},
+        nodes: { shape: 'dot', font: { color: '#e0e0e0', size: 12 }, borderWidth: 2 },
+        edges: { color: { color: '#4a4a6a', highlight: '#FF9DA7', hover: '#FF9DA7' }, font: { color: '#888', size: 10 }, arrows: { to: { enabled: false } }, smooth: { type: 'continuous' } },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true }
+    };
+    var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    network.on('stabilizationIterationsDone', function() { network.setOptions({ physics: { enabled: false } }); });
+    network.on('click', function(params) {
+        var panel = document.getElementById('info-panel');
+        if (params.nodes.length > 0) {
+            var node = nodes.get(params.nodes[0]);
+            if (node) {
+                panel.innerHTML = '<div><span class="prop">Label:</span> <span class="val">' + node.label + '</span></div><div><span class="prop">ID:</span> <span class="val">' + node.id + '</span></div>';
+                network.focus(params.nodes[0], { scale: 1.2, animation: true });
+            }
+        }
+    });
+    var searchEl = document.getElementById('search');
+    var sTimer = null;
+    searchEl.addEventListener('input', function() {
+        clearTimeout(sTimer);
+        sTimer = setTimeout(function() {
+            var term = searchEl.value.toLowerCase();
+            var updates = [];
+            nodes.forEach(function(n) {
+                var h = term && !n.label.toLowerCase().includes(term);
+                if (n.hidden !== h) { updates.push({ id: n.id, hidden: h }); }
+            });
+            if (updates.length > 0) { nodes.update(updates); }
+        }, 200);
+    });
+})();
+</script>
+</body>
+</html>

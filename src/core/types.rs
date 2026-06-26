@@ -87,6 +87,7 @@ pub enum BalancerPoolKind {
 
 #[derive(Debug, Clone)]
 pub struct BalancerPoolState {
+    pub pool_id: Option<alloy::primitives::FixedBytes<32>>,
     pub balances: Vec<U256>,
     pub weights: Vec<U256>,
     pub scaling_factors: Vec<U256>,

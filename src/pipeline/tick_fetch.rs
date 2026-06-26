@@ -40,8 +40,8 @@ pub async fn enrich_v3_ticks<P: alloy::providers::Provider<alloy::network::Ether
 
     use crate::abis::ITickLens;
     use crate::core::constants::TICK_LENS_POLYGON;
-use crate::core::types::V3Tick;
-use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
+    use crate::core::types::V3Tick;
+    use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 
     if pool_addresses.is_empty() {
         return 0;

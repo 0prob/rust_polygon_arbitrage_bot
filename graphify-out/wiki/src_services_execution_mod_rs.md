@@ -1,0 +1,19 @@
+# mod
+
+- **ID:** `src_services_execution_mod_rs`
+- **Type:** File
+- **File:** `./src/services/execution/mod.rs`
+- **Community:** 108 (mod (108))
+
+## Relationships
+
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_circuit_breaker_circuitbreaker (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_flash_liquidity_flashliquiditycache_prepareddispatch_preparedispatchinput_collect_flash_tokens_prepare_evaluated_route (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_flash_policy_flashloanpolicy_hf_eval_flash_source_parse_flash_policy_parse_flash_source (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_candidate_candidatebuildconfig_candidateexecution_build_execution_candidate_evaluated_from_sim (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_gas_feesnapshot_compute_conservative_gas_price_conservative_gas_price_wei (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_gas_oracle_gasoracle (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_opportunity_log_opportunityrecord_log_opportunity_evaluated_log_opportunity_outcome (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_profit_assessprofitinput_profitevalcontext_profitthresholds_routeprofitparams_assess_profit_build_assess_input_on_chain_min_profit_for_route_default_profit_safety_multiplier_bps (imports, Extracted)
+- src_services_execution_mod_rs → src_services_execution_mod_rs_import_pub_use_service_executionoutcome_executionservice (imports, Extracted)
+

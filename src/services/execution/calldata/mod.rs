@@ -13,7 +13,7 @@ use alloy::primitives::{Address, U256};
 use alloy::sol_types::SolCall;
 
 use crate::abis::ExecutorCall;
-use crate::core::types::Edge;
+use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 
@@ -34,6 +34,13 @@ pub fn encode_route(
     Ok(calls)
 }
 
+fn balancer_pool_id_from_arena(arena: &StateArena, pool_index: PoolIndex) -> Option<alloy::primitives::FixedBytes<32>> {
+    match arena.pool_state(pool_index)? {
+        PoolState::Balancer(b) => b.pool_id,
+        _ => None,
+    }
+}
+
 /// Build calldata hops from route edges, hop amounts, and pool metadata
 pub fn build_calldata_hops(
     arena: &StateArena,
@@ -50,6 +57,13 @@ pub fn build_calldata_hops(
         let token_in = arena.token_address(edge.token_in)?;
         let token_out = arena.token_address(edge.token_out)?;
         let meta = pool_metas.iter().find(|m| m.pool_index == edge.pool_index);
+        let meta_pool_id = meta.and_then(|m| m.pool_id);
+        let arena_pool_id = balancer_pool_id_from_arena(arena, edge.pool_index);
+        let pool_id = if edge.protocol == ProtocolType::BalancerV2 {
+            arena_pool_id.or(meta_pool_id)
+        } else {
+            meta_pool_id
+        };
         hops.push(CalldataHop {
             edge: *edge,
             pool_address,
@@ -57,7 +71,7 @@ pub fn build_calldata_hops(
             token_out,
             amount_in: hop_amounts[i],
             amount_out: hop_amounts[i + 1],
-            pool_id: meta.and_then(|m| m.pool_id),
+            pool_id,
             protocol_label: meta.and_then(|m| m.protocol_label.clone()),
             router: meta.and_then(|m| m.router),
             hooks: meta.and_then(|m| m.hooks),

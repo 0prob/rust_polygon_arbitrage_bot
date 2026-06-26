@@ -216,7 +216,7 @@ pub fn get_balancer_stable_amount_out(
         .map(|(i, b)| (*b * scaling[i]) / ONE)
         .collect();
 
-    if scaled_balances.iter().any(|b| b.is_zero()) {
+    if scaled_balances.iter().any(U256::is_zero) {
         return U256::ZERO;
     }
 
@@ -296,6 +296,7 @@ mod tests {
         let bal = U256::from(100u128) * ONE;
         let amount_in = ONE;
         let state = BalancerPoolState {
+            pool_id: None,
             balances: vec![bal, bal],
             weights: vec![ONE / U256::from(2), ONE / U256::from(2)],
             scaling_factors: vec![],

@@ -3,7 +3,9 @@ use rayon::join;
 use crate::core::types::FoundCycle;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
-use crate::pipeline::cycle_filter::{dedupe_cycles_by_fingerprint, prefilter_cycles_by_atomic_sim};
+use crate::pipeline::cycle_filter::{
+    ProbeContext, dedupe_cycles_by_fingerprint, prefilter_cycles_by_atomic_sim_with_context,
+};
 use crate::pipeline::cycle_finder::find_cycles_multi_pass;
 use crate::pipeline::johnson::find_cycles_johnson_multi_pass_with_adj;
 use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
@@ -17,6 +19,16 @@ pub fn find_cycles_hybrid_multi_pass(
     graph: &RoutingGraph,
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
+) -> Vec<FoundCycle> {
+    find_cycles_hybrid_multi_pass_with_context(arena, graph, passes, atomic_prefilter, None)
+}
+
+pub fn find_cycles_hybrid_multi_pass_with_context(
+    arena: &StateArena,
+    graph: &RoutingGraph,
+    passes: &[CycleSearchPass],
+    atomic_prefilter: bool,
+    probe_ctx: Option<&ProbeContext<'_>>,
 ) -> Vec<FoundCycle> {
     if passes.is_empty() {
         return Vec::new();
@@ -69,7 +81,7 @@ pub fn find_cycles_hybrid_multi_pass(
     let merged = dedupe_cycles_by_fingerprint(dfs_cycles);
     let total_cap = passes.iter().map(|p| p.max_cycles).sum();
     if atomic_prefilter {
-        prefilter_cycles_by_atomic_sim(arena, merged, total_cap)
+        prefilter_cycles_by_atomic_sim_with_context(arena, merged, total_cap, probe_ctx)
     } else {
         let mut out = merged;
         if out.len() > total_cap {

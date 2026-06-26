@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, FixedBytes, keccak256};
 
-use crate::core::protocol::{fee_to_bps, is_fetchable_protocol, normalize_protocol};
+use crate::core::protocol::{
+    fee_to_bps, is_fetchable_protocol, normalize_balancer_pool_type, resolve_protocol_from_hasura,
+};
 use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
 use crate::pipeline::types::PoolMeta;
 
@@ -17,6 +19,8 @@ pub struct DiscoveredPool {
     pub tick_spacing: Option<i32>,
     pub pool_id: Option<FixedBytes<32>>,
     pub hooks: Option<Address>,
+    /// Hasura `poolType` hint (`crypto` / `stable` for Curve, `weighted` / `stable` for Balancer).
+    pub pool_type: Option<String>,
     pub created_block: u64,
 }
 
@@ -68,7 +72,7 @@ pub fn is_routable_pool(pool: &DiscoveredPool) -> bool {
     is_fetchable_protocol(pool.protocol) && is_supported_v4_pool(pool.protocol, pool.hooks)
 }
 
-fn resolve_pool_identity(
+fn resolve_pool_identity_from_id(
     id: &str,
     pool_id_raw: Option<&str>,
 ) -> Option<(String, Address, Option<FixedBytes<32>>)> {
@@ -90,6 +94,46 @@ fn resolve_pool_identity(
     }
     let pool_id = parse_optional_bytes32(pool_id_raw);
     Some((pool_key, address, pool_id))
+}
+
+fn resolve_pool_identity(
+    id: &str,
+    pool_id_raw: Option<&str>,
+    address_raw: Option<&str>,
+) -> Option<(String, Address, Option<FixedBytes<32>>)> {
+    let (pool_key, address, pool_id) = resolve_pool_identity_from_id(id, pool_id_raw)?;
+    let address = apply_explicit_pool_address(&pool_key, address, address_raw);
+    Some((pool_key, address, pool_id))
+}
+
+/// Prefer Hasura `address` for 20-byte pool contracts when provided.
+fn apply_explicit_pool_address(
+    pool_key: &str,
+    default: Address,
+    address_raw: Option<&str>,
+) -> Address {
+    let Some(raw) = address_raw else {
+        return default;
+    };
+    let lower = raw.to_ascii_lowercase();
+    if !is_valid_pool_key(&lower) {
+        return default;
+    }
+    let hex = lower.strip_prefix("0x").unwrap_or(&lower);
+    if hex.len() != 40 {
+        return default;
+    }
+    let Ok(addr) = lower.parse::<Address>() else {
+        return default;
+    };
+    if addr.is_zero() {
+        return default;
+    }
+    let key_hex = pool_key.strip_prefix("0x").unwrap_or(pool_key);
+    if key_hex.len() == 40 {
+        return addr;
+    }
+    default
 }
 
 pub fn discovered_to_pool_meta(
@@ -128,9 +172,11 @@ pub fn parse_pool_meta_row(
     tick_spacing: Option<i32>,
     pool_id_raw: Option<&str>,
     hooks_raw: Option<&str>,
+    pool_type_raw: Option<&str>,
     created_block: Option<i64>,
+    address_raw: Option<&str>,
 ) -> Option<DiscoveredPool> {
-    let (pool_key, address, pool_id) = resolve_pool_identity(id, pool_id_raw)?;
+    let (pool_key, address, pool_id) = resolve_pool_identity(id, pool_id_raw, address_raw)?;
 
     let tokens: Vec<Address> = match tokens_raw {
         serde_json::Value::Array(arr) => arr
@@ -149,9 +195,14 @@ pub fn parse_pool_meta_row(
         return None;
     }
 
-    let proto = normalize_protocol(protocol);
+    let proto = resolve_protocol_from_hasura(protocol, pool_type_raw);
     let fee_bps = fee_to_bps(protocol, fee.map(|f| f as u32));
     let mut hooks = hooks_raw.and_then(|h| h.parse().ok());
+    let pool_type = if proto == ProtocolType::BalancerV2 {
+        normalize_balancer_pool_type(pool_type_raw)
+    } else {
+        pool_type_raw.map(str::to_string)
+    };
 
     if proto == ProtocolType::UniswapV4 {
         // Schema without `hooks` field → assume hookless (no hook info available).
@@ -173,12 +224,15 @@ pub fn parse_pool_meta_row(
         tick_spacing,
         pool_id,
         hooks,
+        pool_type,
         created_block: created_block.unwrap_or(0).max(0) as u64,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -194,7 +248,9 @@ mod tests {
             Some(60),
             None,
             None,
+            None,
             Some(100),
+            None,
         )
         .expect("v4 pool without hooks field should be accepted as hookless");
         assert_eq!(pool.hooks, Some(Address::ZERO));
@@ -214,7 +270,9 @@ mod tests {
             Some(60),
             None,
             Some("0x0000000000000000000000000000000000000000"),
+            None,
             Some(100),
+            None,
         )
         .expect("v4 pool");
         assert_eq!(pool.pool_key, pool_id.to_ascii_lowercase());
@@ -235,7 +293,9 @@ mod tests {
             Some(10),
             None,
             Some("0x0000000000000000000000000000000000000001"),
+            None,
             Some(100),
+            None,
         );
         assert!(pool.is_none());
     }
@@ -254,10 +314,57 @@ mod tests {
             None,
             Some(pool_id),
             None,
+            None,
             Some(100),
+            Some("0x0000000000000000000000000000000000000a01"),
         )
         .expect("balancer pool");
         assert_eq!(pool.pool_id, Some(pool_id.parse().expect("pool id bytes")));
+    }
+
+    #[test]
+    fn classifies_curve_crypto_from_pool_type() {
+        let pool = parse_pool_meta_row(
+            "0x0000000000000000000000000000000000000a01",
+            "CURVE",
+            &serde_json::json!([
+                "0x000000000000000000000000000000000000aaaa",
+                "0x000000000000000000000000000000000000bbbb"
+            ]),
+            Some(4),
+            None,
+            None,
+            None,
+            Some("crypto_ng"),
+            Some(100),
+            None,
+        )
+        .expect("curve crypto pool");
+        assert_eq!(pool.protocol, ProtocolType::CurveCrypto);
+    }
+
+    #[test]
+    fn uses_explicit_address_for_20_byte_pool_id() {
+        let pool = parse_pool_meta_row(
+            "0x0000000000000000000000000000000000000a01",
+            "QUICKSWAP_V2",
+            &serde_json::json!([
+                "0x000000000000000000000000000000000000aaaa",
+                "0x000000000000000000000000000000000000bbbb"
+            ]),
+            Some(30),
+            None,
+            None,
+            None,
+            None,
+            Some(100),
+            Some("0x000000000000000000000000000000000000feed"),
+        )
+        .expect("v2 pool with explicit address");
+        assert_eq!(
+            pool.address,
+            Address::from_str("0x000000000000000000000000000000000000feed").expect("address")
+        );
     }
 
     #[test]
@@ -275,6 +382,7 @@ mod tests {
             tick_spacing: Some(60),
             pool_id: None,
             hooks: Some(hooks),
+            pool_type: None,
             created_block: 0,
         };
         let meta = discovered_to_pool_meta(&pool, PoolIndex(0), &[TokenIndex(0), TokenIndex(1)]);

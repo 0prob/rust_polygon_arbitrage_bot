@@ -1,0 +1,23 @@
+# opportunity_journal
+
+- **ID:** `src_services_execution_opportunity_journal_rs`
+- **Type:** File
+- **File:** `./src/services/execution/opportunity_journal.rs`
+- **Community:** 55 (JournalEntry)
+
+## Relationships
+
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_std_fs_openoptions (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_std_io_write (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_std_path_pathbuf (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_parking_lot_mutex (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_serde_serialize (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_std_sync_lazylock (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_crate_core_types_profitassessment (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_import_crate_services_execution_opportunity_log_opportunityrecord (imports, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_init_from_env (defines, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_journalentry (defines, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_append (defines, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_journal_from_record (defines, Extracted)
+- src_services_execution_opportunity_journal_rs → src_services_execution_opportunity_journal_rs_journal_outcome (defines, Extracted)
+

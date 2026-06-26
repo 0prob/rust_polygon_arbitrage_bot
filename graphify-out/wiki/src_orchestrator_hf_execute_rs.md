@@ -1,0 +1,25 @@
+# hf_execute
+
+- **ID:** `src_orchestrator_hf_execute_rs`
+- **Type:** File
+- **File:** `./src/orchestrator/hf_execute.rs`
+- **Community:** 44 (dispatch_with_provider())
+
+## Relationships
+
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_alloy_network_ethereum (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_alloy_providers_provider (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_ruint_aliases_u256_as_ru256 (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_tracing_instrument_debug_info_info_span_instrument_warn (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_core_types_evaluatedroute (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_infra_tracing_util_pool_addrs_csv_record_evaluated_route (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_orchestrator_hf_hfcontext (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_pipeline_arena_statearena (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_pipeline_types_route_fingerprint (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_services_execution_candidatebuildconfig_executionoutcome_preparedispatchinput_build_execution_candidate_collect_flash_tokens_prepare_evaluated_route (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_services_oracle_price_oracle_bootstrap_matic_rate_per_unit (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_services_execution_flash_policy_parse_flash_policy (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_import_crate_services_execution_impact_slippage_depth_impact_slippage_bps (imports, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_dispatch_profitable_candidates (defines, Extracted)
+- src_orchestrator_hf_execute_rs → src_orchestrator_hf_execute_rs_dispatch_with_provider (defines, Extracted)
+

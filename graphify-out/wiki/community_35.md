@@ -1,0 +1,53 @@
+# Community 35: weighted_50_50_zero_fee()
+
+**Members:** 17
+
+## Nodes
+
+- **balancer** (`src_core_math_balancer_rs`, File, degree: 16)
+- **abs_diff()** (`src_core_math_balancer_rs_abs_diff`, Function, degree: 3)
+- **balancer_swap_fee_from_pool_meta_fee()** (`src_core_math_balancer_rs_balancer_swap_fee_from_pool_meta_fee`, Function, degree: 1)
+- **calculate_balancer_stable_invariant()** (`src_core_math_balancer_rs_calculate_balancer_stable_invariant`, Function, degree: 4)
+- **get_balancer_stable_amount_out()** (`src_core_math_balancer_rs_get_balancer_stable_amount_out`, Function, degree: 5)
+- **get_balancer_weighted_amount_out()** (`src_core_math_balancer_rs_get_balancer_weighted_amount_out`, Function, degree: 4)
+- **crate::core::types::{BalancerPoolKind, BalancerPoolState}** (`src_core_math_balancer_rs_import_crate_core_types_balancerpoolkind_balancerpoolstate`, Module, degree: 1)
+- **ruint::aliases::U256** (`src_core_math_balancer_rs_import_ruint_aliases_u256`, Module, degree: 1)
+- **super::*** (`src_core_math_balancer_rs_import_super`, Module, degree: 1)
+- **super::fixed_point::{ONE, complement, pow_down}** (`src_core_math_balancer_rs_import_super_fixed_point_one_complement_pow_down`, Module, degree: 1)
+- **super::full_math::div_rounding_up_or_zero** (`src_core_math_balancer_rs_import_super_full_math_div_rounding_up_or_zero`, Module, degree: 1)
+- **resolve_swap_fee()** (`src_core_math_balancer_rs_resolve_swap_fee`, Function, degree: 3)
+- **simulate_balancer_swap()** (`src_core_math_balancer_rs_simulate_balancer_swap`, Function, degree: 3)
+- **stable_invariant_positive()** (`src_core_math_balancer_rs_stable_invariant_positive`, Function, degree: 2)
+- **swap_fee_from_meta()** (`src_core_math_balancer_rs_swap_fee_from_meta`, Function, degree: 1)
+- **token_balance_given_invariant()** (`src_core_math_balancer_rs_token_balance_given_invariant`, Function, degree: 3)
+- **weighted_50_50_zero_fee()** (`src_core_math_balancer_rs_weighted_50_50_zero_fee`, Function, degree: 2)
+
+## Relationships
+
+- src_core_math_balancer_rs → src_core_math_balancer_rs_import_ruint_aliases_u256 (imports)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_import_crate_core_types_balancerpoolkind_balancerpoolstate (imports)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_import_super_fixed_point_one_complement_pow_down (imports)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_import_super_full_math_div_rounding_up_or_zero (imports)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_balancer_swap_fee_from_pool_meta_fee (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_resolve_swap_fee (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_abs_diff (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_get_balancer_weighted_amount_out (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_calculate_balancer_stable_invariant (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_token_balance_given_invariant (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_get_balancer_stable_amount_out (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_simulate_balancer_swap (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_import_super (imports)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_swap_fee_from_meta (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_weighted_50_50_zero_fee (defines)
+- src_core_math_balancer_rs → src_core_math_balancer_rs_stable_invariant_positive (defines)
+- src_core_math_balancer_rs_get_balancer_weighted_amount_out → src_core_math_balancer_rs_resolve_swap_fee (calls)
+- src_core_math_balancer_rs_calculate_balancer_stable_invariant → src_core_math_balancer_rs_abs_diff (calls)
+- src_core_math_balancer_rs_token_balance_given_invariant → src_core_math_balancer_rs_abs_diff (calls)
+- src_core_math_balancer_rs_get_balancer_stable_amount_out → src_core_math_balancer_rs_resolve_swap_fee (calls)
+- src_core_math_balancer_rs_get_balancer_stable_amount_out → src_core_math_balancer_rs_calculate_balancer_stable_invariant (calls)
+- src_core_math_balancer_rs_get_balancer_stable_amount_out → src_core_math_balancer_rs_token_balance_given_invariant (calls)
+- src_core_math_balancer_rs_simulate_balancer_swap → src_core_math_balancer_rs_get_balancer_weighted_amount_out (calls)
+- src_core_math_balancer_rs_simulate_balancer_swap → src_core_math_balancer_rs_get_balancer_stable_amount_out (calls)
+- src_core_math_balancer_rs_weighted_50_50_zero_fee → src_core_math_balancer_rs_get_balancer_weighted_amount_out (calls)
+- src_core_math_balancer_rs_stable_invariant_positive → src_core_math_balancer_rs_calculate_balancer_stable_invariant (calls)
+

@@ -44,21 +44,6 @@ pub fn spawn_mock_updates(bridge: UiBridge) -> tokio::task::JoinHandle<()> {
             let cycles = mock_cycles(tick);
             bridge.try_send(UiUpdate::NewCycles(cycles.clone()));
 
-            let sims: Vec<_> = cycles
-                .iter()
-                .take(8)
-                .map(|c| crate::tui::app::UiSimulation {
-                    fingerprint: c.fingerprint,
-                    route_summary: c.route_summary.clone(),
-                    bf_score: c.bf_score,
-                    live_score: c.live_score.unwrap_or(c.bf_score),
-                    result: None,
-                })
-                .collect();
-            for s in sims {
-                let _ = s;
-            }
-
             bridge.try_send(UiUpdate::MetricsUpdate(ScannerMetrics {
                 negative_cycles: 12 + (tick as usize % 20),
                 routes_executed: tick / 3,
@@ -76,26 +61,29 @@ pub fn spawn_mock_updates(bridge: UiBridge) -> tokio::task::JoinHandle<()> {
             if tick % 5 == 0 {
                 if let Some(c) = mock_cycles(tick).into_iter().next() {
                     bridge.try_send(UiUpdate::TradeExecuted(trade_from_outcome(
-                    c.fingerprint,
-                    c.route_summary,
-                    c.cycle.hop_count,
-                    c.protocols,
-                    "0.42 MATIC".into(),
-                    0.29,
-                    380_000,
-                    Some(format!("0xdead{:08x}", tick)),
-                    if tick % 10 == 0 {
-                        TradeStatus::Reverted
-                    } else {
-                        TradeStatus::DryRun
-                    },
+                        c.fingerprint,
+                        c.route_summary,
+                        c.cycle.hop_count,
+                        c.protocols,
+                        "0.42 MATIC".into(),
+                        0.29,
+                        380_000,
+                        Some(format!("0xdead{:08x}", tick)),
+                        if tick % 10 == 0 {
+                            TradeStatus::Reverted
+                        } else {
+                            TradeStatus::DryRun
+                        },
                     )));
-                bridge.try_send(UiUpdate::PnlTick(0.29));
+                    bridge.try_send(UiUpdate::PnlTick(0.29));
                 }
             }
 
             bridge.try_send(UiUpdate::Alert(if tick % 7 == 0 {
-                alert_warn(format!("Mock: high gas {:.1} gwei", 28.5 + tick as f64 * 0.1))
+                alert_warn(format!(
+                    "Mock: high gas {:.1} gwei",
+                    28.5 + tick as f64 * 0.1
+                ))
             } else {
                 alert_info(format!("Mock scan #{tick} complete"))
             }));
@@ -130,9 +118,7 @@ fn mock_graph_stats() -> GraphStatsSnapshot {
 }
 
 fn mock_cycles(seed: u64) -> Vec<UiOpportunity> {
-    (0..15)
-        .map(|i| mock_opportunity(seed, i))
-        .collect()
+    (0..15).map(|i| mock_opportunity(seed, i)).collect()
 }
 
 fn mock_opportunity(seed: u64, i: u64) -> UiOpportunity {

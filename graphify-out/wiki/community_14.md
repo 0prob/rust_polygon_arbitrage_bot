@@ -1,0 +1,63 @@
+# Community 14: v2_marginal_spot()
+
+**Members:** 22
+
+## Nodes
+
+- **spot_price** (`src_pipeline_spot_price_rs`, File, degree: 31)
+- **cl_marginal_spot()** (`src_pipeline_spot_price_rs_cl_marginal_spot`, Function, degree: 2)
+- **compute_edge_log_weight_with_state()** (`src_pipeline_spot_price_rs_compute_edge_log_weight_with_state`, Function, degree: 4)
+- **compute_spot_price()** (`src_pipeline_spot_price_rs_compute_spot_price`, Function, degree: 7)
+- **finalize_enumerated_cycles()** (`src_pipeline_spot_price_rs_finalize_enumerated_cycles`, Function, degree: 1)
+- **alloy::primitives::Address** (`src_pipeline_spot_price_rs_import_alloy_primitives_address`, Module, degree: 1)
+- **crate::core::types::{
+    ConcentratedLiquidityPoolState, Edge, FoundCycle, PoolState, ProtocolType, TokenIndex,
+}** (`src_pipeline_spot_price_rs_import_crate_core_types_concentratedliquiditypoolstate_edge_foundcycle_poolstate_protocoltype_tokenindex`, Module, degree: 1)
+- **crate::core::types::V2PoolState** (`src_pipeline_spot_price_rs_import_crate_core_types_v2poolstate`, Module, degree: 1)
+- **crate::pipeline::arena::StateArena** (`src_pipeline_spot_price_rs_import_crate_pipeline_arena_statearena`, Module, degree: 1)
+- **crate::pipeline::cycle_finder::clamp_fee_bps** (`src_pipeline_spot_price_rs_import_crate_pipeline_cycle_finder_clamp_fee_bps`, Module, degree: 1)
+- **crate::pipeline::graph::{build_graph, pool_meta_from_pair}** (`src_pipeline_spot_price_rs_import_crate_pipeline_graph_build_graph_pool_meta_from_pair`, Module, degree: 1)
+- **crate::pipeline::local_sim::simulate_hop_amount_out** (`src_pipeline_spot_price_rs_import_crate_pipeline_local_sim_simulate_hop_amount_out`, Module, degree: 1)
+- **crate::pipeline::types::{GraphEdge, RoutingGraph}** (`src_pipeline_spot_price_rs_import_crate_pipeline_types_graphedge_routinggraph`, Module, degree: 1)
+- **crate::util::u256_to_f64** (`src_pipeline_spot_price_rs_import_crate_util_u256_to_f64`, Module, degree: 1)
+- **ruint::aliases::U256** (`src_pipeline_spot_price_rs_import_ruint_aliases_u256`, Module, degree: 1)
+- **rustc_hash::FxHashMap** (`src_pipeline_spot_price_rs_import_rustc_hash_fxhashmap`, Module, degree: 1)
+- **super::*** (`src_pipeline_spot_price_rs_import_super`, Module, degree: 1)
+- **rescore_cycles_by_spot_price()** (`src_pipeline_spot_price_rs_rescore_cycles_by_spot_price`, Function, degree: 4)
+- **rescore_cycles_with_table()** (`src_pipeline_spot_price_rs_rescore_cycles_with_table`, Function, degree: 3)
+- **rescored_v2_cycle_has_negative_log_weight()** (`src_pipeline_spot_price_rs_rescored_v2_cycle_has_negative_log_weight`, Function, degree: 5)
+- **spot_ratio()** (`src_pipeline_spot_price_rs_spot_ratio`, Function, degree: 2)
+- **v2_marginal_spot()** (`src_pipeline_spot_price_rs_v2_marginal_spot`, Function, degree: 2)
+
+## Relationships
+
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_core_types_concentratedliquiditypoolstate_edge_foundcycle_poolstate_protocoltype_tokenindex (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_pipeline_arena_statearena (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_pipeline_cycle_finder_clamp_fee_bps (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_pipeline_local_sim_simulate_hop_amount_out (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_pipeline_types_graphedge_routinggraph (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_util_u256_to_f64 (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_ruint_aliases_u256 (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_rustc_hash_fxhashmap (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_v2_marginal_spot (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_cl_marginal_spot (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_spot_ratio (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_compute_spot_price (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_compute_edge_log_weight_with_state (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_rescore_cycles_by_spot_price (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_rescore_cycles_with_table (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_finalize_enumerated_cycles (defines)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_super (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_core_types_v2poolstate (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_crate_pipeline_graph_build_graph_pool_meta_from_pair (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_import_alloy_primitives_address (imports)
+- src_pipeline_spot_price_rs → src_pipeline_spot_price_rs_rescored_v2_cycle_has_negative_log_weight (defines)
+- src_pipeline_spot_price_rs_compute_spot_price → src_pipeline_spot_price_rs_v2_marginal_spot (calls)
+- src_pipeline_spot_price_rs_compute_spot_price → src_pipeline_spot_price_rs_cl_marginal_spot (calls)
+- src_pipeline_spot_price_rs_compute_spot_price → src_pipeline_spot_price_rs_spot_ratio (calls)
+- src_pipeline_spot_price_rs_compute_edge_log_weight_with_state → src_pipeline_spot_price_rs_compute_spot_price (calls)
+- src_pipeline_spot_price_rs_rescore_cycles_by_spot_price → src_pipeline_spot_price_rs_rescore_cycles_with_table (calls)
+- src_pipeline_spot_price_rs_rescored_v2_cycle_has_negative_log_weight → src_pipeline_spot_price_rs_compute_spot_price (calls)
+- src_pipeline_spot_price_rs_rescored_v2_cycle_has_negative_log_weight → src_pipeline_spot_price_rs_compute_edge_log_weight_with_state (calls)
+- src_pipeline_spot_price_rs_rescored_v2_cycle_has_negative_log_weight → src_pipeline_spot_price_rs_rescore_cycles_by_spot_price (calls)
+

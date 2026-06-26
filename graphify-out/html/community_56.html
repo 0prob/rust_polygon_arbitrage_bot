@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>curve — Community 56</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+#sidebar { width: 320px; min-width: 320px; background: #1a1a2e; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #2a2a4a; }
+#sidebar h2 { font-size: 18px; color: #B07AA1; margin-bottom: 4px; }
+#sidebar h3 { font-size: 14px; color: #9ca3af; margin-bottom: 8px; }
+.nav-link { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; color: #e0e0e0; text-decoration: none; }
+.nav-link:hover { background: #2a2a4a; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+#graph-container { flex: 1; position: relative; }
+#search { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #3a3a5a; background: #0f0f1a; color: #e0e0e0; font-size: 14px; }
+#search:focus { outline: none; border-color: #B07AA1; }
+#info-panel { background: #0f0f1a; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; min-height: 100px; }
+#info-panel .prop { color: #9ca3af; }
+#info-panel .val { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+    <div>
+        <h2>curve</h2>
+        <p style="font-size:12px;color:#666;">14 nodes · Community 56</p>
+    </div>
+    <input id="search" type="text" placeholder="Search nodes…" />
+    <div>
+        <h3>Node Info</h3>
+        <div id="info-panel"><i style="color:#666">Click a node to see details</i></div>
+    </div>
+    <div>
+        <h3>Navigation</h3>
+        <a href="index.html" class="nav-link" style="font-weight:bold;">← Overview</a><a href="community_137.html" class="nav-link"><span class="legend-dot" style="background:#FF9DA7"></span>encode_curve_hop_zero_slippage_fails() (8 links)</a>
+    </div>
+</div>
+<div id="graph-container"></div>
+<script>
+(function() {
+    var nodesData = [{id:"src_services_execution_calldata_encoders_curve_rs",label:"curve",title:"curve\nType: File\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 21",color:"#B07AA1",size:26.3},{id:"src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_address",label:"alloy::primitives::Address",title:"alloy::primitives::Address\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_alloy_sol_types_solcall",label:"alloy::sol_types::SolCall",title:"alloy::sol_types::SolCall\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_abis_executorcall_icurvecryptopool_icurvestablengpool_icurvestablepool",label:"crate::abis::{ExecutorCall, ICurveCryptoPool, ICurveStableNgPool, ICurveStablePool}",title:"crate::abis::{ExecutorCall, ICurveCryptoPool, ICurveStableNgPool, ICurveStablePool}\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_protocoltype",label:"crate::core::types::ProtocolType",title:"crate::core::types::ProtocolType\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_pipeline_arena_statearena",label:"crate::pipeline::arena::StateArena",title:"crate::pipeline::arena::StateArena\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_approvals_encode_approve_if_needed",label:"crate::services::execution::calldata::approvals::encode_approve_if_needed",title:"crate::services::execution::calldata::approvals::encode_approve_if_needed\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_types_calldatahop",label:"crate::services::execution::calldata::types::CalldataHop",title:"crate::services::execution::calldata::types::CalldataHop\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_profit_slippage_adjusted",label:"crate::services::execution::profit::slippage_adjusted",title:"crate::services::execution::profit::slippage_adjusted\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_quote_quote_hop_for_execution",label:"crate::services::execution::quote::quote_hop_for_execution",title:"crate::services::execution::quote::quote_hop_for_execution\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_u256",label:"alloy::primitives::U256",title:"alloy::primitives::U256\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_super_shared_curve_uses_receiver",label:"super::shared::curve_uses_receiver",title:"super::shared::curve_uses_receiver\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_super",label:"super::*",title:"super::*\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0},{id:"src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_edge_poolindex_tokenindex",label:"crate::core::types::{Edge, PoolIndex, TokenIndex}",title:"crate::core::types::{Edge, PoolIndex, TokenIndex}\nType: Module\nFile: ./src/services/execution/calldata/encoders/curve.rs\nDegree: 1",color:"#B07AA1",size:12.0}];
+    var edgesData = [{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_address",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_address\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_alloy_sol_types_solcall",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_alloy_sol_types_solcall\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_abis_executorcall_icurvecryptopool_icurvestablengpool_icurvestablepool",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_abis_executorcall_icurvecryptopool_icurvestablengpool_icurvestablepool\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_protocoltype",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_protocoltype\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_pipeline_arena_statearena",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_pipeline_arena_statearena\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_approvals_encode_approve_if_needed",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_approvals_encode_approve_if_needed\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_types_calldatahop",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_calldata_types_calldatahop\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_profit_slippage_adjusted",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_profit_slippage_adjusted\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_quote_quote_hop_for_execution",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_services_execution_quote_quote_hop_for_execution\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_u256",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_alloy_primitives_u256\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_super_shared_curve_uses_receiver",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_super_shared_curve_uses_receiver\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_super",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_super\nConfidence: Extracted"},{from:"src_services_execution_calldata_encoders_curve_rs",to:"src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_edge_poolindex_tokenindex",label:"imports",dashes:false,title:"imports: src_services_execution_calldata_encoders_curve_rs → src_services_execution_calldata_encoders_curve_rs_import_crate_core_types_edge_poolindex_tokenindex\nConfidence: Extracted"}];
+    var container = document.getElementById('graph-container');
+    var nodes = new vis.DataSet(nodesData);
+    var edges = new vis.DataSet(edgesData);
+    var options = {
+        physics: {solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:120,springConstant:0.08,damping:0.4,avoidOverlap:0.5},stabilization:{iterations:200}},
+        nodes: { shape: 'dot', font: { color: '#e0e0e0', size: 12 }, borderWidth: 2 },
+        edges: { color: { color: '#4a4a6a', highlight: '#B07AA1', hover: '#B07AA1' }, font: { color: '#888', size: 10 }, arrows: { to: { enabled: false } }, smooth: { type: 'continuous' } },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true }
+    };
+    var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    network.on('stabilizationIterationsDone', function() { network.setOptions({ physics: { enabled: false } }); });
+    network.on('click', function(params) {
+        var panel = document.getElementById('info-panel');
+        if (params.nodes.length > 0) {
+            var node = nodes.get(params.nodes[0]);
+            if (node) {
+                panel.innerHTML = '<div><span class="prop">Label:</span> <span class="val">' + node.label + '</span></div><div><span class="prop">ID:</span> <span class="val">' + node.id + '</span></div>';
+                network.focus(params.nodes[0], { scale: 1.2, animation: true });
+            }
+        }
+    });
+    var searchEl = document.getElementById('search');
+    var sTimer = null;
+    searchEl.addEventListener('input', function() {
+        clearTimeout(sTimer);
+        sTimer = setTimeout(function() {
+            var term = searchEl.value.toLowerCase();
+            var updates = [];
+            nodes.forEach(function(n) {
+                var h = term && !n.label.toLowerCase().includes(term);
+                if (n.hidden !== h) { updates.push({ id: n.id, hidden: h }); }
+            });
+            if (updates.length > 0) { nodes.update(updates); }
+        }, 200);
+    });
+})();
+</script>
+</body>
+</html>

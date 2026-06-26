@@ -30,8 +30,12 @@ pub fn derive_balancer_pool_id(pool_address: Address) -> FixedBytes<32> {
 pub fn resolve_balancer_pool_id(
     pool_address: Address,
     pool_id: Option<FixedBytes<32>>,
-) -> FixedBytes<32> {
-    pool_id.unwrap_or_else(|| derive_balancer_pool_id(pool_address))
+) -> anyhow::Result<FixedBytes<32>> {
+    pool_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing Balancer pool_id for {pool_address} — indexer must supply poolId or pool state must be hydrated"
+        )
+    })
 }
 
 /// Check if Curve pool uses receiver parameter
@@ -80,19 +84,15 @@ mod tests {
         let addr = Address::repeat_byte(0xab);
         let explicit = FixedBytes::repeat_byte(0xcd);
 
-        let resolved = resolve_balancer_pool_id(addr, Some(explicit));
+        let resolved = resolve_balancer_pool_id(addr, Some(explicit)).expect("explicit id");
 
         assert_eq!(resolved, explicit);
     }
 
     #[test]
-    fn test_resolve_balancer_pool_id_derives_when_none() {
+    fn test_resolve_balancer_pool_id_errors_when_none() {
         let addr = Address::repeat_byte(0xab);
-
-        let resolved = resolve_balancer_pool_id(addr, None);
-        let derived = derive_balancer_pool_id(addr);
-
-        assert_eq!(resolved, derived);
+        assert!(resolve_balancer_pool_id(addr, None).is_err());
     }
 
     #[test]

@@ -11,8 +11,15 @@ pub const V3_SWAP_TOPIC: B256 = IUniswapV3Pool::Swap::SIGNATURE_HASH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogPatch {
-    V2Reserves { reserve0: U256, reserve1: U256 },
-    V3Slot { sqrt_price_x96: U256, liquidity: u128, tick: i32 },
+    V2Reserves {
+        reserve0: U256,
+        reserve1: U256,
+    },
+    V3Slot {
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+    },
 }
 
 /// Zero-copy decode of a filtered pool log (topic0 already matched by subscription).

@@ -159,8 +159,7 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
         quote_reserve: quote,
         base_target: decode_u256(results.get(3)?.as_ref()?).unwrap_or(base),
         quote_target: decode_u256(results.get(4)?.as_ref()?).unwrap_or(quote),
-        i: decode_u256(results.get(5)?.as_ref()?)
-            .unwrap_or(U256::from(10u128).pow(U256::from(18))),
+        i: decode_u256(results.get(5)?.as_ref()?).unwrap_or(U256::from(10u128).pow(U256::from(18))),
         k: decode_u256(results.get(6)?.as_ref()?).unwrap_or(U256::ZERO),
         r_status,
         lp_fee_rate: decode_u256(results.get(7)?.as_ref()?).unwrap_or(U256::ZERO),
@@ -254,11 +253,19 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         } else {
             BalancerPoolKind::Weighted
         }
+    } else if plan
+        .pool
+        .pool_type
+        .as_deref()
+        .is_some_and(|t| t.contains("stable"))
+    {
+        BalancerPoolKind::Stable
     } else {
         BalancerPoolKind::Weighted
     };
     let bpt_index = tokens.tokens.iter().position(|t| *t == plan.pool.address);
     Some(PoolState::Balancer(BalancerPoolState {
+        pool_id: plan.pool.pool_id,
         balances,
         weights,
         scaling_factors,

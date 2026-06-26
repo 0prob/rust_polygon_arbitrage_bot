@@ -1,13 +1,19 @@
+use crate::core::constants::BPS_SCALE;
 use crate::core::types::{
-    ConcentratedLiquidityPoolState, Edge, FoundCycle, PoolState, ProtocolType, TokenIndex,
+    ConcentratedLiquidityPoolState, Edge, FlashLoanSource, FoundCycle, PoolState, ProtocolType,
+    TokenIndex,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
 use crate::pipeline::local_sim::simulate_hop_amount_out;
+use crate::pipeline::sim_sanity::profit_probe_amount;
 use crate::pipeline::types::{GraphEdge, RoutingGraph};
+use crate::services::execution::profit::flash_loan_fee_bps;
 use crate::util::u256_to_f64;
+use alloy::primitives::Address;
 use ruint::aliases::U256;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]); // 1e12 wei
 const Q96_F64: f64 = 79228162514264337593543950336.0; // 2^96
@@ -185,13 +191,14 @@ pub fn rescore_cycles_by_spot_price(arena: &StateArena, cycles: &mut [FoundCycle
     rescore_cycles_with_table(arena, &mut table, cycles);
 }
 
-/// Convert expected route gas into a log-weight penalty for cycle ranking.
+/// Convert expected route gas + flash-loan fee into a log-weight penalty for cycle ranking.
 pub fn gas_log_penalty_for_cycle(
     edges: &[Edge],
     gas_price_wei: U256,
     token_to_matic_rates: Option<&FxHashMap<TokenIndex, U256>>,
-    _arena: &StateArena,
     start_token: TokenIndex,
+    start_token_decimals: u8,
+    flash_source: Option<FlashLoanSource>,
 ) -> f64 {
     let gas_units = crate::pipeline::local_sim::estimate_route_gas(edges);
     if gas_units == 0 || gas_price_wei.is_zero() {
@@ -200,15 +207,22 @@ pub fn gas_log_penalty_for_cycle(
     let gas_cost_wei = U256::from(gas_units) * gas_price_wei;
     let rate = token_to_matic_rates
         .and_then(|m| m.get(&start_token).copied())
-        .filter(|r| !r.is_zero())
+        .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE)
         .unwrap_or_else(crate::services::oracle::price_oracle::bootstrap_matic_rate_per_unit);
-    let gas_f64 = u256_to_f64(gas_cost_wei);
+    let mut drag_wei = gas_cost_wei;
+    if let Some(source) = flash_source {
+        let probe = profit_probe_amount(start_token_decimals, rate);
+        let flash_fee = (probe * U256::from(flash_loan_fee_bps(source))) / BPS_SCALE;
+        let scale = crate::util::ten_pow_u256(start_token_decimals);
+        drag_wei = drag_wei.saturating_add((flash_fee * rate) / scale);
+    }
+    let drag_f64 = u256_to_f64(drag_wei);
     let rate_f64 = u256_to_f64(rate);
-    if gas_f64 <= 0.0 || rate_f64 <= 0.0 {
+    if drag_f64 <= 0.0 || rate_f64 <= 0.0 {
         return 0.0;
     }
-    // Express gas as a fractional drag on a unit trade: ln(1 + gas/token_value).
-    (gas_f64 / rate_f64).ln_1p()
+    // Express drag as a fractional cost on a unit trade: ln(1 + cost/token_value).
+    (drag_f64 / rate_f64).ln_1p()
 }
 
 pub fn rescore_cycles_with_table(
@@ -216,7 +230,7 @@ pub fn rescore_cycles_with_table(
     table: &mut SpotTable,
     cycles: &mut [FoundCycle],
 ) {
-    rescore_cycles_with_table_and_gas(arena, table, cycles, None, None);
+    rescore_cycles_with_table_and_gas(arena, table, cycles, None, None, None, None);
 }
 
 /// Rescore cycles with spot prices and optional gas penalty (lower score = better).
@@ -226,8 +240,19 @@ pub fn rescore_cycles_with_table_and_gas(
     cycles: &mut [FoundCycle],
     gas_price_wei: Option<U256>,
     token_to_matic_rates: Option<&FxHashMap<TokenIndex, U256>>,
+    token_decimals: Option<&HashMap<Address, u8>>,
+    flash_source: Option<FlashLoanSource>,
 ) {
     for cycle in cycles.iter_mut() {
+        let start_decimals = token_decimals
+            .map(|m| {
+                crate::services::oracle::resolve_token_decimals_for_index(
+                    cycle.start_token,
+                    arena,
+                    m,
+                )
+            })
+            .unwrap_or(18);
         let mut log_weight = 0.0;
         let mut cum_fee = 0u32;
         let mut missing_spot = 0u32;
@@ -248,7 +273,16 @@ pub fn rescore_cycles_with_table_and_gas(
         };
         let gas_penalty = gas_price_wei
             .filter(|p| !p.is_zero())
-            .map(|price| gas_log_penalty_for_cycle(&cycle.edges, price, token_to_matic_rates, arena, cycle.start_token))
+            .map(|price| {
+                gas_log_penalty_for_cycle(
+                    &cycle.edges,
+                    price,
+                    token_to_matic_rates,
+                    cycle.start_token,
+                    start_decimals,
+                    flash_source,
+                )
+            })
             .unwrap_or(0.0);
         log_weight += hop_penalty(cycle.hop_count) + missing_penalty + gas_penalty;
         cycle.log_weight = log_weight;

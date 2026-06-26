@@ -1,3 +1,7 @@
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use alloy::hex;
 use alloy::network::Ethereum;
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -5,7 +9,27 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-const PROBE_TIMEOUT_SECS: u64 = 8;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+static PROBE_HTTP: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_max_idle_per_host(4)
+        .build()
+        .expect("private submit probe reqwest client")
+});
+
+static SUBMIT_HTTP: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(SUBMIT_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_max_idle_per_host(4)
+        .build()
+        .expect("private submit reqwest client")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateSubmitMode {
@@ -48,13 +72,9 @@ struct JsonRpcError {
 
 /// Probe an RPC URL for private-transaction capabilities (no wallet required).
 pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| Client::new());
-
+    let client = &*PROBE_HTTP;
     let mut notes = Vec::new();
-    let chain_id_ok = match rpc_call(&client, url, "eth_chainId", serde_json::json!([])).await {
+    let chain_id_ok = match rpc_call(client, url, "eth_chainId", serde_json::json!([])).await {
         Ok(v) => v
             .and_then(|r| r.as_str().map(String::from))
             .is_some_and(|id| id.eq_ignore_ascii_case("0x89")),
@@ -64,26 +84,25 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
         }
     };
 
-    let (supports_private_rpc_method, private_method_error) =
-        match rpc_call(
-            &client,
-            url,
-            "eth_sendRawTransactionPrivate",
-            serde_json::json!(["0x00"]),
-        )
-        .await
-        {
-            Ok(_) => (true, None),
-            Err(e) => {
-                let msg = e.to_string();
-                // Distinguish "method exists but tx invalid" from "method missing".
-                let exists = msg.contains("invalid")
-                    || msg.contains("rlp")
-                    || msg.contains("transaction")
-                    || msg.contains("not accepted");
-                (exists, Some(msg))
-            }
-        };
+    let (supports_private_rpc_method, private_method_error) = match rpc_call(
+        &client,
+        url,
+        "eth_sendRawTransactionPrivate",
+        serde_json::json!(["0x00"]),
+    )
+    .await
+    {
+        Ok(_) => (true, None),
+        Err(e) => {
+            let msg = e.to_string();
+            // Distinguish "method exists but tx invalid" from "method missing".
+            let exists = msg.contains("invalid")
+                || msg.contains("rlp")
+                || msg.contains("transaction")
+                || msg.contains("not accepted");
+            (exists, Some(msg))
+        }
+    };
 
     let recommended_mode = if supports_private_rpc_method {
         PrivateSubmitMode::PolygonPrivateRpc
@@ -110,17 +129,13 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
 }
 
 pub async fn probe_bloxroute_auth(auth_header: &str) -> bool {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| Client::new());
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "polygon_private_tx",
         "params": { "transaction": "00" }
     });
-    client
+    PROBE_HTTP
         .post("https://api.blxrbdn.com/")
         .header("Authorization", auth_header)
         .header("Content-Type", "application/json")
@@ -132,23 +147,21 @@ pub async fn probe_bloxroute_auth(auth_header: &str) -> bool {
 
 /// Submit signed raw transaction bytes via bloXroute `polygon_private_tx`.
 pub async fn submit_bloxroute_private(raw_tx: &[u8], auth_header: &str) -> anyhow::Result<B256> {
-    let hex = hex::encode(raw_tx);
+    let tx_hex = hex::encode(raw_tx);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "polygon_private_tx",
-        "params": { "transaction": hex }
+        "params": { "transaction": tx_hex }
     });
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let resp = client
+    let resp = SUBMIT_HTTP
         .post("https://api.blxrbdn.com/")
         .header("Authorization", auth_header)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .await?;
+        .await?
+        .error_for_status()?;
     let parsed: JsonRpcResponse = resp.json().await?;
     if let Some(err) = parsed.error {
         anyhow::bail!("bloxroute polygon_private_tx: {}", err.message);
@@ -164,9 +177,6 @@ pub async fn submit_bloxroute_private(raw_tx: &[u8], auth_header: &str) -> anyho
 
 /// Submit via `eth_sendRawTransactionPrivate` JSON-RPC.
 pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Result<B256> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
     let raw_hex = format!("0x{}", hex::encode(raw_tx));
     let body = JsonRpcRequest {
         jsonrpc: "2.0",
@@ -174,7 +184,12 @@ pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Res
         method: "eth_sendRawTransactionPrivate",
         params: serde_json::json!([raw_hex]),
     };
-    let resp = client.post(url).json(&body).send().await?;
+    let resp = SUBMIT_HTTP
+        .post(url)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
     let parsed: JsonRpcResponse = resp.json().await?;
     if let Some(err) = parsed.error {
         anyhow::bail!("eth_sendRawTransactionPrivate: {}", err.message);
@@ -197,9 +212,10 @@ pub fn resolve_submit_mode(
         return PrivateSubmitMode::Bloxroute;
     }
     if let Some(p) = probe
-        && p.supports_private_rpc_method {
-            return PrivateSubmitMode::PolygonPrivateRpc;
-        }
+        && p.supports_private_rpc_method
+    {
+        return PrivateSubmitMode::PolygonPrivateRpc;
+    }
     if private_rpc_url.is_some() {
         // URL configured but private method not verified — still prefer it over public execution RPC
         // (Polygon official private mempool uses standard eth_sendRawTransaction on private URL).
@@ -236,7 +252,12 @@ async fn rpc_call(
         method,
         params,
     };
-    let resp = client.post(url).json(&body).send().await?;
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
     let parsed: JsonRpcResponse = resp.json().await?;
     if let Some(err) = parsed.error {
         anyhow::bail!("{}", err.message);

@@ -1,12 +1,9 @@
-use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -15,28 +12,41 @@ use tokio::time;
 use crate::tui::app::{App, BotStatus};
 use crate::tui::bridge::UiBridge;
 use crate::tui::events::handle_key;
+use crate::tui::terminal::TerminalGuard;
 use crate::tui::update::UiUpdate;
 use crate::tui::widgets;
 
 pub async fn run_tui(
     mut app: App,
     mut ui_rx: mpsc::Receiver<UiUpdate>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    let (_guard, stdout) = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().context("clear terminal")?;
+    terminal.hide_cursor().context("hide cursor")?;
+
+    if let Some(tx) = ready {
+        let _ = tx.send(());
+    }
 
     let (key_tx, mut key_rx) = mpsc::channel::<crossterm::event::KeyEvent>(64);
-    std::thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        let _ = key_tx.blocking_send(key);
+    let stop_keys = Arc::new(AtomicBool::new(false));
+    std::thread::spawn({
+        let stop = Arc::clone(&stop_keys);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(100)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if key.kind == KeyEventKind::Press {
+                                let _ = key_tx.blocking_send(key);
+                            }
+                        }
                     }
+                    Ok(false) => {}
+                    Err(_) => break,
                 }
             }
         }
@@ -68,6 +78,9 @@ pub async fn run_tui(
                         while let Ok(next) = ui_rx.try_recv() {
                             apply_update(&mut app, next);
                         }
+                        terminal
+                            .draw(|f| widgets::render_main(f, &app))
+                            .context("draw")?;
                     }
                     None => break Ok(()),
                 }
@@ -75,8 +88,7 @@ pub async fn run_tui(
         }
     };
 
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    stop_keys.store(true, Ordering::Relaxed);
     terminal.show_cursor().ok();
 
     result
@@ -149,7 +161,10 @@ fn apply_update(app: &mut App, update: UiUpdate) {
             app.block_lag_ms = lag_ms;
         }
         UiUpdate::GasUpdate { gwei } => app.gas_gwei = gwei,
-        UiUpdate::SimulationResult { fingerprint, result } => {
+        UiUpdate::SimulationResult {
+            fingerprint,
+            result,
+        } => {
             if let Some(sim) = app
                 .simulations
                 .iter_mut()
@@ -197,13 +212,11 @@ pub fn spawn_snapshot_poller(
                     })
                     .collect();
                 bridge.try_send(UiUpdate::NewCycles(ui_cycles));
-                bridge.try_send(UiUpdate::GraphStats(
-                    crate::tui::bridge::build_graph_stats(
-                        &snap.arena,
-                        &snap.pool_metas,
-                        snap.discovered_pools.len(),
-                    ),
-                ));
+                bridge.try_send(UiUpdate::GraphStats(crate::tui::bridge::build_graph_stats(
+                    &snap.arena,
+                    &snap.pool_metas,
+                    snap.discovered_pools.len(),
+                )));
                 bridge.try_send(UiUpdate::StatusChange(BotStatus::Idle));
             }
         }

@@ -107,7 +107,6 @@ pub fn get_sqrt_ratio_at_tick(tick: i32) -> Option<U256> {
     }
 }
 
-
 pub fn get_tick_at_sqrt_ratio(sqrt_price_x96: U256) -> Option<i32> {
     if sqrt_price_x96 < MIN_SQRT_RATIO || sqrt_price_x96 >= MAX_SQRT_RATIO {
         return None;

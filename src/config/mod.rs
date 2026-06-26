@@ -56,10 +56,7 @@ pub struct ExecutionConfig {
     /// Cleared after [`WalletSecrets::load`] — never retain raw key material in memory.
     #[serde(default)]
     pub private_key: Option<String>,
-    #[serde(
-        default = "default_min_profit_matic_wei",
-        alias = "min_profit_wei"
-    )]
+    #[serde(default = "default_min_profit_matic_wei")]
     pub min_profit_matic_wei: String,
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: u64,
@@ -112,22 +109,23 @@ pub struct PipelineConfig {
     pub hf_sim_cap: usize,
     #[serde(default = "default_hf_max_dispatch")]
     pub hf_max_dispatch: usize,
+    /// Top profitable routes to preflight with `estimate_gas` before submission.
+    #[serde(default = "default_hf_gas_estimate_top_n")]
+    pub hf_gas_estimate_top_n: usize,
     #[serde(default = "default_graph_rebuild_interval")]
     pub graph_rebuild_interval: u64,
-    #[serde(default = "default_hf_trigger_on_block")]
-    pub hf_trigger_on_block: bool,
     /// Enable filtered WSS log stream for hot pool partial cache.
     #[serde(default)]
     pub stream_enabled: bool,
-    /// Max V2/V3 pools tracked by the in-RAM partial cache + WSS subscriptions.
+    /// Max WSS/V2+V3 pools tracked by the in-RAM partial cache + WSS subscriptions.
     #[serde(default = "default_stream_max_pools")]
     pub stream_max_pools: usize,
-    /// Run HF immediately when a stream patch lands (in addition to interval polling).
-    #[serde(default = "default_hf_trigger_on_stream")]
-    pub hf_trigger_on_stream: bool,
-    /// Skip RPC multicall prefetch on stream-triggered HF ticks.
-    #[serde(default = "default_hf_skip_prefetch_on_stream")]
-    pub hf_skip_prefetch_on_stream: bool,
+    /// Pause execution when indexer lag exceeds this many blocks behind chain head.
+    #[serde(default = "default_indexer_max_lag_blocks")]
+    pub indexer_max_lag_blocks: u64,
+    /// Trip circuit breaker when indexer lag exceeds threshold.
+    #[serde(default = "default_indexer_pause_on_lag")]
+    pub indexer_pause_on_lag: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,8 +156,6 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OracleConfig {
-    #[serde(default = "default_oracle_enabled")]
-    pub enabled: bool,
     #[serde(default = "default_pyth_hermes_url")]
     pub pyth_hermes_url: String,
     #[serde(default = "default_tick_word_range")]
@@ -211,12 +207,12 @@ impl Default for PipelineConfig {
             hf_score_cap: default_hf_score_cap(),
             hf_sim_cap: default_hf_sim_cap(),
             hf_max_dispatch: default_hf_max_dispatch(),
+            hf_gas_estimate_top_n: default_hf_gas_estimate_top_n(),
             graph_rebuild_interval: default_graph_rebuild_interval(),
-            hf_trigger_on_block: default_hf_trigger_on_block(),
             stream_enabled: default_stream_enabled(),
             stream_max_pools: default_stream_max_pools(),
-            hf_trigger_on_stream: default_hf_trigger_on_stream(),
-            hf_skip_prefetch_on_stream: default_hf_skip_prefetch_on_stream(),
+            indexer_max_lag_blocks: default_indexer_max_lag_blocks(),
+            indexer_pause_on_lag: default_indexer_pause_on_lag(),
         }
     }
 }
@@ -293,11 +289,11 @@ fn default_hf_sim_cap() -> usize {
 fn default_hf_max_dispatch() -> usize {
     8
 }
+fn default_hf_gas_estimate_top_n() -> usize {
+    3
+}
 fn default_graph_rebuild_interval() -> u64 {
     60
-}
-fn default_hf_trigger_on_block() -> bool {
-    true
 }
 fn default_stream_enabled() -> bool {
     false
@@ -305,10 +301,10 @@ fn default_stream_enabled() -> bool {
 fn default_stream_max_pools() -> usize {
     500
 }
-fn default_hf_trigger_on_stream() -> bool {
-    true
+fn default_indexer_max_lag_blocks() -> u64 {
+    200
 }
-fn default_hf_skip_prefetch_on_stream() -> bool {
+fn default_indexer_pause_on_lag() -> bool {
     true
 }
 fn default_slippage_bps() -> u64 {
@@ -336,10 +332,6 @@ fn default_max_multicall_calls() -> u32 {
     800
 }
 
-fn default_oracle_enabled() -> bool {
-    true
-}
-
 fn default_pyth_hermes_url() -> String {
     "https://hermes.pyth.network".to_string()
 }
@@ -351,7 +343,6 @@ fn default_tick_word_range() -> i16 {
 impl Default for OracleConfig {
     fn default() -> Self {
         Self {
-            enabled: default_oracle_enabled(),
             pyth_hermes_url: default_pyth_hermes_url(),
             tick_word_range: default_tick_word_range(),
         }
@@ -383,8 +374,8 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// Flat env aliases shared with the TypeScript bot (`/home/x/arb/t/.env.example`).
-fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
+/// Apply flat environment variable overrides (see `.env.example`).
+fn apply_env_overrides(config: &mut AppConfig) -> anyhow::Result<()> {
     if let Some(url) = env_var("HASURA_URL") {
         config.hasura_url = url;
     }
@@ -394,8 +385,6 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
     }
 
     if let Some(raw) = env_var("MIN_PROFIT_MATIC_WEI") {
-        config.execution.min_profit_matic_wei = raw;
-    } else if let Some(raw) = env_var("MIN_PROFIT_WEI") {
         config.execution.min_profit_matic_wei = raw;
     }
     if let Some(raw) = env_var("SLIPPAGE_BPS") {
@@ -461,13 +450,11 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
     if let Some(raw) = env_var("HF_MAX_DISPATCH") {
         config.pipeline.hf_max_dispatch = raw.parse()?;
     }
+    if let Some(raw) = env_var("HF_GAS_ESTIMATE_TOP_N") {
+        config.pipeline.hf_gas_estimate_top_n = raw.parse()?;
+    }
     if let Some(raw) = env_var("GRAPH_REBUILD_INTERVAL") {
         config.pipeline.graph_rebuild_interval = raw.parse()?;
-    }
-    if let Some(raw) = env_var("HF_TRIGGER_ON_BLOCK")
-        && let Some(v) = parse_env_bool(&raw)
-    {
-        config.pipeline.hf_trigger_on_block = v;
     }
     if let Some(raw) = env_var("STREAM_ENABLED")
         && let Some(v) = parse_env_bool(&raw)
@@ -477,15 +464,13 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
     if let Some(raw) = env_var("STREAM_MAX_POOLS") {
         config.pipeline.stream_max_pools = raw.parse()?;
     }
-    if let Some(raw) = env_var("HF_TRIGGER_ON_STREAM")
-        && let Some(v) = parse_env_bool(&raw)
-    {
-        config.pipeline.hf_trigger_on_stream = v;
+    if let Some(raw) = env_var("INDEXER_MAX_LAG_BLOCKS") {
+        config.pipeline.indexer_max_lag_blocks = raw.parse()?;
     }
-    if let Some(raw) = env_var("HF_SKIP_PREFETCH_ON_STREAM")
+    if let Some(raw) = env_var("INDEXER_PAUSE_ON_LAG")
         && let Some(v) = parse_env_bool(&raw)
     {
-        config.pipeline.hf_skip_prefetch_on_stream = v;
+        config.pipeline.indexer_pause_on_lag = v;
     }
     if let Some(url) = env_var("WSS_URL").or_else(|| env_var("POLYGON_WSS_URL")) {
         config.rpc.wss_url = Some(url);
@@ -508,11 +493,6 @@ fn apply_flat_env_aliases(config: &mut AppConfig) -> anyhow::Result<()> {
         config.routing.cycle_finder = CycleFinderKind::parse_str(&raw)?;
     }
 
-    if let Some(raw) = env_var("ORACLE_ENABLED")
-        && let Some(enabled) = parse_env_bool(&raw)
-    {
-        config.oracle.enabled = enabled;
-    }
     if let Some(raw) = env_var("ORACLE_PYTH_HERMES_URL") {
         config.oracle.pyth_hermes_url = raw;
     }
@@ -590,7 +570,7 @@ impl AppConfig {
         }
 
         let mut config: AppConfig = figment.extract()?;
-        apply_flat_env_aliases(&mut config)?;
+        apply_env_overrides(&mut config)?;
 
         config
             .execution
@@ -672,7 +652,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flat_execution_mode_overrides_default() {
+    fn execution_mode_env_override() {
         let key = "EXECUTION_MODE";
         let prev = std::env::var(key).ok();
         unsafe {
@@ -693,7 +673,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
         };
 
-        apply_flat_env_aliases(&mut config).expect("flat aliases");
+        apply_env_overrides(&mut config).expect("env overrides");
         assert_eq!(config.execution.mode, "live");
 
         unsafe {
@@ -705,11 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn flat_routing_and_oracle_aliases_apply() {
+    fn routing_and_oracle_env_overrides_apply() {
         let keys = [
             ("ROUTING_MAX_HOPS", "6"),
             ("TERNARY_SEARCH_ITERATIONS", "14"),
-            ("ORACLE_ENABLED", "false"),
             ("TICK_WORD_RANGE", "8"),
         ];
         let prev: Vec<_> = keys
@@ -737,10 +716,9 @@ mod tests {
             pipeline: PipelineConfig::default(),
         };
 
-        apply_flat_env_aliases(&mut config).expect("flat aliases");
+        apply_env_overrides(&mut config).expect("env overrides");
         assert_eq!(config.routing.max_hops, 6);
         assert_eq!(config.routing.ternary_search_iterations, 14);
-        assert!(!config.oracle.enabled);
         assert_eq!(config.oracle.tick_word_range, 8);
 
         unsafe {

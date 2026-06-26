@@ -38,7 +38,6 @@ impl fmt::Display for CycleFinderKind {
     }
 }
 
-
 impl<'de> Deserialize<'de> for CycleFinderKind {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

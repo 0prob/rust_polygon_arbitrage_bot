@@ -6,29 +6,30 @@ use tracing::instrument;
 
 use alloy::primitives::Address;
 
+use crate::core::constants::MIN_ECONOMIC_VALUE_MATIC_WEI;
 use crate::core::math::dodo::estimate_dodo_hop_capacity;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_minimal;
+use crate::pipeline::sim_sanity::{SimSanityInput, check_sim_sanity, min_economic_amount_in};
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::profit::{ProfitEvalContext, net_profit_after_gas_from_sim};
+use crate::services::oracle::resolve_token_to_matic_rate;
+use crate::util::ten_pow_u256;
 
 const BRENT_CACHE_SLOTS: usize = 16;
 const GOLDEN_RATIO: u128 = 382; // (3 - sqrt(5))/2 * 1000
 const CONVERGENCE_DIVISOR: u128 = 1000;
 const DEFAULT_BRENT_ITERATIONS: u32 = 8;
-const MIN_ECONOMIC_VALUE_MATIC_WEI: u128 = 10u128.pow(18);
 const DEFAULT_MAX_FLASH_LOAN_USD: u64 = 50_000;
 const TEN_POW_18: U256 = U256::from_limbs([0xDE0B6B3A7640000, 0, 0, 0]);
 
 #[inline]
-fn ten_pow_u256(decimals: u8) -> U256 {
-    match decimals {
-        0 => U256::from(1u8),
-        6 => U256::from(1_000_000u128),
-        8 => U256::from(100_000_000u128),
-        18 => TEN_POW_18,
-        other => U256::from(10u128).pow(U256::from(other as u32)),
+fn ten_pow_u256_cached(decimals: u8) -> U256 {
+    if decimals == 18 {
+        TEN_POW_18
+    } else {
+        ten_pow_u256(decimals)
     }
 }
 
@@ -90,7 +91,8 @@ where
     for _ in 0..max_iter {
         let xm = a + (b - a) / U256::from(2u8);
         let tol = {
-            let t = high / U256::from(CONVERGENCE_DIVISOR);
+            let bracket = b.saturating_sub(a);
+            let t = bracket / U256::from(CONVERGENCE_DIVISOR);
             if t > U256::from(1u8) {
                 t
             } else {
@@ -231,7 +233,12 @@ fn parabolic_step_u256(
         && p.unsigned_abs() < (q.saturating_mul(e_i) / 2).unsigned_abs();
 
     if parabolic_ok {
-        Some(U256::try_from(p / q).unwrap_or(U256::ZERO))
+        let step = p / q;
+        // Negative parabolic steps must fall back to golden-section (unsigned d cannot represent them).
+        if step <= 0 {
+            return None;
+        }
+        Some(U256::try_from(step as u128).unwrap_or(U256::ZERO))
     } else {
         None
     }
@@ -305,17 +312,15 @@ pub fn get_dynamic_search_bounds(
     max_flash_loan_usd: u64,
     liquidity_cap: Option<U256>,
 ) -> (U256, U256) {
-    let start_rate = token_to_matic_rates
-        .get(&cycle.start_token)
-        .copied()
-        .unwrap_or(U256::ZERO);
+    let start_rate =
+        resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
     let start_decimals = arena
         .token_address(cycle.start_token)
         .map(|a| token_decimals.get(&a).copied().unwrap_or(18))
         .unwrap_or(18);
 
     let mut min_capacity = U256::MAX;
-    let mut can_normalize_all = !start_rate.is_zero();
+    let mut can_normalize_all = true;
     let mut saw_capacity = false;
 
     for edge in &cycle.edges {
@@ -324,23 +329,19 @@ pub fn get_dynamic_search_bounds(
         };
         saw_capacity = true;
 
-        if !start_rate.is_zero() {
-            if let Some(token_in_rate) = token_to_matic_rates.get(&edge.token_in).copied() {
-                if token_in_rate.is_zero() {
-                    can_normalize_all = false;
-                } else {
-                    let token_in_decimals = arena
-                        .token_address(edge.token_in)
-                        .map(|a| token_decimals.get(&a).copied().unwrap_or(18))
-                        .unwrap_or(18);
-                    let start_scale = ten_pow_u256(start_decimals);
-                    let token_in_scale = ten_pow_u256(token_in_decimals);
-                    capacity =
-                        (capacity * token_in_rate * start_scale) / (start_rate * token_in_scale);
-                }
-            } else {
-                can_normalize_all = false;
-            }
+        let token_in_rate =
+            resolve_token_to_matic_rate(edge.token_in, arena, token_to_matic_rates);
+        if token_in_rate.is_zero() {
+            can_normalize_all = false;
+        } else {
+            let token_in_decimals = arena
+                .token_address(edge.token_in)
+                .map(|a| token_decimals.get(&a).copied().unwrap_or(18))
+                .unwrap_or(18);
+            let start_scale = ten_pow_u256_cached(start_decimals);
+            let token_in_scale = ten_pow_u256_cached(token_in_decimals);
+            capacity =
+                (capacity * token_in_rate * start_scale) / (start_rate * token_in_scale);
         }
 
         if capacity < min_capacity {
@@ -365,7 +366,7 @@ pub fn get_dynamic_search_bounds(
     }
 
     if !start_rate.is_zero() {
-        let start_scale = ten_pow_u256(start_decimals);
+        let start_scale = ten_pow_u256_cached(start_decimals);
         let min_economic = (U256::from(MIN_ECONOMIC_VALUE_MATIC_WEI) * start_scale) / start_rate;
         if min_economic <= max_search_low && low < min_economic {
             low = min_economic;
@@ -373,7 +374,7 @@ pub fn get_dynamic_search_bounds(
     }
 
     if !start_rate.is_zero() {
-        let scale = ten_pow_u256(start_decimals);
+        let scale = ten_pow_u256_cached(start_decimals);
         let max_wei = (U256::from(max_flash_loan_usd) * TEN_POW_18 * scale) / start_rate;
         if high > max_wei {
             high = max_wei;
@@ -398,7 +399,9 @@ pub fn get_dynamic_search_bounds(
     };
 
     let (mut out_low, mut out_high) = (final_low, final_high);
-    if let Some(cap) = liquidity_cap.filter(|c| !c.is_zero()) && out_high > cap {
+    if let Some(cap) = liquidity_cap.filter(|c| !c.is_zero())
+        && out_high > cap
+    {
         out_high = cap;
         if out_low > out_high {
             let floor = out_high / U256::from(100u8);
@@ -408,7 +411,9 @@ pub fn get_dynamic_search_bounds(
                 U256::from(1u8)
             };
             if out_low > out_high {
-                out_low = out_high.saturating_sub(U256::from(1u8)).max(U256::from(1u8));
+                out_low = out_high
+                    .saturating_sub(U256::from(1u8))
+                    .max(U256::from(1u8));
             }
         }
     }
@@ -429,8 +434,18 @@ pub fn get_dynamic_search_bounds(
     if let Some(cap) = liquidity_cap.filter(|c| !c.is_zero()) {
         out_high = out_high.min(cap);
         if out_low > out_high {
-            out_low = out_high.saturating_sub(U256::from(1u8)).max(U256::from(1u8));
+            out_low = out_high
+                .saturating_sub(U256::from(1u8))
+                .max(U256::from(1u8));
         }
+    }
+
+    let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+    if out_low < economic_floor && economic_floor <= out_high {
+        out_low = economic_floor;
+    }
+    if out_high <= out_low {
+        out_high = out_low.saturating_add(U256::from(1u8));
     }
 
     (out_low, out_high)
@@ -454,9 +469,19 @@ pub fn optimize_cycle(
     max_flash_loan_usd: Option<u64>,
     max_iterations: Option<u32>,
     liquidity_cap: Option<U256>,
-    profit_ctx: Option<&ProfitEvalContext>,
+    profit_ctx: &ProfitEvalContext,
+    seed_sims: Option<&[(U256, crate::pipeline::types::MinimalSimResult)]>,
 ) -> Option<OptimizationResult> {
-    let (low, high) = get_dynamic_search_bounds(
+    let start_rate =
+        resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
+    let start_decimals = arena
+        .token_address(cycle.start_token)
+        .map(|a| token_decimals.get(&a).copied().unwrap_or(18))
+        .unwrap_or(18);
+    let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+
+    let edges = &cycle.edges;
+    let (mut low, mut high) = get_dynamic_search_bounds(
         cycle,
         arena,
         token_to_matic_rates,
@@ -464,16 +489,86 @@ pub fn optimize_cycle(
         max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
         liquidity_cap,
     );
+    if high < economic_floor {
+        high = economic_floor.saturating_mul(U256::from(100u8));
+        if !start_rate.is_zero() {
+            let scale = ten_pow_u256_cached(start_decimals);
+            let max_wei = (U256::from(
+                max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
+            ) * TEN_POW_18
+                * scale)
+                / start_rate;
+            if high > max_wei {
+                high = max_wei;
+            }
+        }
+    }
+    if low < economic_floor {
+        low = economic_floor;
+    }
+    if let Some(seeds) = seed_sims {
+        if let Some((seed_amount, seed_sim)) = seeds.first() {
+            if !seed_sim.profit.is_zero()
+                && *seed_amount >= economic_floor
+                && *seed_amount <= high
+                && *seed_amount > low
+            {
+                low = *seed_amount;
+            }
+        }
+    }
+    if high < economic_floor || high <= low {
+        // #region agent log
+        crate::debug_agent::log(
+            "H-G",
+            "ternary.rs:optimize_cycle",
+            "optimize_bounds_invalid",
+            serde_json::json!({
+                "route_fingerprint": crate::pipeline::types::route_fingerprint(edges),
+                "low": low.to_string(),
+                "high": high.to_string(),
+                "economic_floor": economic_floor.to_string(),
+                "start_rate": start_rate.to_string(),
+            }),
+        );
+        // #endregion
+        return None;
+    }
+    if low < economic_floor {
+        low = economic_floor;
+    }
 
-    let edges = &cycle.edges;
     let mut sim_cache: Vec<(U256, crate::pipeline::types::MinimalSimResult)> =
         Vec::with_capacity(BRENT_CACHE_SLOTS);
+    if let Some(seeds) = seed_sims {
+        for (amount, sim) in seeds {
+            if sim_cache.len() >= BRENT_CACHE_SLOTS {
+                break;
+            }
+            sim_cache.push((*amount, sim.clone()));
+        }
+    }
     let evaluate = |amount: U256| -> U256 {
+        if amount < economic_floor {
+            return U256::ZERO;
+        }
         if let Some(sim) = lookup_sim_cache(&sim_cache, amount) {
             return score_sim(amount, &sim, profit_ctx);
         }
         match simulate_route_minimal(arena, edges, amount) {
             Some(sim) => {
+                if sim.profit.is_zero()
+                    || check_sim_sanity(SimSanityInput {
+                        amount_in: amount,
+                        gross_profit: sim.profit,
+                        search_low: low,
+                        token_decimals: start_decimals,
+                        token_to_matic_rate: start_rate,
+                    })
+                    .is_err()
+                {
+                    return U256::ZERO;
+                }
                 let score = score_sim(amount, &sim, profit_ctx);
                 if sim_cache.len() < BRENT_CACHE_SLOTS {
                     sim_cache.push((amount, sim));
@@ -486,8 +581,37 @@ pub fn optimize_cycle(
 
     let iterations = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
     let optimal = solve_brent_optimal(low, high, evaluate, iterations);
+    if optimal < economic_floor {
+        return None;
+    }
     let sim = lookup_sim_cache(&sim_cache, optimal)
         .or_else(|| simulate_route_minimal(arena, edges, optimal))?;
+    if sim.profit.is_zero()
+        || check_sim_sanity(SimSanityInput {
+            amount_in: optimal,
+            gross_profit: sim.profit,
+            search_low: low,
+            token_decimals: start_decimals,
+            token_to_matic_rate: start_rate,
+        })
+        .is_err()
+    {
+        // #region agent log
+        crate::debug_agent::log(
+            "H-G",
+            "ternary.rs:optimize_cycle",
+            "optimize_final_reject",
+            serde_json::json!({
+                "route_fingerprint": crate::pipeline::types::route_fingerprint(edges),
+                "optimal": optimal.to_string(),
+                "profit": sim.profit.to_string(),
+                "low": low.to_string(),
+                "high": high.to_string(),
+            }),
+        );
+        // #endregion
+        return None;
+    }
     tracing::Span::current().record("optimal_input", tracing::field::display(&optimal));
     tracing::Span::current().record(
         "net_profit",
@@ -499,26 +623,25 @@ pub fn optimize_cycle(
         expected_gross: sim.amount_out,
         net_profit: sim.profit,
         total_gas: sim.total_gas,
+        search_low: low,
     })
 }
 
 fn score_sim(
     amount_in: U256,
     sim: &crate::pipeline::types::MinimalSimResult,
-    profit_ctx: Option<&ProfitEvalContext>,
+    profit_ctx: &ProfitEvalContext,
 ) -> U256 {
-    match profit_ctx {
-        Some(ctx) => net_profit_after_gas_from_sim(sim, amount_in, ctx),
-        None => sim.profit,
-    }
+    net_profit_after_gas_from_sim(sim, amount_in, profit_ctx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{PoolState, ProtocolType, V2PoolState};
+    use crate::core::types::{FlashLoanSource, PoolState, ProtocolType, V2PoolState};
     use crate::pipeline::graph::{build_graph, pool_meta_from_pair};
     use crate::pipeline::{cycle_finder, local_sim};
+    use crate::services::execution::profit::ProfitEvalContext;
     use alloy::primitives::Address;
 
     #[test]
@@ -533,6 +656,27 @@ mod tests {
             12,
         );
         assert!(optimal >= U256::from(400u64) && optimal <= U256::from(600u64));
+    }
+
+    #[test]
+    fn brent_converges_on_narrow_bracket() {
+        let peak = U256::from(1_000_000u64);
+        let optimal = solve_brent_optimal(
+            U256::from(999_000u64),
+            U256::from(1_001_000u64),
+            |x| {
+                if x > peak {
+                    peak.saturating_sub(x - peak)
+                } else {
+                    x
+                }
+            },
+            12,
+        );
+        assert!(
+            optimal >= U256::from(999_500u64) && optimal <= U256::from(1_000_500u64),
+            "optimal {optimal}"
+        );
     }
 
     #[test]
@@ -575,7 +719,27 @@ mod tests {
             .expect("3-hop");
         let mut rates = FxHashMap::default();
         rates.insert(t0, U256::from(10u128).pow(U256::from(18)));
-        let opt = optimize_cycle(&arena, &cycle, &rates, &HashMap::new(), None, None, None, None).expect("opt");
+        let profit_ctx = ProfitEvalContext::for_cycle(
+            t0,
+            &arena,
+            &rates,
+            &HashMap::new(),
+            U256::from(30_000_000_000u64),
+            50,
+            FlashLoanSource::Balancer,
+        );
+        let opt = optimize_cycle(
+            &arena,
+            &cycle,
+            &rates,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            &profit_ctx,
+            None,
+        )
+        .expect("opt");
         assert!(opt.optimal_input > U256::ZERO);
         let sim =
             local_sim::simulate_route_minimal(&arena, &cycle.edges, opt.optimal_input).unwrap();

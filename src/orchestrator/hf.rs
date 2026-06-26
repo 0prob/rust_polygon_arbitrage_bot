@@ -14,11 +14,12 @@ use crate::infra::tracing_util::{pool_addrs_csv, start_token_addr};
 use crate::orchestrator::dispatch_queue::{
     PendingDispatch, queue_pending_dispatch, take_pending_dispatch,
 };
-use crate::orchestrator::hf_eval::{HfEvalInputOwned, evaluate_cycles_parallel_async};
+use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::dispatch_profitable_candidates;
+use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
 use crate::orchestrator::ui_hook::SharedUiHook;
-use crate::pipeline::spot_price::{SpotTable, rescore_cycles_with_table_and_gas};
-use crate::pipeline::types::{compare_cycle_score, route_fingerprint as fp};
+use crate::pipeline::types::{route_fingerprint as fp};
+use rustc_hash::FxHashSet;
 use crate::services::execution::{
     ExecutionService, GasOracle, OpportunityRecord, evaluated_from_sim,
     flash_policy::{hf_eval_flash_source, parse_flash_policy},
@@ -65,7 +66,13 @@ pub struct HfTickResult {
         elapsed_ms = tracing::field::Empty,
     )
 )]
-pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow::Result<HfTickResult> {
+pub async fn run_hf_tick(
+    ctx: Arc<HfContext>,
+    stream_triggered: bool,
+) -> anyhow::Result<HfTickResult> {
+    sync_indexer_execution_gate(&ctx).await;
+    try_drain_pending_dispatch(&ctx).await;
+
     let start = now_ms();
     let snap = ctx.snapshots.read();
 
@@ -90,22 +97,28 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
             }
         }
     }
+    if pipeline.stream_enabled {
+        for addr in ctx.partial_cache.tracked_addresses() {
+            hot_pools.insert(addr);
+        }
+    }
     let hot_pools: Vec<_> = hot_pools.into_iter().collect();
 
     let refresh = Arc::clone(&ctx.refresh);
-    let prefetch_count = pipeline.hf_prefetch_count;
-    let skip_prefetch = stream_triggered
-        && pipeline.stream_enabled
-        && pipeline.hf_skip_prefetch_on_stream;
-    let prefetch = if skip_prefetch {
+    let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
+    let skip_prefetch = stream_triggered && pipeline.stream_enabled;
+    let prefetch_hot = hot_pools.clone();
+    let prefetch = if skip_prefetch || prefetch_hot.is_empty() {
         None
     } else {
-        Some(tokio::spawn(
-            async move { refresh.refresh_pool_states(prefetch_count).await },
-        ))
+        Some(tokio::spawn(async move {
+            refresh
+                .refresh_pool_states_for(&prefetch_hot, prefetch_count)
+                .await
+        }))
     };
 
-    let mut cycles: Vec<_> = snap.cycles.iter().take(rescore_cap).cloned().collect();
+    let cycles: Vec<_> = snap.cycles.iter().take(rescore_cap).cloned().collect();
     let mut arena = snap.arena.clone();
     let gas_price = ctx.gas_oracle.conservative_gas_price();
 
@@ -123,36 +136,44 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
     }
     arena.apply_hot_cache(&ctx.cache, &hot_pools);
 
-    let mut spot_table = SpotTable::new(arena.pool_count());
-    rescore_cycles_with_table_and_gas(
-        &arena,
-        &mut spot_table,
-        &mut cycles,
-        Some(gas_price),
-        Some(&snap.token_to_matic_rates),
-    );
-    cycles.sort_by(compare_cycle_score);
-    cycles.truncate(sim_cap);
+    let mut flash_tokens = FxHashSet::default();
+    let mut flash_token_list = Vec::new();
+    for c in &cycles {
+        collect_flash_tokens_for_cycle(&arena, c, &mut flash_tokens, &mut flash_token_list);
+    }
+    if !flash_token_list.is_empty() {
+        if let Ok(provider) = ctx.rpc.connect_state() {
+            let _ = ctx
+                .execution
+                .flash_liquidity
+                .refresh(&provider, &flash_token_list)
+                .await;
+        }
+    }
 
-    let owned = HfEvalInputOwned {
+    let flash_source = hf_eval_flash_source(parse_flash_policy(
+        &ctx.config.execution.flash_loan_source,
+    ));
+
+    let owned = HfEvalInputOwned::with_shared_maps(
         arena,
-        token_to_matic_rates: snap.token_to_matic_rates.clone(),
-        token_decimals: snap.token_decimals.clone(),
-        brent_iters: ctx.config.routing.ternary_search_iterations,
-        min_profit_matic: parse_min_profit(&ctx.config)?,
-        min_profit_roi_bps: ctx.config.execution.min_profit_roi_bps,
+        Arc::clone(&snap.token_to_matic_rates),
+        Arc::clone(&snap.token_decimals),
+        Arc::clone(&ctx.gas_oracle),
+        ctx.config.routing.ternary_search_iterations,
+        parse_min_profit(&ctx.config)?,
+        ctx.config.execution.min_profit_roi_bps,
         gas_price,
-        slippage_bps: ctx.config.execution.slippage_bps,
-        flash_source: hf_eval_flash_source(parse_flash_policy(
-            &ctx.config.execution.flash_loan_source,
-        )),
-        max_flash_loan_usd: ctx.config.execution.max_flash_loan_usd,
-        safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
-    };
+        ctx.config.execution.slippage_bps,
+        flash_source,
+        ctx.config.execution.max_flash_loan_usd,
+        ctx.config.execution.profit_safety_multiplier_bps,
+        Arc::clone(&ctx.execution.flash_liquidity),
+    );
     let eval_arena = owned.arena.clone();
     let eval_gas_price = owned.gas_price;
     let cycles_considered = cycles.len();
-    let eval_results = evaluate_cycles_parallel_async(cycles, owned).await?;
+    let eval_results = rescore_rank_and_evaluate_async(cycles, owned, sim_cap).await?;
 
     let mut profitable = Vec::new();
     let mut best_profit = U256::ZERO;
@@ -182,7 +203,7 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
             let record = OpportunityRecord::from_assessment(
                 route_fp,
                 result.cycle.hop_count,
-                result.opt.optimal_input,
+                result.sim.amount_in,
                 result.sim.total_gas,
                 eval_gas_price,
                 result.effective_slippage_bps,
@@ -211,7 +232,7 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
             log_opportunity_evaluated(&OpportunityRecord::from_assessment(
                 route_fp,
                 result.cycle.hop_count,
-                result.opt.optimal_input,
+                result.sim.amount_in,
                 result.sim.total_gas,
                 eval_gas_price,
                 result.effective_slippage_bps,
@@ -245,10 +266,23 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
     span.record("elapsed_ms", elapsed_ms);
 
     if profitable_count > 0 {
-        let route_fps: Vec<u64> = profitable
-            .iter()
-            .map(|r| fp(&r.cycle.edges))
-            .collect();
+        let indexer_stale = ctx.refresh.is_indexer_stale();
+        if indexer_stale && ctx.config.pipeline.indexer_pause_on_lag {
+            warn!(
+                lag = ctx.refresh.indexer_lag_blocks(),
+                max_lag = ctx.config.pipeline.indexer_max_lag_blocks,
+                profitable = profitable_count,
+                "indexer stale — skipping dispatch"
+            );
+            return Ok(HfTickResult {
+                cycles_considered,
+                profitable_count,
+                best_profit,
+                elapsed_ms,
+            });
+        }
+
+        let route_fps: Vec<u64> = profitable.iter().map(|r| fp(&r.cycle.edges)).collect();
         info!(
             profitable = profitable_count,
             best_profit = %best_profit,
@@ -257,6 +291,20 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
             elapsed_ms,
             "hf profitable cycles"
         );
+        // #region agent log
+        crate::debug_agent::log(
+            "H-B",
+            "hf.rs:run_hf_tick",
+            "profitable_dispatch_spawn",
+            serde_json::json!({
+                "profitable_count": profitable_count,
+                "dry_run": ctx.config.is_dry_run(),
+                "indexer_stale": indexer_stale,
+                "route_fingerprints": route_fps,
+                "best_profit": best_profit.to_string(),
+            }),
+        );
+        // #endregion
 
         let pool_metas = snap.pool_metas.clone();
         let dispatch_arena = eval_arena.clone();
@@ -303,6 +351,34 @@ pub async fn run_hf_tick(ctx: Arc<HfContext>, stream_triggered: bool) -> anyhow:
     }
 
     Ok(tick_result)
+}
+
+async fn try_drain_pending_dispatch(ctx: &HfContext) {
+    if ctx.pending_dispatch.lock().is_none() {
+        return;
+    }
+    let Ok(guard) = ctx.dispatch_lock.try_lock() else {
+        return;
+    };
+    let _guard = guard;
+    let Some(pending) = take_pending_dispatch(&ctx.pending_dispatch) else {
+        return;
+    };
+    info!(
+        routes = pending.profitable.len(),
+        "processing queued dispatch before hf eval"
+    );
+    run_dispatch_loop(
+        ctx,
+        pending.arena,
+        pending.profitable,
+        pending.pool_metas,
+    )
+    .await;
+}
+
+async fn sync_indexer_execution_gate(ctx: &HfContext) {
+    ctx.refresh.maybe_refresh_indexer_health().await;
 }
 
 fn parse_min_profit(config: &AppConfig) -> anyhow::Result<U256> {

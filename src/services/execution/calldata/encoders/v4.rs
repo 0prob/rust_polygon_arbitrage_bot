@@ -13,7 +13,7 @@ use crate::services::execution::calldata::types::CalldataHop;
 /// Encode a Uniswap V4 hop into executor calls
 ///
 /// Returns a vector containing:
-/// 1. An approval call if needed (via IArbExecutor.approveIfNeeded)
+/// 1. An ERC-20 approve on the input token for the pool manager
 /// 2. A lock call to the V4 PoolManager
 pub fn encode_v4_hop(
     hop: &CalldataHop,

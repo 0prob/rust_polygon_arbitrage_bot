@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>u256_to_u128() — Community 47</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+#sidebar { width: 320px; min-width: 320px; background: #1a1a2e; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #2a2a4a; }
+#sidebar h2 { font-size: 18px; color: #FF9DA7; margin-bottom: 4px; }
+#sidebar h3 { font-size: 14px; color: #9ca3af; margin-bottom: 8px; }
+.nav-link { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; color: #e0e0e0; text-decoration: none; }
+.nav-link:hover { background: #2a2a4a; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+#graph-container { flex: 1; position: relative; }
+#search { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #3a3a5a; background: #0f0f1a; color: #e0e0e0; font-size: 14px; }
+#search:focus { outline: none; border-color: #FF9DA7; }
+#info-panel { background: #0f0f1a; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; min-height: 100px; }
+#info-panel .prop { color: #9ca3af; }
+#info-panel .val { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+    <div>
+        <h2>u256_to_u128()</h2>
+        <p style="font-size:12px;color:#666;">16 nodes · Community 47</p>
+    </div>
+    <input id="search" type="text" placeholder="Search nodes…" />
+    <div>
+        <h3>Node Info</h3>
+        <div id="info-panel"><i style="color:#666">Click a node to see details</i></div>
+    </div>
+    <div>
+        <h3>Navigation</h3>
+        <a href="index.html" class="nav-link" style="font-weight:bold;">← Overview</a>
+    </div>
+</div>
+<div id="graph-container"></div>
+<script>
+(function() {
+    var nodesData = [{id:"src_services_execution_gas_rs",label:"gas",title:"gas\nType: File\nFile: ./src/services/execution/gas.rs\nDegree: 15",color:"#FF9DA7",size:23.5},{id:"src_services_execution_gas_rs_import_anyhow_result_anyhow",label:"anyhow::{Result, anyhow}",title:"anyhow::{Result, anyhow}\nType: Module\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_import_ruint_aliases_u256",label:"ruint::aliases::U256",title:"ruint::aliases::U256\nType: Module\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_feesnapshot",label:"FeeSnapshot",title:"FeeSnapshot\nType: Struct\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_u256_to_u128",label:"u256_to_u128()",title:"u256_to_u128()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 2",color:"#FF9DA7",size:13.7},{id:"src_services_execution_gas_rs_buffer_gas_limit",label:"buffer_gas_limit()",title:"buffer_gas_limit()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 2",color:"#FF9DA7",size:13.7},{id:"src_services_execution_gas_rs_pick_buffered_gas_limit",label:"pick_buffered_gas_limit()",title:"pick_buffered_gas_limit()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 3",color:"#FF9DA7",size:14.9},{id:"src_services_execution_gas_rs_pick_live_gas_limit",label:"pick_live_gas_limit()",title:"pick_live_gas_limit()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 4",color:"#FF9DA7",size:16.0},{id:"src_services_execution_gas_rs_estimate_route_gas_from_hops",label:"estimate_route_gas_from_hops()",title:"estimate_route_gas_from_hops()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_compute_conservative_gas_price",label:"compute_conservative_gas_price()",title:"compute_conservative_gas_price()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_conservative_gas_price_wei",label:"conservative_gas_price_wei()",title:"conservative_gas_price_wei()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_default_priority_fee_wei",label:"default_priority_fee_wei()",title:"default_priority_fee_wei()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_gas_drift_bps",label:"gas_drift_bps()",title:"gas_drift_bps()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_import_super",label:"super::*",title:"super::*\nType: Module\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0},{id:"src_services_execution_gas_rs_pick_live_gas_uses_max_of_sim_and_dry_run",label:"pick_live_gas_uses_max_of_sim_and_dry_run()",title:"pick_live_gas_uses_max_of_sim_and_dry_run()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 2",color:"#FF9DA7",size:13.7},{id:"src_services_execution_gas_rs_pick_live_gas_fails_on_zero",label:"pick_live_gas_fails_on_zero()",title:"pick_live_gas_fails_on_zero()\nType: Function\nFile: ./src/services/execution/gas.rs\nDegree: 1",color:"#FF9DA7",size:12.0}];
+    var edgesData = [{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_import_anyhow_result_anyhow",label:"imports",dashes:false,title:"imports: src_services_execution_gas_rs → src_services_execution_gas_rs_import_anyhow_result_anyhow\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_import_ruint_aliases_u256",label:"imports",dashes:false,title:"imports: src_services_execution_gas_rs → src_services_execution_gas_rs_import_ruint_aliases_u256\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_feesnapshot",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_feesnapshot\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_u256_to_u128",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_u256_to_u128\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_buffer_gas_limit",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_buffer_gas_limit\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_pick_buffered_gas_limit",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_pick_buffered_gas_limit\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_pick_live_gas_limit",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_pick_live_gas_limit\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_estimate_route_gas_from_hops",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_estimate_route_gas_from_hops\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_compute_conservative_gas_price",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_compute_conservative_gas_price\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_conservative_gas_price_wei",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_conservative_gas_price_wei\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_default_priority_fee_wei",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_default_priority_fee_wei\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_gas_drift_bps",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_gas_drift_bps\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_import_super",label:"imports",dashes:false,title:"imports: src_services_execution_gas_rs → src_services_execution_gas_rs_import_super\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_pick_live_gas_uses_max_of_sim_and_dry_run",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_pick_live_gas_uses_max_of_sim_and_dry_run\nConfidence: Extracted"},{from:"src_services_execution_gas_rs",to:"src_services_execution_gas_rs_pick_live_gas_fails_on_zero",label:"defines",dashes:false,title:"defines: src_services_execution_gas_rs → src_services_execution_gas_rs_pick_live_gas_fails_on_zero\nConfidence: Extracted"},{from:"src_services_execution_gas_rs_pick_buffered_gas_limit",to:"src_services_execution_gas_rs_buffer_gas_limit",label:"calls",dashes:true,title:"calls: src_services_execution_gas_rs_pick_buffered_gas_limit → src_services_execution_gas_rs_buffer_gas_limit\nConfidence: Inferred"},{from:"src_services_execution_gas_rs_pick_live_gas_limit",to:"src_services_execution_gas_rs_pick_buffered_gas_limit",label:"calls",dashes:true,title:"calls: src_services_execution_gas_rs_pick_live_gas_limit → src_services_execution_gas_rs_pick_buffered_gas_limit\nConfidence: Inferred"},{from:"src_services_execution_gas_rs_pick_live_gas_limit",to:"src_services_execution_gas_rs_u256_to_u128",label:"calls",dashes:true,title:"calls: src_services_execution_gas_rs_pick_live_gas_limit → src_services_execution_gas_rs_u256_to_u128\nConfidence: Inferred"},{from:"src_services_execution_gas_rs_pick_live_gas_uses_max_of_sim_and_dry_run",to:"src_services_execution_gas_rs_pick_live_gas_limit",label:"calls",dashes:true,title:"calls: src_services_execution_gas_rs_pick_live_gas_uses_max_of_sim_and_dry_run → src_services_execution_gas_rs_pick_live_gas_limit\nConfidence: Inferred"}];
+    var container = document.getElementById('graph-container');
+    var nodes = new vis.DataSet(nodesData);
+    var edges = new vis.DataSet(edgesData);
+    var options = {
+        physics: {solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-50,centralGravity:0.01,springLength:120,springConstant:0.08,damping:0.4,avoidOverlap:0.5},stabilization:{iterations:200}},
+        nodes: { shape: 'dot', font: { color: '#e0e0e0', size: 12 }, borderWidth: 2 },
+        edges: { color: { color: '#4a4a6a', highlight: '#FF9DA7', hover: '#FF9DA7' }, font: { color: '#888', size: 10 }, arrows: { to: { enabled: false } }, smooth: { type: 'continuous' } },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true }
+    };
+    var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    network.on('stabilizationIterationsDone', function() { network.setOptions({ physics: { enabled: false } }); });
+    network.on('click', function(params) {
+        var panel = document.getElementById('info-panel');
+        if (params.nodes.length > 0) {
+            var node = nodes.get(params.nodes[0]);
+            if (node) {
+                panel.innerHTML = '<div><span class="prop">Label:</span> <span class="val">' + node.label + '</span></div><div><span class="prop">ID:</span> <span class="val">' + node.id + '</span></div>';
+                network.focus(params.nodes[0], { scale: 1.2, animation: true });
+            }
+        }
+    });
+    var searchEl = document.getElementById('search');
+    var sTimer = null;
+    searchEl.addEventListener('input', function() {
+        clearTimeout(sTimer);
+        sTimer = setTimeout(function() {
+            var term = searchEl.value.toLowerCase();
+            var updates = [];
+            nodes.forEach(function(n) {
+                var h = term && !n.label.toLowerCase().includes(term);
+                if (n.hidden !== h) { updates.push({ id: n.id, hidden: h }); }
+            });
+            if (updates.length > 0) { nodes.update(updates); }
+        }, 200);
+    });
+})();
+</script>
+</body>
+</html>

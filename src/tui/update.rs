@@ -12,9 +12,17 @@ pub enum UiUpdate {
     GraphStats(GraphStatsSnapshot),
     TradeExecuted(TradeRecord),
     Alert(Alert),
-    BlockUpdate { block: u64, lag_ms: u64 },
-    GasUpdate { gwei: f64 },
-    SimulationResult { fingerprint: u64, result: UiSimResult },
+    BlockUpdate {
+        block: u64,
+        lag_ms: u64,
+    },
+    GasUpdate {
+        gwei: f64,
+    },
+    SimulationResult {
+        fingerprint: u64,
+        result: UiSimResult,
+    },
     PnlTick(f64),
     ConfigSnapshot(ConfigSnapshot),
 }

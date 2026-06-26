@@ -17,9 +17,7 @@ fn render_hubs(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .title(format!(
             " Top Hubs ({} pools / {} tokens / {} edges) ",
-            app.graph_stats.pool_count,
-            app.graph_stats.token_count,
-            app.graph_stats.edge_count
+            app.graph_stats.pool_count, app.graph_stats.token_count, app.graph_stats.edge_count
         ))
         .border_style(Theme::block_border());
 
@@ -31,12 +29,9 @@ fn render_hubs(f: &mut Frame, area: Rect, app: &App) {
         .map(|(tok, deg)| Row::new(vec![Cell::from(tok.clone()), Cell::from(format!("{deg}"))]))
         .collect();
 
-    let table = Table::new(
-        rows,
-        [Constraint::Min(20), Constraint::Length(12)],
-    )
-    .header(header)
-    .block(block);
+    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(12)])
+        .header(header)
+        .block(block);
     f.render_widget(table, area);
 }
 

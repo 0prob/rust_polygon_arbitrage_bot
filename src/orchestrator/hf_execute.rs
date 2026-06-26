@@ -8,13 +8,14 @@ use crate::infra::tracing_util::{pool_addrs_csv, record_evaluated_route};
 use crate::orchestrator::hf::HfContext;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::route_fingerprint;
+use crate::services::execution::flash_policy::parse_flash_policy;
+use crate::services::execution::impact_slippage::depth_impact_slippage_bps;
 use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
     collect_flash_tokens, prepare_evaluated_route,
 };
-use crate::services::oracle::price_oracle::bootstrap_matic_rate_per_unit;
-use crate::services::execution::flash_policy::parse_flash_policy;
-use crate::services::execution::impact_slippage::depth_impact_slippage_bps;
+use crate::services::execution::dryrun::estimate_candidate_gas;
+use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
 
 #[instrument(skip(ctx, arena, profitable, pool_metas), fields(dispatch_count = profitable.len()))]
 pub async fn dispatch_profitable_candidates(
@@ -65,9 +66,7 @@ pub async fn dispatch_profitable_candidates(
     )
     .await;
 
-    ctx.execution
-        .shutdown_resync(&sim_provider, operator)
-        .await;
+    ctx.execution.shutdown_resync(&sim_provider, operator).await;
 }
 
 #[instrument(skip(ctx, arena, profitable, sim_provider, pool_metas))]
@@ -87,8 +86,29 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         .collect();
     if fps.iter().all(|fp| ctx.execution.any_quarantined(&[*fp])) {
         info!("all profitable routes quarantined — skipping dispatch");
+        // #region agent log
+        crate::debug_agent::log(
+            "H-B",
+            "hf_execute.rs:dispatch_with_provider",
+            "dispatch_skipped_all_quarantined",
+            serde_json::json!({ "route_fingerprints": fps }),
+        );
+        // #endregion
         return;
     }
+
+    // #region agent log
+    crate::debug_agent::log(
+        "H-B",
+        "hf_execute.rs:dispatch_with_provider",
+        "dispatch_enter",
+        serde_json::json!({
+            "route_count": profitable.len(),
+            "dry_run": ctx.config.is_dry_run(),
+            "route_fingerprints": fps,
+        }),
+    );
+    // #endregion
 
     let snap = ctx.snapshots.read();
     let flash_policy = parse_flash_policy(&ctx.config.execution.flash_loan_source);
@@ -110,10 +130,12 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         warn!(error = %e, "flash liquidity refresh failed — dispatch may skip routes");
     }
 
+    let top_n_gas = ctx.config.pipeline.hf_gas_estimate_top_n;
     let mut prepared_count = 0u32;
     let mut skipped_prepare = 0u32;
+    let mut skipped_quarantined = 0u32;
 
-    for evaluated in profitable {
+    for (route_index, evaluated) in profitable.into_iter().enumerate() {
         if *ctx.shutdown.borrow() {
             info!("shutdown signalled — stopping dispatch loop");
             break;
@@ -132,6 +154,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         record_evaluated_route(&exec_span, arena, &evaluated);
 
         if ctx.execution.is_route_quarantined(route_fp) {
+            skipped_quarantined += 1;
             debug!(route_fingerprint = route_fp, "route skipped — quarantined");
             continue;
         }
@@ -145,24 +168,34 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
             .get(&start_token_addr)
             .copied()
             .unwrap_or(18);
-        let token_to_matic_rate = snap
-            .token_to_matic_rates
-            .get(&evaluated.cycle.start_token)
-            .copied()
-            .unwrap_or_else(bootstrap_matic_rate_per_unit);
+        let Some(token_to_matic_rate) = resolve_token_to_matic_rate_or_bootstrap(
+            evaluated.cycle.start_token,
+            arena,
+            &snap.token_to_matic_rates,
+        ) else {
+            skipped_prepare += 1;
+            debug!(
+                route_fingerprint = route_fp,
+                "route skipped — no reliable MATIC rate"
+            );
+            continue;
+        };
 
         let liquidity = ctx.execution.flash_liquidity.snapshot(start_token_addr);
         let slippage_bps = if evaluated.effective_slippage_bps > 0 {
             evaluated.effective_slippage_bps
         } else {
-            let depth_bps =
-                depth_impact_slippage_bps(arena, &evaluated.cycle.edges, evaluated.result.amount_in);
+            let depth_bps = depth_impact_slippage_bps(
+                arena,
+                &evaluated.cycle.edges,
+                evaluated.result.amount_in,
+            );
             crate::services::execution::impact_slippage::effective_slippage_bps(
                 base_slippage_bps,
                 depth_bps,
             )
         };
-        let Some(prepared) = prepare_evaluated_route(PrepareDispatchInput {
+        let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
             evaluated: &evaluated,
             arena,
             liquidity,
@@ -213,20 +246,38 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         };
 
         async {
-            let candidate = match build_execution_candidate(
-                arena,
-                &prepared.evaluated,
-                &build_cfg,
-                pool_metas,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(route_fingerprint = route_fp, error = %e, "candidate build failed");
-                    return;
-                }
-            };
+            let mut candidate =
+                match build_execution_candidate(arena, &prepared.evaluated, &build_cfg, pool_metas)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(route_fingerprint = route_fp, error = %e, "candidate build failed");
+                        return;
+                    }
+                };
 
-            match ctx
+            if route_index < top_n_gas {
+                if let Some(gas) =
+                    estimate_candidate_gas(sim_provider, &candidate, operator).await
+                {
+                    ctx.gas_oracle
+                        .record_sim_observed(candidate.simulated_gas, gas);
+                    candidate.simulated_gas = gas.min(u32::MAX as u64) as u32;
+                    if let Some(limit) =
+                        crate::services::execution::gas::buffer_gas_limit(candidate.simulated_gas)
+                    {
+                        candidate.gas_limit = Some(limit);
+                    }
+                    debug!(
+                        route_fingerprint = route_fp,
+                        estimate_gas = gas,
+                        simulated_gas = candidate.simulated_gas,
+                        "top-N estimate_gas applied"
+                    );
+                }
+            }
+
+            let outcome = ctx
                 .execution
                 .process_candidate(
                     sim_provider,
@@ -240,8 +291,19 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
                     Some(&ctx.shutdown),
                     Some(ctx.metrics.as_ref()),
                 )
-                .await
-            {
+                .await;
+            // #region agent log
+            crate::debug_agent::log(
+                "H-D",
+                "hf_execute.rs:dispatch_with_provider",
+                "execution_outcome",
+                serde_json::json!({
+                    "route_fingerprint": candidate.route_fingerprint,
+                    "outcome": format!("{outcome:?}"),
+                }),
+            );
+            // #endregion
+            match outcome {
                 ExecutionOutcome::DryRunPassed { gas_used } => {
                     ctx.metrics.record_dry_run_passed();
                     info!(
@@ -272,7 +334,11 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
                 ExecutionOutcome::SkippedCircuitBreaker => {
                     warn!(
                         route_fingerprint = candidate.route_fingerprint,
-                        reason = ctx.execution.circuit_breaker.pause_reason().unwrap_or_default(),
+                        reason = ctx
+                            .execution
+                            .circuit_breaker
+                            .pause_reason()
+                            .unwrap_or_default(),
                         "skipped — circuit breaker tripped"
                     );
                 }
@@ -328,16 +394,24 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         .await;
     }
 
-    if prepared_count == 0 && skipped_prepare > 0 {
+    if prepared_count == 0 && skipped_prepare > 0 && skipped_quarantined == 0 {
         info!(
             skipped_prepare,
             flash_policy = ?flash_policy,
             "dispatch complete — all routes skipped before execution"
         );
+    } else if skipped_quarantined > 0 && prepared_count == 0 {
+        info!(
+            skipped_quarantined,
+            skipped_prepare,
+            flash_policy = ?flash_policy,
+            "dispatch complete — routes quarantined or skipped at prepare"
+        );
     } else if prepared_count > 0 {
         debug!(
             prepared = prepared_count,
             skipped_prepare,
+            skipped_quarantined,
             "dispatch complete"
         );
     }

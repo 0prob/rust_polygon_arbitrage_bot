@@ -20,23 +20,25 @@ pub mod rpc_errors;
 pub mod service;
 pub mod submit;
 
+pub use candidate::{
+    CandidateBuildConfig, CandidateExecution, build_execution_candidate, evaluated_from_sim,
+};
 pub use circuit_breaker::CircuitBreaker;
 pub use flash_liquidity::{
-    FlashLiquidityCache, PreparedDispatch, PrepareDispatchInput, collect_flash_tokens,
+    FlashLiquidityCache, PrepareDispatchInput, PreparedDispatch, collect_flash_tokens,
+    collect_flash_tokens_for_cycle, prefer_aave_flash_start, rotate_cycle_to_start,
+    balancer_route_flash_feasible, cycle_has_aave_listed_token,
     prepare_evaluated_route,
 };
 pub use flash_policy::{
     FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy, parse_flash_source,
 };
-pub use candidate::{
-    CandidateBuildConfig, CandidateExecution, build_execution_candidate, evaluated_from_sim,
-};
 pub use gas::{FeeSnapshot, compute_conservative_gas_price, conservative_gas_price_wei};
 pub use gas_oracle::GasOracle;
 pub use opportunity_log::{OpportunityRecord, log_opportunity_evaluated, log_opportunity_outcome};
 pub use profit::{
-    AssessProfitInput, ProfitEvalContext, ProfitThresholds, RouteProfitParams,
-    assess_profit, build_assess_input, on_chain_min_profit_for_route,
-    DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS,
+    AssessProfitInput, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitEvalContext, ProfitThresholds,
+    RouteProfitParams, assess_profit, assess_route_profit, build_assess_input,
+    on_chain_min_profit_for_route,
 };
 pub use service::{ExecutionOutcome, ExecutionService};

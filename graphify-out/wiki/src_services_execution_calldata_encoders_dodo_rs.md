@@ -1,0 +1,24 @@
+# dodo
+
+- **ID:** `src_services_execution_calldata_encoders_dodo_rs`
+- **Type:** File
+- **File:** `./src/services/execution/calldata/encoders/dodo.rs`
+- **Community:** 128 (dodo)
+
+## Relationships
+
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_alloy_primitives_address_u256 (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_alloy_sol_types_solcall (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_crate_abis_executorcall_idodopool_ierc20 (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_crate_services_execution_calldata_approvals_encode_transfer_all (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_crate_services_execution_calldata_types_calldatahop (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_super (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_import_crate_core_types_edge_poolindex_tokenindex (imports, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_returns_two_calls (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_explicit_transfer (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_transfer_all (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_respects_zero_for_one (defines, Extracted)
+- src_services_execution_calldata_encoders_dodo_rs → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_generates_valid_calls (defines, Extracted)
+

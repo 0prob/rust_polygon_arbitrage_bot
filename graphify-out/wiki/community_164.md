@@ -1,0 +1,24 @@
+# Community 164: encode_balancer_hop_zero_slippage_fails()
+
+**Members:** 6
+
+## Nodes
+
+- **create_test_hop()** (`src_services_execution_calldata_encoders_balancer_rs_create_test_hop`, Function, degree: 5)
+- **encode_balancer_hop()** (`src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop`, Function, degree: 5)
+- **encode_balancer_hop_first_call_is_approval()** (`src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_first_call_is_approval`, Function, degree: 3)
+- **encode_balancer_hop_returns_two_calls()** (`src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_returns_two_calls`, Function, degree: 3)
+- **encode_balancer_hop_second_call_is_swap()** (`src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_second_call_is_swap`, Function, degree: 3)
+- **encode_balancer_hop_zero_slippage_fails()** (`src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_zero_slippage_fails`, Function, degree: 3)
+
+## Relationships
+
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_returns_two_calls → src_services_execution_calldata_encoders_balancer_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_returns_two_calls → src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_first_call_is_approval → src_services_execution_calldata_encoders_balancer_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_first_call_is_approval → src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_second_call_is_swap → src_services_execution_calldata_encoders_balancer_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_second_call_is_swap → src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_zero_slippage_fails → src_services_execution_calldata_encoders_balancer_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop_zero_slippage_fails → src_services_execution_calldata_encoders_balancer_rs_encode_balancer_hop (calls)
+

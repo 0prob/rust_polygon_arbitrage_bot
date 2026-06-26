@@ -16,10 +16,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(block, area);
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "No wallet balances loaded.",
-                    Theme::muted(),
-                )),
+                Line::from(Span::styled("No wallet balances loaded.", Theme::muted())),
                 Line::from(Span::raw(
                     "Connect execution wallet RPC to populate balances via oracle.",
                 )),
@@ -34,7 +31,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .title(" Portfolio / Exposure ")
         .border_style(Theme::block_border());
 
-    let header = Row::new(vec!["Symbol", "Balance", "USD", "%", "Long-tail"]).style(Theme::header());
+    let header =
+        Row::new(vec!["Symbol", "Balance", "USD", "%", "Long-tail"]).style(Theme::header());
     let rows: Vec<Row> = app
         .portfolio
         .iter()

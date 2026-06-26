@@ -12,7 +12,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .title(" Simulations & Rescore ")
         .border_style(Theme::block_border());
 
-    let header = Row::new(vec!["FP", "Route", "BF", "Live", "Slip", "Status"]).style(Theme::header());
+    let header =
+        Row::new(vec!["FP", "Route", "BF", "Live", "Slip", "Status"]).style(Theme::header());
 
     let rows: Vec<Row> = app
         .opportunities

@@ -1,6 +1,7 @@
 use std::hint::black_box;
 
 use alloy::primitives::Address;
+use criterion::{Criterion, criterion_group, criterion_main};
 use rpbot::core::types::{PoolState, ProtocolType, V2PoolState};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::bellman_ford::find_cycles_bellman_ford;
@@ -8,7 +9,6 @@ use rpbot::pipeline::cycle_finder::{find_cycles, find_cycles_multi_pass};
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair};
 use rpbot::pipeline::johnson::find_cycles_johnson_multi_pass;
 use rpbot::pipeline::types::{CycleSearchPass, RoutingGraph};
-use criterion::{Criterion, criterion_group, criterion_main};
 use ruint::aliases::U256;
 
 fn triangle_fixture() -> (StateArena, Vec<rpbot::pipeline::types::PoolMeta>) {
@@ -138,14 +138,26 @@ fn dense_ring_fixture(n: usize) -> (StateArena, RoutingGraph) {
             Address::repeat_byte(0x20 + (i % 200) as u8),
             v2(reserve, reserve * U256::from((i % 5 + 1) as u64)),
         );
-        pools.push(pool_meta_from_pair(p, ProtocolType::UniswapV2, t_in, t_out, Some(30)));
+        pools.push(pool_meta_from_pair(
+            p,
+            ProtocolType::UniswapV2,
+            t_in,
+            t_out,
+            Some(30),
+        ));
         let cross = tokens[(i + 2) % tokens.len()];
         if cross != t_in && cross != t_out {
             let p2 = arena.register_pool(
                 Address::repeat_byte(0xC0 + (i % 55) as u8),
                 v2(reserve, reserve),
             );
-            pools.push(pool_meta_from_pair(p2, ProtocolType::UniswapV2, t_in, cross, Some(30)));
+            pools.push(pool_meta_from_pair(
+                p2,
+                ProtocolType::UniswapV2,
+                t_in,
+                cross,
+                Some(30),
+            ));
         }
     }
     let graph = build_graph(&arena, &pools);

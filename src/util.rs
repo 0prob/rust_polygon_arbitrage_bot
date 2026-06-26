@@ -9,6 +9,17 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Token decimal scale (10^decimals) with fast paths for common ERC-20 precisions.
+pub fn ten_pow_u256(decimals: u8) -> U256 {
+    match decimals {
+        0 => U256::from(1u8),
+        6 => U256::from(1_000_000u128),
+        8 => U256::from(100_000_000u128),
+        18 => U256::from(10u128).pow(U256::from(18u32)),
+        other => U256::from(10u128).pow(U256::from(other as u32)),
+    }
+}
+
 pub fn u256_to_f64(v: U256) -> f64 {
     let limbs = v.as_limbs();
     if limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0 {

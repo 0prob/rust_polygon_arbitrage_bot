@@ -26,11 +26,12 @@
     clippy::map_unwrap_or,
     clippy::match_same_arms,
     clippy::ignored_unit_patterns,
-    clippy::used_underscore_binding,
+    clippy::used_underscore_binding
 )]
 
 pub mod abis;
 pub mod config;
+pub mod debug_agent;
 pub mod core;
 pub mod error;
 pub mod infra;

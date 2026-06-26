@@ -1,0 +1,27 @@
+# Community 147: encode_dodo_hop_with_transfer_all()
+
+**Members:** 7
+
+## Nodes
+
+- **create_test_hop()** (`src_services_execution_calldata_encoders_dodo_rs_create_test_hop`, Function, degree: 6)
+- **encode_dodo_hop()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop`, Function, degree: 6)
+- **encode_dodo_hop_generates_valid_calls()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_generates_valid_calls`, Function, degree: 3)
+- **encode_dodo_hop_respects_zero_for_one()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_respects_zero_for_one`, Function, degree: 3)
+- **encode_dodo_hop_returns_two_calls()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_returns_two_calls`, Function, degree: 3)
+- **encode_dodo_hop_with_explicit_transfer()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_explicit_transfer`, Function, degree: 3)
+- **encode_dodo_hop_with_transfer_all()** (`src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_transfer_all`, Function, degree: 3)
+
+## Relationships
+
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_returns_two_calls → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_returns_two_calls → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_explicit_transfer → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_explicit_transfer → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_transfer_all → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_with_transfer_all → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_respects_zero_for_one → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_respects_zero_for_one → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_generates_valid_calls → src_services_execution_calldata_encoders_dodo_rs_create_test_hop (calls)
+- src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop_generates_valid_calls → src_services_execution_calldata_encoders_dodo_rs_encode_dodo_hop (calls)
+

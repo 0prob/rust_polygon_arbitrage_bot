@@ -84,9 +84,7 @@ impl CircuitBreaker {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         if count >= max_consecutive {
-            self.trip(format!(
-                "{count} consecutive failures (last: {context})"
-            ));
+            self.trip(format!("{count} consecutive failures (last: {context})"));
             true
         } else {
             false

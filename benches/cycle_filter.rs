@@ -1,13 +1,13 @@
 use std::hint::black_box;
 
 use alloy::primitives::Address;
+use criterion::{Criterion, criterion_group, criterion_main};
 use rpbot::core::types::{FoundCycle, PoolState, ProtocolType, V2PoolState};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_filter::{dedupe_cycles_by_fingerprint, prefilter_cycles_by_atomic_sim};
 use rpbot::pipeline::cycle_finder::find_cycles_multi_pass;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair};
 use rpbot::pipeline::types::CycleSearchPass;
-use criterion::{Criterion, criterion_group, criterion_main};
 use ruint::aliases::U256;
 
 /// Build a ring graph and return the arena, graph, and discovered cycles.
@@ -33,10 +33,23 @@ fn ring_fixture(n: usize, max_hops: u32, max_cycles: usize) -> (StateArena, Vec<
             Address::repeat_byte(0x20 + (i % 200) as u8),
             v2(reserve, reserve * U256::from((i % 5 + 1) as u64)),
         );
-        pools.push(pool_meta_from_pair(p, ProtocolType::UniswapV2, t_in, t_out, Some(30)));
+        pools.push(pool_meta_from_pair(
+            p,
+            ProtocolType::UniswapV2,
+            t_in,
+            t_out,
+            Some(30),
+        ));
     }
     let graph = build_graph(&arena, &pools);
-    let cycles = find_cycles_multi_pass(&arena, &graph, &[CycleSearchPass { max_hops, max_cycles }]);
+    let cycles = find_cycles_multi_pass(
+        &arena,
+        &graph,
+        &[CycleSearchPass {
+            max_hops,
+            max_cycles,
+        }],
+    );
     (arena, cycles)
 }
 
@@ -48,7 +61,11 @@ fn bench_prefilter_atomic_sim(c: &mut Criterion) {
             let mut buf = cycles.clone();
             b.iter(|| {
                 buf.clone_from(&cycles);
-                black_box(prefilter_cycles_by_atomic_sim(black_box(&_arena), black_box(buf.clone()), keep));
+                black_box(prefilter_cycles_by_atomic_sim(
+                    black_box(&_arena),
+                    black_box(buf.clone()),
+                    keep,
+                ));
             });
         });
     }

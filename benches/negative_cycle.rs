@@ -1,9 +1,11 @@
 use std::hint::black_box;
 
-use rpbot::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
-use rpbot::pipeline::negative_cycle::{collect_negative_cycles_from_source, is_simple_cycle, route_call_count};
-use rpbot::pipeline::weighted_graph::WeightedEdge;
 use criterion::{Criterion, criterion_group, criterion_main};
+use rpbot::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
+use rpbot::pipeline::negative_cycle::{
+    collect_negative_cycles_from_source, is_simple_cycle, route_call_count,
+};
+use rpbot::pipeline::weighted_graph::WeightedEdge;
 use rustc_hash::FxHashSet;
 
 /// Build a chain of edges forming a simple cycle.
@@ -39,8 +41,16 @@ fn bench_is_simple_cycle_complex(c: &mut Criterion) {
     // Create a cycle with repeated token intermediates (worst case for SmallVec search).
     let mut edges = Vec::with_capacity(10);
     for i in 0..10 {
-        let t_in = if i % 3 == 0 { TokenIndex(0) } else { TokenIndex(i as u32) };
-        let t_out = if i % 3 == 2 { TokenIndex(10) } else { TokenIndex((i + 1) as u32) };
+        let t_in = if i % 3 == 0 {
+            TokenIndex(0)
+        } else {
+            TokenIndex(i as u32)
+        };
+        let t_out = if i % 3 == 2 {
+            TokenIndex(10)
+        } else {
+            TokenIndex((i + 1) as u32)
+        };
         edges.push(Edge {
             pool_index: PoolIndex(i as u32),
             token_in: t_in,
@@ -82,7 +92,7 @@ fn bench_collect_negative_cycles_from_source(c: &mut Criterion) {
     let edges = [
         (TokenIndex(0), TokenIndex(1), -1.0),
         (TokenIndex(1), TokenIndex(2), -2.0),
-        (TokenIndex(2), TokenIndex(0), 2.0),  // sum = -1.0 — negative cycle
+        (TokenIndex(2), TokenIndex(0), 2.0), // sum = -1.0 — negative cycle
     ];
     for (i, &(src, dst, w)) in edges.iter().enumerate() {
         adj[src.0 as usize].push(WeightedEdge {

@@ -2,18 +2,26 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rpbot::core::types::{PoolState, ProtocolType, V2PoolState};
 use rpbot::orchestrator::hf_eval::{HfEvalInput, evaluate_cycles_parallel};
+use rpbot::services::execution::gas_oracle::GasOracle;
 use rpbot::pipeline::arena::StateArena;
+use rpbot::pipeline::cycle_finder::find_cycles_multi_pass;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair};
 use rpbot::pipeline::spot_price::{SpotTable, rescore_cycles_with_table_and_gas};
-use rpbot::pipeline::types::{compare_cycle_score, CycleSearchPass};
-use rpbot::pipeline::cycle_finder::find_cycles_multi_pass;
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rpbot::pipeline::types::{CycleSearchPass, compare_cycle_score};
 use ruint::aliases::U256;
 use rustc_hash::FxHashMap;
 
-fn ring_fixture(n_tokens: usize, n_pools: usize) -> (StateArena, rpbot::pipeline::types::RoutingGraph, Vec<rpbot::core::types::FoundCycle>) {
+fn ring_fixture(
+    n_tokens: usize,
+    n_pools: usize,
+) -> (
+    StateArena,
+    rpbot::pipeline::types::RoutingGraph,
+    Vec<rpbot::core::types::FoundCycle>,
+) {
     let mut arena = StateArena::new();
     let reserve = U256::from(1_000_000u128) * U256::from(10u128).pow(U256::from(18));
     let v2 = |r0: U256, r1: U256| {
@@ -60,10 +68,13 @@ fn ring_fixture(n_tokens: usize, n_pools: usize) -> (StateArena, rpbot::pipeline
 fn bench_hf_rescore_eval(c: &mut Criterion) {
     let (arena, _graph, cycles) = ring_fixture(32, 32);
     let gas = U256::from(30_000_000_000u64);
+    let gas_oracle = GasOracle::default();
+    let flash_liquidity = rpbot::services::execution::flash_liquidity::FlashLiquidityCache::default();
     let input = HfEvalInput {
         arena: &arena,
         token_to_matic_rates: &FxHashMap::default(),
         token_decimals: &std::collections::HashMap::new(),
+        gas_oracle: &gas_oracle,
         brent_iters: 8,
         min_profit_matic: U256::from(10u128).pow(U256::from(18)),
         gas_price: gas,
@@ -72,6 +83,7 @@ fn bench_hf_rescore_eval(c: &mut Criterion) {
         max_flash_loan_usd: 50_000,
         min_profit_roi_bps: 0,
         safety_multiplier_bps: 1_000,
+        flash_liquidity: &flash_liquidity,
     };
 
     let mut group = c.benchmark_group("hf_rescore_eval");
@@ -87,9 +99,15 @@ fn bench_hf_rescore_eval(c: &mut Criterion) {
                 black_box(&mut cyc),
                 Some(gas),
                 None,
+                None,
+                None,
             );
             cyc.sort_by(compare_cycle_score);
-            black_box(evaluate_cycles_parallel(black_box(&cyc), black_box(&input)));
+            black_box(evaluate_cycles_parallel(
+                black_box(&cyc),
+                black_box(&input),
+                &FxHashMap::default(),
+            ));
         });
     });
     group.finish();
@@ -143,5 +161,10 @@ fn bench_graph_fingerprint(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hf_rescore_eval, bench_arena_hot_patch, bench_graph_fingerprint);
+criterion_group!(
+    benches,
+    bench_hf_rescore_eval,
+    bench_arena_hot_patch,
+    bench_graph_fingerprint
+);
 criterion_main!(benches);
