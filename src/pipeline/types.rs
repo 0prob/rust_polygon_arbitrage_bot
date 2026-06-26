@@ -72,7 +72,7 @@ impl RoutingGraph {
 
 pub fn route_fingerprint(edges: &[Edge]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = rustc_hash::FxHasher::default();
     for e in edges {
         e.pool_index.0.hash(&mut h);
         e.token_in.0.hash(&mut h);

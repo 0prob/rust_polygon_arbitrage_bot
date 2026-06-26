@@ -51,7 +51,7 @@ impl SpotTable {
 
     pub fn new(pool_count: usize) -> Self {
         Self {
-            values: vec![0.0; pool_count.max(1) * 2],
+            values: vec![f64::NAN; pool_count.max(1) * 2],
         }
     }
 
@@ -71,13 +71,12 @@ impl SpotTable {
 
     pub fn ensure_edge(&mut self, arena: &StateArena, edge: &Edge) -> f64 {
         let slot = Self::slot(edge.pool_index, edge.zero_for_one);
-        if self.values.get(slot).copied().unwrap_or(0.0) > 0.0 {
-            return self.values[slot];
+        let v = self.values[slot];
+        if !v.is_nan() {
+            return v;
         }
         let spot = compute_spot_price(arena, edge);
-        if let Some(v) = self.values.get_mut(slot) {
-            *v = spot;
-        }
+        self.values[slot] = spot;
         spot
     }
 

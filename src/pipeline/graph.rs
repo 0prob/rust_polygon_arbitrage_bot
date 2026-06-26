@@ -133,19 +133,21 @@ pub fn rescore_pools_in_place(
     }
     let mut spot_table = SpotTable::new(arena.pool_count());
     let mut touched = 0usize;
-    let pool_set: rustc_hash::FxHashSet<u32> = pools.iter().map(|p| p.0).collect();
     for adj in &mut graph.adjacency {
+        let mut modified = false;
         for ge in adj.iter_mut() {
-            if !pool_set.contains(&ge.edge.pool_index.0) {
-                continue;
+            if pools.iter().any(|p| p.0 == ge.edge.pool_index.0) {
+                touched += rescore_graph_edge(arena, ge, &mut spot_table);
+                modified = true;
             }
-            touched += rescore_graph_edge(arena, ge, &mut spot_table);
         }
-        adj.sort_by(|a, b| {
-            a.log_weight
-                .partial_cmp(&b.log_weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if modified {
+            adj.sort_by(|a, b| {
+                a.log_weight
+                    .partial_cmp(&b.log_weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
     }
     touched
 }
