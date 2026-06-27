@@ -140,7 +140,7 @@ impl RpcPool {
             return Ok(provider);
         }
         let provider = ProviderBuilder::new()
-            .connect_http(url.parse().map_err(anyhow::Error::msg)?)
+            .connect_reqwest(self.http.clone(), url.parse().map_err(anyhow::Error::msg)?)
             .erased();
         self.http_providers
             .inner

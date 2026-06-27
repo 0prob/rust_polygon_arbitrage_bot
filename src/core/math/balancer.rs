@@ -7,7 +7,7 @@ use super::full_math::div_rounding_up_or_zero;
 
 const MAX_IN_RATIO: U256 = U256::from_limbs([3_000_000_000_000_000_000, 0, 0, 0]); // 0.3 * 1e18
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
-const MAX_ITERATIONS: u32 = 50;
+const MAX_ITERATIONS: u32 = 25;
 
 pub fn balancer_swap_fee_from_pool_meta_fee(fee: u64) -> U256 {
     let raw = U256::from(fee);

@@ -4,7 +4,7 @@ use crate::core::types::CurvePoolState;
 
 use super::fixed_point::ONE;
 const A_MULTIPLIER: U256 = U256::from_limbs([10_000, 0, 0, 0]);
-const MAX_ITERATIONS: u32 = 255;
+const MAX_ITERATIONS: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewtonResult {
@@ -296,7 +296,7 @@ pub fn get_curve_crypto_amount_out(
     if out_rate.is_zero() {
         return U256::ZERO;
     }
-    let out = (dy * out_rate) / ONE;
+    let out = (dy * ONE) / out_rate;
     let fee_amount = (out * fee) / fee_denom;
     out.saturating_sub(fee_amount)
 }

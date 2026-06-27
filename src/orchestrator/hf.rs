@@ -141,14 +141,12 @@ pub async fn run_hf_tick(
     for c in &cycles {
         collect_flash_tokens_for_cycle(&arena, c, &mut flash_tokens, &mut flash_token_list);
     }
-    if !flash_token_list.is_empty() {
-        if let Ok(provider) = ctx.rpc.connect_state() {
-            let _ = ctx
-                .execution
-                .flash_liquidity
-                .refresh(&provider, &flash_token_list)
-                .await;
-        }
+    if !flash_token_list.is_empty() && let Ok(provider) = ctx.rpc.connect_state() {
+        let _ = ctx
+            .execution
+            .flash_liquidity
+            .refresh(&provider, &flash_token_list)
+            .await;
     }
 
     let flash_source = hf_eval_flash_source(parse_flash_policy(
@@ -291,20 +289,6 @@ pub async fn run_hf_tick(
             elapsed_ms,
             "hf profitable cycles"
         );
-        // #region agent log
-        crate::debug_agent::log(
-            "H-B",
-            "hf.rs:run_hf_tick",
-            "profitable_dispatch_spawn",
-            serde_json::json!({
-                "profitable_count": profitable_count,
-                "dry_run": ctx.config.is_dry_run(),
-                "indexer_stale": indexer_stale,
-                "route_fingerprints": route_fps,
-                "best_profit": best_profit.to_string(),
-            }),
-        );
-        // #endregion
 
         let pool_metas = snap.pool_metas.clone();
         let dispatch_arena = eval_arena.clone();

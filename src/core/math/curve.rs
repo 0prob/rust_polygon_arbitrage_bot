@@ -5,7 +5,7 @@ use crate::core::types::CurvePoolState;
 use super::fixed_point::ONE;
 const CURVE_FEE_DENOMINATOR: U256 = U256::from_limbs([10_000_000_000, 0, 0, 0]);
 const A_PRECISION: U256 = U256::from_limbs([100, 0, 0, 0]);
-const MAX_ITERATIONS: u32 = 255;
+const MAX_ITERATIONS: u32 = 128;
 
 fn get_d(xp: &[U256], a: U256) -> Option<U256> {
     if a.is_zero() || xp.len() < 2 || xp.iter().any(U256::is_zero) {
@@ -38,7 +38,7 @@ fn get_d(xp: &[U256], a: U256) -> Option<U256> {
             d_p = (d_p * d) / xn;
         }
         let d_prev = d;
-        let denominator = ((ann_minus_p * d) / A_PRECISION).saturating_add(n_plus_1 * d_p);
+        let denominator = (ann_minus_p.saturating_mul(d) / A_PRECISION).saturating_add(n_plus_1 * d_p);
         if denominator.is_zero() {
             return None;
         }
@@ -120,17 +120,19 @@ pub fn get_curve_stable_amount_out(
         return U256::ZERO;
     }
 
-    let rates: Vec<U256> = if state.rates.is_empty() {
-        vec![ONE; state.balances.len()]
+    let default_rates;
+    let rates: &[U256] = if state.rates.is_empty() {
+        default_rates = vec![ONE; state.balances.len()];
+        &default_rates
     } else {
-        state.rates.clone()
+        &state.rates
     };
 
     if rates.len() != state.balances.len() || state.fee >= CURVE_FEE_DENOMINATOR {
         return U256::ZERO;
     }
 
-    let xp = to_xp(&state.balances, &rates);
+    let xp = to_xp(&state.balances, rates);
     if xp.iter().any(U256::is_zero) {
         return U256::ZERO;
     }

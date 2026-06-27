@@ -118,11 +118,6 @@ impl NonceManager {
             return Err(anyhow::anyhow!("nonce manager not initialized"));
         }
         let mut state = self.state.lock();
-        if !state.in_flight.is_empty() {
-            return Err(anyhow::anyhow!(
-                "prior nonce still in flight — serial submission required"
-            ));
-        }
         let nonce = state.next_available();
         state.in_flight.insert(nonce);
         Ok(nonce)
@@ -131,7 +126,6 @@ impl NonceManager {
     pub fn confirm(&self, confirmed: u64) {
         let mut state = self.state.lock();
         state.in_flight.remove(&confirmed);
-        state.in_flight.retain(|n| *n > confirmed);
         state.local_nonce = state.local_nonce.max(confirmed + 1);
         state.prune_stale();
     }
@@ -219,15 +213,17 @@ mod tests {
     }
 
     #[test]
-    fn blocks_second_nonce_while_in_flight() {
+    fn allows_multiple_in_flight_nonces() {
         let mgr = NonceManager::new(Address::repeat_byte(0xab));
         mgr.initialized.store(true, Ordering::Release);
         {
             let mut s = mgr.state.lock();
             s.local_nonce = 10;
         }
-        let _ = mgr.next_nonce().unwrap();
-        assert!(mgr.next_nonce().is_err());
+        let n1 = mgr.next_nonce().unwrap();
+        assert_eq!(n1, 10);
+        let n2 = mgr.next_nonce().unwrap();
+        assert_eq!(n2, 11);
     }
 
     #[test]
@@ -253,6 +249,7 @@ mod tests {
         }
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let ok: Vec<u64> = results.into_iter().filter_map(|r| r.ok()).collect();
-        assert_eq!(ok.len(), 1, "only one in-flight nonce allowed at a time");
+        let unique: std::collections::HashSet<u64> = ok.iter().copied().collect();
+        assert_eq!(ok.len(), unique.len(), "concurrent nonces must not duplicate");
     }
 }

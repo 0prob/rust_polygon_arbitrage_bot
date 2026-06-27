@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ruint::aliases::U256;
 use rustc_hash::FxHashMap;
-use tracing::instrument;
+
 
 use alloy::primitives::Address;
 
@@ -451,16 +451,6 @@ pub fn get_dynamic_search_bounds(
     (out_low, out_high)
 }
 
-#[instrument(
-    skip(arena, cycle, token_to_matic_rates, token_decimals),
-    fields(
-        route_fingerprint = crate::pipeline::types::route_fingerprint(&cycle.edges),
-        hop_count = cycle.hop_count,
-        optimal_input = tracing::field::Empty,
-        net_profit = tracing::field::Empty,
-        total_gas = tracing::field::Empty,
-    )
-)]
 pub fn optimize_cycle(
     arena: &StateArena,
     cycle: &FoundCycle,
@@ -506,32 +496,16 @@ pub fn optimize_cycle(
     if low < economic_floor {
         low = economic_floor;
     }
-    if let Some(seeds) = seed_sims {
-        if let Some((seed_amount, seed_sim)) = seeds.first() {
-            if !seed_sim.profit.is_zero()
-                && *seed_amount >= economic_floor
-                && *seed_amount <= high
-                && *seed_amount > low
-            {
-                low = *seed_amount;
-            }
-        }
+    if let Some(seeds) = seed_sims
+        && let Some((seed_amount, seed_sim)) = seeds.first()
+        && !seed_sim.profit.is_zero()
+        && *seed_amount >= economic_floor
+        && *seed_amount <= high
+        && *seed_amount > low
+    {
+        low = *seed_amount;
     }
     if high < economic_floor || high <= low {
-        // #region agent log
-        crate::debug_agent::log(
-            "H-G",
-            "ternary.rs:optimize_cycle",
-            "optimize_bounds_invalid",
-            serde_json::json!({
-                "route_fingerprint": crate::pipeline::types::route_fingerprint(edges),
-                "low": low.to_string(),
-                "high": high.to_string(),
-                "economic_floor": economic_floor.to_string(),
-                "start_rate": start_rate.to_string(),
-            }),
-        );
-        // #endregion
         return None;
     }
     if low < economic_floor {
@@ -596,28 +570,8 @@ pub fn optimize_cycle(
         })
         .is_err()
     {
-        // #region agent log
-        crate::debug_agent::log(
-            "H-G",
-            "ternary.rs:optimize_cycle",
-            "optimize_final_reject",
-            serde_json::json!({
-                "route_fingerprint": crate::pipeline::types::route_fingerprint(edges),
-                "optimal": optimal.to_string(),
-                "profit": sim.profit.to_string(),
-                "low": low.to_string(),
-                "high": high.to_string(),
-            }),
-        );
-        // #endregion
         return None;
     }
-    tracing::Span::current().record("optimal_input", tracing::field::display(&optimal));
-    tracing::Span::current().record(
-        "net_profit",
-        tracing::field::display(&score_sim(optimal, &sim, profit_ctx)),
-    );
-    tracing::Span::current().record("total_gas", sim.total_gas);
     Some(OptimizationResult {
         optimal_input: optimal,
         expected_gross: sim.amount_out,

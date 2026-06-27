@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use rustc_hash::FxHashMap;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
@@ -12,7 +13,7 @@ use crate::error::ArbError;
 use crate::infra::hasura::{DiscoveryCursor, HasuraClient};
 use crate::infra::rpc::RpcPool;
 use crate::pipeline::fetcher::fetch_missing_pool_states;
-use crate::services::discovery::{DiscoveredPool, TokenMeta};
+use crate::services::discovery::{DiscoveredPool, TokenMeta, is_routable_pool};
 use crate::services::state_cache::StateCache;
 use crate::util::now_ms;
 
@@ -26,20 +27,27 @@ const MAX_INVALID_FETCHES: u32 = 30;
 /// Minimum interval between Hasura indexer lag checks.
 const INDEXER_HEALTH_CHECK_INTERVAL_MS: u64 = 5_000;
 
-#[derive(Default)]
 struct DiscoveryState {
     discovered: Arc<Vec<DiscoveredPool>>,
-    token_metas: Vec<TokenMeta>,
+    pool_key_index: FxHashMap<String, usize>,
+    token_metas: Arc<Vec<TokenMeta>>,
     discovery_cursor: DiscoveryCursor,
     last_discovery_ms: u64,
     hot_addresses: Vec<Address>,
     invalid_fetch_count: HashMap<Address, u32>,
 }
 
-impl DiscoveryState {
-    fn rebuild_discovered(&mut self, new_pools: Vec<DiscoveredPool>, cursor: DiscoveryCursor) {
-        self.discovered = Arc::new(new_pools);
-        self.discovery_cursor = cursor;
+impl Default for DiscoveryState {
+    fn default() -> Self {
+        Self {
+            discovered: Arc::new(Vec::new()),
+            pool_key_index: FxHashMap::default(),
+            token_metas: Arc::new(Vec::new()),
+            discovery_cursor: DiscoveryCursor::default(),
+            last_discovery_ms: 0,
+            hot_addresses: Vec::new(),
+            invalid_fetch_count: HashMap::default(),
+        }
     }
 }
 
@@ -224,30 +232,27 @@ impl StateRefreshService {
         let (added, updated) = {
             let mut state = self.discovery_state.write();
             let start_len = state.discovered.len();
-            let mut by_key: std::collections::HashMap<String, usize> = state
-                .discovered
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.pool_key.clone(), i))
-                .collect();
             let mut added = 0usize;
             let mut updated = 0usize;
             let mut new_discovered = Vec::with_capacity(start_len + result.pools.len());
             new_discovered.extend_from_slice(&state.discovered);
             for pool in result.pools {
-                if !crate::services::discovery::is_routable_pool(&pool) {
+                if !is_routable_pool(&pool) {
                     continue;
                 }
-                if let Some(&idx) = by_key.get(&pool.pool_key) {
+                if let Some(&idx) = state.pool_key_index.get(&pool.pool_key) {
                     new_discovered[idx] = pool;
                     updated += 1;
                 } else {
-                    by_key.insert(pool.pool_key.clone(), new_discovered.len());
+                    state
+                        .pool_key_index
+                        .insert(pool.pool_key.clone(), new_discovered.len());
                     new_discovered.push(pool);
                     added += 1;
                 }
             }
-            state.rebuild_discovered(new_discovered, result.cursor.clone());
+            state.discovered = Arc::new(new_discovered);
+            state.discovery_cursor = result.cursor.clone();
             (added, updated)
         };
 
@@ -280,7 +285,7 @@ impl StateRefreshService {
         match self.hasura.fetch_token_metas().await {
             Ok(metas) => {
                 let count = metas.len();
-                self.discovery_state.write().token_metas = metas;
+                self.discovery_state.write().token_metas = Arc::new(metas);
                 info!(count, "token metadata refreshed");
             }
             Err(e) => warn!(error = %e, "token metadata refresh failed"),
@@ -341,6 +346,12 @@ impl StateRefreshService {
             .collect();
         let removed = before - retained.len();
         state.discovered = Arc::new(retained);
+        state.pool_key_index = state
+            .discovered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.pool_key.clone(), i))
+            .collect();
 
         for addr in &to_remove {
             state.invalid_fetch_count.remove(addr);
@@ -355,8 +366,8 @@ impl StateRefreshService {
         }
     }
 
-    pub fn token_metas(&self) -> Vec<TokenMeta> {
-        self.discovery_state.read().token_metas.clone()
+    pub fn token_metas(&self) -> Arc<Vec<TokenMeta>> {
+        Arc::clone(&self.discovery_state.read().token_metas)
     }
 
     pub fn token_decimals_map(&self) -> HashMap<Address, u8> {

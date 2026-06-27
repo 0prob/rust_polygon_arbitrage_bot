@@ -359,7 +359,7 @@ pub fn load_dotenv() {
     let _ = dotenvy::dotenv();
 }
 
-fn env_var(key: &str) -> Option<String> {
+pub(crate) fn env_var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|v| v.trim().to_string())

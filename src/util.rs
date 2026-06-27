@@ -2,6 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ruint::aliases::U256;
 
+const BN18: U256 = U256::from_limbs([1000000000000000000, 0, 0, 0]);
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -15,7 +17,7 @@ pub fn ten_pow_u256(decimals: u8) -> U256 {
         0 => U256::from(1u8),
         6 => U256::from(1_000_000u128),
         8 => U256::from(100_000_000u128),
-        18 => U256::from(10u128).pow(U256::from(18u32)),
+        18 => BN18,
         other => U256::from(10u128).pow(U256::from(other as u32)),
     }
 }

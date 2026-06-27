@@ -214,12 +214,14 @@ fn build_curve_plan(plan: &mut PoolFetchPlan) {
         encode_call(&ICurvePool::stored_ratesCall {}),
         CallKind::CurveRates,
     );
-    push_call(
-        plan,
-        plan.pool.address,
-        encode_call(&ICurvePool::gammaCall {}),
-        CallKind::CurveGamma,
-    );
+    if plan.pool.protocol == ProtocolType::CurveCrypto {
+        push_call(
+            plan,
+            plan.pool.address,
+            encode_call(&ICurvePool::gammaCall {}),
+            CallKind::CurveGamma,
+        );
+    }
 }
 
 fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {

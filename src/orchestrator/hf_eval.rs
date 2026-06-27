@@ -81,24 +81,6 @@ pub struct HfEvalInputOwned {
 }
 
 impl HfEvalInputOwned {
-    pub fn from_input(input: &HfEvalInput<'_>, arena: StateArena) -> Self {
-        Self {
-            arena,
-            token_to_matic_rates: Arc::new(input.token_to_matic_rates.clone()),
-            token_decimals: Arc::new(input.token_decimals.clone()),
-            gas_oracle: Arc::new(GasOracle::default()),
-            brent_iters: input.brent_iters,
-            min_profit_matic: input.min_profit_matic,
-            min_profit_roi_bps: input.min_profit_roi_bps,
-            gas_price: input.gas_price,
-            slippage_bps: input.slippage_bps,
-            flash_source: input.flash_source,
-            max_flash_loan_usd: input.max_flash_loan_usd,
-            safety_multiplier_bps: input.safety_multiplier_bps,
-            flash_liquidity: Arc::new(FlashLiquidityCache::new()),
-        }
-    }
-
     pub fn with_shared_maps(
         arena: StateArena,
         token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
@@ -306,34 +288,6 @@ pub async fn rescore_rank_and_evaluate_async(
         .map_err(|e| anyhow::anyhow!("hf eval task failed: {e}"))
 }
 
-/// Run cycle evaluation on a dedicated rayon pool so Tokio workers stay responsive.
-pub async fn evaluate_cycles_parallel_async(
-    cycles: Vec<FoundCycle>,
-    input: HfEvalInputOwned,
-) -> anyhow::Result<Vec<HfEvalResult>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    HF_EVAL_POOL.spawn(move || {
-        let eval = HfEvalInput {
-            arena: &input.arena,
-            token_to_matic_rates: &input.token_to_matic_rates,
-            token_decimals: &input.token_decimals,
-            gas_oracle: &input.gas_oracle,
-            brent_iters: input.brent_iters,
-            min_profit_matic: input.min_profit_matic,
-            min_profit_roi_bps: input.min_profit_roi_bps,
-            gas_price: input.gas_price,
-            slippage_bps: input.slippage_bps,
-            flash_source: input.flash_source,
-            max_flash_loan_usd: input.max_flash_loan_usd,
-            safety_multiplier_bps: input.safety_multiplier_bps,
-            flash_liquidity: input.flash_liquidity.as_ref(),
-        };
-        let _ = tx.send(evaluate_cycles_parallel(&cycles, &eval, &FxHashMap::default()));
-    });
-    rx.await
-        .map_err(|e| anyhow::anyhow!("hf eval task failed: {e}"))
-}
-
 fn evaluate_one(
     cycle: &FoundCycle,
     input: &HfEvalInput<'_>,
@@ -342,23 +296,7 @@ fn evaluate_one(
     let route_fp_orig = route_fingerprint(&cycle.edges);
     let cycle = prefer_aave_flash_start(cycle, input.arena, input.flash_liquidity);
     let route_fp = route_fingerprint(&cycle.edges);
-    let log_exit = |reason: &str, extra: serde_json::Value| {
-        // #region agent log
-        crate::debug_agent::log(
-            "H-F",
-            "hf_eval.rs:evaluate_one",
-            "eval_exit",
-            serde_json::json!({
-                "route_fingerprint": route_fp,
-                "route_fingerprint_orig": route_fp_orig,
-                "reason": reason,
-                "extra": extra,
-            }),
-        );
-        // #endregion
-    };
     if !balancer_route_flash_feasible(&cycle, input.arena, input.flash_liquidity) {
-        log_exit("balancer_flash_infeasible", serde_json::json!({}));
         return None;
     }
     let base_slippage = effective_slippage_bps(input.slippage_bps, 0);
@@ -377,7 +315,7 @@ fn evaluate_one(
         probe_sims
             .get(&route_fp)
             .or_else(|| probe_sims.get(&route_fp_orig))
-            .and_then(|sim| {
+            .map(|sim| {
                 let start_decimals = resolve_token_decimals_for_index(
                     cycle.start_token,
                     input.arena,
@@ -389,14 +327,14 @@ fn evaluate_one(
                     input.token_to_matic_rates,
                 );
                 let probe_amount = profit_probe_amount(start_decimals, rate);
-                Some(vec![(probe_amount, sim.clone())])
+                vec![(probe_amount, sim.clone())]
             })
     } else {
         None
     };
     let seed_slice = seed_sims.as_deref();
 
-    let Some(mut opt) = optimize_cycle(
+    let mut opt = optimize_cycle(
         input.arena,
         &cycle,
         input.token_to_matic_rates,
@@ -406,30 +344,21 @@ fn evaluate_one(
         None,
         &profit_ctx,
         seed_slice,
-    ) else {
-        log_exit("optimize_none", serde_json::json!({}));
-        return None;
-    };
+    )?;
 
-    let Some(mut sim) = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input) else {
-        log_exit("simulate_none", serde_json::json!({ "amount_in": opt.optimal_input.to_string() }));
-        return None;
-    };
+    let mut sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
     if !local_sim::route_cl_fidelity_ok(
         input.arena,
         &cycle.edges,
         opt.optimal_input,
         crate::pipeline::spot_price::SPOT_PROBE,
     ) {
-        log_exit("cl_fidelity_fail", serde_json::json!({ "amount_in": opt.optimal_input.to_string() }));
         return None;
     }
     if sim.profit.is_zero() {
-        log_exit("zero_profit", serde_json::json!({ "amount_in": sim.amount_in.to_string() }));
         return None;
     }
-    if let Some(reason) = sim_sanity_reject(&cycle, input, &sim, opt.search_low) {
-        log_exit("sim_sanity", serde_json::json!({ "reject": format!("{reason:?}") }));
+    if sim_sanity_reject(&cycle, input, &sim, opt.search_low).is_some() {
         return None;
     }
 
@@ -495,24 +424,6 @@ fn evaluate_one(
 
     let assessment = assess_route_for_cycle(input, &sim, &cycle, slippage_bps)?;
 
-    // #region agent log
-    if assessment.should_execute || assessment.reject_reason.is_some() {
-        crate::debug_agent::log(
-            "H-A",
-            "hf_eval.rs:evaluate_one",
-            "eval_assessment",
-            serde_json::json!({
-                "route_fingerprint": route_fp,
-                "should_execute": assessment.should_execute,
-                "reject_reason": assessment.reject_reason,
-                "net_profit_matic_wei": assessment.net_profit_after_gas_matic_wei.to_string(),
-                "amount_in": sim.amount_in.to_string(),
-                "gross_profit": sim.profit.to_string(),
-            }),
-        );
-    }
-    // #endregion
-
     Some(HfEvalResult {
         cycle: cycle.clone(),
         opt,
@@ -567,25 +478,14 @@ fn sim_sanity_reject(
         input.arena,
         input.token_decimals,
     );
-    match check_sim_sanity(SimSanityInput {
+    check_sim_sanity(SimSanityInput {
         amount_in: sim.amount_in,
         gross_profit: sim.profit,
         search_low,
         token_decimals,
         token_to_matic_rate,
-    }) {
-        Ok(()) => None,
-        Err(reason) => {
-            tracing::debug!(
-                route_fingerprint = crate::pipeline::types::route_fingerprint(&cycle.edges),
-                amount_in = %sim.amount_in,
-                gross_profit = %sim.profit,
-                ?reason,
-                "simulation rejected — sanity check"
-            );
-            Some(reason)
-        }
-    }
+    })
+    .err()
 }
 
 use rayon::prelude::*;

@@ -160,10 +160,10 @@ mod tests {
         let result = encode_v4_hop(&hop, recipient, &arena);
         let calls = result.unwrap();
 
-        // First call should be approval to executor
+        // First call should be approval to token_in
         assert_eq!(
-            calls[0].target, recipient,
-            "First call should target executor (recipient)"
+            calls[0].target, hop.token_in,
+            "First call should target token_in"
         );
         assert_eq!(
             calls[0].value,

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -18,8 +19,12 @@ use crate::util::now_ms;
 /// Max pool addresses per `eth_subscribe` filter (provider limits vary; 50 is conservative).
 const SUBSCRIBE_CHUNK: usize = 50;
 
-/// Reconnect backoff after WSS disconnect.
-const RECONNECT_DELAY_MS: u64 = 2_000;
+/// Base reconnect delay (doubles on each failure, capped at MAX_RECONNECT_DELAY_MS).
+const BASE_RECONNECT_DELAY_MS: u64 = 500;
+const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+
+/// Silence timeout: if no log arrives within this window, the connection is considered stale.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct PoolLogFeed {
     wss_url: String,
@@ -49,6 +54,7 @@ impl PoolLogFeed {
     pub async fn run(mut self) {
         let mut addr_rx = self.addresses.watch();
         let mut current_addrs = addr_rx.borrow().clone();
+        let mut backoff_ms = BASE_RECONNECT_DELAY_MS;
 
         loop {
             if *self.shutdown.borrow() {
@@ -57,6 +63,7 @@ impl PoolLogFeed {
             }
 
             if current_addrs.is_empty() {
+                backoff_ms = BASE_RECONNECT_DELAY_MS;
                 tokio::select! {
                     _ = self.shutdown.changed() => {
                         if *self.shutdown.borrow() { break; }
@@ -75,19 +82,30 @@ impl PoolLogFeed {
                 "starting filtered log subscriptions"
             );
 
-            match self
-                .run_subscriptions(&current_addrs, self.shutdown.clone())
-                .await
-            {
+            let outcome = self
+                .run_subscriptions(&current_addrs, self.shutdown.clone(), &mut addr_rx)
+                .await;
+
+            // Pick up any address changes that arrived during the subscription.
+            current_addrs.clone_from(&addr_rx.borrow());
+
+            match &outcome {
                 Ok(()) => warn!("pool log feed subscriptions ended — reconnecting"),
                 Err(e) => error!(error = %e, "pool log feed error — reconnecting"),
             }
 
+            // ponytail: linear backoff capped at MAX_RECONNECT_DELAY. Exponential backoff
+            // adds complexity; linear to 30s is sufficient given the WSS reconnect triggers
+            // within one idle cycle.
             tokio::select! {
                 _ = self.shutdown.changed() => {
                     if *self.shutdown.borrow() { break; }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS)) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {
+                    if backoff_ms < MAX_RECONNECT_DELAY_MS {
+                        backoff_ms = (backoff_ms * 2).min(MAX_RECONNECT_DELAY_MS);
+                    }
+                }
                 _ = addr_rx.changed() => {
                     current_addrs.clone_from(&addr_rx.borrow());
                 }
@@ -99,6 +117,7 @@ impl PoolLogFeed {
         &self,
         addresses: &[Address],
         mut shutdown: watch::Receiver<bool>,
+        addr_rx: &mut watch::Receiver<Vec<Address>>,
     ) -> anyhow::Result<()> {
         let ws = WsConnect::new(self.wss_url.clone());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -124,11 +143,18 @@ impl PoolLogFeed {
                         return Ok(());
                     }
                 }
+                _ = addr_rx.changed() => {
+                    return Ok(());
+                }
                 maybe_log = merged.next() => {
                     let Some(log) = maybe_log else {
                         return Ok(());
                     };
                     self.handle_log(&log);
+                }
+                _ = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
+                    warn!("WSS stream idle for {STREAM_IDLE_TIMEOUT:?} — reconnecting");
+                    return Ok(());
                 }
             }
         }
@@ -164,7 +190,11 @@ pub fn spawn_pool_log_feed(
             .as_ref()
             .or(config.rpc.polygon_rpc_urls.first())
             .and_then(|url| http_to_wss(url.as_str()))
-    })?;
+    });
+    let Some(wss_url) = wss_url else {
+        warn!("stream enabled but no WSS URL configured or derivable from RPC URLs");
+        return None;
+    };
     info!(url = %mask_wss_url(&wss_url), "pool log WSS feed enabled");
     let feed = PoolLogFeed::new(wss_url, partial, addresses, metrics, shutdown);
     Some(tokio::spawn(async move {

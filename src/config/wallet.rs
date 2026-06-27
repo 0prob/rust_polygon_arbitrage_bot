@@ -57,7 +57,7 @@ impl WalletSecrets {
 }
 
 fn load_key_material(config: &mut AppConfig) -> anyhow::Result<Option<Zeroizing<String>>> {
-    if let Some(path) = env_var("PRIVATE_KEY_FILE") {
+        if let Some(path) = super::env_var("PRIVATE_KEY_FILE") {
         let contents = fs::read_to_string(Path::new(&path))
             .map_err(|e| anyhow::anyhow!("failed to read PRIVATE_KEY_FILE {path}: {e}"))?;
         let trimmed = contents.trim().to_string();
@@ -69,7 +69,7 @@ fn load_key_material(config: &mut AppConfig) -> anyhow::Result<Option<Zeroizing<
     }
 
     if config.execution.private_key.is_none()
-        && let Some(key) = env_var("PRIVATE_KEY")
+            && let Some(key) = super::env_var("PRIVATE_KEY")
     {
         config.execution.private_key = Some(key);
     }
@@ -77,12 +77,7 @@ fn load_key_material(config: &mut AppConfig) -> anyhow::Result<Option<Zeroizing<
     Ok(config.execution.private_key.take().map(Zeroizing::new))
 }
 
-fn env_var(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
+
 
 #[cfg(test)]
 mod tests {

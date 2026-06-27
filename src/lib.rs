@@ -31,7 +31,6 @@
 
 pub mod abis;
 pub mod config;
-pub mod debug_agent;
 pub mod core;
 pub mod error;
 pub mod infra;

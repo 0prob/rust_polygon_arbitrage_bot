@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::Ethereum;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider};
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use ruint::aliases::U256;
 use rustc_hash::FxHashMap;
 use tokio::sync::watch;
@@ -24,7 +24,7 @@ const ROUTE_GAS_HISTORY: usize = 256;
 pub struct GasOracle {
     snapshot: ArcSwap<Option<FeeSnapshot>>,
     poll_interval: Duration,
-    route_gas: Mutex<FxHashMap<u64, u32>>,
+    route_gas: RwLock<FxHashMap<u64, u32>>,
     /// Latest observed/simulated ratio in bps (10_000 = 1.0×) for heuristic uplift.
     sim_scale_bps: AtomicU32,
 }
@@ -40,14 +40,14 @@ impl GasOracle {
         Self {
             snapshot: ArcSwap::from_pointee(None),
             poll_interval,
-            route_gas: Mutex::new(FxHashMap::default()),
+            route_gas: RwLock::new(FxHashMap::default()),
             sim_scale_bps: AtomicU32::new(10_000),
         }
     }
 
     /// Prefer dry-run / on-chain gas for this route fingerprint, else scaled heuristic.
     pub fn route_gas_or_heuristic(&self, route_fp: u64, heuristic: u32) -> u32 {
-        if let Some(&observed) = self.route_gas.lock().get(&route_fp) {
+        if let Some(&observed) = self.route_gas.read().get(&route_fp) {
             return observed;
         }
         let scale = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000);
@@ -60,11 +60,9 @@ impl GasOracle {
         if gas == 0 {
             return;
         }
-        let mut map = self.route_gas.lock();
-        if map.len() >= ROUTE_GAS_HISTORY {
-            if let Some(key) = map.keys().next().copied() {
-                map.remove(&key);
-            }
+        let mut map = self.route_gas.write();
+        if map.len() >= ROUTE_GAS_HISTORY && let Some(key) = map.keys().next().copied() {
+            map.remove(&key);
         }
         map.insert(route_fp, gas);
     }
@@ -74,7 +72,7 @@ impl GasOracle {
         if simulated == 0 || observed == 0 {
             return;
         }
-        let ratio_bps = ((observed * 10_000) / u64::from(simulated)).min(u64::from(u32::MAX)) as u32;
+        let ratio_bps = ((observed.saturating_mul(10_000)) / u64::from(simulated)).min(u64::from(u32::MAX)) as u32;
         let prev = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000);
         let blended = ((u64::from(prev) * 3 + u64::from(ratio_bps)) / 4) as u32;
         self.sim_scale_bps.store(blended.max(10_000), Ordering::Relaxed);
@@ -116,10 +114,9 @@ impl GasOracle {
 
     pub async fn start_background(
         self: Arc<Self>,
-        rpc_url: &str,
+        provider: DynProvider,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         if let Err(e) = self.refresh_once(&provider).await {
             warn!(error = %e, "initial gas oracle refresh failed");
         }

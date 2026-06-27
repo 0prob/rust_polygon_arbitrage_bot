@@ -9,6 +9,8 @@ use crate::services::execution::calldata::types::CalldataHop;
 use crate::services::execution::profit::slippage_adjusted;
 use crate::services::execution::quote::quote_hop_for_execution;
 
+#[cfg(test)]
+use super::shared::derive_balancer_pool_id;
 use super::shared::resolve_balancer_pool_id;
 
 const BALANCER_GIVEN_IN: u8 = 0;
@@ -82,7 +84,7 @@ mod tests {
             token_out: Address::repeat_byte(0x03),
             amount_in: U256::from(1000),
             amount_out: U256::from(900),
-            pool_id: None,
+            pool_id: Some(derive_balancer_pool_id(Address::repeat_byte(0x01))),
             protocol_label: None,
             router: None,
             hooks: None,

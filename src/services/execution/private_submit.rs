@@ -1,10 +1,13 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use alloy::eips::eip2718::Encodable2718;
 use alloy::hex;
 use alloy::network::Ethereum;
 use alloy::primitives::B256;
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
+use alloy::signers::local::PrivateKeySigner;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -85,7 +88,7 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
     };
 
     let (supports_private_rpc_method, private_method_error) = match rpc_call(
-        &client,
+        client,
         url,
         "eth_sendRawTransactionPrivate",
         serde_json::json!(["0x00"]),
@@ -237,6 +240,71 @@ pub fn log_probe_report(probe: &PrivateSubmitProbe) {
     }
     if let Some(ref err) = probe.private_method_error {
         warn!(error = %err, "private RPC method probe detail");
+    }
+}
+
+/// Configuration for private transaction submission.
+#[derive(Debug, Clone)]
+pub struct PrivateSubmitConfig {
+    pub mode: PrivateSubmitMode,
+    pub signer: PrivateKeySigner,
+    pub chain_id: u64,
+    pub private_url: Option<String>,
+    pub bloxroute_auth: Option<String>,
+}
+
+/// Sign a [`TransactionRequest`] and return EIP-2718-encoded raw bytes
+/// suitable for `eth_sendRawTransaction*` or `polygon_private_tx`.
+pub async fn sign_tx_to_raw(
+    tx: TransactionRequest,
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+) -> anyhow::Result<Vec<u8>> {
+    use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy::network::TxSigner;
+
+    let mut unsigned = TxEip1559 {
+        chain_id,
+        nonce: tx.nonce.ok_or_else(|| anyhow::anyhow!("nonce required"))?,
+        gas_limit: tx.gas.ok_or_else(|| anyhow::anyhow!("gas_limit required"))?,
+        max_fee_per_gas: tx.max_fee_per_gas.ok_or_else(|| anyhow::anyhow!("max_fee_per_gas required"))?,
+        max_priority_fee_per_gas: tx.max_priority_fee_per_gas.ok_or_else(|| anyhow::anyhow!("max_priority_fee_per_gas required"))?,
+        to: tx.to.ok_or_else(|| anyhow::anyhow!("to address required"))?,
+        value: tx.value.unwrap_or_default(),
+        access_list: tx.access_list.unwrap_or_default(),
+        input: tx.input.into_input().unwrap_or_default(),
+    };
+
+    let sig = signer
+        .sign_transaction(&mut unsigned)
+        .await
+        .map_err(|e| anyhow::anyhow!("tx signing failed: {e}"))?;
+    let envelope = TxEnvelope::Eip1559(unsigned.into_signed(sig));
+    Ok(envelope.encoded_2718())
+}
+
+/// Dispatch a signed raw transaction to the configured private submit endpoint.
+pub async fn submit_signed_raw(
+    raw: &[u8],
+    cfg: &PrivateSubmitConfig,
+) -> anyhow::Result<B256> {
+    match cfg.mode {
+        PrivateSubmitMode::Bloxroute => {
+            let auth = cfg
+                .bloxroute_auth
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("bloxroute_auth required for Bloxroute mode"))?;
+            submit_bloxroute_private(raw, auth).await
+        }
+        PrivateSubmitMode::PolygonPrivateRpc => {
+            let url = cfg.private_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("private_url required for PolygonPrivateRpc mode")
+            })?;
+            submit_polygon_private_rpc(url, raw).await
+        }
+        PrivateSubmitMode::Standard => {
+            anyhow::bail!("submit_signed_raw called with Standard mode — use provider path")
+        }
     }
 }
 

@@ -9,6 +9,7 @@ use super::candidate::CandidateExecution;
 use super::gas::{default_priority_fee_wei, u256_to_u128};
 use super::gas_oracle::GasOracle;
 use super::nonce::NonceManager;
+use super::private_submit::{PrivateSubmitConfig, sign_tx_to_raw, submit_signed_raw};
 use super::rpc_errors::{SubmitAction, classify_submit_error, extract_tx_hash_from_error};
 
 pub const FEE_BUMP_BPS: u64 = 1500;
@@ -84,7 +85,7 @@ pub fn build_transaction_request(
 }
 
 #[instrument(
-    skip(provider, candidate, fees),
+    skip(provider, candidate, fees, private),
     fields(
         route_fingerprint = candidate.route_fingerprint,
         nonce,
@@ -98,10 +99,21 @@ pub async fn submit_live_candidate<P: Provider<Ethereum>>(
     nonce: u64,
     fees: &SubmitFees,
     gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
 ) -> Result<B256> {
     let tx = build_transaction_request(candidate, nonce, fees, gas_limit)?;
-    let pending = provider.send_transaction(tx).await?;
-    let hash = *pending.tx_hash();
+
+    let hash = if let Some(cfg) = private
+        && cfg.mode != super::private_submit::PrivateSubmitMode::Standard
+    {
+        let chain_id = cfg.chain_id;
+        let raw = sign_tx_to_raw(tx, &cfg.signer, chain_id).await?;
+        submit_signed_raw(&raw, cfg).await?
+    } else {
+        let pending = provider.send_transaction(tx).await?;
+        *pending.tx_hash()
+    };
+
     tracing::Span::current().record("tx_hash", tracing::field::display(&hash));
     info!(
         route = candidate.route_fingerprint,
@@ -123,11 +135,12 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
     mut nonce: u64,
     mut fees: SubmitFees,
     gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
 ) -> Result<B256> {
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        match submit_live_candidate(provider, candidate, nonce, &fees, gas_limit).await {
+        match submit_live_candidate(provider, candidate, nonce, &fees, gas_limit, private).await {
             Ok(hash) => return Ok(hash),
             Err(e) => {
                 if attempts >= MAX_SUBMIT_ATTEMPTS {

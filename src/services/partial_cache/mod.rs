@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy::primitives::{Address, B256, U256};
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashSet;
 use tokio::sync::watch;
 
 pub use decode::{LogPatch, V2_SYNC_TOPIC, V3_SWAP_TOPIC, decode_pool_log, is_streamable_protocol};
@@ -94,6 +95,7 @@ pub struct PartialPoolCache {
     pools: DashMap<Address, SlimPoolState>,
     patches: AtomicU64,
     trigger: StreamTrigger,
+    dirty: parking_lot::Mutex<FxHashSet<Address>>,
 }
 
 impl PartialPoolCache {
@@ -102,6 +104,7 @@ impl PartialPoolCache {
             pools: DashMap::new(),
             patches: AtomicU64::new(0),
             trigger: StreamTrigger::new(),
+            dirty: Mutex::new(FxHashSet::default()),
         }
     }
 
@@ -187,14 +190,26 @@ impl PartialPoolCache {
                 }
             }
         }
+        self.dirty.lock().insert(pool);
         self.patches.fetch_add(1, Ordering::Relaxed);
         self.trigger.notify();
     }
 
     /// Merge slim snapshots into the shared `StateCache` for pools that already have full state.
+    /// Only flushes pools that have been modified since last drain — prevents unnecessary
+    /// StateCache generation bumps when seeding re-applies identical values.
     pub fn flush_to_state_cache(&self, cache: &StateCache, addresses: &[Address]) -> usize {
+        let dirty_addrs: Vec<Address> = {
+            let mut d = self.dirty.lock();
+            let addrs: Vec<Address> = addresses.iter().filter(|a| d.contains(*a)).copied().collect();
+            d.clear();
+            addrs
+        };
+        if dirty_addrs.is_empty() {
+            return 0;
+        }
         let mut flushed = 0usize;
-        for addr in addresses {
+        for addr in &dirty_addrs {
             let Some(slim) = self.get(addr) else {
                 continue;
             };
@@ -374,10 +389,7 @@ mod tests {
                 fee_denominator: U256::from(10_000u64),
             }),
         );
-        partial.seed(
-            addr,
-            SlimPoolState::from_v2(U256::from(150u64), U256::from(250u64), 0),
-        );
+        partial.apply_patch(addr, LogPatch::V2Reserves { reserve0: U256::from(150u64), reserve1: U256::from(250u64) }, 0);
         assert_eq!(partial.flush_to_state_cache(&cache, &[addr]), 1);
         match cache.get(&addr).unwrap() {
             PoolState::V2(s) => {

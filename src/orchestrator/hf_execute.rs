@@ -86,30 +86,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
         .collect();
     if fps.iter().all(|fp| ctx.execution.any_quarantined(&[*fp])) {
         info!("all profitable routes quarantined — skipping dispatch");
-        // #region agent log
-        crate::debug_agent::log(
-            "H-B",
-            "hf_execute.rs:dispatch_with_provider",
-            "dispatch_skipped_all_quarantined",
-            serde_json::json!({ "route_fingerprints": fps }),
-        );
-        // #endregion
         return;
     }
-
-    // #region agent log
-    crate::debug_agent::log(
-        "H-B",
-        "hf_execute.rs:dispatch_with_provider",
-        "dispatch_enter",
-        serde_json::json!({
-            "route_count": profitable.len(),
-            "dry_run": ctx.config.is_dry_run(),
-            "route_fingerprints": fps,
-        }),
-    );
-    // #endregion
-
     let snap = ctx.snapshots.read();
     let flash_policy = parse_flash_policy(&ctx.config.execution.flash_loan_source);
     let gas_price = ctx.gas_oracle.conservative_gas_price();
@@ -256,25 +234,24 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
                     }
                 };
 
-            if route_index < top_n_gas {
-                if let Some(gas) =
+            if route_index < top_n_gas
+                && let Some(gas) =
                     estimate_candidate_gas(sim_provider, &candidate, operator).await
+            {
+                ctx.gas_oracle
+                    .record_sim_observed(candidate.simulated_gas, gas);
+                candidate.simulated_gas = gas.min(u32::MAX as u64) as u32;
+                if let Some(limit) =
+                    crate::services::execution::gas::buffer_gas_limit(candidate.simulated_gas)
                 {
-                    ctx.gas_oracle
-                        .record_sim_observed(candidate.simulated_gas, gas);
-                    candidate.simulated_gas = gas.min(u32::MAX as u64) as u32;
-                    if let Some(limit) =
-                        crate::services::execution::gas::buffer_gas_limit(candidate.simulated_gas)
-                    {
-                        candidate.gas_limit = Some(limit);
-                    }
-                    debug!(
-                        route_fingerprint = route_fp,
-                        estimate_gas = gas,
-                        simulated_gas = candidate.simulated_gas,
-                        "top-N estimate_gas applied"
-                    );
+                    candidate.gas_limit = Some(limit);
                 }
+                debug!(
+                    route_fingerprint = route_fp,
+                    estimate_gas = gas,
+                    simulated_gas = candidate.simulated_gas,
+                    "top-N estimate_gas applied"
+                );
             }
 
             let outcome = ctx
@@ -292,17 +269,6 @@ async fn dispatch_with_provider<P: Provider<Ethereum>>(
                     Some(ctx.metrics.as_ref()),
                 )
                 .await;
-            // #region agent log
-            crate::debug_agent::log(
-                "H-D",
-                "hf_execute.rs:dispatch_with_provider",
-                "execution_outcome",
-                serde_json::json!({
-                    "route_fingerprint": candidate.route_fingerprint,
-                    "outcome": format!("{outcome:?}"),
-                }),
-            );
-            // #endregion
             match outcome {
                 ExecutionOutcome::DryRunPassed { gas_used } => {
                     ctx.metrics.record_dry_run_passed();

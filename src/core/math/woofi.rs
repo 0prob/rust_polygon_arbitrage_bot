@@ -1,9 +1,19 @@
-use ruint::aliases::U256;
+use ruint::aliases::{U256, U512};
 
 use crate::core::types::{WoofiBaseTokenState, WoofiPoolState};
 
 use super::fixed_point::ONE;
 const WOOFI_FEE_DENOMINATOR: U256 = U256::from_limbs([100_000, 0, 0, 0]);
+
+fn mul_div_triple(a: U256, b: U256, c: U256, d: U256, e: U256) -> U256 {
+    (U512::from(a) * U512::from(b) * U512::from(c) / (U512::from(d) * U512::from(e)))
+        .wrapping_to::<U256>()
+}
+
+fn mul_triple_div_single(a: U256, b: U256, c: U256, d: U256) -> U256 {
+    (U512::from(a) * U512::from(b) * U512::from(c) / U512::from(d))
+        .wrapping_to::<U256>()
+}
 
 fn has_positive_swap_factor(gamma: U256, spread: U256) -> bool {
     gamma <= ONE && spread <= ONE && gamma + spread < ONE
@@ -25,12 +35,12 @@ fn calc_quote_amount_sell_base(
     }
 
     let notional_swap =
-        (base_amount * base.price * base.quote_dec) / (base.base_dec * base.price_dec);
+        mul_div_triple(base_amount, base.price, base.quote_dec, base.base_dec, base.price_dec);
     if !base.max_notional_swap.is_zero() && notional_swap > base.max_notional_swap {
         return U256::ZERO;
     }
 
-    let gamma = (base_amount * base.price * base.coeff) / (base.price_dec * base.base_dec);
+    let gamma = mul_div_triple(base_amount, base.price, base.coeff, base.price_dec, base.base_dec);
     if !base.max_gamma.is_zero() && gamma > base.max_gamma {
         return U256::ZERO;
     }
@@ -38,8 +48,8 @@ fn calc_quote_amount_sell_base(
         return U256::ZERO;
     }
 
-    (((base_amount * base.price * base.quote_dec) / base.price_dec) * (ONE - gamma - spread))
-        / (ONE * base.base_dec)
+    let quote_no_spread = mul_triple_div_single(base_amount, base.price, base.quote_dec, base.price_dec);
+    (quote_no_spread * (ONE - gamma - spread)) / (ONE * base.base_dec)
 }
 
 fn calc_base_amount_sell_quote(
@@ -69,8 +79,8 @@ fn calc_base_amount_sell_quote(
         return U256::ZERO;
     }
 
-    (((quote_amount * base.base_dec * base.price_dec) / base.price) * (ONE - gamma - spread))
-        / (ONE * base.quote_dec)
+    let base_no_spread = mul_triple_div_single(quote_amount, base.base_dec, base.price_dec, base.price);
+    (base_no_spread * (ONE - gamma - spread)) / (ONE * base.quote_dec)
 }
 
 fn apply_woofi_fee(amount: U256, fee_rate: U256) -> U256 {
@@ -146,20 +156,3 @@ pub fn get_woofi_amount_out(
     base_out
 }
 
-pub fn simulate_woofi_swap(
-    state: &WoofiPoolState,
-    amount_in: U256,
-    token_in_is_quote: bool,
-    token_out_is_quote: bool,
-    base_in_idx: Option<usize>,
-    base_out_idx: Option<usize>,
-) -> U256 {
-    get_woofi_amount_out(
-        state,
-        amount_in,
-        token_in_is_quote,
-        token_out_is_quote,
-        base_in_idx,
-        base_out_idx,
-    )
-}

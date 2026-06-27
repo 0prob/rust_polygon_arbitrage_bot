@@ -6,6 +6,8 @@
 //!
 //! See: <https://docs.rs/hypersync-client/latest/hypersync_client/>
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use hypersync_client::Client;
@@ -18,11 +20,14 @@ use crate::config::RpcConfig;
 use crate::core::constants::POLYGON_CHAIN_ID;
 
 const DEFAULT_RECEIPT_LOOKBACK: u64 = 50;
+const HEIGHT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Thin wrapper around [`hypersync_client::Client`] for the arb bot.
 pub struct HyperSyncService {
     client: Client,
     chain_id: u64,
+    cached_height: AtomicU64,
+    cached_height_at: AtomicU64, // unix millis
 }
 
 impl HyperSyncService {
@@ -39,19 +44,38 @@ impl HyperSyncService {
             .build()
             .context("failed to build hypersync client")?;
 
-        Ok(Self { client, chain_id })
+        Ok(Self {
+            client,
+            chain_id,
+            cached_height: AtomicU64::new(0),
+            cached_height_at: AtomicU64::new(0),
+        })
     }
 
     pub fn chain_id(&self) -> u64 {
         self.chain_id
     }
 
-    /// One-shot chain tip — useful for indexer lag checks and reorg guards.
+    /// One-shot chain tip — cached for [`HEIGHT_CACHE_TTL`] to avoid redundant
+    /// network calls from tight loops (e.g. receipt polling).
     pub async fn get_height(&self) -> Result<u64> {
-        self.client
+        let now_ms = now_unix_ms();
+        let cached_at = self.cached_height_at.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(cached_at) < HEIGHT_CACHE_TTL.as_millis() as u64 {
+            let cached = self.cached_height.load(Ordering::Relaxed);
+            if cached != 0 {
+                return Ok(cached);
+            }
+        }
+
+        let height = self
+            .client
             .get_height()
             .await
-            .context("hypersync get_height failed")
+            .context("hypersync get_height failed")?;
+        self.cached_height.store(height, Ordering::Relaxed);
+        self.cached_height_at.store(now_ms, Ordering::Relaxed);
+        Ok(height)
     }
 
     /// Live head feed via SSE — lower latency than polling JSON-RPC `eth_blockNumber`.
@@ -99,6 +123,13 @@ impl HyperSyncService {
         let gas_used = tx.gas_used.as_ref().map(quantity_to_u64).unwrap_or(0);
         Ok(Some((success, gas_used)))
     }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn quantity_to_u64(q: &hypersync_client::format::Quantity) -> u64 {

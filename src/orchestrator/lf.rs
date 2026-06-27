@@ -203,31 +203,33 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     let cycle_tokens: Vec<TokenIndex> = cycle_tokens_set.into_iter().collect();
     let prior_rates = Arc::clone(&ctx.snapshots.read().token_to_matic_rates);
 
-    let rates = if cycles_from_cache {
-        merge_oracle_rates(
-            &prior_rates,
-            snap_oracle_rates(ctx, &arena, &cycle_tokens, &decimals).await,
-        )
-    } else if let Ok(provider) = ctx.rpc.connect_state() {
-        let tick_pools = collect_v3_pool_addresses(&arena, &capped);
-        let ticks_loaded = enrich_v3_ticks(
-            &provider,
-            &mut arena,
-            &tick_pools,
-            ctx.config.oracle.tick_word_range,
-        )
-        .await;
+    if cycles_from_cache {
         rescore_cycles_by_spot_price(&arena, &mut capped);
         capped.sort_by(compare_cycle_score);
-        if capped.len() > max_paths {
-            capped.truncate(max_paths);
-        }
-        if ticks_loaded > 0 {
-            info!(ticks_loaded, "v3 tick enrichment");
-        }
+    }
 
-        merge_oracle_rates(
-            &prior_rates,
+    let rates = merge_oracle_rates(
+        &prior_rates,
+        if cycles_from_cache {
+            snap_oracle_rates(ctx, &arena, &cycle_tokens, &decimals).await
+        } else if let Ok(provider) = ctx.rpc.connect_state() {
+            let tick_pools = collect_v3_pool_addresses(&arena, &capped);
+            let ticks_loaded = enrich_v3_ticks(
+                &provider,
+                &mut arena,
+                &tick_pools,
+                ctx.config.oracle.tick_word_range,
+            )
+            .await;
+            rescore_cycles_by_spot_price(&arena, &mut capped);
+            capped.sort_by(compare_cycle_score);
+            if capped.len() > max_paths {
+                capped.truncate(max_paths);
+            }
+            if ticks_loaded > 0 {
+                info!(ticks_loaded, "v3 tick enrichment");
+            }
+
             enrich_token_to_matic_rates(
                 &ctx.price_oracle,
                 &arena,
@@ -235,27 +237,27 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
                 &decimals,
                 Some(&provider),
             )
-            .await,
-        )
-    } else {
-        tracing::debug!("state RPC unavailable — oracle via Pyth/cached rates");
-        merge_oracle_rates(
-            &prior_rates,
+            .await
+        } else {
+            tracing::debug!("state RPC unavailable — oracle via Pyth/cached rates");
             enrich_token_to_matic_rates_offline(
                 &ctx.price_oracle,
                 &arena,
                 &cycle_tokens,
                 &decimals,
             )
-            .await,
-        )
-    };
+            .await
+        },
+    );
 
-    let hot: Vec<_> = capped
-        .iter()
-        .flat_map(|c| c.edges.iter())
-        .filter_map(|e| arena.pool_address(e.pool_index))
-        .collect();
+    let hot: Vec<alloy::primitives::Address> = {
+        let set: rustc_hash::FxHashSet<alloy::primitives::Address> = capped
+            .iter()
+            .flat_map(|c| c.edges.iter())
+            .filter_map(|e| arena.pool_address(e.pool_index))
+            .collect();
+        set.into_iter().collect()
+    };
 
     let cycle_count = capped.len();
     let pool_count = pool_metas.len();
@@ -281,7 +283,7 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
         .publish(crate::services::hf_snapshot::HfSnapshot {
             generation: 0,
             cycles: capped,
-            token_to_matic_rates: Arc::new(rates),
+            token_to_matic_rates: rates,
             token_decimals: Arc::new(decimals),
             pool_metas,
             arena,
@@ -335,23 +337,21 @@ async fn snap_oracle_rates(
 }
 
 fn merge_oracle_rates(
-    prior: &FxHashMap<TokenIndex, ruint::aliases::U256>,
+    prior: &Arc<FxHashMap<TokenIndex, ruint::aliases::U256>>,
     fresh: FxHashMap<TokenIndex, ruint::aliases::U256>,
-) -> FxHashMap<TokenIndex, ruint::aliases::U256> {
+) -> Arc<FxHashMap<TokenIndex, ruint::aliases::U256>> {
     if fresh.is_empty() {
-        return prior.clone();
+        return Arc::clone(prior);
     }
-    let mut merged = prior.clone();
+    let mut merged = (**prior).clone();
     merged.extend(fresh);
-    merged
+    Arc::new(merged)
 }
 
 pub fn spawn_lf_background(
     lf_ctx: Arc<LfContext>,
     lf_interval_ms: u64,
     mut shutdown: watch::Receiver<bool>,
-    _stream_addresses: StreamAddressSet,
-    _partial_cache: Arc<PartialPoolCache>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("LF background task started (interval={}ms)", lf_interval_ms);

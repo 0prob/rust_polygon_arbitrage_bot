@@ -136,31 +136,9 @@ impl RuntimeContext {
 }
 
 async fn run_hf_tick_logged(ctx: Arc<HfContext>, stream_triggered: bool) {
-    let tick_span = tracing::debug_span!("hf_tick", stream_triggered);
-    match run_hf_tick(Arc::clone(&ctx), stream_triggered)
-        .instrument(tick_span)
-        .await
-    {
+    match run_hf_tick(Arc::clone(&ctx), stream_triggered).await {
         Ok(result) => {
-            ctx.metrics
-                .record_hf_tick(result.elapsed_ms, result.profitable_count);
-            if result.profitable_count > 0 {
-                debug!(
-                    cycles = result.cycles_considered,
-                    profitable = result.profitable_count,
-                    profit = %result.best_profit,
-                    elapsed_ms = result.elapsed_ms,
-                    "hf tick"
-                );
-            }
-            let snap = ctx.metrics.snapshot();
-            debug!(
-                hf_ticks = snap.hf_ticks,
-                hf_eval_ms_avg = snap.hf_eval_ms_avg,
-                dispatches = snap.dispatches_started,
-                txs_confirmed = snap.txs_confirmed,
-                "pipeline metrics"
-            );
+            ctx.metrics.record_hf_tick(result.elapsed_ms, result.profitable_count);
         }
         Err(e) => error!(error = %e, "hf tick failed"),
     }
@@ -212,12 +190,12 @@ pub async fn run_pass_loop(
             });
         }
 
-        if let Some(url) = ctx.rpc.state_url() {
+        if let Ok(provider) = ctx.rpc.connect_state() {
             let gas_shutdown = shutdown.clone();
             if let Err(e) = ctx
                 .gas_oracle
                 .clone()
-                .start_background(url, gas_shutdown)
+                .start_background(provider.clone(), gas_shutdown)
                 .await
             {
                 warn!(error = %e, "gas oracle background task failed to start");
@@ -225,7 +203,7 @@ pub async fn run_pass_loop(
                 info!("gas oracle polling started");
             }
 
-            spawn_operator_balance_monitor(&ctx, url.to_string(), shutdown.clone());
+            spawn_operator_balance_monitor(&ctx, provider, shutdown.clone());
         }
 
         let mut height_rx = ctx.hypersync.as_ref().map(|hs| {
@@ -238,8 +216,6 @@ pub async fn run_pass_loop(
             lf_ctx,
             ctx.config.lf_interval_ms,
             lf_shutdown,
-            ctx.stream_addresses.clone(),
-            ctx.partial_cache.clone(),
         );
 
         let _stream_feed = spawn_pool_log_feed(
@@ -293,9 +269,30 @@ pub async fn run_pass_loop(
                         None => std::future::pending().await,
                     }
                 }, if height_rx.is_some() => {
-                    if event.is_some() {
-                        hf_ctx.metrics.record_block_triggered_hf();
-                        spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), false);
+                    use hypersync_client::HeightStreamEvent;
+                    match event {
+                        Some(HeightStreamEvent::Height(_)) => {
+                            hf_ctx.metrics.record_block_triggered_hf();
+                            spawn_hf_tick(
+                                Arc::clone(&hf_ctx),
+                                Arc::clone(&hf_inflight),
+                                false,
+                            );
+                        }
+                        Some(HeightStreamEvent::Reconnecting { delay, error_msg }) => {
+                            debug!(
+                                delay_ms = delay.as_millis(),
+                                error_msg,
+                                "HyperSync height stream reconnecting"
+                            );
+                        }
+                        Some(HeightStreamEvent::Connected) => {
+                            debug!("HyperSync height stream connected");
+                        }
+                        None => {
+                            info!("HyperSync height stream closed — disabling block trigger");
+                            height_rx = None;
+                        }
                     }
                 }
                 _ = async {
@@ -318,10 +315,10 @@ pub async fn run_pass_loop(
 
 fn spawn_operator_balance_monitor(
     ctx: &Arc<RuntimeContext>,
-    rpc_url: String,
+    provider: alloy::providers::DynProvider,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::providers::Provider;
     use ruint::aliases::U256;
 
     let min_wei = ctx
@@ -341,14 +338,6 @@ fn spawn_operator_balance_monitor(
     let execution = Arc::clone(&ctx.execution);
 
     tokio::spawn(async move {
-        let url = match rpc_url.parse() {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(error = %e, "invalid balance monitor RPC URL");
-                return;
-            }
-        };
-        let provider = ProviderBuilder::new().connect_http(url);
         let mut ticker = interval(Duration::from_secs(30));
         loop {
             tokio::select! {

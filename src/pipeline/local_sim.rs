@@ -1,13 +1,12 @@
 use ruint::aliases::U256;
 use smallvec::SmallVec;
-use tracing::instrument;
 
 use crate::core::math::balancer::simulate_balancer_swap;
 use crate::core::math::curve::get_curve_stable_amount_out;
-use crate::core::math::dodo::simulate_dodo_swap;
+use crate::core::math::dodo::get_dodo_amount_out;
 use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
-use crate::core::math::woofi::simulate_woofi_swap;
+use crate::core::math::woofi::get_woofi_amount_out;
 use crate::core::types::{Edge, PoolState, ProtocolType, RouteSimulationResult};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::MinimalSimResult;
@@ -115,7 +114,7 @@ fn simulate_hop(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<HopRe
             })
         }
         (PoolState::Dodo(s), ProtocolType::Dodo) => {
-            let out = simulate_dodo_swap(s, amount_in, edge.zero_for_one);
+            let out = get_dodo_amount_out(s, amount_in, edge.zero_for_one);
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_DODO,
@@ -136,7 +135,7 @@ fn simulate_hop(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<HopRe
                 Some(edge.token_out_idx as usize)
             };
             let out =
-                simulate_woofi_swap(s, amount_in, in_is_quote, out_is_quote, base_in, base_out);
+                get_woofi_amount_out(s, amount_in, in_is_quote, out_is_quote, base_in, base_out);
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_WOOFI,
@@ -231,10 +230,6 @@ pub fn simulate_route_minimal(
 }
 
 /// Full hop trace for calldata encoding and profit assessment.
-#[instrument(
-    skip(arena, edges),
-    fields(hop_count = edges.len(), amount_in = %amount_in, profit = tracing::field::Empty, total_gas = tracing::field::Empty)
-)]
 pub fn simulate_route_detailed(
     arena: &StateArena,
     edges: &[Edge],

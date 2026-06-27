@@ -72,6 +72,7 @@ pub fn get_next_sqrt_price_from_input(
     }
 }
 
+#[allow(dead_code)]
 pub fn get_next_sqrt_price_from_output(
     sqrt_px96: U256,
     liquidity: U256,

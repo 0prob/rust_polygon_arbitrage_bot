@@ -157,13 +157,13 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
     Some(PoolState::Dodo(DodoPoolState {
         base_reserve: base,
         quote_reserve: quote,
-        base_target: decode_u256(results.get(3)?.as_ref()?).unwrap_or(base),
-        quote_target: decode_u256(results.get(4)?.as_ref()?).unwrap_or(quote),
-        i: decode_u256(results.get(5)?.as_ref()?).unwrap_or(U256::from(10u128).pow(U256::from(18))),
-        k: decode_u256(results.get(6)?.as_ref()?).unwrap_or(U256::ZERO),
+        base_target: results.get(3).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(base),
+        quote_target: results.get(4).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(quote),
+        i: results.get(5).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(U256::from(10u128).pow(U256::from(18))),
+        k: results.get(6).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(U256::ZERO),
         r_status,
-        lp_fee_rate: decode_u256(results.get(7)?.as_ref()?).unwrap_or(U256::ZERO),
-        mt_fee_rate: decode_u256(results.get(8)?.as_ref()?).unwrap_or(U256::ZERO),
+        lp_fee_rate: results.get(7).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(U256::ZERO),
+        mt_fee_rate: results.get(8).and_then(|b| b.as_ref()).and_then(decode_u256).unwrap_or(U256::ZERO),
     }))
 }
 

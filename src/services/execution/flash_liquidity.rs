@@ -279,18 +279,6 @@ pub fn prefer_aave_flash_start(
         );
         cycle.clone()
     });
-    // #region agent log
-    crate::debug_agent::log(
-        "H-E",
-        "flash_liquidity.rs:prefer_aave_flash_start",
-        "rotated_flash_start_for_balancer_route",
-        serde_json::json!({
-            "route_fingerprint": crate::pipeline::types::route_fingerprint(&cycle.edges),
-            "original_start": cycle.start_token.0,
-            "new_start": best.0,
-        }),
-    );
-    // #endregion
     rotated
 }
 

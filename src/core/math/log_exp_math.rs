@@ -70,7 +70,7 @@ fn ln(a: U256) -> U256 {
 }
 
 pub fn log_exp_ln(a: U256) -> U256 {
-    if a.is_zero() {
+    if a.is_zero() || a < ONE_18 {
         return U256::ZERO;
     }
     if a > LN_36_LOWER_BOUND && a < LN_36_UPPER_BOUND {
@@ -121,11 +121,27 @@ pub fn log_exp_pow(x: U256, y: U256) -> U256 {
     if x.is_zero() {
         return U256::ZERO;
     }
-    let logx_times_y = log_exp_ln(x) * y / ONE_18;
-    if logx_times_y > max_natural_exponent() {
-        return U256::MAX;
+    if x < ONE_18 {
+        let ln_recip = log_exp_ln((ONE_18 * ONE_18) / x);
+        if ln_recip.is_zero() {
+            return U256::ZERO;
+        }
+        let exponent = (ln_recip * y) / ONE_18;
+        if exponent > max_natural_exponent() {
+            return U256::ZERO;
+        }
+        let e = log_exp_exp(exponent);
+        if e.is_zero() {
+            return U256::ZERO;
+        }
+        (ONE_18 * ONE_18) / e
+    } else {
+        let logx_times_y = log_exp_ln(x) * y / ONE_18;
+        if logx_times_y > max_natural_exponent() {
+            return U256::MAX;
+        }
+        log_exp_exp(logx_times_y)
     }
-    log_exp_exp(logx_times_y)
 }
 
 // Pre-computed U256::from_limbs representations of Balancer V2 LogExpMath literals.

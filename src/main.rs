@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -38,32 +40,22 @@ fn init_tracing() {
             "tokio-console enabled — run `tokio-console` in another terminal \
              (requires RUSTFLAGS='--cfg tokio_unstable' at compile time)"
         );
+        let base = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_subscriber::spawn());
         if json {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_subscriber::spawn())
-                .with(tracing_subscriber::fmt::layer().json())
-                .init();
+            base.with(tracing_subscriber::fmt::layer().json()).init();
         } else {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_subscriber::spawn())
-                .with(tracing_subscriber::fmt::layer())
-                .init();
+            base.with(tracing_subscriber::fmt::layer()).init();
         }
         return;
     }
 
+    let base = tracing_subscriber::registry().with(env_filter);
     if json {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
+        base.with(tracing_subscriber::fmt::layer().json()).init();
     } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+        base.with(tracing_subscriber::fmt::layer()).init();
     }
 }
 
@@ -107,18 +99,21 @@ async fn main() -> anyhow::Result<()> {
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let loop_ctx = ctx.clone();
-    let loop_handle = tokio::spawn(async move {
-        if let Err(e) = run_pass_loop(loop_ctx, shutdown_rx).await {
-            tracing::error!(error = %e, "pass loop exited with error");
+    let mut loop_handle = tokio::spawn(run_pass_loop(ctx.clone(), shutdown_rx));
+
+    let loop_result = tokio::select! {
+        _ = shutdown_signal() => {
+            let _ = shutdown_tx.send(true);
+            loop_handle.await
         }
-    });
+        result = &mut loop_handle => result,
+    };
 
-    shutdown_signal().await;
-    let _ = shutdown_tx.send(true);
-    let _ = loop_handle.await;
-
-    info!("shutdown complete");
+    match loop_result {
+        Ok(Ok(())) => info!("shutdown complete"),
+        Ok(Err(e)) => return Err(e).context("pass loop failed"),
+        Err(e) => anyhow::bail!("pass loop task panicked: {e}"),
+    }
     Ok(())
 }
 

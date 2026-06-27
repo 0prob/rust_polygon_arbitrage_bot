@@ -100,7 +100,7 @@ fn hash_sorted_pool_indices(indices: impl Iterator<Item = PoolIndex>) -> u64 {
     let mut pools: Vec<PoolIndex> = indices.collect();
     pools.sort_by_key(|p| p.0);
     pools.dedup_by_key(|p| p.0);
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = rustc_hash::FxHasher::default();
     for p in pools {
         p.0.hash(&mut h);
     }

@@ -212,10 +212,6 @@ pub fn get_dodo_amount_out(state: &DodoPoolState, amount_in: U256, base_to_quote
     gross - mul_floor(gross, lp) - mul_floor(gross, mt)
 }
 
-pub fn simulate_dodo_swap(state: &DodoPoolState, amount_in: U256, base_to_quote: bool) -> U256 {
-    get_dodo_amount_out(state, amount_in, base_to_quote)
-}
-
 pub fn estimate_dodo_hop_capacity(state: &DodoPoolState, base_to_quote: bool) -> U256 {
     let b = state.base_reserve;
     let q = state.quote_reserve;

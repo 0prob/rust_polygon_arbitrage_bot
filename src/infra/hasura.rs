@@ -122,19 +122,6 @@ pub struct IndexerProgress {
 
 const POOL_META_FIELDS_FULL: &str =
     "id address protocol tokens fee tickSpacing poolId hooks poolType createdBlock updatedAtBlock";
-const POOL_META_FIELDS_NO_UPDATED: &str =
-    "id address protocol tokens fee tickSpacing poolId hooks poolType createdBlock";
-const POOL_META_FIELDS_NO_POOL_TYPE: &str =
-    "id address protocol tokens fee tickSpacing poolId hooks createdBlock";
-const POOL_META_FIELDS_NO_HOOKS: &str =
-    "id address protocol tokens fee tickSpacing poolId poolType createdBlock updatedAtBlock";
-const POOL_META_FIELDS_NO_HOOKS_NO_UPDATED: &str =
-    "id address protocol tokens fee tickSpacing poolId poolType createdBlock";
-const POOL_META_FIELDS_NO_HOOKS_NO_POOL_TYPE: &str =
-    "id address protocol tokens fee tickSpacing poolId createdBlock";
-const POOL_META_FIELDS_NO_ADDRESS: &str =
-    "id protocol tokens fee tickSpacing poolId hooks poolType createdBlock";
-const POOL_META_FIELDS_LEGACY: &str = "id protocol tokens fee tickSpacing poolId createdBlock";
 
 fn is_missing_graphql_field_error(err: &anyhow::Error, field: &str) -> bool {
     let msg = err.to_string();
@@ -143,6 +130,7 @@ fn is_missing_graphql_field_error(err: &anyhow::Error, field: &str) -> bool {
 }
 
 /// Degrade PoolMeta field selection when Hasura schema lags the indexer.
+/// Removes ONE field at a time so earlier removals are never re-added.
 struct PoolMetaFieldSelector {
     fields: String,
     supports_updated_at_block: bool,
@@ -165,44 +153,21 @@ impl PoolMetaFieldSelector {
     }
 
     fn degrade_for_error(&mut self, err: &anyhow::Error) -> bool {
-        if self.fields.contains("updatedAtBlock")
-            && is_missing_graphql_field_error(err, "updatedAtBlock")
-        {
-            self.fields = POOL_META_FIELDS_NO_UPDATED.to_string();
+        let removable = ["updatedAtBlock", "poolType", "hooks", "address"];
+        let Some(field) = removable.iter().find(|f| {
+            self.fields.contains(*f) && is_missing_graphql_field_error(err, f)
+        }) else {
+            return false;
+        };
+        // Remove the single field with its surrounding whitespace.
+        self.fields = self
+            .fields
+            .replace(&format!(" {field}"), "")
+            .replace(&format!("{field} "), "");
+        if *field == "updatedAtBlock" {
             self.supports_updated_at_block = false;
-            return true;
         }
-        if self.fields.contains("poolType") && is_missing_graphql_field_error(err, "poolType") {
-            self.fields = if self.supports_updated_at_block {
-                POOL_META_FIELDS_NO_POOL_TYPE.to_string()
-            } else {
-                "id address protocol tokens fee tickSpacing poolId hooks createdBlock".to_string()
-            };
-            return true;
-        }
-        if self.fields.contains("hooks") && is_missing_graphql_field_error(err, "hooks") {
-            self.fields = if self.supports_updated_at_block {
-                if self.fields.contains("poolType") {
-                    POOL_META_FIELDS_NO_HOOKS.to_string()
-                } else {
-                    POOL_META_FIELDS_NO_HOOKS_NO_POOL_TYPE.to_string()
-                }
-            } else if self.fields.contains("poolType") {
-                POOL_META_FIELDS_NO_HOOKS_NO_UPDATED.to_string()
-            } else {
-                POOL_META_FIELDS_NO_HOOKS_NO_POOL_TYPE.to_string()
-            };
-            return true;
-        }
-        if self.fields.contains("address") && is_missing_graphql_field_error(err, "address") {
-            self.fields = if self.supports_updated_at_block {
-                POOL_META_FIELDS_NO_ADDRESS.to_string()
-            } else {
-                POOL_META_FIELDS_LEGACY.to_string()
-            };
-            return true;
-        }
-        false
+        true
     }
 }
 

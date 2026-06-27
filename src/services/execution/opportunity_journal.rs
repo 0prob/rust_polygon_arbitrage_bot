@@ -1,21 +1,26 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::sync::LazyLock;
 
 use crate::core::types::ProfitAssessment;
 use crate::services::execution::opportunity_log::OpportunityRecord;
 
-static JOURNAL_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+static JOURNAL: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn init_from_env() {
     if let Ok(path) = std::env::var("OPPORTUNITY_JOURNAL_PATH")
         && !path.trim().is_empty()
     {
-        *JOURNAL_PATH.lock() = Some(PathBuf::from(path));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PathBuf::from(path))
+            .ok();
+        *JOURNAL.lock() = file;
     }
 }
 
@@ -41,13 +46,11 @@ struct JournalEntry<'a> {
 }
 
 fn append(entry: &JournalEntry<'_>) {
-    let path = JOURNAL_PATH.lock().clone();
-    let Some(path) = path else {
+    let mut guard = JOURNAL.lock();
+    let Some(file) = guard.as_mut() else {
         return;
     };
-    if let Ok(line) = serde_json::to_string(entry)
-        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
-    {
+    if let Ok(line) = serde_json::to_string(entry) {
         let _ = writeln!(file, "{line}");
     }
 }

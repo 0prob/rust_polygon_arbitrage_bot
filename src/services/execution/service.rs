@@ -27,6 +27,9 @@ use crate::services::execution::opportunity_log::log_opportunity_outcome;
 use crate::services::execution::profit::{AssessProfitInput, assess_profit};
 use crate::services::execution::profit_logs::parse_transfer_profit;
 use crate::services::execution::receipt::ReceiptPoller;
+use crate::services::execution::private_submit::{
+    PrivateSubmitConfig, PrivateSubmitMode, resolve_submit_mode,
+};
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
 use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit_with_recovery};
@@ -264,20 +267,7 @@ impl ExecutionService {
         let dry = dry_run_candidate(sim_provider, candidate, operator)
             .instrument(dry_span)
             .await;
-        // #region agent log
-        crate::debug_agent::log(
-            "H-C",
-            "service.rs:process_candidate",
-            "dry_run_result",
-            serde_json::json!({
-                "route_fingerprint": fp,
-                "success": dry.success,
-                "gas_used": dry.gas_used,
-                "error": dry.error,
-                "flash_loan_source": format!("{:?}", candidate.flash_loan_source),
-            }),
-        );
-        // #endregion
+
         if !dry.success {
             self.quarantine_route(fp, now);
             self.circuit_breaker.record_failure(
@@ -431,6 +421,8 @@ impl ExecutionService {
         );
         record_candidate(&submit_span, candidate);
 
+        let private_cfg = build_private_config(rpc, signer, &submit_provider).await;
+
         let tx_hash = match submit_with_recovery(
             &submit_provider,
             &nonce_mgr,
@@ -438,6 +430,7 @@ impl ExecutionService {
             nonce,
             fees,
             final_gas,
+            private_cfg.as_ref(),
         )
         .instrument(submit_span)
         .await
@@ -650,6 +643,29 @@ impl ExecutionService {
             profit_wei,
         }
     }
+}
+
+async fn build_private_config(
+    rpc: &RpcPool,
+    signer: &alloy::signers::local::PrivateKeySigner,
+    submit_provider: &alloy::providers::DynProvider,
+) -> Option<PrivateSubmitConfig> {
+    let private_url = rpc.private_url().map(str::to_string);
+    let bloxroute_auth = std::env::var("BLOXROUTE_AUTH_HEADER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mode = resolve_submit_mode(private_url.as_deref(), bloxroute_auth.as_deref(), None);
+    if mode == PrivateSubmitMode::Standard {
+        return None;
+    }
+    let chain_id = submit_provider.get_chain_id().await.ok()?;
+    Some(PrivateSubmitConfig {
+        mode,
+        signer: signer.clone(),
+        chain_id,
+        private_url,
+        bloxroute_auth,
+    })
 }
 
 fn min_operator_balance_wei(config: &AppConfig) -> Option<U256> {
