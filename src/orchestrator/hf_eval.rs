@@ -604,7 +604,7 @@ fn probe_fallback_opt(
     input: &HfEvalInput<'_>,
     probe_seed: Option<(U256, MinimalSimResult)>,
     stats: &EvalFailStats,
-    fp: u64,
+    _fp: u64,
 ) -> Option<(OptimizationResult, RouteSimulationResult)> {
     let rate =
         resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);

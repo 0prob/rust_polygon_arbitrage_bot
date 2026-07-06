@@ -31,6 +31,8 @@ const FETCHABLE_PROTOCOLS: [ProtocolType; 8] = [
 
 /// Fetch up to `max_pools` missing/stale pools and write into `cache`.
 /// Pools whose addresses appear in `priority` are fetched first.
+/// Targets are grouped by protocol and fetched concurrently via `tokio::join!`
+/// to maximize RPC throughput when multiple protocol families need refresh.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: P,
@@ -47,19 +49,59 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
     if targets.is_empty() {
         return (0, false);
     }
-    (
-        fetch_pools_batched(
-            provider,
-            cache,
-            &targets,
-            max_multicall_calls,
-            batch_pace_ms,
-            block_number,
-            meta_cache,
-        )
-        .await,
-        true,
-    )
+
+    // Group targets by protocol so we can parallelize fetch across protocol families.
+    // V2 gets its own group (dominant count), the rest are batched together.
+    let mut v2_targets: Vec<&DiscoveredPool> = Vec::new();
+    let mut other_targets: Vec<&DiscoveredPool> = Vec::new();
+    for &t in &targets {
+        if t.protocol == ProtocolType::UniswapV2 {
+            v2_targets.push(t);
+        } else {
+            other_targets.push(t);
+        }
+    }
+
+    // ponytail: only split into 2 groups (V2 vs rest) — finer splits starve individual
+    // multicall batching. The chunk-level parallelism inside fetch_pools_batched
+    // (8 concurrent chunks) provides further parallelism.
+    let provider2 = provider.clone();
+    let cache2 = Arc::clone(&cache);
+    let (updated_v2, updated_other) = tokio::join!(
+        async {
+            if v2_targets.is_empty() {
+                0usize
+            } else {
+                fetch_pools_batched(
+                    provider.clone(),
+                    Arc::clone(&cache),
+                    &v2_targets,
+                    max_multicall_calls,
+                    batch_pace_ms,
+                    block_number,
+                    meta_cache,
+                )
+                .await
+            }
+        },
+        async {
+            if other_targets.is_empty() {
+                0usize
+            } else {
+                fetch_pools_batched(
+                    provider2,
+                    cache2,
+                    &other_targets,
+                    max_multicall_calls,
+                    batch_pace_ms,
+                    block_number,
+                    meta_cache,
+                )
+                .await
+            }
+        },
+    );
+    (updated_v2 + updated_other, true)
 }
 
 fn select_fetch_targets<'a>(
