@@ -312,7 +312,13 @@ pub fn get_curve_crypto_amount_out(
     }
     let out = (dy * ONE) / out_rate;
     let fee_amount = (out * fee) / fee_denom;
-    out.saturating_sub(fee_amount)
+    let out_after_fee = out.saturating_sub(fee_amount);
+    // Apply output buffer to guard against state drift between simulation and execution.
+    // Same proportion as the stable Curve buffer (0.001% of output).
+    out_after_fee.saturating_sub(
+        (out_after_fee * crate::core::math::curve::CURVE_OUTPUT_BUFFER)
+            / crate::core::math::curve::CURVE_FEE_DENOMINATOR,
+    )
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ sol! {
         function executeArb(bytes calldata packedRoute) external returns (uint256 realizedProfit);
         function executeArbDirect(bytes calldata packedRoute) external returns (uint256 realizedProfit);
         function executeArbWithAave(bytes calldata packedRoute) external returns (uint256 realizedProfit);
+        function executeArbWithDodo(bytes calldata packedRoute) external returns (uint256 realizedProfit);
         function transferAll(address token, address to) external;
     }
 
@@ -207,6 +208,14 @@ sol! {
         function _BASE_RESERVE_() external view returns (uint256);
         function _QUOTE_RESERVE_() external view returns (uint256);
         function _LP_FEE_RATE_() external view returns (uint256);
+        function _BASE_TOKEN_() external view returns (address);
+        function _QUOTE_TOKEN_() external view returns (address);
+    }
+
+    /// DODO V2 flash loan interface — shared by DVM/DPP/DSP pools.
+    #[sol(rpc)]
+    interface IDodoFlashLoan {
+        function flashLoan(uint256 baseAmount, uint256 quoteAmount, address assetTo, bytes calldata data) external;
         function _BASE_TOKEN_() external view returns (address);
         function _QUOTE_TOKEN_() external view returns (address);
     }

@@ -71,6 +71,7 @@ fn resolve_executor_entrypoint(
         FlashLoanSource::Balancer if hops_are_balancer_only(hops) => {
             ExecutorEntrypoint::BalancerFlash
         }
+        FlashLoanSource::Dodo => ExecutorEntrypoint::DodoFlash,
         FlashLoanSource::Direct | FlashLoanSource::AaveV3 | FlashLoanSource::Balancer => {
             ExecutorEntrypoint::AaveFlash
         }

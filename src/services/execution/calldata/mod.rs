@@ -116,6 +116,7 @@ pub fn hops_are_balancer_only(hops: &[CalldataHop]) -> bool {
 pub enum ExecutorEntrypoint {
     BalancerFlash,
     AaveFlash,
+    DodoFlash,
     Direct,
 }
 
@@ -210,6 +211,10 @@ pub fn build_arb_calldata(
 
     let data = match entrypoint {
         ExecutorEntrypoint::AaveFlash => crate::abis::IArbExecutor::executeArbWithAaveCall {
+            packedRoute: packed_route.clone(),
+        }
+        .abi_encode(),
+        ExecutorEntrypoint::DodoFlash => crate::abis::IArbExecutor::executeArbWithDodoCall {
             packedRoute: packed_route.clone(),
         }
         .abi_encode(),

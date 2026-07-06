@@ -5,11 +5,16 @@ use crate::core::constants::MAX_POOL_TOKENS;
 use crate::core::types::CurvePoolState;
 
 use super::fixed_point::ONE;
-const CURVE_FEE_DENOMINATOR: U256 = U256::from_limbs([10_000_000_000, 0, 0, 0]);
+pub(crate) const CURVE_FEE_DENOMINATOR: U256 = U256::from_limbs([10_000_000_000, 0, 0, 0]);
 const A_PRECISION: U256 = U256::from_limbs([100, 0, 0, 0]);
 const ONE_U256: U256 = U256::from_limbs([1, 0, 0, 0]);
 const TWO_U256: U256 = U256::from_limbs([2, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 128;
+/// Safety buffer applied to Curve output (0x186a0 = 100_000 = 0.001% of fee precision).
+/// Accounts for state drift between multicall read and eth_call execution.
+/// Curve pools are susceptible to frontrunning that shifts reserves by 1-2 wei,
+/// causing the "fewer coins than expected" revert.
+pub(crate) const CURVE_OUTPUT_BUFFER: U256 = U256::from_limbs([0x186a0, 0, 0, 0]);
 type CurveXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
 
 fn get_d(xp: &[U256], a: U256) -> Option<U256> {
@@ -159,8 +164,12 @@ pub fn get_curve_stable_amount_out(
     }
 
     let fee_amount = (dy * state.fee) / CURVE_FEE_DENOMINATOR;
-    let dy_after_fee = dy - fee_amount;
-    if dy_after_fee.is_zero() {
+    let dy_after_fee = dy.saturating_sub(fee_amount);
+    // Apply output buffer to guard against state drift between simulation and execution.
+    let dy_buffered = dy_after_fee.saturating_sub(
+        (dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR,
+    );
+    if dy_buffered.is_zero() {
         return U256::ZERO;
     }
 
@@ -169,7 +178,7 @@ pub fn get_curve_stable_amount_out(
         return U256::ZERO;
     }
 
-    (dy_after_fee * ONE) / out_rate
+    (dy_buffered * ONE) / out_rate
 }
 
 #[cfg(test)]

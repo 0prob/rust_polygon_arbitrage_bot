@@ -23,12 +23,16 @@ pub fn set_aave_flash_loan_fee_bps(fee_bps: u64) {
     AAVE_FLASH_LOAN_FEE_BPS.store(fee_bps, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ponytail: DODO flash loan fee = pool swap fee. Most DODO pools use 0.1% = 10 bps.
+const DODO_FLASH_LOAN_FEE_BPS: u64 = 10;
+
 pub fn flash_loan_fee_bps(source: FlashLoanSource) -> u64 {
     match source {
         FlashLoanSource::Balancer | FlashLoanSource::Direct => 0,
         FlashLoanSource::AaveV3 => {
             AAVE_FLASH_LOAN_FEE_BPS.load(std::sync::atomic::Ordering::Relaxed)
         }
+        FlashLoanSource::Dodo => DODO_FLASH_LOAN_FEE_BPS,
     }
 }
 

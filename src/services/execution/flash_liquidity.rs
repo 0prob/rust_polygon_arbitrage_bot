@@ -67,6 +67,8 @@ pub struct TokenFlashLiquidity {
     pub balancer: U256,
     pub aave: U256,
     pub aave_listed: bool,
+    /// DODO V2 pool liquidity — max of all DODO pools for this token.
+    pub dodo: U256,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +211,7 @@ impl FlashLiquidityCache {
                         balancer,
                         aave,
                         aave_listed,
+                        dodo: U256::MAX,
                     },
                     fetched_at: now,
                 },
@@ -425,10 +428,18 @@ fn plan_auto(amount_in: U256, liquidity: TokenFlashLiquidity, allow_balancer: bo
             cap: amount_in,
         };
     }
+    // DODO fallback — pool transfers tokens upfront, no pre-check needed.
+    if liquidity.dodo >= amount_in {
+        return FlashPlan {
+            source: FlashLoanSource::Dodo,
+            action: FlashPlanAction::Direct,
+            cap: amount_in,
+        };
+    }
     let cap = if allow_balancer {
-        liquidity.balancer.max(liquidity.aave)
+        liquidity.balancer.max(liquidity.aave).max(liquidity.dodo)
     } else {
-        liquidity.aave
+        liquidity.aave.max(liquidity.dodo)
     };
     if cap.is_zero() {
         return FlashPlan {
@@ -439,8 +450,10 @@ fn plan_auto(amount_in: U256, liquidity: TokenFlashLiquidity, allow_balancer: bo
     }
     let source = if allow_balancer && liquidity.balancer >= liquidity.aave {
         FlashLoanSource::Balancer
-    } else {
+    } else if liquidity.aave_listed && liquidity.aave >= liquidity.dodo {
         FlashLoanSource::AaveV3
+    } else {
+        FlashLoanSource::Dodo
     };
     FlashPlan {
         source,
@@ -489,6 +502,9 @@ fn flash_liquidity_for_cycle(
         balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
         aave: snapshot.aave,
         aave_listed: snapshot.aave_listed,
+        // DODO pools transfer tokens upfront — liquidity is bounded by pool reserves.
+        // Set to U256::MAX so DODO is always tried as fallback when Balancer/Aave fail.
+        dodo: U256::MAX,
     })
 }
 
@@ -529,10 +545,11 @@ pub fn resolve_flash_source_for_cycle(
         FlashPlanAction::Reject => {
             if flash_liquidity.has_fresh_entry(start_addr) {
                 crate::debug!(
-                    "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={}",
+                    "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={} dodo={}",
                     liquidity.balancer,
                     liquidity.aave,
                     liquidity.aave_listed,
+                    liquidity.dodo,
                 );
                 None
             } else {
@@ -615,6 +632,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         balancer: effective_balancer_liquidity(input.liquidity.balancer, route_cap),
         aave: input.liquidity.aave,
         aave_listed: input.liquidity.aave_listed,
+        dodo: U256::MAX,
     };
     let forbid_balancer_flash = route_uses_balancer_vault_swap(&input.evaluated.cycle);
     let balancer_only = route_is_balancer_only(&input.evaluated.cycle);
@@ -956,6 +974,7 @@ mod tests {
                 balancer: U256::from(10_000u64),
                 aave: U256::from(400u64),
                 aave_listed: true,
+                dodo: U256::ZERO,
             },
             true,
             false,
@@ -975,6 +994,7 @@ mod tests {
                 balancer: U256::from(10_000u64),
                 aave: U256::from(500u64),
                 aave_listed: true,
+                dodo: U256::ZERO,
             },
             true,
             false,
@@ -994,6 +1014,7 @@ mod tests {
                 balancer: U256::from(10_000u64),
                 aave: U256::ZERO,
                 aave_listed: false,
+                dodo: U256::ZERO,
             },
             true,
             true,
@@ -1013,6 +1034,7 @@ mod tests {
                 balancer: U256::ZERO,
                 aave: U256::ZERO,
                 aave_listed: false,
+                dodo: U256::ZERO,
             },
             false,
             false,
@@ -1053,6 +1075,7 @@ mod tests {
                 balancer: U256::from(10_000u64),
                 aave: U256::ZERO,
                 aave_listed: true,
+                dodo: U256::ZERO,
             },
             true,
             false,

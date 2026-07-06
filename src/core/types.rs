@@ -374,6 +374,8 @@ pub enum FlashLoanSource {
     Balancer,
     /// `executeArbWithAave` — Aave V3 `flashLoan`.
     AaveV3,
+    /// `executeArbWithDodo` — DODO V2 pool `flashLoan`.
+    Dodo,
     /// `executeArbDirect` — no flash loan; Balancer `batchSwap` flash-swap routes.
     Direct,
 }
