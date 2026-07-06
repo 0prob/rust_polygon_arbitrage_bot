@@ -1,0 +1,337 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use alloy::eips::BlockNumberOrTag;
+use alloy::network::Ethereum;
+use alloy::primitives::U256;
+use alloy::providers::{DynProvider, Provider};
+use arc_swap::ArcSwapOption;
+use dashmap::DashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
+
+use super::gas::{FeeSnapshot, compute_conservative_gas_price, scaled_simulated_gas};
+
+const ROUTE_GAS_HISTORY: usize = 256;
+/// Cap sim→observed uplift so one outlier receipt cannot dominate Brent ranking.
+const MAX_SIM_SCALE_BPS: u32 = 30_000;
+
+/// Prefetch observed route gas when an HF tick evaluates at least this many routes.
+pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 48;
+
+/// Per-HF-tick snapshot of route gas data for lock-free lookups in `hf_eval`.
+#[derive(Clone, Debug)]
+pub struct RouteGasLookup {
+    scale_bps: u64,
+    observed: FxHashMap<u64, u32>,
+    preloaded: bool,
+}
+
+impl RouteGasLookup {
+    /// Build a tick-local lookup table when route volume warrants prefetch.
+    pub fn for_fingerprints(
+        oracle: &GasOracle,
+        fingerprints: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let fps: Vec<u64> = fingerprints.into_iter().collect();
+        let scale_bps = oracle.sim_scale_bps().max(10_000);
+        if fps.len() < ROUTE_GAS_CACHE_MIN_ROUTES {
+            return Self {
+                scale_bps,
+                observed: FxHashMap::default(),
+                preloaded: false,
+            };
+        }
+        let mut observed =
+            FxHashMap::with_capacity_and_hasher(fps.len().min(ROUTE_GAS_HISTORY), FxBuildHasher);
+        for fp in fps {
+            if let Some(gas) = oracle.observed_route_gas(fp) {
+                observed.insert(fp, gas);
+            }
+        }
+        Self {
+            scale_bps,
+            observed,
+            preloaded: true,
+        }
+    }
+
+    #[must_use]
+    pub fn scale_bps(&self) -> u64 {
+        self.scale_bps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preloaded(&self) -> bool {
+        self.preloaded
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observed_gas(&self, route_fp: u64) -> Option<u32> {
+        self.observed.get(&route_fp).copied()
+    }
+
+    /// Prefer prefetched observed gas; otherwise scaled heuristic (no DashMap on preload path).
+    pub fn route_gas_or_heuristic(&self, oracle: &GasOracle, route_fp: u64, heuristic: u32) -> u32 {
+        if let Some(&gas) = self.observed.get(&route_fp) {
+            return gas;
+        }
+        if !self.preloaded {
+            return oracle.route_gas_or_heuristic(route_fp, heuristic);
+        }
+        scaled_simulated_gas(heuristic, self.scale_bps)
+    }
+}
+
+#[derive(Debug)]
+pub struct GasOracle {
+    snapshot: ArcSwapOption<FeeSnapshot>,
+    poll_interval: Duration,
+    route_gas: DashMap<u64, u32, FxBuildHasher>,
+    /// FIFO eviction order — avoids `iter`/`len` on DashMap (deadlock-prone per docs).
+    route_gas_order: parking_lot::Mutex<VecDeque<u64>>,
+    /// Latest observed/simulated ratio in bps (10_000 = 1.0×) for heuristic uplift.
+    sim_scale_bps: AtomicU32,
+}
+
+impl Default for GasOracle {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(1))
+    }
+}
+
+impl GasOracle {
+    #[must_use]
+    pub fn new(poll_interval: Duration) -> Self {
+        Self {
+            snapshot: ArcSwapOption::empty(),
+            poll_interval,
+            route_gas: DashMap::with_capacity_and_hasher(ROUTE_GAS_HISTORY, FxBuildHasher),
+            route_gas_order: parking_lot::Mutex::new(VecDeque::with_capacity(ROUTE_GAS_HISTORY)),
+            sim_scale_bps: AtomicU32::new(10_000),
+        }
+    }
+
+    pub fn observed_route_gas(&self, route_fp: u64) -> Option<u32> {
+        self.route_gas.get(&route_fp).map(|entry| *entry)
+    }
+
+    /// Prefer dry-run / on-chain gas for this route fingerprint, else scaled heuristic.
+    pub fn route_gas_or_heuristic(&self, route_fp: u64, heuristic: u32) -> u32 {
+        if let Some(observed) = self.observed_route_gas(route_fp) {
+            return observed;
+        }
+        let scale = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000) as u64;
+        scaled_simulated_gas(heuristic, scale)
+    }
+
+    /// Current global sim→observed gas scale in bps (10_000 = 1.0×).
+    pub fn sim_scale_bps(&self) -> u64 {
+        self.sim_scale_bps.load(Ordering::Relaxed).max(10_000) as u64
+    }
+
+    /// Record on-chain or dry-run gas for a route fingerprint.
+    pub fn record_route_gas(&self, route_fp: u64, gas: u32) {
+        if gas == 0 {
+            return;
+        }
+        if let Some(mut entry) = self.route_gas.get_mut(&route_fp) {
+            *entry = gas;
+            return;
+        }
+        let mut order = self.route_gas_order.lock();
+        while order.len() >= ROUTE_GAS_HISTORY {
+            let Some(old) = order.pop_front() else {
+                break;
+            };
+            self.route_gas.remove(&old);
+        }
+        self.route_gas.insert(route_fp, gas);
+        order.push_back(route_fp);
+    }
+
+    #[cfg(test)]
+    fn route_gas_tracked(&self) -> usize {
+        self.route_gas_order.lock().len()
+    }
+
+    /// Calibrate heuristic gas from estimate_gas / dry-run observations.
+    pub fn record_sim_observed(&self, simulated: u32, observed: u64) {
+        if simulated == 0 || observed == 0 {
+            return;
+        }
+        let ratio_bps = ((observed.saturating_mul(10_000)) / u64::from(simulated))
+            .clamp(10_000, u64::from(MAX_SIM_SCALE_BPS)) as u32;
+        let prev = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000);
+        let blended = ((u64::from(prev) * 3 + u64::from(ratio_bps)) / 4) as u32;
+        self.sim_scale_bps
+            .store(blended.clamp(10_000, MAX_SIM_SCALE_BPS), Ordering::Relaxed);
+    }
+
+    /// Single arc-swap read; prefer this over separate `snapshot` +
+    /// `conservative_gas_price` in the same scope.
+    pub fn loaded_snapshot(&self) -> Option<FeeSnapshot> {
+        self.snapshot.load().as_deref().copied()
+    }
+
+    pub fn snapshot(&self) -> Option<FeeSnapshot> {
+        self.loaded_snapshot()
+    }
+
+    pub fn conservative_gas_price(&self) -> Option<U256> {
+        self.loaded_snapshot().map(compute_conservative_gas_price)
+    }
+
+    pub fn conservative_gas_price_required(&self) -> U256 {
+        self.conservative_gas_price().unwrap_or(U256::ZERO)
+    }
+
+    pub async fn refresh_once<P: Provider<Ethereum>>(&self, provider: &P) -> anyhow::Result<()> {
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("latest block unavailable"))?;
+
+        let base_fee = block
+            .header
+            .base_fee_per_gas
+            .map(U256::from)
+            .ok_or_else(|| anyhow::anyhow!("block header missing base_fee_per_gas"))?;
+
+        let priority_fee = match provider.get_max_priority_fee_per_gas().await {
+            Ok(v) => U256::from(v),
+            Err(_e) => self
+                .snapshot
+                .load()
+                .as_deref()
+                .map_or(U256::ZERO, |snap| snap.priority_fee),
+        };
+
+        self.snapshot.store(Some(Arc::new(FeeSnapshot {
+            base_fee,
+            priority_fee,
+        })));
+        Ok(())
+    }
+
+    pub fn start_background(
+        self: Arc<Self>,
+        provider: DynProvider,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let poll = self.poll_interval;
+        tokio::spawn(async move {
+            let _ = self.refresh_once(&provider).await;
+            let mut ticker = tokio::time::interval(poll);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let _ = self.refresh_once(&provider).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_gas_lookup_prefetches_observed_gas_for_large_batches() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        oracle.record_route_gas(7, 500_000);
+        let fps: Vec<u64> = (0..ROUTE_GAS_CACHE_MIN_ROUTES as u64).collect();
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, fps);
+        assert!(lookup.preloaded());
+        assert_eq!(lookup.observed_gas(7), Some(500_000));
+        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 7, 100_000), 500_000);
+        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 99, 100_000), 100_000);
+    }
+
+    #[test]
+    fn gas_scaling_saturates_instead_of_wrapping() {
+        assert_eq!(scaled_simulated_gas(100_000, 25_000), 250_000);
+        assert_eq!(scaled_simulated_gas(u32::MAX, u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn sim_scale_caps_outlier_observations() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        for _ in 0..32 {
+            oracle.record_sim_observed(100_000, 1_000_000);
+        }
+        let scale = oracle.sim_scale_bps();
+        assert!(scale <= u64::from(MAX_SIM_SCALE_BPS));
+        assert!(scale >= 29_900);
+    }
+
+    #[test]
+    fn mined_gas_calibrates_heuristic_uplift() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        oracle.record_sim_observed(100_000, 200_000);
+
+        // 75% prior (1.0x) + 25% observation (2.0x).
+        assert_eq!(oracle.sim_scale_bps(), 12_500);
+        assert_eq!(oracle.route_gas_or_heuristic(99, 100_000), 125_000);
+    }
+
+    #[test]
+    fn route_gas_lookup_skips_prefetch_for_small_batches() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        oracle.record_route_gas(1, 250_000);
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64, 2]);
+        assert!(!lookup.preloaded());
+        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 1, 100_000), 250_000);
+    }
+
+    #[test]
+    fn route_gas_history_is_bounded_and_updates_existing_fingerprint() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        for fp in 0..ROUTE_GAS_HISTORY as u64 {
+            oracle.record_route_gas(fp, 100 + fp as u32);
+        }
+        assert_eq!(oracle.route_gas_tracked(), ROUTE_GAS_HISTORY);
+        oracle.record_route_gas(0, 9_999);
+        assert_eq!(oracle.route_gas.get(&0).map(|v| *v), Some(9_999));
+        oracle.record_route_gas(ROUTE_GAS_HISTORY as u64, 42);
+        assert!(oracle.route_gas_tracked() <= ROUTE_GAS_HISTORY);
+        assert_eq!(
+            oracle
+                .route_gas
+                .get(&(ROUTE_GAS_HISTORY as u64))
+                .map(|v| *v),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn arc_swap_option_stores_and_loads_fee_snapshot() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        assert!(oracle.snapshot().is_none());
+
+        let fees = FeeSnapshot {
+            base_fee: U256::from(100u64),
+            priority_fee: U256::from(2u64),
+        };
+        oracle.snapshot.store(Some(Arc::new(fees)));
+
+        let loaded = oracle.loaded_snapshot().expect("fees stored");
+        assert_eq!(loaded.base_fee, fees.base_fee);
+        assert_eq!(loaded.priority_fee, fees.priority_fee);
+        assert_eq!(
+            oracle.conservative_gas_price(),
+            Some(compute_conservative_gas_price(fees))
+        );
+    }
+}

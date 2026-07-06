@@ -1,0 +1,442 @@
+mod decode;
+mod plans;
+
+use std::sync::Arc;
+
+use alloy::network::Ethereum;
+use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
+
+use crate::abis::{IBalancerPool, IWoofiPool, IWooracle};
+use crate::core::types::{PoolState, ProtocolType, WoofiBaseTokenState, WoofiPoolState};
+use crate::infra::pool_meta_cache::PoolMetaCache;
+use crate::pipeline::abi_cache::{BALANCER_POOL_ID, WOOFI_QUOTE_TOKEN, WOOFI_WOORACLE};
+use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall_at_chunked};
+use crate::services::discovery::DiscoveredPool;
+use crate::services::state_cache::StateCache;
+
+use decode::decode_plan;
+use plans::{PoolFetchPlan, build_plan_with_pool_id};
+
+#[derive(Clone)]
+struct WoofiMeta {
+    address: Address,
+    tokens: Vec<Address>,
+    quote: Address,
+    wooracle: Address,
+}
+
+async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    pools: &[&DiscoveredPool],
+    block_number: Option<u64>,
+    max_chunk: usize,
+    meta_cache: &PoolMetaCache,
+) -> Vec<(Address, Option<PoolState>)> {
+    if pools.is_empty() {
+        return Vec::new();
+    }
+
+    let mut phase1 = Vec::with_capacity(pools.len() * 2);
+    let mut owners: Vec<Address> = Vec::with_capacity(pools.len());
+    let mut cached_metas: Vec<Option<WoofiMeta>> = Vec::with_capacity(pools.len());
+    for pool in pools {
+        owners.push(pool.address);
+        if let Some((quote, wooracle)) = meta_cache.woofi_meta(&pool.address) {
+            cached_metas.push(Some(WoofiMeta {
+                address: pool.address,
+                tokens: pool.tokens.clone(),
+                quote,
+                wooracle,
+            }));
+            continue;
+        }
+        cached_metas.push(None);
+        phase1.push(MulticallItem {
+            target: pool.address,
+            data: WOOFI_QUOTE_TOKEN.clone(),
+        });
+        phase1.push(MulticallItem {
+            target: pool.address,
+            data: WOOFI_WOORACLE.clone(),
+        });
+    }
+
+    let phase1_results = if phase1.is_empty() {
+        Vec::new()
+    } else {
+        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await
+        {
+            Ok(r) => r,
+            Err(_) => return owners.into_iter().map(|addr| (addr, None)).collect(),
+        }
+    };
+
+    let mut metas = Vec::new();
+    let mut phase1_idx = 0usize;
+    for (i, pool) in pools.iter().enumerate() {
+        if let Some(cached) = &cached_metas[i] {
+            metas.push(cached.clone());
+            continue;
+        }
+        let quote = phase1_results
+            .get(phase1_idx * 2)
+            .and_then(|r| r.as_ref())
+            .and_then(|b| IWoofiPool::quoteTokenCall::abi_decode_returns(b).ok())
+            .unwrap_or(Address::ZERO);
+        let wooracle = phase1_results
+            .get(phase1_idx * 2 + 1)
+            .and_then(|r| r.as_ref())
+            .and_then(|b| IWoofiPool::wooracleCall::abi_decode_returns(b).ok())
+            .unwrap_or(Address::ZERO);
+        phase1_idx += 1;
+        if quote.is_zero() || wooracle.is_zero() {
+            continue;
+        }
+        meta_cache.set_woofi_meta(&pool.address, quote, wooracle);
+        metas.push(WoofiMeta {
+            address: pool.address,
+            tokens: pool.tokens.clone(),
+            quote,
+            wooracle,
+        });
+    }
+
+    if metas.is_empty() {
+        return owners.into_iter().map(|addr| (addr, None)).collect();
+    }
+
+    let mut phase2 = Vec::new();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(metas.len());
+    for (meta_idx, meta) in metas.iter().enumerate() {
+        let start = phase2.len();
+        for token in &meta.tokens {
+            phase2.push(MulticallItem {
+                target: meta.address,
+                data: encode_call(&IWoofiPool::tokenInfosCall { base: *token }),
+            });
+            phase2.push(MulticallItem {
+                target: meta.wooracle,
+                data: encode_call(&IWooracle::stateCall { base: *token }),
+            });
+            phase2.push(MulticallItem {
+                target: meta.wooracle,
+                data: encode_call(&IWooracle::decimalInfoCall { base: *token }),
+            });
+        }
+        spans.push((meta_idx, start, phase2.len()));
+    }
+
+    let Ok(phase2_results) =
+        execute_multicall_at_chunked(provider.clone(), &phase2, block_number, max_chunk).await
+    else {
+        return owners.into_iter().map(|addr| (addr, None)).collect();
+    };
+
+    let mut out: Vec<(Address, Option<PoolState>)> =
+        owners.into_iter().map(|addr| (addr, None)).collect();
+    let mut resolved = rustc_hash::FxHashMap::default();
+
+    for (meta_idx, start, _end) in spans {
+        let meta = &metas[meta_idx];
+        let mut base_states = Vec::new();
+        let mut state_tokens = Vec::new();
+        let mut quote_reserve = U256::ZERO;
+        for (t, token_addr) in meta.tokens.iter().enumerate() {
+            let base = phase2_results.get(start + t * 3).and_then(|r| r.as_ref());
+            let oracle = phase2_results
+                .get(start + t * 3 + 1)
+                .and_then(|r| r.as_ref());
+            let decimals = phase2_results
+                .get(start + t * 3 + 2)
+                .and_then(|r| r.as_ref());
+            let Some(info_bytes) = base else { continue };
+            let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(info_bytes) else {
+                continue;
+            };
+            if *token_addr == meta.quote {
+                quote_reserve = U256::from(info.reserve);
+                continue;
+            }
+            let Some(oracle_bytes) = oracle else { continue };
+            let Ok(oracle_state) = IWooracle::stateCall::abi_decode_returns(oracle_bytes) else {
+                continue;
+            };
+            if !oracle_state.woFeasible {
+                continue;
+            }
+            let (base_dec, quote_dec, price_dec) = decimals
+                .and_then(|b| IWooracle::decimalInfoCall::abi_decode_returns(b).ok())
+                .map_or((18u8, 18u8, 18u8), |d| (d.baseDec, d.quoteDec, d.priceDec));
+            base_states.push(WoofiBaseTokenState {
+                price: U256::from(oracle_state.price),
+                spread: U256::from(oracle_state.spread),
+                coeff: U256::from(oracle_state.coeff),
+                reserve: U256::from(info.reserve),
+                base_dec: crate::util::ten_pow_u256_cached(base_dec),
+                quote_dec: crate::util::ten_pow_u256_cached(quote_dec),
+                price_dec: crate::util::ten_pow_u256_cached(price_dec),
+                fee_rate: U256::from(info.feeRate),
+                max_gamma: U256::from(info.maxGamma),
+                max_notional_swap: U256::from(info.maxNotionalSwap),
+            });
+            state_tokens.push(*token_addr);
+        }
+        let state = if quote_reserve.is_zero() || base_states.is_empty() {
+            None
+        } else {
+            state_tokens.push(meta.quote);
+            Some(PoolState::Woofi(WoofiPoolState {
+                tokens: state_tokens,
+                quote_reserve,
+                base_states,
+                fee: U256::ZERO,
+            }))
+        };
+        resolved.insert(meta.address, state);
+    }
+
+    for entry in &mut out {
+        if let Some(state) = resolved.remove(&entry.0) {
+            entry.1 = state;
+        }
+    }
+    out
+}
+
+async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    pools: &[&DiscoveredPool],
+    block_number: Option<u64>,
+    meta_cache: &PoolMetaCache,
+) -> rustc_hash::FxHashMap<Address, FixedBytes<32>> {
+    let unverified: Vec<&DiscoveredPool> = pools
+        .iter()
+        .copied()
+        .filter(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified)
+        .collect();
+
+    let mut out =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(unverified.len(), rustc_hash::FxBuildHasher);
+    let mut needs_rpc: Vec<&DiscoveredPool> = Vec::new();
+
+    for pool in &unverified {
+        if let Some(id) = meta_cache.balancer_pool_id(&pool.address) {
+            out.insert(pool.address, id);
+        } else {
+            needs_rpc.push(pool);
+        }
+    }
+
+    if needs_rpc.is_empty() {
+        return out;
+    }
+
+    let items: Vec<MulticallItem> = needs_rpc
+        .iter()
+        .map(|pool| MulticallItem {
+            target: pool.address,
+            data: BALANCER_POOL_ID.clone(),
+        })
+        .collect();
+
+    let Ok(results) = execute_multicall_at_chunked(
+        provider.clone(),
+        &items,
+        block_number,
+        crate::pipeline::multicall::MULTICALL_CHUNK,
+    )
+    .await
+    else {
+        return out;
+    };
+
+    for (pool, bytes) in needs_rpc.iter().zip(results.iter()) {
+        let Some(bytes) = bytes.as_ref() else {
+            continue;
+        };
+        if let Ok(id) = IBalancerPool::getPoolIdCall::abi_decode_returns(bytes) {
+            meta_cache.set_balancer_pool_id(&pool.address, id);
+            out.insert(pool.address, id);
+        }
+    }
+    out
+}
+
+fn balancer_pool_id<'a>(
+    pool: &'a DiscoveredPool,
+    hydrated: &'a rustc_hash::FxHashMap<Address, FixedBytes<32>>,
+) -> Option<FixedBytes<32>> {
+    hydrated.get(&pool.address).copied().or(pool.pool_id)
+}
+
+async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    woofi_pools: &[&DiscoveredPool],
+    block_number: Option<u64>,
+    max_chunk: usize,
+    cache: &StateCache,
+    meta_cache: &PoolMetaCache,
+) -> usize {
+    if woofi_pools.is_empty() {
+        return 0;
+    }
+    let mut updated = 0usize;
+    for (addr, state) in
+        fetch_woofi_pools_batched(provider, woofi_pools, block_number, max_chunk, meta_cache).await
+    {
+        match state {
+            Some(s) => {
+                cache.insert(addr, s);
+                updated += 1;
+            }
+            None => {
+                cache.insert(addr, PoolState::Invalid);
+            }
+        }
+    }
+    updated
+}
+
+async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    batches: &[Vec<PoolFetchPlan>],
+    cache: &StateCache,
+    block_number: Option<u64>,
+    max_calls: usize,
+    batch_pace_ms: u64,
+) -> usize {
+    if batches.is_empty() {
+        return 0;
+    }
+
+    let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
+    let mut updated = 0usize;
+    for (i, batch) in batches.iter().enumerate() {
+        updated += execute_plan_batch(provider, batch, cache, block_number, max_calls).await;
+        if batch_pace_ms > 0 && i + 1 < batches.len() {
+            tokio::time::sleep(pacing).await;
+        }
+    }
+    updated
+}
+
+pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: P,
+    cache: Arc<StateCache>,
+    pools: &[&DiscoveredPool],
+    max_multicall_calls: usize,
+    batch_pace_ms: u64,
+    block_number: Option<u64>,
+    meta_cache: &PoolMetaCache,
+) -> usize {
+    let max_calls = max_multicall_calls.max(1);
+    let needs_balancer_hydrate = pools
+        .iter()
+        .any(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified);
+    let balancer_ids = if needs_balancer_hydrate {
+        hydrate_balancer_pool_ids(&provider, pools, block_number, meta_cache).await
+    } else {
+        rustc_hash::FxHashMap::default()
+    };
+
+    let woofi_pools: Vec<&DiscoveredPool> = pools
+        .iter()
+        .copied()
+        .filter(|p| p.protocol == ProtocolType::Woofi)
+        .collect();
+
+    let mut plans = Vec::with_capacity(pools.len().saturating_sub(woofi_pools.len()));
+    for pool in pools {
+        if pool.protocol == ProtocolType::Woofi {
+            continue;
+        }
+        let pool_id = balancer_pool_id(pool, &balancer_ids);
+        if let Some(plan) = build_plan_with_pool_id(pool, pool_id) {
+            plans.push(plan);
+        } else {
+            cache.insert(pool.address, PoolState::Invalid);
+        }
+    }
+
+    let mut batches: Vec<Vec<PoolFetchPlan>> = Vec::new();
+    if !plans.is_empty() {
+        let mut batch: Vec<PoolFetchPlan> = Vec::with_capacity(plans.len());
+        let mut batch_calls = 0usize;
+
+        for plan in plans {
+            let n = plan.calls.len();
+            if batch_calls + n > max_calls && !batch.is_empty() {
+                batches.push(std::mem::take(&mut batch));
+                batch_calls = 0;
+            }
+            batch_calls += n;
+            batch.push(plan);
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+    }
+
+    let provider_woofi = provider.clone();
+    let (woofi_updated, plan_updated) = tokio::join!(
+        apply_woofi_results(
+            &provider_woofi,
+            &woofi_pools,
+            block_number,
+            max_calls,
+            cache.as_ref(),
+            meta_cache,
+        ),
+        run_plan_batches(
+            &provider,
+            &batches,
+            cache.as_ref(),
+            block_number,
+            max_calls,
+            batch_pace_ms,
+        ),
+    );
+
+    woofi_updated + plan_updated
+}
+
+async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    plans: &[PoolFetchPlan],
+    cache: &StateCache,
+    block_number: Option<u64>,
+    max_chunk: usize,
+) -> usize {
+    let total_calls: usize = plans.iter().map(|p| p.calls.len()).sum();
+    let mut items = Vec::with_capacity(total_calls);
+    let mut spans: Vec<(&PoolFetchPlan, usize, usize)> = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let start = items.len();
+        items.extend_from_slice(&plan.calls);
+        spans.push((plan, start, items.len()));
+    }
+
+    let results =
+        match execute_multicall_at_chunked(provider.clone(), &items, block_number, max_chunk).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                crate::warn!("multicall batch failed ({} items): {e}", items.len());
+                return 0;
+            }
+        };
+
+    let mut updated = 0usize;
+    for (plan, start, end) in spans {
+        let slice = &results[start..end];
+        if let Some(state) = decode_plan(plan, slice) {
+            cache.insert(plan.pool.address, state);
+            updated += 1;
+        } else {
+            cache.insert(plan.pool.address, PoolState::Invalid);
+        }
+    }
+    updated
+}

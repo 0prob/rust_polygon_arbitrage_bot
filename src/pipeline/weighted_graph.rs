@@ -1,0 +1,63 @@
+use crate::core::types::Edge;
+use crate::pipeline::cycle_finder::is_live_graph_edge;
+use crate::pipeline::types::RoutingGraph;
+
+#[derive(Clone, Copy)]
+pub struct WeightedEdge {
+    pub edge: Edge,
+    pub weight: f64,
+}
+
+/// Build Johnson/Bellman-Ford adjacency from graph edge weights (already rescored).
+#[must_use]
+pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> {
+    let mut out = Vec::with_capacity(graph.token_count as usize);
+    for edges in &graph.adjacency {
+        let mut list = Vec::with_capacity(edges.len());
+        for ge in edges {
+            if !is_live_graph_edge(ge) {
+                continue;
+            }
+            list.push(WeightedEdge {
+                edge: ge.edge,
+                weight: ge.log_weight,
+            });
+        }
+        out.push(list);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+    use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+    use crate::pipeline::types::GraphEdge;
+
+    fn graph_edge(weight: f64) -> GraphEdge {
+        GraphEdge {
+            edge: crate::core::types::Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            log_weight: weight,
+        }
+    }
+
+    #[test]
+    fn weighted_adjacency_skips_dead_edges() {
+        let mut graph = RoutingGraph::new(2);
+        graph.add_edge(TokenIndex(0), graph_edge(-0.1));
+        graph.add_edge(TokenIndex(1), graph_edge(DEAD_EDGE_LOG_WEIGHT));
+        let adj = build_weighted_adjacency(&graph);
+        assert_eq!(adj[0].len(), 1);
+        assert!(adj[1].is_empty());
+    }
+}

@@ -1,0 +1,59 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Secrets & local config
+.env
+.env.*
+!.env.example
+config.local.toml
+/external_gateway/
+
+# Runtime data & journals
+opportunities.jsonl
+*.jsonl
+.rpbot-route-stats.json
+.rpbot-route-stats.json.tmp
+.rpbot-pool-meta.json
+.rpbot-pool-meta.json.tmp
+
+# Profiling & benchmarks
+flamegraph*.svg
+perf.data
+perf.data.old
+*.profraw
+
+# Criterion benchmark reports
+/target/criterion/
+
+# Code intelligence / doc generators (regenerable)
+docs/
+graphify-rs-out/
+graphify-out/
+graphify-out-routing/
+
+# IDE & OS
+.idea/
+.vscode/
+.cursor/
+.omo/*
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Symlens index (local, regenerable)
+.symlens/
+
+# Logs
+*.log
+.cursor/

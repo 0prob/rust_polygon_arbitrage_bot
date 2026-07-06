@@ -1,0 +1,447 @@
+use std::sync::Arc;
+
+use alloy::primitives::U256;
+use parking_lot::Mutex as ParkingMutex;
+use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, MissedTickBehavior, interval};
+
+use alloy::providers::Provider;
+
+use crate::config::{AppConfig, OracleConfig, WalletSecrets};
+use crate::info;
+use crate::infra::hypersync::HyperSyncService;
+use crate::infra::rpc::RpcPool;
+use crate::infra::wss_feed::spawn_pool_log_feed;
+use crate::orchestrator::hf::{HfContext, run_hf_tick};
+use crate::orchestrator::lf::{LfContext, spawn_lf_background};
+use crate::orchestrator::ui_hook::SharedUiHook;
+use crate::pipeline::arena::StateArena;
+use crate::pipeline::graph_cache::GraphCache;
+use crate::services::execution::ExecutionService;
+use crate::services::execution::GasOracle;
+use crate::services::hf_snapshot::SnapshotStore;
+use crate::services::oracle::price_oracle::PriceOracle;
+use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet};
+use crate::services::state_cache::StateCache;
+use crate::services::state_refresh::StateRefreshService;
+
+pub struct RuntimeContext {
+    pub config: Arc<AppConfig>,
+    pub wallet: Arc<WalletSecrets>,
+    pub rpc: Arc<RpcPool>,
+    pub cache: Arc<StateCache>,
+    pub partial_cache: Arc<PartialPoolCache>,
+    pub stream_addresses: StreamAddressSet,
+    pub snapshots: Arc<SnapshotStore>,
+    pub refresh: Arc<StateRefreshService>,
+    pub execution: Arc<ExecutionService>,
+    pub gas_oracle: Arc<GasOracle>,
+    pub price_oracle: Arc<PriceOracle>,
+    pub hypersync: Option<Arc<HyperSyncService>>,
+    pub graph_cache: Arc<parking_lot::Mutex<GraphCache>>,
+    pub arena: Arc<parking_lot::Mutex<StateArena>>,
+    pub lf_tick_lock: Arc<Mutex<()>>,
+    pub ui_hook: SharedUiHook,
+}
+
+impl RuntimeContext {
+    pub fn new(
+        config: AppConfig,
+        wallet: WalletSecrets,
+        hypersync: Option<HyperSyncService>,
+    ) -> anyhow::Result<Self> {
+        let rebuild_interval = config.pipeline.graph_rebuild_interval;
+        let config = Arc::new(config);
+        let wallet = Arc::new(wallet);
+        let rpc = Arc::new(RpcPool::from_config(&config));
+        let cache = Arc::new(StateCache::default());
+        let partial_cache = Arc::new(PartialPoolCache::with_capacity(
+            config.pipeline.stream_max_pools,
+        ));
+        let stream_addresses = StreamAddressSet::new();
+        let snapshots = Arc::new(SnapshotStore::new());
+        let refresh = Arc::new(StateRefreshService::new(
+            config.clone(),
+            cache.clone(),
+            rpc.clone(),
+        ));
+        let execution = Arc::new(ExecutionService::from_config(&config));
+        let gas_oracle = Arc::new(GasOracle::default());
+        let price_oracle = Arc::new(PriceOracle::new(
+            rpc.http().clone(),
+            config.oracle.pyth_hermes_url.clone(),
+        ));
+        register_configured_oracle_feeds(&price_oracle, &config.oracle);
+        Ok(Self {
+            config,
+            wallet,
+            rpc,
+            cache,
+            partial_cache,
+            stream_addresses,
+            snapshots,
+            refresh,
+            execution,
+            gas_oracle,
+            price_oracle,
+            hypersync: hypersync.map(Arc::new),
+            graph_cache: Arc::new(parking_lot::Mutex::new(GraphCache::with_rebuild_interval(
+                rebuild_interval,
+            ))),
+            arena: Arc::new(parking_lot::Mutex::new(StateArena::default())),
+            lf_tick_lock: Arc::new(Mutex::new(())),
+            ui_hook: Arc::new(()),
+        })
+    }
+
+    #[must_use]
+    pub fn with_ui_hook(mut self, hook: SharedUiHook) -> Self {
+        self.ui_hook = hook;
+        self
+    }
+
+    #[must_use]
+    pub fn lf_context(&self) -> LfContext {
+        LfContext {
+            config: Arc::clone(&self.config),
+            refresh: Arc::clone(&self.refresh),
+            cache: Arc::clone(&self.cache),
+            snapshots: Arc::clone(&self.snapshots),
+            stream_addresses: self.stream_addresses.clone(),
+            partial_cache: Arc::clone(&self.partial_cache),
+            price_oracle: Arc::clone(&self.price_oracle),
+            rpc: Arc::clone(&self.rpc),
+            graph_cache: Arc::clone(&self.graph_cache),
+            arena: Arc::clone(&self.arena),
+            tick_lock: Arc::clone(&self.lf_tick_lock),
+            ui_hook: Arc::clone(&self.ui_hook),
+        }
+    }
+
+    #[must_use]
+    pub fn hf_context(&self, shutdown: watch::Receiver<bool>) -> HfContext {
+        HfContext {
+            config: Arc::clone(&self.config),
+            refresh: Arc::clone(&self.refresh),
+            cache: Arc::clone(&self.cache),
+            partial_cache: Arc::clone(&self.partial_cache),
+            snapshots: Arc::clone(&self.snapshots),
+            execution: Arc::clone(&self.execution),
+            gas_oracle: Arc::clone(&self.gas_oracle),
+            wallet: Arc::clone(&self.wallet),
+            rpc: Arc::clone(&self.rpc),
+            hypersync: self.hypersync.clone(),
+            shutdown,
+            ui_hook: Arc::clone(&self.ui_hook),
+        }
+    }
+}
+
+pub async fn run_pass_loop(
+    ctx: Arc<RuntimeContext>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    info!("pass loop started");
+
+    ctx.rpc.probe_and_rank_state_urls().await;
+    ctx.rpc.spawn_periodic_probe(
+        shutdown.clone(),
+        std::time::Duration::from_secs(600),
+    );
+
+    match ctx.refresh.maybe_discover().await {
+        Ok(added) => {
+            if added > 0 {
+                info!("initial discovery added {added} pools");
+            }
+        }
+        Err(e) => crate::warn!("initial pool discovery failed: {e:#}"),
+    }
+
+    let daily_loss_guard = spawn_daily_loss_guard(&ctx, &shutdown);
+
+    let rpc = Arc::clone(&ctx.rpc);
+    tokio::spawn(async move {
+        if let Ok(p) = rpc.connect_state()
+            && let Err(e) =
+                crate::services::execution::flash_liquidity::fetch_and_cache_aave_flash_loan_fee_bps(
+                    &p,
+                )
+                .await
+        {
+            crate::warn!("aave flash loan fee fetch failed: {e}");
+        }
+    });
+
+    let lf_ctx = Arc::new(ctx.lf_context());
+    let hf_ctx = Arc::new(ctx.hf_context(shutdown.clone()));
+
+    let mut hf_timer = interval(Duration::from_millis(ctx.config.hf_interval_ms.max(1)));
+    hf_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let hf_inflight = Arc::new(Semaphore::new(1));
+    let hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>> = Arc::new(ParkingMutex::new(None)); // ponytail: simple shared handle tracking
+
+    if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
+        let probe_url = url.to_string();
+        tokio::spawn(async move {
+            let _probe =
+                crate::services::execution::private_submit::probe_submit_endpoint(&probe_url).await;
+            if let Some(auth) = std::env::var("BLOXROUTE_AUTH_HEADER")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                let _ =
+                    crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
+            }
+        });
+    }
+
+    if let Ok(provider) = ctx.rpc.connect_state() {
+        ctx.gas_oracle
+            .clone()
+            .start_background(provider, shutdown.clone());
+    }
+
+    let mut height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
+    let mut hs_reconnect_log_at = 0u64;
+    let mut hs_height_fallback_at = 0u64;
+    let mut hs_restart_backoff = Duration::from_secs(2);
+
+    let lf_shutdown = shutdown.clone();
+    let lf_handle = spawn_lf_background(lf_ctx, ctx.config.lf_interval_ms, lf_shutdown);
+
+    let stream_feed = spawn_pool_log_feed(
+        &ctx.config,
+        Arc::clone(&ctx.partial_cache),
+        ctx.stream_addresses.clone(),
+        shutdown.clone(),
+    );
+
+    let mut stream_rx = if ctx.config.pipeline.stream_enabled {
+        Some(ctx.partial_cache.trigger().subscribe())
+    } else {
+        None
+    };
+
+    let spawn_hf_tick = {
+        let hf_task = Arc::clone(&hf_task);
+        move |hf_ctx: Arc<HfContext>, hf_inflight: Arc<Semaphore>, stream_triggered: bool| {
+            let Ok(permit) = hf_inflight.try_acquire_owned() else {
+                return;
+            };
+            let hf_task = Arc::clone(&hf_task);
+            *hf_task.lock() = Some(tokio::spawn(async move {
+                let _permit = permit;
+                if stream_triggered {
+                    let _ = hf_ctx.partial_cache.trigger().take_stream_triggered();
+                }
+                if let Err(e) = run_hf_tick(hf_ctx, stream_triggered).await {
+                    crate::warn!("hf tick failed: {e:#}");
+                }
+            }));
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = hf_timer.tick() => {
+                spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), false);
+            }
+            event = async {
+                match height_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if height_rx.is_some() => {
+                use hypersync_client::HeightStreamEvent;
+                match event {
+                    Some(HeightStreamEvent::Height(height)) => {
+                        hs_restart_backoff = Duration::from_secs(2);
+                        if let Some(hs) = ctx.hypersync.as_ref() {
+                            hs.record_height(height);
+                        }
+                        spawn_hf_tick(
+                            Arc::clone(&hf_ctx),
+                            Arc::clone(&hf_inflight),
+                            false,
+                        );
+                    }
+                    Some(HeightStreamEvent::Reconnecting { delay, error_msg }) => {
+                        let now = crate::util::now_ms();
+                        if delay >= Duration::from_secs(5)
+                            && now.saturating_sub(hs_height_fallback_at) >= 15_000
+                            && let Ok(provider) = ctx.rpc.connect_state()
+                            && let Ok(height) = provider.get_block_number().await
+                        {
+                            if let Some(hs) = ctx.hypersync.as_ref() {
+                                hs.record_height(height);
+                            }
+                            hs_height_fallback_at = now;
+                            crate::debug!("hypersync height fallback from RPC: {height}");
+                        }
+                        let reason = error_msg
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty() && !line.starts_with("Caused by:"))
+                            .unwrap_or(error_msg.as_str());
+                        if now.saturating_sub(hs_reconnect_log_at) >= 30_000
+                            || delay.as_millis() == 0
+                        {
+                            crate::warn!(
+                                "hypersync height stream reconnecting in {}ms: {reason}",
+                                delay.as_millis()
+                            );
+                            hs_reconnect_log_at = now;
+                        }
+                    }
+                    Some(HeightStreamEvent::Connected) => {
+                        hs_restart_backoff = Duration::from_secs(2);
+                        crate::debug!("hypersync height stream connected");
+                    }
+                    None => {
+                        crate::warn!(
+                            "hypersync height stream closed, restarting in {}ms",
+                            hs_restart_backoff.as_millis()
+                        );
+                        tokio::time::sleep(hs_restart_backoff).await;
+                        hs_restart_backoff =
+                            (hs_restart_backoff * 2).min(Duration::from_secs(30));
+                        height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
+                    }
+                }
+            }
+            result = async {
+                match stream_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending::<Result<(), tokio::sync::watch::error::RecvError>>().await,
+                }
+            }, if stream_rx.is_some() => {
+                match result {
+                    Ok(()) => {
+                        spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), true);
+                    }
+                    Err(_) => {
+                        // Attempt to re-subscribe on error. If the trigger is
+                        // gone (all senders dropped), this is terminal.
+                        let new_rx = ctx.partial_cache.trigger().subscribe();
+                        if new_rx.has_changed().is_err() {
+                            crate::warn!("stream trigger permanently closed — WSS-triggered HF ticks disabled");
+                            stream_rx = None;
+                        } else {
+                            stream_rx = Some(new_rx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("pass loop shutting down");
+    drop(height_rx);
+    if let Some(handle) = stream_feed {
+        handle.abort();
+    }
+    if let Some(handle) = daily_loss_guard {
+        handle.abort();
+    }
+    let hf_join = hf_task.lock().take();
+    if let Some(handle) = hf_join {
+        handle.abort();
+        let _ = handle.await;
+    }
+    lf_handle.abort();
+    if tokio::time::timeout(Duration::from_secs(2), lf_handle)
+        .await
+        .is_err()
+    {
+        crate::warn!("lf background task did not exit within 2s of shutdown");
+    }
+    Ok(())
+}
+
+/// ponytail: global lock on daily loss check. Per-circuit refinement if needed.
+fn spawn_daily_loss_guard(
+    ctx: &Arc<RuntimeContext>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    let max_loss = match ctx
+        .config
+        .execution
+        .max_daily_loss_matic_wei
+        .parse::<U256>()
+    {
+        Ok(v) if !v.is_zero() => v,
+        Ok(_) => return None,
+        Err(_) => {
+            crate::warn!(
+                "failed to parse max_daily_loss_matic_wei='{}' — daily loss guard disabled",
+                ctx.config.execution.max_daily_loss_matic_wei
+            );
+            return None;
+        }
+    };
+
+    let execution = Arc::clone(&ctx.execution);
+    let mut rx = shutdown_rx.clone();
+    Some(tokio::spawn(async move {
+        use std::time::Instant;
+
+        let mut ticker = interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = rx.changed() => {
+                    if *rx.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let daily_loss = execution.pnl_snapshot().1;
+                    if daily_loss < 0 {
+                        let abs_loss = U256::from(daily_loss.unsigned_abs());
+                        if abs_loss >= max_loss {
+                            execution.quarantine_global(Duration::from_secs(3600), Instant::now());
+                            crate::error!(
+                                "DAILY LOSS LIMIT BREACHED: {abs_loss} >= {max_loss} wei — execution quarantined 1h"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {
+    use alloy::primitives::Address;
+
+    for pair in config.pyth_feeds.split(',').filter(|s| !s.is_empty()) {
+        let Some((token_str, feed_id)) = pair.split_once('=') else {
+            continue;
+        };
+        let Ok(token) = token_str.trim().parse::<Address>() else {
+            continue;
+        };
+        oracle.register_pyth_feed(token, feed_id.trim().to_string());
+    }
+
+    for pair in config.chainlink_feeds.split(',').filter(|s| !s.is_empty()) {
+        let Some((token_str, feed_str)) = pair.split_once('=') else {
+            continue;
+        };
+        let Ok(token) = token_str.trim().parse::<Address>() else {
+            continue;
+        };
+        let Ok(feed) = feed_str.trim().parse::<Address>() else {
+            continue;
+        };
+        oracle.register_chainlink_feed(token, feed);
+    }
+}

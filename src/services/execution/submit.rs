@@ -1,0 +1,181 @@
+use alloy::network::Ethereum;
+use alloy::primitives::{B256, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
+use anyhow::{Result, anyhow};
+
+use super::candidate::CandidateExecution;
+use super::gas::{compute_conservative_gas_price, u256_to_u128};
+use super::gas_oracle::GasOracle;
+use super::nonce::NonceManager;
+use super::private_submit::{PrivateSubmitConfig, sign_tx_to_raw, submit_signed_raw};
+use super::rpc_errors::{SubmitAction, classify_submit_error, extract_tx_hash_from_error};
+
+/// ponytail: 15% fee bump on resubmit. Standard EIP-1559 bump.
+pub const FEE_BUMP_BPS: u64 = 1500;
+const MAX_SUBMIT_ATTEMPTS: u32 = 3;
+/// ponytail: cap profit-derived priority fee boost at 200 gwei.
+/// 100 gwei was too conservative during Polygon MEV competition.
+const MAX_PROFIT_PRIORITY_FEE_WEI: u128 = 200_000_000_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubmitFees {
+    pub max_fee_per_gas: U256,
+    pub max_priority_fee_per_gas: U256,
+}
+
+#[must_use]
+pub fn bump_fees(fees: SubmitFees, bump_bps: u64) -> SubmitFees {
+    let num = U256::from(10_000u64 + bump_bps);
+    SubmitFees {
+        max_fee_per_gas: (fees.max_fee_per_gas * num) / U256::from(10_000u64),
+        max_priority_fee_per_gas: (fees.max_priority_fee_per_gas * num) / U256::from(10_000u64),
+    }
+}
+
+pub fn resolve_submit_fees(gas_oracle: &GasOracle) -> Option<SubmitFees> {
+    let snap = gas_oracle.loaded_snapshot()?;
+    Some(SubmitFees {
+        max_fee_per_gas: compute_conservative_gas_price(snap),
+        max_priority_fee_per_gas: snap.priority_fee,
+    })
+}
+
+/// Blend oracle fees with a profit-proportional priority fee boost (wei per gas).
+pub fn resolve_submit_fees_with_profit(
+    gas_oracle: &GasOracle,
+    expected_profit_matic_wei: U256,
+    alpha_bps: u64,
+    gas_limit: u64,
+) -> Option<SubmitFees> {
+    let snap = gas_oracle.loaded_snapshot()?;
+    let max_fee_per_gas = compute_conservative_gas_price(snap);
+    let priority_fee = snap.priority_fee;
+    let mut fees = SubmitFees {
+        max_fee_per_gas,
+        max_priority_fee_per_gas: priority_fee,
+    };
+
+    if expected_profit_matic_wei.is_zero() || alpha_bps == 0 || gas_limit == 0 {
+        return Some(fees);
+    }
+
+    let total_boost = (expected_profit_matic_wei * U256::from(alpha_bps)) / U256::from(10_000u64);
+    let per_gas = total_boost / U256::from(gas_limit);
+    let capped = per_gas.min(U256::from(MAX_PROFIT_PRIORITY_FEE_WEI));
+    fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(capped);
+
+    let min_max_fee = snap.base_fee + fees.max_priority_fee_per_gas;
+    fees.max_fee_per_gas = fees.max_fee_per_gas.max(min_max_fee);
+
+    Some(fees)
+}
+
+pub fn build_transaction_request(
+    candidate: &CandidateExecution,
+    nonce: u64,
+    fees: &SubmitFees,
+    gas_limit: u64,
+) -> Result<TransactionRequest> {
+    Ok(TransactionRequest::default()
+        .to(candidate.target_address)
+        .input(candidate.calldata.clone().into())
+        .value(candidate.value)
+        .nonce(nonce)
+        .max_fee_per_gas(u256_to_u128(fees.max_fee_per_gas)?)
+        .max_priority_fee_per_gas(u256_to_u128(fees.max_priority_fee_per_gas)?)
+        .gas_limit(gas_limit))
+}
+
+pub async fn submit_live_candidate<P: Provider<Ethereum>>(
+    provider: &P,
+    candidate: &CandidateExecution,
+    nonce: u64,
+    fees: &SubmitFees,
+    gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
+) -> Result<B256> {
+    let tx = build_transaction_request(candidate, nonce, fees, gas_limit)?;
+
+    let hash = if let Some(cfg) = private
+        && cfg.mode != super::private_submit::PrivateSubmitMode::Standard
+    {
+        let chain_id = cfg.chain_id;
+        let raw = sign_tx_to_raw(tx, &cfg.signer, chain_id).await?;
+        submit_signed_raw(&raw, cfg).await?
+    } else {
+        let pending = provider.send_transaction(tx).await?;
+        *pending.tx_hash()
+    };
+
+    Ok(hash)
+}
+
+/// Submit with classified RPC error recovery (resync, fee bump, already-known).
+pub async fn submit_with_recovery<P: Provider<Ethereum>>(
+    provider: &P,
+    nonce_mgr: &NonceManager,
+    candidate: &CandidateExecution,
+    mut nonce: u64,
+    mut fees: SubmitFees,
+    gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
+) -> Result<B256> {
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match submit_live_candidate(provider, candidate, nonce, &fees, gas_limit, private).await {
+            Ok(hash) => return Ok(hash),
+            Err(e) => {
+                if attempts >= MAX_SUBMIT_ATTEMPTS {
+                    return Err(e);
+                }
+                match classify_submit_error(&e) {
+                    SubmitAction::ResyncAndRetry => {
+                        nonce_mgr.release(nonce);
+                        nonce_mgr.resync(provider).await?;
+                        nonce = nonce_mgr.next_nonce()?;
+                    }
+                    SubmitAction::BumpFeesAndRetry => {
+                        fees = bump_fees(fees, FEE_BUMP_BPS);
+                    }
+                    SubmitAction::AlreadyKnown => {
+                        if let Some(hash) = extract_tx_hash_from_error(&e.to_string()) {
+                            return Ok(hash);
+                        }
+                        return Err(anyhow!("transaction already known but hash unavailable"));
+                    }
+                    SubmitAction::InsufficientFunds => return Err(e),
+                    SubmitAction::Fail(msg) => return Err(anyhow!(msg)),
+                }
+            }
+        }
+    }
+}
+
+/// Replace a stuck transaction: same nonce, 12% higher fees.
+/// ponytail: 12% bump per EIP-1559 best practice, re-evaluate if v3 blocks need finer control.
+pub async fn submit_replacement<P: Provider<Ethereum>>(
+    provider: &P,
+    nonce_mgr: &NonceManager,
+    candidate: &CandidateExecution,
+    nonce: u64,
+    fees: SubmitFees,
+    gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
+) -> Result<B256> {
+    let bumped = bump_fees(fees, 1200);
+    nonce_mgr.mark_stale(nonce);
+    let replacement_nonce = nonce_mgr
+        .replace_nonce(nonce)
+        .ok_or_else(|| anyhow!("nonce {nonce} not available for replacement"))?;
+    submit_live_candidate(
+        provider,
+        candidate,
+        replacement_nonce,
+        &bumped,
+        gas_limit,
+        private,
+    )
+    .await
+}

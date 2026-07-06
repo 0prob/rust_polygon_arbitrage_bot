@@ -1,0 +1,13 @@
+disallowed-types = [
+      { path = "std::sync::Mutex", reason = "Use parking_lot::Mutex for sync code or tokio::sync::Mutex for async code." },
+      { path = "std::sync::RwLock", reason = "Use parking_lot::RwLock for sync code or tokio::sync::RwLock for async code." },
+  ]
+
+  disallowed-macros = [
+      { path = "std::todo", reason = "Do not deploy unimplemented stubs." },
+      { path = "std::unimplemented", reason = "Do not deploy unimplemented stubs." },
+      { path = "std::print", reason = "Use the repository logging macros." },
+      { path = "std::println", reason = "Use the repository logging macros." },
+      { path = "std::eprint", reason = "Use the repository logging macros." },
+      { path = "std::eprintln", reason = "Use the repository logging macros." },
+  ]
