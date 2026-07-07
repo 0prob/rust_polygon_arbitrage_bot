@@ -271,13 +271,11 @@ mod proptests {
         ) {
             if sqrt_a.is_zero() || sqrt_b.is_zero() || sqrt_a == sqrt_b { return Ok(()); }
 
-            if let Some(amount0) = get_amount0_delta(sqrt_a, sqrt_b, liq, false) {
-                if let Some(amount1) = get_amount1_delta(sqrt_a, sqrt_b, liq, false) {
-                    if !amount0.is_zero() || !amount1.is_zero() {
+            if let Some(amount0) = get_amount0_delta(sqrt_a, sqrt_b, liq, false)
+                && let Some(amount1) = get_amount1_delta(sqrt_a, sqrt_b, liq, false)
+                    && (!amount0.is_zero() || !amount1.is_zero()) {
                         prop_assert!(!liq.is_zero(), "nonzero delta needs liquidity");
                     }
-                }
-            }
         }
 
         #[test]

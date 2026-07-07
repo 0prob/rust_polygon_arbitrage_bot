@@ -434,7 +434,7 @@ mod tests {
         let err_out = parse_bloxroute_submit_response(reqwest::StatusCode::BAD_REQUEST, err);
         assert!(
             err_out
-                .unwrap_err()
+                .expect_err("bad request should produce an error")
                 .to_string()
                 .contains("The transaction is invalid.")
         );

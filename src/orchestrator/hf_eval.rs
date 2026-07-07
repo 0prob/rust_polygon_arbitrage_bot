@@ -586,13 +586,11 @@ fn probe_fallback_amounts(
             continue;
         }
         // Skip SPOT_PROBE if it exceeds the flash loan cap for this token.
-        if candidate == spot {
-            if let Some(cap) = max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate) {
-                if spot > cap {
+        if candidate == spot
+            && let Some(cap) = max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate)
+                && spot > cap {
                     continue;
                 }
-            }
-        }
         amounts[n] = candidate;
         n += 1;
     }

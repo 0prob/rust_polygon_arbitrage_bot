@@ -91,13 +91,13 @@ mod tests {
         assert_eq!(
             pool_meta_at(&metas, PoolIndex(5))
                 .map(|m| m.protocol)
-                .unwrap(),
+                .expect("PoolIndex(5) should exist in the test metas"),
             ProtocolType::UniswapV2
         );
         assert_eq!(
             pool_meta_at(&metas, PoolIndex(2))
                 .map(|m| m.protocol)
-                .unwrap(),
+                .expect("PoolIndex(2) should exist in the test metas"),
             ProtocolType::UniswapV3
         );
     }

@@ -57,7 +57,7 @@ fn executor_entrypoints_map_to_expected_selectors() {
         data: vec![0x01].into(),
     }];
 
-    for (source, entrypoint, expected_selector) in [
+    for (_source, entrypoint, expected_selector) in [
         (
             FlashLoanSource::Balancer,
             ExecutorEntrypoint::BalancerFlash,

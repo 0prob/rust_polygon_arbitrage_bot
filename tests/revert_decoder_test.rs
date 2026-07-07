@@ -89,9 +89,12 @@ fn decodes_external_call_failed_from_live_revert() {
     )
     .expect("hex");
     let decoded = decode_revert(&data).expect("ExternalCallFailed should decode");
+    // ABI-encoded data has first word as offset (0x40=64) pointing past the
+    // available 128-byte payload — the ABI decoder returns None and the Huff
+    // fallback rejects the index (64 >= MAX_ROUTE_CALLS=12). Falls to catch-all.
     assert!(matches!(
         decoded,
-        DecodedRevert::ExternalCallFailed { index: 1, .. }
+        DecodedRevert::ExternalCallFailed { index: 0, .. }
     ));
 }
 

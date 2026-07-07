@@ -443,7 +443,7 @@ mod tests {
             std::env::set_var("BLOXROUTE_AUTH_HEADER", "test-auth");
         }
         assert_eq!(
-            pool.wallet_provider_url_for_submit().unwrap(),
+            pool.wallet_provider_url_for_submit().expect("submit URL should be valid"),
             "https://exec.example"
         );
         unsafe {

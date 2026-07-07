@@ -3,7 +3,6 @@ use crate::core::constants::{
     GAS_WOOFI_HOP,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
-use std::sync::Arc;
 use crate::core::math::curve::get_curve_stable_amount_out;
 use crate::core::math::dodo::get_dodo_amount_out;
 use crate::core::math::uniswap_v2::simulate_v2_swap;

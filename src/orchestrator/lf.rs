@@ -274,7 +274,7 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     expand_hub_spoke_resolvable(&mut resolvable, pool_metas.as_ref(), &arena);
     let resolvable_count = resolvable.len();
 
-    let mut cycles_arc = cpu.cycles;
+    let cycles_arc = cpu.cycles;
     let routing_graph = cpu.graph;
 
     let mut cycle_tokens_set = rustc_hash::FxHashSet::default();

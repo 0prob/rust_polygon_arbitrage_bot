@@ -95,7 +95,15 @@ impl FlashLiquidityCache {
             aave_pool: AAVE_V3_POOL,
         }
     }
+}
 
+impl Default for FlashLiquidityCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlashLiquidityCache {
     #[must_use]
     pub fn with_addresses(balancer_vault: Address, aave_pool: Address) -> Self {
         Self {

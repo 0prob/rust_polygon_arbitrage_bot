@@ -114,7 +114,7 @@ pub struct PgClient {
 }
 
 impl PgClient {
-    #[must_use]
+    
     pub fn new(url_str: String) -> anyhow::Result<Self> {
         let (user, password, host, port, dbname) = parse_pg_url(&url_str)
             .context("invalid postgres connection URL")?;

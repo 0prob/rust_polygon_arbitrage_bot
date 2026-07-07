@@ -24,6 +24,10 @@ const SEL_APPROVE_FAILED: [u8; 4] = [0x1b, 0x6c, 0x83, 0xab];
 const SEL_ZERO_ADDRESS: [u8; 4] = [0xd9, 0x2e, 0x23, 0x3d];
 const SEL_INVALID_CALLBACK_SOURCE: [u8; 4] = [0x93, 0x61, 0x98, 0xe9];
 const SEL_BALANCER_VAULT_REENTRANCY: [u8; 4] = [0x6b, 0xe9, 0x2d, 0xa6];
+/// Standard Solidity `revert(string)` — produced by `require(cond, "msg")`.
+const SEL_ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+/// Solidity `Panic(uint256)` — produced by `assert()`, division by zero, etc.
+const SEL_PANIC: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 
 #[derive(Debug, Clone)]
 pub enum DecodedRevert {
@@ -101,6 +105,19 @@ pub fn decode_revert(data: &[u8]) -> Option<DecodedRevert> {
         SEL_INSUFFICIENT_PROFIT => decode_insufficient_profit(payload),
         SEL_TRANSFER_FAILED => decode_transfer_failed(payload),
         SEL_APPROVE_FAILED => decode_approve_failed(payload),
+        SEL_ERROR_STRING => Some(DecodedRevert::ExternalCallFailed {
+            index: 0,
+            target: Address::ZERO,
+            reason: decode_abi_string(payload, 0),
+        }),
+        SEL_PANIC => {
+            let code = U256::from_be_slice(payload.get(..32).unwrap_or(&[]));
+            Some(DecodedRevert::ExternalCallFailed {
+                index: 0,
+                target: Address::ZERO,
+                reason: format!("Panic({code})"),
+            })
+        }
         _ => {
             let hex = data
                 .iter()
