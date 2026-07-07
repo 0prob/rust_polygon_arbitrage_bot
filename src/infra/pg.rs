@@ -115,9 +115,9 @@ pub struct PgClient {
 
 impl PgClient {
     #[must_use]
-    pub fn new(url_str: String) -> Self {
+    pub fn new(url_str: String) -> anyhow::Result<Self> {
         let (user, password, host, port, dbname) = parse_pg_url(&url_str)
-            .expect("invalid postgres connection URL");
+            .context("invalid postgres connection URL")?;
         let mut pg_config = tokio_postgres::Config::new();
         pg_config.host(&host);
         pg_config.port(port);
@@ -135,8 +135,8 @@ impl PgClient {
         let pool = Pool::builder(mgr)
             .max_size(MAX_POOL_SIZE)
             .build()
-            .expect("deadpool postgres pool build failed");
-        Self { pool }
+            .context("deadpool postgres pool build failed")?;
+        Ok(Self { pool })
     }
 
     pub async fn probe_pool_meta_count(&self) -> anyhow::Result<u64> {
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn incremental_requires_bootstrapped_cursor() {
-        let client = PgClient::new("postgres://localhost:5432/test".into());
+        let client = PgClient::new("postgres://localhost:5432/test".into()).expect("test pg url");
         let err = tokio::runtime::Runtime::new()
             .expect("test runtime")
             .block_on(client.fetch_pool_meta_incremental(&DiscoveryCursor::default()))

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy::primitives::{Address, FixedBytes};
 use parking_lot::RwLock;
@@ -23,6 +24,7 @@ struct WoofiMetaEntry {
 pub struct PoolMetaCache {
     inner: RwLock<PoolMetaData>,
     path: PathBuf,
+    write_seq: AtomicU64,
 }
 
 impl PoolMetaCache {
@@ -34,6 +36,7 @@ impl PoolMetaCache {
         Self {
             inner: RwLock::new(data),
             path,
+            write_seq: AtomicU64::new(0),
         }
     }
 
@@ -73,14 +76,19 @@ impl PoolMetaCache {
         self.persist();
     }
 
+    /// Write cache to disk off the async runtime (avoid blocking tokio worker threads).
     fn persist(&self) {
         let data = self.inner.read();
-        if let Ok(raw) = serde_json::to_vec(&*data) {
-            // atomic write via temp + rename, same as route stats
-            let tmp = self.path.with_extension("json.tmp");
+        let Ok(raw) = serde_json::to_vec(&*data) else {
+            return;
+        };
+        let path = self.path.clone();
+        let seq = self.write_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{seq}.tmp"));
+        tokio::task::spawn_blocking(move || {
             if std::fs::write(&tmp, &raw).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
+                let _ = std::fs::rename(&tmp, &path);
             }
-        }
+        });
     }
 }

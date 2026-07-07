@@ -430,8 +430,9 @@ mod safety_tests {
     #[test]
     fn insane_net_matic_profit_fails_closed() {
         let mut i = input();
-        i.gross_profit = U256::from(2u128 * 10u128.pow(18));
-        i.amount_in = U256::from(2u128 * 10u128.pow(18));
+        // MAX_SANE_PROFIT_MATIC_WEI = 50 POL; use 100 POL to exceed the cap.
+        i.gross_profit = U256::from(100u128 * 10u128.pow(18));
+        i.amount_in = U256::from(100u128 * 10u128.pow(18));
         i.slippage_bps = 0;
         i.safety_multiplier_bps = 0;
         let result = assess_profit(&i);

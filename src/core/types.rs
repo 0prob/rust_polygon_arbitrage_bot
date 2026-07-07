@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, U256};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 use crate::core::constants::{HOP_CAP, MAX_POOL_TOKENS, MIN_HOP_TOKEN_BALANCE};
 
@@ -97,7 +98,7 @@ pub struct ConcentratedLiquidityPoolState {
     pub liquidity: u128,
     pub fee: U256,
     pub tick_spacing: i32,
-    pub ticks: Box<[V3Tick]>,
+    pub ticks: Arc<[V3Tick]>,
     /// False = pool is paused (slot0.unlocked == 0).
     pub unlocked: bool,
     /// Protocol fee share in hundredths of a bip (0 = no protocol fee).

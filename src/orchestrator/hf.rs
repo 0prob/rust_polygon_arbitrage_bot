@@ -109,12 +109,10 @@ fn select_cycles_for_rescore(
     for (idx, score) in &mut candidates {
         *score = cycle_activity_score(&snap_cycles[*idx], arena, partial_cache, activity_now);
     }
+    // ponytail: all candidates already passed has_reliable_matic_rate filter
+    // above, so sort by activity score then cycle score directly.
     candidates.sort_by(|a, b| {
-        let a_rate = has_reliable_matic_rate(snap_cycles[a.0].start_token, token_to_matic_rates);
-        let b_rate = has_reliable_matic_rate(snap_cycles[b.0].start_token, token_to_matic_rates);
-        b_rate
-            .cmp(&a_rate)
-            .then_with(|| b.1.cmp(&a.1))
+        b.1.cmp(&a.1)
             .then_with(|| compare_cycle_score(&snap_cycles[a.0], &snap_cycles[b.0]))
     });
     candidates.truncate(rescore_cap);

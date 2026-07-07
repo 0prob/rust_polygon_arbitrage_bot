@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
+use anyhow::Context;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::config::AppConfig;
@@ -61,12 +62,13 @@ pub struct StateRefreshService {
 }
 
 impl StateRefreshService {
-    pub fn new(config: Arc<AppConfig>, cache: Arc<StateCache>, rpc: Arc<RpcPool>) -> Self {
-        let pg = PgClient::new(config.pg_url.clone());
+    pub fn new(config: Arc<AppConfig>, cache: Arc<StateCache>, rpc: Arc<RpcPool>) -> anyhow::Result<Self> {
+        let pg = PgClient::new(config.pg_url.clone())
+            .with_context(|| "failed to connect to PostgreSQL")?;
         let pool_meta_cache = Arc::new(PoolMetaCache::new(PathBuf::from(
             &config.pipeline.pool_meta_cache_path,
         )));
-        Self {
+        Ok(Self {
             config,
             pg,
             cache,
@@ -79,7 +81,7 @@ impl StateRefreshService {
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
             last_state_block: AtomicU64::new(0),
-        }
+        })
     }
 
     pub fn hot_addresses(&self) -> Arc<Vec<Address>> {

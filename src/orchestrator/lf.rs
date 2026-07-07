@@ -9,7 +9,7 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::AppConfig;
 use crate::core::constants::HOP_CAP;
-use crate::core::types::{PoolIndex, TokenIndex};
+use crate::core::types::{FoundCycle, PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
@@ -314,16 +314,14 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
         .await;
     }
 
-    let capped = Arc::make_mut(&mut cycles_arc);
+    let mut capped: Vec<FoundCycle> = cycles_arc.iter().cloned().collect();
     let mut table = SpotTable::new(arena.pool_count());
-    rescore_cycles_with_table(&arena, &mut table, capped);
+    rescore_cycles_with_table(&arena, &mut table, &mut capped);
     // Prune any that became unroutable due to dirty state updates (prevents
     // polluting HF candidate pool with now-dead cycles kept from graph cache).
     capped.retain(|c| c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT);
     capped.sort_by(compare_cycle_score);
-    if capped.len() > max_paths {
-        capped.truncate(max_paths);
-    }
+    capped.truncate(max_paths);
 
     let rates = if let Some(ref provider) = state_provider {
         merge_token_rates(
@@ -412,7 +410,7 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
             state_block: ctx.refresh.last_state_block(),
-            cycles: std::mem::take(capped).into_iter().map(Arc::new).collect(),
+            cycles: capped.into_iter().map(Arc::new).collect(),
             token_to_matic_rates: rates,
             token_decimals: decimals,
             pool_metas,

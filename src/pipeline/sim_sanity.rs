@@ -127,7 +127,8 @@ mod tests {
     fn insane_matic_profit_is_rejected() {
         let rate = U256::from(10u128.pow(18));
         let amount_in = U256::from(10u128.pow(20));
-        let profit = U256::from(2u128 * 10u128.pow(18));
+        // MAX_SANE_PROFIT_MATIC_WEI = 50 POL; use 100 POL to exceed the cap.
+        let profit = U256::from(100u128 * 10u128.pow(18));
         assert!(matches!(
             check_sim_sanity(SimSanityInput {
                 amount_in,

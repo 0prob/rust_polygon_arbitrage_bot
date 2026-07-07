@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, FixedBytes};
 use rustc_hash::FxHashSet;
+use std::sync::Arc;
 
 use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
@@ -185,7 +186,7 @@ pub async fn enrich_v3_ticks<
             }
             ticks.sort_unstable();
             if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(idx) {
-                s.ticks = ticks.into_boxed_slice();
+                s.ticks = Arc::from(ticks);
                 updated += 1;
             }
         }
@@ -305,7 +306,7 @@ pub async fn enrich_v4_ticks<
     for (idx, mut ticks) in grouped {
         ticks.sort_unstable();
         if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(idx) {
-            state.ticks = ticks.into_boxed_slice();
+            state.ticks = Arc::from(ticks);
             updated += 1;
         }
     }
@@ -423,7 +424,7 @@ async fn enrich_algebra_ticks<
     for (idx, mut ticks) in grouped {
         ticks.sort_unstable();
         if let Some(crate::core::types::PoolState::V3(state)) = arena.pool_state_mut(idx) {
-            state.ticks = ticks.into_boxed_slice();
+            state.ticks = Arc::from(ticks);
             updated += 1;
         }
     }

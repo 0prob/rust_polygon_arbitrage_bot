@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
+use std::sync::Arc;
 
 use crate::abis::{IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurvePool};
 use crate::core::math::balancer::balancer_swap_fee_from_pool_meta_fee;
@@ -130,7 +131,7 @@ fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
         liquidity,
         fee: fee_pips,
         tick_spacing: plan.pool.tick_spacing.unwrap_or(60),
-        ticks: Box::new([]),
+            ticks: Arc::from(Vec::new()),
         unlocked,
         fee_protocol: 0,
         observation_cardinality: obs_card,
@@ -158,7 +159,7 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
         liquidity,
         fee,
         tick_spacing: plan.pool.tick_spacing.unwrap_or(60),
-        ticks: Box::new([]),
+            ticks: Arc::from(Vec::new()),
         unlocked: true,
         fee_protocol: 0,
         observation_cardinality: 1,

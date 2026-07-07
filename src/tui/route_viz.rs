@@ -34,6 +34,7 @@ pub fn route_fingerprint(edges: &[Edge]) -> u64 {
 mod tests {
     use super::*;
     use crate::core::types::{CycleEdges, Edge, PoolIndex, ProtocolType, TokenIndex};
+    use crate::pipeline::types::{PoolMeta, pool_meta_at};
 
     fn sample_edge(reverse: bool) -> Edge {
         let (token_in, token_out) = if reverse {

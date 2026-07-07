@@ -3,6 +3,7 @@ use crate::core::constants::{
     GAS_WOOFI_HOP,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
+use std::sync::Arc;
 use crate::core::math::curve::get_curve_stable_amount_out;
 use crate::core::math::dodo::get_dodo_amount_out;
 use crate::core::math::uniswap_v2::simulate_v2_swap;
@@ -396,7 +397,7 @@ mod tests {
                 unlocked: true,
                 fee_protocol: 0,
                 observation_cardinality: 1,
-                ticks: Box::new([]),
+                ticks: Arc::from(Vec::new()),
             })),
         );
         let edge = Edge {
@@ -474,7 +475,7 @@ mod tests {
                 unlocked: true,
                 fee_protocol: 0,
                 observation_cardinality: 1,
-                ticks: Box::new([V3Tick {
+                ticks: Arc::from(vec![V3Tick {
                     tick: -60,
                     liquidity_gross: 1_000_000,
                     liquidity_net: 1_000_000,
@@ -524,7 +525,7 @@ mod tests {
                 unlocked: true,
                 fee_protocol: 0,
                 observation_cardinality: 0,
-                ticks: Box::new([]),
+                ticks: Arc::from(Vec::new()),
             })),
         );
         let edges = [
@@ -625,7 +626,7 @@ mod tests {
                 unlocked: true,
                 fee_protocol: 0,
                 observation_cardinality: 0,
-                ticks: Box::new([]),
+                ticks: Arc::from(Vec::new()),
             })),
         );
         let edges = [Edge {

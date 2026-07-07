@@ -54,7 +54,13 @@ pub fn log_startup(config: &AppConfig) {
 /// Non-blocking postgres probe; does not delay runtime startup.
 pub fn spawn_pg_probe(pg_url: String) {
     tokio::spawn(async move {
-        let pg = PgClient::new(pg_url);
+        let pg = match PgClient::new(pg_url) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::warn!("postgres connection failed: {e}");
+                return;
+            }
+        };
         match pg.probe_pool_meta_count().await {
             Ok(count) => crate::info!("postgres connected pool_meta_rows={count}"),
             Err(e) => crate::warn!("postgres probe failed: {e}"),

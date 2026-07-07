@@ -65,7 +65,7 @@ impl RuntimeContext {
             config.clone(),
             cache.clone(),
             rpc.clone(),
-        ));
+        )?);
         let execution = Arc::new(ExecutionService::from_config(&config));
         let gas_oracle = Arc::new(GasOracle::default());
         let price_oracle = Arc::new(PriceOracle::new(

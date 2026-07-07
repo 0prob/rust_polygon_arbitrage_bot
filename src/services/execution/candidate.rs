@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use rustc_hash::{FxHashMap, FxHasher};
 
-use crate::core::types::{EvaluatedRoute, FlashLoanSource, PoolIndex, RouteSimulationResult};
+use crate::core::types::{EvaluatedRoute, FlashLoanSource, PoolIndex, PoolState, RouteSimulationResult};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 use crate::services::execution::calldata::{
@@ -49,6 +49,18 @@ pub struct CandidateBuildConfig {
     pub safety_multiplier_bps: u64,
     pub state_generation: u64,
     pub route_fingerprint: u64,
+}
+
+fn dodo_pool_address_for_cycle(
+    arena: &StateArena,
+    edges: &[crate::core::types::Edge],
+) -> Option<Address> {
+    for edge in edges {
+        if matches!(arena.pool_state(edge.pool_index)?, PoolState::Dodo(_)) {
+            return arena.pool_address(edge.pool_index);
+        }
+    }
+    None
 }
 
 #[must_use]
@@ -146,9 +158,19 @@ pub fn build_execution_candidate(
         .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
 
     let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, &hops);
+
+    // DODO flash loan: packRoute flash_token field must be the DODO pool address,
+    // not the token address — the Huff contract calls flashLoan on it directly.
+    let flash_token = if entrypoint == ExecutorEntrypoint::DodoFlash {
+        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges)
+            .unwrap_or(start_token)
+    } else {
+        start_token
+    };
+
     let built = build_arb_calldata(
         config.executor_address,
-        start_token,
+        flash_token,
         start_token,
         evaluated.result.amount_in,
         min_profit,
