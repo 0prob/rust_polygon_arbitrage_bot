@@ -190,7 +190,9 @@ pub async fn run_hf_tick(
             hot_pools.insert(addr);
         }
     }
-    let hot_pools: Arc<Vec<_>> = Arc::new(hot_pools.into_iter().collect());
+    let mut hot_vec = Vec::with_capacity(hot_pools.len());
+    hot_vec.extend(hot_pools);
+    let hot_pools: Arc<Vec<_>> = Arc::new(hot_vec);
 
     let refresh = Arc::clone(&ctx.refresh);
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
@@ -395,23 +397,29 @@ fn near_miss_route_summary(
     cycle: &FoundCycle,
     pool_metas: &[PoolMeta],
 ) -> String {
-    let mut parts = Vec::with_capacity(cycle.edges.len().saturating_mul(2) + 1);
-    let start = arena
-        .token_address(cycle.start_token)
-        .map(|a| crate::util::truncate_str(&format!("{a}"), 12))
-        .unwrap_or_else(|| format!("t{}", cycle.start_token.0));
-    parts.push(start);
+    // ponytail: single String alloc with write! avoids per-format! allocs
+    let cap = cycle.edges.len().saturating_mul(64).max(64);
+    let mut buf = String::with_capacity(cap);
+    use std::fmt::Write;
+    if let Some(addr) = arena.token_address(cycle.start_token) {
+        let hex = alloy::primitives::hex::encode(&addr.as_slice()[..6]);
+        let _ = write!(buf, "0x{}..{}", &hex[..4], &hex[4..6]);
+    } else {
+        let _ = write!(buf, "t{}", cycle.start_token.0);
+    }
     for edge in &cycle.edges {
         let tag = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
             .map(|m| protocol_tag(m.protocol))
             .unwrap_or_else(|| protocol_tag(edge.protocol));
-        let token = arena
-            .token_address(edge.token_out)
-            .map(|a| crate::util::truncate_str(&format!("{a}"), 12))
-            .unwrap_or_else(|| format!("t{}", edge.token_out.0));
-        parts.push(format!("{tag}:{token}"));
+        let _ = write!(buf, "->{tag}:");
+        if let Some(addr) = arena.token_address(edge.token_out) {
+            let hex = alloy::primitives::hex::encode(&addr.as_slice()[..6]);
+            let _ = write!(buf, "0x{}..{}", &hex[..4], &hex[4..6]);
+        } else {
+            let _ = write!(buf, "t{}", edge.token_out.0);
+        }
     }
-    parts.join("->")
+    buf
 }
 
 fn near_miss_safety_floor(

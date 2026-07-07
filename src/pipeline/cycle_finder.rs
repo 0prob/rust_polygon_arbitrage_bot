@@ -147,7 +147,7 @@ pub fn clamp_fee_bps(fee_bps: u32) -> u32 {
 /// Boosts tokens whose live outgoing edges span more protocols (helps surface
 /// cross-protocol cycles instead of pure Balancer-dense hubs).
 pub fn prioritize_cycle_start_tokens(graph: &RoutingGraph) -> Vec<TokenIndex> {
-    let mut scored: Vec<(TokenIndex, usize, usize)> = Vec::new(); // (token, proto_diversity, degree)
+    let mut scored: Vec<(TokenIndex, usize, usize)> = Vec::with_capacity(graph.adjacency.len()); // (token, proto_diversity, degree)
     for (ti, edges) in graph.adjacency.iter().enumerate() {
         let live: Vec<_> = edges.iter().filter(|ge| is_live_graph_edge(ge)).collect();
         if live.is_empty() {
@@ -203,6 +203,8 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     let mut compact = Vec::with_capacity(token_count);
     let mut min_outgoing = vec![f64::INFINITY; token_count];
     let mut global_min = f64::INFINITY;
+    // ponytail: single pass for live edges + diversity scoring (was double iteration).
+    let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
 
     for (index, edges) in graph.adjacency.iter().enumerate() {
         if !coverage.token_mask.get(index).copied().unwrap_or(false) {
@@ -210,9 +212,16 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             continue;
         }
         let mut live: Vec<GraphEdge> = Vec::new();
+        let mut protos: u8 = 0;
+        let mut proto_bits = 0u16; // bitmask: ProtocolType has ≤9 variants
         for ge in edges {
             if !is_live_graph_edge(ge) {
                 continue;
+            }
+            let bit = 1u16 << (ge.edge.protocol as u8);
+            if proto_bits & bit == 0 {
+                protos += 1;
+                proto_bits |= bit;
             }
             live.push(*ge);
             let w = ge.log_weight;
@@ -223,21 +232,13 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
                 global_min = w;
             }
         }
+        let len = live.len();
         compact.push(live);
+        if len > 0 {
+            scored_div.push((TokenIndex(index as u32), protos as usize, len));
+        }
     }
 
-    // Diversity-aware start ordering (boost tokens connected to multiple protocols).
-    let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
-    for (index, edges) in compact.iter().enumerate() {
-        if edges.is_empty() {
-            continue;
-        }
-        let mut protos: rustc_hash::FxHashSet<ProtocolType> = rustc_hash::FxHashSet::default();
-        for ge in edges {
-            protos.insert(ge.edge.protocol);
-        }
-        scored_div.push((TokenIndex(index as u32), protos.len(), edges.len()));
-    }
     scored_div.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| b.2.cmp(&a.2))
@@ -543,12 +544,7 @@ fn collect_cycles_dfs_parallel(
 }
 
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    let cap = shard_cycles.iter().map(Vec::len).sum();
-    let mut flat = Vec::with_capacity(cap);
-    for shard in shard_cycles {
-        flat.extend(shard.iter().cloned());
-    }
-    dedupe_cycles_by_edges(flat)
+    dedupe_cycles_by_edges(shard_cycles.iter().flatten().cloned().collect())
 }
 
 #[must_use]
@@ -583,15 +579,29 @@ pub fn find_cycles_multi_pass(
 /// Returns the most frequently used protocol in the cycle (primary protocol for diversity).
 #[must_use]
 pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
-    let mut counts: rustc_hash::FxHashMap<ProtocolType, u32> = rustc_hash::FxHashMap::default();
-    for e in edges {
-        *counts.entry(e.protocol).or_default() += 1;
+    // ponytail: small array avoids HashMap alloc for typical 2-4 hop cycles
+    let mut best: (ProtocolType, u32) = (ProtocolType::UniswapV2, 0);
+    let mut i = 0usize;
+    while i < edges.len() {
+        let p = edges[i].protocol;
+        let mut count = 1u32;
+        // Count remaining occurrences of this protocol from the rest of the slice.
+        // This is O(n²) worst-case but n ≤ HOP_CAP (typically 2-4), so it's faster
+        // than HashMap allocation + hashing for small inputs.
+        for e in &edges[i + 1..] {
+            if e.protocol == p {
+                count += 1;
+            }
+        }
+        if count > best.1 {
+            best = (p, count);
+        }
+        // Skip past all occurrences of p (they'll produce the same count).
+        while i < edges.len() && edges[i].protocol == p {
+            i += 1;
+        }
     }
-    counts
-        .into_iter()
-        .max_by_key(|&(_, c)| c)
-        .map(|(p, _)| p)
-        .unwrap_or(ProtocolType::UniswapV2)
+    best.0
 }
 
 /// Selects up to `max_cycles` opportunities with better protocol distribution.
@@ -611,6 +621,7 @@ pub fn apply_protocol_diverse_selection(
 
     let mut groups: rustc_hash::FxHashMap<ProtocolType, Vec<FoundCycle>> =
         rustc_hash::FxHashMap::default();
+    groups.reserve(8);
     for c in cycles {
         let p = primary_protocol(&c.edges);
         groups.entry(p).or_default().push(c);

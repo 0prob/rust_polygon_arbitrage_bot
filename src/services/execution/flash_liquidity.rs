@@ -136,7 +136,7 @@ impl FlashLiquidityCache {
         provider: &P,
         tokens: &[Address],
     ) -> anyhow::Result<()> {
-        let mut to_fetch = Vec::new();
+        let mut to_fetch = Vec::with_capacity(tokens.len());
         let now = Instant::now();
         {
             let guard = self.entries.read();
@@ -337,10 +337,12 @@ pub fn prefer_aave_flash_start<'a>(
         return Cow::Borrowed(cycle);
     }
 
+    // ponytail: FxHashSet avoids O(n²) linear scan per edge for small cycles.
+    let mut seen: rustc_hash::FxHashSet<TokenIndex> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
     for edge in &cycle.edges {
         let token = edge.token_in;
-        if candidates.iter().any(|(_, t)| *t == token) {
+        if !seen.insert(token) {
             continue;
         }
         let Some(addr) = arena.token_address(token) else {

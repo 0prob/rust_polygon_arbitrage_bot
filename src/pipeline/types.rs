@@ -123,7 +123,6 @@ pub fn pool_meta_at(pool_metas: &[PoolMeta], index: PoolIndex) -> Option<&PoolMe
     pool_metas
         .get(index.0 as usize)
         .filter(|meta| meta.pool_index == index)
-        .or_else(|| pool_metas.iter().find(|meta| meta.pool_index == index))
 }
 
 #[must_use]

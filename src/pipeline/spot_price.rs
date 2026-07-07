@@ -160,6 +160,13 @@ pub fn compute_spot_price(arena: &StateArena, edge: &Edge) -> f64 {
         Some(s) if s.is_tradable() => s,
         _ => return 0.0,
     };
+    spot_price_from_state(state, edge)
+}
+
+/// Compute spot price from an already-retrieved and validated pool state, skipping
+/// the redundant arena lookup when the caller has already verified tradability.
+#[must_use]
+pub fn spot_price_from_state(state: &PoolState, edge: &Edge) -> f64 {
     match (state, edge.protocol) {
         (PoolState::V2(s), ProtocolType::UniswapV2) => v2_marginal_spot(s, edge),
         (PoolState::V3(s), ProtocolType::UniswapV3)
@@ -257,7 +264,14 @@ fn rescore_one_cycle(
             log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
             break;
         }
-        let spot = table.ensure_edge(arena, edge);
+        let cached = table.get(edge);
+        let spot = if !cached.is_nan() {
+            cached
+        } else {
+            let val = spot_price_from_state(state, edge);
+            table.set(edge, val);
+            val
+        };
         if spot <= 0.0 {
             missing_spot += 1;
             log_weight += compute_edge_log_weight(edge.fee_bps);

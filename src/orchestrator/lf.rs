@@ -242,9 +242,7 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 
-    let snap = ctx.snapshots.read();
-    let prior_rates = Arc::clone(&snap.token_to_matic_rates);
-    drop(snap);
+    let prior_rates = Arc::clone(&ctx.snapshots.read().token_to_matic_rates);
 
     let state_provider = ctx.rpc.connect_state().ok();
     let state_generation = ctx.cache.generation();
@@ -277,15 +275,22 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     let cycles_arc = cpu.cycles;
     let routing_graph = cpu.graph;
 
+    // ponytail: collect unique cycle tokens without intermediate HashSet→Vec copy
+    let mut cycle_tokens: Vec<TokenIndex> = Vec::new();
     let mut cycle_tokens_set = rustc_hash::FxHashSet::default();
     for c in cycles_arc.iter() {
-        cycle_tokens_set.insert(c.start_token);
+        if cycle_tokens_set.insert(c.start_token) {
+            cycle_tokens.push(c.start_token);
+        }
         for e in &c.edges {
-            cycle_tokens_set.insert(e.token_in);
-            cycle_tokens_set.insert(e.token_out);
+            if cycle_tokens_set.insert(e.token_in) {
+                cycle_tokens.push(e.token_in);
+            }
+            if cycle_tokens_set.insert(e.token_out) {
+                cycle_tokens.push(e.token_out);
+            }
         }
     }
-    let cycle_tokens: Vec<TokenIndex> = cycle_tokens_set.into_iter().collect();
 
     if let Some(ref provider) = state_provider {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());

@@ -21,6 +21,9 @@ pub fn collect_algebra_pools(
 ) -> (FxHashSet<Address>, FxHashSet<Address>) {
     let mut algebra_pools = FxHashSet::default();
     let mut algebra_integral_pools = FxHashSet::default();
+    // ponytail: pre-size for common case - most pools aren't algebra
+    algebra_pools.reserve(32);
+    algebra_integral_pools.reserve(16);
     for meta in pool_metas {
         let Some(label) = meta.protocol_label.as_deref() else {
             continue;
@@ -40,7 +43,7 @@ pub fn collect_algebra_pools(
 
 #[must_use]
 pub fn collect_v3_pool_addresses(arena: &StateArena, cycles: &[FoundCycle]) -> Vec<Address> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(cycles.len().min(MAX_TICK_POOLS));
     let mut seen: FxHashSet<Address> = FxHashSet::default();
     'cycles: for cycle in cycles {
         for edge in &cycle.edges {

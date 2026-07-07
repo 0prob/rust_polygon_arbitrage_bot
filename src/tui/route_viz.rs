@@ -21,7 +21,7 @@ pub fn protocol_tag(protocol: ProtocolType) -> &'static str {
 #[must_use]
 pub fn short_address(address: Address) -> String {
     let s = format!("{address}");
-    truncate_str(&s, 12)
+    truncate_str(&s, 12).into_owned()
 }
 
 /// Same fingerprint as execution / HF eval (`hash_cycle_edges`).

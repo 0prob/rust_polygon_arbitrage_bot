@@ -63,14 +63,6 @@ async fn pg_query(
     client.query(&stmt, params).await.context("pg query failed")
 }
 
-// ponytail: COPY-based bulk bootstrap requires tokio-stream for CopyOutStream.
-// Current keyset pagination with composite index + connection pool is already
-// sub-ms per page. Revisit if initial bootstrap exceeds 10s for 500k+ pools.
-#[allow(dead_code)]
-pub async fn pg_copy_pool_metas(_pool: &Pool) -> anyhow::Result<Vec<Row>> {
-    anyhow::bail!("pg COPY requires tokio-stream; use fetch_pool_meta_page instead")
-}
-
 /// Same as `pg_query` but with transient-error retry.
 async fn pg_query_retry(
     pool: &Pool,

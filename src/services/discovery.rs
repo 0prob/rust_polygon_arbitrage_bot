@@ -79,11 +79,11 @@ fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool
     {
         return false;
     }
-    for i in 0..tokens.len() {
-        for j in (i + 1)..tokens.len() {
-            if tokens[i] == tokens[j] {
-                return false;
-            }
+    // ponytail: FxHashSet dedup is O(n) vs the O(n²) nested loop it replaces
+    if tokens.len() > 1 {
+        let mut seen = rustc_hash::FxHashSet::default();
+        if !tokens.iter().all(|t| seen.insert(*t)) {
+            return false;
         }
     }
     match protocol {

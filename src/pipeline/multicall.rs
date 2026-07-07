@@ -204,7 +204,7 @@ mod tests {
     fn chunking_splits_large_batches() {
         let items_len = 450usize;
         let chunk = MULTICALL_CHUNK;
-        let chunk_count = (0..items_len).collect::<Vec<_>>().chunks(chunk).count();
+        let chunk_count = items_len.div_ceil(chunk);
         assert_eq!(chunk_count, 3);
     }
 

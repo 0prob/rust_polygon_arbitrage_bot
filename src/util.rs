@@ -174,23 +174,31 @@ pub fn u256_to_f64(v: U256) -> f64 {
 }
 
 /// Truncate to at most `max_chars` Unicode scalar values (not bytes).
-/// Avoids full scan of long strings.
+/// Returns `&str` when no truncation is needed, avoiding allocation.
 #[inline]
 #[must_use]
-pub fn truncate_str(s: &str, max_chars: usize) -> String {
-    let mut iter = s.chars();
-    // Collect up to max_chars; if no more chars, return as-is (no alloc if possible, but collect does).
-    let collected: String = iter.by_ref().take(max_chars).collect();
-    if iter.next().is_none() {
-        collected
-    } else if max_chars == 0 {
-        "…".to_string()
-    } else {
-        // Had more chars: drop the last collected char to make room for … (matches prior take(max-1)+…)
-        let mut short = collected;
-        short.pop();
-        short.push('…');
-        short
+pub fn truncate_str(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    let mut iter = s.char_indices();
+    for _ in 0..max_chars {
+        if iter.next().is_none() {
+            return std::borrow::Cow::Borrowed(s);
+        }
+    }
+    match iter.next() {
+        None => std::borrow::Cow::Borrowed(s),
+        Some((pos, _)) => {
+            if max_chars == 0 {
+                std::borrow::Cow::Owned('…'.to_string())
+            } else if let Some((last_char_pos, _)) = s.char_indices().nth(max_chars - 1) {
+                let mut truncated = s[..last_char_pos].to_string();
+                truncated.push('…');
+                std::borrow::Cow::Owned(truncated)
+            } else {
+                let mut truncated = s[..pos].to_string();
+                truncated.push('…');
+                std::borrow::Cow::Owned(truncated)
+            }
+        }
     }
 }
 

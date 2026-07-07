@@ -63,9 +63,9 @@ impl StateCache {
         &self,
         address_to_pool: &FxHashMap<Address, PoolIndex>,
     ) -> Vec<PoolIndex> {
-        let addresses: Vec<Address> = self.dirty.lock().drain().collect();
-        addresses
-            .into_iter()
+        self.dirty
+            .lock()
+            .drain()
             .filter_map(|addr| address_to_pool.get(&addr).copied())
             .collect()
     }
@@ -83,9 +83,16 @@ impl StateCache {
 
     /// Count addresses whose cached state is tradable (single read-lock pass).
     pub fn count_tradable(&self, addresses: &[Address]) -> usize {
+        self.count_tradable_iter(addresses.iter())
+    }
+
+    pub fn count_tradable_iter<'a>(
+        &self,
+        addresses: impl IntoIterator<Item = &'a Address>,
+    ) -> usize {
         let guard = self.inner.read();
         addresses
-            .iter()
+            .into_iter()
             .filter(|addr| {
                 guard.get(*addr).is_some_and(|entry| {
                     entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable()

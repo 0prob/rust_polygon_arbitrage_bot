@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -137,7 +137,11 @@ impl ExecutionService {
             .create(true)
             .open(path)
         {
-            let _ = writeln!(file, "{}", line);
+            // ponytail: BufWriter reduces syscall overhead when multiple route
+            // events arrive in quick succession (HF ticks at ~200ms intervals).
+            let mut writer = BufWriter::new(&mut file);
+            let _ = writeln!(writer, "{}", line);
+            let _ = writer.flush();
         }
     }
 

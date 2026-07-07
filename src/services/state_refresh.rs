@@ -103,10 +103,8 @@ impl StateRefreshService {
     /// Discovered pools with tradable on-chain state in cache (routing arena input).
     pub fn routable_pool_count(&self) -> usize {
         let state = self.discovery_state.read();
-        {
-            let addresses: Vec<Address> = state.discovered.iter().map(|p| p.address).collect();
-            self.cache.count_tradable(&addresses)
-        }
+        self.cache
+            .count_tradable_iter(state.discovered.iter().map(|p| &p.address))
     }
 
     pub fn cache_size(&self) -> usize {
@@ -565,16 +563,25 @@ impl StateRefreshService {
             return Ok(0);
         }
         let all = self.discovered_pools();
-        // Build an address→pool index from the discovered list for O(1) lookups.
-        // This avoids scanning all discovered pools per address in the hot path.
-        let pool_map: rustc_hash::FxHashMap<Address, &DiscoveredPool> = all
-            .iter()
-            .map(|p| (p.address, p))
-            .collect();
-        let pools: Vec<DiscoveredPool> = addresses
-            .iter()
-            .filter_map(|addr| pool_map.get(addr).copied().cloned())
-            .collect();
+        // ponytail: sort+two-pointer avoids HashMap allocation. discovered_pools() returns
+        // a stable-ordered Arc<Vec>. Sorting addresses once + linear merge is faster than
+        // building a HashMap from all discovered pools (which can be 10k+ entries).
+        let mut addrs: Vec<Address> = addresses.to_vec();
+        addrs.sort_unstable();
+        let mut pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
+        let mut ai = 0usize;
+        let mut pi = 0usize;
+        while ai < addrs.len() && pi < all.len() {
+            match addrs[ai].cmp(&all[pi].address) {
+                std::cmp::Ordering::Equal => {
+                    pools.push(all[pi].clone());
+                    ai += 1;
+                    pi += 1;
+                }
+                std::cmp::Ordering::Less => ai += 1,
+                std::cmp::Ordering::Greater => pi += 1,
+            }
+        }
         if pools.is_empty() {
             return Ok(0);
         }

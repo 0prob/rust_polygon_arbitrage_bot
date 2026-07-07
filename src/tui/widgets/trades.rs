@@ -35,7 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         .profit_wei
                         .map_or_else(|| "-".to_string(), |p| p.to_string()),
                 ),
-                Cell::from(trade.tx_hash.clone().unwrap_or_else(|| "-".to_string())),
+                Cell::from(trade.tx_hash.as_deref().unwrap_or("-")),
             ])
             .style(style),
         );

@@ -1,6 +1,3 @@
-use smallvec::SmallVec;
-
-use crate::core::constants::HOP_CAP_USIZE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
 use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
@@ -17,19 +14,22 @@ fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     if edges.last().map(|e| e.token_out) != Some(start) {
         return None;
     }
-    let mut pools: SmallVec<[u32; HOP_CAP_USIZE]> = SmallVec::with_capacity(len);
-    let mut intermediates: SmallVec<[u32; HOP_CAP_USIZE]> = SmallVec::with_capacity(len);
+    // Bitmask for O(1) duplicate-pool / duplicate-intermediate checks (HOP_CAP=8, u16 fits).
+    let mut seen_pools: u16 = 0;
+    let mut seen_tokens: u16 = 0;
     for (i, e) in edges.iter().enumerate() {
-        if pools.contains(&e.pool_index.0) {
+        let pool_bit = 1u16 << (e.pool_index.0 & 15);
+        if seen_pools & pool_bit != 0 {
             return None;
         }
-        pools.push(e.pool_index.0);
+        seen_pools |= pool_bit;
         if i < len - 1 {
             let mid = e.token_out;
-            if mid == start || intermediates.contains(&mid.0) {
+            let mid_bit = 1u16 << (mid.0 & 15);
+            if mid == start || seen_tokens & mid_bit != 0 {
                 return None;
             }
-            intermediates.push(mid.0);
+            seen_tokens |= mid_bit;
         }
     }
     let route_calls = estimate_packed_route_calls(edges);
@@ -110,14 +110,14 @@ pub fn collect_negative_cycles_from_source(
                 continue;
             }
 
-            let mut visited: SmallVec<[TokenIndex; HOP_CAP_USIZE]> =
-                SmallVec::with_capacity(HOP_CAP_USIZE);
+            let mut visited_mask: u32 = 0;
             let mut curr = Some(TokenIndex(u_idx as u32));
             while let Some(c) = curr {
-                if visited.contains(&c) {
+                let bit = 1u32 << (c.0 & 31);
+                if visited_mask & bit != 0 {
                     break;
                 }
-                visited.push(c);
+                visited_mask |= bit;
                 curr = pred_node[c.0 as usize];
             }
             let Some(cycle_start) = curr else {
