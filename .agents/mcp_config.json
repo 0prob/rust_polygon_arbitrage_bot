@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "headroom": {
-      "command": "/home/x/.local/bin/headroom",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
