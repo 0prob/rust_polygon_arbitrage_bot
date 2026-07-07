@@ -11,6 +11,7 @@ use alloy::providers::Provider;
 use crate::config::{AppConfig, OracleConfig, WalletSecrets};
 use crate::info;
 use crate::infra::hypersync::HyperSyncService;
+use crate::infra::pg::PgClient;
 use crate::infra::rpc::RpcPool;
 use crate::infra::wss_feed::spawn_pool_log_feed;
 use crate::orchestrator::hf::{HfContext, run_hf_tick};
@@ -160,6 +161,18 @@ pub async fn run_pass_loop(
     }
 
     let daily_loss_guard = spawn_daily_loss_guard(&ctx, &shutdown);
+
+    // Spawn PostgreSQL LISTEN/NOTIFY consumer — triggers early discovery on pool changes.
+    {
+        let notify_flag = ctx.refresh.notify_flag();
+        let pg_url = ctx.config.pg_url.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = PgClient::spawn_notify_listener(&pg_url, notify_flag, shutdown).await {
+                crate::warn!("pg LISTEN/NOTIFY not available — polling only: {e:#}");
+            }
+        });
+    }
 
     let rpc = Arc::clone(&ctx.rpc);
     tokio::spawn(async move {

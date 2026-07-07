@@ -1,4 +1,5 @@
 use crate::core::constants::{BPS_SCALE, MAX_POOL_TOKENS};
+use crate::core::math::fixed_point::ONE;
 use crate::core::types::{
     ConcentratedLiquidityPoolState, Edge, FlashLoanSource, FoundCycle, PoolState, ProtocolType,
     TokenIndex,
@@ -17,6 +18,64 @@ use std::sync::Arc;
 
 pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]); // 1e12 wei
 const Q96_F64: f64 = 79228162514264337593543950336.0; // 2^96
+/// Compute V2 spot price ratio as U256 fixed-point (ONE = 10^18).
+/// Returns `reserve_out * ONE / reserve_in * fee_factor` or `None` on zero/overflow.
+/// The f64 conversion is done once on the final ratio, avoiding per-reserve conversion error.
+#[inline]
+fn v2_spot_u256(state: &crate::core::types::V2PoolState, edge: &Edge) -> Option<U256> {
+    let (reserve_in, reserve_out) = if edge.zero_for_one {
+        (state.reserve0, state.reserve1)
+    } else {
+        (state.reserve1, state.reserve0)
+    };
+    if reserve_in.is_zero() || reserve_out.is_zero() {
+        return None;
+    }
+    let raw_ratio = reserve_out.checked_mul(ONE)?.checked_div(reserve_in)?;
+    let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
+    raw_ratio.checked_mul(fee_numer).map(|v| v / U256::from(10000u64))
+}
+
+/// Compute CL V3/V4 spot price ratio as U256 fixed-point.
+/// For zero_for_one (token0→token1): price = sqrt^2 / 2^96 (/ 2^96).
+/// For !zero_for_one (token1→token0): price = 2^192 / sqrt^2.
+#[inline]
+fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U256> {
+    let sqrt = state.sqrt_price_x96;
+    if sqrt.is_zero() {
+        return None;
+    }
+    if !edge.zero_for_one {
+        // Inverse price not implemented in U256 — falls back to f64 path.
+        return None;
+    }
+    // price = sqrt^2 / 2^192 expressed in ONE.
+    // Avoid overflow: sqrt^2 may exceed U256, so split into high/low parts.
+    let sqrt_hi: U256 = sqrt >> 96;
+    let sqrt_lo: U256 = sqrt & U256::from(u64::MAX);
+
+    // Spot ≈ (sqrt_hi + sqrt_lo/2^96)^2 * ONE = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96
+    let hi_term = sqrt_hi.checked_mul(sqrt_hi)?.checked_mul(ONE)?;
+    let cross = sqrt_hi.checked_mul(sqrt_lo)?.checked_mul(ONE)?;
+    let spot_u256 = hi_term.checked_add(cross >> 96)?;
+
+    let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
+    spot_u256.checked_mul(fee_numer).map(|v| v / U256::from(10000u64))
+}
+
+/// Evaluate spot price ratio to f64, preferring U256 fixed-point then falling back to f64.
+#[inline]
+fn spot_ratio_to_f64(ratio: Option<U256>) -> f64 {
+    match ratio {
+        Some(r) if !r.is_zero() => {
+            // Convert U256 fixed-point ratio (ONE=10^18) to f64.
+            let r_f64 = u256_to_f64(r);
+            let one_f64 = 1_000_000_000_000_000_000.0;
+            r_f64 / one_f64
+        }
+        _ => 0.0,
+    }
+}
 
 const HOP_PENALTIES: [f64; 9] = [0.0, 0.0, 0.0, 0.01, 0.03, 0.08, 0.15, 0.30, 0.50];
 
@@ -35,9 +94,11 @@ pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
 }
 
 /// Dense spot cache keyed by `(pool_index, token_in_idx, token_out_idx)`.
+/// Uses `Option<f64>` instead of `f64::NAN` sentinel for cleaner semantics
+/// and faster comparisons (no NaN checking).
 #[derive(Debug, Clone)]
 pub struct SpotTable {
-    values: Vec<f64>,
+    values: Vec<Option<f64>>,
 }
 
 const SPOT_SLOTS_PER_POOL: usize = MAX_POOL_TOKENS * MAX_POOL_TOKENS;
@@ -56,16 +117,20 @@ impl SpotTable {
     #[must_use]
     pub fn new(pool_count: usize) -> Self {
         Self {
-            values: vec![f64::NAN; pool_count.max(1) * SPOT_SLOTS_PER_POOL],
+            values: vec![None; pool_count.max(1) * SPOT_SLOTS_PER_POOL],
         }
     }
 
     #[must_use]
     pub fn get(&self, edge: &Edge) -> f64 {
-        let Some(slot) = Self::slot(edge) else {
-            return 0.0;
-        };
-        self.values.get(slot).copied().unwrap_or_default()
+        self.get_opt(edge).unwrap_or(0.0)
+    }
+
+    /// Returns `Some(spot)` if cached (even if zero), `None` if not computed yet.
+    #[must_use]
+    pub fn get_opt(&self, edge: &Edge) -> Option<f64> {
+        let slot = Self::slot(edge)?;
+        self.values.get(slot).copied().flatten()
     }
 
     pub fn set(&mut self, edge: &Edge, spot: f64) {
@@ -73,7 +138,7 @@ impl SpotTable {
             return;
         };
         if let Some(v) = self.values.get_mut(slot) {
-            *v = spot;
+            *v = Some(spot);
         }
     }
 
@@ -81,8 +146,8 @@ impl SpotTable {
         let Some(slot) = Self::slot(edge) else {
             return compute_spot_price(arena, edge);
         };
-        if let Some(v) = self.values.get(slot) {
-            if !v.is_nan() {
+        if let Some(entry) = self.values.get(slot) {
+            if let Some(v) = entry {
                 return *v;
             }
         } else {
@@ -90,7 +155,7 @@ impl SpotTable {
         }
         let spot = compute_spot_price(arena, edge);
         if let Some(v) = self.values.get_mut(slot) {
-            *v = spot;
+            *v = Some(spot);
         }
         spot
     }
@@ -107,43 +172,41 @@ impl SpotTable {
     }
 }
 
-/// Marginal V2 spot from reserves (no swap simulation).
+/// Marginal V2 spot from reserves — uses U256 fixed-point for the ratio then converts once.
 #[inline]
 fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge) -> f64 {
-    let (reserve_in, reserve_out) = if edge.zero_for_one {
-        (state.reserve0, state.reserve1)
-    } else {
-        (state.reserve1, state.reserve0)
-    };
-    if reserve_in.is_zero() || reserve_out.is_zero() {
-        return 0.0;
-    }
-    let rin = u256_to_f64(reserve_in);
-    if rin <= 0.0 {
-        return 0.0;
-    }
-    let fee_factor = 1.0 - edge.fee_bps as f64 / 10_000.0;
-    u256_to_f64(reserve_out) / rin * fee_factor
+    spot_ratio_to_f64(v2_spot_u256(state, edge))
 }
 
-/// Marginal V3/V4 spot from `sqrt_price_x96` (no tick walk).
+/// Marginal V3/V4 spot from `sqrt_price_x96` — uses U256 fixed-point for ratio then converts once.
 #[inline]
 fn cl_marginal_spot(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> f64 {
-    if state.sqrt_price_x96.is_zero() {
-        return 0.0;
+    let r = cl_spot_u256(state, edge);
+    match r {
+        Some(ratio) if !ratio.is_zero() => {
+            let r_f64 = u256_to_f64(ratio);
+            let one_f64 = 1_000_000_000_000_000_000.0;
+            r_f64 / one_f64
+        }
+        _ => {
+            // Fallback to f64 for inverse price or edge cases.
+            if state.sqrt_price_x96.is_zero() {
+                return 0.0;
+            }
+            let sqrt = u256_to_f64(state.sqrt_price_x96);
+            let price1_per_0 = (sqrt / Q96_F64).powi(2);
+            if !price1_per_0.is_finite() || price1_per_0 <= 0.0 {
+                return 0.0;
+            }
+            let raw = if edge.zero_for_one {
+                price1_per_0
+            } else {
+                1.0 / price1_per_0
+            };
+            let fee_factor = 1.0 - edge.fee_bps as f64 / 10_000.0;
+            raw * fee_factor
+        }
     }
-    let sqrt = u256_to_f64(state.sqrt_price_x96);
-    let price1_per_0 = (sqrt / Q96_F64).powi(2);
-    if !price1_per_0.is_finite() || price1_per_0 <= 0.0 {
-        return 0.0;
-    }
-    let raw = if edge.zero_for_one {
-        price1_per_0
-    } else {
-        1.0 / price1_per_0
-    };
-    let fee_factor = 1.0 - edge.fee_bps as f64 / 10_000.0;
-    raw * fee_factor
 }
 
 #[must_use]
@@ -264,13 +327,13 @@ fn rescore_one_cycle(
             log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
             break;
         }
-        let cached = table.get(edge);
-        let spot = if !cached.is_nan() {
-            cached
-        } else {
-            let val = spot_price_from_state(state, edge);
-            table.set(edge, val);
-            val
+        let spot = match table.get_opt(edge) {
+            Some(v) => v,
+            None => {
+                let val = spot_price_from_state(state, edge);
+                table.set(edge, val);
+                val
+            }
         };
         if spot <= 0.0 {
             missing_spot += 1;

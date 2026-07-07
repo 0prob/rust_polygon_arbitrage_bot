@@ -59,6 +59,9 @@ pub struct StateRefreshService {
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
     last_state_block: AtomicU64,
+    /// Set to true by the LISTEN/NOTIFY task when a pool_meta_channel notification arrives.
+    /// Cleared by `maybe_discover` after triggering an early incremental refresh.
+    pg_notify_pending: Arc<AtomicBool>,
 }
 
 impl StateRefreshService {
@@ -81,7 +84,13 @@ impl StateRefreshService {
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
             last_state_block: AtomicU64::new(0),
+            pg_notify_pending: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Returns a shareable flag reference for the LISTEN/NOTIFY task to set on notification.
+    pub fn notify_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pg_notify_pending)
     }
 
     pub fn hot_addresses(&self) -> Arc<Vec<Address>> {
@@ -222,7 +231,12 @@ impl StateRefreshService {
             let elapsed = now_ms().saturating_sub(state.last_discovery_ms);
             let cursor = state.discovery_cursor.clone();
             let is_bootstrap = cursor.last_block == 0;
-            if !is_bootstrap && elapsed < self.config.discovery_interval_ms {
+
+            // Check the LISTEN/NOTIFY flag: if a pool_meta_channel notification arrived
+            // since last discovery, skip the interval gate and refresh immediately.
+            let notify_pending = self.pg_notify_pending.swap(false, Ordering::AcqRel);
+
+            if !is_bootstrap && !notify_pending && elapsed < self.config.discovery_interval_ms {
                 return Ok(0);
             }
             (cursor, is_bootstrap)

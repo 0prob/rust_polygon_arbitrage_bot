@@ -19,11 +19,12 @@ use tokio::sync::{mpsc, watch};
 const SUBSCRIBE_CHUNK: usize = 50;
 
 /// Base reconnect delay (doubles on each failure, capped at MAX_RECONNECT_DELAY_MS).
-const BASE_RECONNECT_DELAY_MS: u64 = 500;
-const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+/// Reduced for HFT sensitivity — Polygon WSS endpoints typically reconnect in <200ms.
+const BASE_RECONNECT_DELAY_MS: u64 = 100;
+const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
 /// Silence timeout: if no log arrives within this window, the connection is considered stale.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-endpoint connect + `eth_blockNumber` probe budget.
 const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

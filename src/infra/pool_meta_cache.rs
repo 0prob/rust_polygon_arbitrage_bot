@@ -77,9 +77,14 @@ impl PoolMetaCache {
     }
 
     /// Write cache to disk off the async runtime (avoid blocking tokio worker threads).
+    /// Clones data under read lock then releases it before serializing to prevent
+    /// stalling concurrent `set_*` callers that need the write lock.
     fn persist(&self) {
-        let data = self.inner.read();
-        let Ok(raw) = serde_json::to_vec(&*data) else {
+        let cloned = {
+            let data = self.inner.read();
+            (*data).clone()
+        };
+        let Ok(raw) = serde_json::to_vec(&cloned) else {
             return;
         };
         let path = self.path.clone();

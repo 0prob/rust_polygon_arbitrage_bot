@@ -1,7 +1,10 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use tokio::sync::watch;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Error as PgError, NoTls, Row, types::ToSql};
 
@@ -45,9 +48,10 @@ const TOKEN_METAS_SQL: &str = r#"SELECT id, decimals FROM "TokenMeta""#;
 
 const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
-const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_POOL_SIZE: usize = 8;
+const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_POOL_SIZE: usize = 3;
+const NOTIFY_CHANNEL: &str = "pool_meta_channel";
 
 /// Execute a query against the pool with a cached (per-connection) prepared statement.
 async fn pg_query(
@@ -119,6 +123,7 @@ impl PgClient {
             pg_config.password(&password);
         }
         pg_config.connect_timeout(PG_CONNECT_TIMEOUT);
+        // HFT-optimized connection pool: small, fast-recycle, bounded wait.
         let mgr = Manager::from_config(
             pg_config,
             NoTls,
@@ -129,6 +134,60 @@ impl PgClient {
             .build()
             .context("deadpool postgres pool build failed")?;
         Ok(Self { pool })
+    }
+
+    /// Spawn a background task that keeps a dedicated `LISTEN` connection alive.
+    /// The Envio-side trigger sends `NOTIFY pool_meta_channel` on PoolMeta changes.
+    /// This keeps the subscription registered so Postgres doesn't drop it,
+    /// and periodically health-pings. Actual data is fetched by the incremental
+    /// query in `maybe_discover` — lowering the discovery interval (see config)
+    /// is the practical latency reduction for this tokio-postgres 0.7 codebase.
+    ///
+    /// Uses a **dedicated** connection (not the pool) because `LISTEN` is
+    /// connection-scoped and the pool recycles connections.
+    pub async fn spawn_notify_listener(
+        url_str: &str,
+        _notify_flag: Arc<AtomicBool>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let (client, connection) = tokio_postgres::connect(url_str, NoTls)
+            .await
+            .context("pg LISTEN connect failed")?;
+
+        client
+            .batch_execute(&format!("LISTEN {NOTIFY_CHANNEL}"))
+            .await
+            .context("pg LISTEN pool_meta_channel failed")?;
+        crate::info!("pg LISTEN subscribed to {NOTIFY_CHANNEL}");
+
+        // Drive the connection in background (required for IO to happen).
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                crate::warn!("pg LISTEN connection driver exited: {e}");
+            }
+        });
+
+        // Health-check loop keeps the LISTEN subscription alive.
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { break; }
+                    }
+                    _ = tick.tick() => {
+                        if client.batch_execute("SELECT 1").await.is_err() {
+                            crate::warn!("pg LISTEN health check failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            crate::info!("pg LISTEN listener shut down");
+        });
+
+        Ok(())
     }
 
     pub async fn probe_pool_meta_count(&self) -> anyhow::Result<u64> {
