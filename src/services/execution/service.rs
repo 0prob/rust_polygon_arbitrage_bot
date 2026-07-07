@@ -487,6 +487,7 @@ impl ExecutionService {
         }
 
         if self.global_is_quarantined() {
+            crate::info!("dispatch skip: fp={}, global circuit breaker active", fp);
             let outcome = ExecutionOutcome::SkippedCircuitBreaker;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -502,6 +503,13 @@ impl ExecutionService {
             .saturating_mul(U256::from(risk_multiplier))
             / U256::from(10_000u64);
         if candidate.expected_profit_matic_wei < learned_floor {
+            crate::debug!(
+                "dispatch skip: fp={}, profit {} below learned floor {} (risk_mult={})",
+                fp,
+                candidate.expected_profit_matic_wei,
+                learned_floor,
+                risk_multiplier,
+            );
             let outcome = ExecutionOutcome::SkippedUnprofitableAfterDryRun;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -530,6 +538,7 @@ impl ExecutionService {
         if let Some(expiry) = self.quarantine.read().get(&fp)
             && now < *expiry
         {
+            crate::debug!("dispatch skip: fp={}, route quarantined until {expiry:?}", fp);
             let outcome = ExecutionOutcome::SkippedQuarantined;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -540,6 +549,7 @@ impl ExecutionService {
         if let Some(last) = self.last_submit.read().get(&fp)
             && now.saturating_duration_since(*last) < ROUTE_COOLDOWN
         {
+            crate::debug!("dispatch skip: fp={}, route cooldown active (last={last:?})", fp);
             let outcome = ExecutionOutcome::SkippedCooldown;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -689,15 +699,18 @@ impl ExecutionService {
             return outcome;
         }
 
+        crate::debug!("dispatch live: fp={}, gas_used={}, live_mode=true", fp, gas_used);
         let mempool_clear = match self.operator_mempool_clear(sim_provider, operator).await {
             Ok(clear) => clear,
             Err(e) => {
+                crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
                 return ExecutionOutcome::SubmitFailed {
                     reason: e.to_string(),
                 };
             }
         };
         if !mempool_clear {
+            crate::info!("dispatch skip: fp={}, mempool not clear — resyncing", fp);
             let outcome = ExecutionOutcome::SkippedCooldown;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -706,6 +719,7 @@ impl ExecutionService {
         }
 
         let Some(signer) = wallet.signer() else {
+            crate::error!("dispatch skip: fp={}, wallet has no signer", fp);
             let outcome = ExecutionOutcome::SkippedNoWallet;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -768,6 +782,10 @@ impl ExecutionService {
             }
         };
         if balance < required_balance {
+            crate::info!(
+                "dispatch skip: fp={}, operator balance {} below required {} (gas_limit={} max_fee={})",
+                fp, balance, required_balance, final_gas, fees.max_fee_per_gas,
+            );
             let outcome = ExecutionOutcome::SkippedCircuitBreaker;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -832,8 +850,18 @@ impl ExecutionService {
         )
         .await
         {
-            Ok(hash) => hash,
+            Ok(hash) => {
+                crate::info!(
+                    "submit success: fp={}, nonce={}, tx_hash={}, gas_limit={}",
+                    fp, nonce, hash, final_gas,
+                );
+                hash
+            }
             Err(e) => {
+                crate::warn!(
+                    "submit failed: fp={}, nonce={}, error={e:#}",
+                    fp, nonce,
+                );
                 nonce_mgr.release(nonce);
                 self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
                 match classify_submit_error(&e) {
@@ -866,6 +894,10 @@ impl ExecutionService {
             .wait_with_hypersync(sim_provider, tx_hash, hypersync, shutdown)
             .await
         else {
+            crate::info!(
+                "receipt timeout: fp={}, tx_hash={}, nonce={}",
+                fp, tx_hash, nonce,
+            );
             if shutdown.is_some_and(|rx| *rx.borrow()) {
                 nonce_mgr.release(nonce);
                 let outcome = ExecutionOutcome::SkippedShutdown;

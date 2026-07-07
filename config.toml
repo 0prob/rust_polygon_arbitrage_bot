@@ -1,8 +1,8 @@
 [execution]
-# 0.05 MATIC net profit floor after flash fees
-min_profit_matic_wei = "50000000000000000"
-# 1.3x: slightly more aggressive while maintaining safety
-profit_safety_multiplier_bps = 13000
+# 0.01 MATIC net profit floor — lower threshold captures more marginal opportunities
+min_profit_matic_wei = "10000000000000000"
+# 1.0x: cover gas only, net profit above gas is enough
+profit_safety_multiplier_bps = 10000
 # Balancer-first waterfall with Aave fallback for mixed routes
 flash_loan_source = "auto"
 
@@ -15,9 +15,9 @@ max_hops = 4
 # Hot-pool WSS patches; requires WSS_URL or POLYGON_WSS_URLS in .env
 stream_enabled = true
 # Raise sim/score caps to eval more candidates per HF tick -> more chance of net>0 after gas.
-hf_sim_cap = 200
-hf_score_cap = 300
-hf_prefetch_count = 150
+hf_sim_cap = 300
+hf_score_cap = 400
+hf_prefetch_count = 300
 
 [oracle]
 # Additional Pyth price feeds beyond the built-in 8 tokens

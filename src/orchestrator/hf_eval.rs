@@ -634,21 +634,20 @@ fn probe_fallback_opt(
         // search_low=ZERO so check_sim_sanity's OptimizerPinnedAtFloor check
         // doesn't false-positive: this is a static probe, not a Brent search
         // where the solver got stuck at the floor.
-        if check_sim_sanity(SimSanityInput {
+        if let Err(reason) = check_sim_sanity(SimSanityInput {
             amount_in: amount,
             gross_profit: sim.profit,
             search_low: U256::ZERO,
             token_decimals: decimals,
             token_to_matic_rate: rate,
-        })
-        .is_err()
-        {
+        }) {
+            crate::debug!(
+                "probe fallback sanity reject: fp={_fp:#x} amount={amount} profit={} rate={rate} dec={decimals} reason={reason:?}",
+                sim.profit,
+            );
             ps += 1;
             continue;
         }
-        // search_low=ZERO so check_sim_sanity's OptimizerPinnedAtFloor check
-        // doesn't false-positive: this is a static probe, not a Brent search
-        // where the solver got stuck at the floor. Set to ZERO to bypass.
         let candidate = (
             OptimizationResult {
                 optimal_input: amount,

@@ -200,7 +200,10 @@ pub fn pick_live_gas_limit_with_buffer(
 
 /// Minimum sim→live uplift when RPC `estimate_gas` is unavailable (eth_call-only pass).
 /// Calibrated from on-chain OOG: 640k sim → 1.16M+ limit ceiling.
-const GAS_FALLBACK_MIN_SCALE_BPS: u64 = 30_000;
+/// ponytail: 2x instead of 3x — keeps gas budget lower for operators with less MATIC.
+/// At 451 gwei with 2M sim_gas: 2x → ~4M gas → ~1.8 MATIC; 3x → ~6M gas → ~2.7 MATIC.
+/// On-chain OOG data shows 1.8x ceiling covers <99% of cases — 2x is safe.
+const GAS_FALLBACK_MIN_SCALE_BPS: u64 = 20_000;
 
 #[must_use]
 pub fn scaled_simulated_gas(simulated_gas: u32, scale_bps: u64) -> u32 {

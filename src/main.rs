@@ -8,6 +8,7 @@ use rpbot::orchestrator::run_pass_loop;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rpbot::config::load_dotenv();
     rpbot::log::init();
 
     let ctx = bootstrap(None).await?;
