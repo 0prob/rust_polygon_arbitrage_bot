@@ -959,6 +959,7 @@ mod tests {
             log_weight: -(f64::from(id)),
             cumulative_fee_bps: 0,
             score: -(f64::from(id)),
+            cycle_ratio: U256::ZERO,
         }
     }
 

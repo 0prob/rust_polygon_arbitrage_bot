@@ -31,6 +31,7 @@ pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
     use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
     use crate::pipeline::types::GraphEdge;
@@ -48,14 +49,19 @@ mod tests {
                 zero_for_one: true,
             },
             log_weight: weight,
+            ratio: U256::ZERO,
         }
     }
 
     #[test]
     fn weighted_adjacency_skips_dead_edges() {
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(TokenIndex(0), graph_edge(-0.1));
-        graph.add_edge(TokenIndex(1), graph_edge(DEAD_EDGE_LOG_WEIGHT));
+        let mut live = graph_edge(-0.1);
+        live.ratio = U256::from(1_000_000_000_000_000_000u64);
+        graph.add_edge(TokenIndex(0), live);
+        let mut dead = graph_edge(DEAD_EDGE_LOG_WEIGHT);
+        dead.ratio = U256::ZERO;
+        graph.add_edge(TokenIndex(1), dead);
         let adj = build_weighted_adjacency(&graph);
         assert_eq!(adj[0].len(), 1);
         assert!(adj[1].is_empty());

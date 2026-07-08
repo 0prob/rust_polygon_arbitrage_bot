@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 
 use crate::core::constants::MIN_ECONOMIC_VALUE_MATIC_WEI;
@@ -22,10 +22,10 @@ pub struct RouteGasCosting<'a> {
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::util::ten_pow_u256_cached;
 
-const BRENT_CACHE_SLOTS: usize = 16;
-const GOLDEN_RATIO: u128 = 382; // (3 - sqrt(5))/2 * 1000
+const BRENT_CACHE_SLOTS: usize = 24;
+const GOLDEN_RATIO: u128 = 382;
 const CONVERGENCE_DIVISOR: u128 = 1000;
-const DEFAULT_BRENT_ITERATIONS: u32 = 8;
+const DEFAULT_BRENT_ITERATIONS: u32 = 16;
 const DEFAULT_MAX_FLASH_LOAN_USD: u64 = 50_000;
 
 fn lookup_sim_cache(
@@ -86,9 +86,16 @@ where
     let mut cache_size = 0usize;
 
     let mut cached_evaluate = |amount: U256| -> U256 {
-        for i in 0..cache_size.min(BRENT_CACHE_SLOTS) {
+        // ponytail: manual unrolled search over small fixed-size cache (16 slots).
+        // The optimizer struggles to auto-vectorize the dynamic bounds path when
+        // cache_size < BRENT_CACHE_SLOTS, so we search the full allocated region
+        // and short-circuit on ZERO sentinels.
+        for i in 0..BRENT_CACHE_SLOTS {
             if cache_amounts[i] == amount {
                 return cache_profits[i];
+            }
+            if cache_amounts[i].is_zero() {
+                break;
             }
         }
         let profit = evaluate(amount);
@@ -232,7 +239,11 @@ fn get_dynamic_search_bounds(
                 resolve_token_decimals_for_index(edge.token_in, arena, token_decimals);
             let start_scale = ten_pow_u256_cached(start_decimals);
             let token_in_scale = ten_pow_u256_cached(token_in_decimals);
-            capacity = (capacity * token_in_rate * start_scale) / (start_rate * token_in_scale);
+            // U512 widening prevents overflow when capacity * token_in_rate * start_scale
+            // exceeds U256::MAX — common for 18-decimal tokens with large reserves.
+            let num = U512::from(capacity) * U512::from(token_in_rate) * U512::from(start_scale);
+            let den = U512::from(start_rate) * U512::from(token_in_scale);
+            capacity = crate::util::u512_to_u256(num / den);
         }
 
         if capacity < min_capacity {

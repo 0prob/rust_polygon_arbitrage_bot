@@ -1,4 +1,4 @@
-use crate::core::constants::{BPS_SCALE, MAX_POOL_TOKENS};
+use crate::core::constants::BPS_SCALE;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{
     ConcentratedLiquidityPoolState, Edge, FlashLoanSource, FoundCycle, PoolState, ProtocolType,
@@ -11,8 +11,7 @@ use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::types::RoutingGraph;
 use crate::services::execution::profit::flash_loan_fee_bps;
 use crate::util::u256_to_f64;
-use alloy::primitives::Address;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -49,20 +48,27 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
     if sqrt.is_zero() {
         return None;
     }
-    if !edge.zero_for_one {
-        // Inverse price not implemented in U256 — falls back to f64 path.
-        return None;
-    }
-    // price = sqrt^2 / 2^192 expressed in ONE.
-    // Avoid overflow: sqrt^2 may exceed U256, so split into high/low parts.
-    let sqrt_hi: U256 = sqrt >> 96;
-    let sqrt_lo: U256 = sqrt & U256::from(u64::MAX);
-
-    // Spot ≈ (sqrt_hi + sqrt_lo/2^96)^2 * ONE = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96
-    let hi_term = sqrt_hi.checked_mul(sqrt_hi)?.checked_mul(ONE)?;
-    let cross = sqrt_hi.checked_mul(sqrt_lo)?.checked_mul(ONE)?;
-    let spot_u256 = hi_term.checked_add(cross >> 96)?;
-
+    let spot_u256 = if edge.zero_for_one {
+        // price = sqrt^2 / 2^192 expressed in ONE.
+        // Avoid overflow: sqrt^2 may exceed U256, so split into high/low parts.
+        let sqrt_hi: U256 = sqrt >> 96;
+        let sqrt_lo: U256 = sqrt & U256::from(u64::MAX);
+        // Spot ≈ (sqrt_hi + sqrt_lo/2^96)^2 * ONE = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96
+        let hi_term = sqrt_hi.checked_mul(sqrt_hi)?.checked_mul(ONE)?;
+        let cross = sqrt_hi.checked_mul(sqrt_lo)?.checked_mul(ONE)?;
+        hi_term.checked_add(cross >> 96)?
+    } else {
+        // Inverse price: price0_per_1 = 2^192 / sqrt^2.
+        // Compute (2^192 * ONE) / sqrt^2 using U512 to prevent overflow.
+        let two_pow_192 = U256::from(1u128) << 192;
+        let numerator = U512::from(two_pow_192) * U512::from(ONE);
+        let sqrt_sq = U512::from(sqrt) * U512::from(sqrt);
+        let raw = numerator / sqrt_sq;
+        if raw.is_zero() {
+            return None;
+        }
+        crate::util::u512_to_u256(raw)
+    };
     let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
     spot_u256
         .checked_mul(fee_numer)
@@ -94,76 +100,65 @@ pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
     (fee_bps as f64 / 10_000.0).ln_1p()
 }
 
-/// Dense spot cache keyed by `(pool_index, token_in_idx, token_out_idx)`.
-/// Uses `Option<f64>` instead of `f64::NAN` sentinel for cleaner semantics
-/// and faster comparisons (no NaN checking).
-#[derive(Debug, Clone)]
+/// Sparse spot cache keyed by `(pool_index, token_in_idx, token_out_idx)`.
+/// Uses a HashMap instead of Vec<Option<f64>> to avoid allocating pool_count * 64
+/// entries when most pools have only 2 tokens (4 slot combinations).
+/// For 5000 pools with typical 2-token layout, this saves ~4.8 MB of allocation
+/// and avoids zero-initializing tens of thousands of unused slots.
+#[derive(Debug, Clone, Default)]
 pub struct SpotTable {
-    values: Vec<Option<f64>>,
+    values: rustc_hash::FxHashMap<u64, f64>,
 }
-
-const SPOT_SLOTS_PER_POOL: usize = MAX_POOL_TOKENS * MAX_POOL_TOKENS;
 
 impl SpotTable {
     #[inline]
-    fn slot(edge: &Edge) -> Option<usize> {
-        let tin = edge.token_in_idx as usize;
-        let tout = edge.token_out_idx as usize;
-        if tin >= MAX_POOL_TOKENS || tout >= MAX_POOL_TOKENS {
-            return None;
-        }
-        Some(edge.pool_index.0 as usize * SPOT_SLOTS_PER_POOL + tin * MAX_POOL_TOKENS + tout)
+    fn key(edge: &Edge) -> u64 {
+        let tin = u64::from(edge.token_in_idx);
+        let tout = u64::from(edge.token_out_idx);
+        (u64::from(edge.pool_index.0) << 16) | (tin << 8) | tout
     }
 
     #[must_use]
-    pub fn new(pool_count: usize) -> Self {
+    pub fn new(_pool_count: usize) -> Self {
         Self {
-            values: vec![None; pool_count.max(1) * SPOT_SLOTS_PER_POOL],
+            values: rustc_hash::FxHashMap::default(),
         }
     }
 
     #[must_use]
     pub fn get(&self, edge: &Edge) -> f64 {
-        self.get_opt(edge).unwrap_or(0.0)
+        self.values.get(&Self::key(edge)).copied().unwrap_or(0.0)
     }
 
     /// Returns `Some(spot)` if cached (even if zero), `None` if not computed yet.
     #[must_use]
     pub fn get_opt(&self, edge: &Edge) -> Option<f64> {
-        let slot = Self::slot(edge)?;
-        self.values.get(slot).copied().flatten()
+        self.values.get(&Self::key(edge)).copied()
     }
 
     pub fn set(&mut self, edge: &Edge, spot: f64) {
-        let Some(slot) = Self::slot(edge) else {
-            return;
-        };
-        if let Some(v) = self.values.get_mut(slot) {
-            *v = Some(spot);
-        }
+        self.values.insert(Self::key(edge), spot);
     }
 
     pub fn ensure_edge(&mut self, arena: &StateArena, edge: &Edge) -> f64 {
-        let Some(slot) = Self::slot(edge) else {
-            return compute_spot_price(arena, edge);
-        };
-        if let Some(entry) = self.values.get(slot) {
-            if let Some(v) = entry {
-                return *v;
-            }
-        } else {
-            return 0.0;
+        let k = Self::key(edge);
+        if let Some(&v) = self.values.get(&k) {
+            return v;
         }
         let spot = compute_spot_price(arena, edge);
-        if let Some(v) = self.values.get_mut(slot) {
-            *v = Some(spot);
-        }
+        self.values.insert(k, spot);
         spot
     }
 
     #[must_use]
     pub fn build_for_graph(arena: &StateArena, graph: &RoutingGraph) -> Self {
-        let mut table = Self::new(arena.pool_count());
+        let capacity: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
+        let mut table = Self {
+            values: rustc_hash::FxHashMap::with_capacity_and_hasher(
+                capacity,
+                rustc_hash::FxBuildHasher,
+            ),
+        };
         for adj in &graph.adjacency {
             for ge in adj {
                 table.ensure_edge(arena, &ge.edge);
@@ -240,6 +235,43 @@ pub fn spot_price_from_state(state: &PoolState, edge: &Edge) -> f64 {
                 let p = u256_to_f64(SPOT_PROBE);
                 if p <= 0.0 { 0.0 } else { u256_to_f64(out) / p }
             }
+        }
+    }
+}
+
+/// Compute edge ratio as U256 fixed-point (ONE = 1e18).
+/// Returns the spot_price * (1 - fee_bps/10000) ratio in ONE units.
+/// ratio > ONE means the edge is net-profitable at the margin.
+#[must_use]
+pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
+    let Some(state) = arena.pool_state(edge.pool_index) else {
+        return U256::ZERO;
+    };
+    if !state.is_tradable() {
+        return U256::ZERO;
+    }
+    match (state, edge.protocol) {
+        (PoolState::V2(s), ProtocolType::UniswapV2) => {
+            v2_spot_u256(s, edge).unwrap_or(U256::ZERO)
+        }
+        (PoolState::V3(s), ProtocolType::UniswapV3)
+        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
+            cl_spot_u256(s, edge).unwrap_or(U256::ZERO)
+        }
+        _ => {
+            let out = simulate_hop_amount_out(state, edge, SPOT_PROBE).unwrap_or(U256::ZERO);
+            if out.is_zero() {
+                return U256::ZERO;
+            }
+            let raw_ratio = out.checked_mul(ONE).and_then(|v| v.checked_div(SPOT_PROBE))
+                .unwrap_or(U256::ZERO);
+            if raw_ratio.is_zero() {
+                return U256::ZERO;
+            }
+            let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
+            raw_ratio.checked_mul(fee_numer)
+                .map(|v| v / U256::from(10000u64))
+                .unwrap_or(U256::ZERO)
         }
     }
 }

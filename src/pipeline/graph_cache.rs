@@ -156,6 +156,7 @@ impl GraphCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
     use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
 
     fn dummy_cycle() -> FoundCycle {
@@ -175,6 +176,7 @@ mod tests {
             log_weight: -0.1,
             cumulative_fee_bps: 30,
             score: -0.1,
+            cycle_ratio: U256::ZERO,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::sync::{LazyLock, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 
 use crate::core::math::fixed_point::ONE;
 
@@ -175,6 +175,20 @@ pub fn u256_to_f64(v: U256) -> f64 {
             mid_hi.mul_add(F64_2_POW_128, mid_lo.mul_add(F64_2_POW_64, lo)),
         )
     }
+}
+
+/// Lossless truncation of U512 to U256 (low 256 bits).
+/// U512 stores little-endian limbs; we extract the lower 4 limbs (256 bits).
+#[inline]
+#[must_use]
+pub fn u512_to_u256(v: U512) -> U256 {
+    // Uint uses little-endian u64 limbs internally.
+    // U512 (64 bytes) has 8 limbs; lower 4 limbs = U256 low bits.
+    // We transmute via byte slice since as_slice() isn't available on Uint in this alloy version.
+    let raw = v.as_le_slice();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&raw[..32]);
+    U256::from_le_bytes(buf)
 }
 
 /// Truncate to at most `max_chars` Unicode scalar values (not bytes).

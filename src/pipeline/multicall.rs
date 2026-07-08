@@ -58,6 +58,7 @@ fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
     calls
 }
 
+
 async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     provider: &P,
     items: &[MulticallItem],

@@ -353,6 +353,11 @@ pub struct FoundCycle {
     pub log_weight: f64,
     pub cumulative_fee_bps: u32,
     pub score: f64,
+    /// U256 fixed-point cycle ratio = product(edge_ratios) / ONE^(hop_count-1).
+    /// cycle_ratio > ONE means the cycle is gross-profitable (more output than input).
+    /// Used for precision-critical profitability checks; eliminates f64 rounding in
+    /// the final profit decision.
+    pub cycle_ratio: U256,
 }
 
 #[derive(Debug, Clone)]

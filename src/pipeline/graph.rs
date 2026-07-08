@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
@@ -152,6 +153,7 @@ fn push_graph_edge(graph: &mut RoutingGraph, edge: Edge) {
         slot.push(GraphEdge {
             edge,
             log_weight: 0.0,
+            ratio: U256::ZERO,
         });
     }
 }
@@ -232,9 +234,8 @@ pub fn rescore_pools_in_place(
     let mut spot_table = SpotTable::new(arena.pool_count());
     let mut touched_pools = rustc_hash::FxHashSet::default();
     let mut touched = 0usize;
-    // Reuse hash sets across iterations — .clear() preserves capacity.
+    // Reuse hash set across iterations — .clear() preserves capacity.
     let mut affected_adjacencies = rustc_hash::FxHashSet::default();
-    let mut affected_pools = rustc_hash::FxHashSet::default();
 
     for pool in pools {
         let pool_idx = pool.0 as usize;
@@ -242,7 +243,6 @@ pub fn rescore_pools_in_place(
             continue;
         };
         affected_adjacencies.clear();
-        affected_pools.clear();
         for &(adj_idx, edge_pos) in positions {
             let Some(adj) = graph.adjacency.get_mut(adj_idx) else {
                 continue;
@@ -252,14 +252,14 @@ pub fn rescore_pools_in_place(
             };
             touched += rescore_graph_edge(arena, ge, &mut spot_table);
             affected_adjacencies.insert(adj_idx);
-            affected_pools.insert(ge.edge.pool_index.0 as usize);
         }
         for adj_idx in &affected_adjacencies {
             if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
                 sort_adjacency_edges(adj);
             }
         }
-        touched_pools.extend(affected_pools.drain());
+        // All edges in positions belong to this pool, insert directly.
+        touched_pools.insert(pool_idx);
     }
     rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
     touched
@@ -279,16 +279,21 @@ fn rescore_adjacency(
 }
 
 fn sort_adjacency_edges(adj: &mut [GraphEdge]) {
-    adj.sort_by(|a, b| {
-        a.log_weight
-            .partial_cmp(&b.log_weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // ponytail: total_cmp is branchless for finite values (log_weights are never NaN).
+    adj.sort_by(|a, b| a.log_weight.total_cmp(&b.log_weight));
 }
 
 fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
+    // Single-pass: find max pool index AND populate positions simultaneously.
     let mut max_pool = 0usize;
-    for adj in graph.adjacency.iter() {
+    // Pre-scan for empty graph early exit.
+    let all_empty = graph.adjacency.iter().all(Vec::is_empty);
+    if all_empty {
+        graph.pool_edge_positions.clear();
+        return;
+    }
+    // First pass: count per-pool occurrences to allocate exact capacities.
+    for adj in &graph.adjacency {
         for ge in adj {
             let idx = ge.edge.pool_index.0 as usize;
             if idx > max_pool {
@@ -296,19 +301,25 @@ fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
             }
         }
     }
-    if max_pool == 0 && graph.adjacency.iter().all(Vec::is_empty) {
-        graph.pool_edge_positions.clear();
-        return;
-    }
     let slot_count = max_pool + 1;
-    graph.pool_edge_positions.clear();
-    graph.pool_edge_positions.resize(slot_count, Vec::new());
+    // Pre-size each inner Vec to avoid reallocation during push.
+    let mut counts = vec![0usize; slot_count];
+    for adj in &graph.adjacency {
+        for ge in adj {
+            counts[ge.edge.pool_index.0 as usize] += 1;
+        }
+    }
+    let mut slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(slot_count);
+    for &c in &counts {
+        slots.push(Vec::with_capacity(c));
+    }
     for (adj_idx, adj) in graph.adjacency.iter().enumerate() {
         for (pos, ge) in adj.iter().enumerate() {
             let idx = ge.edge.pool_index.0 as usize;
-            graph.pool_edge_positions[idx].push((adj_idx, pos));
+            slots[idx].push((adj_idx, pos));
         }
     }
+    graph.pool_edge_positions = slots;
 }
 
 fn rebuild_pool_edge_positions_for_pools(
@@ -353,12 +364,14 @@ fn rebuild_pool_edge_positions_for_pools(
 fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut SpotTable) -> usize {
     let Some(state) = arena.pool_state(ge.edge.pool_index) else {
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        ge.ratio = U256::ZERO;
         return 1;
     };
     let tin = ge.edge.token_in_idx as usize;
     let tout = ge.edge.token_out_idx as usize;
     if !state.hop_pair_routable(tin, tout) {
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        ge.ratio = U256::ZERO;
         return 1;
     }
     let spot = spot_table.ensure_edge(arena, &ge.edge);
@@ -367,6 +380,7 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut S
     } else {
         edge_log_weight_from_spot(spot, ge.edge.fee_bps)
     };
+    ge.ratio = crate::pipeline::spot_price::compute_edge_ratio(arena, &ge.edge);
     // ponytail: multi-token pools (Balancer, Curve) create n*(n-1) edges vs 2 for
     // 2-token pools, over-representing them in DFS enumeration. Apply a mild
     // per-extra-token penalty so their edge count doesn't bias cycle discovery.
@@ -685,7 +699,9 @@ mod tests {
         assert_eq!(graph.active_pool_count(), 2);
         let dust_idx = dust_pool.0 as usize;
         for &(adj_idx, edge_pos) in &graph.pool_edge_positions[dust_idx].clone() {
-            graph.adjacency[adj_idx][edge_pos].log_weight = DEAD_EDGE_LOG_WEIGHT;
+            let ge = &mut graph.adjacency[adj_idx][edge_pos];
+            ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+            ge.ratio = U256::ZERO;
         }
         assert_eq!(graph.active_pool_count(), 1);
         assert!(graph.pool_has_live_edges(live_pool));

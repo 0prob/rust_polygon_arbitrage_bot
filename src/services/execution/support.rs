@@ -345,9 +345,9 @@ mod tests {
 
     #[test]
     fn submit_gas_basis_scales_when_estimate_missing() {
-        // GAS_FALLBACK_MIN_SCALE_BPS = 30_000 (3×), so 885_000 × 3 = 2_655_000.
+        // GAS_FALLBACK_MIN_SCALE_BPS = 20_000 (2×), so 885_000 × 2 = 1_770_000.
         let basis = submit_gas_basis(None, 10_000, 885_000, None);
-        assert_eq!(basis, 2_655_000);
+        assert_eq!(basis, 1_770_000);
         let limit = pick_live_gas_limit_with_buffer(885_000, basis, GAS_FALLBACK_BUFFER_BPS)
             .expect("limit");
         assert!(limit > 1_017_751);

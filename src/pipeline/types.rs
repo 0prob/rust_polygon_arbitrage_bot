@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, FixedBytes, U256};
 
 use crate::core::types::{Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
 
@@ -6,6 +6,10 @@ use crate::core::types::{Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
 pub struct GraphEdge {
     pub edge: Edge,
     pub log_weight: f64,
+    /// U256 fixed-point ratio: spot_price * (1 - fee_bps/10000) scaled to ONE (1e18).
+    /// ratio > ONE means the edge is profitable (more output than input).
+    /// U256::ZERO = dead/unroutable edge.
+    pub ratio: U256,
 }
 
 #[derive(Debug, Clone)]

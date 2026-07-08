@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
 use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
@@ -14,22 +15,20 @@ fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     if edges.last().map(|e| e.token_out) != Some(start) {
         return None;
     }
-    // Bitmask for O(1) duplicate-pool / duplicate-intermediate checks (HOP_CAP=8, u16 fits).
-    let mut seen_pools: u16 = 0;
-    let mut seen_tokens: u16 = 0;
+    // Check pool and token uniqueness via FxHashSet. At most HOP_CAP=8 entries
+    // per set — allocation is negligible and avoids the 16-bit mask collision bug
+    // that would miss duplicates when pool_index > 15 or token_index > 15.
+    let mut seen_pools: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut seen_tokens: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
     for (i, e) in edges.iter().enumerate() {
-        let pool_bit = 1u16 << (e.pool_index.0 & 15);
-        if seen_pools & pool_bit != 0 {
+        if !seen_pools.insert(e.pool_index.0) {
             return None;
         }
-        seen_pools |= pool_bit;
         if i < len - 1 {
             let mid = e.token_out;
-            let mid_bit = 1u16 << (mid.0 & 15);
-            if mid == start || seen_tokens & mid_bit != 0 {
+            if mid == start || !seen_tokens.insert(mid.0) {
                 return None;
             }
-            seen_tokens |= mid_bit;
         }
     }
     let route_calls = estimate_packed_route_calls(edges);
@@ -53,14 +52,18 @@ pub fn collect_negative_cycles_from_source(
     in_next: &mut [bool],
     should_stop: &mut impl FnMut() -> bool,
 ) {
-    dist.fill(f64::INFINITY);
-    pred_node.fill(None);
-    pred_edge.fill(None);
+    // Track which entries were touched so we only reset those (avoids O(N) fill on
+    // large arrays for each of BELLMAN_FORD_MAX_SOURCES=15 sources).
+    // Use a single scratch Vec that doubles as both the "touched" set and the
+    // reset list, allocated once and grown incrementally.
+    let mut touched = Vec::<usize>::new();
+
+    // Seed with source node.
     dist[source.0 as usize] = 0.0;
+    touched.push(source.0 as usize);
 
     active.clear();
     next_active.clear();
-    in_next.fill(false);
     active.push(source.0 as usize);
 
     for _ in 0..max_hops {
@@ -79,6 +82,10 @@ pub fn collect_negative_cycles_from_source(
                 let new_dist = u_dist + we.weight;
                 let old = dist[v];
                 if new_dist < old - 1e-9 {
+                    if !old.is_finite() {
+                        // First time reaching this node in this source run.
+                        touched.push(v);
+                    }
                     dist[v] = new_dist;
                     pred_node[v] = Some(TokenIndex(u_idx as u32));
                     pred_edge[v] = Some(*we);
@@ -165,7 +172,16 @@ pub fn collect_negative_cycles_from_source(
                 log_weight,
                 cumulative_fee_bps: cum_fee,
                 score: log_weight,
+                cycle_ratio: U256::ZERO,
             });
         }
+    }
+
+    // Reset only the entries that were touched, avoiding O(N) fill on each source.
+    for &idx in &touched {
+        dist[idx] = f64::INFINITY;
+        pred_node[idx] = None;
+        pred_edge[idx] = None;
+        in_next[idx] = false;
     }
 }

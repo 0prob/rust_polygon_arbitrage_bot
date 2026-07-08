@@ -11,19 +11,36 @@ pub mod uniswap_v2;
 pub mod uniswap_v3;
 pub mod woofi;
 
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
+
+use crate::util::u512_to_u256;
 
 #[inline(always)]
 pub(crate) fn mul_div(a: U256, b: U256, denominator: U256) -> Option<U256> {
-    a.checked_mul(b)?.checked_div(denominator)
+    if denominator.is_zero() {
+        return None;
+    }
+    // U512 widening prevents intermediate overflow when a*b exceeds U256::MAX
+    // but the final (a*b)/denominator fits in U256.
+    let product = U512::from(a) * U512::from(b);
+    let result = u512_to_u256(product / U512::from(denominator));
+    if result.is_zero() && !a.is_zero() && !b.is_zero() {
+        return None;
+    }
+    Some(result)
 }
 
 #[inline(always)]
 pub(crate) fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Option<U256> {
-    let product = a.checked_mul(b)?;
-    let result = product.checked_div(denominator)?;
-    if product % denominator > U256::ZERO {
-        Some(result + U256::from(1))
+    if denominator.is_zero() {
+        return None;
+    }
+    let product = U512::from(a) * U512::from(b);
+    let result = u512_to_u256(product / U512::from(denominator));
+    if product % U512::from(denominator) > U512::ZERO {
+        result.checked_add(U256::from(1))
+    } else if result.is_zero() && !a.is_zero() && !b.is_zero() {
+        None
     } else {
         Some(result)
     }

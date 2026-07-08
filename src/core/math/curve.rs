@@ -48,8 +48,11 @@ fn get_d(xp: &[U256], a: U256) -> Option<U256> {
             d_p = (d_p * d) / xn;
         }
         let d_prev = d;
-        let denominator =
-            (ann_minus_p.saturating_mul(d) / A_PRECISION).saturating_add(n_plus_1 * d_p);
+        // EVM reverts on overflow — checked_mul propagates as None, matching
+        // on-chain behavior. saturating_mul silently produces wrong D values.
+        let ann_term = ann_minus_p.checked_mul(d)? / A_PRECISION;
+        let hop_term = n_plus_1.checked_mul(d_p)?;
+        let denominator = ann_term.checked_add(hop_term)?;
         if denominator.is_zero() {
             return None;
         }

@@ -2,22 +2,32 @@ use alloy::primitives::U256;
 
 use crate::core::types::DodoPoolState;
 
+use alloy::primitives::U512;
+
 use super::fixed_point::{ONE, mul_down as mul_floor};
 
-const ONE2: U256 = U256::from_limbs([0xb34b9f1000000000, 0xc097ce7bc90715, 0, 0]);
+// Exact 1e36 — DODO on-chain `_K_PRECISION`. Previous constant was an approximation.
+const ONE2: U256 = {
+    let bytes = 1_000_000_000_000_000_000_000_000_000_000_000_000u128;
+    U256::from_limbs([bytes as u64, (bytes >> 64) as u64, 0, 0])
+};
 
 fn div_ceil(a: U256, b: U256) -> U256 {
     if b.is_zero() {
         return U256::ZERO;
     }
-    (a * ONE + b - U256::from(1)) / b
+    // U512 widening prevents overflow in a * ONE
+    let product = U512::from(a) * U512::from(ONE);
+    let result = (product + U512::from(b) - U512::ONE) / U512::from(b);
+    crate::util::u512_to_u256(result)
 }
 
 fn reciprocal_floor(target: U256) -> U256 {
     if target.is_zero() {
         return U256::ZERO;
     }
-    ONE2 / target
+    let result = U512::from(ONE2) / U512::from(target);
+    crate::util::u512_to_u256(result)
 }
 
 fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, k: U256) -> U256 {

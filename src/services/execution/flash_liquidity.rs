@@ -287,6 +287,7 @@ pub fn rotate_cycle_to_start(cycle: &FoundCycle, new_start: TokenIndex) -> Optio
             log_weight: cycle.log_weight,
             cumulative_fee_bps: cycle.cumulative_fee_bps,
             score: cycle.score,
+            cycle_ratio: cycle.cycle_ratio,
         })
     } else {
         None

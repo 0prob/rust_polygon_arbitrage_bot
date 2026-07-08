@@ -178,6 +178,7 @@ mod tests {
             log_weight: score,
             cumulative_fee_bps: 30,
             score,
+            cycle_ratio: U256::ZERO,
         }
     }
 

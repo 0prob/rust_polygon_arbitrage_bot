@@ -96,7 +96,7 @@ impl RpcPool {
         }
     }
 
-    fn state_urls_ordered(&self) -> Vec<String> {
+    fn state_urls_ordered_slice(&self) -> Vec<String> {
         let urls = self.state_urls.read().clone();
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
@@ -107,12 +107,21 @@ impl RpcPool {
     }
 
     pub fn state_url(&self) -> Option<String> {
-        self.state_urls_ordered().into_iter().next()
+        // Fast path for common single-URL case — avoids allocating the full partition vecs.
+        let urls = self.state_urls.read();
+        if urls.len() <= 1 {
+            return urls.first().cloned();
+        }
+        let penalties = self.state_url_penalties.read();
+        let now = Instant::now();
+        urls.iter().find(|url| {
+            penalties.get(url.as_str()).is_none_or(|until| now >= *until)
+        }).or_else(|| urls.first()).cloned()
     }
 
     #[must_use]
     pub fn state_url_candidates(&self) -> Vec<String> {
-        self.state_urls_ordered()
+        self.state_urls_ordered_slice()
     }
 
     /// Move a rate-limited or failing endpoint to the back of the rotation.

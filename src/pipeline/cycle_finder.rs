@@ -2,8 +2,12 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 
+use alloy::primitives::{U256, U512};
+use crate::util::u512_to_u256;
+
 use crate::core::constants::HOP_CAP;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+use crate::core::math::fixed_point::ONE;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -23,7 +27,7 @@ pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
 #[inline]
 #[must_use]
 pub fn is_live_graph_edge(ge: &GraphEdge) -> bool {
-    ge.log_weight < DEAD_EDGE_LOG_WEIGHT
+    !ge.ratio.is_zero()
 }
 
 /// Structural cycle coverage for the current live routing graph.
@@ -189,6 +193,8 @@ struct ActiveGraph {
     adjacency: Vec<Vec<GraphEdge>>,
     start_tokens: Vec<TokenIndex>,
     /// Best live edge leaving each token (used for the next hop in the bound).
+    /// Only valid for token indices where adjacency has live edges;
+    /// for dead tokens the caller falls through to global_min.
     min_outgoing_weight: Vec<f64>,
     /// Graph-wide minimum live edge (optimistic bound for hops after the first).
     global_min_live_edge_weight: f64,
@@ -201,7 +207,9 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         .unwrap_or_else(|| cycle_capable_coverage(graph));
     let token_count = graph.adjacency.len();
     let mut compact = Vec::with_capacity(token_count);
-    let mut min_outgoing = vec![f64::INFINITY; token_count];
+    // min_outgoing lazily populated: only tokens with live edges get entries.
+    // Use a sparse representation: None for dead/unreachable tokens.
+    let mut min_outgoing: Vec<Option<f64>> = vec![None; token_count];
     let mut global_min = f64::INFINITY;
     // ponytail: single pass for live edges + diversity scoring (was double iteration).
     let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
@@ -225,8 +233,10 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             }
             live.push(*ge);
             let w = ge.log_weight;
-            if w < min_outgoing[index] {
-                min_outgoing[index] = w;
+            match min_outgoing[index] {
+                Some(ref mut best) if w < *best => *best = w,
+                None => min_outgoing[index] = Some(w),
+                _ => {}
             }
             if w < global_min {
                 global_min = w;
@@ -245,10 +255,17 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             .then_with(|| a.0.0.cmp(&b.0.0))
     });
     let start_tokens = scored_div.into_iter().map(|(t, _, _)| t).collect();
+    // Convert sparse Option<f64> to dense f64 with INFINITY sentinel
+    // Only needed for tokens that reached min_outgoing — others get INFINITY
+    // which makes can_still_be_negative return false immediately.
+    let min_outgoing_dense: Vec<f64> = min_outgoing
+        .into_iter()
+        .map(|opt| opt.unwrap_or(f64::INFINITY))
+        .collect();
     ActiveGraph {
         adjacency: compact,
         start_tokens,
-        min_outgoing_weight: min_outgoing,
+        min_outgoing_weight: min_outgoing_dense,
         global_min_live_edge_weight: if global_min == f64::INFINITY {
             0.0
         } else {
@@ -277,7 +294,10 @@ fn can_still_be_negative(
     if !first.is_finite() {
         return false;
     }
-    let tail = f64::from(remaining.saturating_sub(1)) * global_min;
+    let tail = match remaining {
+        1 => 0.0,
+        _ => f64::from(remaining - 1) * global_min,
+    };
     log_weight + first + tail <= LOG_WEIGHT_PRUNE_THRESHOLD
 }
 
@@ -286,15 +306,25 @@ fn collect_cycles_dfs_single_start(
     start: TokenIndex,
     hop_limit: u32,
     max_cycles: usize,
-    pool_slot_count: usize,
     budget: &SharedDeadlineGuard,
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
-    let mut pool_state = vec![0u8; pool_slot_count];
+    // Track visited pools via FxHashSet instead of vec![0u8; pool_slot_count].
+    // At most HOP_CAP=8 pools are in-use simultaneously — a hash set with ≤8
+    // entries is cheaper to insert/check/clear than zeroing a Vec of thousands.
+    let mut used_pools: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
     let mut used_tokens = vec![false; prep.adjacency.len()];
     let mut path = Vec::with_capacity(hop_cap as usize);
     let mut cycles = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
+
+    fn pool_mark(used: &mut rustc_hash::FxHashSet<u32>, pool_id: u32) -> bool {
+        used.insert(pool_id)
+    }
+
+    fn pool_unmark(used: &mut rustc_hash::FxHashSet<u32>, pool_id: u32) {
+        used.remove(&pool_id);
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
@@ -302,10 +332,11 @@ fn collect_cycles_dfs_single_start(
         start: TokenIndex,
         curr: TokenIndex,
         path: &mut Vec<Edge>,
-        pool_state: &mut [u8],
+        used_pools: &mut rustc_hash::FxHashSet<u32>,
         used_tokens: &mut [bool],
         hops: u32,
         log_w: f64,
+        product_ratio: U256,
         cum_fee: u32,
         route_calls: usize,
         hop_cap: u32,
@@ -342,6 +373,7 @@ fn collect_cycles_dfs_single_start(
                 log_weight: score,
                 cumulative_fee_bps: cum_fee,
                 score,
+                cycle_ratio: product_ratio,
             });
             return;
         }
@@ -370,8 +402,8 @@ fn collect_cycles_dfs_single_start(
             if budget.tick() || cycles.len() >= max_cycles {
                 break;
             }
-            let pool_id = ge.edge.pool_index.0 as usize;
-            if pool_state[pool_id] != 0 {
+            let pool_id = ge.edge.pool_index.0;
+            if !pool_mark(used_pools, pool_id) {
                 continue;
             }
             let next_log_w = log_w + ge.log_weight;
@@ -383,24 +415,29 @@ fn collect_cycles_dfs_single_start(
                 &prep.min_outgoing_weight,
                 prep.global_min_live_edge_weight,
             ) {
+                pool_unmark(used_pools, pool_id);
                 continue;
             }
             let hop_calls = estimate_hop_calls(ge.edge.protocol);
             if route_calls + hop_calls > MAX_ROUTE_CALLS {
+                pool_unmark(used_pools, pool_id);
                 continue;
             }
-            pool_state[pool_id] = 1;
 
             path.push(ge.edge);
+            let next_ratio = u512_to_u256(
+                U512::from(product_ratio) * U512::from(ge.ratio) / U512::from(ONE)
+            );
             dfs(
                 prep,
                 start,
                 ge.edge.token_out,
                 path,
-                pool_state,
+                used_pools,
                 used_tokens,
                 hops + 1,
                 next_log_w,
+                next_ratio,
                 cum_fee + clamp_fee_bps(ge.edge.fee_bps),
                 route_calls + hop_calls,
                 hop_cap,
@@ -410,7 +447,7 @@ fn collect_cycles_dfs_single_start(
                 seen,
             );
             path.pop();
-            pool_state[pool_id] = 0;
+            pool_unmark(used_pools, pool_id);
         }
 
         used_tokens[curr.0 as usize] = false;
@@ -426,7 +463,7 @@ fn collect_cycles_dfs_single_start(
         if budget.tick() || cycles.len() >= max_cycles {
             break;
         }
-        let pool_id = ge.edge.pool_index.0 as usize;
+        let pool_id = ge.edge.pool_index.0;
         if !can_still_be_negative(
             ge.log_weight,
             1,
@@ -437,18 +474,21 @@ fn collect_cycles_dfs_single_start(
         ) {
             continue;
         }
-        pool_state[pool_id] = 1;
+        pool_mark(&mut used_pools, pool_id);
         let hop_calls = estimate_hop_calls(ge.edge.protocol);
         path.push(ge.edge);
+        // Start product_ratio = edge.ratio (ONE * edge.ratio / ONE = edge.ratio)
+        let initial_product = ge.ratio;
         dfs(
             prep,
             start,
             ge.edge.token_out,
             &mut path,
-            &mut pool_state,
+            &mut used_pools,
             &mut used_tokens,
             1,
             ge.log_weight,
+            initial_product,
             clamp_fee_bps(ge.edge.fee_bps),
             hop_calls,
             hop_cap,
@@ -458,7 +498,7 @@ fn collect_cycles_dfs_single_start(
             &mut seen,
         );
         path.pop();
-        pool_state[pool_id] = 0;
+        pool_unmark(&mut used_pools, pool_id);
     }
     used_tokens[start.0 as usize] = false;
     cycles
@@ -468,7 +508,6 @@ fn collect_cycles_dfs_parallel(
     prep: &ActiveGraph,
     hop_limit: u32,
     max_cycles: usize,
-    pool_slot_count: usize,
 ) -> Vec<FoundCycle> {
     let start_tokens = &prep.start_tokens;
     if start_tokens.is_empty() || max_cycles == 0 {
@@ -481,14 +520,7 @@ fn collect_cycles_dfs_parallel(
         .par_iter()
         .zip(shard_caps.par_iter())
         .map(|(start, cap)| {
-            collect_cycles_dfs_single_start(
-                prep,
-                *start,
-                hop_limit,
-                *cap,
-                pool_slot_count,
-                budget.as_ref(),
-            )
+            collect_cycles_dfs_single_start(prep, *start, hop_limit, *cap, budget.as_ref())
         })
         .collect();
 
@@ -523,7 +555,6 @@ fn collect_cycles_dfs_parallel(
                         start_tokens[i],
                         hop_limit,
                         cap,
-                        pool_slot_count,
                         budget.as_ref(),
                     ),
                 )
@@ -566,15 +597,12 @@ pub fn find_cycles_multi_pass(
     if prep.start_tokens.is_empty() {
         return Vec::new();
     }
-    let pool_slot_count = arena.pool_count().max(1);
-
     let mut all = Vec::new();
     for pass in passes {
         let mut shard = collect_cycles_dfs_parallel(
             &prep,
             pass.max_hops,
             pass.max_cycles.min(MAX_CYCLES_PER_PASS),
-            pool_slot_count,
         );
         all.append(&mut shard);
     }
@@ -717,6 +745,7 @@ mod tests {
                 zero_for_one: true,
             },
             log_weight: -0.01,
+            ratio: U256::from(1_000_000_000_000_000_000u64), // ONE
         }
     }
 
@@ -728,6 +757,7 @@ mod tests {
         graph.add_edge(hub, graph_edge(0, hub, tail));
         let mut dead = graph_edge(1, tail, hub);
         dead.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        dead.ratio = U256::ZERO;
         graph.add_edge(tail, dead);
         graph.add_edge(tail, graph_edge(2, tail, hub));
 
@@ -772,6 +802,7 @@ mod tests {
         graph.add_edge(a, graph_edge(0, a, b));
         let mut dead_return = graph_edge(1, b, a);
         dead_return.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        dead_return.ratio = U256::ZERO;
         graph.add_edge(b, dead_return);
 
         let coverage = cycle_capable_coverage(&graph);
@@ -811,6 +842,7 @@ mod tests {
                     zero_for_one: true,
                 },
                 log_weight: 0.10,
+                ratio: U256::from(1_000_000_000_000_000_000u64),
             },
         );
         graph.add_edge(
@@ -827,12 +859,13 @@ mod tests {
                     zero_for_one: true,
                 },
                 log_weight: -1.0,
+                ratio: U256::from(1_000_000_000_000_000_000u64),
             },
         );
 
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![a];
-        let cycles = collect_cycles_dfs_parallel(&prep, 2, 10, 2);
+        let cycles = collect_cycles_dfs_parallel(&prep, 2, 10);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
@@ -896,6 +929,7 @@ mod tests {
                     zero_for_one: true,
                 },
                 log_weight: -1.0,
+                ratio: U256::from(1_000_000_000_000_000_000u64),
             }
         }
 
@@ -914,7 +948,7 @@ mod tests {
 
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![dead, hub];
-        let cycles = collect_cycles_dfs_parallel(&prep, 2, 4, 7);
+        let cycles = collect_cycles_dfs_parallel(&prep, 2, 4);
         assert_eq!(cycles.len(), 3);
     }
 }
