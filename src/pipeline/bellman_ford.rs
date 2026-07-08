@@ -22,7 +22,9 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
     let mut seen = rustc_hash::FxHashSet::default();
 
     let token_count = adj.len();
+    use crate::core::math::fixed_point::ONE;
     let mut dist = vec![f64::INFINITY; token_count];
+    let mut dist_ratio = vec![ONE; token_count];
     let mut pred_node = vec![None; token_count];
     let mut pred_edge = vec![None; token_count];
     let mut active = Vec::with_capacity(token_count);
@@ -51,6 +53,7 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
                 &mut seen,
                 &mut all,
                 &mut dist,
+                &mut dist_ratio,
                 &mut pred_node,
                 &mut pred_edge,
                 &mut active,

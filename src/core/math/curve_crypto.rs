@@ -1,4 +1,4 @@
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 use smallvec::SmallVec;
 
 use crate::core::constants::MAX_POOL_TOKENS;
@@ -91,7 +91,15 @@ pub fn curve_crypto_newton_d(ann: U256, gamma: U256, xp: &[U256]) -> NewtonResul
         if g1k0.is_zero() {
             break;
         }
-        let mul1 = (((ONE * d) / gamma * g1k0) / gamma * g1k0 * A_MULTIPLIER) / ann;
+        // U512 for mul1: low-gamma pools (gamma ~ 10^3) produce intermediates
+        // exceeding U256::MAX.  Sequence: ONE*d/gamma * g1k0 / gamma * g1k0 * A_MULTIPLIER / ann.
+        let mul1 = crate::util::u512_to_u256(
+            (((U512::from(ONE) * U512::from(d)) / U512::from(gamma) * U512::from(g1k0))
+                / U512::from(gamma)
+                * U512::from(g1k0)
+                * U512::from(A_MULTIPLIER))
+                / U512::from(ann),
+        );
         let mul2 = (U256::from(2u8) * ONE * n * k0) / g1k0;
         let neg_fprime = (s + (s * mul2) / ONE + (mul1 * n) / k0)
             .saturating_sub((mul2 * d) / ONE);
@@ -196,7 +204,14 @@ pub fn curve_crypto_newton_y(
         if g1k0.is_zero() {
             break;
         }
-        let mul1 = (((ONE * d) / gamma * g1k0) / gamma * g1k0 * A_MULTIPLIER) / ann;
+        // U512 for mul1 — same overflow regime as newton_d (low gamma).
+        let mul1 = crate::util::u512_to_u256(
+            (((U512::from(ONE) * U512::from(d)) / U512::from(gamma) * U512::from(g1k0))
+                / U512::from(gamma)
+                * U512::from(g1k0)
+                * U512::from(A_MULTIPLIER))
+                / U512::from(ann),
+        );
         let mul2 = ONE + (U256::from(2u8) * ONE * k0) / g1k0;
         let mut yfprime = ONE * y + s * mul2 + mul1;
         let dyfprime = d * mul2;

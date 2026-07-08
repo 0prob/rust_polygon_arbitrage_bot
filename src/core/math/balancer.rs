@@ -11,7 +11,7 @@ type BalXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
 
 const MAX_IN_RATIO: U256 = U256::from_limbs([3_000_000_000_000_000_000, 0, 0, 0]);
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
-const MAX_ITERATIONS: u32 = 25;
+const MAX_ITERATIONS: u32 = 64;
 
 #[must_use]
 pub fn balancer_swap_fee_from_pool_meta_fee(fee: u64) -> U256 {
@@ -130,6 +130,9 @@ pub fn calculate_balancer_stable_invariant(
             return U256::ZERO;
         }
         invariant = numerator / denominator;
+        if invariant > sum {
+            return sum;
+        }
         if invariant.abs_diff(prev) <= U256::from(1) {
             return invariant;
         }

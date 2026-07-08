@@ -13,7 +13,7 @@ pub mod woofi;
 
 use alloy::primitives::{U256, U512};
 
-use crate::util::u512_to_u256;
+use crate::util::{u512_to_u256, u512_to_u256_checked};
 
 #[inline(always)]
 pub(crate) fn mul_div(a: U256, b: U256, denominator: U256) -> Option<U256> {
@@ -36,7 +36,7 @@ pub(crate) fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Option
         return None;
     }
     let product = U512::from(a) * U512::from(b);
-    let result = u512_to_u256(product / U512::from(denominator));
+    let result = u512_to_u256_checked(product / U512::from(denominator))?;
     if product % U512::from(denominator) > U512::ZERO {
         result.checked_add(U256::from(1))
     } else if result.is_zero() && !a.is_zero() && !b.is_zero() {

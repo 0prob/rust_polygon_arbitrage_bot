@@ -4,6 +4,7 @@ use crate::core::types::DodoPoolState;
 
 use alloy::primitives::U512;
 
+use crate::util::{u512_to_u256, u512_to_u256_checked};
 use super::fixed_point::{ONE, ONE_U512, mul_down as mul_floor};
 
 // Exact 1e36 — DODO on-chain `_K_PRECISION`. Previous constant was an approximation.
@@ -16,10 +17,9 @@ fn div_ceil(a: U256, b: U256) -> U256 {
     if b.is_zero() {
         return U256::ZERO;
     }
-    // U512 widening prevents overflow in a * ONE
     let product = U512::from(a) * ONE_U512;
     let result = (product + U512::from(b) - U512::ONE) / U512::from(b);
-    crate::util::u512_to_u256(result)
+    u512_to_u256(result)
 }
 
 fn reciprocal_floor(target: U256) -> U256 {
@@ -27,7 +27,7 @@ fn reciprocal_floor(target: U256) -> U256 {
         return U256::ZERO;
     }
     let result = U512::from(ONE2) / U512::from(target);
-    crate::util::u512_to_u256(result)
+    u512_to_u256(result)
 }
 
 fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, k: U256) -> U256 {
@@ -55,9 +55,11 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
     }
 
     let part2 = {
-        // Use U512 to prevent overflow when k (1e18 fp) * v0² exceeds U256.
+        // U512 for k*v0²/v1; then checked truncation since quotient can exceed U256::MAX
+        // for extreme k/v0/v1 combinations (k up to 1e18, v0 up to 1e30).
         let k_v0_v0 = U512::from(k) * U512::from(v0) * U512::from(v0) / U512::from(v1);
-        crate::util::u512_to_u256(k_v0_v0) + mul_floor(i, delta)
+        let k_term = u512_to_u256_checked(k_v0_v0).unwrap_or(U256::MAX);
+        k_term + mul_floor(i, delta)
     };
     let mut b_abs = (ONE - k) * v1;
     let mut b_sig = false;

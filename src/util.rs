@@ -179,16 +179,32 @@ pub fn u256_to_f64(v: U256) -> f64 {
 
 /// Lossless truncation of U512 to U256 (low 256 bits).
 /// U512 stores little-endian limbs; we extract the lower 4 limbs (256 bits).
+/// **Panics in debug** when the high 256 bits are non-zero (caller guarantees no overflow).
 #[inline]
 #[must_use]
 pub fn u512_to_u256(v: U512) -> U256 {
-    // Uint uses little-endian u64 limbs internally.
-    // U512 (64 bytes) has 8 limbs; lower 4 limbs = U256 low bits.
-    // We transmute via byte slice since as_slice() isn't available on Uint in this alloy version.
     let raw = v.as_le_slice();
+    debug_assert!(
+        raw[32..].iter().all(|&b| b == 0),
+        "u512_to_u256: high 256 bits non-zero — value exceeds U256 range"
+    );
     let mut buf = [0u8; 32];
     buf.copy_from_slice(&raw[..32]);
     U256::from_le_bytes(buf)
+}
+
+/// **Checked** U512 → U256 truncation. Returns `None` when the value exceeds U256::MAX.
+/// Prefer this over [`u512_to_u256`] at call sites where overflow is possible.
+#[inline]
+#[must_use]
+pub fn u512_to_u256_checked(v: U512) -> Option<U256> {
+    let raw = v.as_le_slice();
+    if raw[32..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&raw[..32]);
+    Some(U256::from_le_bytes(buf))
 }
 
 /// Truncate to at most `max_chars` Unicode scalar values (not bytes).

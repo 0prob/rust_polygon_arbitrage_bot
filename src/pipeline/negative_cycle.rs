@@ -7,6 +7,30 @@ use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_packed_route_calls}
 use crate::pipeline::spot_price::hop_penalty;
 use crate::pipeline::weighted_graph::WeightedEdge;
 
+/// Compute `a * b / ONE` as a U256 product ratio, saturating to ZERO on overflow.
+///
+/// This is the fixed-point ratio chaining operation: two consecutive edge ratios
+/// (both scaled by ONE) multiply to produce the cumulative path ratio.
+/// U512 intermediate avoids overflow for a single hop — two U256 values of at
+/// most 1.0 can't exceed 2.0, and the product of two U256·ONE ratios fits in U512.
+#[inline]
+fn mul_ratio(a: U256, b: U256) -> U256 {
+    U512::from(a)
+        .checked_mul(U512::from(b))
+        .map(|p| p / ONE_U512)
+        .and_then(|p| {
+            let raw = p.as_le_slice();
+            if raw[32..].iter().any(|&b| b != 0) {
+                None
+            } else {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(&raw[..32]);
+                Some(U256::from_le_bytes(buf))
+            }
+        })
+        .unwrap_or(U256::ZERO)
+}
+
 fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     let len = edges.len();
     if len < 2 {
@@ -37,6 +61,12 @@ fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
 }
 
 /// Extract negative cycles reachable from `source` after a bounded Bellman-Ford relaxation.
+///
+/// # Dual-precision tracking
+///
+/// `dist` is f64 log-weight (fast additive BF).  `dist_ratio` is U256 fixed-point
+/// product ratio (full 256-bit precision).  The U256 path catches tight-margin
+/// arbitrages where f64 log-weights are indistinguishable from noise.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_negative_cycles_from_source(
     source: TokenIndex,
@@ -46,6 +76,7 @@ pub fn collect_negative_cycles_from_source(
     found_keys: &mut rustc_hash::FxHashSet<u64>,
     cycles: &mut Vec<FoundCycle>,
     dist: &mut [f64],
+    dist_ratio: &mut [U256],
     pred_node: &mut [Option<TokenIndex>],
     pred_edge: &mut [Option<WeightedEdge>],
     active: &mut Vec<usize>,
@@ -61,6 +92,7 @@ pub fn collect_negative_cycles_from_source(
 
     // Seed with source node.
     dist[source.0 as usize] = 0.0;
+    dist_ratio[source.0 as usize] = ONE;
     touched.push(source.0 as usize);
 
     active.clear();
@@ -73,9 +105,10 @@ pub fn collect_negative_cycles_from_source(
     // numerical noise. f64 has ~15-17 decimal digits of precision; 1e-12 ratio
     // per unit magnitude is conservative.
     fn bf_eps(old: f64) -> f64 {
-        // 16 units-in-the-last-place instead of 256: tighter threshold for thin-margin
-        // arb cycles (log-weight ~1e-15 per hop) while still above pure f64 arithmetic noise.
-        f64::EPSILON * old.abs().max(1.0) * 16.0
+        // 2 units-in-the-last-place: tight enough for log-weight ~1e-15 per hop
+        // without masking tight arbitrage (16× was masking profitable cycles on
+        // large-magnitude edges).
+        f64::EPSILON * old.abs().max(1.0) * 2.0
     }
 
     for _ in 0..max_hops {
@@ -89,16 +122,23 @@ pub fn collect_negative_cycles_from_source(
 
         for &u_idx in active.iter() {
             let u_dist = dist[u_idx];
+            let u_ratio = dist_ratio[u_idx];
             for we in &adj[u_idx] {
                 let v = we.edge.token_out.0 as usize;
+                if we.ratio.is_zero() {
+                    continue;
+                }
                 let new_dist = u_dist + we.weight;
                 let old = dist[v];
-                if new_dist < old - bf_eps(old) {
+                let new_ratio = mul_ratio(u_ratio, we.ratio);
+                let ratio_improves = new_ratio > dist_ratio[v];
+                if new_dist < old - bf_eps(old) || ratio_improves {
                     if !old.is_finite() {
                         // First time reaching this node in this source run.
                         touched.push(v);
                     }
                     dist[v] = new_dist;
+                    dist_ratio[v] = new_ratio;
                     pred_node[v] = Some(TokenIndex(u_idx as u32));
                     pred_edge[v] = Some(*we);
                     if !in_next[v] {
@@ -125,7 +165,9 @@ pub fn collect_negative_cycles_from_source(
             }
             let v = we.edge.token_out;
             let v_dist = dist[v.0 as usize];
-            if u_dist + we.weight >= v_dist - bf_eps(v_dist) {
+            let we_neg_via_ratio =
+                !we.ratio.is_zero() && mul_ratio(dist_ratio[u_idx], we.ratio) > dist_ratio[v.0 as usize];
+            if u_dist + we.weight >= v_dist - bf_eps(v_dist) && !we_neg_via_ratio {
                 continue;
             }
 
@@ -154,12 +196,7 @@ pub fn collect_negative_cycles_from_source(
                 };
                 log_weight += we_pred.weight;
                 cum_fee = cum_fee.saturating_add(clamp_fee_bps(we_pred.edge.fee_bps));
-                let p = U512::from(product_ratio) * U512::from(we_pred.ratio) / ONE_U512;
-                product_ratio = if p > U512::from(U256::MAX) {
-                    U256::ZERO
-                } else {
-                    crate::util::u512_to_u256(p)
-                };
+                product_ratio = mul_ratio(product_ratio, we_pred.ratio);
                 cycle_edges.push(we_pred.edge);
                 trace = pred_node[t.0 as usize];
                 if trace == Some(cycle_start) {
@@ -199,6 +236,7 @@ pub fn collect_negative_cycles_from_source(
     // Reset only the entries that were touched, avoiding O(N) fill on each source.
     for &idx in &touched {
         dist[idx] = f64::INFINITY;
+        dist_ratio[idx] = ONE;
         pred_node[idx] = None;
         pred_edge[idx] = None;
         in_next[idx] = false;

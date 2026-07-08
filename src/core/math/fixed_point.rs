@@ -39,8 +39,5 @@ pub fn pow_down(x: U256, y: U256) -> U256 {
 
     let raw = log_exp_pow(x, y);
     let max_error = mul_up(raw, MAX_POW_RELATIVE_ERROR) + U256::from(1);
-    if raw < max_error {
-        return U256::ZERO;
-    }
-    raw - max_error
+    raw.saturating_sub(max_error)
 }
