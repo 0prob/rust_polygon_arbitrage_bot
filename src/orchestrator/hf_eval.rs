@@ -445,7 +445,7 @@ pub fn rank_cycles_by_probe_net(
     probe_seeds.retain(|fingerprint, _| kept_fingerprints.contains(fingerprint));
 
     if kept.is_empty() && !scanned.is_empty() {
-        crate::info!(
+        crate::debug!(
             "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len}",
             scanned.len(),
             skip.rate,
@@ -508,7 +508,7 @@ pub fn evaluate_cycles_parallel(
         .filter_map(|cycle| evaluate_one(cycle, input, probe_seeds, &stats))
         .collect();
     if results.is_empty() && !cycles.is_empty() {
-        crate::info!(
+        crate::debug!(
             "hf assess failed: routes={} quarantine={} flash={} flash_source={} opt_none={} detailed_none={} fallback_none={} probe(sim_none={} zero={} fidelity={} sanity={})",
             cycles.len(),
             load(&stats.quarantine),

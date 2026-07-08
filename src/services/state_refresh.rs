@@ -357,7 +357,7 @@ impl StateRefreshService {
                 break;
             }
             keyset = next;
-            crate::info!(
+            crate::debug!(
                 "pg bootstrap page (batch={batch}, total={}, max_block={})",
                 all_pools.len(),
                 keyset.created_block,

@@ -213,7 +213,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             let hop = match reject {
                 local_sim::HopFidelityReject::MissingPool(i)
                 | local_sim::HopFidelityReject::PoolLocked(i)
-                | local_sim::HopFidelityReject::ShallowCl(i) => i,
+                | local_sim::HopFidelityReject::ShallowCl(i)
+                | local_sim::HopFidelityReject::V2ReserveExhausted(i) => i,
             };
             let hop_amount = refreshed
                 .hop_amounts

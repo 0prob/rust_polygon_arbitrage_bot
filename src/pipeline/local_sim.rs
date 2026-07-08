@@ -187,6 +187,7 @@ pub enum HopFidelityReject {
     MissingPool(usize),
     PoolLocked(usize),
     ShallowCl(usize),
+    V2ReserveExhausted(usize),
 }
 
 fn cl_hop_shallow_at_amount(state: &PoolState, edge: &Edge, amount_in: U256) -> bool {
@@ -226,7 +227,7 @@ pub fn route_hop_fidelity_ok(
     route_hop_fidelity_reject(arena, edges, hop_amounts, spot_probe).is_none()
 }
 
-/// First CL hop that fails tick-depth or tradability checks above `spot_probe`, if any.
+/// First hop that fails tick-depth, tradability, or reserve-depth checks above `spot_probe`, if any.
 #[must_use]
 pub fn route_hop_fidelity_reject(
     arena: &StateArena,
@@ -235,12 +236,6 @@ pub fn route_hop_fidelity_reject(
     spot_probe: U256,
 ) -> Option<HopFidelityReject> {
     for (i, edge) in edges.iter().enumerate() {
-        if !matches!(
-            edge.protocol,
-            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
-        ) {
-            continue;
-        }
         let amount_in = hop_amounts.get(i).copied().unwrap_or(U256::ZERO);
         if amount_in <= spot_probe {
             continue;
@@ -251,8 +246,26 @@ pub fn route_hop_fidelity_reject(
         if !state.is_tradable() {
             return Some(HopFidelityReject::PoolLocked(i));
         }
-        if cl_hop_shallow_at_amount(state, edge, amount_in) {
-            return Some(HopFidelityReject::ShallowCl(i));
+        match (state, edge.protocol) {
+            (PoolState::V2(s), ProtocolType::UniswapV2) => {
+                let (reserve_in, _reserve_out) = if edge.zero_for_one {
+                    (s.reserve0, s.reserve1)
+                } else {
+                    (s.reserve1, s.reserve0)
+                };
+                // If trade input >= reserve_in, the swap would drain >50% of the pool.
+                // The pool lacks sufficient depth for this trade — reject before
+                // the simulation produces an unrealistic (phantom) profit.
+                if amount_in >= reserve_in {
+                    return Some(HopFidelityReject::V2ReserveExhausted(i));
+                }
+            }
+            (PoolState::V3(_) | PoolState::V4(_), ProtocolType::UniswapV3 | ProtocolType::UniswapV4) => {
+                if cl_hop_shallow_at_amount(state, edge, amount_in) {
+                    return Some(HopFidelityReject::ShallowCl(i));
+                }
+            }
+            _ => {}
         }
     }
     None

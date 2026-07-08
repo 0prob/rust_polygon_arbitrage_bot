@@ -55,7 +55,7 @@ pub fn init() {
 }
 
 thread_local! {
-    static LOG_BUF: RefCell<String> = RefCell::new(String::with_capacity(256));
+    static LOG_BUF: RefCell<String> = RefCell::new(String::with_capacity(512));
 }
 
 #[inline]
