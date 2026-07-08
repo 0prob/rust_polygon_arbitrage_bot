@@ -81,6 +81,20 @@ fn is_quickswap_v2_label(label: &str) -> bool {
         || b.windows(8).any(|w| w.eq_ignore_ascii_case(b"quick_v2"))
 }
 
+fn uniswap_v2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("UNISWAP_V2_ENABLED")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn is_uniswap_v2_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    b.windows(11).any(|w| w.eq_ignore_ascii_case(b"uniswap_v2"))
+}
+
 #[must_use]
 pub fn is_routable_pool(pool: &DiscoveredPool) -> bool {
     is_fetchable_protocol(pool.protocol)
@@ -88,6 +102,8 @@ pub fn is_routable_pool(pool: &DiscoveredPool) -> bool {
         && is_supported_v4_pool(pool.protocol, pool.hooks)
         // ponytail: env toggle for quickswap v2 pools
         && (quickswap_v2_enabled() || !is_quickswap_v2_label(&pool.protocol_label))
+        // ponytail: env toggle for uniswap v2 pools
+        && (uniswap_v2_enabled() || !is_uniswap_v2_label(&pool.protocol_label))
 }
 
 fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool {
