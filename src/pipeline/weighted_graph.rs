@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use crate::core::types::Edge;
 use crate::pipeline::cycle_finder::is_live_graph_edge;
 use crate::pipeline::types::RoutingGraph;
@@ -6,6 +7,9 @@ use crate::pipeline::types::RoutingGraph;
 pub struct WeightedEdge {
     pub edge: Edge,
     pub weight: f64,
+    /// U256 fixed-point ratio (spot_price * (1-fee) / ONE), carried from GraphEdge
+    /// so Bellman-Ford can compute precise cycle_ratio for discovered cycles.
+    pub ratio: U256,
 }
 
 /// Build Johnson/Bellman-Ford adjacency from graph edge weights (already rescored).
@@ -21,6 +25,7 @@ pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> 
             list.push(WeightedEdge {
                 edge: ge.edge,
                 weight: ge.log_weight,
+                ratio: ge.ratio,
             });
         }
         out.push(list);

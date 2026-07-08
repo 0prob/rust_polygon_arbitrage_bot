@@ -1,5 +1,6 @@
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
+use crate::core::math::fixed_point::{ONE, ONE_U512};
 use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_packed_route_calls};
@@ -66,6 +67,17 @@ pub fn collect_negative_cycles_from_source(
     next_active.clear();
     active.push(source.0 as usize);
 
+    // Relative epsilon for Bellman-Ford comparisons: scaled by the magnitude
+    // of the existing distance so tight arbitrage (log-weight ~ 1e-15) is not
+    // masked by a hardcoded epsilon, while large distances don't trigger on
+    // numerical noise. f64 has ~15-17 decimal digits of precision; 1e-12 ratio
+    // per unit magnitude is conservative.
+    fn bf_eps(old: f64) -> f64 {
+        // 16 units-in-the-last-place instead of 256: tighter threshold for thin-margin
+        // arb cycles (log-weight ~1e-15 per hop) while still above pure f64 arithmetic noise.
+        f64::EPSILON * old.abs().max(1.0) * 16.0
+    }
+
     for _ in 0..max_hops {
         if active.is_empty() {
             break;
@@ -81,7 +93,7 @@ pub fn collect_negative_cycles_from_source(
                 let v = we.edge.token_out.0 as usize;
                 let new_dist = u_dist + we.weight;
                 let old = dist[v];
-                if new_dist < old - 1e-9 {
+                if new_dist < old - bf_eps(old) {
                     if !old.is_finite() {
                         // First time reaching this node in this source run.
                         touched.push(v);
@@ -113,7 +125,7 @@ pub fn collect_negative_cycles_from_source(
             }
             let v = we.edge.token_out;
             let v_dist = dist[v.0 as usize];
-            if u_dist + we.weight >= v_dist - 1e-9 {
+            if u_dist + we.weight >= v_dist - bf_eps(v_dist) {
                 continue;
             }
 
@@ -134,6 +146,7 @@ pub fn collect_negative_cycles_from_source(
             let mut cycle_edges: CycleEdges = CycleEdges::new();
             let mut log_weight = 0.0;
             let mut cum_fee = 0u32;
+            let mut product_ratio = ONE;
             let mut trace = Some(cycle_start);
             while let Some(t) = trace {
                 let Some(we_pred) = pred_edge[t.0 as usize] else {
@@ -141,6 +154,12 @@ pub fn collect_negative_cycles_from_source(
                 };
                 log_weight += we_pred.weight;
                 cum_fee = cum_fee.saturating_add(clamp_fee_bps(we_pred.edge.fee_bps));
+                let p = U512::from(product_ratio) * U512::from(we_pred.ratio) / ONE_U512;
+                product_ratio = if p > U512::from(U256::MAX) {
+                    U256::ZERO
+                } else {
+                    crate::util::u512_to_u256(p)
+                };
                 cycle_edges.push(we_pred.edge);
                 trace = pred_node[t.0 as usize];
                 if trace == Some(cycle_start) {
@@ -172,7 +191,7 @@ pub fn collect_negative_cycles_from_source(
                 log_weight,
                 cumulative_fee_bps: cum_fee,
                 score: log_weight,
-                cycle_ratio: U256::ZERO,
+                cycle_ratio: product_ratio,
             });
         }
     }

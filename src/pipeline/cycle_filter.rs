@@ -3,6 +3,7 @@ use alloy::primitives::U256;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::hash_map::Entry;
 
+use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_minimal;
@@ -70,7 +71,12 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
         let probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
         let keep = match &probe {
             Some(sim) => sim.profit > U256::ZERO,
-            None if cycle.score < 0.0 => {
+            // Use exact U256 cycle_ratio > ONE to gate rescue, falling back to f64 score
+            // only when cycle_ratio wasn't computed (cache restore path sets it to ZERO).
+            None
+                if cycle.cycle_ratio > ONE
+                    || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) =>
+            {
                 if missing_state_rescued >= rescue_cap {
                     false
                 } else {

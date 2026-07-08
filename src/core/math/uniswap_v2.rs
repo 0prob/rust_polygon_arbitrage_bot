@@ -1,4 +1,5 @@
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
+use crate::util::u512_to_u256;
 
 use crate::core::constants::{DEFAULT_FEE_NUMERATOR, FEE_DENOMINATOR};
 use crate::core::types::V2PoolState;
@@ -22,23 +23,21 @@ pub fn get_amount_out(
         return U256::ZERO;
     }
 
-    // Treat any overflow or div-by-zero as unexecutable (return 0).
-    let Some(amount_in_with_fee) = amount_in.checked_mul(fee_numerator) else {
-        return U256::ZERO;
-    };
-    let Some(numerator) = amount_in_with_fee.checked_mul(reserve_out) else {
-        return U256::ZERO;
-    };
-    let Some(den_part) = reserve_in.checked_mul(fee_denominator) else {
-        return U256::ZERO;
-    };
-    let Some(denominator) = den_part.checked_add(amount_in_with_fee) else {
-        return U256::ZERO;
-    };
+    // U512 widening prevents silent overflow on deep pools with large reserves.
+    // amount_in * fee_numerator * reserve_out can exceed U256::MAX for
+    // high-liquidity pairs (e.g. WMATIC/USDC with 10^18+ balances).
+    let amount_in_with_fee = U512::from(amount_in) * U512::from(fee_numerator);
+    let numerator = amount_in_with_fee * U512::from(reserve_out);
+    let den_part = U512::from(reserve_in) * U512::from(fee_denominator);
+    let denominator = den_part + amount_in_with_fee;
     if denominator.is_zero() {
         return U256::ZERO;
     }
-    numerator / denominator
+    let result = numerator / denominator;
+    if result.is_zero() {
+        return U256::ZERO;
+    }
+    u512_to_u256(result)
 }
 
 #[inline]

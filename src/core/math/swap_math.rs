@@ -93,7 +93,7 @@ pub fn compute_swap_step(
     Some(SwapStepResult {
         sqrt_ratio_next_x96,
         amount_in: actual_in,
-        amount_out: actual_out,
+        amount_out: actual_out.min(liquidity),
         fee_amount,
     })
 }

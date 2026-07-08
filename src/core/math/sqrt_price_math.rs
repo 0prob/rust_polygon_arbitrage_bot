@@ -14,7 +14,7 @@ pub fn get_next_sqrt_price_from_amount0_rounding_up(
         return Some(sqrt_px96);
     }
 
-    let numerator1: U256 = liquidity << 96;
+    let numerator1: U256 = liquidity.checked_shl(96)?;
 
     if add {
         if let Some(product) = amount.checked_mul(sqrt_px96)
@@ -77,7 +77,7 @@ pub fn get_amount0_delta(
         return None;
     }
 
-    let numerator1: U256 = liquidity << 96;
+    let numerator1: U256 = liquidity.checked_shl(96)?;
     let numerator2 = sqrt_ratio_b_x96 - sqrt_ratio_a_x96;
 
     if round_up {

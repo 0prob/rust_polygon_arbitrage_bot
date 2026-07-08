@@ -8,7 +8,7 @@ flash_loan_source = "auto"
 
 [routing]
 # 300: Larger pool for more cycle diversity. LF runs in background with try_lock.
-enumeration_max_paths = 300
+enumeration_max_paths = 500
 max_hops = 4
 
 [pipeline]

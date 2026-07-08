@@ -93,7 +93,8 @@ pub fn curve_crypto_newton_d(ann: U256, gamma: U256, xp: &[U256]) -> NewtonResul
         }
         let mul1 = (((ONE * d) / gamma * g1k0) / gamma * g1k0 * A_MULTIPLIER) / ann;
         let mul2 = (U256::from(2u8) * ONE * n * k0) / g1k0;
-        let neg_fprime = s + (s * mul2) / ONE + (mul1 * n) / k0 - (mul2 * d) / ONE;
+        let neg_fprime = (s + (s * mul2) / ONE + (mul1 * n) / k0)
+            .saturating_sub((mul2 * d) / ONE);
         if neg_fprime.is_zero() {
             return NewtonResult {
                 value: U256::ZERO,

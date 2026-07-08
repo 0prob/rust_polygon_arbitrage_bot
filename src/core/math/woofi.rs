@@ -13,8 +13,13 @@ fn mul_div_triple(a: U256, b: U256, c: U256, d: U256, e: U256) -> U256 {
     {
         return abc / de;
     }
-    (U512::from(a) * U512::from(b) * U512::from(c) / (U512::from(d) * U512::from(e)))
-        .wrapping_to::<U256>()
+    // U512 fallback: if the division result exceeds U256::MAX, return zero.
+    let result = U512::from(a) * U512::from(b) * U512::from(c) / (U512::from(d) * U512::from(e));
+    if result > U512::from(U256::MAX) {
+        U256::ZERO
+    } else {
+        crate::util::u512_to_u256(result)
+    }
 }
 
 fn has_positive_swap_factor(gamma: U256, spread: U256) -> bool {

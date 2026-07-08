@@ -2,8 +2,9 @@ use alloy::primitives::U256;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
-use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, edge_log_weight_from_spot};
+use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, compute_edge_ratio, edge_log_weight_from_spot};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
+use crate::util::u256_to_f64;
 
 /// Build directed swap edges for a two-token pool (V2/V3/DODO).
 /// When `state` is set, only emits hops that pass [`PoolState::hop_pair_routable`].
@@ -374,13 +375,24 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut S
         ge.ratio = U256::ZERO;
         return 1;
     }
-    let spot = spot_table.ensure_edge(arena, &ge.edge);
-    ge.log_weight = if spot <= 0.0 {
-        compute_edge_log_weight(ge.edge.fee_bps)
+    // Compute U256 ratio first (once), then derive log_weight from it.
+    // This avoids the double simulation that happened when both ensure_edge
+    // (line 378) and compute_edge_ratio (line 384) independently called
+    // simulate_hop_amount_out for complex pools (Balancer, Curve, Dodo).
+    ge.ratio = compute_edge_ratio(arena, &ge.edge);
+    if ge.ratio.is_zero() {
+        ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        return 1;
+    }
+    let spot_f64 = u256_to_f64(ge.ratio) / 1e18;
+    // Check spot is sane (> 0): a ratio less than 1e-18 * ONE could round to 0.
+    if spot_f64 > 0.0 {
+        // Pre-populate the spot table so subsequent ensure_edge calls hit cache.
+        spot_table.set(&ge.edge, spot_f64);
+        ge.log_weight = edge_log_weight_from_spot(spot_f64, ge.edge.fee_bps);
     } else {
-        edge_log_weight_from_spot(spot, ge.edge.fee_bps)
-    };
-    ge.ratio = crate::pipeline::spot_price::compute_edge_ratio(arena, &ge.edge);
+        ge.log_weight = compute_edge_log_weight(ge.edge.fee_bps);
+    }
     // ponytail: multi-token pools (Balancer, Curve) create n*(n-1) edges vs 2 for
     // 2-token pools, over-representing them in DFS enumeration. Apply a mild
     // per-extra-token penalty so their edge count doesn't bias cycle discovery.

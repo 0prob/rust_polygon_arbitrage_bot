@@ -1,5 +1,5 @@
 use crate::core::constants::BPS_SCALE;
-use crate::core::math::fixed_point::ONE;
+use crate::core::math::fixed_point::{ONE, ONE_U512};
 use crate::core::types::{
     ConcentratedLiquidityPoolState, Edge, FlashLoanSource, FoundCycle, PoolState, ProtocolType,
     TokenIndex,
@@ -16,7 +16,6 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]); // 1e12 wei
-const Q96_F64: f64 = 79228162514264337593543950336.0; // 2^96
 const ONE_F64: f64 = 1_000_000_000_000_000_000.0; // 10^18 — ONE in f64
 
 /// Compute V2 spot price ratio as U256 fixed-point (ONE = 10^18).
@@ -50,18 +49,26 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
     }
     let spot_u256 = if edge.zero_for_one {
         // price = sqrt^2 / 2^192 expressed in ONE.
-        // Avoid overflow: sqrt^2 may exceed U256, so split into high/low parts.
+        // Full expansion: (sqrt_hi * 2^96 + sqrt_lo)^2 * ONE / 2^192
+        // = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96 + sqrt_lo^2*ONE/2^192
         let sqrt_hi: U256 = sqrt >> 96;
-        let sqrt_lo: U256 = sqrt & U256::from(u64::MAX);
-        // Spot ≈ (sqrt_hi + sqrt_lo/2^96)^2 * ONE = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96
+        let sqrt_lo: U256 = sqrt & ((U256::from(1u128) << 96) - U256::from(1));
         let hi_term = sqrt_hi.checked_mul(sqrt_hi)?.checked_mul(ONE)?;
-        let cross = sqrt_hi.checked_mul(sqrt_lo)?.checked_mul(ONE)?;
-        hi_term.checked_add(cross >> 96)?
+        let cross = U512::from(sqrt_hi) * U512::from(sqrt_lo) * ONE_U512;
+        // cross >> 95 = 2 * sqrt_hi * sqrt_lo * ONE / 2^96 (original >> 96 missed factor 2)
+        let cross_term = crate::util::u512_to_u256(cross >> 95);
+        // lo_term = sqrt_lo^2 * ONE / 2^192 — < 1 wei for valid prices but included
+        let lo_sq = U512::from(sqrt_lo) * U512::from(sqrt_lo);
+        let lo_numer = lo_sq * ONE_U512;
+        let lo_term = crate::util::u512_to_u256(lo_numer >> 192);
+        hi_term
+            .checked_add(cross_term)?
+            .checked_add(lo_term)?
     } else {
         // Inverse price: price0_per_1 = 2^192 / sqrt^2.
         // Compute (2^192 * ONE) / sqrt^2 using U512 to prevent overflow.
         let two_pow_192 = U256::from(1u128) << 192;
-        let numerator = U512::from(two_pow_192) * U512::from(ONE);
+        let numerator = U512::from(two_pow_192) * ONE_U512;
         let sqrt_sq = U512::from(sqrt) * U512::from(sqrt);
         let raw = numerator / sqrt_sq;
         if raw.is_zero() {
@@ -174,30 +181,12 @@ fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge) -> f64
     spot_ratio_to_f64(v2_spot_u256(state, edge))
 }
 
-/// Marginal V3/V4 spot from `sqrt_price_x96` — uses U256 fixed-point for ratio then converts once.
+/// Marginal V3/V4 spot from `sqrt_price_x96` — U256 fixed-point only. No f64 fallback.
 #[inline]
 fn cl_marginal_spot(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> f64 {
-    let r = cl_spot_u256(state, edge);
-    match r {
+    match cl_spot_u256(state, edge) {
         Some(ratio) if !ratio.is_zero() => u256_to_f64(ratio) / ONE_F64,
-        _ => {
-            // Fallback to f64 for inverse price or edge cases.
-            if state.sqrt_price_x96.is_zero() {
-                return 0.0;
-            }
-            let sqrt = u256_to_f64(state.sqrt_price_x96);
-            let price1_per_0 = (sqrt / Q96_F64).powi(2);
-            if !price1_per_0.is_finite() || price1_per_0 <= 0.0 {
-                return 0.0;
-            }
-            let raw = if edge.zero_for_one {
-                price1_per_0
-            } else {
-                1.0 / price1_per_0
-            };
-            let fee_factor = 1.0 - edge.fee_bps as f64 / 10_000.0;
-            raw * fee_factor
-        }
+        _ => 0.0,
     }
 }
 

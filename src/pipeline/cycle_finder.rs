@@ -7,7 +7,7 @@ use crate::util::u512_to_u256;
 
 use crate::core::constants::HOP_CAP;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
-use crate::core::math::fixed_point::ONE;
+use crate::core::math::fixed_point::ONE_U512;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -426,7 +426,7 @@ fn collect_cycles_dfs_single_start(
 
             path.push(ge.edge);
             let next_ratio = u512_to_u256(
-                U512::from(product_ratio) * U512::from(ge.ratio) / U512::from(ONE)
+                U512::from(product_ratio) * U512::from(ge.ratio) / ONE_U512
             );
             dfs(
                 prep,
@@ -585,7 +585,7 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 
 #[must_use]
 pub fn find_cycles_multi_pass(
-    arena: &StateArena,
+    _arena: &StateArena,
     graph: &RoutingGraph,
     passes: &[CycleSearchPass],
 ) -> Vec<FoundCycle> {
