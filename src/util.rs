@@ -25,7 +25,11 @@ pub fn ten_pow_u256(decimals: u8) -> U256 {
         9 => U256::from(1_000_000_000u128),
         12 => U256::from(1_000_000_000_000u128),
         18 => ONE,
-        other => U256::from(10u128).pow(U256::from(other as u32)),
+        // Avoid U256::from(other) in the hot path — use the raw limb directly.
+        other => {
+            const BASE: U256 = U256::from_limbs([10, 0, 0, 0]);
+            BASE.pow(U256::from_limbs([u64::from(other), 0, 0, 0]))
+        }
     }
 }
 

@@ -191,8 +191,11 @@ pub enum HopFidelityReject {
 }
 
 fn cl_hop_shallow_at_amount(state: &PoolState, edge: &Edge, amount_in: U256) -> bool {
+    // ponytail: reuse cl_hop_tickless instead of duplicating the match
+    if cl_hop_tickless(state) {
+        return true;
+    }
     match state {
-        PoolState::V3(s) | PoolState::V4(s) if s.ticks.is_empty() => true,
         PoolState::V3(s) | PoolState::V4(s) => {
             simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps)).shallow
         }

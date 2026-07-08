@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PoolMetaData {
     #[serde(default)]
-    balancer_pool_ids: FxHashMap<String, String>,
+    balancer_pool_ids: FxHashMap<Address, String>,
     #[serde(default)]
-    woofi_meta: FxHashMap<String, WoofiMetaEntry>,
+    woofi_meta: FxHashMap<Address, WoofiMetaEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,26 +41,23 @@ impl PoolMetaCache {
     }
 
     pub fn balancer_pool_id(&self, addr: &Address) -> Option<FixedBytes<32>> {
-        let key = format!("{addr:#x}");
         self.inner
             .read()
             .balancer_pool_ids
-            .get(&key)
+            .get(addr)
             .and_then(|s| s.parse().ok())
     }
 
     pub fn set_balancer_pool_id(&self, addr: &Address, id: FixedBytes<32>) {
-        let key = format!("{addr:#x}");
         self.inner
             .write()
             .balancer_pool_ids
-            .insert(key, format!("{id:#x}"));
+            .insert(*addr, format!("{id:#x}"));
         self.persist();
     }
 
     pub fn woofi_meta(&self, addr: &Address) -> Option<(Address, Address)> {
-        let key = format!("{addr:#x}");
-        self.inner.read().woofi_meta.get(&key).and_then(|entry| {
+        self.inner.read().woofi_meta.get(addr).and_then(|entry| {
             let quote = entry.quote.parse().ok()?;
             let wooracle = entry.wooracle.parse().ok()?;
             Some((quote, wooracle))
@@ -68,9 +65,8 @@ impl PoolMetaCache {
     }
 
     pub fn set_woofi_meta(&self, addr: &Address, quote: Address, wooracle: Address) {
-        let key = format!("{addr:#x}");
         self.inner.write().woofi_meta.insert(
-            key,
+            *addr,
             WoofiMetaEntry {
                 quote: format!("{quote:#x}"),
                 wooracle: format!("{wooracle:#x}"),

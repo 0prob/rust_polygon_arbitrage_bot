@@ -269,6 +269,21 @@ impl PoolState {
         }
     }
 
+    /// Returns true when at least 2 distinct token indices are funded.
+    /// Shared by Curve and Balancer is_tradable checks.
+    fn at_least_two_funded(&self, n: usize) -> bool {
+        let mut funded = 0usize;
+        for i in 0..n {
+            if self.hop_token_funded(i) {
+                funded += 1;
+                if funded >= 2 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     #[must_use]
     pub fn is_tradable(&self) -> bool {
         match self {
@@ -287,16 +302,7 @@ impl PoolState {
                 if s.rates.iter().any(U256::is_zero) {
                     return false;
                 }
-                let mut funded = 0usize;
-                for i in 0..n {
-                    if self.hop_token_funded(i) {
-                        funded += 1;
-                        if funded >= 2 {
-                            return true;
-                        }
-                    }
-                }
-                false
+                self.at_least_two_funded(n)
             }
             PoolState::Balancer(s) => {
                 let bpt = s.bpt_index;
@@ -326,16 +332,7 @@ impl PoolState {
                 if s.scaling_factors.iter().any(U256::is_zero) {
                     return false;
                 }
-                let mut funded = 0usize;
-                for i in 0..n {
-                    if self.hop_token_funded(i) {
-                        funded += 1;
-                        if funded >= 2 {
-                            return true;
-                        }
-                    }
-                }
-                false
+                self.at_least_two_funded(n)
             }
             PoolState::Woofi(s) => {
                 if s.tokens.len() != s.base_states.len() + 1 {

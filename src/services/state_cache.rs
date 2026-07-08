@@ -157,9 +157,9 @@ impl StateCache {
         let Some(entry) = guard.get_mut(&address) else {
             return false;
         };
-        let mut state = (*entry.state).clone();
-        f(&mut state);
-        entry.state = Arc::new(state);
+        // ponytail: Arc::make_mut provides COW semantics — no deep clone when
+        // the Arc is uniquely held (common for hot-patched pool states from WSS).
+        f(Arc::make_mut(&mut entry.state));
         entry.updated_at = Instant::now();
         self.generation.fetch_add(1, Ordering::Release);
         self.mark_dirty(address);

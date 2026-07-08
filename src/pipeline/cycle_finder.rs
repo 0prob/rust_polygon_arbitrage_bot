@@ -3,7 +3,7 @@ use std::time::Duration;
 use rayon::prelude::*;
 
 use crate::core::constants::HOP_CAP;
-use crate::core::types::{Edge, FoundCycle, ProtocolType, TokenIndex};
+use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -211,7 +211,7 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             compact.push(Vec::new());
             continue;
         }
-        let mut live: Vec<GraphEdge> = Vec::new();
+        let mut live: Vec<GraphEdge> = Vec::with_capacity(edges.len());
         let mut protos: u8 = 0;
         let mut proto_bits = 0u16; // bitmask: ProtocolType has ≤9 variants
         for ge in edges {
@@ -332,9 +332,12 @@ fn collect_cycles_dfs_single_start(
                 return;
             }
             seen.insert(fp);
+            // ponytail: SmallVec::from(&[T]) copies inline (≤HOP_CAP=8) without
+            // iterator adaptor overhead — avoids .iter().copied().collect() dispatch.
+            let edges: CycleEdges = CycleEdges::from(path.as_slice());
             cycles.push(FoundCycle {
                 start_token: start,
-                edges: path.iter().copied().collect(),
+                edges,
                 hop_count: hops,
                 log_weight: score,
                 cumulative_fee_bps: cum_fee,
@@ -544,7 +547,9 @@ fn collect_cycles_dfs_parallel(
 }
 
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    dedupe_cycles_by_edges(shard_cycles.iter().flatten().cloned().collect())
+    // ponytail: pass the iterator chain directly — dedupe_cycles_by_edges now
+    // accepts IntoIterator, avoiding the intermediate .collect() allocation.
+    dedupe_cycles_by_edges(shard_cycles.iter().flatten().cloned())
 }
 
 #[must_use]
@@ -579,29 +584,39 @@ pub fn find_cycles_multi_pass(
 /// Returns the most frequently used protocol in the cycle (primary protocol for diversity).
 #[must_use]
 pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
-    // ponytail: small array avoids HashMap alloc for typical 2-4 hop cycles
-    let mut best: (ProtocolType, u32) = (ProtocolType::UniswapV2, 0);
-    let mut i = 0usize;
-    while i < edges.len() {
-        let p = edges[i].protocol;
-        let mut count = 1u32;
-        // Count remaining occurrences of this protocol from the rest of the slice.
-        // This is O(n²) worst-case but n ≤ HOP_CAP (typically 2-4), so it's faster
-        // than HashMap allocation + hashing for small inputs.
-        for e in &edges[i + 1..] {
-            if e.protocol == p {
-                count += 1;
-            }
-        }
-        if count > best.1 {
-            best = (p, count);
-        }
-        // Skip past all occurrences of p (they'll produce the same count).
-        while i < edges.len() && edges[i].protocol == p {
-            i += 1;
+    // ponytail: fixed-size [u32; 9] stack array avoids both O(n²) nested loop
+    // and HashMap alloc. ProtocolType has ≤ 8 variants so this is O(n) with
+    // a single pass and zero heap allocation.
+    let mut counts = [0u32; 9]; // ProtocolType has 8 variants + sentinel
+    for e in edges {
+        match e.protocol {
+            ProtocolType::UniswapV2 => counts[0] += 1,
+            ProtocolType::UniswapV3 => counts[1] += 1,
+            ProtocolType::UniswapV4 => counts[2] += 1,
+            ProtocolType::BalancerV2 => counts[3] += 1,
+            ProtocolType::CurveStable => counts[4] += 1,
+            ProtocolType::CurveCrypto => counts[5] += 1,
+            ProtocolType::Dodo => counts[6] += 1,
+            ProtocolType::Woofi => counts[7] += 1,
         }
     }
-    best.0
+    let mut best_idx = 0usize;
+    for i in 1..8 {
+        if counts[i] > counts[best_idx] {
+            best_idx = i;
+        }
+    }
+    match best_idx {
+        0 => ProtocolType::UniswapV2,
+        1 => ProtocolType::UniswapV3,
+        2 => ProtocolType::UniswapV4,
+        3 => ProtocolType::BalancerV2,
+        4 => ProtocolType::CurveStable,
+        5 => ProtocolType::CurveCrypto,
+        6 => ProtocolType::Dodo,
+        7 => ProtocolType::Woofi,
+        _ => unreachable!(),
+    }
 }
 
 /// Selects up to `max_cycles` opportunities with better protocol distribution.
@@ -645,34 +660,28 @@ pub fn apply_protocol_diverse_selection(
         cap.saturating_mul(60) / 100
     };
 
-    let mut cursors: rustc_hash::FxHashMap<ProtocolType, usize> =
-        protos.iter().map(|&p| (p, 0usize)).collect();
-    let mut counts: rustc_hash::FxHashMap<ProtocolType, usize> =
-        protos.iter().map(|&p| (p, 0usize)).collect();
+    // ponytail: flat Vec<(cursor, count)> indexed by proto position replaces
+    // two HashMaps — eliminates hashing overhead on the hot round-robin path.
+    let mut proto_state: Vec<(usize, usize)> = vec![(0, 0); protos.len()];
     let mut selected: Vec<FoundCycle> = Vec::with_capacity(cap);
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
 
     while selected.len() < cap {
         let mut progressed = false;
-        for &p in &protos {
+        for (i, &p) in protos.iter().enumerate() {
             if selected.len() >= cap {
                 break;
             }
-            if counts.get(&p).copied().unwrap_or(0) >= hard_ceiling {
+            if proto_state[i].1 >= hard_ceiling {
                 continue;
             }
             if let Some(g) = groups.get(&p) {
-                let cur = cursors
-                    .get_mut(&p)
-                    .expect("cursor initialized for every proto");
-                while *cur < g.len() {
-                    let candidate = &g[*cur];
-                    *cur += 1;
+                while proto_state[i].0 < g.len() {
+                    let candidate = &g[proto_state[i].0];
+                    proto_state[i].0 += 1;
                     let key = crate::pipeline::cycle_filter::cycle_key(&candidate.edges);
                     if seen.insert(key) {
-                        *counts
-                            .get_mut(&p)
-                            .expect("count initialized for every proto") += 1;
+                        proto_state[i].1 += 1;
                         selected.push(candidate.clone());
                         progressed = true;
                         break;

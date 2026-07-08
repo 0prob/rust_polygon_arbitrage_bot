@@ -127,6 +127,14 @@ fn try_rank_probe_minimal(
     for amount in [economic, SPOT_PROBE] {
         if let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount)
             && !sim.profit.is_zero()
+            && check_sim_sanity(SimSanityInput {
+                amount_in: amount,
+                gross_profit: sim.profit,
+                search_low: amount,
+                token_decimals: start_decimals,
+                token_to_matic_rate: rate,
+            })
+            .is_ok()
         {
             return Some((amount, sim));
         }

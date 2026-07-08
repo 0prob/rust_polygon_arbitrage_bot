@@ -232,6 +232,7 @@ pub fn rescore_pools_in_place(
     let mut spot_table = SpotTable::new(arena.pool_count());
     let mut touched_pools = rustc_hash::FxHashSet::default();
     let mut touched = 0usize;
+    // Reuse hash sets across iterations — .clear() preserves capacity.
     let mut affected_adjacencies = rustc_hash::FxHashSet::default();
     let mut affected_pools = rustc_hash::FxHashSet::default();
 
@@ -295,7 +296,7 @@ fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
             }
         }
     }
-    if max_pool == 0 && graph.adjacency.iter().flatten().next().is_none() {
+    if max_pool == 0 && graph.adjacency.iter().all(Vec::is_empty) {
         graph.pool_edge_positions.clear();
         return;
     }

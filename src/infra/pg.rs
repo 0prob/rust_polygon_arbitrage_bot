@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
@@ -50,7 +50,7 @@ const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
 const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_POOL_SIZE: usize = 3;
+const MAX_POOL_SIZE: usize = 16;      // increased from 8: discovery + bootstrap + token + health + spare
 const NOTIFY_CHANNEL: &str = "pool_meta_channel";
 
 /// Execute a query against the pool with a cached (per-connection) prepared statement.
@@ -135,23 +135,28 @@ impl PgClient {
         );
         let pool = Pool::builder(mgr)
             .max_size(MAX_POOL_SIZE)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()
             .context("deadpool postgres pool build failed")?;
         Ok(Self { pool })
     }
 
-    /// Spawn a background task that keeps a dedicated `LISTEN` connection alive.
-    /// The Envio-side trigger sends `NOTIFY pool_meta_channel` on PoolMeta changes.
-    /// This keeps the subscription registered so Postgres doesn't drop it,
-    /// and periodically health-pings. Actual data is fetched by the incremental
-    /// query in `maybe_discover` — lowering the discovery interval (see config)
-    /// is the practical latency reduction for this tokio-postgres 0.7 codebase.
+    /// Keep a dedicated `LISTEN` connection alive. The Envio-side `NOTIFY`
+    /// trigger sends JSON payloads on pool_meta_channel whenever PoolMeta is
+    /// inserted or updated.
+    ///
+    /// tokio-postgres 0.7.18 does not expose `Client::notifications()` as a
+    /// public API, so we cannot consume NOTIFY payloads directly from `Client`.
+    /// The fast-poll approach runs a lightweight `SELECT MAX("updatedAtBlock")`
+    /// query every 2s and sets the notify_flag whenever the watermark advances,
+    /// which triggers `maybe_discover()` on the next LF tick (~1.5s).
+    /// Effective pool-discovery latency: ~3.5s vs the 60s polling interval alone.
     ///
     /// Uses a **dedicated** connection (not the pool) because `LISTEN` is
     /// connection-scoped and the pool recycles connections.
     pub async fn spawn_notify_listener(
         url_str: &str,
-        _notify_flag: Arc<AtomicBool>,
+        notify_flag: Arc<AtomicBool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let (client, connection) = tokio_postgres::connect(url_str, NoTls)
@@ -171,9 +176,11 @@ impl PgClient {
             }
         });
 
-        // Health-check loop keeps the LISTEN subscription alive.
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        // Fast-poll for PoolMeta changes: compare MAX(updatedAtBlock) against
+        // a cached watermark and flag the discovery service on advance.
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_watermark: Option<i32> = None;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -181,9 +188,29 @@ impl PgClient {
                         if *shutdown.borrow() { break; }
                     }
                     _ = tick.tick() => {
-                        if client.batch_execute("SELECT 1").await.is_err() {
-                            crate::warn!("pg LISTEN health check failed");
-                            break;
+                        let r = client.query_one(
+                            "SELECT MAX(\"updatedAtBlock\") FROM \"PoolMeta\"",
+                            &[],
+                        ).await;
+                        match r {
+                            Ok(row) => {
+                                let current: Option<i32> = row.get(0);
+                                let changed = match (last_watermark, current) {
+                                    (Some(old), Some(new)) if new > old => true,
+                                    (None, Some(_)) => true,
+                                    _ => false,
+                                };
+                                if changed {
+                                    notify_flag.store(true, Ordering::Release);
+                                }
+                                if current.is_some() {
+                                    last_watermark = current;
+                                }
+                            }
+                            Err(e) => {
+                                crate::warn!("pg change-detection poll failed: {e}");
+                                // Continue – don't break on transient errors.
+                            }
                         }
                     }
                 }

@@ -406,8 +406,9 @@ fn near_miss_route_summary(
     let mut buf = String::with_capacity(cap);
     use std::fmt::Write;
     if let Some(addr) = arena.token_address(cycle.start_token) {
-        let hex = alloy::primitives::hex::encode(&addr.as_slice()[..6]);
-        let _ = write!(buf, "0x{}..{}", &hex[..4], &hex[4..6]);
+        // Write first 6 hex chars directly without intermediate hex::encode.
+        let bytes = addr.as_slice();
+        let _ = write!(buf, "0x{:02x}{:02x}..{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3]);
     } else {
         let _ = write!(buf, "t{}", cycle.start_token.0);
     }
@@ -417,8 +418,8 @@ fn near_miss_route_summary(
             .unwrap_or_else(|| protocol_tag(edge.protocol));
         let _ = write!(buf, "->{tag}:");
         if let Some(addr) = arena.token_address(edge.token_out) {
-            let hex = alloy::primitives::hex::encode(&addr.as_slice()[..6]);
-            let _ = write!(buf, "0x{}..{}", &hex[..4], &hex[4..6]);
+            let bytes = addr.as_slice();
+            let _ = write!(buf, "0x{:02x}{:02x}..{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3]);
         } else {
             let _ = write!(buf, "t{}", edge.token_out.0);
         }

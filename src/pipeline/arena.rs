@@ -249,31 +249,36 @@ impl StateArena {
                 continue;
             }
             let pool_index = self.register_pool(pool.address, Arc::clone(&state));
-            let token_addrs: Vec<Address> = match state.as_ref() {
-                PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.clone(),
-                PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.clone(),
+            // ponytail: borrow token addresses instead of cloning Vec — most
+            // pools use the discovery order, and state-hydrated tokens (Balancer,
+            // Woofi) can be borrowed directly. Dodo canonicalization is the only
+            // case that allocates (rare — discovery order matches on-chain 99%+).
+            let token_addrs: &[Address];
+            let dodo_owned; // extends lifetime of the rare Dodo canonicalization vec
+            match state.as_ref() {
+                PoolState::Balancer(b) if !b.tokens.is_empty() => {
+                    token_addrs = &b.tokens;
+                }
+                PoolState::Woofi(w) if !w.tokens.is_empty() => {
+                    token_addrs = &w.tokens;
+                }
                 PoolState::Dodo(d)
                     if pool.tokens.len() == 2
                         && !d.base_token.is_zero()
                         && !d.quote_token.is_zero() =>
                 {
-                    // Canonicalize: always [base, quote] for Dodo so that token_in_idx 0/1,
-                    // zero_for_one (base_to_quote), hop_ checks and calldata sellBase/sellQuote
-                    // are consistent with state semantics and math.
-                    if pool.tokens[0] == d.base_token {
-                        pool.tokens.clone()
-                    } else if pool.tokens[0] == d.quote_token {
-                        vec![d.base_token, d.quote_token]
+                    if pool.tokens[0] == d.quote_token {
+                        dodo_owned = vec![d.base_token, d.quote_token];
+                        token_addrs = &dodo_owned;
                     } else {
-                        // discovery tokens differ from onchain (rare); fall back
-                        pool.tokens.clone()
+                        token_addrs = &pool.tokens;
                     }
                 }
-                _ => pool.tokens.clone(),
-            };
+                _ => token_addrs = &pool.tokens,
+            }
             let mut token_indices = Vec::with_capacity(token_addrs.len());
-            for addr in &token_addrs {
-                token_indices.push(self.register_token_with_hints(*addr, decimal_hints));
+            for &addr in token_addrs {
+                token_indices.push(self.register_token_with_hints(addr, decimal_hints));
             }
             let mut meta = discovered_to_pool_meta(pool, pool_index, &token_indices);
             if pool.protocol == ProtocolType::BalancerV2

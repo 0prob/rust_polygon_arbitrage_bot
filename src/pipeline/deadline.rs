@@ -65,7 +65,10 @@ impl SharedDeadlineGuard {
         });
         if ops & DEADLINE_CHECK_MASK == 0 && Instant::now() > self.deadline {
             self.expired.store(true, Ordering::Relaxed);
+            // Return immediately — we know we just expired.
+            return true;
         }
+        // Re-check: another thread may have set expired since our first load.
         self.expired.load(Ordering::Relaxed)
     }
 }

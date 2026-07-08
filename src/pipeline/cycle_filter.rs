@@ -1,6 +1,7 @@
 use alloy::primitives::Address;
 use alloy::primitives::U256;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHasher};
+use std::collections::hash_map::Entry;
 
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
@@ -105,25 +106,28 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
 }
 
 /// Deduplicate by cycle key, keeping the best-scored variant.
-pub fn dedupe_cycles_by_edges(cycles: Vec<FoundCycle>) -> Vec<FoundCycle> {
-    let cap = cycles.len();
-    let mut best: FxHashMap<u64, Vec<FoundCycle>> =
-        FxHashMap::with_capacity_and_hasher(cap, FxBuildHasher);
+///
+/// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
+/// iterator chain directly without an intermediate `.collect()`.
+pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
+    // ponytail: single flat map avoids Vec-per-bucket allocation and the
+    // subsequent flatten. FxHash collisions are 1-in-2^64 — for practical
+    // cycle counts (~50k) the birthday-collision probability is negligible.
+    let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
     for cycle in cycles {
         let key = cycle_key(&cycle.edges);
-        let bucket = best.entry(key).or_default();
-        if let Some(existing) = bucket
-            .iter_mut()
-            .find(|existing| existing.edges == cycle.edges)
-        {
-            if cycle.score < existing.score {
-                *existing = cycle;
+        match best.entry(key) {
+            Entry::Occupied(mut e) => {
+                if cycle.score < e.get().score {
+                    e.insert(cycle);
+                }
             }
-        } else {
-            bucket.push(cycle);
+            Entry::Vacant(e) => {
+                e.insert(cycle);
+            }
         }
     }
-    let mut out: Vec<FoundCycle> = best.into_values().flatten().collect();
+    let mut out: Vec<FoundCycle> = best.into_values().collect();
     out.sort_unstable_by(compare_cycle_score);
     out
 }

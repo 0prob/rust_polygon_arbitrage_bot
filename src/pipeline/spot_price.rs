@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]); // 1e12 wei
 const Q96_F64: f64 = 79228162514264337593543950336.0; // 2^96
+const ONE_F64: f64 = 1_000_000_000_000_000_000.0; // 10^18 — ONE in f64
+
 /// Compute V2 spot price ratio as U256 fixed-point (ONE = 10^18).
 /// Returns `reserve_out * ONE / reserve_in * fee_factor` or `None` on zero/overflow.
 /// The f64 conversion is done once on the final ratio, avoiding per-reserve conversion error.
@@ -32,7 +34,7 @@ fn v2_spot_u256(state: &crate::core::types::V2PoolState, edge: &Edge) -> Option<
         return None;
     }
     let raw_ratio = reserve_out.checked_mul(ONE)?.checked_div(reserve_in)?;
-    let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
+    let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
     raw_ratio
         .checked_mul(fee_numer)
         .map(|v| v / U256::from(10000u64))
@@ -61,7 +63,7 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
     let cross = sqrt_hi.checked_mul(sqrt_lo)?.checked_mul(ONE)?;
     let spot_u256 = hi_term.checked_add(cross >> 96)?;
 
-    let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
+    let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
     spot_u256
         .checked_mul(fee_numer)
         .map(|v| v / U256::from(10000u64))
@@ -71,12 +73,7 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
 #[inline]
 fn spot_ratio_to_f64(ratio: Option<U256>) -> f64 {
     match ratio {
-        Some(r) if !r.is_zero() => {
-            // Convert U256 fixed-point ratio (ONE=10^18) to f64.
-            let r_f64 = u256_to_f64(r);
-            let one_f64 = 1_000_000_000_000_000_000.0;
-            r_f64 / one_f64
-        }
+        Some(r) if !r.is_zero() => u256_to_f64(r) / ONE_F64,
         _ => 0.0,
     }
 }
@@ -187,11 +184,7 @@ fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge) -> f64
 fn cl_marginal_spot(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> f64 {
     let r = cl_spot_u256(state, edge);
     match r {
-        Some(ratio) if !ratio.is_zero() => {
-            let r_f64 = u256_to_f64(ratio);
-            let one_f64 = 1_000_000_000_000_000_000.0;
-            r_f64 / one_f64
-        }
+        Some(ratio) if !ratio.is_zero() => u256_to_f64(ratio) / ONE_F64,
         _ => {
             // Fallback to f64 for inverse price or edge cases.
             if state.sqrt_price_x96.is_zero() {

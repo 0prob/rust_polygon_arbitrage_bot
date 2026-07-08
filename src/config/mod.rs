@@ -196,7 +196,7 @@ fn default_pg_url() -> String {
     "postgres://postgres@localhost:5433/envio-dev".to_string()
 }
 fn default_discovery_interval_ms() -> u64 {
-    60_000
+    5_000
 }
 fn default_discovery_bootstrap_batch() -> usize {
     5_000

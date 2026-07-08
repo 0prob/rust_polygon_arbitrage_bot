@@ -69,8 +69,6 @@ pub fn collect_v4_tick_targets(
     cycles: &[FoundCycle],
     pool_metas: &[PoolMeta],
 ) -> Vec<(PoolIndex, FixedBytes<32>)> {
-    let meta_by_pool: rustc_hash::FxHashMap<PoolIndex, &PoolMeta> =
-        pool_metas.iter().map(|m| (m.pool_index, m)).collect();
     let mut out = Vec::new();
     let mut seen: FxHashSet<PoolIndex> = FxHashSet::default();
     'cycles: for cycle in cycles {
@@ -81,7 +79,9 @@ pub fn collect_v4_tick_targets(
             if !seen.insert(edge.pool_index) {
                 continue;
             }
-            let Some(meta) = meta_by_pool.get(&edge.pool_index) else {
+            // pool_metas is indexable by PoolIndex — no HashMap needed.
+            let Some(meta) = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+            else {
                 continue;
             };
             let Some(pool_id) = meta.pool_id else {

@@ -28,16 +28,22 @@ async fn retry_sleep(attempt: u32) {
 
 fn is_retryable_rpc_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
-    let lc = msg.to_ascii_lowercase();
-    lc.contains("rate limit")
-        || lc.contains("usage limit")
-        || msg.contains("429")
-        || lc.contains("too many request")
-        || msg.contains("error code 15")
-        || lc.contains("unknown block")
-        // A load-balanced RPC may report a new head before every backend can
-        // serve it. Retry the same pinned block to preserve snapshot integrity.
-        || lc.contains("header not found")
+    // Fast path: case-sensitive patterns (numbers, fixed codes) skip allocation.
+    if msg.contains("429") || msg.contains("error code 15") {
+        return true;
+    }
+    // Case-insensitive patterns — scan bytes without allocating a lowered copy.
+    let b = msg.as_bytes();
+    const PATTERNS: &[&[u8]] = &[
+        b"rate limit",
+        b"usage limit",
+        b"too many request",
+        b"unknown block",
+        b"header not found",
+    ];
+    PATTERNS
+        .iter()
+        .any(|pat| b.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
 }
 
 fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
@@ -62,11 +68,11 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     }
 
     let contract = IMulticall3::new(MULTICALL3, provider);
+    let calls = build_calls(items);  // Build once — reused across retries.
 
     let mut attempt = 0u32;
     loop {
-        let calls = build_calls(items);
-        let mut call = contract.aggregate3(calls);
+        let mut call = contract.aggregate3(calls.clone());
         if let Some(number) = block_number {
             call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
         }
