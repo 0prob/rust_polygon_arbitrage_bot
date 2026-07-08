@@ -345,6 +345,12 @@ impl PoolState {
     }
 }
 
+impl AsRef<FoundCycle> for FoundCycle {
+    fn as_ref(&self) -> &FoundCycle {
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FoundCycle {
     pub start_token: TokenIndex,

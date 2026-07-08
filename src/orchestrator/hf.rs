@@ -17,7 +17,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
 use crate::services::execution::{
-    ExecutionService, GasOracle, flash_policy::parse_flash_policy, hash_cycle_edges,
+    ExecutionService, GasOracle, hash_cycle_edges,
 };
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::has_reliable_matic_rate;
@@ -185,7 +185,7 @@ pub async fn run_hf_tick(
             elapsed_ms: now_ms().saturating_sub(start),
         });
     }
-    if pipeline.stream_enabled {
+    if stream_triggered && pipeline.stream_enabled {
         for addr in ctx.partial_cache.tracked_addresses() {
             hot_pools.insert(addr);
         }
@@ -241,6 +241,9 @@ pub async fn run_hf_tick(
     }
 
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
+    ctx.execution
+        .route_sim_cache
+        .clear_stale(evaluation_state_generation);
 
     let mut flash_tokens = FxHashSet::default();
     let mut flash_token_list = Vec::new();
@@ -270,7 +273,7 @@ pub async fn run_hf_tick(
         }
     }
 
-    let flash_policy = parse_flash_policy(&ctx.config.execution.flash_loan_source);
+    let flash_policy = ctx.config.flash_policy;
 
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
@@ -279,6 +282,7 @@ pub async fn run_hf_tick(
         token_to_matic_rates,
         token_decimals,
         gas_oracle: Arc::clone(&ctx.gas_oracle),
+        state_generation: evaluation_state_generation,
         brent_iters: ctx.config.routing.ternary_search_iterations,
         min_profit_matic: ctx.config.min_profit_matic,
         min_profit_roi_bps: ctx.config.execution.min_profit_roi_bps,

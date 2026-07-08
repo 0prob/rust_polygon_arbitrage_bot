@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -78,9 +79,86 @@ pub struct ExecutionService {
     pub total_losses: AtomicU64,
     pub consecutive_fails: AtomicU32,
     route_stats: RwLock<FxHashMap<u64, RouteStats>>,
-    route_stats_path: PathBuf,
+    _route_stats_path: PathBuf,
     last_near_miss_log: Mutex<Option<(u64, U256)>>,
     last_dispatch_log: Mutex<Option<(u64, U256)>>,
+    pub route_sim_cache: Arc<crate::pipeline::route_sim_cache::RouteSimCache>,
+    route_stats_writer: RouteStatsWriter,
+    cached_chain_id: Mutex<Option<u64>>,
+}
+
+enum RouteStatsMsg {
+    Line(String),
+    Flush(Sender<()>),
+}
+
+#[derive(Debug)]
+struct RouteStatsWriter {
+    tx: Sender<RouteStatsMsg>,
+}
+
+impl RouteStatsWriter {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("route-stats-writer".into())
+            .spawn(move || route_stats_writer_loop(path, rx))
+            .expect("route stats writer thread");
+        Self { tx }
+    }
+
+    fn enqueue(&self, line: String) {
+        let _ = self.tx.send(RouteStatsMsg::Line(line));
+    }
+
+    fn flush(&self) {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if self.tx.send(RouteStatsMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+}
+
+impl Drop for RouteStatsWriter {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+fn route_stats_writer_loop(path: PathBuf, rx: mpsc::Receiver<RouteStatsMsg>) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let mut writer = BufWriter::new(&mut file);
+    let mut pending = 0usize;
+    let mut last_flush = Instant::now();
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            RouteStatsMsg::Line(line) => {
+                let _ = writeln!(writer, "{line}");
+                pending += 1;
+                if pending >= 64 || last_flush.elapsed() >= Duration::from_millis(100) {
+                    let _ = writer.flush();
+                    pending = 0;
+                    last_flush = Instant::now();
+                }
+            }
+            RouteStatsMsg::Flush(ack) => {
+                let _ = writer.flush();
+                pending = 0;
+                last_flush = Instant::now();
+                let _ = ack.send(());
+            }
+        }
+    }
+    let _ = writer.flush();
 }
 
 impl Default for ExecutionService {
@@ -104,7 +182,7 @@ impl ExecutionService {
         Self::with_route_stats_path(PathBuf::from(path))
     }
 
-    fn with_route_stats_path(route_stats_path: PathBuf) -> Self {
+    pub(crate) fn with_route_stats_path(route_stats_path: PathBuf) -> Self {
         let route_stats = Self::replay_route_stats(&route_stats_path);
         Self {
             last_submit: RwLock::new(FxHashMap::default()),
@@ -119,30 +197,28 @@ impl ExecutionService {
             total_losses: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
             route_stats: RwLock::new(route_stats),
-            route_stats_path,
+            _route_stats_path: route_stats_path.clone(),
             last_near_miss_log: Mutex::new(None),
             last_dispatch_log: Mutex::new(None),
+            route_sim_cache: Arc::new(crate::pipeline::route_sim_cache::RouteSimCache::new()),
+            route_stats_writer: RouteStatsWriter::spawn(route_stats_path),
+            cached_chain_id: Mutex::new(None),
         }
     }
 }
 
 impl ExecutionService {
-    fn write_route_event(&self, line: &str) {
-        let path = &self.route_stats_path;
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
+    fn write_route_event(&self, line: String) {
+        self.route_stats_writer.enqueue(line);
+    }
+
+    async fn cached_chain_id<P: Provider<Ethereum>>(&self, provider: &P) -> Option<u64> {
+        if let Some(id) = *self.cached_chain_id.lock() {
+            return Some(id);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-        {
-            // ponytail: BufWriter reduces syscall overhead when multiple route
-            // events arrive in quick succession (HF ticks at ~200ms intervals).
-            let mut writer = BufWriter::new(&mut file);
-            let _ = writeln!(writer, "{}", line);
-            let _ = writer.flush();
-        }
+        let id = provider.get_chain_id().await.ok()?;
+        *self.cached_chain_id.lock() = Some(id);
+        Some(id)
     }
 
     fn replay_route_stats(path: &std::path::Path) -> FxHashMap<u64, RouteStats> {
@@ -191,12 +267,12 @@ impl ExecutionService {
             RouteFailureKind::RealizedLoss => stats.realized_losses += 1,
         }
         drop(all);
-        self.write_route_event(&format!("{} f {:?}", fp, kind));
+        self.write_route_event(format!("{} f {:?}", fp, kind));
     }
 
     fn record_route_success(&self, fp: u64) {
         self.route_stats.write().entry(fp).or_default().successes += 1;
-        self.write_route_event(&format!("{} s", fp));
+        self.write_route_event(format!("{} s", fp));
     }
 
     /// Learned minimum-profit uplift. With fewer than three outcomes there is
@@ -853,7 +929,8 @@ impl ExecutionService {
             }
         };
 
-        let private_cfg = build_private_config(rpc, signer, &submit_provider).await;
+        let chain_id = self.cached_chain_id(&submit_provider).await;
+        let private_cfg = build_private_config(rpc, signer, chain_id);
 
         let tx_hash = match submit_with_recovery(
             &submit_provider,
@@ -1103,10 +1180,10 @@ impl ExecutionService {
     }
 }
 
-async fn build_private_config(
+fn build_private_config(
     rpc: &RpcPool,
     signer: &alloy::signers::local::PrivateKeySigner,
-    submit_provider: &alloy::providers::DynProvider,
+    chain_id: Option<u64>,
 ) -> Option<PrivateSubmitConfig> {
     let private_url = rpc.private_url().map(str::to_string);
     let bloxroute_auth = std::env::var("BLOXROUTE_AUTH_HEADER")
@@ -1116,7 +1193,7 @@ async fn build_private_config(
     if mode == PrivateSubmitMode::Standard {
         return None;
     }
-    let chain_id = submit_provider.get_chain_id().await.ok()?;
+    let chain_id = chain_id?;
     Some(PrivateSubmitConfig {
         mode,
         signer: signer.clone(),
@@ -1269,9 +1346,7 @@ mod safety_tests {
 
     #[test]
     fn route_stats_appends_events_and_replays() {
-        let mut service = ExecutionService::new();
-        service.route_stats.write().clear();
-        service.route_stats_path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "rpbot-route-stats-{}-{}.log",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1279,18 +1354,21 @@ mod safety_tests {
                 .expect("system clock after Unix epoch")
                 .as_nanos()
         ));
+        let service = ExecutionService::with_route_stats_path(path.clone());
+        service.route_stats.write().clear();
 
         for _ in 0..100 {
             service.record_route_success(7);
         }
         service.record_route_failure(7, RouteFailureKind::DryRun);
+        service.route_stats_writer.flush();
 
-        let saved = ExecutionService::replay_route_stats(&service.route_stats_path);
+        let saved = ExecutionService::replay_route_stats(&path);
         let stats = saved.get(&7).expect("saved route");
         assert_eq!(stats.successes, 100);
         assert_eq!(stats.failures, 1);
         assert_eq!(stats.dry_run_failures, 1);
 
-        let _ = std::fs::remove_file(&service.route_stats_path);
+        let _ = std::fs::remove_file(&path);
     }
 }

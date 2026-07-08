@@ -44,7 +44,7 @@ pub struct CycleSearchPass {
     pub max_cycles: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MinimalSimResult {
     pub profit: alloy::primitives::U256,
     pub amount_out: alloy::primitives::U256,

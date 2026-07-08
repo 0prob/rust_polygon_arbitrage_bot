@@ -187,8 +187,6 @@ impl StateArena {
         let pool_count = self.inner.pools.len();
         if self.hot_overlay.len() != pool_count {
             self.hot_overlay.resize(pool_count, None);
-        } else {
-            self.hot_overlay.fill(None);
         }
         let (states, generation) = cache.get_arcs_with_generation(addresses);
         for (address, state) in states {

@@ -12,8 +12,9 @@ use crate::pipeline::types::MinimalSimResult;
 
 // --- flash_policy ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlashLoanPolicy {
+    #[default]
     Auto,
     BalancerOnly,
     AaveOnly,
@@ -244,9 +245,31 @@ pub fn submit_gas_basis(
     }))
 }
 
+/// EVM storage read costs (EIP-2929 warm / legacy cold).
+pub const GAS_COLD_SLOAD: u32 = 2100;
+pub const GAS_WARM_SLOAD: u32 = 100;
+
+/// Huff executor: ~4 warm `SLOAD`s per hop (pool, token0, token1, reserve/slot0).
+#[must_use]
+pub fn estimate_route_storage_gas(hop_count: usize, cold_pool_slots: u32) -> u32 {
+    let warm_reads = hop_count as u32 * 4;
+    cold_pool_slots * GAS_COLD_SLOAD + warm_reads * GAS_WARM_SLOAD
+}
+
 #[must_use]
 pub fn estimate_route_gas_from_hops(hop_gas: u32, hop_count: usize) -> u32 {
     hop_gas + ROUTE_EXECUTION_GAS_OVERHEAD + hop_count as u32 * PER_HOP_EXECUTOR_GAS_OVERHEAD
+}
+
+/// Opcode-aware route gas: hop simulation + executor overhead + cold/warm storage reads.
+#[must_use]
+pub fn estimate_route_gas_from_hops_evm(
+    hop_gas: u32,
+    hop_count: usize,
+    cold_pool_slots: u32,
+) -> u32 {
+    estimate_route_gas_from_hops(hop_gas, hop_count)
+        .saturating_add(estimate_route_storage_gas(hop_count, cold_pool_slots))
 }
 
 #[must_use]

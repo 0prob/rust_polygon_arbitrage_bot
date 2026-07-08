@@ -55,13 +55,26 @@ pub fn max_flash_borrow_wei(
         .checked_div(token_to_matic_rate)
 }
 
+/// Fast rejects for Brent inner-loop evaluation (skips floor/pin checks).
+#[inline]
+pub fn check_sim_sanity_fast(input: SimSanityInput) -> Result<(), SimSanityReject> {
+    if input.amount_in.is_zero() {
+        return Err(SimSanityReject::AmountBelowEconomicFloor);
+    }
+    let max_sane_profit = input.amount_in * U256::from(MAX_SANE_PROFIT_RATIO_BPS) / BPS_SCALE;
+    if input.gross_profit > max_sane_profit {
+        return Err(SimSanityReject::InsaneProfitRatio);
+    }
+    Ok(())
+}
+
 pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
     if input.amount_in.is_zero() {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
     }
 
     let floor = min_economic_amount_in(input.token_decimals, input.token_to_matic_rate);
-    let tickless_probe = crate::pipeline::spot_price::SPOT_PROBE;
+    let tickless_probe = crate::pipeline::spot_price::spot_probe_for_decimals(input.token_decimals);
     let tickless_cap_trade = input.amount_in >= tickless_probe && input.amount_in < floor;
     if input.amount_in < floor && !tickless_cap_trade {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
@@ -85,7 +98,7 @@ pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
     }
 
     // Brent pinned at the search floor with non-trivial profit → corrupt bounds/state.
-    // Skip for tickless CL cap trades sized at SPOT_PROBE (below economic floor).
+    // Skip for tickless CL cap trades sized at the decimal-aware probe (below economic floor).
     if !tickless_cap_trade {
         let pin_tolerance = input.search_low / U256::from(50u64); // relaxed 2x for Balancer/Curve edge cases
         let pin_ceiling = input
@@ -107,15 +120,16 @@ mod tests {
 
     #[test]
     fn tickless_probe_below_economic_floor_passes_sanity() {
-        use crate::pipeline::spot_price::SPOT_PROBE;
+        use crate::pipeline::spot_price::spot_probe_for_decimals;
 
         let rate = U256::from(10u128.pow(18));
-        let profit = SPOT_PROBE / U256::from(200u64);
+        let probe = spot_probe_for_decimals(18);
+        let profit = probe / U256::from(200u64);
         assert!(
             check_sim_sanity(SimSanityInput {
-                amount_in: SPOT_PROBE,
+                amount_in: probe,
                 gross_profit: profit,
-                search_low: SPOT_PROBE,
+                search_low: probe,
                 token_decimals: 18,
                 token_to_matic_rate: rate,
             })

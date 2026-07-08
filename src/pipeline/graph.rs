@@ -2,7 +2,8 @@ use alloy::primitives::U256;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
-use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, compute_edge_ratio, edge_log_weight_from_spot};
+use crate::core::math::fixed_point::edge_log_weight_from_ratio;
+use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
 use crate::util::u256_to_f64;
 
@@ -109,6 +110,61 @@ pub fn edges_for_multi_token(
     out
 }
 
+fn balancer_token_indices_to_expand(
+    state: &PoolState,
+    tokens: &[TokenIndex],
+    bpt_index: Option<usize>,
+) -> Vec<usize> {
+    let PoolState::Balancer(balancer) = state else {
+        return vec![];
+    };
+    let mut ranked: Vec<(usize, U256)> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bpt_index != Some(*i))
+        .map(|(i, _)| (i, balancer.balances.get(i).copied().unwrap_or_default()))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let max_tokens = ranked.len().min(4);
+    ranked.truncate(max_tokens);
+    ranked.sort_by_key(|(i, _)| *i);
+    ranked.into_iter().map(|(i, _)| i).collect()
+}
+
+fn edges_for_balancer_multi_token(
+    pool_index: PoolIndex,
+    tokens: &[TokenIndex],
+    fee_bps: u32,
+    bpt_index: Option<usize>,
+    state: &PoolState,
+    protocol: ProtocolType,
+) -> Vec<Edge> {
+    let keep = balancer_token_indices_to_expand(state, tokens, bpt_index);
+    let mut out = Vec::with_capacity(keep.len().saturating_mul(keep.len().saturating_sub(1)));
+    for &i in &keep {
+        for &j in &keep {
+            if i == j {
+                continue;
+            }
+            if !state.hop_pair_routable(i, j) {
+                continue;
+            }
+            out.push(Edge {
+                pool_index,
+                token_in: tokens[i],
+                token_out: tokens[j],
+                token_in_idx: i as u8,
+                token_out_idx: j as u8,
+                protocol,
+                fee_bps,
+                zero_for_one: i < j,
+            });
+        }
+    }
+    out
+}
+
 /// Pools that would receive at least one directed edge on the next graph build.
 #[must_use]
 pub fn count_graph_eligible_pools(arena: &StateArena, pools: &[PoolMeta]) -> usize {
@@ -182,14 +238,25 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
                 push_graph_edge(&mut graph, edge);
             }
         } else if meta.tokens.len() > 2 {
-            for edge in edges_for_multi_token(
-                meta.pool_index,
-                meta.protocol,
-                &meta.tokens,
-                meta.fee_bps,
-                meta.bpt_index,
-                Some(state),
-            ) {
+            let edges = match state {
+                PoolState::Balancer(_) => edges_for_balancer_multi_token(
+                    meta.pool_index,
+                    &meta.tokens,
+                    meta.fee_bps,
+                    meta.bpt_index,
+                    state,
+                    meta.protocol,
+                ),
+                _ => edges_for_multi_token(
+                    meta.pool_index,
+                    meta.protocol,
+                    &meta.tokens,
+                    meta.fee_bps,
+                    meta.bpt_index,
+                    Some(state),
+                ),
+            };
+            for edge in edges {
                 push_graph_edge(&mut graph, edge);
             }
         }
@@ -205,7 +272,8 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
 
 /// Recompute edge log-weights from current pool states without rebuilding adjacency.
 pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
-    let mut spot_table = SpotTable::new(arena.pool_count());
+    let edge_count: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
+    let mut spot_table = SpotTable::with_capacity(edge_count);
     rescore_adjacency(arena, &mut graph.adjacency, &mut spot_table);
 }
 
@@ -232,10 +300,10 @@ pub fn rescore_pools_in_place(
     if pools.is_empty() {
         return 0;
     }
-    let mut spot_table = SpotTable::new(arena.pool_count());
+    let edge_count: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
+    let mut spot_table = SpotTable::with_capacity(edge_count);
     let mut touched_pools = rustc_hash::FxHashSet::default();
     let mut touched = 0usize;
-    // Reuse hash set across iterations — .clear() preserves capacity.
     let mut affected_adjacencies = rustc_hash::FxHashSet::default();
 
     for pool in pools {
@@ -243,7 +311,6 @@ pub fn rescore_pools_in_place(
         let Some(positions) = graph.pool_edge_positions.get(pool_idx) else {
             continue;
         };
-        affected_adjacencies.clear();
         for &(adj_idx, edge_pos) in positions {
             let Some(adj) = graph.adjacency.get_mut(adj_idx) else {
                 continue;
@@ -254,13 +321,12 @@ pub fn rescore_pools_in_place(
             touched += rescore_graph_edge(arena, ge, &mut spot_table);
             affected_adjacencies.insert(adj_idx);
         }
-        for adj_idx in &affected_adjacencies {
-            if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
-                sort_adjacency_edges(adj);
-            }
-        }
-        // All edges in positions belong to this pool, insert directly.
         touched_pools.insert(pool_idx);
+    }
+    for adj_idx in &affected_adjacencies {
+        if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
+            sort_adjacency_edges(adj);
+        }
     }
     rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
     touched
@@ -384,13 +450,14 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut S
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
         return 1;
     }
-    let spot_f64 = u256_to_f64(ge.ratio) / 1e18;
-    // Check spot is sane (> 0): a ratio less than 1e-18 * ONE could round to 0.
-    if spot_f64 > 0.0 {
-        // Pre-populate the spot table so subsequent ensure_edge calls hit cache.
-        spot_table.set(&ge.edge, spot_f64);
-        ge.log_weight = edge_log_weight_from_spot(spot_f64, ge.edge.fee_bps);
-    } else {
+    ge.log_weight = edge_log_weight_from_ratio(ge.ratio);
+    if !ge.ratio.is_zero() {
+        let spot_f64 = u256_to_f64(ge.ratio) / 1e18;
+        if spot_f64 > 0.0 {
+            spot_table.set(&ge.edge, spot_f64);
+        }
+    }
+    if !ge.log_weight.is_finite() {
         ge.log_weight = compute_edge_log_weight(ge.edge.fee_bps);
     }
     // ponytail: multi-token pools (Balancer, Curve) create n*(n-1) edges vs 2 for
@@ -497,6 +564,59 @@ mod tests {
             Some(&state),
         );
         assert_eq!(gated.len(), 2);
+    }
+
+    #[test]
+    fn balancer_multi_token_edges_are_liquidity_capped() {
+        let tokens = [
+            TokenIndex(0),
+            TokenIndex(1),
+            TokenIndex(2),
+            TokenIndex(3),
+            TokenIndex(4),
+            TokenIndex(5),
+        ];
+        let state = PoolState::Balancer(BalancerPoolState {
+            pool_id: None,
+            tokens: vec![
+                Address::from([0u8; 20]),
+                Address::from([1u8; 20]),
+                Address::from([2u8; 20]),
+                Address::from([3u8; 20]),
+                Address::from([4u8; 20]),
+                Address::from([5u8; 20]),
+            ],
+            balances: vec![
+                MIN_HOP_TOKEN_BALANCE,
+                MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                MIN_HOP_TOKEN_BALANCE + U256::from(2u64),
+                MIN_HOP_TOKEN_BALANCE + U256::from(3u64),
+                MIN_HOP_TOKEN_BALANCE - U256::from(1u64),
+                MIN_HOP_TOKEN_BALANCE - U256::from(2u64),
+            ],
+            weights: vec![U256::from(1u64); 6],
+            scaling_factors: vec![U256::from(1u64); 6],
+            amp: U256::from(1u64),
+            amp_precision: U256::from(1u64),
+            fee: U256::ZERO,
+            pool_type: BalancerPoolKind::Weighted,
+            linear: None,
+            bpt_index: None,
+            is_updating: false,
+            last_change_block: 0,
+        });
+
+        let edges = edges_for_balancer_multi_token(
+            PoolIndex(0),
+            &tokens,
+            10,
+            None,
+            &state,
+            ProtocolType::BalancerV2,
+        );
+
+        assert_eq!(edges.len(), 12);
+        assert!(edges.iter().all(|e| e.token_in.0 < 4 && e.token_out.0 < 4));
     }
 
     #[test]

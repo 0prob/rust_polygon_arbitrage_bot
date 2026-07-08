@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use anyhow::{Context, ensure};
+use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -178,6 +179,8 @@ pub struct AppConfig {
     pub pipeline: PipelineConfig,
     #[serde(skip)]
     pub min_profit_matic: U256,
+    #[serde(skip)]
+    pub flash_policy: FlashLoanPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -305,7 +308,7 @@ fn default_pyth_hermes_url() -> String {
     "https://hermes.pyth.network".to_string()
 }
 fn default_tick_word_range() -> i16 {
-    8
+    10
 }
 
 impl Default for RpcConfig {
@@ -407,6 +410,7 @@ impl Default for AppConfig {
             oracle: OracleConfig::default(),
             pipeline: PipelineConfig::default(),
             min_profit_matic: U256::ZERO,
+            flash_policy: FlashLoanPolicy::Auto,
         }
     }
 }
@@ -602,6 +606,7 @@ impl AppConfig {
                     config.execution.min_profit_matic_wei
                 )
             })?;
+        config.flash_policy = parse_flash_policy(&config.execution.flash_loan_source);
 
         Ok(config)
     }

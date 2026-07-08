@@ -1,11 +1,14 @@
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use futures_util::{StreamExt, stream};
 use tokio::sync::watch;
 use tokio_postgres::error::SqlState;
+use tokio_postgres::AsyncMessage;
 use tokio_postgres::{Error as PgError, NoTls, Row, types::ToSql};
 
 use crate::services::discovery::{DiscoveredPool, TokenMeta, parse_pool_meta_row};
@@ -14,16 +17,16 @@ use alloy::primitives::Address;
 
 const POOL_META_COLUMNS: &str = r#"id, address, protocol::text, tokens, fee, "tickSpacing", "poolId", hooks, "poolType", "createdBlock""#;
 
-fn pool_meta_keyset_sql() -> String {
+static POOL_META_KEYSET_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"SELECT {POOL_META_COLUMNS} FROM "PoolMeta"
         WHERE ("createdBlock", id) > ($1, $2)
         ORDER BY "createdBlock", id
         LIMIT $3"#
     )
-}
+});
 
-fn pool_meta_incremental_sql() -> String {
+static POOL_META_INCREMENTAL_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"
         SELECT {POOL_META_COLUMNS}, "updatedAtBlock", "sortBlock" FROM (
@@ -38,7 +41,7 @@ fn pool_meta_incremental_sql() -> String {
         ORDER BY "sortBlock" ASC
         "#
     )
-}
+});
 
 const INDEXER_META_SQL: &str = r#"SELECT "chainId", "progressBlock", "sourceBlock", "isReady" FROM "_meta" WHERE "chainId" = $1"#;
 
@@ -64,7 +67,10 @@ async fn pg_query(
         .await
         .context("pg prepare_cached timed out")?
         .context("pg prepare_cached failed")?;
-    client.query(&stmt, params).await.context("pg query failed")
+    tokio::time::timeout(PG_QUERY_TIMEOUT, client.query(&stmt, params))
+        .await
+        .context("pg query timed out")?
+        .context("pg query failed")
 }
 
 /// Same as `pg_query` but with transient-error retry.
@@ -94,9 +100,9 @@ async fn pg_query_opt(
         .await
         .context("pg prepare_cached timed out")?
         .context("pg prepare_cached failed")?;
-    client
-        .query_opt(&stmt, params)
+    tokio::time::timeout(PG_QUERY_TIMEOUT, client.query_opt(&stmt, params))
         .await
+        .context("pg query_opt timed out")?
         .context("pg query_opt failed")
 }
 
@@ -141,25 +147,12 @@ impl PgClient {
         Ok(Self { pool })
     }
 
-    /// Keep a dedicated `LISTEN` connection alive. The Envio-side `NOTIFY`
-    /// trigger sends JSON payloads on pool_meta_channel whenever PoolMeta is
-    /// inserted or updated.
-    ///
-    /// tokio-postgres 0.7.18 does not expose `Client::notifications()` as a
-    /// public API, so we cannot consume NOTIFY payloads directly from `Client`.
-    /// The fast-poll approach runs a lightweight `SELECT MAX("updatedAtBlock")`
-    /// query every 2s and sets the notify_flag whenever the watermark advances,
-    /// which triggers `maybe_discover()` on the next LF tick (~1.5s).
-    /// Effective pool-discovery latency: ~3.5s vs the 60s polling interval alone.
-    ///
-    /// Uses a **dedicated** connection (not the pool) because `LISTEN` is
-    /// connection-scoped and the pool recycles connections.
     pub async fn spawn_notify_listener(
         url_str: &str,
         notify_flag: Arc<AtomicBool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let (client, connection) = tokio_postgres::connect(url_str, NoTls)
+        let (client, mut connection) = tokio_postgres::connect(url_str, NoTls)
             .await
             .context("pg LISTEN connect failed")?;
 
@@ -169,48 +162,28 @@ impl PgClient {
             .context("pg LISTEN pool_meta_channel failed")?;
         crate::info!("pg LISTEN subscribed to {NOTIFY_CHANNEL}");
 
-        // Drive the connection in background (required for IO to happen).
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                crate::warn!("pg LISTEN connection driver exited: {e}");
-            }
-        });
-
-        // Fast-poll for PoolMeta changes: compare MAX(updatedAtBlock) against
-        // a cached watermark and flag the discovery service on advance.
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_watermark: Option<i32> = None;
-        tokio::spawn(async move {
+            let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {
-                        if *shutdown.borrow() { break; }
+                        if *shutdown.borrow() {
+                            break;
+                        }
                     }
-                    _ = tick.tick() => {
-                        let r = client.query_one(
-                            "SELECT MAX(\"updatedAtBlock\") FROM \"PoolMeta\"",
-                            &[],
-                        ).await;
-                        match r {
-                            Ok(row) => {
-                                let current: Option<i32> = row.get(0);
-                                let changed = match (last_watermark, current) {
-                                    (Some(old), Some(new)) if new > old => true,
-                                    (None, Some(_)) => true,
-                                    _ => false,
-                                };
-                                if changed {
+                    message = messages.next() => {
+                        match message {
+                            Some(Ok(AsyncMessage::Notification(notification))) => {
+                                if notification.channel() == NOTIFY_CHANNEL {
                                     notify_flag.store(true, Ordering::Release);
                                 }
-                                if current.is_some() {
-                                    last_watermark = current;
-                                }
                             }
-                            Err(e) => {
-                                crate::warn!("pg change-detection poll failed: {e}");
-                                // Continue – don't break on transient errors.
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                crate::warn!("pg LISTEN connection driver exited: {e}");
+                                break;
                             }
+                            None => break,
                         }
                     }
                 }
@@ -234,10 +207,9 @@ impl PgClient {
     ) -> anyhow::Result<(Vec<DiscoveredPool>, PoolMetaKeyset, bool, ParseStats)> {
         let after = after.clone();
         let limit_i64 = i64::try_from(limit).context("pool meta page limit overflow")?;
-        let sql = pool_meta_keyset_sql();
         let rows = pg_query_retry(
             &self.pool,
-            &sql,
+            POOL_META_KEYSET_SQL.as_str(),
             &[&after.created_block, &after.id, &limit_i64],
         )
         .await?;
@@ -271,10 +243,9 @@ impl PgClient {
             i32::try_from(updated_wm).context("cursor updated watermark overflow")?;
         let initial_created = cursor.last_block;
         let initial_updated = cursor.last_updated_block;
-        let sql = pool_meta_incremental_sql();
         let rows = pg_query_retry(
             &self.pool,
-            &sql,
+            POOL_META_INCREMENTAL_SQL.as_str(),
             &[&last_block, &updated_wm_i32, &last_block],
         )
         .await?;
@@ -497,7 +468,7 @@ mod tests {
 
     #[test]
     fn pool_meta_sql_generates_keyset_without_offset() {
-        let page = pool_meta_keyset_sql();
+        let page = POOL_META_KEYSET_SQL.as_str();
         assert!(
             page.contains(r#""createdBlock""#),
             "keyset sql missing quoted createdBlock: {page}"
@@ -505,7 +476,7 @@ mod tests {
         assert!(page.contains(r#"("createdBlock", id) >"#));
         assert!(!page.contains("OFFSET"));
 
-        let incremental = pool_meta_incremental_sql();
+        let incremental = POOL_META_INCREMENTAL_SQL.as_str();
         assert!(
             incremental.contains(r#""createdBlock", "updatedAtBlock""#),
             "incremental sql missing quoted columns: {incremental}"

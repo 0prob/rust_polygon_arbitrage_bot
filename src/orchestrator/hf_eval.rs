@@ -16,7 +16,7 @@ use crate::pipeline::local_sim::{self, simulate_route_detailed, simulate_route_m
 use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, max_flash_borrow_wei, min_economic_amount_in,
 };
-use crate::pipeline::spot_price::SPOT_PROBE;
+use crate::pipeline::spot_price::{spot_probe_for_decimals, spot_probe_for_token};
 use crate::pipeline::ternary::{RouteGasCosting, optimize_cycle};
 use crate::pipeline::types::OptimizationResult;
 use crate::pipeline::types::{MinimalSimResult, compare_cycle_score};
@@ -55,6 +55,7 @@ pub struct HfEvalInput<'a> {
     pub token_decimals: &'a FxHashMap<Address, u8>,
     pub gas_oracle: &'a GasOracle,
     pub route_gas: &'a RouteGasLookup,
+    pub state_generation: u64,
     pub brent_iters: u32,
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
@@ -73,6 +74,7 @@ pub struct HfEvalInputOwned {
     pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
     pub token_decimals: Arc<FxHashMap<Address, u8>>,
     pub gas_oracle: Arc<GasOracle>,
+    pub state_generation: u64,
     pub brent_iters: u32,
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
@@ -93,6 +95,7 @@ impl HfEvalInputOwned {
             token_decimals: self.token_decimals.as_ref(),
             gas_oracle: self.gas_oracle.as_ref(),
             route_gas,
+            state_generation: self.state_generation,
             brent_iters: self.brent_iters,
             min_profit_matic: self.min_profit_matic,
             min_profit_roi_bps: self.min_profit_roi_bps,
@@ -116,7 +119,7 @@ pub struct HfEvalResult {
     pub effective_slippage_bps: u64,
 }
 
-/// Economic probe first, then `SPOT_PROBE` for tickless CL routes.
+/// Economic probe first, then decimal-aware spot probe for tickless CL routes.
 fn try_rank_probe_minimal(
     arena: &StateArena,
     cycle: &FoundCycle,
@@ -124,7 +127,8 @@ fn try_rank_probe_minimal(
     rate: U256,
 ) -> Option<(U256, MinimalSimResult)> {
     let economic = min_economic_amount_in(start_decimals, rate);
-    for amount in [economic, SPOT_PROBE] {
+    let spot_probe = spot_probe_for_decimals(start_decimals);
+    for amount in [economic, spot_probe] {
         if let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount)
             && !sim.profit.is_zero()
             && check_sim_sanity(SimSanityInput {
@@ -158,7 +162,8 @@ fn cycle_simulatable(
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
     let probe = min_economic_amount_in(decimals, rate);
-    for amount in [probe, crate::pipeline::spot_price::SPOT_PROBE] {
+    let spot_probe = spot_probe_for_decimals(decimals);
+    for amount in [probe, spot_probe] {
         let Some(sim) = simulate_route_detailed(arena, &cycle.edges, amount) else {
             continue;
         };
@@ -169,7 +174,7 @@ fn cycle_simulatable(
             arena,
             &cycle.edges,
             &sim.hop_amounts,
-            crate::pipeline::spot_price::SPOT_PROBE,
+            spot_probe,
         ) {
             continue;
         }
@@ -336,10 +341,10 @@ pub fn rank_cycles_by_probe_net(
             safety_multiplier_bps,
         );
         ctx.gas_scale_bps = 10_000;
-        let mut ranked_probe = probe.clone();
+        let mut ranked_probe = probe;
         ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
         let net = net_profit_after_gas_from_sim(&ranked_probe, probe_amount, &ctx);
-        probe_seeds.insert(fp, (probe_amount, probe.clone()));
+        probe_seeds.insert(fp, (probe_amount, probe));
         if net.is_zero() {
             let hop_count = cycle.edges.len();
             if !probe.profit.is_zero()
@@ -445,7 +450,6 @@ pub fn rank_cycles_by_probe_net(
             );
         }
     }
-    kept.retain(|cycle| cycle_flash_evaluable(cycle, arena, flash_liquidity, flash_policy));
     let kept_fingerprints: rustc_hash::FxHashSet<u64> = kept
         .iter()
         .map(|cycle| hash_cycle_edges(&cycle.edges))
@@ -585,7 +589,17 @@ pub async fn rescore_rank_and_evaluate_async(
                 crate::debug!("probe rank kept {} cycles for Brent", cycles.len());
             }
             let eval = input.as_eval_input(&route_gas);
-            evaluate_cycles_parallel(&cycles, &eval, &probe_seeds)
+            let eval_results = evaluate_cycles_parallel(&cycles, &eval, &probe_seeds);
+            let cache = &input.execution.route_sim_cache;
+            let hits = cache.stats.hits.load(std::sync::atomic::Ordering::Relaxed);
+            let misses = cache.stats.misses.load(std::sync::atomic::Ordering::Relaxed);
+            if hits.saturating_add(misses) > 0 {
+                crate::debug!(
+                    "route_sim_cache hit_rate_bps={} hits={hits} misses={misses}",
+                    cache.stats.hit_rate_bps()
+                );
+            }
+            eval_results
         });
         let _ = tx.send(result);
     });
@@ -602,17 +616,16 @@ fn probe_fallback_amounts(
     let rate =
         resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
     let economic = min_economic_amount_in(dec, rate);
-    let spot = crate::pipeline::spot_price::SPOT_PROBE;
+    let spot = crate::pipeline::spot_price::spot_probe_for_decimals(dec);
     let seed = probe_seed.map(|(a, _)| a).unwrap_or(economic);
-    // Try economic first, then the probe seed amount, then SPOT_PROBE.
-    // SPOT_PROBE last because it can be absurdly large for low-decimal tokens.
+    // Try economic first, then the probe seed amount, then the decimal-aware spot probe.
     let mut amounts = [U256::ZERO; 3];
     let mut n = 0usize;
     for candidate in [economic, seed, spot] {
         if candidate.is_zero() || amounts[..n].contains(&candidate) {
             continue;
         }
-        // Skip SPOT_PROBE if it exceeds the flash loan cap for this token.
+        // Skip spot probe if it exceeds the flash loan cap for this token.
         if candidate == spot
             && let Some(cap) = max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate)
             && spot > cap
@@ -654,7 +667,7 @@ fn probe_fallback_opt(
             input.arena,
             &cycle.edges,
             &sim.hop_amounts,
-            crate::pipeline::spot_price::SPOT_PROBE,
+            spot_probe_for_token(input.arena, cycle.start_token),
         ) {
             pf += 1;
             continue;
@@ -730,7 +743,7 @@ fn evaluate_one(
     let probe_seed = probe_seeds
         .get(&seed_fp)
         .or_else(|| probe_seeds.get(&fp))
-        .map(|(amount, sim)| (*amount, sim.clone()));
+        .map(|(amount, sim)| (*amount, *sim));
     let base_slippage = effective_slippage_bps(input.slippage_bps, 0);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
@@ -761,6 +774,11 @@ fn evaluate_one(
         &profit_ctx,
         probe_seed.as_ref().map(std::slice::from_ref),
         Some(route_gas_costing),
+        Some((
+            input.execution.route_sim_cache.as_ref(),
+            input.state_generation,
+            fp,
+        )),
     ) {
         Some(opt) => {
             let Some(sim) = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)
@@ -831,6 +849,11 @@ fn evaluate_one(
             &depth_ctx,
             None,
             Some(route_gas_costing),
+            Some((
+                input.execution.route_sim_cache.as_ref(),
+                input.state_generation,
+                fp,
+            )),
         ) {
             opt = reopt;
             sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
@@ -932,7 +955,7 @@ fn validate_optimized_sim(
             input.arena,
             &cycle.edges,
             &sim.hop_amounts,
-            crate::pipeline::spot_price::SPOT_PROBE,
+            spot_probe_for_token(input.arena, cycle.start_token),
         )
         && !sim.profit.is_zero()
         && within_flash_cap

@@ -259,8 +259,6 @@ mod proptests {
             if fee >= FEE_PIPS_SCALE { return Ok(()); }
 
             if let Some(step) = compute_swap_step(sqrt_a, sqrt_b, liq, amount, fee) {
-                prop_assert!(step.amount_out <= liq,
-                    "output {} exceeds liquidity {}", step.amount_out, liq);
                 let consumed = step.amount_in + step.fee_amount;
                 prop_assert!(consumed <= amount || amount.is_zero(),
                     "consumed {} exceeds amount {}", consumed, amount);

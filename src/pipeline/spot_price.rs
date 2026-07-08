@@ -1,46 +1,116 @@
 use crate::core::constants::BPS_SCALE;
 use crate::core::math::fixed_point::{ONE, ONE_U512};
+use crate::core::math::uniswap_v2::simulate_v2_swap;
+use crate::core::math::uniswap_v3::simulate_v3_swap;
 use crate::core::types::{
     ConcentratedLiquidityPoolState, Edge, FlashLoanSource, FoundCycle, PoolState, ProtocolType,
     TokenIndex,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
-use crate::pipeline::local_sim::simulate_hop_amount_out;
+use crate::pipeline::local_sim::simulate_hop_amount_out_with_cap;
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::types::RoutingGraph;
 use crate::services::execution::profit::flash_loan_fee_bps;
-use crate::util::u256_to_f64;
+use crate::util::{ten_pow_u256_cached, u256_to_f64, u512_to_u256_checked};
 use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]); // 1e12 wei
-const ONE_F64: f64 = 1_000_000_000_000_000_000.0; // 10^18 — ONE in f64
+/// Legacy alias for 18-decimal probe sizing. Prefer [`spot_probe_for_decimals`].
+pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]); // 1e15
 
-/// Compute V2 spot price ratio as U256 fixed-point (ONE = 10^18).
-/// Returns `reserve_out * ONE / reserve_in * fee_factor` or `None` on zero/overflow.
-/// The f64 conversion is done once on the final ratio, avoiding per-reserve conversion error.
-#[inline]
-fn v2_spot_u256(state: &crate::core::types::V2PoolState, edge: &Edge) -> Option<U256> {
-    let (reserve_in, reserve_out) = if edge.zero_for_one {
-        (state.reserve0, state.reserve1)
+const ONE_F64: f64 = 1_000_000_000_000_000_000.0;
+
+/// Decimal-aware marginal probe: ~10^(decimals−6) wei, clamped to [0.001, 0.01] token units.
+#[must_use]
+pub fn spot_probe_for_decimals(decimals: u8) -> U256 {
+    let scale = ten_pow_u256_cached(decimals);
+    let exp_probe = if decimals >= 6 {
+        ten_pow_u256_cached(decimals - 6)
     } else {
-        (state.reserve1, state.reserve0)
+        U256::from(1u64)
     };
-    if reserve_in.is_zero() || reserve_out.is_zero() {
-        return None;
-    }
-    let raw_ratio = reserve_out.checked_mul(ONE)?.checked_div(reserve_in)?;
-    let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
-    raw_ratio
-        .checked_mul(fee_numer)
-        .map(|v| v / U256::from(10000u64))
+    let dust_floor = scale / U256::from(1000u64);
+    let cap = scale / U256::from(100u64);
+    exp_probe
+        .max(dust_floor)
+        .max(U256::from(1000u64))
+        .min(cap)
 }
 
-/// Compute CL V3/V4 spot price ratio as U256 fixed-point.
-/// For zero_for_one (token0→token1): price = sqrt^2 / 2^96 (/ 2^96).
-/// For !zero_for_one (token1→token0): price = 2^192 / sqrt^2.
+#[must_use]
+pub fn spot_probe_for_token(arena: &StateArena, token: TokenIndex) -> U256 {
+    spot_probe_for_decimals(arena.token_decimals(token))
+}
+
+/// Multiply two fixed-point ratios (`ONE` = 1e18). Returns `None` on U256 overflow.
+#[inline]
+#[must_use]
+pub fn mul_ratio(a: U256, b: U256) -> Option<U256> {
+    if a.is_zero() || b.is_zero() {
+        return Some(U256::ZERO);
+    }
+    let product = U512::from(a).checked_mul(U512::from(b))? / ONE_U512;
+    u512_to_u256_checked(product)
+}
+
+/// Chained ratio product; saturates to `U256::MAX` on overflow (profitable sentinel).
+#[inline]
+#[must_use]
+pub fn mul_ratio_saturating(a: U256, b: U256) -> U256 {
+    mul_ratio(a, b).unwrap_or(U256::MAX)
+}
+
+/// True when `current * edge_ratio / ONE` strictly improves `best` (overflow ⇒ true).
+#[inline]
+#[must_use]
+pub fn ratio_product_improves(current: U256, edge_ratio: U256, best: U256) -> bool {
+    match mul_ratio(current, edge_ratio) {
+        Some(r) => r > best,
+        None => true,
+    }
+}
+
+#[inline]
+fn simulated_edge_ratio(out: U256, probe: U256) -> Option<U256> {
+    if out.is_zero() || probe.is_zero() {
+        return None;
+    }
+    out.checked_mul(ONE)?.checked_div(probe)
+}
+
+/// V2 edge ratio via constant-product simulation at `probe` (fee-inclusive).
+#[inline]
+fn v2_edge_ratio_u256(
+    state: &crate::core::types::V2PoolState,
+    edge: &Edge,
+    probe: U256,
+) -> Option<U256> {
+    let out = simulate_v2_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
+    simulated_edge_ratio(out, probe)
+}
+
+#[inline]
+fn cl_has_ticks(state: &ConcentratedLiquidityPoolState) -> bool {
+    !state.ticks.is_empty()
+}
+
+/// CL edge ratio: probe simulation when tick bitmap is loaded, else instantaneous spot.
+#[inline]
+fn cl_edge_ratio_u256(
+    state: &ConcentratedLiquidityPoolState,
+    edge: &Edge,
+    probe: U256,
+) -> Option<U256> {
+    if cl_has_ticks(state) {
+        let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
+        return simulated_edge_ratio(r.amount_out, probe);
+    }
+    cl_spot_u256(state, edge)
+}
+
+/// Compute CL V3/V4 spot price ratio as U256 fixed-point (tickless fallback).
 #[inline]
 fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U256> {
     let sqrt = state.sqrt_price_x96;
@@ -48,16 +118,11 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
         return None;
     }
     let spot_u256 = if edge.zero_for_one {
-        // price = sqrt^2 / 2^192 expressed in ONE.
-        // Full expansion: (sqrt_hi * 2^96 + sqrt_lo)^2 * ONE / 2^192
-        // = sqrt_hi^2 * ONE + 2*sqrt_hi*sqrt_lo*ONE/2^96 + sqrt_lo^2*ONE/2^192
         let sqrt_hi: U256 = sqrt >> 96;
         let sqrt_lo: U256 = sqrt & ((U256::from(1u128) << 96) - U256::from(1));
         let hi_term = sqrt_hi.checked_mul(sqrt_hi)?.checked_mul(ONE)?;
         let cross = U512::from(sqrt_hi) * U512::from(sqrt_lo) * ONE_U512;
-        // cross >> 95 = 2 * sqrt_hi * sqrt_lo * ONE / 2^96 (original >> 96 missed factor 2)
         let cross_term = crate::util::u512_to_u256(cross >> 95);
-        // lo_term = sqrt_lo^2 * ONE / 2^192 — < 1 wei for valid prices but included
         let lo_sq = U512::from(sqrt_lo) * U512::from(sqrt_lo);
         let lo_numer = lo_sq * ONE_U512;
         let lo_term = crate::util::u512_to_u256(lo_numer >> 192);
@@ -65,8 +130,6 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
             .checked_add(cross_term)?
             .checked_add(lo_term)?
     } else {
-        // Inverse price: price0_per_1 = 2^192 / sqrt^2.
-        // Compute (2^192 * ONE) / sqrt^2 using U512 to prevent overflow.
         let two_pow_192 = U256::from(1u128) << 192;
         let numerator = U512::from(two_pow_192) * ONE_U512;
         let sqrt_sq = U512::from(sqrt) * U512::from(sqrt);
@@ -82,7 +145,6 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
         .map(|v| v / U256::from(10000u64))
 }
 
-/// Evaluate spot price ratio to f64, preferring U256 fixed-point then falling back to f64.
 #[inline]
 fn spot_ratio_to_f64(ratio: Option<U256>) -> f64 {
     match ratio {
@@ -93,7 +155,17 @@ fn spot_ratio_to_f64(ratio: Option<U256>) -> f64 {
 
 const HOP_PENALTIES: [f64; 9] = [0.0, 0.0, 0.0, 0.01, 0.03, 0.08, 0.15, 0.30, 0.50];
 
-/// Discourage long routes in log-weight scoring (gas + execution risk).
+/// Minimum `cycle_ratio` for `hops` to clear per-hop fee + gas drag at graph-search margin.
+/// Two-hop cycles stay permissive (probe-rank applies gas); longer routes prune earlier.
+#[must_use]
+pub fn min_profitable_cycle_ratio(hops: u32) -> U256 {
+    if hops <= 2 {
+        return ONE.saturating_add(U256::from(1u8));
+    }
+    let drag_bps = u64::from(hops.saturating_mul(40));
+    ONE.saturating_add(ONE * U256::from(drag_bps) / U256::from(10_000u64))
+}
+
 #[must_use]
 pub fn hop_penalty(hops: u32) -> f64 {
     HOP_PENALTIES
@@ -107,11 +179,6 @@ pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
     (fee_bps as f64 / 10_000.0).ln_1p()
 }
 
-/// Sparse spot cache keyed by `(pool_index, token_in_idx, token_out_idx)`.
-/// Uses a HashMap instead of Vec<Option<f64>> to avoid allocating pool_count * 64
-/// entries when most pools have only 2 tokens (4 slot combinations).
-/// For 5000 pools with typical 2-token layout, this saves ~4.8 MB of allocation
-/// and avoids zero-initializing tens of thousands of unused slots.
 #[derive(Debug, Clone, Default)]
 pub struct SpotTable {
     values: rustc_hash::FxHashMap<u64, f64>,
@@ -126,9 +193,29 @@ impl SpotTable {
     }
 
     #[must_use]
-    pub fn new(_pool_count: usize) -> Self {
+    pub fn new(pool_count: usize) -> Self {
+        Self::with_capacity(pool_count.saturating_mul(4))
+    }
+
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            values: rustc_hash::FxHashMap::default(),
+            values: rustc_hash::FxHashMap::with_capacity_and_hasher(
+                capacity,
+                rustc_hash::FxBuildHasher,
+            ),
+        }
+    }
+
+    /// Pre-fill spot prices from graph edge ratios (avoids re-simulating at rescore time).
+    pub fn populate_from_graph(&mut self, graph: &RoutingGraph) {
+        for adj in &graph.adjacency {
+            for ge in adj {
+                if !ge.ratio.is_zero() {
+                    let spot = u256_to_f64(ge.ratio) / ONE_F64;
+                    self.set(&ge.edge, spot);
+                }
+            }
         }
     }
 
@@ -137,7 +224,6 @@ impl SpotTable {
         self.values.get(&Self::key(edge)).copied().unwrap_or(0.0)
     }
 
-    /// Returns `Some(spot)` if cached (even if zero), `None` if not computed yet.
     #[must_use]
     pub fn get_opt(&self, edge: &Edge) -> Option<f64> {
         self.values.get(&Self::key(edge)).copied()
@@ -160,28 +246,28 @@ impl SpotTable {
     #[must_use]
     pub fn build_for_graph(arena: &StateArena, graph: &RoutingGraph) -> Self {
         let capacity: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
-        let mut table = Self {
-            values: rustc_hash::FxHashMap::with_capacity_and_hasher(
-                capacity,
-                rustc_hash::FxBuildHasher,
-            ),
-        };
+        let mut table = Self::with_capacity(capacity);
+        table.populate_from_graph(graph);
         for adj in &graph.adjacency {
             for ge in adj {
-                table.ensure_edge(arena, &ge.edge);
+                if table.get_opt(&ge.edge).is_none() {
+                    table.ensure_edge(arena, &ge.edge);
+                }
             }
         }
         table
     }
 }
 
-/// Marginal V2 spot from reserves — uses U256 fixed-point for the ratio then converts once.
 #[inline]
-fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge) -> f64 {
-    spot_ratio_to_f64(v2_spot_u256(state, edge))
+fn v2_marginal_spot(
+    state: &crate::core::types::V2PoolState,
+    edge: &Edge,
+    probe: U256,
+) -> f64 {
+    spot_ratio_to_f64(v2_edge_ratio_u256(state, edge, probe))
 }
 
-/// Marginal V3/V4 spot from `sqrt_price_x96` — U256 fixed-point only. No f64 fallback.
 #[inline]
 fn cl_marginal_spot(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> f64 {
     match cl_spot_u256(state, edge) {
@@ -200,37 +286,43 @@ pub fn edge_log_weight_from_spot(spot_price: f64, fee_bps: u32) -> f64 {
 
 #[must_use]
 pub fn compute_spot_price(arena: &StateArena, edge: &Edge) -> f64 {
-    let state = match arena.pool_state(edge.pool_index) {
-        Some(s) if s.is_tradable() => s,
-        _ => return 0.0,
-    };
-    spot_price_from_state(state, edge)
+    let ratio = compute_edge_ratio(arena, edge);
+    if ratio.is_zero() {
+        0.0
+    } else {
+        u256_to_f64(ratio) / ONE_F64
+    }
 }
 
-/// Compute spot price from an already-retrieved and validated pool state, skipping
-/// the redundant arena lookup when the caller has already verified tradability.
 #[must_use]
-pub fn spot_price_from_state(state: &PoolState, edge: &Edge) -> f64 {
+pub fn spot_price_from_state(state: &PoolState, edge: &Edge, token_in_decimals: u8) -> f64 {
+    let probe = spot_probe_for_decimals(token_in_decimals);
+    let shallow_cap = probe;
     match (state, edge.protocol) {
-        (PoolState::V2(s), ProtocolType::UniswapV2) => v2_marginal_spot(s, edge),
+        (PoolState::V2(s), ProtocolType::UniswapV2) => v2_marginal_spot(s, edge, probe),
         (PoolState::V3(s), ProtocolType::UniswapV3)
-        | (PoolState::V4(s), ProtocolType::UniswapV4) => cl_marginal_spot(s, edge),
+        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
+            if cl_has_ticks(s) {
+                spot_ratio_to_f64(cl_edge_ratio_u256(s, edge, probe))
+            } else {
+                cl_marginal_spot(s, edge)
+            }
+        }
         _ => {
-            let out = match simulate_hop_amount_out(state, edge, SPOT_PROBE) {
+            let out = match simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap) {
                 Some(v) if !v.is_zero() => v,
                 _ => return 0.0,
             };
-            {
-                let p = u256_to_f64(SPOT_PROBE);
-                if p <= 0.0 { 0.0 } else { u256_to_f64(out) / p }
+            let p = u256_to_f64(probe);
+            if p <= 0.0 {
+                0.0
+            } else {
+                u256_to_f64(out) / p
             }
         }
     }
 }
 
-/// Compute edge ratio as U256 fixed-point (ONE = 1e18).
-/// Returns the spot_price * (1 - fee_bps/10000) ratio in ONE units.
-/// ratio > ONE means the edge is net-profitable at the margin.
 #[must_use]
 pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
     let Some(state) = arena.pool_state(edge.pool_index) else {
@@ -239,28 +331,21 @@ pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
     if !state.is_tradable() {
         return U256::ZERO;
     }
+    let probe = spot_probe_for_token(arena, edge.token_in);
+    let shallow_cap = probe;
     match (state, edge.protocol) {
         (PoolState::V2(s), ProtocolType::UniswapV2) => {
-            v2_spot_u256(s, edge).unwrap_or(U256::ZERO)
+            v2_edge_ratio_u256(s, edge, probe).unwrap_or(U256::ZERO)
         }
         (PoolState::V3(s), ProtocolType::UniswapV3)
         | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            cl_spot_u256(s, edge).unwrap_or(U256::ZERO)
+            cl_edge_ratio_u256(s, edge, probe).unwrap_or(U256::ZERO)
         }
         _ => {
-            let out = simulate_hop_amount_out(state, edge, SPOT_PROBE).unwrap_or(U256::ZERO);
-            if out.is_zero() {
-                return U256::ZERO;
-            }
-            let raw_ratio = out.checked_mul(ONE).and_then(|v| v.checked_div(SPOT_PROBE))
-                .unwrap_or(U256::ZERO);
-            if raw_ratio.is_zero() {
-                return U256::ZERO;
-            }
-            let fee_numer = U256::from(10000u64 - u64::from(clamp_fee_bps(edge.fee_bps)));
-            raw_ratio.checked_mul(fee_numer)
-                .map(|v| v / U256::from(10000u64))
-                .unwrap_or(U256::ZERO)
+            let out =
+                simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap)
+                    .unwrap_or(U256::ZERO);
+            simulated_edge_ratio(out, probe).unwrap_or(U256::ZERO)
         }
     }
 }
@@ -274,7 +359,6 @@ pub fn compute_edge_log_weight_with_table(table: &SpotTable, edge: &Edge) -> f64
     edge_log_weight_from_spot(spot, edge.fee_bps)
 }
 
-/// Convert expected route gas + flash-loan fee into a log-weight penalty for cycle ranking.
 #[must_use]
 pub fn gas_log_penalty_for_cycle(
     edges: &[Edge],
@@ -307,7 +391,6 @@ pub fn gas_log_penalty_for_cycle(
     if drag_f64 <= 0.0 || rate_f64 <= 0.0 {
         return 0.0;
     }
-    // Express drag as a fractional cost on a unit trade: ln(1 + cost/token_value).
     (drag_f64 / rate_f64).ln_1p()
 }
 
@@ -345,10 +428,18 @@ fn rescore_one_cycle(
             log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
             break;
         }
+        let tin_decimals = match token_decimals {
+            Some(m) => crate::services::oracle::resolve_token_decimals_for_index(
+                edge.token_in,
+                arena,
+                m,
+            ),
+            None => arena.token_decimals(edge.token_in),
+        };
         let spot = match table.get_opt(edge) {
             Some(v) => v,
             None => {
-                let val = spot_price_from_state(state, edge);
+                let val = spot_price_from_state(state, edge, tin_decimals);
                 table.set(edge, val);
                 val
             }
@@ -381,7 +472,6 @@ fn rescore_one_cycle(
     cycle.cumulative_fee_bps = cum_fee;
 }
 
-/// Rescore cycles with spot prices and optional gas penalty (lower score = better).
 pub fn rescore_cycles_with_table_and_gas(
     arena: &StateArena,
     table: &mut SpotTable,
@@ -404,7 +494,6 @@ pub fn rescore_cycles_with_table_and_gas(
     }
 }
 
-/// Rescore shared cycles in place (COW per entry when snapshot still references them).
 pub fn rescore_arc_cycles_with_table_and_gas(
     arena: &StateArena,
     table: &mut SpotTable,
@@ -452,6 +541,25 @@ mod tests {
             fee_bps: 10,
             zero_for_one,
         }
+    }
+
+    #[test]
+    fn spot_probe_scales_with_decimals() {
+        let six = spot_probe_for_decimals(6);
+        let eighteen = spot_probe_for_decimals(18);
+        assert_eq!(six, U256::from(1_000u64));
+        assert_eq!(eighteen, U256::from(10u128.pow(15)));
+        assert!(six < eighteen);
+    }
+
+    #[test]
+    fn mul_ratio_detects_overflow() {
+        let huge = U256::MAX / U256::from(2u64);
+        assert!(mul_ratio(huge, U256::MAX).is_none());
+        assert_eq!(
+            mul_ratio_saturating(huge, U256::MAX),
+            U256::MAX
+        );
     }
 
     #[test]

@@ -60,25 +60,23 @@ pub fn get_amount_in(
         return U256::ZERO;
     }
 
-    // Safe path.
-    let Some(num1) = reserve_in.checked_mul(amount_out) else {
+    let Some(reserve_out_minus) = reserve_out.checked_sub(amount_out) else {
         return U256::ZERO;
     };
-    let Some(numerator) = num1.checked_mul(fee_denominator) else {
-        return U256::ZERO;
-    };
-    let Some(den1) = reserve_out.checked_sub(amount_out) else {
-        return U256::ZERO;
-    };
-    let Some(denominator) = den1.checked_mul(fee_numerator) else {
-        return U256::ZERO;
-    };
+    let numerator =
+        U512::from(reserve_in) * U512::from(amount_out) * U512::from(fee_denominator);
+    let denominator =
+        U512::from(reserve_out_minus) * U512::from(fee_numerator);
     if denominator.is_zero() {
         return U256::ZERO;
     }
-    numerator
-        .checked_div(denominator)
-        .map_or(U256::ZERO, |v| v + U256::from(1))
+    let quotient = numerator / denominator;
+    let result = u512_to_u256(quotient);
+    if numerator % denominator > U512::ZERO {
+        result.saturating_add(U256::from(1))
+    } else {
+        result
+    }
 }
 
 #[must_use]

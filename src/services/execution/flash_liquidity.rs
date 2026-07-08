@@ -115,12 +115,26 @@ impl FlashLiquidityCache {
     }
 
     pub fn snapshot(&self, token: Address) -> TokenFlashLiquidity {
-        let guard = self.entries.read();
-        guard
-            .get(&token)
-            .filter(|e| e.fetched_at.elapsed() < self.ttl)
-            .map(|e| e.snapshot)
+        self.snapshots_for(std::slice::from_ref(&token))
+            .first()
+            .copied()
             .unwrap_or_default()
+    }
+
+    /// Batch-read flash liquidity under a single lock (hot path for cycle ranking).
+    #[must_use]
+    pub fn snapshots_for(&self, tokens: &[Address]) -> Vec<TokenFlashLiquidity> {
+        let guard = self.entries.read();
+        tokens
+            .iter()
+            .map(|token| {
+                guard
+                    .get(token)
+                    .filter(|e| e.fetched_at.elapsed() < self.ttl)
+                    .map(|e| e.snapshot)
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     #[must_use]
@@ -338,9 +352,9 @@ pub fn prefer_aave_flash_start<'a>(
         return Cow::Borrowed(cycle);
     }
 
-    // ponytail: FxHashSet avoids O(n²) linear scan per edge for small cycles.
     let mut seen: rustc_hash::FxHashSet<TokenIndex> = rustc_hash::FxHashSet::default();
-    let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
+    let mut token_addrs: Vec<Address> = Vec::new();
+    let mut token_indices: Vec<TokenIndex> = Vec::new();
     for edge in &cycle.edges {
         let token = edge.token_in;
         if !seen.insert(token) {
@@ -349,7 +363,12 @@ pub fn prefer_aave_flash_start<'a>(
         let Some(addr) = arena.token_address(token) else {
             continue;
         };
-        let liq = flash_liquidity.snapshot(addr);
+        token_addrs.push(addr);
+        token_indices.push(token);
+    }
+    let snapshots = flash_liquidity.snapshots_for(&token_addrs);
+    let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
+    for (liq, token) in snapshots.into_iter().zip(token_indices) {
         if liq.aave_listed {
             candidates.push((liq.aave, token));
         }
@@ -787,6 +806,7 @@ fn reoptimize_capped(
         Some(input.brent_iters),
         Some(cap),
         &profit_ctx,
+        None,
         None,
         None,
     )?;

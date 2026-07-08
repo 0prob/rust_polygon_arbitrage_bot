@@ -7,7 +7,10 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{cl_amount_cap, simulate_route_minimal};
-use crate::pipeline::sim_sanity::{SimSanityInput, check_sim_sanity, min_economic_amount_in};
+use crate::pipeline::route_sim_cache::RouteSimCache;
+use crate::pipeline::sim_sanity::{
+    SimSanityInput, check_sim_sanity, check_sim_sanity_fast, min_economic_amount_in,
+};
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
 use crate::services::execution::profit::{ProfitEvalContext, net_profit_after_gas_from_sim};
@@ -35,7 +38,7 @@ fn lookup_sim_cache(
     cache.iter().find(|(a, _)| *a == amount).map(|(_, sim)| sim)
 }
 
-/// Tickless CL pools cap trade size at `SPOT_PROBE`; Brent cannot search above that.
+/// Tickless CL pools cap trade size at the decimal-aware probe; Brent cannot search above that.
 fn optimize_at_amount_cap(
     arena: &StateArena,
     edges: &[Edge],
@@ -331,6 +334,7 @@ pub fn optimize_cycle(
     profit_ctx: &ProfitEvalContext,
     seed_sims: Option<&[(U256, crate::pipeline::types::MinimalSimResult)]>,
     route_gas: Option<RouteGasCosting<'_>>,
+    route_sim_cache: Option<(&RouteSimCache, u64, u64)>,
 ) -> Option<OptimizationResult> {
     let start_rate = resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
     let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
@@ -409,7 +413,7 @@ pub fn optimize_cycle(
             if sim_cache.len() >= BRENT_CACHE_SLOTS {
                 break;
             }
-            sim_cache.push((*amount, sim.clone()));
+            sim_cache.push((*amount, *sim));
         }
     }
     let evaluate = |amount: U256| -> U256 {
@@ -418,6 +422,14 @@ pub fn optimize_cycle(
         }
         if let Some(sim) = lookup_sim_cache(&sim_cache, amount) {
             return net_profit_after_gas_from_sim(sim, amount, profit_ctx);
+        }
+        if let Some((cache, generation, route_fp)) = route_sim_cache
+            && let Some(cached) = cache.get(generation, route_fp, amount)
+        {
+            if sim_cache.len() < BRENT_CACHE_SLOTS {
+                sim_cache.push((amount, cached));
+            }
+            return net_profit_after_gas_from_sim(&cached, amount, profit_ctx);
         }
         match simulate_route_minimal(arena, edges, amount) {
             Some(mut sim) => {
@@ -429,7 +441,7 @@ pub fn optimize_cycle(
                     );
                 }
                 if sim.profit.is_zero()
-                    || check_sim_sanity(SimSanityInput {
+                    || check_sim_sanity_fast(SimSanityInput {
                         amount_in: amount,
                         gross_profit: sim.profit,
                         search_low: low,
@@ -441,6 +453,9 @@ pub fn optimize_cycle(
                     return U256::ZERO;
                 }
                 let score = net_profit_after_gas_from_sim(&sim, amount, profit_ctx);
+                if let Some((cache, generation, route_fp)) = route_sim_cache {
+                    cache.insert(generation, route_fp, amount, sim);
+                }
                 if sim_cache.len() < BRENT_CACHE_SLOTS {
                     sim_cache.push((amount, sim));
                 }
@@ -459,7 +474,7 @@ pub fn optimize_cycle(
         return None;
     }
     let mut sim = lookup_sim_cache(&sim_cache, optimal)
-        .cloned()
+        .copied()
         .or_else(|| simulate_route_minimal(arena, edges, optimal))?;
     if let Some(costing) = route_gas {
         sim.total_gas = costing.lookup.route_gas_or_heuristic(

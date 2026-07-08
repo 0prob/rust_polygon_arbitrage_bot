@@ -8,12 +8,12 @@ use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
-use crate::pipeline::spot_price::SPOT_PROBE;
+use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
 use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
-use crate::services::execution::flash_policy::parse_flash_policy;
+
 use crate::services::execution::impact_slippage::depth_impact_slippage_bps;
 use crate::services::execution::{
     CandidateBuildConfig, PrepareDispatchInput, build_execution_candidate, prepare_evaluated_route,
@@ -65,12 +65,7 @@ pub async fn dispatch_profitable_candidates(
         .collect();
 
     let operator = ctx.wallet.operator_address(executor);
-    let min_profit_matic = ctx
-        .config
-        .execution
-        .min_profit_matic_wei
-        .parse::<U256>()
-        .expect("min_profit_matic_wei validated at config load");
+    let min_profit_matic = ctx.config.min_profit_matic;
 
     dispatch_with_provider(
         ctx,
@@ -107,13 +102,13 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     >,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
-    _state_generation: u64,
+    state_generation: u64,
 ) {
     if ctx.execution.global_is_quarantined() {
         crate::warn!("dispatch skipped: execution circuit breaker active");
         return;
     }
-    let flash_policy = parse_flash_policy(&ctx.config.execution.flash_loan_source);
+    let flash_policy = ctx.config.flash_policy;
     let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
         crate::warn!("dispatch skipped: gas oracle has no fee snapshot yet");
         return;
@@ -125,7 +120,11 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let deadline_secs = ctx.config.execution.deadline_secs;
 
     let flash_tokens = collect_flash_tokens_for_evals(arena, &profitable);
-    if !flash_tokens.is_empty()
+    let flash_stale = flash_tokens
+        .iter()
+        .any(|token| !ctx.execution.flash_liquidity.has_fresh_entry(*token));
+    if flash_stale
+        && !flash_tokens.is_empty()
         && let Err(_e) = ctx
             .execution
             .flash_liquidity
@@ -136,8 +135,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
 
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
-    let dispatch_cycles: Vec<FoundCycle> = profitable.iter().map(|r| r.cycle.clone()).collect();
+    let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
     let mut dispatch_arena = arena.clone();
+    let mut dispatch_state_generation = state_generation;
     if !dispatch_pools.is_empty() {
         if let Err(e) = ctx
             .refresh
@@ -146,7 +146,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         {
             crate::debug!("dispatch pool refresh failed: {e:#}");
         } else {
-            let _ = dispatch_arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
+            dispatch_state_generation =
+                dispatch_arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
             enrich_dispatch_cl_ticks(
                 sim_provider,
                 &mut dispatch_arena,
@@ -207,7 +208,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             &dispatch_arena,
             &evaluated.cycle.edges,
             &refreshed.hop_amounts,
-            SPOT_PROBE,
+            spot_probe_for_token(&dispatch_arena, evaluated.cycle.start_token),
         ) {
             *skipped.entry("fidelity").or_default() += 1;
             let hop = match reject {
@@ -268,14 +269,6 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             continue;
         };
 
-        let route_pools: Vec<alloy::primitives::Address> = evaluated
-            .cycle
-            .edges
-            .iter()
-            .filter_map(|edge| dispatch_arena.pool_address(edge.pool_index))
-            .collect();
-        let candidate_state_generation = dispatch_arena.apply_hot_cache(&ctx.cache, &route_pools);
-
         let build_cfg = CandidateBuildConfig {
             executor_address: executor,
             slippage_bps,
@@ -286,7 +279,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             token_decimals: resolved_token_decimals,
             token_to_matic_rate,
             safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
-            state_generation: candidate_state_generation,
+            state_generation: dispatch_state_generation,
             route_fingerprint: fp,
         };
 
@@ -350,7 +343,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
 async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: &P,
     arena: &mut StateArena,
-    cycles: &[FoundCycle],
+    cycles: &[&FoundCycle],
     pool_metas: &[crate::pipeline::types::PoolMeta],
     word_range: i16,
 ) {

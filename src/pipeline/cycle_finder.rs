@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 
-use alloy::primitives::{U256, U512};
-use crate::util::u512_to_u256;
+use alloy::primitives::U256;
 
 use crate::core::constants::HOP_CAP;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
-use crate::core::math::fixed_point::ONE_U512;
+use crate::core::math::fixed_point::ONE;
+use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -198,6 +198,10 @@ struct ActiveGraph {
     min_outgoing_weight: Vec<f64>,
     /// Graph-wide minimum live edge (optimistic bound for hops after the first).
     global_min_live_edge_weight: f64,
+    /// Best (highest) U256 ratio leaving each token for optimistic profitability bounds.
+    max_outgoing_ratio: Vec<U256>,
+    /// Graph-wide best live edge ratio.
+    global_max_live_edge_ratio: U256,
 }
 
 fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
@@ -210,7 +214,9 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     // min_outgoing lazily populated: only tokens with live edges get entries.
     // Use a sparse representation: None for dead/unreachable tokens.
     let mut min_outgoing: Vec<Option<f64>> = vec![None; token_count];
+    let mut max_outgoing_ratio: Vec<U256> = vec![ONE; token_count];
     let mut global_min = f64::INFINITY;
+    let mut global_max_ratio = ONE;
     // ponytail: single pass for live edges + diversity scoring (was double iteration).
     let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
 
@@ -240,6 +246,12 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             }
             if w < global_min {
                 global_min = w;
+            }
+            if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio[index] {
+                max_outgoing_ratio[index] = ge.ratio;
+            }
+            if ge.ratio > global_max_ratio {
+                global_max_ratio = ge.ratio;
             }
         }
         let len = live.len();
@@ -271,6 +283,8 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         } else {
             global_min
         },
+        max_outgoing_ratio,
+        global_max_live_edge_ratio: global_max_ratio,
     }
 }
 
@@ -299,6 +313,78 @@ fn can_still_be_negative(
         _ => f64::from(remaining - 1) * global_min,
     };
     log_weight + first + tail <= LOG_WEIGHT_PRUNE_THRESHOLD
+}
+
+#[inline]
+fn can_still_be_profitable_u256(
+    product_ratio: U256,
+    hops: u32,
+    hop_cap: u32,
+    curr: TokenIndex,
+    max_outgoing_ratio: &[U256],
+    global_max_ratio: U256,
+) -> bool {
+    if product_ratio > ONE {
+        if product_ratio >= min_profitable_cycle_ratio(hops) {
+            return true;
+        }
+    }
+    let remaining = hop_cap.saturating_sub(hops);
+    if remaining == 0 {
+        return false;
+    }
+    let first = max_outgoing_ratio
+        .get(curr.0 as usize)
+        .copied()
+        .unwrap_or(ONE);
+    if first < ONE {
+        return false;
+    }
+    let mut optimistic = mul_ratio_saturating(product_ratio, first);
+    if optimistic > ONE {
+        return true;
+    }
+    if remaining > 1 && global_max_ratio >= ONE {
+        for _ in 1..remaining {
+            optimistic = mul_ratio_saturating(optimistic, global_max_ratio);
+            if optimistic > ONE {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn can_still_find_profitable_cycle(
+    log_weight: f64,
+    product_ratio: U256,
+    hops: u32,
+    hop_cap: u32,
+    curr: TokenIndex,
+    prep: &ActiveGraph,
+) -> bool {
+    if product_ratio > ONE {
+        return true;
+    }
+    if !can_still_be_negative(
+        log_weight,
+        hops,
+        hop_cap,
+        curr,
+        &prep.min_outgoing_weight,
+        prep.global_min_live_edge_weight,
+    ) {
+        return false;
+    }
+    can_still_be_profitable_u256(
+        product_ratio,
+        hops,
+        hop_cap,
+        curr,
+        &prep.max_outgoing_ratio,
+        prep.global_max_live_edge_ratio,
+    )
 }
 
 fn collect_cycles_dfs_single_start(
@@ -350,7 +436,10 @@ fn collect_cycles_dfs_single_start(
         }
 
         if hops >= 2 && curr == start {
-            if route_calls > MAX_ROUTE_CALLS {
+            if route_calls > MAX_ROUTE_CALLS
+                || product_ratio <= ONE
+                || product_ratio < min_profitable_cycle_ratio(hops)
+            {
                 return;
             }
             let penalty = hop_penalty(hops);
@@ -381,14 +470,7 @@ fn collect_cycles_dfs_single_start(
         if used_tokens[curr.0 as usize] || hops >= hop_cap {
             return;
         }
-        if !can_still_be_negative(
-            log_w,
-            hops,
-            hop_cap,
-            curr,
-            &prep.min_outgoing_weight,
-            prep.global_min_live_edge_weight,
-        ) {
+        if !can_still_find_profitable_cycle(log_w, product_ratio, hops, hop_cap, curr, prep) {
             return;
         }
         let next_edges = match prep.adjacency.get(curr.0 as usize) {
@@ -402,18 +484,22 @@ fn collect_cycles_dfs_single_start(
             if budget.tick() || cycles.len() >= max_cycles {
                 break;
             }
+            if ge.ratio.is_zero() || ge.ratio < ONE {
+                continue;
+            }
             let pool_id = ge.edge.pool_index.0;
             if !pool_mark(used_pools, pool_id) {
                 continue;
             }
             let next_log_w = log_w + ge.log_weight;
-            if !can_still_be_negative(
+            let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
+            if !can_still_find_profitable_cycle(
                 next_log_w,
+                next_ratio,
                 hops + 1,
                 hop_cap,
                 ge.edge.token_out,
-                &prep.min_outgoing_weight,
-                prep.global_min_live_edge_weight,
+                prep,
             ) {
                 pool_unmark(used_pools, pool_id);
                 continue;
@@ -425,9 +511,6 @@ fn collect_cycles_dfs_single_start(
             }
 
             path.push(ge.edge);
-            let next_ratio = u512_to_u256(
-                U512::from(product_ratio) * U512::from(ge.ratio) / ONE_U512
-            );
             dfs(
                 prep,
                 start,
@@ -463,14 +546,18 @@ fn collect_cycles_dfs_single_start(
         if budget.tick() || cycles.len() >= max_cycles {
             break;
         }
+        if ge.ratio.is_zero() || ge.ratio < ONE {
+            continue;
+        }
         let pool_id = ge.edge.pool_index.0;
-        if !can_still_be_negative(
+        let next_ratio_preview = mul_ratio_saturating(ONE, ge.ratio);
+        if !can_still_find_profitable_cycle(
             ge.log_weight,
+            next_ratio_preview,
             1,
             hop_cap,
             ge.edge.token_out,
-            &prep.min_outgoing_weight,
-            prep.global_min_live_edge_weight,
+            prep,
         ) {
             continue;
         }
@@ -578,9 +665,24 @@ fn collect_cycles_dfs_parallel(
 }
 
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    // ponytail: pass the iterator chain directly — dedupe_cycles_by_edges now
-    // accepts IntoIterator, avoiding the intermediate .collect() allocation.
-    dedupe_cycles_by_edges(shard_cycles.iter().flatten().cloned())
+    use rustc_hash::FxHashMap;
+    use std::collections::hash_map::Entry;
+
+    let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
+    for cycle in shard_cycles.iter().flatten() {
+        let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+        match best.entry(key) {
+            Entry::Occupied(mut e) => {
+                if cycle.score < e.get().score {
+                    e.insert(cycle.clone());
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(cycle.clone());
+            }
+        }
+    }
+    best.into_values().collect()
 }
 
 #[must_use]
@@ -703,17 +805,17 @@ pub fn apply_protocol_diverse_selection(
             if proto_state[i].1 >= hard_ceiling {
                 continue;
             }
-            if let Some(g) = groups.get(&p) {
+            if let Some(g) = groups.get_mut(&p) {
                 while proto_state[i].0 < g.len() {
-                    let candidate = &g[proto_state[i].0];
-                    proto_state[i].0 += 1;
-                    let key = crate::pipeline::cycle_filter::cycle_key(&candidate.edges);
-                    if seen.insert(key) {
-                        proto_state[i].1 += 1;
-                        selected.push(candidate.clone());
-                        progressed = true;
-                        break;
+                    let key = crate::pipeline::cycle_filter::cycle_key(&g[proto_state[i].0].edges);
+                    if !seen.insert(key) {
+                        g.swap_remove(proto_state[i].0);
+                        continue;
                     }
+                    proto_state[i].1 += 1;
+                    selected.push(g.swap_remove(proto_state[i].0));
+                    progressed = true;
+                    break;
                 }
             }
         }
@@ -859,7 +961,7 @@ mod tests {
                     zero_for_one: true,
                 },
                 log_weight: -1.0,
-                ratio: U256::from(1_000_000_000_000_000_000u64),
+                ratio: U256::from(1_000_000_000_000_000_001u64),
             },
         );
 
@@ -869,6 +971,27 @@ mod tests {
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
+    }
+
+    #[test]
+    fn u256_bound_keeps_prefix_when_ratio_can_recover() {
+        let max_out = [ONE + U256::from(2u64), ONE + U256::from(1u64)];
+        assert!(can_still_be_profitable_u256(
+            ONE,
+            1,
+            2,
+            TokenIndex(0),
+            &max_out,
+            ONE + U256::from(1u64),
+        ));
+        assert!(!can_still_be_profitable_u256(
+            ONE,
+            1,
+            2,
+            TokenIndex(0),
+            &[ONE, ONE],
+            ONE,
+        ));
     }
 
     #[test]
@@ -929,7 +1052,7 @@ mod tests {
                     zero_for_one: true,
                 },
                 log_weight: -1.0,
-                ratio: U256::from(1_000_000_000_000_000_000u64),
+                ratio: U256::from(1_000_000_000_000_000_001u64),
             }
         }
 

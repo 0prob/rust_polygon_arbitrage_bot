@@ -44,6 +44,9 @@ fn decodes_all_executor_custom_errors() {
         (sel("6be92da6"), |r| {
             matches!(r, DecodedRevert::BalancerVaultReentrancy)
         }),
+        (sel("90cd6f24"), |r| {
+            matches!(r, DecodedRevert::AaveReserveInactive)
+        }),
     ];
     for (selector, pred) in cases {
         let mut data = selector.to_vec();

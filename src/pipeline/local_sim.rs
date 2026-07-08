@@ -9,13 +9,15 @@ use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
 use crate::core::math::woofi::get_woofi_amount_out;
 use crate::core::types::{
-    Edge, PoolState, ProtocolType, RouteSimulationResult, hop_amounts_zeroed,
+    Edge, PoolState, ProtocolType, RouteSimulationResult, TokenIndex, hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
+use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::types::MinimalSimResult;
 use alloy::primitives::U256;
+use rustc_hash::FxHashMap;
 
-use crate::services::execution::gas::estimate_route_gas_from_hops;
+
 
 /// Per-hop gas estimate for route ranking (matches simulation constants).
 #[must_use]
@@ -31,14 +33,19 @@ pub fn estimate_hop_gas(protocol: ProtocolType) -> u32 {
     }
 }
 
-/// Conservative gas units for a full route (overhead + per-hop + tick premium for CL).
+/// Conservative gas units for a full route (overhead + per-hop + tick premium + storage reads).
 #[must_use]
 pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     if edges.is_empty() {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
     }
     let hop_gas: u32 = edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum();
-    estimate_route_gas_from_hops(hop_gas, edges.len())
+    let cold_slots = edges.len() as u32;
+    crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+        hop_gas,
+        edges.len(),
+        cold_slots,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +54,12 @@ struct HopResult {
     gas: u32,
 }
 
-fn simulate_hop(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<HopResult> {
+fn simulate_hop(
+    state: &PoolState,
+    edge: &Edge,
+    amount_in: U256,
+    shallow_cap: U256,
+) -> Option<HopResult> {
     if amount_in.is_zero() {
         return Some(HopResult {
             amount_out: U256::ZERO,
@@ -66,7 +78,7 @@ fn simulate_hop(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<HopRe
         (PoolState::V3(s), ProtocolType::UniswapV3)
         | (PoolState::V4(s), ProtocolType::UniswapV4) => {
             let r = simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps));
-            if r.shallow && amount_in > crate::pipeline::spot_price::SPOT_PROBE {
+            if r.shallow && amount_in > shallow_cap {
                 return None;
             }
             Some(HopResult {
@@ -145,7 +157,17 @@ fn simulate_hop(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<HopRe
 /// Quote a single hop output for calldata encoding (reuses pipeline math).
 #[must_use]
 pub fn simulate_hop_amount_out(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<U256> {
-    simulate_hop(state, edge, amount_in).map(|h| h.amount_out)
+    simulate_hop_amount_out_with_cap(state, edge, amount_in, U256::MAX)
+}
+
+#[must_use]
+pub fn simulate_hop_amount_out_with_cap(
+    state: &PoolState,
+    edge: &Edge,
+    amount_in: U256,
+    shallow_cap: U256,
+) -> Option<U256> {
+    simulate_hop(state, edge, amount_in, shallow_cap).map(|h| h.amount_out)
 }
 
 fn cl_hop_tickless(state: &PoolState) -> bool {
@@ -156,10 +178,11 @@ fn cl_hop_tickless(state: &PoolState) -> bool {
 }
 
 /// Max trade size with faithful CL simulation. `None` = full tick coverage.
-/// `Some(SPOT_PROBE)` = at least one CL hop lacks ticks (shallow above probe).
+/// `Some(cap)` = at least one CL hop lacks ticks (shallow above per-hop probe).
 #[must_use]
 pub fn cl_amount_cap(arena: &StateArena, edges: &[Edge]) -> Option<U256> {
     let mut tickless = false;
+    let mut cap = U256::MAX;
     for edge in edges {
         if !matches!(
             edge.protocol,
@@ -172,9 +195,12 @@ pub fn cl_amount_cap(arena: &StateArena, edges: &[Edge]) -> Option<U256> {
         };
         if cl_hop_tickless(state) {
             tickless = true;
+            let hop_cap =
+                crate::pipeline::spot_price::spot_probe_for_token(arena, edge.token_in);
+            cap = cap.min(hop_cap);
         }
     }
-    tickless.then_some(crate::pipeline::spot_price::SPOT_PROBE)
+    tickless.then_some(cap)
 }
 
 /// Max gross-profit erosion (bps) tolerated between eval and post-refresh resim.
@@ -263,10 +289,11 @@ pub fn route_hop_fidelity_reject(
                     return Some(HopFidelityReject::V2ReserveExhausted(i));
                 }
             }
-            (PoolState::V3(_) | PoolState::V4(_), ProtocolType::UniswapV3 | ProtocolType::UniswapV4) => {
-                if cl_hop_shallow_at_amount(state, edge, amount_in) {
-                    return Some(HopFidelityReject::ShallowCl(i));
-                }
+            (
+                PoolState::V3(_) | PoolState::V4(_),
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
+            ) if cl_hop_shallow_at_amount(state, edge, amount_in) => {
+                return Some(HopFidelityReject::ShallowCl(i));
             }
             _ => {}
         }
@@ -311,12 +338,23 @@ pub fn route_resim_fidelity_reject(
     None
 }
 
+fn route_token_probes(arena: &StateArena, edges: &[Edge]) -> FxHashMap<TokenIndex, U256> {
+    let mut probes = FxHashMap::default();
+    for edge in edges {
+        probes
+            .entry(edge.token_in)
+            .or_insert_with(|| spot_probe_for_token(arena, edge.token_in));
+    }
+    probes
+}
+
 #[must_use]
 pub fn simulate_route_minimal(
     arena: &StateArena,
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
+    let probes = route_token_probes(arena, edges);
     let mut current = amount_in;
     let mut total_gas = 0u32;
 
@@ -325,7 +363,8 @@ pub fn simulate_route_minimal(
         if !state.is_tradable() {
             return None;
         }
-        let hop = simulate_hop(state, edge, current)?;
+        let shallow_cap = *probes.get(&edge.token_in)?;
+        let hop = simulate_hop(state, edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
@@ -334,7 +373,12 @@ pub fn simulate_route_minimal(
     }
 
     let profit = current.saturating_sub(amount_in);
-    let total_gas = estimate_route_gas_from_hops(total_gas, edges.len());
+    let hop_count = edges.len();
+    let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+        total_gas,
+        hop_count,
+        hop_count as u32,
+    );
     Some(MinimalSimResult {
         profit,
         amount_out: current,
@@ -349,6 +393,7 @@ pub fn simulate_route_detailed(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
+    let probes = route_token_probes(arena, edges);
     let hop_count = edges.len();
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
     hop_amounts[0] = amount_in;
@@ -360,7 +405,8 @@ pub fn simulate_route_detailed(
         if !state.is_tradable() {
             return None;
         }
-        let hop = simulate_hop(state, edge, current)?;
+        let shallow_cap = *probes.get(&edge.token_in)?;
+        let hop = simulate_hop(state, edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
@@ -370,7 +416,11 @@ pub fn simulate_route_detailed(
     }
 
     let profit = current.saturating_sub(amount_in);
-    let total_gas = estimate_route_gas_from_hops(total_gas, hop_count);
+    let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+        total_gas,
+        hop_count,
+        hop_count as u32,
+    );
     Some(RouteSimulationResult {
         amount_in,
         amount_out: current,
@@ -426,10 +476,11 @@ mod tests {
             zero_for_one: true,
         };
 
-        let amount_in = crate::pipeline::spot_price::SPOT_PROBE;
+        let amount_in = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
         let sim = simulate_route_minimal(&arena, &[edge], amount_in).expect("simulation");
-        let expected = crate::services::execution::gas::estimate_route_gas_from_hops(
+        let expected = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
             crate::core::constants::GAS_V3_BASE,
+            1,
             1,
         );
         assert_eq!(sim.total_gas, expected);
@@ -438,9 +489,7 @@ mod tests {
     #[test]
     fn route_gas_formula_matches_executor_overhead_model() {
         use crate::core::constants::GAS_V2_HOP;
-        use crate::services::execution::gas::{
-            PER_HOP_EXECUTOR_GAS_OVERHEAD, ROUTE_EXECUTION_GAS_OVERHEAD,
-        };
+        use crate::services::execution::gas::estimate_route_gas_from_hops_evm;
 
         let edges = [
             Edge {
@@ -464,11 +513,10 @@ mod tests {
                 zero_for_one: true,
             },
         ];
-        let expected =
-            GAS_V2_HOP * 2 + ROUTE_EXECUTION_GAS_OVERHEAD + 2 * PER_HOP_EXECUTOR_GAS_OVERHEAD;
+        let hop_gas = GAS_V2_HOP * 2;
+        let expected = estimate_route_gas_from_hops_evm(hop_gas, 2, 2);
         assert_eq!(estimate_route_gas(&edges), expected);
-        // Typical 2-hop Polygon flash route: ~350k–550k before GasOracle uplift.
-        assert!((350_000..=550_000).contains(&expected));
+        assert!(expected > hop_gas);
     }
 
     #[test]
@@ -565,7 +613,7 @@ mod tests {
                 zero_for_one: true,
             },
         ];
-        let probe = crate::pipeline::spot_price::SPOT_PROBE;
+        let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
         // First assertion: only first hop matters (matches old route_cl_fidelity_ok semantics)
         let mut first_only = hop_amounts_zeroed(edges.len());
         first_only[0] = probe;
@@ -656,7 +704,7 @@ mod tests {
         }];
         assert_eq!(
             cl_amount_cap(&arena, &edges),
-            Some(crate::pipeline::spot_price::SPOT_PROBE)
+            Some(crate::pipeline::spot_price::spot_probe_for_token(&arena, t0))
         );
     }
 

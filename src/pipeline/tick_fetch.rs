@@ -10,7 +10,7 @@ use crate::core::v4_storage::{
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 
-const MAX_TICK_POOLS: usize = 200;
+const MAX_TICK_POOLS: usize = 512;
 
 /// Collect (algebra, algebra_integral) pool address sets from metas for tick enrichment.
 /// Integral pools are also algebra (use special tick path) but require different decode ABI.
@@ -42,11 +42,14 @@ pub fn collect_algebra_pools(
 }
 
 #[must_use]
-pub fn collect_v3_pool_addresses(arena: &StateArena, cycles: &[FoundCycle]) -> Vec<Address> {
+pub fn collect_v3_pool_addresses<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+) -> Vec<Address> {
     let mut out = Vec::with_capacity(cycles.len().min(MAX_TICK_POOLS));
     let mut seen: FxHashSet<Address> = FxHashSet::default();
     'cycles: for cycle in cycles {
-        for edge in &cycle.edges {
+        for edge in &cycle.as_ref().edges {
             if edge.protocol != ProtocolType::UniswapV3 {
                 continue;
             }
@@ -65,14 +68,14 @@ pub fn collect_v3_pool_addresses(arena: &StateArena, cycles: &[FoundCycle]) -> V
 }
 
 #[must_use]
-pub fn collect_v4_tick_targets(
-    cycles: &[FoundCycle],
+pub fn collect_v4_tick_targets<C: AsRef<FoundCycle>>(
+    cycles: &[C],
     pool_metas: &[PoolMeta],
 ) -> Vec<(PoolIndex, FixedBytes<32>)> {
     let mut out = Vec::new();
     let mut seen: FxHashSet<PoolIndex> = FxHashSet::default();
     'cycles: for cycle in cycles {
-        for edge in &cycle.edges {
+        for edge in &cycle.as_ref().edges {
             if edge.protocol != ProtocolType::UniswapV4 {
                 continue;
             }
