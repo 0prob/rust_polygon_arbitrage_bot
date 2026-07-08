@@ -146,10 +146,8 @@ pub async fn run_pass_loop(
     info!("pass loop started");
 
     ctx.rpc.probe_and_rank_state_urls().await;
-    ctx.rpc.spawn_periodic_probe(
-        shutdown.clone(),
-        std::time::Duration::from_secs(600),
-    );
+    ctx.rpc
+        .spawn_periodic_probe(shutdown.clone(), std::time::Duration::from_secs(600));
 
     match ctx.refresh.maybe_discover().await {
         Ok(added) => {

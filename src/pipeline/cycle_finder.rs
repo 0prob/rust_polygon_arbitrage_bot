@@ -670,7 +670,9 @@ pub fn apply_protocol_diverse_selection(
                     *cur += 1;
                     let key = crate::pipeline::cycle_filter::cycle_key(&candidate.edges);
                     if seen.insert(key) {
-                        *counts.get_mut(&p).expect("count initialized for every proto") += 1;
+                        *counts
+                            .get_mut(&p)
+                            .expect("count initialized for every proto") += 1;
                         selected.push(candidate.clone());
                         progressed = true;
                         break;

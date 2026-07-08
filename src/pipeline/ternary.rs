@@ -362,7 +362,10 @@ pub fn optimize_cycle(
         low = *seed_amount;
     }
     if high < economic_floor || high <= low {
-        crate::trace!("optimize_cycle: bounds empty low={low} high={high} economic_floor={economic_floor} edge_count={}", edges.len());
+        crate::trace!(
+            "optimize_cycle: bounds empty low={low} high={high} economic_floor={economic_floor} edge_count={}",
+            edges.len()
+        );
         return None;
     }
     if low < economic_floor {
@@ -381,7 +384,9 @@ pub fn optimize_cycle(
             high = cap;
         }
         if high <= low {
-            crate::trace!("optimize_cycle: bounds empty after CL cap low={low} high={high} cap={cap}");
+            crate::trace!(
+                "optimize_cycle: bounds empty after CL cap low={low} high={high} cap={cap}"
+            );
             return None;
         }
     }
@@ -437,7 +442,9 @@ pub fn optimize_cycle(
     let iterations = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
     let optimal = solve_brent_optimal(low, high, evaluate, iterations);
     if optimal < economic_floor {
-        crate::trace!("optimize_cycle: optimal={optimal} < economic_floor={economic_floor} low={low} high={high}");
+        crate::trace!(
+            "optimize_cycle: optimal={optimal} < economic_floor={economic_floor} low={low} high={high}"
+        );
         return None;
     }
     let mut sim = lookup_sim_cache(&sim_cache, optimal)
@@ -461,7 +468,10 @@ pub fn optimize_cycle(
         token_decimals: start_decimals,
         token_to_matic_rate: start_rate,
     }) {
-        crate::trace!("optimize_cycle: sanity({reason:?}) optimal={optimal} profit={} low={low}", sim.profit);
+        crate::trace!(
+            "optimize_cycle: sanity({reason:?}) optimal={optimal} profit={} low={low}",
+            sim.profit
+        );
         return None;
     }
     Some(OptimizationResult {

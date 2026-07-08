@@ -217,8 +217,10 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
         .filter(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified)
         .collect();
 
-    let mut out =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(unverified.len(), rustc_hash::FxBuildHasher);
+    let mut out = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        unverified.len(),
+        rustc_hash::FxBuildHasher,
+    );
     let mut needs_rpc: Vec<&DiscoveredPool> = Vec::new();
 
     for pool in &unverified {

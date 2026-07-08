@@ -156,7 +156,9 @@ impl ExecutionService {
             if parts.len() < 2 {
                 continue;
             }
-            let Ok(fp) = parts[0].parse::<u64>() else { continue };
+            let Ok(fp) = parts[0].parse::<u64>() else {
+                continue;
+            };
             let entry: &mut RouteStats = stats.entry(fp).or_default();
             match parts[1] {
                 "s" => entry.successes += 1,
@@ -538,7 +540,10 @@ impl ExecutionService {
         if let Some(expiry) = self.quarantine.read().get(&fp)
             && now < *expiry
         {
-            crate::debug!("dispatch skip: fp={}, route quarantined until {expiry:?}", fp);
+            crate::debug!(
+                "dispatch skip: fp={}, route quarantined until {expiry:?}",
+                fp
+            );
             let outcome = ExecutionOutcome::SkippedQuarantined;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -549,7 +554,10 @@ impl ExecutionService {
         if let Some(last) = self.last_submit.read().get(&fp)
             && now.saturating_duration_since(*last) < ROUTE_COOLDOWN
         {
-            crate::debug!("dispatch skip: fp={}, route cooldown active (last={last:?})", fp);
+            crate::debug!(
+                "dispatch skip: fp={}, route cooldown active (last={last:?})",
+                fp
+            );
             let outcome = ExecutionOutcome::SkippedCooldown;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -699,7 +707,11 @@ impl ExecutionService {
             return outcome;
         }
 
-        crate::debug!("dispatch live: fp={}, gas_used={}, live_mode=true", fp, gas_used);
+        crate::debug!(
+            "dispatch live: fp={}, gas_used={}, live_mode=true",
+            fp,
+            gas_used
+        );
         let mempool_clear = match self.operator_mempool_clear(sim_provider, operator).await {
             Ok(clear) => clear,
             Err(e) => {
@@ -784,7 +796,11 @@ impl ExecutionService {
         if balance < required_balance {
             crate::info!(
                 "dispatch skip: fp={}, operator balance {} below required {} (gas_limit={} max_fee={})",
-                fp, balance, required_balance, final_gas, fees.max_fee_per_gas,
+                fp,
+                balance,
+                required_balance,
+                final_gas,
+                fees.max_fee_per_gas,
             );
             let outcome = ExecutionOutcome::SkippedCircuitBreaker;
             if let Some(ui_hook) = ui_hook {
@@ -853,15 +869,15 @@ impl ExecutionService {
             Ok(hash) => {
                 crate::info!(
                     "submit success: fp={}, nonce={}, tx_hash={}, gas_limit={}",
-                    fp, nonce, hash, final_gas,
+                    fp,
+                    nonce,
+                    hash,
+                    final_gas,
                 );
                 hash
             }
             Err(e) => {
-                crate::warn!(
-                    "submit failed: fp={}, nonce={}, error={e:#}",
-                    fp, nonce,
-                );
+                crate::warn!("submit failed: fp={}, nonce={}, error={e:#}", fp, nonce,);
                 nonce_mgr.release(nonce);
                 self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
                 match classify_submit_error(&e) {
@@ -896,7 +912,9 @@ impl ExecutionService {
         else {
             crate::info!(
                 "receipt timeout: fp={}, tx_hash={}, nonce={}",
-                fp, tx_hash, nonce,
+                fp,
+                tx_hash,
+                nonce,
             );
             if shutdown.is_some_and(|rx| *rx.borrow()) {
                 nonce_mgr.release(nonce);

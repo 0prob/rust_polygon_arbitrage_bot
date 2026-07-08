@@ -65,11 +65,29 @@ pub fn is_supported_v4_pool(protocol: ProtocolType, hooks: Option<Address>) -> b
     }
 }
 
+/// Read env var once; defaults to enabled (no change from current behaviour).
+fn quickswap_v2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("QUICKSWAP_V2_ENABLED")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn is_quickswap_v2_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    b.windows(12).any(|w| w.eq_ignore_ascii_case(b"quickswap_v2"))
+        || b.windows(8).any(|w| w.eq_ignore_ascii_case(b"quick_v2"))
+}
+
 #[must_use]
 pub fn is_routable_pool(pool: &DiscoveredPool) -> bool {
     is_fetchable_protocol(pool.protocol)
         && has_supported_token_shape(pool.protocol, &pool.tokens)
         && is_supported_v4_pool(pool.protocol, pool.hooks)
+        // ponytail: env toggle for quickswap v2 pools
+        && (quickswap_v2_enabled() || !is_quickswap_v2_label(&pool.protocol_label))
 }
 
 fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool {

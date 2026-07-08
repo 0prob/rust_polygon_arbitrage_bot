@@ -21,8 +21,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BLOXROUTE_API_URL: &str = "https://api.blxrbdn.com";
 
-static HTTP: LazyLock<Client> =
-    LazyLock::new(|| build_static(HttpClientOpts { timeout: SUBMIT_TIMEOUT, pool_max_idle_per_host: 4, max_redirects: 5 }, "private submit"));
+static HTTP: LazyLock<Client> = LazyLock::new(|| {
+    build_static(
+        HttpClientOpts {
+            timeout: SUBMIT_TIMEOUT,
+            pool_max_idle_per_host: 4,
+            max_redirects: 5,
+        },
+        "private submit",
+    )
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateSubmitMode {
@@ -47,7 +55,9 @@ pub struct PrivateSubmitProbe {
 pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
     let client = &*HTTP;
     let chain_id_ok = match rpc_call::<Vec<String>>(client, url, "eth_chainId", vec![]).await {
-        Ok(v) => matches!(v.as_ref(), Some(JsonRpcResult::Hex(s)) if s.eq_ignore_ascii_case("0x89")),
+        Ok(v) => {
+            matches!(v.as_ref(), Some(JsonRpcResult::Hex(s)) if s.eq_ignore_ascii_case("0x89"))
+        }
         Err(_) => false,
     };
 

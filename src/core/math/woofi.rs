@@ -61,8 +61,13 @@ fn calc_quote_amount_sell_base(
         return U256::ZERO;
     }
 
-    let quote_no_spread =
-        mul_div_triple(base_amount, base.price, base.quote_dec, base.price_dec, U256::ONE);
+    let quote_no_spread = mul_div_triple(
+        base_amount,
+        base.price,
+        base.quote_dec,
+        base.price_dec,
+        U256::ONE,
+    );
     (quote_no_spread * (ONE - gamma - spread)) / (ONE * base.base_dec)
 }
 
@@ -93,8 +98,13 @@ fn calc_base_amount_sell_quote(
         return U256::ZERO;
     }
 
-    let base_no_spread =
-        mul_div_triple(quote_amount, base.base_dec, base.price_dec, base.price, U256::ONE);
+    let base_no_spread = mul_div_triple(
+        quote_amount,
+        base.base_dec,
+        base.price_dec,
+        base.price,
+        U256::ONE,
+    );
     (base_no_spread * (ONE - gamma - spread)) / (ONE * base.quote_dec)
 }
 
@@ -255,9 +265,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
-    use proptest::prelude::*;
     use super::*;
     use alloy::primitives::Address;
+    use proptest::prelude::*;
 
     fn non_zero_u256() -> impl Strategy<Value = U256> {
         (1u128..=u128::MAX / 2).prop_map(U256::from)

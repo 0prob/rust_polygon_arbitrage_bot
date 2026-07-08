@@ -65,7 +65,11 @@ pub struct StateRefreshService {
 }
 
 impl StateRefreshService {
-    pub fn new(config: Arc<AppConfig>, cache: Arc<StateCache>, rpc: Arc<RpcPool>) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Arc<AppConfig>,
+        cache: Arc<StateCache>,
+        rpc: Arc<RpcPool>,
+    ) -> anyhow::Result<Self> {
         let pg = PgClient::new(config.pg_url.clone())
             .with_context(|| "failed to connect to PostgreSQL")?;
         let pool_meta_cache = Arc::new(PoolMetaCache::new(PathBuf::from(

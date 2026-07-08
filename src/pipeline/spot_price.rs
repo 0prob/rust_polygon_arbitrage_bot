@@ -33,7 +33,9 @@ fn v2_spot_u256(state: &crate::core::types::V2PoolState, edge: &Edge) -> Option<
     }
     let raw_ratio = reserve_out.checked_mul(ONE)?.checked_div(reserve_in)?;
     let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
-    raw_ratio.checked_mul(fee_numer).map(|v| v / U256::from(10000u64))
+    raw_ratio
+        .checked_mul(fee_numer)
+        .map(|v| v / U256::from(10000u64))
 }
 
 /// Compute CL V3/V4 spot price ratio as U256 fixed-point.
@@ -60,7 +62,9 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
     let spot_u256 = hi_term.checked_add(cross >> 96)?;
 
     let fee_numer = U256::from(10000u64 - edge.fee_bps.min(10000) as u64);
-    spot_u256.checked_mul(fee_numer).map(|v| v / U256::from(10000u64))
+    spot_u256
+        .checked_mul(fee_numer)
+        .map(|v| v / U256::from(10000u64))
 }
 
 /// Evaluate spot price ratio to f64, preferring U256 fixed-point then falling back to f64.
@@ -408,7 +412,6 @@ pub fn rescore_arc_cycles_with_table_and_gas(
         );
     }
 }
-
 
 #[must_use]
 pub fn finalize_enumerated_cycles(

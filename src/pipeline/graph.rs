@@ -194,7 +194,9 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
 
     rescore_graph_in_place(arena, &mut graph);
     rebuild_pool_edge_positions_full(&mut graph);
-    graph.coverage = Some(crate::pipeline::cycle_finder::cycle_capable_coverage(&graph));
+    graph.coverage = Some(crate::pipeline::cycle_finder::cycle_capable_coverage(
+        &graph,
+    ));
     graph
 }
 

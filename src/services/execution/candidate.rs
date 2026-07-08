@@ -1,7 +1,9 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use rustc_hash::{FxHashMap, FxHasher};
 
-use crate::core::types::{EvaluatedRoute, FlashLoanSource, PoolIndex, PoolState, RouteSimulationResult};
+use crate::core::types::{
+    EvaluatedRoute, FlashLoanSource, PoolIndex, PoolState, RouteSimulationResult,
+};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 use crate::services::execution::calldata::{
@@ -162,8 +164,7 @@ pub fn build_execution_candidate(
     // DODO flash loan: packRoute flash_token field must be the DODO pool address,
     // not the token address — the Huff contract calls flashLoan on it directly.
     let flash_token = if entrypoint == ExecutorEntrypoint::DodoFlash {
-        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges)
-            .unwrap_or(start_token)
+        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges).unwrap_or(start_token)
     } else {
         start_token
     };

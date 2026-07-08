@@ -173,8 +173,8 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
-    use proptest::prelude::*;
     use super::*;
+    use proptest::prelude::*;
 
     proptest! {
         #[test]

@@ -30,12 +30,13 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
     let mut in_next = vec![false; token_count];
 
     let mut deadline = DeadlineGuard::new(BF_TIME_BUDGET);
-    let sources: Vec<_> = crate::pipeline::cycle_finder::prioritize_cycle_start_tokens_from_out_degrees(
-        adj.iter().map(Vec::len),
-    )
-    .into_iter()
-    .take(BELLMAN_FORD_MAX_SOURCES)
-    .collect();
+    let sources: Vec<_> =
+        crate::pipeline::cycle_finder::prioritize_cycle_start_tokens_from_out_degrees(
+            adj.iter().map(Vec::len),
+        )
+        .into_iter()
+        .take(BELLMAN_FORD_MAX_SOURCES)
+        .collect();
 
     for pass in passes {
         for source in &sources {

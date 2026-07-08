@@ -44,7 +44,6 @@ impl JsonRpcResult {
             Self::Hex(s) => Some(s.as_str()),
         }
     }
-
 }
 
 #[derive(Debug, Serialize)]

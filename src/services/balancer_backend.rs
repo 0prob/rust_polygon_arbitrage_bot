@@ -21,7 +21,11 @@ query PolygonV2Pools {
 
 static BALANCER_HTTP: LazyLock<Client> = LazyLock::new(|| {
     build_static(
-        HttpClientOpts { timeout: Duration::from_secs(10), pool_max_idle_per_host: 4, max_redirects: 5 },
+        HttpClientOpts {
+            timeout: Duration::from_secs(10),
+            pool_max_idle_per_host: 4,
+            max_redirects: 5,
+        },
         "balancer backend",
     )
 });
@@ -78,7 +82,12 @@ pub async fn enrich_polygon_balancer_pool_ids(
         .await?;
 
     if !response.errors.is_empty() {
-        let messages = response.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; ");
+        let messages = response
+            .errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
         anyhow::bail!("Balancer backend GraphQL error: {messages}");
     }
 

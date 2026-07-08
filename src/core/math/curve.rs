@@ -166,9 +166,8 @@ pub fn get_curve_stable_amount_out(
     let fee_amount = (dy * state.fee) / CURVE_FEE_DENOMINATOR;
     let dy_after_fee = dy.saturating_sub(fee_amount);
     // Apply output buffer to guard against state drift between simulation and execution.
-    let dy_buffered = dy_after_fee.saturating_sub(
-        (dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR,
-    );
+    let dy_buffered =
+        dy_after_fee.saturating_sub((dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR);
     if dy_buffered.is_zero() {
         return U256::ZERO;
     }
@@ -206,8 +205,8 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
-    use proptest::prelude::*;
     use super::*;
+    use proptest::prelude::*;
 
     fn non_zero() -> impl Strategy<Value = U256> {
         (1u128..=u128::MAX).prop_map(U256::from)

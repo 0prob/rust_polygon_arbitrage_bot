@@ -155,7 +155,6 @@ impl HyperSyncService {
         let gas_used = tx.gas_used.as_ref().map_or(0, quantity_to_u64);
         Ok(Some((success, gas_used)))
     }
-
 }
 
 fn quantity_to_u64(q: &Quantity) -> u64 {
@@ -168,7 +167,9 @@ fn quantity_to_u64(q: &Quantity) -> u64 {
 
 /// Returns `Some(service)` when `ENVIO_API_TOKEN` is set; otherwise `None`.
 pub fn try_from_env(rpc: &RpcConfig) -> Option<HyperSyncService> {
-    let token = std::env::var("ENVIO_API_TOKEN").ok().filter(|t| !t.is_empty())?;
+    let token = std::env::var("ENVIO_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())?;
     HyperSyncService::from_config(rpc, &token).ok()
 }
 

@@ -279,14 +279,13 @@ async fn probe_wss_urls(urls: &[String]) -> Option<(String, Duration)> {
     best
 }
 
-async fn select_wss_url(
-    urls: &[String],
-    sticky: Option<&str>,
-) -> Option<String> {
+async fn select_wss_url(urls: &[String], sticky: Option<&str>) -> Option<String> {
     if urls.is_empty() {
         return None;
     }
-    if sticky.is_some() && let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s)) {
+    if sticky.is_some()
+        && let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s))
+    {
         crate::debug!("WSS sticky reconnect ({url}, probe skipped)");
         return Some(url.to_string());
     }

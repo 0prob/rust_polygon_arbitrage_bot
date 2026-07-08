@@ -162,9 +162,9 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
-    use proptest::prelude::*;
     use super::*;
     use alloy::primitives::Address;
+    use proptest::prelude::*;
 
     fn non_zero() -> impl Strategy<Value = U256> {
         (1u128..=u128::MAX).prop_map(U256::from)

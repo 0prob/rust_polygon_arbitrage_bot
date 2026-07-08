@@ -150,7 +150,10 @@ mod tests {
                 max_cycles: 5_000,
             },
         ];
-        assert_eq!(passes.iter().map(|p| p.max_cycles).max().unwrap_or(0), 5_000);
+        assert_eq!(
+            passes.iter().map(|p| p.max_cycles).max().unwrap_or(0),
+            5_000
+        );
     }
 
     #[test]

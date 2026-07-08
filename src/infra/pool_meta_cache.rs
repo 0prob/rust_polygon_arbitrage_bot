@@ -51,7 +51,10 @@ impl PoolMetaCache {
 
     pub fn set_balancer_pool_id(&self, addr: &Address, id: FixedBytes<32>) {
         let key = format!("{addr:#x}");
-        self.inner.write().balancer_pool_ids.insert(key, format!("{id:#x}"));
+        self.inner
+            .write()
+            .balancer_pool_ids
+            .insert(key, format!("{id:#x}"));
         self.persist();
     }
 

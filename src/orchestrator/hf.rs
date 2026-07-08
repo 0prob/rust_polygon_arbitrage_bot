@@ -328,9 +328,13 @@ pub async fn run_hf_tick(
 
     if cycles_considered > 0 {
         if profitable_count > 0 {
-            crate::info!("hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})");
+            crate::info!(
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})"
+            );
         } else {
-            crate::debug!("hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})");
+            crate::debug!(
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})"
+            );
         }
         if eval_count == 0 {
             crate::debug!(

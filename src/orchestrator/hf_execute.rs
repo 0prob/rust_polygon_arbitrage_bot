@@ -38,11 +38,22 @@ pub async fn dispatch_profitable_candidates(
         return;
     };
 
-    let sim_provider = match ctx.rpc.connect_simulation_checked(executor).await {
-        Ok(p) => p,
-        Err(e) => {
-            crate::warn!("dispatch skipped: simulation RPC/executor check failed: {e:#}");
-            return;
+    // ponytail: skip executor bytecode check in dry-run mode — no on-chain txs to sign
+    let sim_provider = if ctx.config.is_dry_run() {
+        match ctx.rpc.connect_simulation() {
+            Ok(p) => p,
+            Err(e) => {
+                crate::warn!("dispatch skipped: simulation RPC unavailable: {e:#}");
+                return;
+            }
+        }
+    } else {
+        match ctx.rpc.connect_simulation_checked(executor).await {
+            Ok(p) => p,
+            Err(e) => {
+                crate::warn!("dispatch skipped: simulation RPC/executor check failed: {e:#}");
+                return;
+            }
         }
     };
     let pool_metas_by_pool: FxHashMap<

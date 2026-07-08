@@ -54,7 +54,14 @@ impl RpcPool {
     #[must_use]
     pub fn from_config(config: &AppConfig) -> Self {
         let timeout = Duration::from_millis(config.rpc.request_timeout_ms.max(1));
-        let http = build_static(HttpClientOpts { timeout, pool_max_idle_per_host: 16, max_redirects: 0 }, "rpc pool");
+        let http = build_static(
+            HttpClientOpts {
+                timeout,
+                pool_max_idle_per_host: 16,
+                max_redirects: 0,
+            },
+            "rpc pool",
+        );
 
         let mut state_urls = Vec::new();
         if let Some(url) = config
@@ -245,7 +252,10 @@ impl RpcPool {
     /// JSON-RPC endpoint for nonce/chain-id during live submit.
     /// bloXroute BDN only accepts `polygon_private_tx`; it is not a full node.
     fn wallet_provider_url_for_submit(&self) -> anyhow::Result<String> {
-        if std::env::var("BLOXROUTE_AUTH_HEADER").ok().is_some_and(|s| !s.is_empty()) {
+        if std::env::var("BLOXROUTE_AUTH_HEADER")
+            .ok()
+            .is_some_and(|s| !s.is_empty())
+        {
             return self.simulation_url();
         }
         self.submit_url().map(|(url, _)| url)
@@ -443,7 +453,8 @@ mod tests {
             std::env::set_var("BLOXROUTE_AUTH_HEADER", "test-auth");
         }
         assert_eq!(
-            pool.wallet_provider_url_for_submit().expect("submit URL should be valid"),
+            pool.wallet_provider_url_for_submit()
+                .expect("submit URL should be valid"),
             "https://exec.example"
         );
         unsafe {

@@ -73,5 +73,3 @@ impl PipelineUiHook for TuiBridgeHook {
 pub fn publish_snapshot(tx: &UnboundedSender<UiEvent>, snapshot: DashboardSnapshot) {
     let _ = tx.send(UiEvent::Snapshot(Box::new(snapshot)));
 }
-
-

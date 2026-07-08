@@ -94,7 +94,10 @@ async fn pg_query_opt(
         .await
         .context("pg prepare_cached timed out")?
         .context("pg prepare_cached failed")?;
-    client.query_opt(&stmt, params).await.context("pg query_opt failed")
+    client
+        .query_opt(&stmt, params)
+        .await
+        .context("pg query_opt failed")
 }
 
 /// Keyset cursor for paginated PoolMeta bootstrap (avoids OFFSET scans).
@@ -110,10 +113,9 @@ pub struct PgClient {
 }
 
 impl PgClient {
-    
     pub fn new(url_str: String) -> anyhow::Result<Self> {
-        let (user, password, host, port, dbname) = parse_pg_url(&url_str)
-            .context("invalid postgres connection URL")?;
+        let (user, password, host, port, dbname) =
+            parse_pg_url(&url_str).context("invalid postgres connection URL")?;
         let mut pg_config = tokio_postgres::Config::new();
         pg_config.host(&host);
         pg_config.port(port);
@@ -127,7 +129,9 @@ impl PgClient {
         let mgr = Manager::from_config(
             pg_config,
             NoTls,
-            ManagerConfig { recycling_method: RecyclingMethod::Fast },
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
         );
         let pool = Pool::builder(mgr)
             .max_size(MAX_POOL_SIZE)
@@ -204,10 +208,16 @@ impl PgClient {
         let after = after.clone();
         let limit_i64 = i64::try_from(limit).context("pool meta page limit overflow")?;
         let sql = pool_meta_keyset_sql();
-        let rows = pg_query_retry(&self.pool, &sql, &[&after.created_block, &after.id, &limit_i64]).await?;
+        let rows = pg_query_retry(
+            &self.pool,
+            &sql,
+            &[&after.created_block, &after.id, &limit_i64],
+        )
+        .await?;
         let has_more = rows.len() == limit as usize;
         let (pools, _, stats) = parse_rows(&rows, "createdBlock", 0);
-        let next = rows.last()
+        let next = rows
+            .last()
             .map(|row| PoolMetaKeyset {
                 created_block: row.try_get("createdBlock").unwrap_or(after.created_block),
                 id: row.try_get("id").unwrap_or_else(|_| after.id.clone()),
@@ -220,15 +230,32 @@ impl PgClient {
         &self,
         cursor: &DiscoveryCursor,
     ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64)> {
-        ensure!(cursor.last_block > 0, "pool discovery not bootstrapped — use keyset bootstrap first");
-        let updated_wm = if cursor.last_updated_block == 0 { cursor.last_block } else { cursor.last_updated_block };
+        ensure!(
+            cursor.last_block > 0,
+            "pool discovery not bootstrapped — use keyset bootstrap first"
+        );
+        let updated_wm = if cursor.last_updated_block == 0 {
+            cursor.last_block
+        } else {
+            cursor.last_updated_block
+        };
         let last_block = i32::try_from(cursor.last_block).context("cursor last_block overflow")?;
-        let updated_wm_i32 = i32::try_from(updated_wm).context("cursor updated watermark overflow")?;
+        let updated_wm_i32 =
+            i32::try_from(updated_wm).context("cursor updated watermark overflow")?;
         let initial_created = cursor.last_block;
         let initial_updated = cursor.last_updated_block;
         let sql = pool_meta_incremental_sql();
-        let rows = pg_query_retry(&self.pool, &sql, &[&last_block, &updated_wm_i32, &last_block]).await?;
-        Ok(parse_incremental_rows(&rows, initial_created, initial_updated))
+        let rows = pg_query_retry(
+            &self.pool,
+            &sql,
+            &[&last_block, &updated_wm_i32, &last_block],
+        )
+        .await?;
+        Ok(parse_incremental_rows(
+            &rows,
+            initial_created,
+            initial_updated,
+        ))
     }
 
     pub async fn fetch_all_token_metas(&self) -> anyhow::Result<Vec<TokenMeta>> {
@@ -236,7 +263,10 @@ impl PgClient {
         Ok(parse_token_meta_rows(&rows))
     }
 
-    pub async fn fetch_indexer_progress(&self, chain_id: u64) -> anyhow::Result<Option<IndexerProgress>> {
+    pub async fn fetch_indexer_progress(
+        &self,
+        chain_id: u64,
+    ) -> anyhow::Result<Option<IndexerProgress>> {
         let chain_id_i32 = i32::try_from(chain_id).context("chain_id overflow")?;
         if let Some(row) = pg_query_opt(&self.pool, INDEXER_META_SQL, &[&chain_id_i32]).await? {
             return Ok(Some(parse_meta_row(row, chain_id_i32)));
@@ -245,10 +275,14 @@ impl PgClient {
         let rows = pg_query(&self.pool, INDEXER_LEGACY_SQL, &[&id]).await?;
         Ok(rows.into_iter().next().map(|row| {
             let last: i32 = row.get(0);
-            IndexerProgress { chain_id, last_processed_block: last.max(0) as u64, source_block: None, is_ready: None }
+            IndexerProgress {
+                chain_id,
+                last_processed_block: last.max(0) as u64,
+                source_block: None,
+                is_ready: None,
+            }
         }))
     }
-
 }
 
 /// Lightweight PG URL parser (avoids url crate dependency).
@@ -262,7 +296,13 @@ fn parse_pg_url(url_str: &str) -> Option<(String, String, String, u16, String)> 
     let dbname = db_and_params.split('?').next().unwrap_or("");
     let (host, port_str) = hostport.rsplit_once(':').unwrap_or((hostport, "5432"));
     let port: u16 = port_str.parse().unwrap_or(5432);
-    Some((user.to_string(), password.to_string(), host.to_string(), port, dbname.to_string()))
+    Some((
+        user.to_string(),
+        password.to_string(),
+        host.to_string(),
+        port,
+        dbname.to_string(),
+    ))
 }
 
 /// Cursor for pool discovery — tracks watermarks for incremental queries.

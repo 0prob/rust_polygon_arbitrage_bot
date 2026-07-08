@@ -109,7 +109,9 @@ pub async fn bootstrap(ui_hook: Option<SharedUiHook>) -> anyhow::Result<Arc<Runt
         .is_some_and(|t| !t.trim().is_empty());
     let hypersync = try_from_env(&config.rpc);
     match (&hypersync, token_present) {
-        (None, true) => crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled"),
+        (None, true) => {
+            crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled")
+        }
         (None, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
         _ => {}
     }

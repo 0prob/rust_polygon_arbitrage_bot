@@ -226,15 +226,19 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
-    use proptest::prelude::*;
     use super::*;
+    use crate::core::constants::FEE_PIPS_SCALE;
     use crate::core::math::sqrt_price_math::{
         get_amount0_delta, get_amount1_delta, get_next_sqrt_price_from_input,
     };
-    use crate::core::constants::FEE_PIPS_SCALE;
+    use proptest::prelude::*;
 
     fn sqrt_price() -> impl Strategy<Value = U256> {
-        (..=u128::MAX).prop_map(|v| U256::from(v).max(MIN_SQRT_RATIO + U256::from(1)).min(MAX_SQRT_RATIO - U256::from(1)))
+        (..=u128::MAX).prop_map(|v| {
+            U256::from(v)
+                .max(MIN_SQRT_RATIO + U256::from(1))
+                .min(MAX_SQRT_RATIO - U256::from(1))
+        })
     }
 
     fn liquidity() -> impl Strategy<Value = U256> {

@@ -15,7 +15,9 @@ use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_search::find_cycles_for_mode;
 use crate::pipeline::graph_cache::GraphCache;
-use crate::pipeline::spot_price::{finalize_enumerated_cycles, rescore_cycles_with_table, SpotTable};
+use crate::pipeline::spot_price::{
+    SpotTable, finalize_enumerated_cycles, rescore_cycles_with_table,
+};
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
@@ -23,8 +25,8 @@ use crate::pipeline::types::{CycleSearchPass, compare_cycle_score};
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
-    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline,
-    expand_hub_spoke_resolvable, merge_token_rates, resolvable_token_set,
+    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
+    merge_token_rates, resolvable_token_set,
 };
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet, select_stream_targets};
 use crate::services::pipeline_survival::PipelineSurvival;

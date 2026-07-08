@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy::primitives::Address;
 use alloy::primitives::U256;
@@ -35,9 +35,9 @@ use crate::services::execution::profit::{
     net_profit_after_gas_from_sim,
 };
 use crate::services::execution::service::ExecutionService;
-    use crate::services::oracle::{
-        has_reliable_matic_rate, resolve_token_decimals_for_index, resolve_token_to_matic_rate,
-    };
+use crate::services::oracle::{
+    has_reliable_matic_rate, resolve_token_decimals_for_index, resolve_token_to_matic_rate,
+};
 
 #[derive(Default)]
 struct SkipCounters {
@@ -335,16 +335,16 @@ pub fn rank_cycles_by_probe_net(
         if net.is_zero() {
             let hop_count = cycle.edges.len();
             if !probe.profit.is_zero()
-                    && cycle_simulatable(
-                        arena,
-                        &cycle,
-                        token_decimals,
-                        token_to_matic_rates,
-                        flash_liquidity,
-                    )
-                {
-                    near_net.push((probe.profit, cycle.into_owned()));
-                }
+                && cycle_simulatable(
+                    arena,
+                    &cycle,
+                    token_decimals,
+                    token_to_matic_rates,
+                    flash_liquidity,
+                )
+            {
+                near_net.push((probe.profit, cycle.into_owned()));
+            }
             skip.net += 1;
             if probe.profit.is_zero() {
                 crate::trace!(
@@ -354,7 +354,9 @@ pub fn rank_cycles_by_probe_net(
             } else {
                 crate::trace!(
                     "probe net=0 (gas eats profit): fp={fp:#x} hops={hop_count} sim_profit={} probe_amt={probe_amount} gas={} gas_cost_in_token={} rate={rate} dec={start_decimals}",
-                    probe.profit, ranked_probe.total_gas, ctx.gas_price,
+                    probe.profit,
+                    ranked_probe.total_gas,
+                    ctx.gas_price,
                 );
             }
             continue;
@@ -362,7 +364,8 @@ pub fn rank_cycles_by_probe_net(
         let hop_count = cycle.edges.len();
         crate::debug!(
             "probe net>0: fp={fp:#x} hops={hop_count} net={net} probe_amt={probe_amount} sim_profit={} gas={} rate={rate} dec={start_decimals}",
-            probe.profit, ranked_probe.total_gas,
+            probe.profit,
+            ranked_probe.total_gas,
         );
         profitable_ranked.push((net, cycle.into_owned()));
     }
@@ -425,7 +428,12 @@ pub fn rank_cycles_by_probe_net(
         if had_net_ranked || !near_net.is_empty() {
             crate::debug!(
                 "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} skip_net={} near_net={} rescue={rescue_len}",
-                kept.len(), scanned.len(), skip.rate, skip.probe, skip.net, near_net.len(),
+                kept.len(),
+                scanned.len(),
+                skip.rate,
+                skip.probe,
+                skip.net,
+                near_net.len(),
             );
         }
     }
@@ -439,12 +447,23 @@ pub fn rank_cycles_by_probe_net(
     if kept.is_empty() && !scanned.is_empty() {
         crate::info!(
             "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len}",
-            scanned.len(), skip.rate, skip.flash, skip.flash_source, skip.probe, skip.net,
+            scanned.len(),
+            skip.rate,
+            skip.flash,
+            skip.flash_source,
+            skip.probe,
+            skip.net,
         );
     } else if kept.len() <= 3 && scanned.len() > kept.len() {
         crate::debug!(
             "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={}",
-            kept.len(), scanned.len(), skip.rate, skip.flash, skip.flash_source, skip.probe, skip.net,
+            kept.len(),
+            scanned.len(),
+            skip.rate,
+            skip.flash,
+            skip.flash_source,
+            skip.probe,
+            skip.net,
         );
     }
 
@@ -588,9 +607,10 @@ fn probe_fallback_amounts(
         // Skip SPOT_PROBE if it exceeds the flash loan cap for this token.
         if candidate == spot
             && let Some(cap) = max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate)
-                && spot > cap {
-                    continue;
-                }
+            && spot > cap
+        {
+            continue;
+        }
         amounts[n] = candidate;
         n += 1;
     }
@@ -737,18 +757,25 @@ fn evaluate_one(
         Some(opt) => {
             let Some(sim) = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)
             else {
-                crate::trace!("evaluate_one detailed_none: fp={fp:#x} opt_input={}", opt.optimal_input);
+                crate::trace!(
+                    "evaluate_one detailed_none: fp={fp:#x} opt_input={}",
+                    opt.optimal_input
+                );
                 inc(&stats.detailed_none);
                 return None;
             };
             if validate_optimized_sim(input, cycle, &sim, opt.optimal_input, opt.search_low) {
                 (opt, sim, false)
             } else {
-                crate::trace!("evaluate_one validate_failed -> probe_fallback: fp={fp:#x} search_low={}", opt.search_low);
-                let pair = probe_fallback_opt(cycle, input, probe_seed, stats, fp).or_else(|| {
-                    inc(&stats.fallback_none);
-                    None
-                })?;
+                crate::trace!(
+                    "evaluate_one validate_failed -> probe_fallback: fp={fp:#x} search_low={}",
+                    opt.search_low
+                );
+                let pair =
+                    probe_fallback_opt(cycle, input, probe_seed, stats, fp).or_else(|| {
+                        inc(&stats.fallback_none);
+                        None
+                    })?;
                 (pair.0, pair.1, true)
             }
         }
@@ -907,7 +934,8 @@ fn validate_optimized_sim(
             search_low,
             token_decimals,
             token_to_matic_rate,
-        }).is_ok()
+        })
+        .is_ok()
 }
 
 #[cfg(test)]
