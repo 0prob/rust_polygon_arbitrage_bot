@@ -4,7 +4,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 
 ## Features
 
-- **Dual-frequency loop** — LF pass (~1s): pool discovery, state refresh, graph build, cycle enumeration. HF pass (~200ms): prefetch, Brent input sizing, local simulation, dry-run or live execution.
+- **Dual-frequency loop** — LF pass (default 1s): pool discovery, state refresh, graph build, cycle enumeration. HF pass (default 150ms): prefetch, Brent input sizing, local simulation, dry-run or live execution.
 - **Multi-protocol routing** — Uniswap V2/V3/V4 (hookless pools via `unlock`/`unlockCallback`), QuickSwap Algebra V3/Integral, Balancer V2, Curve (stable & crypto), Dodo, Woofi.
 - **Cycle search** — Hybrid parallel DFS + Johnson hub search + Bellman-Ford (default), or `dfs` / `johnson` / `bellman-ford` alone; spot-weighted adjacency graph, atomic probe prefilter, graph/cycle caching.
 - **Pool discovery** — PostgreSQL direct SQL feed from HyperIndex; periodic refresh and dead-pool pruning.
@@ -14,7 +14,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Flash-loan routing** — `FLASH_LOAN_SOURCE=auto` (default) uses a Balancer-first waterfall: on-chain liquidity checks per token, Aave fallback, and cap-and-reoptimize when borrow size exceeds provider liquidity. HF eval uses pessimistic Aave fees in auto mode.
 - **Execution** — Dry-run simulation or live submit via Huff `ArbExecutor`; optional MEV-protected `PRIVATE_RPC_URL`, profit-scaled priority fees, nonce management, route cooldown/quarantine, receipt polling.
 - **HyperSync** (optional) — Block head feed and receipt lookups when `ENVIO_API_TOKEN` is set.
-- **TUI dashboard** — Ratatui terminal UI with live pipeline metrics, opportunities, route visualization, simulations, trades, portfolio, diagnostics, and config panels. Mock mode for demos without RPC/indexer.
+- **TUI dashboard** — Ratatui terminal UI with live pipeline metrics, opportunities, route visualization, simulations, trades, portfolio, diagnostics, and config panels (requires the same RPC/indexer setup as `rpbot`).
 
 ## Binaries
 
@@ -65,7 +65,7 @@ cd ../sol && ./script/deploy_mainnet.sh
 # Set EXECUTOR_ADDRESS in .env to the logged address
 ```
 
-Optional TOML config overrides env vars: set `CONFIG_PATH=./config.toml` (Figment merge).
+Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The shipped `config.toml` lowers `min_profit_matic_wei` to 0.01 MATIC, raises HF caps, and sets `enumeration_max_paths = 500`.
 
 ## Run
 
@@ -81,12 +81,6 @@ TUI dashboard (live pipeline):
 cargo run --bin tui --release
 ```
 
-TUI mock demo (no RPC/indexer required):
-
-```bash
-cargo run --bin tui --release -- --mock
-```
-
 Useful env vars:
 
 ```bash
@@ -96,16 +90,26 @@ ROUTING_CYCLE_FINDER=hybrid             # hybrid | dfs | johnson | bellman-ford
 BLOXROUTE_AUTH_HEADER=your_bloxroute_auth   # private mempool via bloXroute BDN
 PRIVATE_RPC_URL=https://...                  # MEV-protected submission endpoint
 REQUIRE_PRIVATE_SUBMIT=false            # force submissions through PRIVATE_RPC_URL
-FLASH_LOAN_SOURCE=auto                  # auto | BALANCER | AAVE_V3
+FLASH_LOAN_SOURCE=auto                  # auto | balancer | aave | aave_v3
 STREAM_ENABLED=true                     # WSS log stream for hot pool partial cache
 WSS_URL=wss://...                       # WebSocket pool log feed endpoint
+QUICKSWAP_V2_ENABLED=true             # include QuickSwap V2 pools (off unless set to true)
+UNISWAP_V2_ENABLED=true                 # include Uniswap V2 pools (off unless set to true)
+```
+
+Continuous runner and log dashboard (after `cargo build --release`):
+
+```bash
+./scripts/run-continuous.sh   # restart loop with backoff, logs to target/run-logs/
+./scripts/watch.sh              # tail metrics from the latest run log
 ```
 
 ## Development
 
 ```bash
 cargo test
-cargo bench                            # cycle_finder, local_sim, spot_price, hf_tick
+cargo bench   # simulate_v2_swap, simulate_v3_swap_ticks, simulate_route_3hop,
+              # rescore_graph_64_pools, find_cycles_hybrid_3pool, optimize_cycle_2hop
 ```
 
 Calldata golden tests in `tests/calldata_test.rs` verify route encoding and executor selectors.

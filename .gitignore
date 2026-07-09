@@ -10,28 +10,43 @@ Cargo.lock.bak
 *.dylib
 *.dll
 
-# Secrets & local config
+# Secrets, credentials & local config
 .env
 .env.*
 !.env.example
 config.local.toml
+*.local.toml
+*.local.yml
+*.local.json
+
+# Key / wallet material (never commit)
+*.pem
+*.p12
+*.pfx
+*.key
+*.keystore
+*.mnemonic
+id_rsa*
+**/wallet.json
+*secret*
+*secrets*
+credentials/
+keystore/
+wallet/
+
+# External integrations (certs, registration keys)
 /external_gateway/
 
 # Runtime data & journals
+.rpbot-*
 opportunities.jsonl
 *.jsonl
-.rpbot-route-stats.json
-.rpbot-route-stats.json.tmp
-.rpbot-pool-meta.json
-.rpbot-pool-meta.json.tmp
 
 # Profiling & benchmarks
 flamegraph*.svg
 perf.data
 perf.data.old
 *.profraw
-
-# Criterion benchmark reports
 /target/criterion/
 
 # Code intelligence / doc generators (regenerable)
@@ -40,20 +55,26 @@ graphify-rs-out/
 graphify-out/
 graphify-out-routing/
 
+# AI / agent tooling (not functional workspace)
+.agents/
+.codex/
+.codegraph
+.cursor/
+.grok/
+.omo/
+.serena/
+.symlens/
+
 # IDE & OS
 .idea/
 .vscode/
-.cursor/
-.omo/*
 *.swp
 *.swo
 *~
 .DS_Store
 Thumbs.db
 
-# Symlens index (local, regenerable)
-.symlens/
-
-# Logs
+# Logs (may contain RPC URLs, addresses, session metadata)
 *.log
-.cursor/
+target/run-logs/
+run-logs/
