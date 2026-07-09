@@ -686,7 +686,6 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
     );
     let token_to_matic_rate = resolve_token_to_matic_rate(
         input.evaluated.cycle.start_token,
-        input.arena,
         input.token_to_matic_rates,
     );
     let flash_borrow_cap = max_flash_borrow_wei(
@@ -895,7 +894,6 @@ fn capped_sim_passes_sanity(
 ) -> bool {
     let token_to_matic_rate = resolve_token_to_matic_rate(
         input.evaluated.cycle.start_token,
-        input.arena,
         input.token_to_matic_rates,
     );
     let token_decimals = resolve_token_decimals_for_index(

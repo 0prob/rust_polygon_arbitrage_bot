@@ -231,7 +231,7 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             input.config.execution.slippage_bps,
             48,
         );
-        let simulations = build_simulations(&input.snapshot, &opportunities, input.matic_usd);
+        let simulations = build_simulations(&opportunities);
         (Arc::new(opportunities), Arc::new(simulations))
     };
 
@@ -366,11 +366,8 @@ fn build_routes(
         if arena.token_address(cycle.start_token).is_none() {
             continue;
         }
-        let rate = resolve_token_to_matic_rate(
-            cycle.start_token,
-            arena,
-            snapshot.token_to_matic_rates.as_ref(),
-        );
+        let rate =
+            resolve_token_to_matic_rate(cycle.start_token, snapshot.token_to_matic_rates.as_ref());
         let decimals = arena.token_decimals(cycle.start_token);
         let amount_in = min_economic_amount_in(decimals, rate);
         // Negative graph score ⇒ candidate arb; skip sim for clearly unprofitable routes.
@@ -464,7 +461,7 @@ pub fn build_route_cache(
     matic_usd: f64,
 ) -> RouteBuildCache {
     let opportunities = build_routes(snapshot, arena, matic_usd, None, 0, 48);
-    let simulations = build_simulations(snapshot, &opportunities, matic_usd);
+    let simulations = build_simulations(&opportunities);
     RouteBuildCache {
         generation: snapshot.generation,
         opportunities: Arc::new(opportunities),
@@ -472,11 +469,7 @@ pub fn build_route_cache(
     }
 }
 
-fn build_simulations(
-    _snapshot: &HfSnapshot,
-    routes: &[RouteSummary],
-    _matic_usd: f64,
-) -> Vec<SimulationRow> {
+fn build_simulations(routes: &[RouteSummary]) -> Vec<SimulationRow> {
     routes
         .iter()
         .take(12)

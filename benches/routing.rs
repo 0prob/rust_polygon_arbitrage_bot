@@ -9,7 +9,6 @@ use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_search::find_cycles_for_mode;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair, rescore_graph_in_place};
 use rpbot::pipeline::local_sim::simulate_route_minimal;
-use rpbot::pipeline::split_route::simulate_two_way_split;
 use rpbot::pipeline::ternary::optimize_cycle;
 use rpbot::pipeline::types::CycleSearchPass;
 use rustc_hash::FxHashMap;
@@ -209,58 +208,6 @@ fn bench_cycle_search(c: &mut Criterion) {
     });
 }
 
-fn bench_split_route(c: &mut Criterion) {
-    let mut arena = StateArena::default();
-    let t0 = arena.register_token(Address::from([1u8; 20]));
-    let t1 = arena.register_token(Address::from([2u8; 20]));
-    let p0 = arena.register_pool(
-        Address::from([3u8; 20]),
-        Arc::new(PoolState::V2(V2PoolState {
-            reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
-            reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(2000u64),
-            fee: U256::from(997u64),
-            fee_denominator: U256::from(1_000u64),
-            block_timestamp_last: 0,
-        })),
-    );
-    let p1 = arena.register_pool(
-        Address::from([4u8; 20]),
-        Arc::new(PoolState::V2(V2PoolState {
-            reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1500u64),
-            reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(2500u64),
-            fee: U256::from(997u64),
-            fee_denominator: U256::from(1_000u64),
-            block_timestamp_last: 0,
-        })),
-    );
-    let edge_a = Edge {
-        pool_index: p0,
-        token_in: t0,
-        token_out: t1,
-        token_in_idx: 0,
-        token_out_idx: 1,
-        protocol: ProtocolType::UniswapV2,
-        fee_bps: 30,
-        zero_for_one: true,
-    };
-    let edge_b = Edge {
-        pool_index: p1,
-        token_in: t0,
-        token_out: t1,
-        token_in_idx: 0,
-        token_out_idx: 1,
-        protocol: ProtocolType::UniswapV2,
-        fee_bps: 30,
-        zero_for_one: true,
-    };
-    let amount = U256::from(10u128.pow(18));
-    c.bench_function("split_route_50_50", |b| {
-        b.iter(|| {
-            simulate_two_way_split(black_box(&arena), &edge_a, &edge_b, black_box(amount), 5000)
-        });
-    });
-}
-
 fn bench_optimize_cycle(c: &mut Criterion) {
     let mut arena = StateArena::default();
     let a = arena.register_token(Address::from([1u8; 20]));
@@ -353,7 +300,6 @@ criterion_group!(
     bench_route_sim,
     bench_graph_rescore,
     bench_cycle_search,
-    bench_split_route,
     bench_optimize_cycle
 );
 criterion_main!(benches);

@@ -7,7 +7,6 @@ use alloy::primitives::U256;
 use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
-use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
@@ -674,11 +673,7 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 }
 
 #[must_use]
-pub fn find_cycles_multi_pass(
-    _arena: &StateArena,
-    graph: &RoutingGraph,
-    passes: &[CycleSearchPass],
-) -> Vec<FoundCycle> {
+pub fn find_cycles_multi_pass(graph: &RoutingGraph, passes: &[CycleSearchPass]) -> Vec<FoundCycle> {
     if passes.is_empty() {
         return Vec::new();
     }
@@ -770,12 +765,12 @@ pub fn apply_protocol_diverse_selection(
     let cap = max_cycles.min(total);
     // ponytail: per-protocol hard ceiling prevents Balancer multi-token pools
     // (n tokens → n*(n-1) edges) from dominating the cycle set. When 2+ protocols
-    // have live candidates, no single protocol exceeds 60% of cap. When only one
+    // have live candidates, no single protocol exceeds 40% of cap. When only one
     // protocol exists, no ceiling applies (no alternative to diversify with).
     let hard_ceiling = if protos.len() <= 1 {
         cap
     } else {
-        cap.saturating_mul(60) / 100
+        cap.saturating_mul(40) / 100
     };
 
     // ponytail: flat Vec<(cursor, count)> indexed by proto position replaces

@@ -21,7 +21,7 @@ use crate::pipeline::spot_price::{
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
-use crate::pipeline::types::{CycleSearchPass, compare_cycle_score};
+use crate::pipeline::types::CycleSearchPass;
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
@@ -189,11 +189,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             true,
             None,
         );
-        let cycles = Arc::new(finalize_enumerated_cycles(
-            &work.arena,
-            result,
-            work.max_paths,
-        ));
+        let cycles = Arc::new(finalize_enumerated_cycles(result, work.max_paths));
         work.graph_cache.lock().store(
             Arc::clone(&graph),
             Some(Arc::clone(&cycles)),
@@ -358,8 +354,9 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     // Prune any that became unroutable due to dirty state updates (prevents
     // polluting HF candidate pool with now-dead cycles kept from graph cache).
     capped.retain(|c| c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT);
-    capped.sort_by(compare_cycle_score);
-    capped.truncate(max_paths);
+    // ponytail: rescore reorders by score and would undo enumeration-time protocol
+    // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
+    capped = finalize_enumerated_cycles(capped, max_paths);
 
     let rates = if let Some(ref provider) = state_provider {
         merge_token_rates(
@@ -368,7 +365,6 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
                 &ctx.price_oracle,
                 &arena,
                 cycle_tokens.iter().copied(),
-                decimals.as_ref(),
                 Some(provider),
             )
             .await,
@@ -380,7 +376,6 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
                 &ctx.price_oracle,
                 &arena,
                 cycle_tokens.iter().copied(),
-                decimals.as_ref(),
             )
             .await,
         )

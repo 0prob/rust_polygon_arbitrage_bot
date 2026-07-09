@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::tui::app::{App, Severity};
@@ -62,24 +62,42 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Trades [{}]", len)),
+                .title(Line::from(vec![
+                    Span::styled(" ", theme::muted()),
+                    Span::styled(format!("Trades [{}]", len), theme::title()),
+                ])),
         ),
         chunks[0],
     );
 
     let detail = if let Some(row) = app.selected_trade() {
         vec![
-            Line::from(format!("latest {}", row.outcome)),
-            Line::from(format!("fingerprint {:x}", row.fingerprint)),
-            Line::from(format!("gas {:?}", row.gas_used)),
-            Line::from(format!("profit {:?}", row.profit_wei)),
-            Line::from(format!("tx {:?}", row.tx_hash)),
+            theme::label_value("latest", row.outcome.clone(), row.severity),
+            theme::label_value("fingerprint", format!("{:x}", row.fingerprint), Severity::Info),
+            theme::label_value(
+                "gas",
+                row.gas_used.map_or_else(|| "-".to_string(), |g| g.to_string()),
+                Severity::Info,
+            ),
+            theme::label_value(
+                "profit",
+                row.profit_wei.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                Severity::Info,
+            ),
+            theme::label_value(
+                "tx",
+                row.tx_hash.clone().unwrap_or_else(|| "-".to_string()),
+                Severity::Info,
+            ),
         ]
     } else {
         vec![Line::from("no trade history yet")]
     };
     frame.render_widget(
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Latest")),
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Latest", theme::title()),
+        ]))),
         chunks[1],
     );
 }

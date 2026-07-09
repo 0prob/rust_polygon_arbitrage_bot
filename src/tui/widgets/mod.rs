@@ -44,17 +44,33 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = if let Some(route) = app.selected_route() {
-        vec![Line::from(format!(
-            "selected {:x} | {} | risk {} | profit {:.4} MATIC",
-            route.fingerprint, route.route, route.risk_score, route.profit_matic
-        ))]
+        vec![Line::from(vec![
+            ratatui::text::Span::styled(" selected ", theme::muted()),
+            ratatui::text::Span::styled(
+                format!("{:x}", route.fingerprint),
+                theme::severity_style(crate::tui::app::Severity::Good),
+            ),
+            ratatui::text::Span::raw("  "),
+            ratatui::text::Span::styled(route.route.clone(), theme::title()),
+            ratatui::text::Span::raw("  "),
+            ratatui::text::Span::styled(
+                format!("net {:+.4} MATIC", route.net_profit_matic),
+                if route.net_profit_matic > 0.0 {
+                    theme::good()
+                } else {
+                    theme::bad()
+                },
+            ),
+        ])]
     } else {
         vec![Line::from("no selection")]
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::muted())
-        .title(Line::from(" status "));
+        .title(Line::from(vec![
+            ratatui::text::Span::styled(" status ", theme::title()),
+        ]));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 }

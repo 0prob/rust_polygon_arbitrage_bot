@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use crate::core::types::{
     EvaluatedRoute, FlashLoanSource, PoolIndex, PoolState, RouteSimulationResult,
@@ -258,15 +258,7 @@ pub fn evaluated_from_sim(
 
 #[must_use]
 pub fn hash_cycle_edges(edges: &[crate::core::types::Edge]) -> u64 {
-    use std::hash::Hasher;
-    let mut h = FxHasher::default();
-    for e in edges {
-        let p_in = ((e.pool_index.0 as u64) << 32) | (e.token_in.0 as u64);
-        let out_z = ((e.token_out.0 as u64) << 32) | (e.zero_for_one as u64);
-        h.write_u64(p_in);
-        h.write_u64(out_z);
-    }
-    h.finish()
+    crate::pipeline::cycle_filter::cycle_key(edges)
 }
 
 #[cfg(test)]

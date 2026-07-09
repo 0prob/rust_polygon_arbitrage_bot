@@ -80,7 +80,13 @@ pub fn build_transaction_request(
     fees: &SubmitFees,
     gas_limit: u64,
 ) -> Result<TransactionRequest> {
-    build_transaction_request_with_calldata(candidate, candidate.calldata.clone(), nonce, fees, gas_limit)
+    build_transaction_request_with_calldata(
+        candidate,
+        candidate.calldata.clone(),
+        nonce,
+        fees,
+        gas_limit,
+    )
 }
 
 fn build_transaction_request_with_calldata(

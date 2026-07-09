@@ -234,7 +234,7 @@ fn get_dynamic_search_bounds(
         };
         saw_capacity = true;
 
-        let token_in_rate = resolve_token_to_matic_rate(edge.token_in, arena, token_to_matic_rates);
+        let token_in_rate = resolve_token_to_matic_rate(edge.token_in, token_to_matic_rates);
         if token_in_rate.is_zero() || start_rate.is_zero() {
             can_normalize_all = false;
         } else {
@@ -336,7 +336,7 @@ pub fn optimize_cycle(
     route_gas: Option<RouteGasCosting<'_>>,
     route_sim_cache: Option<(&RouteSimCache, u64, u64)>,
 ) -> Option<OptimizationResult> {
-    let start_rate = resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
+    let start_rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 

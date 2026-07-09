@@ -211,7 +211,7 @@ impl ProfitEvalContext {
         safety_multiplier_bps: u64,
     ) -> Self {
         let token_to_matic_rate =
-            resolve_token_to_matic_rate(cycle_start, arena, token_to_matic_rates);
+            resolve_token_to_matic_rate(cycle_start, token_to_matic_rates);
         let token_decimals = crate::services::oracle::resolve_token_decimals_for_index(
             cycle_start,
             arena,
@@ -347,7 +347,7 @@ pub fn assess_route_profit(
         amount_in: route.amount_in,
         gas_units: route.gas_units,
         gas_price_wei: gas_price,
-        token_to_matic_rate: resolve_token_to_matic_rate(cycle_start, arena, token_to_matic_rates),
+        token_to_matic_rate: resolve_token_to_matic_rate(cycle_start, token_to_matic_rates),
         token_decimals: crate::services::oracle::resolve_token_decimals_for_index(
             cycle_start,
             arena,

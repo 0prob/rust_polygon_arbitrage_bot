@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::app::App;
+use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
@@ -23,28 +24,52 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let left = snapshot
         .diagnostics
         .iter()
-        .map(|row| Line::from(format!("{}  {}", row.key, row.value)))
+        .map(|row| theme::label_value(row.key.clone(), row.value.clone(), row.severity))
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(left).block(Block::default().borders(Borders::ALL).title("Health")),
+        Paragraph::new(left).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Health", theme::title()),
+        ]))),
         chunks[0],
     );
 
     let right = vec![
-        Line::from(format!("search ms {}", snapshot.overview.search_ms)),
-        Line::from(format!("hf ms {}", snapshot.overview.hf_ms)),
-        Line::from(format!("cycles {}", snapshot.overview.cycle_count)),
-        Line::from(format!(
-            "trades {} / losses {}",
-            snapshot.overview.total_trades, snapshot.overview.total_losses
-        )),
-        Line::from(format!(
-            "pnl {:.4} MATIC",
-            snapshot.overview.daily_pnl_wei as f64 / 1e18
-        )),
+        theme::label_value(
+            "search ms",
+            snapshot.overview.search_ms.to_string(),
+            crate::tui::app::Severity::Info,
+        ),
+        theme::label_value(
+            "hf ms",
+            snapshot.overview.hf_ms.to_string(),
+            crate::tui::app::Severity::Info,
+        ),
+        theme::label_value(
+            "cycles",
+            snapshot.overview.cycle_count.to_string(),
+            crate::tui::app::Severity::Info,
+        ),
+        theme::label_value(
+            "trades/losses",
+            format!("{}/{}", snapshot.overview.total_trades, snapshot.overview.total_losses),
+            crate::tui::app::Severity::Info,
+        ),
+        theme::label_value(
+            "pnl",
+            format!("{:+.4} MATIC", snapshot.overview.daily_pnl_wei as f64 / 1e18),
+            if snapshot.overview.daily_pnl_wei >= 0 {
+                crate::tui::app::Severity::Good
+            } else {
+                crate::tui::app::Severity::Warn
+            },
+        ),
     ];
     frame.render_widget(
-        Paragraph::new(right).block(Block::default().borders(Borders::ALL).title("Runtime")),
+        Paragraph::new(right).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Runtime", theme::title()),
+        ]))),
         chunks[1],
     );
 }

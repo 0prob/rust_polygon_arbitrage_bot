@@ -17,9 +17,6 @@ use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-/// Legacy alias for 18-decimal probe sizing. Prefer [`spot_probe_for_decimals`].
-pub const SPOT_PROBE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]); // 1e15
-
 const ONE_F64: f64 = 1_000_000_000_000_000_000.0;
 
 /// Decimal-aware marginal probe: ~10^(decimals−6) wei, clamped to [0.001, 0.01] token units.
@@ -182,9 +179,7 @@ pub struct SpotTable {
 impl SpotTable {
     #[inline]
     fn key(edge: &Edge) -> u64 {
-        let tin = u64::from(edge.token_in_idx);
-        let tout = u64::from(edge.token_out_idx);
-        (u64::from(edge.pool_index.0) << 16) | (tin << 8) | tout
+        crate::pipeline::cycle_filter::edge_hop_key(edge)
     }
 
     #[must_use]
@@ -227,7 +222,6 @@ impl SpotTable {
     pub fn set(&mut self, edge: &Edge, spot: f64) {
         self.values.insert(Self::key(edge), spot);
     }
-
 }
 
 #[inline]
@@ -468,11 +462,7 @@ pub fn rescore_arc_cycles_with_table_and_gas(
 }
 
 #[must_use]
-pub fn finalize_enumerated_cycles(
-    _arena: &StateArena,
-    cycles: Vec<FoundCycle>,
-    max_cycles: usize,
-) -> Vec<FoundCycle> {
+pub fn finalize_enumerated_cycles(cycles: Vec<FoundCycle>, max_cycles: usize) -> Vec<FoundCycle> {
     crate::pipeline::cycle_finder::apply_protocol_diverse_selection(cycles, max_cycles)
 }
 

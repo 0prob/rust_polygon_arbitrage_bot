@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use smallvec::SmallVec;
@@ -19,29 +18,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Min(10),
-        ])
+        .constraints([Constraint::Length(9), Constraint::Min(11), Constraint::Length(10)])
         .split(area);
 
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(28),
+            Constraint::Percentage(28),
         ])
         .split(sections[0]);
 
     let pnl_matic = snapshot.overview.daily_pnl_wei as f64 / 1e18;
+    let profitable_share = if snapshot.overview.cycle_count > 0 {
+        (app.last_profitable_count as f64 / snapshot.overview.cycle_count as f64) * 100.0
+    } else {
+        0.0
+    };
     metric_card(
         frame,
         top[0],
-        "P&L",
-        format!("{pnl_matic:.4} MATIC"),
+        "Net P&L",
+        format!("{pnl_matic:+.4} MATIC"),
         format!("{:.2}% win rate", snapshot.overview.win_rate * 100.0),
         if pnl_matic >= 0.0 {
             theme::good()
@@ -52,34 +52,35 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     metric_card(
         frame,
         top[1],
-        "Cycles",
-        snapshot.overview.cycle_count.to_string(),
-        format!(
-            "{} profitable | {} HF considered",
-            app.last_profitable_count, app.last_cycles_considered
-        ),
+        "Yielding",
+        format!("{}/{}", app.last_profitable_count, app.last_cycles_considered),
+        format!("{profitable_share:.1}% of candidates"),
         theme::accent(),
     );
     metric_card(
         frame,
         top[2],
-        "Latency",
-        format!("{} ms", snapshot.overview.search_ms),
-        format!("HF {} ms", snapshot.overview.hf_ms),
-        theme::warn(),
+        "Freshness",
+        format!("search {} ms", snapshot.overview.search_ms),
+        format!("HF {} ms | age {} ms", snapshot.overview.hf_ms, snapshot.overview.snapshot_age_ms),
+        if snapshot.overview.snapshot_age_ms > 2_500 {
+            theme::warn()
+        } else {
+            theme::good()
+        },
     );
     metric_card(
         frame,
         top[3],
-        "Graph",
+        "Graph Health",
         format!(
-            "{} pools / gen {}",
-            snapshot.graph.health.pool_count, snapshot.graph.health.graph_generation
+            "{} pools | {} tokens",
+            snapshot.graph.health.pool_count, snapshot.graph.health.token_count
         ),
         if snapshot.graph.health.stale_indexer {
-            "indexer stale".to_string()
+            format!("lag {} blocks", snapshot.graph.health.indexer_lag_blocks)
         } else {
-            "healthy".to_string()
+            format!("gen {} | live", snapshot.graph.health.graph_generation)
         },
         if snapshot.graph.health.stale_indexer {
             theme::warn()
@@ -90,14 +91,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let lower = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(sections[1]);
     recent_activity(frame, lower[0], app);
     spark_panel(frame, lower[1], app, snapshot);
 
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(sections[2]);
     risk_panel(frame, bottom[0], snapshot);
     history_panel(frame, bottom[1], app);
@@ -112,7 +113,10 @@ fn metric_card(
     accent: ratatui::style::Style,
 ) {
     let block = Block::default()
-        .title(title)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled(title, theme::title()),
+        ]))
         .borders(Borders::ALL)
         .border_style(theme::muted());
     let text: SmallVec<[Line; 2]> = SmallVec::from_buf([
@@ -138,7 +142,14 @@ fn recent_activity(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
     frame.render_widget(
         Paragraph::new(items.as_slice())
-            .block(Block::default().borders(Borders::ALL).title("Activity")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::from(vec![
+                        Span::styled(" ", theme::muted()),
+                        Span::styled("Activity", theme::title()),
+                    ])),
+            ),
         area,
     );
 }
@@ -151,15 +162,11 @@ fn spark_panel(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
         .split(area);
-    sparkline(frame, chunks[0], "Search ms", &app.chart_search_ms);
-    sparkline(frame, chunks[1], "Cycles", &app.chart_cycles);
-    sparkline(frame, chunks[2], "Profitable", &app.chart_profitable);
+    sparkline(frame, chunks[0], "Search latency", &app.chart_search_ms, theme::warn());
+    sparkline(frame, chunks[1], "Cycles found", &app.chart_cycles, theme::accent());
+    sparkline(frame, chunks[2], "Profitable routes", &app.chart_profitable, theme::good());
     let _ = snapshot;
 }
 
@@ -168,38 +175,60 @@ fn sparkline(
     area: Rect,
     title: &str,
     data: &std::collections::VecDeque<u64>,
+    style: ratatui::style::Style,
 ) {
     let max = data.iter().copied().max().unwrap_or(1);
     let values: SmallVec<[u64; 120]> = data.iter().copied().collect();
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::from(vec![
+                        Span::styled(" ", theme::muted()),
+                        Span::styled(title, theme::title()),
+                    ])),
+            )
             .data(values.as_slice())
-            .style(Style::default().fg(theme::ACCENT))
+            .style(style)
             .max(max),
         area,
     );
 }
 
 fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::DashboardSnapshot) {
-    let lines: SmallVec<[Line; 4]> = SmallVec::from_buf([
+    let lines: SmallVec<[Line; 5]> = SmallVec::from_buf([
         Line::from(format!(
-            "indexer lag: {} blocks",
+            "indexer lag {} blocks",
             snapshot.graph.health.indexer_lag_blocks
         )),
+        theme::label_value(
+            "protocols",
+            snapshot.graph.health.protocol_count.to_string(),
+            crate::tui::app::Severity::Info,
+        ),
+        theme::label_value(
+            "hubs",
+            snapshot.graph.health.top_out_degree.to_string(),
+            crate::tui::app::Severity::Info,
+        ),
         Line::from(format!(
-            "protocols: {}",
-            snapshot.graph.health.protocol_count
-        )),
-        Line::from(format!("hubs: {}", snapshot.graph.health.top_out_degree)),
-        Line::from(format!(
-            "snapshot age: {} ms",
+            "snapshot age {} ms",
             snapshot.captured_at.elapsed().as_millis()
+        )),
+        Line::from(format!(
+            "stale indexer {}",
+            snapshot.graph.health.stale_indexer
         )),
     ]);
     frame.render_widget(
         Paragraph::new(lines.as_slice())
-            .block(Block::default().borders(Borders::ALL).title("Health")),
+            .block(
+                Block::default().borders(Borders::ALL).title(Line::from(vec![
+                    Span::styled(" ", theme::muted()),
+                    Span::styled("Health", theme::title()),
+                ])),
+            ),
         area,
     );
 }
@@ -219,11 +248,12 @@ fn history_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines.as_slice()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Trade history"),
-        ),
+        Paragraph::new(lines.as_slice()).block(Block::default().borders(Borders::ALL).title(
+            Line::from(vec![
+                Span::styled(" ", theme::muted()),
+                Span::styled("Trade history", theme::title()),
+            ]),
+        )),
         area,
     );
 }

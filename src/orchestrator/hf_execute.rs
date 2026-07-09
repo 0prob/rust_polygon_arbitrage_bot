@@ -281,19 +281,16 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         return;
     };
     let resolved_token_decimals = token_decimals.get(&start_token_addr).copied().unwrap_or(18);
-    let Some(token_to_matic_rate) = resolve_token_to_matic_rate_or_bootstrap(
-        evaluated.cycle.start_token,
-        arena,
-        token_to_matic_rates,
-    ) else {
+    let Some(token_to_matic_rate) =
+        resolve_token_to_matic_rate_or_bootstrap(evaluated.cycle.start_token, token_to_matic_rates)
+    else {
         skipped.record("prepare");
         return;
     };
 
     let sim = if pools_refreshed {
         let amount_in = evaluated.sim.amount_in;
-        let Some(refreshed) =
-            simulate_route_detailed(arena, &evaluated.cycle.edges, amount_in)
+        let Some(refreshed) = simulate_route_detailed(arena, &evaluated.cycle.edges, amount_in)
         else {
             skipped.record("fidelity");
             crate::debug!("dispatch skip: fp={fp} resim failed after pool refresh");
@@ -386,19 +383,16 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         route_fingerprint: fp,
     };
 
-    let candidate = match build_execution_candidate(
-        arena,
-        &prepared.evaluated,
-        &build_cfg,
-        pool_metas_by_pool,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            crate::debug!("prepare skip: build failed fp={fp}: {e:#}");
-            skipped.record("build");
-            return;
-        }
-    };
+    let candidate =
+        match build_execution_candidate(arena, &prepared.evaluated, &build_cfg, pool_metas_by_pool)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                crate::debug!("prepare skip: build failed fp={fp}: {e:#}");
+                skipped.record("build");
+                return;
+            }
+        };
 
     if ctx
         .execution

@@ -201,22 +201,6 @@ impl StateArena {
         generation
     }
 
-    /// Patch canonical pool slots in place (legacy; prefer `apply_hot_cache` on HF path).
-    pub fn refresh_pools_from_cache(&mut self, cache: &StateCache, addresses: &[Address]) {
-        self.hot_overlay.clear();
-        let inner = Arc::make_mut(&mut self.inner);
-        for address in addresses {
-            let Some(state) = cache.get_arc(address) else {
-                continue;
-            };
-            if let Some(idx) = inner.address_to_pool.get(address)
-                && let Some(slot) = inner.pools.get_mut(idx.0 as usize)
-            {
-                *slot = state;
-            }
-        }
-    }
-
     /// Register tradable pools only — skips unfetched or non-tradable cache entries
     /// so routing work stays proportional to graph-eligible pools.
     pub fn sync_from_discovery(

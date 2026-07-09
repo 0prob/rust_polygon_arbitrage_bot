@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
+use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
@@ -55,7 +56,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from("net"),
             Cell::from("gas"),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("Local sim")),
+        .block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Local sim", theme::title()),
+        ]))),
         chunks[0],
     );
 
@@ -63,19 +67,35 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         || vec![Line::from("no selection")],
         |r| {
             vec![
-                Line::from(format!("route {}", r.route)),
-                Line::from(format!("raw score {:.4}", r.raw_score)),
-                Line::from(format!("rescored {:.4}", r.rescored)),
-                Line::from(format!(
-                    "risk {} liquidity {}",
-                    r.risk_score, r.liquidity_score
-                )),
-                Line::from(format!("long-tail {}", r.long_tail)),
+                theme::label_value("route", r.route.clone(), crate::tui::app::Severity::Info),
+                theme::label_value("raw score", format!("{:.4}", r.raw_score), crate::tui::app::Severity::Info),
+                theme::label_value("rescored", format!("{:.4}", r.rescored), crate::tui::app::Severity::Info),
+                theme::label_value(
+                    "risk/liquidity",
+                    format!("{}/{}", r.risk_score, r.liquidity_score),
+                    if r.risk_score >= 60 {
+                        crate::tui::app::Severity::Warn
+                    } else {
+                        crate::tui::app::Severity::Good
+                    },
+                ),
+                theme::label_value(
+                    "long-tail",
+                    r.long_tail.to_string(),
+                    if r.long_tail {
+                        crate::tui::app::Severity::Warn
+                    } else {
+                        crate::tui::app::Severity::Good
+                    },
+                ),
             ]
         },
     );
     frame.render_widget(
-        Paragraph::new(selected).block(Block::default().borders(Borders::ALL).title("Compare")),
+        Paragraph::new(selected).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Compare", theme::title()),
+        ]))),
         chunks[1],
     );
 }

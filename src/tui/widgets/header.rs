@@ -24,8 +24,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![
-                    Span::styled(" rpbot ", theme::title()),
-                    Span::styled("live dashboard", theme::muted()),
+                    Span::styled(" arb cockpit ", theme::title()),
+                    Span::styled("market intelligence and execution", theme::muted()),
                 ]))
                 .title_alignment(ratatui::layout::Alignment::Left)
                 .border_style(theme::muted()),
@@ -51,12 +51,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(
             format!(
-                "uptime {}s | routes {} | trades {}",
+                "uptime {}s | routes {} | trades {} | profitable {}",
                 app.snapshot
                     .as_ref()
                     .map_or(0, |s| s.overview.uptime.as_secs()),
                 app.snapshot.as_ref().map_or(0, |s| s.opportunities.len()),
-                app.trade_history.len()
+                app.trade_history.len(),
+                app.snapshot.as_ref().map_or(0, |s| s.overview.profitable_routes),
             ),
             theme::muted(),
         ),

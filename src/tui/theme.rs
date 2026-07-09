@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::tui::app::Severity;
 
@@ -58,4 +59,13 @@ pub fn severity_style(severity: Severity) -> Style {
     Style::default()
         .fg(severity_color(severity))
         .add_modifier(Modifier::BOLD)
+}
+
+#[must_use]
+pub fn label_value(label: impl Into<String>, value: impl Into<String>, severity: Severity) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.into(), muted()),
+        Span::raw("  "),
+        Span::styled(value.into(), severity_style(severity)),
+    ])
 }

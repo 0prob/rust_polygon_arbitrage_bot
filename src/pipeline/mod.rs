@@ -15,7 +15,6 @@ pub mod pool_fetch;
 pub mod route_calls;
 pub mod route_sim_cache;
 pub mod sim_sanity;
-pub mod split_route;
 pub mod spot_price;
 pub mod ternary;
 pub mod tick_fetch;

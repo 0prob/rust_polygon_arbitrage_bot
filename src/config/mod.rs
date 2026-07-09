@@ -48,27 +48,6 @@ pub enum CycleFinderMode {
     BellmanFord,
 }
 
-impl CycleFinderMode {
-    // ponytail: only used in tests
-    pub fn parse(raw: &str) -> anyhow::Result<Self> {
-        let raw = raw.trim();
-        if raw.eq_ignore_ascii_case("hybrid") {
-            Ok(Self::Hybrid)
-        } else if raw.eq_ignore_ascii_case("dfs") {
-            Ok(Self::Dfs)
-        } else if raw.eq_ignore_ascii_case("johnson") {
-            Ok(Self::Johnson)
-        } else if raw.eq_ignore_ascii_case("bellman-ford")
-            || raw.eq_ignore_ascii_case("bellman_ford")
-            || raw.eq_ignore_ascii_case("bellmanford")
-        {
-            Ok(Self::BellmanFord)
-        } else {
-            anyhow::bail!("unknown ROUTING_CYCLE_FINDER: {raw}")
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
     #[serde(default = "default_max_hops")]
@@ -724,6 +703,26 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl CycleFinderMode {
+        fn parse(raw: &str) -> anyhow::Result<Self> {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("hybrid") {
+                Ok(Self::Hybrid)
+            } else if raw.eq_ignore_ascii_case("dfs") {
+                Ok(Self::Dfs)
+            } else if raw.eq_ignore_ascii_case("johnson") {
+                Ok(Self::Johnson)
+            } else if raw.eq_ignore_ascii_case("bellman-ford")
+                || raw.eq_ignore_ascii_case("bellman_ford")
+                || raw.eq_ignore_ascii_case("bellmanford")
+            {
+                Ok(Self::BellmanFord)
+            } else {
+                anyhow::bail!("unknown ROUTING_CYCLE_FINDER: {raw}")
+            }
+        }
+    }
 
     #[test]
     fn default_config_has_discovery_bootstrap_batch() {

@@ -163,7 +163,7 @@ fn cycle_simulatable(
         return false;
     }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
-    let rate = resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
+    let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let probe = min_economic_amount_in(decimals, rate);
     let spot_probe = spot_probe_for_decimals(decimals);
     for amount in [probe, spot_probe] {
@@ -316,7 +316,7 @@ pub fn rank_cycles_by_probe_net(
         };
         let start_decimals =
             resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
-        let rate = resolve_token_to_matic_rate(cycle.start_token, arena, token_to_matic_rates);
+        let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
         let Some((probe_amount, probe)) =
             try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
         else {
@@ -611,7 +611,7 @@ fn probe_fallback_amounts(
     let dec =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
     let rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
+        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let economic = min_economic_amount_in(dec, rate);
     let spot = crate::pipeline::spot_price::spot_probe_for_decimals(dec);
     let seed = probe_seed.map(|(a, _)| a).unwrap_or(economic);
@@ -643,7 +643,7 @@ fn probe_fallback_opt(
     _fp: u64,
 ) -> Option<(OptimizationResult, RouteSimulationResult)> {
     let rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
+        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
     let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
@@ -737,9 +737,7 @@ fn evaluate_one(
         inc(&stats.flash_source);
         return None;
     };
-    let probe_seed = probe_seeds
-        .get(&fp)
-        .map(|(amount, sim)| (*amount, *sim));
+    let probe_seed = probe_seeds.get(&fp).map(|(amount, sim)| (*amount, *sim));
     let base_slippage = input.slippage_bps;
     let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
@@ -952,7 +950,7 @@ fn validate_optimized_sim(
     spot_probe: U256,
 ) -> bool {
     let token_to_matic_rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
+        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let token_decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
     let within_flash_cap = max_flash_borrow_wei(

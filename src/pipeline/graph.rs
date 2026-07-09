@@ -5,6 +5,20 @@ use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
 use alloy::primitives::U256;
+use rustc_hash::FxHashMap;
+
+/// Max parallel directed edges per `(token_in, token_out, protocol)` after rescoring.
+const MAX_PARALLEL_EDGES_PER_PAIR: usize = 2;
+
+#[inline]
+fn pair_zero_for_one(token_in_idx: u8) -> bool {
+    token_in_idx == 0
+}
+
+#[inline]
+fn multi_zero_for_one(token_in_idx: u8, token_out_idx: u8) -> bool {
+    token_in_idx < token_out_idx
+}
 
 /// Build directed swap edges for a two-token pool (V2/V3/DODO).
 /// When `state` is set, only emits hops that pass [`PoolState::hop_pair_routable`].
@@ -28,7 +42,7 @@ pub fn edges_for_pair(
                 token_out_idx: 1,
                 protocol,
                 fee_bps,
-                zero_for_one: true,
+                zero_for_one: pair_zero_for_one(0),
             });
         }
         if state.hop_pair_routable(1, 0) {
@@ -40,7 +54,7 @@ pub fn edges_for_pair(
                 token_out_idx: 0,
                 protocol,
                 fee_bps,
-                zero_for_one: false,
+                zero_for_one: pair_zero_for_one(1),
             });
         }
     } else {
@@ -52,7 +66,7 @@ pub fn edges_for_pair(
             token_out_idx: 1,
             protocol,
             fee_bps,
-            zero_for_one: true,
+            zero_for_one: pair_zero_for_one(0),
         });
         out.push(Edge {
             pool_index,
@@ -62,7 +76,7 @@ pub fn edges_for_pair(
             token_out_idx: 0,
             protocol,
             fee_bps,
-            zero_for_one: false,
+            zero_for_one: pair_zero_for_one(1),
         });
     }
     out
@@ -102,7 +116,7 @@ pub fn edges_for_multi_token(
                 token_out_idx: j as u8,
                 protocol,
                 fee_bps,
-                zero_for_one: i < j,
+                zero_for_one: multi_zero_for_one(i as u8, j as u8),
             });
         }
     }
@@ -125,7 +139,7 @@ fn balancer_token_indices_to_expand(
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let max_tokens = ranked.len().min(4);
+    let max_tokens = ranked.len().min(2);
     ranked.truncate(max_tokens);
     ranked.sort_by_key(|(i, _)| *i);
     ranked.into_iter().map(|(i, _)| i).collect()
@@ -157,7 +171,7 @@ fn edges_for_balancer_multi_token(
                 token_out_idx: j as u8,
                 protocol,
                 fee_bps,
-                zero_for_one: i < j,
+                zero_for_one: multi_zero_for_one(i as u8, j as u8),
             });
         }
     }
@@ -211,6 +225,41 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
             }
             false
         }
+    }
+}
+
+fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
+    if adj.len() <= max_per_pair || max_per_pair == 0 {
+        return;
+    }
+    let mut by_pair: FxHashMap<(u32, u8), Vec<usize>> = FxHashMap::default();
+    for (i, ge) in adj.iter().enumerate() {
+        let key = (ge.edge.token_out.0, ge.edge.protocol as u8);
+        by_pair.entry(key).or_default().push(i);
+    }
+    let mut keep = Vec::new();
+    for mut indices in by_pair.into_values() {
+        if indices.len() <= max_per_pair {
+            keep.extend(indices);
+            continue;
+        }
+        indices.sort_by(|&a, &b| {
+            adj[b]
+                .ratio
+                .cmp(&adj[a].ratio)
+                .then_with(|| adj[a].edge.pool_index.0.cmp(&adj[b].edge.pool_index.0))
+        });
+        keep.extend(indices.into_iter().take(max_per_pair));
+    }
+    keep.sort_unstable();
+    let thinned: Vec<GraphEdge> = keep.into_iter().map(|i| adj[i]).collect();
+    *adj = thinned;
+}
+
+fn thin_parallel_edges_in_graph(graph: &mut RoutingGraph) {
+    for adj in &mut graph.adjacency {
+        thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR);
+        sort_adjacency_edges(adj);
     }
 }
 
@@ -273,6 +322,7 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
     }
 
     rescore_graph_in_place(arena, &mut graph);
+    thin_parallel_edges_in_graph(&mut graph);
     rebuild_pool_edge_positions_full(&mut graph);
     graph.coverage = Some(std::sync::Arc::new(
         crate::pipeline::cycle_finder::cycle_capable_coverage(&graph),
@@ -503,6 +553,41 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn thin_parallel_edges_keeps_top_two_by_ratio() {
+        fn ge(pool: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
+            GraphEdge {
+                edge: Edge {
+                    pool_index: PoolIndex(pool),
+                    token_in: TokenIndex(4),
+                    token_out: TokenIndex(tout),
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                log_weight: -0.01,
+                ratio: U256::from(ratio),
+            }
+        }
+
+        let mut adj = vec![
+            ge(1, 5, ProtocolType::BalancerV2, 1_010_000_000_000_000_000),
+            ge(2, 5, ProtocolType::BalancerV2, 1_020_000_000_000_000_000),
+            ge(3, 5, ProtocolType::BalancerV2, 1_015_000_000_000_000_000),
+            ge(4, 5, ProtocolType::BalancerV2, 1_005_000_000_000_000_000),
+            ge(10, 6, ProtocolType::UniswapV3, 1_010_000_000_000_000_000),
+        ];
+        thin_parallel_edges_in_place(&mut adj, 2);
+        assert_eq!(adj.len(), 3);
+        let pools: Vec<u32> = adj.iter().map(|e| e.edge.pool_index.0).collect();
+        assert!(pools.contains(&2));
+        assert!(pools.contains(&3));
+        assert!(!pools.contains(&4));
+        assert!(pools.contains(&10));
+    }
+
+    #[test]
     fn test_edges_for_pair() {
         let edges = edges_for_pair(
             PoolIndex(0),
@@ -612,8 +697,10 @@ mod tests {
             ProtocolType::BalancerV2,
         );
 
-        assert_eq!(edges.len(), 12);
-        assert!(edges.iter().all(|e| e.token_in.0 < 4 && e.token_out.0 < 4));
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| {
+            matches!(e.token_in.0, 2 | 3) && matches!(e.token_out.0, 2 | 3)
+        }));
     }
 
     #[test]

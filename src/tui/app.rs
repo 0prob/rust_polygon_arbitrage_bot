@@ -366,6 +366,7 @@ impl App {
     pub fn rebuild_route_view(&mut self) {
         let key = self.route_view_cache_key();
         if key == self.route_view_key {
+            self.normalize_route_selection();
             return;
         }
         self.route_view_key = key;
@@ -397,6 +398,7 @@ impl App {
             }
         }
         self.route_view_indices = indices;
+        self.normalize_route_selection();
     }
 
     fn route_view_cache_key(&self) -> u64 {
@@ -429,6 +431,20 @@ impl App {
         let len = self.current_rows_len();
         self.selected_index = len.saturating_sub(1);
         self.scroll = self.selected_index.saturating_sub(10);
+    }
+
+    fn normalize_route_selection(&mut self) {
+        if self.tab != Tab::Opportunities {
+            return;
+        }
+        let len = self.route_view_indices.len();
+        if len == 0 {
+            self.selected_index = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected_index = self.selected_index.min(len - 1);
+        self.scroll = self.scroll.min(self.selected_index);
     }
 
     pub fn cycle_tab(&mut self, step: isize) {

@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::app::App;
+use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
@@ -29,20 +30,35 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[0],
         "Health",
         vec![
-            Line::from(format!(
-                "generation {}",
-                snapshot.graph.health.graph_generation
-            )),
-            Line::from(format!("tokens {}", snapshot.graph.health.token_count)),
-            Line::from(format!("pools {}", snapshot.graph.health.pool_count)),
-            Line::from(format!(
-                "top out-degree {}",
-                snapshot.graph.health.top_out_degree
-            )),
-            Line::from(format!(
-                "stale indexer {}",
-                snapshot.graph.health.stale_indexer
-            )),
+            theme::label_value(
+                "generation",
+                snapshot.graph.health.graph_generation.to_string(),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "tokens",
+                snapshot.graph.health.token_count.to_string(),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "pools",
+                snapshot.graph.health.pool_count.to_string(),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "top degree",
+                snapshot.graph.health.top_out_degree.to_string(),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "stale indexer",
+                snapshot.graph.health.stale_indexer.to_string(),
+                if snapshot.graph.health.stale_indexer {
+                    crate::tui::app::Severity::Warn
+                } else {
+                    crate::tui::app::Severity::Good
+                },
+            ),
         ],
     );
 
@@ -54,7 +70,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .graph
             .protocol_counts
             .iter()
-            .map(|row| Line::from(format!("{}  {}", row.key, row.value)))
+            .map(|row| theme::label_value(row.key.clone(), row.value.clone(), row.severity))
             .collect(),
     );
 
@@ -66,14 +82,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .graph
             .recent_discoveries
             .iter()
-            .map(|row| Line::from(format!("{}  {}", row.key, row.value)))
+            .map(|row| theme::label_value(row.key.clone(), row.value.clone(), row.severity))
             .collect(),
     );
 }
 
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line>) {
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled(title, theme::title()),
+        ]))),
         area,
     );
 }

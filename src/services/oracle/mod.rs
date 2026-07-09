@@ -147,7 +147,6 @@ pub async fn enrich_token_to_matic_rates<P, I>(
     oracle: &PriceOracle,
     arena: &StateArena,
     tokens: I,
-    _decimals: &FxHashMap<Address, u8>,
     provider: Option<&P>,
 ) -> FxHashMap<TokenIndex, U256>
 where
@@ -170,7 +169,6 @@ pub async fn enrich_token_to_matic_rates_offline<I>(
     oracle: &PriceOracle,
     arena: &StateArena,
     tokens: I,
-    _decimals: &FxHashMap<Address, u8>,
 ) -> FxHashMap<TokenIndex, U256>
 where
     I: IntoIterator<Item = TokenIndex>,
@@ -208,17 +206,15 @@ fn build_token_to_matic_rates(
         let rate = if addr == wmatic {
             oracle.token_matic_rate_per_unit_integer(&wmatic)
         } else {
-            oracle
-                .token_matic_rate_per_unit_integer(&addr)
-                .or_else(|| {
-                    if matic_usd > 0.0 {
-                        oracle
-                            .token_usd(&addr)
-                            .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
-                    } else {
-                        None
-                    }
-                })
+            oracle.token_matic_rate_per_unit_integer(&addr).or_else(|| {
+                if matic_usd > 0.0 {
+                    oracle
+                        .token_usd(&addr)
+                        .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
+                } else {
+                    None
+                }
+            })
         }
         .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE);
         if let Some(rate) = rate {

@@ -123,16 +123,33 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
 }
 
 #[inline]
+fn hash_edge_hop(h: &mut FxHasher, edge: &Edge) {
+    use std::hash::Hasher;
+    h.write_u32(edge.pool_index.0);
+    h.write_u32(edge.token_in.0);
+    h.write_u32(edge.token_out.0);
+    h.write_u8(edge.token_in_idx);
+    h.write_u8(edge.token_out_idx);
+}
+
+/// Stable identity for one directed hop (pool + graph tokens + pool-local indices).
+#[inline]
+#[must_use]
+pub fn edge_hop_key(edge: &Edge) -> u64 {
+    use std::hash::Hasher;
+    let mut h = FxHasher::default();
+    hash_edge_hop(&mut h, edge);
+    h.finish()
+}
+
+/// Route fingerprint: ordered directed hops hashed with full pool-local direction.
+#[inline]
 #[must_use]
 pub fn cycle_key(edges: &[Edge]) -> u64 {
     use std::hash::Hasher;
     let mut h = FxHasher::default();
     for edge in edges {
-        h.write_u32(edge.pool_index.0);
-        h.write_u32(edge.token_in.0);
-        h.write_u32(edge.token_out.0);
-        h.write_u8(edge.token_in_idx);
-        h.write_u8(edge.token_out_idx);
+        hash_edge_hop(&mut h, edge);
     }
     h.finish()
 }
@@ -212,6 +229,27 @@ mod tests {
             score,
             cycle_ratio: U256::ZERO,
         }
+    }
+
+    #[test]
+    fn edge_hop_key_distinguishes_pool_local_direction() {
+        let mut forward = cycle(0.0, false);
+        forward.edges[0].token_in_idx = 1;
+        forward.edges[0].token_out_idx = 3;
+        let mut reverse = forward.clone();
+        reverse.edges[0].token_in_idx = 3;
+        reverse.edges[0].token_out_idx = 1;
+        assert_ne!(edge_hop_key(&forward.edges[0]), edge_hop_key(&reverse.edges[0]));
+    }
+
+    #[test]
+    fn hash_cycle_edges_matches_cycle_key() {
+        use crate::services::execution::candidate::hash_cycle_edges;
+        let a = cycle(-0.1, false);
+        let b = cycle(-0.2, true);
+        assert_eq!(hash_cycle_edges(&a.edges), cycle_key(&a.edges));
+        assert_eq!(hash_cycle_edges(&b.edges), cycle_key(&b.edges));
+        assert_ne!(hash_cycle_edges(&a.edges), hash_cycle_edges(&b.edges));
     }
 
     #[test]
