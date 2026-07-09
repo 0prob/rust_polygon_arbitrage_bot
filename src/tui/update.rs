@@ -309,7 +309,7 @@ fn build_graph_snapshot(
         .discovered_pools
         .iter()
         .rev()
-        .take(8)
+        .take(512)
         .map(|pool| KeyValueRow {
             key: pool.protocol_label.clone(),
             value: format!("{}  {}", short_address(pool.address), pool.pool_key),

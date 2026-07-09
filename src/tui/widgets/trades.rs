@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::tui::app::{App, Severity};
+use crate::tui::layout;
 use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -13,8 +14,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let len = app.trade_history.len();
-    let mut rows = Vec::with_capacity(len);
-    for (view_idx, trade) in app.trade_history.iter().rev().enumerate() {
+    let table_block = Block::default().borders(Borders::ALL).title(Line::from(vec![
+        Span::styled(" ", theme::muted()),
+        Span::styled(format!("Trades [{}]", len), theme::title()),
+    ]));
+    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let (start, end) = layout::table_viewport(len, app.selected_index, visible_rows);
+
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    for (view_idx, trade) in app
+        .trade_history
+        .iter()
+        .rev()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
         let selected = view_idx == app.selected_index;
         let style = if selected {
             theme::severity_style(Severity::Good)
@@ -59,14 +74,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from("profit"),
             Cell::from("tx hash"),
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::styled(" ", theme::muted()),
-                    Span::styled(format!("Trades [{}]", len), theme::title()),
-                ])),
-        ),
+        .block(table_block),
         chunks[0],
     );
 

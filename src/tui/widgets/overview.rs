@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use smallvec::SmallVec;
 
 use crate::tui::app::App;
+use crate::tui::layout;
 use crate::tui::theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
@@ -127,11 +128,18 @@ fn metric_card(
 }
 
 fn recent_activity(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items: SmallVec<[Line; 8]> = app
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Activity", theme::title()),
+        ]));
+    let max_lines = layout::inner_lines(&block, area);
+    let items: Vec<Line> = app
         .activity
         .iter()
         .rev()
-        .take(8)
+        .take(max_lines)
         .map(|item| {
             Line::from(vec![
                 Span::styled(format!("{:>5?}", item.at.elapsed()), theme::muted()),
@@ -140,18 +148,7 @@ fn recent_activity(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(items.as_slice())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Line::from(vec![
-                        Span::styled(" ", theme::muted()),
-                        Span::styled("Activity", theme::title()),
-                    ])),
-            ),
-        area,
-    );
+    frame.render_widget(Paragraph::new(items).block(block), area);
 }
 
 fn spark_panel(
@@ -234,11 +231,16 @@ fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::Das
 }
 
 fn history_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines: SmallVec<[Line; 6]> = app
+    let block = Block::default().borders(Borders::ALL).title(Line::from(vec![
+        Span::styled(" ", theme::muted()),
+        Span::styled("Trade history", theme::title()),
+    ]));
+    let max_lines = layout::inner_lines(&block, area);
+    let lines: Vec<Line> = app
         .trade_history
         .iter()
         .rev()
-        .take(6)
+        .take(max_lines)
         .map(|row| {
             Line::from(vec![
                 Span::styled(format!("{:x}", row.fingerprint), theme::muted()),
@@ -247,13 +249,5 @@ fn history_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines.as_slice()).block(Block::default().borders(Borders::ALL).title(
-            Line::from(vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Trade history", theme::title()),
-            ]),
-        )),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }

@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
+use crate::tui::layout;
 use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -26,13 +27,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let total = indices.len();
-    let table_height = chunks[0].height as usize;
-    let visible_rows = table_height.saturating_sub(4).max(1);
-    let start = app
-        .selected_index
-        .saturating_sub(visible_rows / 2)
-        .min(total.saturating_sub(1));
-    let end = (start + visible_rows).min(total);
+    let table_block = Block::default().borders(Borders::ALL);
+    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let (start, end) = layout::table_viewport(total, app.selected_index, visible_rows);
+    let table_block = table_block.title(format!(
+        "Opportunities [{} / {}] filter: {} | sort: {:?}",
+        if total == 0 { 0 } else { start + 1 },
+        total,
+        if app.search.is_empty() {
+            "none"
+        } else {
+            &app.search
+        },
+        app.sort_mode,
+    ));
 
     let mut table_rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
     for (idx, &route_idx) in indices[start..end].iter().enumerate() {
@@ -97,17 +105,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Cell::from("net"),
                 Cell::from("risk"),
             ]))
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                "Opportunities [{} / {}] filter: {} | sort: {:?}",
-                start + 1,
-                total,
-                if app.search.is_empty() {
-                    "none"
-                } else {
-                    &app.search
-                },
-                app.sort_mode,
-            )))
+            .block(table_block)
             .row_highlight_style(theme::accent()),
         chunks[0],
     );

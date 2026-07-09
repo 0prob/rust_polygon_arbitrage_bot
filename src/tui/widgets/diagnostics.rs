@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::app::App;
+use crate::tui::layout;
 use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -21,18 +22,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    let left = snapshot
+    let left_block = Block::default().borders(Borders::ALL).title(Line::from(vec![
+        Span::styled(" ", theme::muted()),
+        Span::styled("Health", theme::title()),
+    ]));
+    let max_lines = layout::inner_lines(&left_block, chunks[0]);
+    let left: Vec<Line> = snapshot
         .diagnostics
         .iter()
+        .take(max_lines)
         .map(|row| theme::label_value(row.key.clone(), row.value.clone(), row.severity))
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(left).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Health", theme::title()),
-        ]))),
-        chunks[0],
-    );
+        .collect();
+    frame.render_widget(Paragraph::new(left).block(left_block), chunks[0]);
 
     let right = vec![
         theme::label_value(
