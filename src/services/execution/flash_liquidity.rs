@@ -148,6 +148,11 @@ impl FlashLiquidityCache {
             .is_some_and(|e| e.fetched_at.elapsed() < self.ttl)
     }
 
+    /// Drop cached liquidity so the next HF tick re-fetches (e.g. after ReserveInactive).
+    pub fn invalidate(&self, token: Address) {
+        self.entries.write().remove(&token);
+    }
+
     pub async fn refresh<P: Provider<Ethereum> + Clone + Send + 'static>(
         &self,
         provider: &P,
@@ -541,25 +546,6 @@ fn flash_liquidity_for_cycle(
     })
 }
 
-fn policy_fallback_flash_source(
-    policy: FlashLoanPolicy,
-    forbid_balancer: bool,
-    balancer_only: bool,
-) -> FlashLoanSource {
-    if forbid_balancer {
-        if balancer_only {
-            FlashLoanSource::Direct
-        } else {
-            FlashLoanSource::AaveV3
-        }
-    } else {
-        match policy {
-            FlashLoanPolicy::AaveOnly => FlashLoanSource::AaveV3,
-            FlashLoanPolicy::Auto | FlashLoanPolicy::BalancerOnly => FlashLoanSource::Balancer,
-        }
-    }
-}
-
 /// Flash loan source for eval/ranking at a concrete borrow size (probe or optimal `amount_in`).
 #[must_use]
 pub fn resolve_flash_source_for_cycle(
@@ -579,17 +565,21 @@ pub fn resolve_flash_source_for_cycle(
     let plan = plan_flash_loan(policy, amount_in, liquidity, forbid, balancer_only);
     match plan.action {
         FlashPlanAction::Reject => {
-            if flash_liquidity.has_fresh_entry(start_addr) {
-                crate::debug!(
-                    "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={} dodo={}",
-                    liquidity.balancer,
-                    liquidity.aave,
-                    liquidity.aave_listed,
-                    liquidity.dodo,
-                );
-                None
+            // ponytail: no optimistic Aave/Balancer fallback when cache is cold — caused
+            // AaveReserveInactive dry-runs after failed flash refresh (RPC rate limits).
+            if balancer_only && forbid {
+                Some(FlashLoanSource::Direct)
             } else {
-                Some(policy_fallback_flash_source(policy, forbid, balancer_only))
+                if flash_liquidity.has_fresh_entry(start_addr) {
+                    crate::debug!(
+                        "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={} dodo={}",
+                        liquidity.balancer,
+                        liquidity.aave,
+                        liquidity.aave_listed,
+                        liquidity.dodo,
+                    );
+                }
+                None
             }
         }
         _ => Some(plan.source),
@@ -1140,6 +1130,23 @@ mod tests {
             thresholds.min_profit_matic_wei,
             U256::from(30_000_000_000_000_000u64)
         );
+    }
+
+    #[test]
+    fn reject_without_fresh_cache_returns_none_for_aave_routes() {
+        let cache = FlashLiquidityCache::new();
+        let token = Address::repeat_byte(0xab);
+        let liquidity = cache.snapshot(token);
+        assert!(!liquidity.aave_listed);
+        let plan = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1_000u64),
+            liquidity,
+            false,
+            false,
+        );
+        assert_eq!(plan.action, FlashPlanAction::Reject);
+        assert!(!cache.has_fresh_entry(token));
     }
 
     #[test]

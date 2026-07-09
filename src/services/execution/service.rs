@@ -725,6 +725,12 @@ impl ExecutionService {
                     ..
                 }) if final_balance.is_zero()
             );
+            if matches!(
+                dry.decoded_revert,
+                Some(DecodedRevert::AaveReserveInactive)
+            ) {
+                self.flash_liquidity.invalidate(candidate.profit_token);
+            }
             if sim_fidelity_miss {
                 self.quarantine_route_soft(fp, now);
             } else {

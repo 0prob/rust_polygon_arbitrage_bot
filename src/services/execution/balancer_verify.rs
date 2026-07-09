@@ -41,12 +41,23 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(BALANCER_VAULT)
         .input(call.abi_encode().into());
-    let output = timeout(QUERY_TIMEOUT, provider.call(tx))
-        .await
-        .ok()?
-        .ok()?;
+    let output = match timeout(QUERY_TIMEOUT, provider.call(tx)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            crate::debug!("queryBatchSwap RPC error: {e:#}");
+            return None;
+        }
+        Err(_) => {
+            crate::debug!("queryBatchSwap timed out after {}s", QUERY_TIMEOUT.as_secs());
+            return None;
+        }
+    };
     let deltas = IBalancerVault::queryBatchSwapCall::abi_decode_returns(&output).ok()?;
-    positive_delta(deltas.get(idx).copied()?)
+    let delta = deltas.get(idx).copied()?;
+    positive_delta(delta).or_else(|| {
+        crate::debug!("queryBatchSwap non-positive delta for profit token: {delta}");
+        None
+    })
 }
 
 /// Reject Direct routes when vault simulation shows less profit than calldata minProfit floor.
