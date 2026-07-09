@@ -258,19 +258,25 @@ fn decode_balance(bytes: Option<&Option<alloy::primitives::Bytes>>) -> U256 {
         .map_or(U256::ZERO, U256::from)
 }
 
-/// Aave V3 `ReserveConfiguration` flags — inactive/frozen/paused reserves revert with
-/// `ReserveInactive()` (selector `0x90cd6f24`) on flash loan.
+/// Aave V3 `ReserveConfigurationMap` bit positions (see Pool.sol / ReserveConfiguration.sol).
+const AAVE_CFG_ACTIVE_BIT: u32 = 56;
+const AAVE_CFG_FROZEN_BIT: u32 = 57;
+const AAVE_CFG_PAUSED_BIT: u32 = 60;
+const AAVE_CFG_FLASH_BIT: u32 = 63;
+
+#[inline]
+fn aave_cfg_bit_set(configuration: U256, bit: u32) -> bool {
+    (configuration >> bit) & U256::from(1) != U256::ZERO
+}
+
+/// Active, unfrozen, unpaused, flash-loan-enabled — else flash reverts `ReserveInactive()`.
 #[inline]
 #[must_use]
 fn aave_reserve_flash_eligible(configuration: U256) -> bool {
-    const ACTIVE: u128 = 1;
-    const FROZEN: u128 = 2;
-    const PAUSED: u128 = 16;
-    const FLASHLOAN_ENABLED: u128 = 128;
-    (configuration & U256::from(ACTIVE)) != U256::ZERO
-        && (configuration & U256::from(FROZEN)) == U256::ZERO
-        && (configuration & U256::from(PAUSED)) == U256::ZERO
-        && (configuration & U256::from(FLASHLOAN_ENABLED)) != U256::ZERO
+    aave_cfg_bit_set(configuration, AAVE_CFG_ACTIVE_BIT)
+        && !aave_cfg_bit_set(configuration, AAVE_CFG_FROZEN_BIT)
+        && !aave_cfg_bit_set(configuration, AAVE_CFG_PAUSED_BIT)
+        && aave_cfg_bit_set(configuration, AAVE_CFG_FLASH_BIT)
 }
 
 /// True when the route swaps through the Balancer vault (not just pool flash liquidity).
@@ -1089,10 +1095,15 @@ mod tests {
 
     #[test]
     fn aave_reserve_flash_eligible_requires_active_and_flash_enabled() {
-        assert!(aave_reserve_flash_eligible(U256::from(0x81))); // active + flash
-        assert!(!aave_reserve_flash_eligible(U256::ZERO)); // inactive
-        assert!(!aave_reserve_flash_eligible(U256::from(0x80))); // flash but inactive
-        assert!(!aave_reserve_flash_eligible(U256::from(0x83))); // active+flash but frozen
+        let active_flash =
+            U256::from(1u128 << AAVE_CFG_ACTIVE_BIT) | U256::from(1u128 << AAVE_CFG_FLASH_BIT);
+        assert!(aave_reserve_flash_eligible(active_flash));
+        assert!(!aave_reserve_flash_eligible(U256::ZERO));
+        assert!(!aave_reserve_flash_eligible(U256::from(1u128 << AAVE_CFG_FLASH_BIT)));
+        let frozen = active_flash | U256::from(1u128 << AAVE_CFG_FROZEN_BIT);
+        assert!(!aave_reserve_flash_eligible(frozen));
+        let paused = active_flash | U256::from(1u128 << AAVE_CFG_PAUSED_BIT);
+        assert!(!aave_reserve_flash_eligible(paused));
     }
 
     #[test]
