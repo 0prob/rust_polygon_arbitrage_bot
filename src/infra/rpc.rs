@@ -28,6 +28,7 @@ pub struct RpcPool {
     submit_providers: Arc<Mutex<FxHashMap<(String, Address), DynProvider>>>,
     polygon_validated_urls: Arc<Mutex<FxHashSet<String>>>,
     validated_executors: Arc<Mutex<FxHashSet<(String, Address)>>>,
+    failed_executors: Arc<Mutex<FxHashSet<(String, Address)>>>,
     state_url_penalties: Arc<RwLock<FxHashMap<String, Instant>>>,
 }
 
@@ -92,6 +93,7 @@ impl RpcPool {
             submit_providers: Arc::new(Mutex::new(FxHashMap::default())),
             polygon_validated_urls: Arc::new(Mutex::new(FxHashSet::default())),
             validated_executors: Arc::new(Mutex::new(FxHashSet::default())),
+            failed_executors: Arc::new(Mutex::new(FxHashSet::default())),
             state_url_penalties: Arc::new(RwLock::new(FxHashMap::default())),
         }
     }
@@ -347,15 +349,22 @@ impl RpcPool {
         self.validate_polygon_endpoint(&url, &provider).await?;
 
         let key = (url.clone(), executor);
+        if self.failed_executors.lock().contains(&key) {
+            anyhow::bail!("no executor bytecode at {executor} on Polygon");
+        }
         if !self.validated_executors.lock().contains(&key) {
             let code = provider
                 .get_code_at(executor)
                 .await
                 .with_context(|| format!("executor code check failed for {executor}"))?;
-            anyhow::ensure!(
-                !code.is_empty(),
-                "no executor bytecode at {executor} on Polygon"
-            );
+            if code.is_empty() {
+                if self.failed_executors.lock().insert(key) {
+                    crate::warn!(
+                        "executor bytecode missing at {executor} on Polygon; dispatch disabled until redeploy + restart"
+                    );
+                }
+                anyhow::bail!("no executor bytecode at {executor} on Polygon");
+            }
             self.validated_executors.lock().insert(key);
         }
         Ok(provider)

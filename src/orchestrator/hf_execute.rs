@@ -94,7 +94,12 @@ pub async fn dispatch_profitable_candidates(
         match ctx.rpc.connect_simulation_checked(executor).await {
             Ok(p) => p,
             Err(e) => {
-                crate::warn!("dispatch skipped: simulation RPC/executor check failed: {e:#}");
+                let msg = format!("{e:#}");
+                if msg.contains("no executor bytecode") {
+                    crate::debug!("dispatch skipped: {msg}");
+                } else {
+                    crate::warn!("dispatch skipped: simulation RPC/executor check failed: {msg}");
+                }
                 return;
             }
         }

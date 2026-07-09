@@ -10,6 +10,8 @@ flash_loan_source = "auto"
 # 300: Larger pool for more cycle diversity. LF runs in background with try_lock.
 enumeration_max_paths = 500
 max_hops = 4
+# More Brent iterations reduces probe-only near-misses on flat profit curves.
+ternary_search_iterations = 18
 
 [pipeline]
 # Hot-pool WSS patches; requires WSS_URL or POLYGON_WSS_URLS in .env
