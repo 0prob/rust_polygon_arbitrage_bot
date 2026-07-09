@@ -20,14 +20,15 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, max_flash_borrow_wei, min_economic_amount_in,
+    SimSanityInput, check_sim_sanity, max_flash_borrow_wei,
 };
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::profit::{
-    AssessmentGas, ProfitEvalContext, ProfitThresholds, RouteAssessRequest, assess_route_from_sim,
+    AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
+    route_profit_thresholds,
 };
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 
@@ -559,20 +560,23 @@ fn policy_fallback_flash_source(
     }
 }
 
-/// Flash loan source for eval/ranking. Uses cached liquidity when present; defers
-/// strict sizing checks to `prepare_evaluated_route` when the cache has not warmed yet.
+/// Flash loan source for eval/ranking at a concrete borrow size (probe or optimal `amount_in`).
 #[must_use]
 pub fn resolve_flash_source_for_cycle(
     cycle: &FoundCycle,
     arena: &StateArena,
     flash_liquidity: &FlashLiquidityCache,
     policy: FlashLoanPolicy,
+    amount_in: U256,
 ) -> Option<FlashLoanSource> {
+    if amount_in.is_zero() {
+        return None;
+    }
     let start_addr = arena.token_address(cycle.start_token)?;
     let liquidity = flash_liquidity_for_cycle(cycle, arena, flash_liquidity)?;
     let forbid = route_uses_balancer_vault_swap(cycle);
     let balancer_only = route_is_balancer_only(cycle);
-    let plan = plan_flash_loan(policy, U256::from(1u64), liquidity, forbid, balancer_only);
+    let plan = plan_flash_loan(policy, amount_in, liquidity, forbid, balancer_only);
     match plan.action {
         FlashPlanAction::Reject => {
             if flash_liquidity.has_fresh_entry(start_addr) {
@@ -645,8 +649,10 @@ pub struct PrepareDispatchInput<'a> {
     pub profit_priority_alpha_bps: u64,
     pub route_fingerprint: u64,
     pub gas_oracle: &'a GasOracle,
-    /// Reuse HF assessment when dispatch state matches eval (skips reassess).
-    pub existing_assessment: Option<ProfitAssessment>,
+    /// Brent/probe search_low from HF eval — must match validate_optimized_sim.
+    pub search_low: U256,
+    /// Learned route risk multiplier applied to min-profit thresholds (matches HF eval).
+    pub risk_multiplier_bps: u64,
 }
 
 pub struct PreparedDispatch {
@@ -715,11 +721,15 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
             if !dispatch_sim_passes_sanity(
                 input,
                 &input.evaluated.result,
-                min_economic_amount_in(token_decimals, token_to_matic_rate),
+                input.search_low,
                 token_decimals,
                 token_to_matic_rate,
             ) {
-                crate::debug!("prepare skip: dispatch sim sanity rejected");
+                crate::debug!(
+                    "prepare skip: dispatch sim sanity rejected (search_low={} amount_in={amount_in} profit={})",
+                    input.search_low,
+                    input.evaluated.result.profit,
+                );
                 return None;
             }
             if plan.source == FlashLoanSource::Balancer
@@ -732,10 +742,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 );
                 return reoptimize_capped(input, plan.source, liquidity.balancer);
             }
-            let assessment = input
-                .existing_assessment
-                .clone()
-                .or_else(|| reassess_route(input, plan.source))?;
+            let assessment = reassess_route(input, plan.source)?;
             if !assessment.should_execute {
                 crate::debug!(
                     "prepare skip: reassess rejected ({})",
@@ -836,12 +843,7 @@ fn reoptimize_capped(
             oracle: input.gas_oracle,
             route_fp: input.route_fingerprint,
         },
-        thresholds: ProfitThresholds {
-            min_profit_matic_wei: input.min_profit_matic,
-            min_profit_roi_bps: input.min_profit_roi_bps,
-            safety_multiplier_bps: input.safety_multiplier_bps,
-            profit_priority_alpha_bps: input.profit_priority_alpha_bps,
-        },
+        thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
@@ -857,6 +859,16 @@ fn reoptimize_capped(
         flash_source: source,
         liquidity_cap_applied: true,
     })
+}
+
+fn prepare_profit_thresholds(input: &PrepareDispatchInput<'_>) -> crate::services::execution::profit::ProfitThresholds {
+    route_profit_thresholds(
+        input.min_profit_matic,
+        input.min_profit_roi_bps,
+        input.safety_multiplier_bps,
+        input.profit_priority_alpha_bps,
+        input.risk_multiplier_bps,
+    )
 }
 
 fn dispatch_sim_passes_sanity(
@@ -927,12 +939,7 @@ fn reassess_route(
             oracle: input.gas_oracle,
             route_fp: input.route_fingerprint,
         },
-        thresholds: ProfitThresholds {
-            min_profit_matic_wei: input.min_profit_matic,
-            min_profit_roi_bps: input.min_profit_roi_bps,
-            safety_multiplier_bps: input.safety_multiplier_bps,
-            profit_priority_alpha_bps: input.profit_priority_alpha_bps,
-        },
+        thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
@@ -1071,6 +1078,43 @@ mod tests {
         assert!(!aave_reserve_flash_eligible(U256::ZERO)); // inactive
         assert!(!aave_reserve_flash_eligible(U256::from(0x80))); // flash but inactive
         assert!(!aave_reserve_flash_eligible(U256::from(0x83))); // active+flash but frozen
+    }
+
+    #[test]
+    fn flash_source_at_economic_probe_differs_from_unit_probe() {
+        let liquidity = TokenFlashLiquidity {
+            balancer: U256::from(500u64),
+            aave: U256::from(10_000u64),
+            aave_listed: true,
+            dodo: U256::ZERO,
+        };
+        let unit = plan_flash_loan(FlashLoanPolicy::Auto, U256::from(1u64), liquidity, false, false);
+        let economic = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1_000u64),
+            liquidity,
+            false,
+            false,
+        );
+        assert_eq!(unit.source, FlashLoanSource::Balancer);
+        assert_eq!(unit.action, FlashPlanAction::Direct);
+        assert_eq!(economic.source, FlashLoanSource::AaveV3);
+        assert_eq!(economic.action, FlashPlanAction::Direct);
+    }
+
+    #[test]
+    fn prepare_thresholds_apply_route_risk_multiplier() {
+        let thresholds = route_profit_thresholds(
+            U256::from(10_000_000_000_000_000u64),
+            0,
+            10_000,
+            0,
+            30_000,
+        );
+        assert_eq!(
+            thresholds.min_profit_matic_wei,
+            U256::from(30_000_000_000_000_000u64)
+        );
     }
 
     #[test]

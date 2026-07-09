@@ -197,9 +197,21 @@ fn cycle_flash_evaluable(
     arena: &StateArena,
     flash_liquidity: &FlashLiquidityCache,
     flash_policy: FlashLoanPolicy,
+    token_decimals: &FxHashMap<Address, u8>,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) -> bool {
+    let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
+    let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
+    let economic = min_economic_amount_in(decimals, rate);
     balancer_route_flash_feasible(cycle, arena, flash_liquidity)
-        && resolve_flash_source_for_cycle(cycle, arena, flash_liquidity, flash_policy).is_some()
+        && resolve_flash_source_for_cycle(
+            cycle,
+            arena,
+            flash_liquidity,
+            flash_policy,
+            economic,
+        )
+        .is_some()
 }
 
 /// Score-ranked fallback when probe ranking yields nothing simulatable at Brent size.
@@ -217,7 +229,14 @@ fn simulatable_score_fallback(
         .filter_map(|cycle| {
             let ready = prefer_aave_flash_start(cycle, arena, flash_liquidity);
             if cycle_simulatable(arena, &ready, token_decimals, token_to_matic_rates)
-                && cycle_flash_evaluable(&ready, arena, flash_liquidity, flash_policy)
+                && cycle_flash_evaluable(
+                    &ready,
+                    arena,
+                    flash_liquidity,
+                    flash_policy,
+                    token_decimals,
+                    token_to_matic_rates,
+                )
             {
                 Some(ready.into_owned())
             } else {
@@ -303,12 +322,6 @@ pub fn rank_cycles_by_probe_net(
             skip.flash += 1;
             continue;
         }
-        let Some(flash_source) =
-            resolve_flash_source_for_cycle(&cycle, arena, flash_liquidity, flash_policy)
-        else {
-            skip.flash_source += 1;
-            continue;
-        };
         let start_decimals =
             resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
         let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
@@ -320,6 +333,16 @@ pub fn rank_cycles_by_probe_net(
             } else {
                 skip.probe += 1;
             }
+            continue;
+        };
+        let Some(flash_source) = resolve_flash_source_for_cycle(
+            &cycle,
+            arena,
+            flash_liquidity,
+            flash_policy,
+            probe_amount,
+        ) else {
+            skip.flash_source += 1;
             continue;
         };
 
@@ -372,7 +395,14 @@ pub fn rank_cycles_by_probe_net(
 
     rescue.retain(|cycle| {
         cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
-            && cycle_flash_evaluable(cycle, arena, flash_liquidity, flash_policy)
+            && cycle_flash_evaluable(
+                cycle,
+                arena,
+                flash_liquidity,
+                flash_policy,
+                token_decimals,
+                token_to_matic_rates,
+            )
     });
     let rescue_len = rescue.len();
     let had_net_ranked = !profitable_ranked.is_empty();
@@ -394,7 +424,14 @@ pub fn rank_cycles_by_probe_net(
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
                 if seen.insert(fp)
-                    && cycle_flash_evaluable(cycle, arena, flash_liquidity, flash_policy)
+                    && cycle_flash_evaluable(
+                        cycle,
+                        arena,
+                        flash_liquidity,
+                        flash_policy,
+                        token_decimals,
+                        token_to_matic_rates,
+                    )
                 {
                     kept.push(cycle.clone());
                 }
@@ -714,18 +751,25 @@ fn evaluate_one(
         inc(&stats.flash);
         return None;
     }
-    let Some(flash_source) = resolve_flash_source_for_cycle(
+    let probe_seed = probe_seeds.get(&fp).map(|(amount, sim)| (*amount, *sim));
+    let base_slippage = input.slippage_bps;
+    let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
+    let start_decimals =
+        resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
+    let start_rate = resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
+    let brent_probe_amount = probe_seed
+        .map(|(amount, _)| amount)
+        .unwrap_or_else(|| min_economic_amount_in(start_decimals, start_rate));
+    let Some(flash_source_brent) = resolve_flash_source_for_cycle(
         cycle,
         input.arena,
         input.flash_liquidity,
         input.flash_policy,
+        brent_probe_amount,
     ) else {
         inc(&stats.flash_source);
         return None;
     };
-    let probe_seed = probe_seeds.get(&fp).map(|(amount, sim)| (*amount, *sim));
-    let base_slippage = input.slippage_bps;
-    let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
@@ -733,7 +777,7 @@ fn evaluate_one(
         input.token_decimals,
         input.gas_price,
         base_slippage,
-        flash_source,
+        flash_source_brent,
         input.safety_multiplier_bps,
     );
     // Match probe ranking: pre-resolve route gas, do not scale twice in Brent.
@@ -803,6 +847,16 @@ fn evaluate_one(
         }
     };
 
+    let Some(flash_source) = resolve_flash_source_for_cycle(
+        cycle,
+        input.arena,
+        input.flash_liquidity,
+        input.flash_policy,
+        opt.optimal_input,
+    ) else {
+        inc(&stats.flash_source);
+        return None;
+    };
     let mut depth_bps = depth_impact_slippage_bps_with_base(
         input.arena,
         &cycle.edges,

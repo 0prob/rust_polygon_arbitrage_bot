@@ -206,7 +206,7 @@ pub fn build_execution_candidate(
         token_decimals: config.token_decimals,
         token_to_matic_rate: config.token_to_matic_rate,
         slippage_bps: config.slippage_bps,
-        flash_loan_source: config.flash_loan_source,
+        flash_loan_source: dispatch_flash_source,
         min_profit_matic_wei: config.min_profit_matic_wei,
         min_profit_roi_bps: config.min_profit_roi_bps,
         hop_count: evaluated.cycle.hop_count,
@@ -320,6 +320,14 @@ mod tests {
             resolve_executor_entrypoint(FlashLoanSource::Balancer, &hops),
             ExecutorEntrypoint::BalancerFlash
         );
+    }
+
+    #[test]
+    fn candidate_stores_dispatch_flash_source_not_config_source() {
+        let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
+        let (dispatch, _) = resolve_dispatch(FlashLoanSource::Balancer, &hops);
+        assert_eq!(dispatch, FlashLoanSource::AaveV3);
+        assert_ne!(dispatch, FlashLoanSource::Balancer);
     }
 
     #[test]

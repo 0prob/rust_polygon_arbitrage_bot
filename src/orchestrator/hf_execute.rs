@@ -351,6 +351,9 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     let liquidity = ctx.execution.flash_liquidity.snapshot(start_token_addr);
     let slippage_bps = evaluated.effective_slippage_bps.max(base_slippage_bps);
+    let search_low = evaluated.opt.search_low;
+    let sim_amount_in = evaluated.sim.amount_in;
+    let sim_profit = evaluated.sim.profit;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
         evaluated.cycle,
         evaluated.sim,
@@ -374,13 +377,16 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         route_fingerprint: fp,
         gas_oracle: &ctx.gas_oracle,
-        existing_assessment: if pools_refreshed {
-            None
-        } else {
-            evaluated.assessment.clone()
-        },
+        search_low,
+        risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
     }) else {
         skipped.record("prepare");
+        if ctx.execution.should_log_prepare_skip(fp) {
+            crate::info!(
+                "prepare skip: fp={fp} search_low={search_low} amount_in={sim_amount_in} profit={sim_profit} pools_refreshed={pools_refreshed}",
+            );
+            ctx.execution.record_prepare_skip(fp);
+        }
         return;
     };
 

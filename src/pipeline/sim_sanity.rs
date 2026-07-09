@@ -156,6 +156,31 @@ mod tests {
     }
 
     #[test]
+    fn hf_search_low_must_match_dispatch_for_pinned_optimizer() {
+        let rate = U256::from(10u128.pow(18));
+        let economic = min_economic_amount_in(18, rate);
+        let amount_in = economic;
+        let profit = amount_in / U256::from(5u64);
+        let hf_search_low = amount_in / U256::from(100u64);
+        let input = SimSanityInput {
+            amount_in,
+            gross_profit: profit,
+            search_low: hf_search_low,
+            token_decimals: 18,
+            token_to_matic_rate: rate,
+        };
+        assert!(check_sim_sanity(input).is_ok());
+        let dispatch_mismatch = SimSanityInput {
+            search_low: economic,
+            ..input
+        };
+        assert!(matches!(
+            check_sim_sanity(dispatch_mismatch),
+            Err(SimSanityReject::OptimizerPinnedAtFloor)
+        ));
+    }
+
+    #[test]
     fn max_flash_borrow_scales_with_rate() {
         let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18))).expect("cap");
         assert_eq!(cap, U256::from(50_000u64) * ONE);

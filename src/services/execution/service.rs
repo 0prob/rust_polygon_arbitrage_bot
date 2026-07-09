@@ -43,6 +43,7 @@ use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit
 use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
+const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 5;
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -130,6 +131,8 @@ pub struct ExecutionService {
     _route_stats_path: PathBuf,
     last_near_miss_log: Mutex<Option<(u64, U256)>>,
     last_dispatch_log: Mutex<Option<(u64, U256)>>,
+    last_prepare_skip_log: Mutex<Option<u64>>,
+    prepare_skip_counts: RwLock<FxHashMap<u64, u32>>,
     pub route_sim_cache: Arc<crate::pipeline::route_sim_cache::RouteSimCache>,
     route_stats_writer: RouteStatsWriter,
     cached_chain_id: Mutex<Option<u64>>,
@@ -250,6 +253,8 @@ impl ExecutionService {
             _route_stats_path: route_stats_path.clone(),
             last_near_miss_log: Mutex::new(None),
             last_dispatch_log: Mutex::new(None),
+            last_prepare_skip_log: Mutex::new(None),
+            prepare_skip_counts: RwLock::new(FxHashMap::default()),
             route_sim_cache: Arc::new(crate::pipeline::route_sim_cache::RouteSimCache::new()),
             route_stats_writer: RouteStatsWriter::spawn(route_stats_path),
             cached_chain_id: Mutex::new(None),
@@ -453,6 +458,30 @@ impl ExecutionService {
         }
         *last = Some((fingerprint, profit_matic));
         true
+    }
+
+    /// Log prepare skip once per fingerprint until it changes.
+    pub fn should_log_prepare_skip(&self, fingerprint: u64) -> bool {
+        let mut last = self.last_prepare_skip_log.lock();
+        if *last == Some(fingerprint) {
+            return false;
+        }
+        *last = Some(fingerprint);
+        true
+    }
+
+    /// Cool down routes that repeatedly fail dispatch prepare after HF marked profitable.
+    pub fn record_prepare_skip(&self, fingerprint: u64) {
+        let count = {
+            let mut counts = self.prepare_skip_counts.write();
+            let count = counts.entry(fingerprint).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if count >= PREPARE_SKIP_QUARANTINE_AFTER {
+            self.quarantine_route_soft(fingerprint, Instant::now());
+            self.prepare_skip_counts.write().remove(&fingerprint);
+        }
     }
 
     fn quarantine_route(&self, fp: u64, now: Instant, kind: RouteFailureKind) {

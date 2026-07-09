@@ -617,13 +617,11 @@ impl App {
             profit_wei,
             severity,
         });
-        self.push_activity(
-            severity,
-            format!("route {route_fingerprint:x}: {outcome_label}"),
-        );
+        // ponytail: outcome_label only; fingerprint visible in Trade History panel
+        self.push_activity(severity, outcome_label);
     }
 
-    pub fn apply_lf_sample(&mut self, cycles: usize, search_ms: u64, discoveries: usize) {
+    pub fn apply_lf_sample(&mut self, cycles: usize, search_ms: u64, _discoveries: usize) {
         self.last_cycle_count = cycles;
         self.last_search_ms = search_ms;
         if let Some(snapshot) = self.snapshot.as_mut() {
@@ -632,10 +630,7 @@ impl App {
         }
         push_series(&mut self.chart_cycles, cycles as u64, 120);
         push_series(&mut self.chart_search_ms, search_ms, 120);
-        self.push_activity(
-            Severity::Info,
-            format!("LF cycles={cycles} discoveries={discoveries} search={search_ms}ms"),
-        );
+        // LF metrics on Freshness card + sparklines; activity would be redundant
     }
 
     pub fn apply_hf_sample(
@@ -654,11 +649,7 @@ impl App {
             snapshot.overview.hf_ms = elapsed_ms;
         }
         push_series(&mut self.chart_profitable, profitable_count as u64, 120);
-        let best = format_matic_wei_label(best_profit_wei);
-        self.push_activity(
-            Severity::Info,
-            format!("HF cycles={cycles_considered} profitable={profitable_count} best={best}"),
-        );
+        // ponytail: HF metrics on Yielding card + sparkline; activity would be redundant
     }
 
     pub fn apply_gas_sample(&mut self, gwei: f64) {
@@ -674,12 +665,6 @@ fn push_series(series: &mut VecDeque<u64>, value: u64, cap: usize) {
         series.pop_front();
     }
     series.push_back(value);
-}
-
-fn format_matic_wei_label(wei: &str) -> String {
-    wei.parse::<u128>()
-        .map(|v| format!("{:.4} MATIC", v as f64 / 1e18))
-        .unwrap_or_else(|_| wei.to_string())
 }
 
 #[cfg(test)]
