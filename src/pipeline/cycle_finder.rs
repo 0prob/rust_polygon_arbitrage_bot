@@ -324,10 +324,8 @@ fn can_still_be_profitable_u256(
     max_outgoing_ratio: &[U256],
     global_max_ratio: U256,
 ) -> bool {
-    if product_ratio > ONE {
-        if product_ratio >= min_profitable_cycle_ratio(hops) {
-            return true;
-        }
+    if product_ratio > ONE && product_ratio >= min_profitable_cycle_ratio(hops) {
+        return true;
     }
     let remaining = hop_cap.saturating_sub(hops);
     if remaining == 0 {

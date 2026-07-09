@@ -36,8 +36,7 @@ impl PipelineSurvival {
         let cached = count_cache_stage(pools, cache, false);
         let tradable = count_cache_stage(pools, cache, true);
         let arena = count_metas(pool_metas);
-        let graph_counts = count_graph_pools(pool_metas, graph);
-        let arena_no_graph = count_arena_no_graph(pool_metas, graph);
+        let (graph_counts, arena_no_graph) = count_graph_partition(pool_metas, graph);
         let cycle_capable = count_cycle_capable_pools(pool_metas, graph);
         Self {
             discovered,
@@ -187,28 +186,21 @@ fn pool_has_graph_edges(meta: &PoolMeta, graph: &RoutingGraph) -> bool {
     graph.pool_has_live_edges(meta.pool_index)
 }
 
-fn count_arena_no_graph(metas: &[PoolMeta], graph: &RoutingGraph) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
+fn count_graph_partition(
+    metas: &[PoolMeta],
+    graph: &RoutingGraph,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut graph_counts = BTreeMap::new();
+    let mut arena_no_graph = BTreeMap::new();
     for meta in metas {
+        let label = meta_label(meta);
         if pool_has_graph_edges(meta, graph) {
-            continue;
+            *graph_counts.entry(label).or_default() += 1;
+        } else {
+            *arena_no_graph.entry(label).or_default() += 1;
         }
-        let label = meta_label(meta);
-        *counts.entry(label).or_default() += 1;
     }
-    counts
-}
-
-fn count_graph_pools(metas: &[PoolMeta], graph: &RoutingGraph) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for meta in metas {
-        if !pool_has_graph_edges(meta, graph) {
-            continue;
-        }
-        let label = meta_label(meta);
-        *counts.entry(label).or_default() += 1;
-    }
-    counts
+    (graph_counts, arena_no_graph)
 }
 
 fn count_cycle_capable_pools(metas: &[PoolMeta], graph: &RoutingGraph) -> BTreeMap<String, usize> {
