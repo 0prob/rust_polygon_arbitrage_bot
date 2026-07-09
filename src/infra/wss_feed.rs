@@ -15,6 +15,7 @@ use alloy::pubsub::Subscription;
 use alloy::rpc::types::Filter;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 /// Max pool addresses per `eth_subscribe` filter (provider limits vary; 50 is conservative).
 const SUBSCRIBE_CHUNK: usize = 50;
@@ -24,8 +25,10 @@ const SUBSCRIBE_CHUNK: usize = 50;
 const BASE_RECONNECT_DELAY_MS: u64 = 100;
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
-/// Silence timeout: if no log arrives within this window, the connection is considered stale.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Silence timeout: if no log or ping succeeds within this window, reconnect.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// RPC ping interval — keeps the WS alive when subscribed pools are quiet.
+const WSS_PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Per-endpoint connect + `eth_blockNumber` probe budget.
 const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,6 +171,17 @@ impl PoolLogFeed {
                         return Ok(());
                     };
                     self.handle_log(&log);
+                }
+                () = tokio::time::sleep(WSS_PING_INTERVAL) => {
+                    if timeout(WSS_PROBE_TIMEOUT, provider.get_block_number())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .is_none()
+                    {
+                        warn!("WSS ping failed ({wss_url}), reconnecting...");
+                        return Ok(());
+                    }
                 }
                 () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
                     warn!("WSS feed idle timeout ({wss_url}), reconnecting...");

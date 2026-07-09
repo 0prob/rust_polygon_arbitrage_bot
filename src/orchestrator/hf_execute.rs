@@ -352,14 +352,13 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     let liquidity = ctx.execution.flash_liquidity.snapshot(start_token_addr);
     let slippage_bps = evaluated.effective_slippage_bps.max(base_slippage_bps);
     let search_low = evaluated.opt.search_low;
-    let sim_amount_in = evaluated.sim.amount_in;
-    let sim_profit = evaluated.sim.profit;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
         evaluated.cycle,
         evaluated.sim,
         evaluated.assessment,
         slippage_bps,
     );
+    let log_prepare_skip = ctx.execution.should_log_prepare_skip(fp);
     let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
         evaluated: &evaluated,
         arena,
@@ -379,12 +378,15 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         gas_oracle: &ctx.gas_oracle,
         search_low,
         risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
+        existing_assessment: if pools_refreshed {
+            None
+        } else {
+            evaluated.assessment.clone()
+        },
+        log_skips: log_prepare_skip,
     }) else {
         skipped.record("prepare");
-        if ctx.execution.should_log_prepare_skip(fp) {
-            crate::info!(
-                "prepare skip: fp={fp} search_low={search_low} amount_in={sim_amount_in} profit={sim_profit} pools_refreshed={pools_refreshed}",
-            );
+        if log_prepare_skip {
             ctx.execution.record_prepare_skip(fp);
         }
         return;
@@ -412,15 +414,26 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 ) => {}
             Some(on_chain_profit) => {
                 skipped.record("prepare");
-                crate::debug!(
-                    "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
-                    prepared.evaluated.result.profit,
-                );
+                if log_prepare_skip {
+                    crate::info!(
+                        "prepare skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                        prepared.evaluated.result.profit,
+                    );
+                } else {
+                    crate::debug!(
+                        "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                        prepared.evaluated.result.profit,
+                    );
+                }
                 return;
             }
             None => {
                 skipped.record("prepare");
-                crate::debug!("dispatch skip: fp={fp} queryBatchSwap unprofitable or failed");
+                if log_prepare_skip {
+                    crate::info!("prepare skip: fp={fp} queryBatchSwap unprofitable or failed");
+                } else {
+                    crate::debug!("dispatch skip: fp={fp} queryBatchSwap unprofitable or failed");
+                }
                 return;
             }
         }

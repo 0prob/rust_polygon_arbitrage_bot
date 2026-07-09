@@ -653,6 +653,19 @@ pub struct PrepareDispatchInput<'a> {
     pub search_low: U256,
     /// Learned route risk multiplier applied to min-profit thresholds (matches HF eval).
     pub risk_multiplier_bps: u64,
+    /// Reuse HF assessment when dispatch state matches eval (skip reassess).
+    pub existing_assessment: Option<crate::core::types::ProfitAssessment>,
+    /// Emit prepare reject reason at INFO (rate-limited by caller).
+    pub log_skips: bool,
+}
+
+#[inline]
+fn prepare_skip_log(enabled: bool, msg: &str) {
+    if enabled {
+        crate::info!("{msg}");
+    } else {
+        crate::debug!("{msg}");
+    }
 }
 
 pub struct PreparedDispatch {
@@ -711,9 +724,12 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
 
     match plan.action {
         FlashPlanAction::Reject => {
-            crate::debug!(
-                "prepare skip: flash plan rejected (policy={:?}, forbid_balancer={forbid_balancer_flash}, amount_in={amount_in})",
-                input.policy
+            prepare_skip_log(
+                input.log_skips,
+                &format!(
+                    "prepare skip: flash plan rejected (policy={:?}, forbid_balancer={forbid_balancer_flash}, amount_in={amount_in})",
+                    input.policy
+                ),
             );
             None
         }
@@ -725,10 +741,12 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 token_decimals,
                 token_to_matic_rate,
             ) {
-                crate::debug!(
-                    "prepare skip: dispatch sim sanity rejected (search_low={} amount_in={amount_in} profit={})",
-                    input.search_low,
-                    input.evaluated.result.profit,
+                prepare_skip_log(
+                    input.log_skips,
+                    &format!(
+                        "prepare skip: dispatch sim sanity rejected (search_low={} amount_in={amount_in} profit={})",
+                        input.search_low, input.evaluated.result.profit,
+                    ),
                 );
                 return None;
             }
@@ -742,11 +760,18 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 );
                 return reoptimize_capped(input, plan.source, liquidity.balancer);
             }
-            let assessment = reassess_route(input, plan.source)?;
+            let assessment = input
+                .existing_assessment
+                .clone()
+                .filter(|a| a.should_execute)
+                .or_else(|| reassess_route(input, plan.source))?;
             if !assessment.should_execute {
-                crate::debug!(
-                    "prepare skip: reassess rejected ({})",
-                    assessment.reject_reason.as_deref().unwrap_or("unknown")
+                prepare_skip_log(
+                    input.log_skips,
+                    &format!(
+                        "prepare skip: reassess rejected ({})",
+                        assessment.reject_reason.as_deref().unwrap_or("unknown")
+                    ),
                 );
                 return None;
             }
@@ -775,7 +800,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                     .as_ref()
                     .and_then(|a| a.reject_reason.clone())
                     .unwrap_or_else(|| "capped reassess rejected".into());
-                crate::debug!("prepare skip: {reason}");
+                prepare_skip_log(input.log_skips, &format!("prepare skip: {reason}"));
                 return None;
             }
             Some(capped)
