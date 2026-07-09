@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::text::Line;
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for simulation data...")
-                .block(Block::default().borders(Borders::ALL).title("Simulations")),
+                .block(theme::panel_block("Simulations")),
             area,
         );
         return;
@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let total = snapshot.simulations.len();
-    let table_block = Block::default().borders(Borders::ALL);
+    let table_block = theme::table_block("Simulations");
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let selected = app.selected_row_index().unwrap_or(0);
     let (start, end) = layout::table_viewport(total, selected, visible_rows);
@@ -61,18 +61,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from("gross"),
             Cell::from("net"),
             Cell::from("gas"),
-        ]))
-        .block(table_block.title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled(
-                format!(
-                    "Local sim [{} / {}]",
-                    if total == 0 { 0 } else { start + 1 },
-                    total
-                ),
-                theme::title(),
-            ),
-        ]))),
+        ]).style(theme::table_header()))
+        .block(table_block.title(Line::from(format!(
+            "Local sim [{} / {}]",
+            if total == 0 { 0 } else { start + 1 },
+            total
+        )))),
         chunks[0],
     );
 
@@ -113,12 +107,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     );
     frame.render_widget(
-        Paragraph::new(selected).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Compare", theme::title()),
-            ],
-        ))),
+        Paragraph::new(selected).block(theme::panel_block("Compare")),
         chunks[1],
     );
 }

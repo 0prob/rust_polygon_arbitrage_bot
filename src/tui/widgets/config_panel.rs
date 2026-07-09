@@ -1,15 +1,16 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
+use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for config snapshot...")
-                .block(Block::default().borders(Borders::ALL).title("Config")),
+                .block(theme::panel_block("Config")),
             area,
         );
         return;
@@ -33,8 +34,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Table::new(rows, [Constraint::Length(24), Constraint::Percentage(76)])
-            .header(Row::new(vec![Cell::from("key"), Cell::from("value")]))
-            .block(Block::default().borders(Borders::ALL).title("Config")),
+            .header(Row::new(vec![Cell::from("key"), Cell::from("value")]).style(theme::table_header()))
+            .block(theme::table_block("Config")),
         chunks[0],
     );
 
@@ -44,7 +45,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from("f cycles sort order."),
     ];
     frame.render_widget(
-        Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Controls")),
+        Paragraph::new(help).block(theme::panel_block("Controls")),
         chunks[1],
     );
 }

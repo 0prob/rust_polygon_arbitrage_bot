@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for diagnostics...")
-                .block(Block::default().borders(Borders::ALL).title("Diagnostics")),
+                .block(theme::panel_block("Diagnostics")),
             area,
         );
         return;

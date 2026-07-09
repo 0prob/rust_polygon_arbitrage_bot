@@ -1,8 +1,8 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Tabs};
+use ratatui::widgets::Tabs;
 
 use crate::tui::app::{App, InputMode, Tab};
 use crate::tui::theme;
@@ -10,7 +10,7 @@ use crate::tui::theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let titles: Vec<Line> = Tab::ALL
         .iter()
-        .map(|tab| Line::from(Span::styled(tab.title(), Style::default())))
+        .map(|tab| Line::from(Span::styled(tab.title(), theme::tab_style(false))))
         .collect();
 
     let selected = app.tab.index();
@@ -20,22 +20,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::styled(" arb cockpit ", theme::title()),
-                    Span::styled("market intelligence and execution", theme::muted()),
-                ]))
-                .title_alignment(ratatui::layout::Alignment::Left)
-                .border_style(theme::muted()),
-        )
-        .style(theme::muted())
-        .highlight_style(
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )
+        .block(theme::tab_block())
+        .style(Style::default().bg(theme::TAB_BG))
+        .highlight_style(theme::tab_style(true))
         .select(selected);
 
     frame.render_widget(tabs, area);

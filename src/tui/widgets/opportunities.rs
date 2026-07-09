@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -16,21 +16,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let Some((snapshot, indices)) = app.route_view() else {
         frame.render_widget(
-            Paragraph::new("waiting for opportunities...").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Opportunities"),
-            ),
+            Paragraph::new("waiting for opportunities...").block(theme::panel_block(
+                "Opportunities",
+            )),
             area,
         );
         return;
     };
 
     let total = indices.len();
-    let table_block = Block::default().borders(Borders::ALL);
+    let table_block = theme::table_block("Opportunities");
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let (start, end) = layout::table_viewport(total, app.selected_index, visible_rows);
-    let table_block = table_block.title(format!(
+    let table_block = table_block.title(Line::from(format!(
         "Opportunities [{} / {}] filter: {} | sort: {:?}",
         if total == 0 { 0 } else { start + 1 },
         total,
@@ -40,7 +38,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &app.search
         },
         app.sort_mode,
-    ));
+    )));
 
     let mut table_rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
     for (idx, &route_idx) in indices[start..end].iter().enumerate() {
@@ -54,11 +52,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme::bad()
         };
         let style = if selected {
-            theme::severity_style(crate::tui::app::Severity::Good)
+            theme::selected_row()
         } else if route.long_tail {
             theme::warn()
         } else {
-            Style::default()
+            Style::default().bg(theme::PANEL)
         };
         table_rows.push(
             Row::new(vec![
@@ -107,9 +105,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Cell::from("score"),
                 Cell::from("net"),
                 Cell::from("risk"),
-            ]))
+            ]).style(theme::table_header()))
             .block(table_block)
-            .row_highlight_style(theme::accent()),
+            .row_highlight_style(theme::selected_row()),
         chunks[0],
     );
 
@@ -177,12 +175,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     frame.render_widget(
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Selected route", theme::title()),
-            ],
-        ))),
+        Paragraph::new(detail).block(theme::panel_block("Selected route")),
         chunks[1],
     );
 }

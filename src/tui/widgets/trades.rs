@@ -14,12 +14,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let len = app.trade_history.len();
-    let table_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled(format!("Trades [{}]", len), theme::title()),
-        ]));
+    let table_block = theme::table_block(format!("Trades [{len}]"));
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let (start, end) = layout::table_viewport(len, app.selected_index, visible_rows);
 
@@ -33,11 +28,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .take(end.saturating_sub(start))
     {
         let selected = view_idx == app.selected_index;
-        let style = if selected {
-            theme::severity_style(Severity::Good)
-        } else {
-            ratatui::style::Style::default()
-        };
+        let style = if selected { theme::selected_row() } else { ratatui::style::Style::default().bg(theme::PANEL) };
         rows.push(
             Row::new(vec![
                 Cell::from(format!("{:x}", trade.fingerprint)),
@@ -75,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from("gas"),
             Cell::from("profit"),
             Cell::from("tx hash"),
-        ]))
+        ]).style(theme::table_header()))
         .block(table_block),
         chunks[0],
     );

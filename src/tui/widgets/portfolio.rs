@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for portfolio data...")
-                .block(Block::default().borders(Borders::ALL).title("Portfolio")),
+                .block(theme::panel_block("Portfolio")),
             area,
         );
         return;
@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let total = snapshot.portfolio.len();
-    let table_block = Block::default().borders(Borders::ALL);
+    let table_block = theme::table_block("Portfolio");
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let selected = app.selected_row_index().unwrap_or(0);
     let (start, end) = layout::table_viewport(total, selected, visible_rows);
@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|row| {
             let is_selected = start + row.0 == selected;
             let style = if is_selected {
-                theme::severity_style(crate::tui::app::Severity::Good)
+                theme::selected_row()
             } else {
                 theme::severity_style(row.1.severity)
             };
@@ -66,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from("balance"),
             Cell::from("USD"),
             Cell::from("source"),
-        ]))
+        ]).style(theme::table_header()))
         .block(table_block.title(Line::from(vec![
             Span::styled(" ", theme::muted()),
             Span::styled(
@@ -126,21 +126,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(chunks[1]);
     frame.render_widget(
-        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Summary", theme::title()),
-            ],
-        ))),
+        Paragraph::new(summary).block(theme::panel_block("Summary")),
         bottom[0],
     );
     frame.render_widget(
-        Paragraph::new(selected).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Selected asset", theme::title()),
-            ],
-        ))),
+        Paragraph::new(selected).block(theme::panel_block("Selected asset")),
         bottom[1],
     );
 }

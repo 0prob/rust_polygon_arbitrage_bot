@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for snapshot...")
-                .block(Block::default().borders(Borders::ALL).title("Overview")),
+                .block(theme::panel_block("Overview")),
             area,
         );
         return;
@@ -129,7 +129,8 @@ fn metric_card(
             Span::styled(title, theme::title()),
         ]))
         .borders(Borders::ALL)
-        .border_style(theme::muted());
+        .border_style(theme::muted())
+        .style(ratatui::style::Style::default().bg(theme::PANEL));
     let text: SmallVec<[Line; 2]> = SmallVec::from_buf([
         Line::from(Span::styled(primary, accent)),
         Line::from(Span::styled(secondary, theme::muted())),
@@ -213,6 +214,7 @@ fn sparkline(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .style(ratatui::style::Style::default().bg(theme::PANEL))
                     .title(Line::from(vec![
                         Span::styled(" ", theme::muted()),
                         Span::styled(title, theme::title()),
@@ -251,23 +253,13 @@ fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::Das
         )),
     ]);
     frame.render_widget(
-        Paragraph::new(lines.as_slice()).block(Block::default().borders(Borders::ALL).title(
-            Line::from(vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Health", theme::title()),
-            ]),
-        )),
+        Paragraph::new(lines.as_slice()).block(theme::panel_block("Health")),
         area,
     );
 }
 
 fn history_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Trade history", theme::title()),
-        ]));
+    let block = theme::panel_block("Trade history");
     let max_lines = layout::inner_lines(&block, area);
     let lines: Vec<Line> = app
         .trade_history

@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::tui::app::App;
+use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, _app: &App) {
     let lines = vec![
@@ -27,7 +28,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, _app: &App) {
         Line::from("  Config           live tunables"),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Help")),
+        Paragraph::new(lines).block(theme::panel_block("Help")),
         area,
     );
 }

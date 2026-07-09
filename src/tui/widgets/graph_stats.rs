@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
             Paragraph::new("waiting for graph snapshot...")
-                .block(Block::default().borders(Borders::ALL).title("Graph")),
+                .block(theme::panel_block("Graph")),
             area,
         );
         return;
@@ -91,6 +91,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line>) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .style(ratatui::style::Style::default().bg(theme::PANEL))
         .title(Line::from(vec![
             Span::styled(" ", theme::muted()),
             Span::styled(title, theme::title()),
