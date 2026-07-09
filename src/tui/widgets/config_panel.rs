@@ -9,8 +9,7 @@ use crate::tui::theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
-            Paragraph::new("waiting for config snapshot...")
-                .block(theme::panel_block("Config")),
+            Paragraph::new("waiting for config snapshot...").block(theme::panel_block("Config")),
             area,
         );
         return;
@@ -34,7 +33,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Table::new(rows, [Constraint::Length(24), Constraint::Percentage(76)])
-            .header(Row::new(vec![Cell::from("key"), Cell::from("value")]).style(theme::table_header()))
+            .header(
+                Row::new(vec![Cell::from("key"), Cell::from("value")]).style(theme::table_header()),
+            )
             .block(theme::table_block("Config")),
         chunks[0],
     );

@@ -1,6 +1,6 @@
 use crate::core::constants::{
     GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP, GAS_V3_BASE, GAS_V4_BASE,
-    GAS_WOOFI_HOP,
+    GAS_WOOFI_HOP, HOP_CAP_USIZE,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
 use crate::core::math::curve::get_curve_stable_amount_out;
@@ -52,11 +52,12 @@ struct HopResult {
 }
 
 #[inline]
-fn route_spot_probes(arena: &StateArena, edges: &[Edge]) -> Vec<U256> {
-    edges
-        .iter()
-        .map(|edge| spot_probe_for_token(arena, edge.token_in))
-        .collect()
+fn route_spot_probes(arena: &StateArena, edges: &[Edge]) -> [U256; HOP_CAP_USIZE] {
+    let mut caps = [U256::MAX; HOP_CAP_USIZE];
+    for (i, edge) in edges.iter().enumerate() {
+        caps[i] = spot_probe_for_token(arena, edge.token_in);
+    }
+    caps
 }
 
 fn simulate_hop(
@@ -361,7 +362,7 @@ fn walk_route_hops(
         if !state.is_tradable() {
             return None;
         }
-        let shallow_cap = shallow_caps.get(i).copied().unwrap_or(U256::MAX);
+        let shallow_cap = shallow_caps[i];
         let hop = simulate_hop(state, edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;

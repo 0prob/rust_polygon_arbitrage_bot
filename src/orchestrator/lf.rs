@@ -353,7 +353,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         .await;
     }
 
-    let mut capped: Vec<FoundCycle> = cycles_arc.iter().cloned().collect();
+    let mut capped: Vec<FoundCycle> = Vec::with_capacity(cycles_arc.len());
+    capped.extend(cycles_arc.iter().cloned());
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
@@ -364,6 +365,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
     capped = finalize_enumerated_cycles(capped, max_paths);
 
+    let rates_started = crate::util::now_ms();
     let rates = if let Some(ref provider) = state_provider {
         merge_token_rates(
             &prior_rates,
@@ -386,6 +388,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .await,
         )
     };
+    let cycle_and_rates_ms = crate::util::now_ms().saturating_sub(refresh_started);
+    let rates_ms = crate::util::now_ms().saturating_sub(rates_started);
 
     let hot: Vec<Address> = {
         let set: rustc_hash::FxHashSet<Address> = capped
@@ -411,10 +415,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         resolvable_count
     );
     crate::info!(
-        "lf latency: total_ms={} discovery_ms={} refresh_ms={} refreshed_pools={} cycle_search_ms={}",
+        "lf latency: total_ms={} discovery_ms={} refresh_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
         crate::util::now_ms().saturating_sub(lf_started),
         discovery_ms,
         refresh_ms,
+        cycle_and_rates_ms,
+        rates_ms,
         refreshed_pools,
         cycle_search_ms,
     );

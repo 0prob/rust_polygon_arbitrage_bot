@@ -301,21 +301,27 @@ async fn collect_snapshot(
         .await;
     }
 
-    let input_arena = if snap.generation != route_cache.generation {
+    if snap.generation != route_cache.generation {
         let hot_pools = hot_pool_addresses(&snap);
         let mut arena = snap.arena.clone();
         arena.apply_hot_cache(&ctx.cache, &hot_pools);
-        *route_cache = build_route_cache(
-            &snap,
-            &arena,
-            matic_usd,
-            ctx.config.execution.slippage_bps,
-            ctx.config.execution.profit_safety_multiplier_bps,
-        );
-        arena
-    } else {
-        snap.arena.clone()
-    };
+        let snap_arc = Arc::clone(&snap);
+        let slippage_bps = ctx.config.execution.slippage_bps;
+        let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
+        let matic = matic_usd;
+        *route_cache = tokio::task::spawn_blocking(move || {
+            build_route_cache(
+                &snap_arc,
+                &arena,
+                matic,
+                slippage_bps,
+                safety_multiplier_bps,
+            )
+        })
+        .await
+        .context("route cache build task failed")?;
+    }
+    let input_arena = crate::pipeline::arena::StateArena::default();
 
     let gas_gwei = ctx
         .gas_oracle

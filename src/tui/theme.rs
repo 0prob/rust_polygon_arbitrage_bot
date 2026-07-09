@@ -57,31 +57,31 @@ pub fn accent() -> Style {
 }
 
 #[must_use]
-pub fn panel_block(label: impl Into<String>) -> Block<'static> {
+pub fn panel_block(label: &'static str) -> Block<'static> {
     Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(muted())
         .style(Style::default().bg(PANEL))
         .title(Line::from(vec![
             Span::styled(" ", muted()),
-            Span::styled(label.into(), title()),
+            Span::styled(label, title()),
         ]))
 }
 
 #[must_use]
-pub fn panel_block_accent(label: impl Into<String>) -> Block<'static> {
+pub fn panel_block_accent(label: &'static str) -> Block<'static> {
     Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(accent())
         .style(Style::default().bg(PANEL))
         .title(Line::from(vec![
             Span::styled(" ", muted()),
-            Span::styled(label.into(), title()),
+            Span::styled(label, title()),
         ]))
 }
 
 #[must_use]
-pub fn table_block(label: impl Into<String>) -> Block<'static> {
+pub fn table_block(label: &'static str) -> Block<'static> {
     panel_block(label)
 }
 

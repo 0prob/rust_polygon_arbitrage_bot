@@ -41,8 +41,12 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     let mut phase1 = Vec::with_capacity(pools.len() * 2);
     let mut owners: Vec<Address> = Vec::with_capacity(pools.len());
     let mut cached_metas: Vec<Option<WoofiMeta>> = Vec::with_capacity(pools.len());
+    let mut woofi_pools: Vec<&DiscoveredPool> = Vec::with_capacity(pools.len());
     for pool in pools {
         owners.push(pool.address);
+        if pool.protocol == ProtocolType::Woofi {
+            woofi_pools.push(*pool);
+        }
         if let Some((quote, wooracle)) = meta_cache.woofi_meta(&pool.address) {
             cached_metas.push(Some(WoofiMeta {
                 address: pool.address,
@@ -73,7 +77,7 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
         }
     };
 
-    let mut metas = Vec::new();
+    let mut metas = Vec::with_capacity(pools.len());
     let mut phase1_idx = 0usize;
     for (i, pool) in pools.iter().enumerate() {
         if let Some(cached) = &cached_metas[i] {
@@ -343,11 +347,12 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
         rustc_hash::FxHashMap::default()
     };
 
-    let woofi_pools: Vec<&DiscoveredPool> = pools
-        .iter()
-        .copied()
-        .filter(|p| p.protocol == ProtocolType::Woofi)
-        .collect();
+    let mut woofi_pools: Vec<&DiscoveredPool> = Vec::with_capacity(pools.len());
+    for pool in pools {
+        if pool.protocol == ProtocolType::Woofi {
+            woofi_pools.push(*pool);
+        }
+    }
 
     let mut plans = Vec::with_capacity(pools.len().saturating_sub(woofi_pools.len()));
     for pool in pools {

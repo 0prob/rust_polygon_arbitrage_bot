@@ -5,9 +5,8 @@ use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
 use alloy::primitives::U256;
-use rustc_hash::FxHashMap;
 
-/// Max parallel directed edges per `(token_in, token_out, protocol)` after rescoring.
+/// Max parallel edges per `(token_in, token_out, protocol)` after rescoring.
 const MAX_PARALLEL_EDGES_PER_PAIR: usize = 2;
 
 #[inline]
@@ -232,28 +231,40 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
     if adj.len() <= max_per_pair || max_per_pair == 0 {
         return;
     }
-    let mut by_pair: FxHashMap<(u32, u8), Vec<usize>> = FxHashMap::default();
-    for (i, ge) in adj.iter().enumerate() {
-        let key = (ge.edge.token_out.0, ge.edge.protocol as u8);
-        by_pair.entry(key).or_default().push(i);
-    }
-    let mut keep = Vec::new();
-    for mut indices in by_pair.into_values() {
-        if indices.len() <= max_per_pair {
-            keep.extend(indices);
-            continue;
+    use std::cmp::Reverse;
+
+    adj.sort_by(|a, b| {
+        (
+            a.edge.token_out.0,
+            a.edge.protocol as u8,
+            Reverse(a.ratio),
+            a.edge.pool_index.0,
+        )
+            .cmp(&(
+                b.edge.token_out.0,
+                b.edge.protocol as u8,
+                Reverse(b.ratio),
+                b.edge.pool_index.0,
+            ))
+    });
+    let mut out_len = 0usize;
+    let mut group_kept = 0usize;
+    let mut cur_key = (u32::MAX, u8::MAX);
+    for i in 0..adj.len() {
+        let key = (adj[i].edge.token_out.0, adj[i].edge.protocol as u8);
+        if key != cur_key {
+            cur_key = key;
+            group_kept = 0;
         }
-        indices.sort_by(|&a, &b| {
-            adj[b]
-                .ratio
-                .cmp(&adj[a].ratio)
-                .then_with(|| adj[a].edge.pool_index.0.cmp(&adj[b].edge.pool_index.0))
-        });
-        keep.extend(indices.into_iter().take(max_per_pair));
+        if group_kept < max_per_pair {
+            if out_len != i {
+                adj.swap(out_len, i);
+            }
+            out_len += 1;
+            group_kept += 1;
+        }
     }
-    keep.sort_unstable();
-    let thinned: Vec<GraphEdge> = keep.into_iter().map(|i| adj[i]).collect();
-    *adj = thinned;
+    adj.truncate(out_len);
 }
 
 fn thin_parallel_edges_in_graph(graph: &mut RoutingGraph) {

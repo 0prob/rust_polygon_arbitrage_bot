@@ -150,15 +150,13 @@ fn try_rank_probe_minimal(
 }
 
 /// Routes that cannot minimal-sim at probe or spot size waste Brent work.
-/// Uses the same Aave flash rotation as `evaluate_one` so rank and Brent agree.
+/// Caller must pass a flash-rotated cycle (same as `rank_cycles_by_probe_net`).
 fn cycle_simulatable(
     arena: &StateArena,
     cycle: &FoundCycle,
     token_decimals: &FxHashMap<Address, u8>,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
-    flash_liquidity: &FlashLiquidityCache,
 ) -> bool {
-    let cycle = prefer_aave_flash_start(cycle, arena, flash_liquidity);
     if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
         return false;
     }
@@ -167,12 +165,15 @@ fn cycle_simulatable(
     let probe = min_economic_amount_in(decimals, rate);
     let spot_probe = spot_probe_for_decimals(decimals);
     for amount in [probe, spot_probe] {
+        let Some(min_sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
+            continue;
+        };
+        if min_sim.profit.is_zero() {
+            continue;
+        }
         let Some(sim) = simulate_route_detailed(arena, &cycle.edges, amount) else {
             continue;
         };
-        if sim.profit.is_zero() {
-            continue;
-        }
         if !local_sim::route_hop_fidelity_ok(arena, &cycle.edges, &sim.hop_amounts, spot_probe) {
             continue;
         }
@@ -197,9 +198,8 @@ fn cycle_flash_evaluable(
     flash_liquidity: &FlashLiquidityCache,
     flash_policy: FlashLoanPolicy,
 ) -> bool {
-    let ready = prefer_aave_flash_start(cycle, arena, flash_liquidity);
-    balancer_route_flash_feasible(&ready, arena, flash_liquidity)
-        && resolve_flash_source_for_cycle(&ready, arena, flash_liquidity, flash_policy).is_some()
+    balancer_route_flash_feasible(cycle, arena, flash_liquidity)
+        && resolve_flash_source_for_cycle(cycle, arena, flash_liquidity, flash_policy).is_some()
 }
 
 /// Score-ranked fallback when probe ranking yields nothing simulatable at Brent size.
@@ -216,13 +216,8 @@ fn simulatable_score_fallback(
         .iter()
         .filter_map(|cycle| {
             let ready = prefer_aave_flash_start(cycle, arena, flash_liquidity);
-            if cycle_simulatable(
-                arena,
-                &ready,
-                token_decimals,
-                token_to_matic_rates,
-                flash_liquidity,
-            ) && cycle_flash_evaluable(&ready, arena, flash_liquidity, flash_policy)
+            if cycle_simulatable(arena, &ready, token_decimals, token_to_matic_rates)
+                && cycle_flash_evaluable(&ready, arena, flash_liquidity, flash_policy)
             {
                 Some(ready.into_owned())
             } else {
@@ -346,13 +341,7 @@ pub fn rank_cycles_by_probe_net(
         if net.is_zero() {
             let hop_count = cycle.edges.len();
             if !probe.profit.is_zero()
-                && cycle_simulatable(
-                    arena,
-                    &cycle,
-                    token_decimals,
-                    token_to_matic_rates,
-                    flash_liquidity,
-                )
+                && cycle_simulatable(arena, &cycle, token_decimals, token_to_matic_rates)
             {
                 near_net.push((probe.profit, cycle.into_owned()));
             }
@@ -382,13 +371,8 @@ pub fn rank_cycles_by_probe_net(
     }
 
     rescue.retain(|cycle| {
-        cycle_simulatable(
-            arena,
-            cycle,
-            token_decimals,
-            token_to_matic_rates,
-            flash_liquidity,
-        ) && cycle_flash_evaluable(cycle, arena, flash_liquidity, flash_policy)
+        cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
+            && cycle_flash_evaluable(cycle, arena, flash_liquidity, flash_policy)
     });
     let rescue_len = rescue.len();
     let had_net_ranked = !profitable_ranked.is_empty();
@@ -618,7 +602,11 @@ fn probe_fallback_amounts(
     let mut amounts = [U256::ZERO; 3];
     let mut n = 0usize;
     for candidate in [economic, seed, spot] {
-        if candidate.is_zero() || amounts[..n].contains(&candidate) {
+        if candidate.is_zero() {
+            continue;
+        }
+        let duplicate = (0..n).any(|i| amounts[i] == candidate);
+        if duplicate {
             continue;
         }
         // Skip spot probe if it exceeds the flash loan cap for this token.
@@ -826,63 +814,69 @@ fn evaluate_one(
         }),
     );
     let mut slippage_bps = effective_slippage_bps(input.slippage_bps, depth_bps);
-    if slippage_bps > base_slippage {
-        let mut depth_ctx = ProfitEvalContext::with_safety_multiplier(
-            cycle.start_token,
-            input.arena,
-            input.token_to_matic_rates,
-            input.token_decimals,
-            input.gas_price,
-            slippage_bps,
-            flash_source,
-            input.safety_multiplier_bps,
-        );
-        depth_ctx.gas_scale_bps = 10_000;
-        if let Some(reopt) = optimize_cycle(
-            input.arena,
-            cycle,
-            input.token_to_matic_rates,
-            input.token_decimals,
-            Some(input.max_flash_loan_usd),
-            Some(input.brent_iters),
-            None,
-            &depth_ctx,
-            None,
-            Some(route_gas_costing),
-            Some((
-                input.execution.route_sim_cache.as_ref(),
-                input.state_generation,
-                fp,
-            )),
-        ) {
-            opt = reopt;
-            sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
-            if !validate_optimized_sim(
-                input,
-                cycle,
-                &sim,
-                opt.optimal_input,
-                opt.search_low,
-                spot_probe,
-            ) {
-                return None;
-            }
-            depth_bps = depth_impact_slippage_bps_with_base(
+    let mut assessment = if slippage_bps > base_slippage {
+        let depth_assessment =
+            assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
+        if depth_assessment.should_execute {
+            depth_assessment
+        } else {
+            let mut depth_ctx = ProfitEvalContext::with_safety_multiplier(
+                cycle.start_token,
                 input.arena,
-                &cycle.edges,
-                opt.optimal_input,
-                Some(&MinimalSimResult {
-                    profit: sim.profit,
-                    amount_out: sim.amount_out,
-                    total_gas: sim.total_gas,
-                }),
+                input.token_to_matic_rates,
+                input.token_decimals,
+                input.gas_price,
+                slippage_bps,
+                flash_source,
+                input.safety_multiplier_bps,
             );
-            slippage_bps = effective_slippage_bps(input.slippage_bps, depth_bps);
+            depth_ctx.gas_scale_bps = 10_000;
+            if let Some(reopt) = optimize_cycle(
+                input.arena,
+                cycle,
+                input.token_to_matic_rates,
+                input.token_decimals,
+                Some(input.max_flash_loan_usd),
+                Some(input.brent_iters),
+                None,
+                &depth_ctx,
+                None,
+                Some(route_gas_costing),
+                Some((
+                    input.execution.route_sim_cache.as_ref(),
+                    input.state_generation,
+                    fp,
+                )),
+            ) {
+                opt = reopt;
+                sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
+                if !validate_optimized_sim(
+                    input,
+                    cycle,
+                    &sim,
+                    opt.optimal_input,
+                    opt.search_low,
+                    spot_probe,
+                ) {
+                    return None;
+                }
+                depth_bps = depth_impact_slippage_bps_with_base(
+                    input.arena,
+                    &cycle.edges,
+                    opt.optimal_input,
+                    Some(&MinimalSimResult {
+                        profit: sim.profit,
+                        amount_out: sim.amount_out,
+                        total_gas: sim.total_gas,
+                    }),
+                );
+                slippage_bps = effective_slippage_bps(input.slippage_bps, depth_bps);
+            }
+            assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
         }
-    }
-
-    let mut assessment =
-        assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
+    } else {
+        assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
+    };
     if probe_only {
         assessment.should_execute = false;
         assessment.reject_reason = Some(

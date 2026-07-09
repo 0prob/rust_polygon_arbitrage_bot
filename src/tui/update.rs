@@ -90,6 +90,7 @@ fn handle_paste(app: &mut App, text: &str) {
     for ch in text.chars().filter(|c| !c.is_control()) {
         app.search.push(ch);
     }
+    app.sync_search_lower();
     app.rebuild_route_view();
 }
 
@@ -106,10 +107,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Backspace => {
                 app.search.pop();
+                app.sync_search_lower();
                 app.rebuild_route_view();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.search.push(c);
+                app.sync_search_lower();
                 app.rebuild_route_view();
             }
             _ => {}
@@ -122,6 +125,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('?') => app.toggle_help(),
             KeyCode::Char('/') => {
                 app.search.clear();
+                app.sync_search_lower();
                 app.input_mode = InputMode::Search;
             }
             KeyCode::Char('j') | KeyCode::Down => app.select_next(),

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
@@ -59,6 +59,8 @@ pub struct StateRefreshService {
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
     last_state_block: AtomicU64,
+    routable_pool_count: AtomicUsize,
+    routable_pool_count_generation: AtomicU64,
     /// Set to true by the LISTEN/NOTIFY task when a pool_meta_channel notification arrives.
     /// Cleared by `maybe_discover` after triggering an early incremental refresh.
     pg_notify_pending: Arc<AtomicBool>,
@@ -88,6 +90,8 @@ impl StateRefreshService {
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
             last_state_block: AtomicU64::new(0),
+            routable_pool_count: AtomicUsize::new(0),
+            routable_pool_count_generation: AtomicU64::new(0),
             pg_notify_pending: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -115,9 +119,20 @@ impl StateRefreshService {
 
     /// Discovered pools with tradable on-chain state in cache (routing arena input).
     pub fn routable_pool_count(&self) -> usize {
-        let state = self.discovery_state.read();
-        self.cache
-            .count_tradable_iter(state.discovered.iter().map(|p| &p.address))
+        let generation = self.cache.generation();
+        if self.routable_pool_count_generation.load(Ordering::Acquire) == generation {
+            return self.routable_pool_count.load(Ordering::Relaxed);
+        }
+
+        let count = {
+            let state = self.discovery_state.read();
+            self.cache
+                .count_tradable_iter(state.discovered.iter().map(|p| &p.address))
+        };
+        self.routable_pool_count.store(count, Ordering::Relaxed);
+        self.routable_pool_count_generation
+            .store(generation, Ordering::Release);
+        count
     }
 
     pub fn cache_size(&self) -> usize {
@@ -339,6 +354,8 @@ impl StateRefreshService {
             self.refresh_token_metas().await;
         }
         self.enrich_token_decimals_onchain().await;
+        self.routable_pool_count_generation
+            .store(0, Ordering::Release);
 
         Ok(added)
     }

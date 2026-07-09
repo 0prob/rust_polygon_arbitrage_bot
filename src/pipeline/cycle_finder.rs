@@ -153,6 +153,7 @@ pub fn clamp_fee_bps(fee_bps: u32) -> u32 {
 /// Major-token-first + high live out-degree hubs for DFS start order.
 /// Boosts tokens whose live outgoing edges span more protocols (helps surface
 /// cross-protocol cycles instead of pure Balancer-dense hubs).
+#[cfg(test)]
 pub fn prioritize_cycle_start_tokens(graph: &RoutingGraph) -> Vec<TokenIndex> {
     let mut scored: Vec<(TokenIndex, usize, usize)> = Vec::with_capacity(graph.adjacency.len()); // (token, proto_diversity, degree)
     for (ti, edges) in graph.adjacency.iter().enumerate() {
@@ -667,9 +668,28 @@ fn collect_cycles_dfs_parallel(
 }
 
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    crate::pipeline::cycle_filter::dedupe_cycles_by_edges(
-        shard_cycles.iter().flat_map(|s| s.iter().cloned()),
-    )
+    use std::collections::hash_map::Entry;
+
+    use crate::pipeline::cycle_filter::cycle_key;
+    use crate::pipeline::types::compare_cycle_score;
+
+    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
+    for cycle in shard_cycles.iter().flat_map(|s| s.iter()) {
+        let key = cycle_key(&cycle.edges);
+        match best.entry(key) {
+            Entry::Occupied(mut e) => {
+                if cycle.score < e.get().score {
+                    e.insert(cycle.clone());
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(cycle.clone());
+            }
+        }
+    }
+    let mut out: Vec<FoundCycle> = best.into_values().collect();
+    out.sort_unstable_by(compare_cycle_score);
+    out
 }
 
 #[must_use]

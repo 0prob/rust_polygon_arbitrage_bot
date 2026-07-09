@@ -10,8 +10,7 @@ use crate::tui::theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
-            Paragraph::new("waiting for snapshot...")
-                .block(theme::panel_block("Overview")),
+            Paragraph::new("waiting for snapshot...").block(theme::panel_block("Overview")),
             area,
         );
         return;

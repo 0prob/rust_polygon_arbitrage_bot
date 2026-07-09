@@ -53,15 +53,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Constraint::Length(8),
             ],
         )
-        .header(Row::new(vec![
-            Cell::from("fp"),
-            Cell::from("route"),
-            Cell::from("in"),
-            Cell::from("out"),
-            Cell::from("gross"),
-            Cell::from("net"),
-            Cell::from("gas"),
-        ]).style(theme::table_header()))
+        .header(
+            Row::new(vec![
+                Cell::from("fp"),
+                Cell::from("route"),
+                Cell::from("in"),
+                Cell::from("out"),
+                Cell::from("gross"),
+                Cell::from("net"),
+                Cell::from("gas"),
+            ])
+            .style(theme::table_header()),
+        )
         .block(table_block.title(Line::from(format!(
             "Local sim [{} / {}]",
             if total == 0 { 0 } else { start + 1 },

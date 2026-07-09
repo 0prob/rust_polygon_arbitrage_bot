@@ -16,9 +16,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let Some((snapshot, indices)) = app.route_view() else {
         frame.render_widget(
-            Paragraph::new("waiting for opportunities...").block(theme::panel_block(
-                "Opportunities",
-            )),
+            Paragraph::new("waiting for opportunities...")
+                .block(theme::panel_block("Opportunities")),
             area,
         );
         return;
@@ -97,15 +96,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Table::new(table_rows, widths)
-            .header(Row::new(vec![
-                Cell::from("fp"),
-                Cell::from("hops"),
-                Cell::from("protocols"),
-                Cell::from("route"),
-                Cell::from("score"),
-                Cell::from("net"),
-                Cell::from("risk"),
-            ]).style(theme::table_header()))
+            .header(
+                Row::new(vec![
+                    Cell::from("fp"),
+                    Cell::from("hops"),
+                    Cell::from("protocols"),
+                    Cell::from("route"),
+                    Cell::from("score"),
+                    Cell::from("net"),
+                    Cell::from("risk"),
+                ])
+                .style(theme::table_header()),
+            )
             .block(table_block)
             .row_highlight_style(theme::selected_row()),
         chunks[0],

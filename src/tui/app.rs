@@ -251,6 +251,7 @@ pub struct App {
     pub snapshot_refresh_pending: bool,
     pub show_help: bool,
     pub last_input_at: Option<Instant>,
+    search_lower: String,
     route_view_key: u64,
     route_view_indices: Vec<usize>,
 }
@@ -289,6 +290,7 @@ impl App {
             snapshot_refresh_pending: false,
             show_help: false,
             last_input_at: None,
+            search_lower: String::new(),
             route_view_key: 0,
             route_view_indices: Vec::new(),
         }
@@ -375,12 +377,12 @@ impl App {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let needle = self.search.trim().to_ascii_lowercase();
+        let needle = self.search_lower.as_str();
         let mut indices: Vec<usize> = snapshot
             .opportunities
             .iter()
             .enumerate()
-            .filter(|(_, row)| needle.is_empty() || row.search_blob.contains(&needle))
+            .filter(|(_, row)| needle.is_empty() || row.search_blob.contains(needle))
             .map(|(idx, _)| idx)
             .collect();
         let rows = snapshot.opportunities.as_ref();
@@ -403,7 +405,7 @@ impl App {
 
     fn route_view_cache_key(&self) -> u64 {
         let mut hasher = FxHasher::default();
-        self.search.hash(&mut hasher);
+        self.search_lower.hash(&mut hasher);
         (self.sort_mode as u8).hash(&mut hasher);
         if let Some(snapshot) = &self.snapshot {
             snapshot.generation.hash(&mut hasher);
@@ -461,9 +463,14 @@ impl App {
 
     pub fn clear_search(&mut self) {
         self.search.clear();
+        self.search_lower.clear();
         self.input_mode = InputMode::Normal;
         self.rebuild_route_view();
         self.select_top();
+    }
+
+    pub(crate) fn sync_search_lower(&mut self) {
+        self.search_lower = self.search.trim().to_ascii_lowercase();
     }
 
     #[must_use]
@@ -769,6 +776,7 @@ mod tests {
 
         assert_eq!(app.route_view().expect("view").1.len(), 2);
         app.search = "wmatic".to_string();
+        app.sync_search_lower();
         app.rebuild_route_view();
         let (_, indices) = app.route_view().expect("view");
         assert_eq!(indices.len(), 1);

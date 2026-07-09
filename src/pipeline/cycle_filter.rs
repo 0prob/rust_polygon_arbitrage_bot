@@ -73,11 +73,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
     }
     cycles.sort_unstable_by(compare_cycle_score);
     let rescue_cap = graph_negative_rescue_cap(max_keep);
-    let sim_candidates = cycles.len().min(
-        max_keep
-            .saturating_mul(2)
-            .max(max_keep.saturating_add(rescue_cap.saturating_mul(4))),
-    );
+    let sim_candidates = cycles.len().min(max_keep.saturating_add(rescue_cap));
     let mut missing_state_rescued = 0usize;
     let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
     for cycle in cycles.into_iter().take(sim_candidates) {

@@ -14,7 +14,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let len = app.trade_history.len();
-    let table_block = theme::table_block(format!("Trades [{len}]"));
+    let table_block = theme::table_block("Trades");
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let (start, end) = layout::table_viewport(len, app.selected_index, visible_rows);
 
@@ -28,7 +28,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .take(end.saturating_sub(start))
     {
         let selected = view_idx == app.selected_index;
-        let style = if selected { theme::selected_row() } else { ratatui::style::Style::default().bg(theme::PANEL) };
+        let style = if selected {
+            theme::selected_row()
+        } else {
+            ratatui::style::Style::default().bg(theme::PANEL)
+        };
         rows.push(
             Row::new(vec![
                 Cell::from(format!("{:x}", trade.fingerprint)),
@@ -60,13 +64,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Constraint::Percentage(40),
             ],
         )
-        .header(Row::new(vec![
-            Cell::from("fingerprint"),
-            Cell::from("outcome"),
-            Cell::from("gas"),
-            Cell::from("profit"),
-            Cell::from("tx hash"),
-        ]).style(theme::table_header()))
+        .header(
+            Row::new(vec![
+                Cell::from("fingerprint"),
+                Cell::from("outcome"),
+                Cell::from("gas"),
+                Cell::from("profit"),
+                Cell::from("tx hash"),
+            ])
+            .style(theme::table_header()),
+        )
         .block(table_block),
         chunks[0],
     );

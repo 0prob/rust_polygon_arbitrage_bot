@@ -190,6 +190,17 @@ pub async fn run_hf_tick(
     }
     let hot_pools: Arc<Vec<_>> = Arc::new(hot_pools.into_iter().collect());
 
+    let mut arena = arena_base;
+    let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
+        crate::warn!("hf tick skipped: gas oracle has no fee snapshot yet");
+        return Ok(HfTickResult {
+            cycles_considered: 0,
+            profitable_count: 0,
+            best_profit: U256::ZERO,
+            elapsed_ms: now_ms().saturating_sub(start),
+        });
+    };
+
     let refresh = Arc::clone(&ctx.refresh);
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
     let skip_prefetch = stream_triggered && pipeline.stream_enabled;
@@ -202,19 +213,6 @@ pub async fn run_hf_tick(
                 .refresh_pool_states_for(prefetch_hot.as_ref(), prefetch_count)
                 .await
         }))
-    };
-    let mut arena = arena_base;
-    let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
-        if let Some(handle) = prefetch {
-            handle.abort();
-        }
-        crate::warn!("hf tick skipped: gas oracle has no fee snapshot yet");
-        return Ok(HfTickResult {
-            cycles_considered: 0,
-            profitable_count: 0,
-            best_profit: U256::ZERO,
-            elapsed_ms: now_ms().saturating_sub(start),
-        });
     };
 
     if let Some(handle) = prefetch {

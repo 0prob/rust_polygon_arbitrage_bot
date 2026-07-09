@@ -374,9 +374,6 @@ pub fn optimize_cycle(
         );
         return None;
     }
-    if low < economic_floor {
-        low = economic_floor;
-    }
 
     if let Some(cap) = cl_amount_cap(arena, edges) {
         if cap.is_zero() {

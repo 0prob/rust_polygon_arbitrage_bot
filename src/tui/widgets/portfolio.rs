@@ -10,8 +10,7 @@ use crate::tui::theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
-            Paragraph::new("waiting for portfolio data...")
-                .block(theme::panel_block("Portfolio")),
+            Paragraph::new("waiting for portfolio data...").block(theme::panel_block("Portfolio")),
             area,
         );
         return;
@@ -60,13 +59,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Constraint::Percentage(24),
             ],
         )
-        .header(Row::new(vec![
-            Cell::from("asset"),
-            Cell::from("address"),
-            Cell::from("balance"),
-            Cell::from("USD"),
-            Cell::from("source"),
-        ]).style(theme::table_header()))
+        .header(
+            Row::new(vec![
+                Cell::from("asset"),
+                Cell::from("address"),
+                Cell::from("balance"),
+                Cell::from("USD"),
+                Cell::from("source"),
+            ])
+            .style(theme::table_header()),
+        )
         .block(table_block.title(Line::from(vec![
             Span::styled(" ", theme::muted()),
             Span::styled(
