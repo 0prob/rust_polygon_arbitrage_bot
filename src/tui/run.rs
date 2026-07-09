@@ -55,12 +55,23 @@ pub async fn run_tui(
         tokio::select! {
             maybe_event = rx.recv() => {
                 let Some(event) = maybe_event else { break; };
-                let input_event = matches!(event, UiEvent::Input(_));
+                let mut input_event = matches!(event, UiEvent::Input(_));
                 apply_event(&mut app, event);
                 if app.should_quit {
                     break;
                 }
                 needs_redraw = true;
+                while let Ok(event) = rx.try_recv() {
+                    input_event |= matches!(event, UiEvent::Input(_));
+                    apply_event(&mut app, event);
+                    if app.should_quit {
+                        break;
+                    }
+                    needs_redraw = true;
+                }
+                if app.should_quit {
+                    break;
+                }
                 if input_event {
                     draw_frame(&mut terminal, &app)?;
                     needs_redraw = false;

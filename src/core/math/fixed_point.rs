@@ -1,46 +1,32 @@
 use alloy::primitives::{U256, U512};
 
-use super::log_exp_math::log_exp_pow;
+use super::log_exp_math::{log_exp_ln, log_exp_pow};
 use crate::util::u512_to_u256;
 
 pub const ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 pub const ONE_U512: U512 = U512::from_limbs([1_000_000_000_000_000_000, 0, 0, 0, 0, 0, 0, 0]);
 pub const MAX_POW_RELATIVE_ERROR: U256 = U256::from_limbs([10_000, 0, 0, 0]);
-const LOG2_ONE_OFFSET: i32 = 60; // 256 - ONE.leading_zeros(); ONE = 1e18
-const ONE_F64: f64 = 1_000_000_000_000_000_000.0;
-
-/// log2(ratio / ONE) via integer bit decomposition; mantissa alone uses f64 in [1, 2).
-#[inline]
-#[must_use]
-pub fn ratio_log2_delta(ratio: U256) -> f64 {
-    if ratio.is_zero() {
-        return f64::NEG_INFINITY;
-    }
-    let log_r = 256i32.saturating_sub(ratio.leading_zeros() as i32);
-    let exp = log_r - LOG2_ONE_OFFSET;
-    let normalized = if exp >= 0 {
-        if exp >= 256 {
-            return f64::INFINITY;
-        }
-        ratio >> exp
-    } else {
-        ratio << (-exp).min(255) as u32
-    };
-    let mantissa = crate::util::u256_to_f64(normalized) / ONE_F64;
-    if mantissa <= 0.0 || !mantissa.is_finite() {
-        return 0.0;
-    }
-    f64::from(exp) + mantissa.log2()
-}
-
-/// Bellman-Ford edge weight: `-ln(ratio / ONE)` without converting full ratio to f64.
 #[inline]
 #[must_use]
 pub fn edge_log_weight_from_ratio(ratio: U256) -> f64 {
     if ratio.is_zero() {
         return f64::INFINITY;
     }
-    -ratio_log2_delta(ratio) * std::f64::consts::LN_2
+    let scale = 1_000_000_000_000_000_000.0;
+    if ratio >= ONE {
+        let ln_ratio = log_exp_ln(ratio);
+        if ln_ratio.is_zero() {
+            return 0.0;
+        }
+        -crate::util::u256_to_f64(ln_ratio) / scale
+    } else {
+        let reciprocal = crate::util::u512_to_u256((ONE_U512 * ONE_U512) / U512::from(ratio));
+        let ln_recip = log_exp_ln(reciprocal);
+        if ln_recip.is_zero() {
+            return 0.0;
+        }
+        crate::util::u256_to_f64(ln_recip) / scale
+    }
 }
 
 #[inline(always)]

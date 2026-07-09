@@ -51,6 +51,14 @@ struct HopResult {
     gas: u32,
 }
 
+#[inline]
+fn route_spot_probes(arena: &StateArena, edges: &[Edge]) -> Vec<U256> {
+    edges
+        .iter()
+        .map(|edge| spot_probe_for_token(arena, edge.token_in))
+        .collect()
+}
+
 fn simulate_hop(
     state: &PoolState,
     edge: &Edge,
@@ -343,6 +351,7 @@ fn walk_route_hops(
 ) -> Option<(U256, u32)> {
     let mut current = amount_in;
     let mut total_gas = 0u32;
+    let shallow_caps = route_spot_probes(arena, edges);
     if let Some(amounts) = hop_amounts.as_deref_mut() {
         *amounts.first_mut()? = amount_in;
     }
@@ -352,7 +361,7 @@ fn walk_route_hops(
         if !state.is_tradable() {
             return None;
         }
-        let shallow_cap = spot_probe_for_token(arena, edge.token_in);
+        let shallow_cap = shallow_caps.get(i).copied().unwrap_or(U256::MAX);
         let hop = simulate_hop(state, edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
@@ -437,7 +446,7 @@ mod tests {
             Address::from([3u8; 20]),
             Arc::new(PoolState::V3(V3PoolState {
                 sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000,
+                liquidity: 1_000_000_000_000_000_000u128,
                 tick: 0,
                 fee: U256::from(3000u32),
                 tick_spacing: 60,
@@ -513,18 +522,22 @@ mod tests {
             Address::from([3u8; 20]),
             Arc::new(PoolState::V3(V3PoolState {
                 sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000,
+                liquidity: u128::MAX / 2,
                 tick: 0,
                 fee: U256::from(3000u32),
                 tick_spacing: 60,
                 unlocked: true,
                 fee_protocol: 0,
                 observation_cardinality: 1,
-                ticks: Arc::from(vec![V3Tick {
-                    tick: -60,
-                    liquidity_gross: 1_000_000,
-                    liquidity_net: 1_000_000,
-                }]),
+                ticks: Arc::from(
+                    (1..=32)
+                        .map(|step| V3Tick {
+                            tick: -(step * 60),
+                            liquidity_gross: 1_000_000,
+                            liquidity_net: 0,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
             })),
         );
         let edges = [Edge {
@@ -606,6 +619,52 @@ mod tests {
         assert_eq!(
             route_hop_fidelity_reject(&arena, &edges, &hop_amounts, probe),
             Some(HopFidelityReject::ShallowCl(1))
+        );
+    }
+
+    #[test]
+    fn hop_fidelity_does_not_reject_loaded_cl_hops_above_spot_probe() {
+        use crate::core::types::{V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1_000_000,
+                    liquidity_net: 1_000_000,
+                }]),
+            })),
+        );
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        let spot_probe = U256::ZERO;
+        let mut hop_amounts = hop_amounts_zeroed(edges.len());
+        hop_amounts[0] = U256::from(1u64);
+
+        assert_eq!(
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts, spot_probe),
+            None
         );
     }
 

@@ -124,9 +124,7 @@ pub fn pool_metas_by_index(pool_metas: &[PoolMeta]) -> rustc_hash::FxHashMap<Poo
 #[inline]
 #[must_use]
 pub fn pool_meta_at(pool_metas: &[PoolMeta], index: PoolIndex) -> Option<&PoolMeta> {
-    pool_metas
-        .get(index.0 as usize)
-        .filter(|meta| meta.pool_index == index)
+    pool_metas.iter().find(|meta| meta.pool_index == index)
 }
 
 #[must_use]
