@@ -610,8 +610,7 @@ fn probe_fallback_amounts(
 ) -> [U256; 3] {
     let dec =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
-    let rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
+    let rate = resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let economic = min_economic_amount_in(dec, rate);
     let spot = crate::pipeline::spot_price::spot_probe_for_decimals(dec);
     let seed = probe_seed.map(|(a, _)| a).unwrap_or(economic);
@@ -642,8 +641,7 @@ fn probe_fallback_opt(
     stats: &EvalFailStats,
     _fp: u64,
 ) -> Option<(OptimizationResult, RouteSimulationResult)> {
-    let rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
+    let rate = resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
     let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);

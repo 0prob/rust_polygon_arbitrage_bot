@@ -27,10 +27,7 @@ pub fn resolve_token_to_matic_rate_or_bootstrap(
 }
 
 /// Single policy for token/MATIC conversion used in eval, dispatch, and sizing.
-pub fn resolve_token_to_matic_rate(
-    token: TokenIndex,
-    rates: &FxHashMap<TokenIndex, U256>,
-) -> U256 {
+pub fn resolve_token_to_matic_rate(token: TokenIndex, rates: &FxHashMap<TokenIndex, U256>) -> U256 {
     rates
         .get(&token)
         .copied()

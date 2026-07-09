@@ -22,10 +22,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    let left_block = Block::default().borders(Borders::ALL).title(Line::from(vec![
-        Span::styled(" ", theme::muted()),
-        Span::styled("Health", theme::title()),
-    ]));
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Health", theme::title()),
+        ]));
     let max_lines = layout::inner_lines(&left_block, chunks[0]);
     let left: Vec<Line> = snapshot
         .diagnostics
@@ -53,12 +55,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         theme::label_value(
             "trades/losses",
-            format!("{}/{}", snapshot.overview.total_trades, snapshot.overview.total_losses),
+            format!(
+                "{}/{}",
+                snapshot.overview.total_trades, snapshot.overview.total_losses
+            ),
             crate::tui::app::Severity::Info,
         ),
         theme::label_value(
             "pnl",
-            format!("{:+.4} MATIC", snapshot.overview.daily_pnl_wei as f64 / 1e18),
+            format!(
+                "{:+.4} MATIC",
+                snapshot.overview.daily_pnl_wei as f64 / 1e18
+            ),
             if snapshot.overview.daily_pnl_wei >= 0 {
                 crate::tui::app::Severity::Good
             } else {
@@ -67,10 +75,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     ];
     frame.render_widget(
-        Paragraph::new(right).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Runtime", theme::title()),
-        ]))),
+        Paragraph::new(right).block(Block::default().borders(Borders::ALL).title(Line::from(
+            vec![
+                Span::styled(" ", theme::muted()),
+                Span::styled("Runtime", theme::title()),
+            ],
+        ))),
         chunks[1],
     );
 }

@@ -89,10 +89,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line>) {
-    let block = Block::default().borders(Borders::ALL).title(Line::from(vec![
-        Span::styled(" ", theme::muted()),
-        Span::styled(title, theme::title()),
-    ]));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled(title, theme::title()),
+        ]));
     let max_lines = layout::inner_lines(&block, area);
     let visible: Vec<Line> = lines.into_iter().take(max_lines).collect();
     frame.render_widget(Paragraph::new(visible).block(block), area);

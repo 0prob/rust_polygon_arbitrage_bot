@@ -14,10 +14,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let len = app.trade_history.len();
-    let table_block = Block::default().borders(Borders::ALL).title(Line::from(vec![
-        Span::styled(" ", theme::muted()),
-        Span::styled(format!("Trades [{}]", len), theme::title()),
-    ]));
+    let table_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled(format!("Trades [{}]", len), theme::title()),
+        ]));
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let (start, end) = layout::table_viewport(len, app.selected_index, visible_rows);
 
@@ -81,15 +83,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let detail = if let Some(row) = app.selected_trade() {
         vec![
             theme::label_value("latest", row.outcome.clone(), row.severity),
-            theme::label_value("fingerprint", format!("{:x}", row.fingerprint), Severity::Info),
+            theme::label_value(
+                "fingerprint",
+                format!("{:x}", row.fingerprint),
+                Severity::Info,
+            ),
             theme::label_value(
                 "gas",
-                row.gas_used.map_or_else(|| "-".to_string(), |g| g.to_string()),
+                row.gas_used
+                    .map_or_else(|| "-".to_string(), |g| g.to_string()),
                 Severity::Info,
             ),
             theme::label_value(
                 "profit",
-                row.profit_wei.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                row.profit_wei
+                    .map_or_else(|| "-".to_string(), |p| p.to_string()),
                 Severity::Info,
             ),
             theme::label_value(
@@ -102,10 +110,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![Line::from("no trade history yet")]
     };
     frame.render_widget(
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Latest", theme::title()),
-        ]))),
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(
+            vec![
+                Span::styled(" ", theme::muted()),
+                Span::styled("Latest", theme::title()),
+            ],
+        ))),
         chunks[1],
     );
 }

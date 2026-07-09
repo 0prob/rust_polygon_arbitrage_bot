@@ -210,8 +210,7 @@ impl ProfitEvalContext {
         flash_source: FlashLoanSource,
         safety_multiplier_bps: u64,
     ) -> Self {
-        let token_to_matic_rate =
-            resolve_token_to_matic_rate(cycle_start, token_to_matic_rates);
+        let token_to_matic_rate = resolve_token_to_matic_rate(cycle_start, token_to_matic_rates);
         let token_decimals = crate::services::oracle::resolve_token_decimals_for_index(
             cycle_start,
             arena,

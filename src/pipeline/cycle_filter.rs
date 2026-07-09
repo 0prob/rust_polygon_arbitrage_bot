@@ -239,7 +239,10 @@ mod tests {
         let mut reverse = forward.clone();
         reverse.edges[0].token_in_idx = 3;
         reverse.edges[0].token_out_idx = 1;
-        assert_ne!(edge_hop_key(&forward.edges[0]), edge_hop_key(&reverse.edges[0]));
+        assert_ne!(
+            edge_hop_key(&forward.edges[0]),
+            edge_hop_key(&reverse.edges[0])
+        );
     }
 
     #[test]

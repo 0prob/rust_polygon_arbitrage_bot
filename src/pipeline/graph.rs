@@ -698,9 +698,11 @@ mod tests {
         );
 
         assert_eq!(edges.len(), 2);
-        assert!(edges.iter().all(|e| {
-            matches!(e.token_in.0, 2 | 3) && matches!(e.token_out.0, 2 | 3)
-        }));
+        assert!(
+            edges
+                .iter()
+                .all(|e| { matches!(e.token_in.0, 2 | 3) && matches!(e.token_out.0, 2 | 3) })
+        );
     }
 
     #[test]

@@ -68,9 +68,10 @@ fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::muted())
-        .title(Line::from(vec![
-            ratatui::text::Span::styled(" status ", theme::title()),
-        ]));
+        .title(Line::from(vec![ratatui::text::Span::styled(
+            " status ",
+            theme::title(),
+        )]));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 }

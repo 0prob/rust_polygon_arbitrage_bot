@@ -62,7 +62,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         table_rows.push(
             Row::new(vec![
-                Cell::from(span_text(format!("{:x}", route.fingerprint), theme::muted())),
+                Cell::from(span_text(
+                    format!("{:x}", route.fingerprint),
+                    theme::muted(),
+                )),
                 Cell::from(span_text(route.hops.to_string(), theme::accent())),
                 Cell::from(span_text(route.protocols.as_str(), theme::title())),
                 Cell::from(span_text(route.route.as_str(), theme::muted())),
@@ -112,12 +115,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let detail = if let Some(route) = app.selected_route() {
         vec![
-            theme::label_value("fingerprint", format!("{:x}", route.fingerprint), crate::tui::app::Severity::Info),
-            theme::label_value("route", route.route.clone(), crate::tui::app::Severity::Info),
-            theme::label_value("detail", route.route_detail.clone(), crate::tui::app::Severity::Info),
+            theme::label_value(
+                "fingerprint",
+                format!("{:x}", route.fingerprint),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "route",
+                route.route.clone(),
+                crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "detail",
+                route.route_detail.clone(),
+                crate::tui::app::Severity::Info,
+            ),
             theme::label_value(
                 "input",
-                format!("{} (~{:.4} MATIC)", route.amount_in_token, route.amount_in_matic),
+                format!(
+                    "{} (~{:.4} MATIC)",
+                    route.amount_in_token, route.amount_in_matic
+                ),
                 crate::tui::app::Severity::Info,
             ),
             theme::label_value(
@@ -143,7 +161,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             theme::label_value(
                 "gas/risk",
-                format!("{} gas  |  {} long-tail", route.gas_estimate, route.long_tail),
+                format!(
+                    "{} gas  |  {} long-tail",
+                    route.gas_estimate, route.long_tail
+                ),
                 if route.long_tail {
                     crate::tui::app::Severity::Warn
                 } else {
@@ -156,12 +177,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     frame.render_widget(
-        Paragraph::new(detail).block(
-            Block::default().borders(Borders::ALL).title(Line::from(vec![
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(
+            vec![
                 Span::styled(" ", theme::muted()),
                 Span::styled("Selected route", theme::title()),
-            ])),
-        ),
+            ],
+        ))),
         chunks[1],
     );
 }

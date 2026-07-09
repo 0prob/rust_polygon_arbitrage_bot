@@ -19,7 +19,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(11), Constraint::Length(10)])
+        .constraints([
+            Constraint::Length(9),
+            Constraint::Min(11),
+            Constraint::Length(10),
+        ])
         .split(area);
 
     let top = Layout::default()
@@ -54,7 +58,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         top[1],
         "Yielding",
-        format!("{}/{}", app.last_profitable_count, app.last_cycles_considered),
+        format!(
+            "{}/{}",
+            app.last_profitable_count, app.last_cycles_considered
+        ),
         format!("{profitable_share:.1}% of candidates"),
         theme::accent(),
     );
@@ -63,7 +70,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         top[2],
         "Freshness",
         format!("search {} ms", snapshot.overview.search_ms),
-        format!("HF {} ms | age {} ms", snapshot.overview.hf_ms, snapshot.overview.snapshot_age_ms),
+        format!(
+            "HF {} ms | age {} ms",
+            snapshot.overview.hf_ms, snapshot.overview.snapshot_age_ms
+        ),
         if snapshot.overview.snapshot_age_ms > 2_500 {
             theme::warn()
         } else {
@@ -159,11 +169,33 @@ fn spark_panel(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
         .split(area);
-    sparkline(frame, chunks[0], "Search latency", &app.chart_search_ms, theme::warn());
-    sparkline(frame, chunks[1], "Cycles found", &app.chart_cycles, theme::accent());
-    sparkline(frame, chunks[2], "Profitable routes", &app.chart_profitable, theme::good());
+    sparkline(
+        frame,
+        chunks[0],
+        "Search latency",
+        &app.chart_search_ms,
+        theme::warn(),
+    );
+    sparkline(
+        frame,
+        chunks[1],
+        "Cycles found",
+        &app.chart_cycles,
+        theme::accent(),
+    );
+    sparkline(
+        frame,
+        chunks[2],
+        "Profitable routes",
+        &app.chart_profitable,
+        theme::good(),
+    );
     let _ = snapshot;
 }
 
@@ -219,22 +251,23 @@ fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::Das
         )),
     ]);
     frame.render_widget(
-        Paragraph::new(lines.as_slice())
-            .block(
-                Block::default().borders(Borders::ALL).title(Line::from(vec![
-                    Span::styled(" ", theme::muted()),
-                    Span::styled("Health", theme::title()),
-                ])),
-            ),
+        Paragraph::new(lines.as_slice()).block(Block::default().borders(Borders::ALL).title(
+            Line::from(vec![
+                Span::styled(" ", theme::muted()),
+                Span::styled("Health", theme::title()),
+            ]),
+        )),
         area,
     );
 }
 
 fn history_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(Line::from(vec![
-        Span::styled(" ", theme::muted()),
-        Span::styled("Trade history", theme::title()),
-    ]));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Trade history", theme::title()),
+        ]));
     let max_lines = layout::inner_lines(&block, area);
     let lines: Vec<Line> = app
         .trade_history

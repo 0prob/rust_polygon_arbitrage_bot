@@ -57,7 +57,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .map_or(0, |s| s.overview.uptime.as_secs()),
                 app.snapshot.as_ref().map_or(0, |s| s.opportunities.len()),
                 app.trade_history.len(),
-                app.snapshot.as_ref().map_or(0, |s| s.overview.profitable_routes),
+                app.snapshot
+                    .as_ref()
+                    .map_or(0, |s| s.overview.profitable_routes),
             ),
             theme::muted(),
         ),

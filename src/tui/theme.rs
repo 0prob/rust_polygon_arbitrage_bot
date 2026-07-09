@@ -62,7 +62,11 @@ pub fn severity_style(severity: Severity) -> Style {
 }
 
 #[must_use]
-pub fn label_value(label: impl Into<String>, value: impl Into<String>, severity: Severity) -> Line<'static> {
+pub fn label_value(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    severity: Severity,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled(label.into(), muted()),
         Span::raw("  "),
