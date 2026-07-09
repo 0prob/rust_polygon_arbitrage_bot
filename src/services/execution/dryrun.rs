@@ -19,6 +19,7 @@ pub struct DryRunResult {
     /// Exact post-repayment profit returned by executors that support it.
     pub realized_profit: Option<U256>,
     pub error: Option<String>,
+    pub decoded_revert: Option<crate::services::execution::revert_decoder::DecodedRevert>,
 }
 
 fn decode_realized_profit(output: &[u8]) -> Option<U256> {
@@ -86,6 +87,7 @@ fn gas_overflow_dry_run_success(realized_profit: Option<U256>) -> DryRunResult {
         gas_used: None,
         realized_profit,
         error: None,
+        decoded_revert: None,
     }
 }
 
@@ -101,6 +103,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
             gas_used: Some(gas),
             realized_profit: None,
             error: None,
+            decoded_revert: None,
         },
         Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => {
             gas_overflow_dry_run_success(None)
@@ -110,6 +113,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
             gas_used: None,
             realized_profit: None,
             error: Some(err.to_string()),
+            decoded_revert: None,
         },
         Err(_) => gas_overflow_dry_run_success(None),
     }
@@ -151,7 +155,9 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 );
                 return dry_run_after_call_gas_overflow(provider, candidate, from).await;
             }
-            let reason = try_decode_revert(&raw)
+            let decoded = try_decode_revert(&raw);
+            let reason = decoded
+                .as_ref()
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| {
                     if raw.contains("BAL#528") {
@@ -173,6 +179,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 gas_used: None,
                 realized_profit: None,
                 error: Some(reason),
+                decoded_revert: decoded,
             };
         }
         Err(_) => {
@@ -181,6 +188,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 gas_used: None,
                 realized_profit: None,
                 error: Some("eth_call timed out".into()),
+                decoded_revert: None,
             };
         }
     };
@@ -192,6 +200,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
             gas_used: Some(gas),
             realized_profit,
             error: None,
+            decoded_revert: None,
         },
         Ok(Err(err)) => {
             // eth_call already succeeded; some RPCs return gas-limit errors on
@@ -205,6 +214,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 gas_used: None,
                 realized_profit: None,
                 error: Some(msg),
+                decoded_revert: None,
             }
         }
         Err(_) => {
@@ -216,6 +226,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                     gas_used: None,
                     realized_profit: None,
                     error: Some("estimate_gas timed out".into()),
+                    decoded_revert: None,
                 }
             }
         }

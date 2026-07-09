@@ -204,6 +204,7 @@ pub async fn run_hf_tick(
     let refresh = Arc::clone(&ctx.refresh);
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
     let skip_prefetch = stream_triggered && pipeline.stream_enabled;
+    let mut prefetch_ok = skip_prefetch;
     let prefetch = if skip_prefetch || hot_pools.is_empty() {
         None
     } else {
@@ -218,7 +219,7 @@ pub async fn run_hf_tick(
     if let Some(handle) = prefetch {
         const PREFETCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
         match tokio::time::timeout(PREFETCH_BUDGET, handle).await {
-            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Ok(_))) => prefetch_ok = true,
             Ok(Ok(Err(e))) => crate::debug!("hf prefetch failed: {e:#}"),
             Ok(Err(e)) => crate::debug!("hf prefetch task failed: {e}"),
             Err(_) => crate::debug!(
@@ -362,6 +363,7 @@ pub async fn run_hf_tick(
             dispatch_token_to_matic_rates.as_ref(),
             dispatch_token_decimals.as_ref(),
             evaluation_state_generation,
+            prefetch_ok,
         )
         .await;
     }

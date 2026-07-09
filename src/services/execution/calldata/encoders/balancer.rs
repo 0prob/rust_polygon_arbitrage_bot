@@ -58,12 +58,17 @@ pub fn encode_balancer_hop(
     ])
 }
 
-/// Encode an all-Balancer route as one vault `batchSwap` flash-swap call for `executeArbDirect`.
-pub fn encode_balancer_batch_route(
+pub struct BalancerBatchSwapRequest {
+    pub swaps: Vec<BalancerBatchSwapStep>,
+    pub assets: Vec<Address>,
+    pub funds: BalancerFundManagement,
+}
+
+/// Build vault `batchSwap` / `queryBatchSwap` parameters for an all-Balancer route.
+pub fn build_balancer_batch_swap_request(
     hops: &[CalldataHop],
     recipient: Address,
-    deadline: U256,
-) -> anyhow::Result<Vec<ExecutorCall>> {
+) -> anyhow::Result<BalancerBatchSwapRequest> {
     if hops.is_empty() {
         anyhow::bail!("balancer batch route requires at least one hop");
     }
@@ -97,10 +102,7 @@ pub fn encode_balancer_batch_route(
         });
     }
 
-    // Flash-swap limits: zero means the vault may pull owed tokens at settlement.
-    let limits = vec![I256::ZERO; assets.len()];
-    let batch = IBalancerVault::batchSwapCall {
-        kind: BALANCER_GIVEN_IN,
+    Ok(BalancerBatchSwapRequest {
         swaps,
         assets,
         funds: BalancerFundManagement {
@@ -109,13 +111,28 @@ pub fn encode_balancer_batch_route(
             recipient,
             toInternalBalance: false,
         },
+    })
+}
+
+/// Encode an all-Balancer route as one vault `batchSwap` flash-swap call for `executeArbDirect`.
+pub fn encode_balancer_batch_route(
+    hops: &[CalldataHop],
+    recipient: Address,
+    deadline: U256,
+) -> anyhow::Result<Vec<ExecutorCall>> {
+    let req = build_balancer_batch_swap_request(hops, recipient)?;
+    // Flash-swap limits: zero means the vault may pull owed tokens at settlement.
+    let limits = vec![I256::ZERO; req.assets.len()];
+    let batch = IBalancerVault::batchSwapCall {
+        kind: BALANCER_GIVEN_IN,
+        swaps: req.swaps,
+        assets: req.assets,
+        funds: req.funds,
         limits,
         deadline,
     };
 
-    let first_hop = &hops[0];
     Ok(vec![
-        encode_approve_if_needed(first_hop.token_in, BALANCER_VAULT, first_hop.amount_in),
         ExecutorCall {
             target: BALANCER_VAULT,
             value: U256::ZERO,

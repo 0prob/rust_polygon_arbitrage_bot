@@ -14,6 +14,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::pubsub::Subscription;
 use alloy::rpc::types::Filter;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 /// Max pool addresses per `eth_subscribe` filter (provider limits vary; 50 is conservative).
 const SUBSCRIBE_CHUNK: usize = 50;
@@ -134,9 +135,10 @@ impl PoolLogFeed {
         }
 
         let (log_tx, mut log_rx) = mpsc::channel(1024);
+        let mut readers = JoinSet::new();
         for mut sub in subs {
             let log_tx = log_tx.clone();
-            tokio::spawn(async move {
+            readers.spawn(async move {
                 while let Ok(log) = sub.recv().await {
                     if log_tx.send(log).await.is_err() {
                         break;
@@ -361,5 +363,35 @@ mod tests {
             http_to_wss("https://polygon.example/v1/key"),
             Some("wss://polygon.example/v1/key".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_reader_join_set_aborts_pending_tasks_on_drop() {
+        struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropNotify {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let mut readers = JoinSet::new();
+        readers.spawn(async move {
+            let _notify = DropNotify(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        started_rx.await.expect("reader task should start");
+        drop(readers);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader task should be aborted")
+            .expect("reader task should drop notify guard");
     }
 }

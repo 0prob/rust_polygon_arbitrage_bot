@@ -17,6 +17,12 @@ use crate::pipeline::tick_fetch::{
 };
 use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
 
+use crate::core::types::FlashLoanSource;
+use crate::services::execution::balancer_verify::{
+    batch_profit_covers_min, query_balancer_batch_profit,
+};
+use crate::services::execution::calldata::build_calldata_hops;
+use crate::services::execution::flash_liquidity::route_is_balancer_only;
 use crate::services::execution::{
     CandidateBuildConfig, PrepareDispatchInput, build_execution_candidate, prepare_evaluated_route,
 };
@@ -64,6 +70,7 @@ pub async fn dispatch_profitable_candidates(
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     state_generation: u64,
+    skip_dispatch_refresh: bool,
 ) {
     if profitable.is_empty() || *ctx.shutdown.borrow() {
         return;
@@ -116,6 +123,7 @@ pub async fn dispatch_profitable_candidates(
         token_to_matic_rates,
         token_decimals,
         state_generation,
+        skip_dispatch_refresh,
     )
     .await;
 
@@ -139,6 +147,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     state_generation: u64,
+    skip_dispatch_refresh: bool,
 ) {
     if ctx.execution.global_is_quarantined() {
         crate::warn!("dispatch skipped: execution circuit breaker active");
@@ -163,21 +172,11 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let flash_stale = flash_tokens
         .iter()
         .any(|token| !ctx.execution.flash_liquidity.has_fresh_entry(*token));
-    if flash_stale
-        && !flash_tokens.is_empty()
-        && let Err(_e) = ctx
-            .execution
-            .flash_liquidity
-            .refresh(sim_provider, &flash_tokens)
-            .await
-    {
-        crate::warn!("flash liquidity refresh failed: {_e}");
-    }
 
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
     let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
     let mut dispatch_state_generation = state_generation;
-    let pools_refreshed = if dispatch_pools.is_empty() {
+    let pools_refreshed = if skip_dispatch_refresh || dispatch_pools.is_empty() {
         false
     } else if let Err(e) = ctx
         .refresh
@@ -198,6 +197,17 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         .await;
         true
     };
+
+    if flash_stale && !flash_tokens.is_empty() {
+        if let Err(_e) = ctx
+            .execution
+            .flash_liquidity
+            .refresh(sim_provider, &flash_tokens)
+            .await
+        {
+            crate::warn!("flash liquidity refresh failed: {_e}");
+        }
+    }
 
     let skipped = Arc::new(SkipCounts::default());
     let shutdown = ctx.shutdown.clone();
@@ -368,6 +378,42 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         skipped.record("prepare");
         return;
     };
+
+    if prepared.flash_source == FlashLoanSource::Direct
+        && route_is_balancer_only(&prepared.evaluated.cycle)
+    {
+        let Some(hops) = build_calldata_hops(
+            arena,
+            &prepared.evaluated.cycle.edges,
+            &prepared.evaluated.result.hop_amounts,
+            pool_metas_by_pool,
+        ) else {
+            skipped.record("prepare");
+            return;
+        };
+        match query_balancer_batch_profit(sim_provider, executor, &hops, start_token_addr).await {
+            Some(on_chain_profit)
+                if batch_profit_covers_min(
+                    on_chain_profit,
+                    prepared.evaluated.result.profit,
+                    prepared.evaluated.result.amount_in,
+                    slippage_bps,
+                ) => {}
+            Some(on_chain_profit) => {
+                skipped.record("prepare");
+                crate::debug!(
+                    "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                    prepared.evaluated.result.profit,
+                );
+                return;
+            }
+            None => {
+                skipped.record("prepare");
+                crate::debug!("dispatch skip: fp={fp} queryBatchSwap unprofitable or failed");
+                return;
+            }
+        }
+    }
 
     let build_cfg = CandidateBuildConfig {
         executor_address: executor,

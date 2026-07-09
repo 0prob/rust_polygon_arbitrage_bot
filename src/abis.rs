@@ -117,6 +117,13 @@ sol! {
             int256[] memory limits,
             uint256 deadline
         ) external payable returns (int256[] memory assetDeltas);
+
+        function queryBatchSwap(
+            uint8 kind,
+            BalancerBatchSwapStep[] memory swaps,
+            address[] memory assets,
+            BalancerFundManagement memory funds
+        ) external returns (int256[] memory assetDeltas);
     }
 
     #[sol(rpc)]

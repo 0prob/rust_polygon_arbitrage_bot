@@ -1,5 +1,6 @@
 mod support;
 
+pub mod balancer_verify;
 pub mod calldata;
 pub mod candidate;
 pub mod dryrun;

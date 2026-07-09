@@ -36,6 +36,7 @@ use crate::services::execution::private_submit::{
 use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
 use crate::services::execution::receipt::ReceiptPoller;
+use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
 use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit_with_recovery};
@@ -688,11 +689,27 @@ impl ExecutionService {
         let dry = dry_run_candidate(sim_provider, candidate, operator).await;
 
         if !dry.success {
-            self.quarantine_route(fp, now, RouteFailureKind::DryRun);
+            let sim_fidelity_miss = matches!(
+                dry.decoded_revert,
+                Some(DecodedRevert::InsufficientProfit {
+                    final_balance,
+                    ..
+                }) if final_balance.is_zero()
+            );
+            if sim_fidelity_miss {
+                self.quarantine_route_soft(fp, now);
+            } else {
+                self.quarantine_route(fp, now, RouteFailureKind::DryRun);
+            }
             crate::info!(
-                "dry-run failed: fp={}, reason={}",
+                "dry-run failed: fp={}, reason={}{}",
                 fp,
-                dry.error.as_deref().unwrap_or("unknown")
+                dry.error.as_deref().unwrap_or("unknown"),
+                if sim_fidelity_miss {
+                    " (sim fidelity miss — soft cooldown)"
+                } else {
+                    ""
+                }
             );
             let outcome = ExecutionOutcome::DryRunFailed {
                 reason: dry.error.unwrap_or_else(|| "unknown".into()),
