@@ -229,6 +229,7 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             input.matic_usd,
             input.gas_gwei,
             input.config.execution.slippage_bps,
+            input.config.execution.profit_safety_multiplier_bps,
             48,
         );
         let simulations = build_simulations(&opportunities);
@@ -350,6 +351,7 @@ fn build_routes(
     matic_usd: f64,
     gas_gwei: Option<f64>,
     slippage_bps: u64,
+    safety_multiplier_bps: u64,
     limit: usize,
 ) -> Vec<RouteSummary> {
     let mut ranked: Vec<&FoundCycle> = snapshot.cycles.iter().map(|c| c.as_ref()).collect();
@@ -397,7 +399,7 @@ fn build_routes(
                 min_profit_roi_bps: 0,
                 slippage_bps,
                 flash_loan_source: FlashLoanSource::Balancer,
-                safety_multiplier_bps: 0,
+                safety_multiplier_bps,
                 profit_priority_alpha_bps: 0,
             });
             u256_to_f64(assessment.net_profit_after_gas_matic_wei)
@@ -459,8 +461,18 @@ pub fn build_route_cache(
     snapshot: &HfSnapshot,
     arena: &crate::pipeline::arena::StateArena,
     matic_usd: f64,
+    slippage_bps: u64,
+    safety_multiplier_bps: u64,
 ) -> RouteBuildCache {
-    let opportunities = build_routes(snapshot, arena, matic_usd, None, 0, 48);
+    let opportunities = build_routes(
+        snapshot,
+        arena,
+        matic_usd,
+        None,
+        slippage_bps,
+        safety_multiplier_bps,
+        48,
+    );
     let simulations = build_simulations(&opportunities);
     RouteBuildCache {
         generation: snapshot.generation,

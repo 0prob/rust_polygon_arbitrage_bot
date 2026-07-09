@@ -362,9 +362,19 @@ pub async fn run_pass_loop(
         handle.abort();
     }
     let hf_join = hf_task.lock().take();
-    if let Some(handle) = hf_join {
-        handle.abort();
-        let _ = handle.await;
+    if let Some(handle) = hf_join
+        && tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .is_err()
+    {
+        crate::warn!("hf task did not exit within 5s of shutdown");
+    }
+    if let (Some(executor), Ok(provider)) = (
+        ctx.config.execution.executor_address,
+        ctx.rpc.connect_state(),
+    ) {
+        let operator = ctx.wallet.operator_address(executor);
+        ctx.execution.shutdown_resync(&provider, operator).await;
     }
     lf_handle.abort();
     if tokio::time::timeout(Duration::from_secs(2), lf_handle)

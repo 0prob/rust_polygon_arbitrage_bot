@@ -305,7 +305,13 @@ async fn collect_snapshot(
         let hot_pools = hot_pool_addresses(&snap);
         let mut arena = snap.arena.clone();
         arena.apply_hot_cache(&ctx.cache, &hot_pools);
-        *route_cache = build_route_cache(&snap, &arena, matic_usd);
+        *route_cache = build_route_cache(
+            &snap,
+            &arena,
+            matic_usd,
+            ctx.config.execution.slippage_bps,
+            ctx.config.execution.profit_safety_multiplier_bps,
+        );
         arena
     } else {
         snap.arena.clone()

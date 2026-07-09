@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, U256};
@@ -65,6 +65,53 @@ enum RouteFailureKind {
     RealizedLoss,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PnlState {
+    total: i128,
+    daily: i128,
+    daily_utc_day: u32,
+}
+
+impl PnlState {
+    const fn new() -> Self {
+        Self {
+            total: 0,
+            daily: 0,
+            daily_utc_day: 0,
+        }
+    }
+
+    fn maybe_roll_daily(&mut self) {
+        let today = utc_day_number();
+        if self.daily_utc_day != today {
+            self.daily = 0;
+            self.daily_utc_day = today;
+        }
+    }
+
+    fn record_profit(&mut self, net: i128) {
+        self.maybe_roll_daily();
+        self.total = self.total.saturating_add(net);
+        self.daily = self.daily.saturating_add(net);
+    }
+
+    fn record_loss(&mut self, loss: i128) {
+        self.maybe_roll_daily();
+        self.total = self.total.saturating_sub(loss);
+        self.daily = self.daily.saturating_sub(loss);
+    }
+
+    fn snapshot(self) -> (i128, i128) {
+        (self.total, self.daily)
+    }
+}
+
+fn utc_day_number() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| (d.as_secs() / 86_400) as u32)
+}
+
 #[derive(Debug)]
 pub struct ExecutionService {
     last_submit: RwLock<FxHashMap<u64, Instant>>,
@@ -74,7 +121,7 @@ pub struct ExecutionService {
     fail_counts: RwLock<FxHashMap<u64, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
-    pnl: Mutex<(i128, i128)>,
+    pnl: Mutex<PnlState>,
     pub total_trades: AtomicU64,
     pub total_losses: AtomicU64,
     pub consecutive_fails: AtomicU32,
@@ -194,7 +241,7 @@ impl ExecutionService {
             fail_counts: RwLock::new(FxHashMap::default()),
             nonce: RwLock::new(None),
             flash_liquidity: Arc::new(FlashLiquidityCache::new()),
-            pnl: Mutex::new((0, 0)),
+            pnl: Mutex::new(PnlState::new()),
             total_trades: AtomicU64::new(0),
             total_losses: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
@@ -297,7 +344,9 @@ impl ExecutionService {
             .min(30_000)
     }
     pub fn pnl_snapshot(&self) -> (i128, i128) {
-        *self.pnl.lock()
+        let mut pnl = self.pnl.lock();
+        pnl.maybe_roll_daily();
+        pnl.snapshot()
     }
 
     fn record_realized(&self, profit_wei: U256, gas_cost_wei: U256) {
@@ -307,18 +356,14 @@ impl ExecutionService {
                 .saturating_sub(gas_cost_wei)
                 .min(U256::from(i128::MAX as u128))
                 .to::<u128>() as i128;
-            let mut pnl = self.pnl.lock();
-            pnl.0 = pnl.0.saturating_add(p);
-            pnl.1 = pnl.1.saturating_add(p);
+            self.pnl.lock().record_profit(p);
             self.total_trades.fetch_add(1, Ordering::Relaxed);
         } else {
             let loss = gas_cost_wei
                 .saturating_sub(profit_wei)
                 .min(U256::from(i128::MAX as u128))
                 .to::<u128>() as i128;
-            let mut pnl = self.pnl.lock();
-            pnl.0 = pnl.0.saturating_sub(loss);
-            pnl.1 = pnl.1.saturating_sub(loss);
+            self.pnl.lock().record_loss(loss);
             self.total_losses.fetch_add(1, Ordering::Relaxed);
             self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
         }
@@ -557,7 +602,7 @@ impl ExecutionService {
         candidate: &CandidateExecution,
         operator: Address,
         gas_oracle: &GasOracle,
-        state_cache: &StateCache,
+        _state_cache: &StateCache,
         hypersync: Option<&HyperSyncService>,
         ui_hook: Option<&SharedUiHook>,
         shutdown: Option<&watch::Receiver<bool>>,
@@ -603,15 +648,6 @@ impl ExecutionService {
             return outcome;
         }
 
-        if state_cache.generation() != candidate.state_generation {
-            crate::info!(
-                "dispatch skip: fp={}, stale state (candidate_gen={}, cache_gen={})",
-                fp,
-                candidate.state_generation,
-                state_cache.generation()
-            );
-            return ExecutionOutcome::SkippedCooldown;
-        }
         let simulation_block = match sim_provider.get_block_number().await {
             Ok(block) => block,
             Err(e) => {
@@ -1275,6 +1311,20 @@ mod safety_tests {
         assert_eq!(service.pnl_snapshot().1, 14);
         assert_eq!(service.total_trades.load(Ordering::Relaxed), 1);
         assert_eq!(service.consecutive_fails.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn daily_pnl_resets_on_utc_day_boundary() {
+        let service = ExecutionService::new();
+        service.record_realized(U256::from(20u8), U256::from(5u8));
+        {
+            let mut pnl = service.pnl.lock();
+            pnl.daily_utc_day = pnl.daily_utc_day.saturating_sub(1);
+        }
+        service.record_realized(U256::from(10u8), U256::from(2u8));
+        let (total, daily) = service.pnl_snapshot();
+        assert_eq!(total, 23);
+        assert_eq!(daily, 8);
     }
 
     #[test]

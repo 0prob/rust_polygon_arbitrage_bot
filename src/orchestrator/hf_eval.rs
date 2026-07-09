@@ -256,7 +256,7 @@ fn select_probe_survivors(
     kept
 }
 
-/// Cycle count worth gas-rescoring and probe-ranking (4× Brent cap).
+/// Cycle count worth gas-rescoring and probe-ranking (2× Brent cap).
 #[inline]
 #[must_use]
 pub fn probe_rank_window(max_keep: usize, total: usize) -> usize {

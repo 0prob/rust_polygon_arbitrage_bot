@@ -138,8 +138,8 @@ pub fn slippage_adjusted(amount_out: U256, slippage_bps: u64) -> Option<U256> {
     }
 }
 
-/// Default 3× worst-case gas loss buffer before submitting (30_000 bps = 3.0×).
-pub const DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS: u64 = 30_000;
+/// Default 2.5× worst-case gas loss buffer before submitting (25_000 bps = 2.5×).
+pub const DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS: u64 = 25_000;
 
 #[derive(Clone)]
 pub struct AssessProfitInput {

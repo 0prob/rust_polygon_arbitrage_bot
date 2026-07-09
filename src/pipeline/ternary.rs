@@ -367,15 +367,6 @@ pub fn optimize_cycle(
     if low < economic_floor {
         low = economic_floor;
     }
-    if let Some(seeds) = seed_sims
-        && let Some((seed_amount, seed_sim)) = seeds.first()
-        && !seed_sim.profit.is_zero()
-        && *seed_amount >= economic_floor
-        && *seed_amount <= high
-        && *seed_amount > low
-    {
-        low = *seed_amount;
-    }
     if high < economic_floor || high <= low {
         crate::trace!(
             "optimize_cycle: bounds empty low={low} high={high} economic_floor={economic_floor} edge_count={}",

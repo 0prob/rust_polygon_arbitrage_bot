@@ -231,7 +231,10 @@ pub struct LfContext {
     pub ui_hook: SharedUiHook,
 }
 
-pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
+pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> anyhow::Result<()> {
+    if *shutdown.borrow() {
+        return Ok(());
+    }
     let lf_started = crate::util::now_ms();
     let lf_pass = ctx.graph_cache.lock().advance_pass();
     let refresh_batch = ctx.refresh.lf_refresh_batch(lf_pass);
@@ -295,6 +298,9 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
     };
     let (cpu, cycle_search_ms) = cycle_search.await;
     let cpu = cpu?;
+    if *shutdown.borrow() {
+        return Ok(());
+    }
 
     let mut resolvable = resolvable_token_set(&prior_rates, &arena);
     expand_hub_spoke_resolvable(&mut resolvable, pool_metas.as_ref(), &arena);
@@ -439,6 +445,10 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
         )
     });
 
+    if *shutdown.borrow() {
+        return Ok(());
+    }
+
     *ctx.arena.lock() = arena.clone();
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
@@ -489,7 +499,7 @@ pub fn spawn_lf_background(
                     let Ok(guard) = lf_ctx.tick_lock.try_lock() else {
                         continue;
                     };
-                    if let Err(e) = run_lf_tick(&lf_ctx).await {
+                    if let Err(e) = run_lf_tick(&lf_ctx, &shutdown).await {
                         crate::warn!("lf tick failed: {e}");
                     }
                     drop(guard);
