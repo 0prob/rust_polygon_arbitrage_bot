@@ -4,8 +4,8 @@ use crate::core::types::DodoPoolState;
 
 use alloy::primitives::U512;
 
-use crate::util::{u512_to_u256, u512_to_u256_checked};
 use super::fixed_point::{ONE, ONE_U512, mul_down as mul_floor};
+use crate::util::{u512_to_u256, u512_to_u256_checked};
 
 // Exact 1e36 — DODO on-chain `_K_PRECISION`. Previous constant was an approximation.
 const ONE2: U256 = {
@@ -61,7 +61,8 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
         let k_term = u512_to_u256_checked(k_v0_v0).unwrap_or(U256::MAX);
         k_term + mul_floor(i, delta)
     };
-    let mut b_abs = (ONE - k) * v1;
+    let one_minus_k = ONE - k;
+    let mut b_abs = one_minus_k * v1;
     let mut b_sig = false;
     if b_abs >= part2 {
         b_abs -= part2;
@@ -71,14 +72,14 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
     }
     b_abs /= ONE;
 
-    let square_root_input = mul_floor((ONE - k) * U256::from(4), mul_floor(k, v0) * v0);
+    let square_root_input = mul_floor(one_minus_k * U256::from(4), mul_floor(k, v0) * v0);
     let square_root = if square_root_input.is_zero() {
         b_abs
     } else {
         (b_abs * b_abs + square_root_input).root(2)
     };
 
-    let denominator = (ONE - k) * U256::from(2);
+    let denominator = one_minus_k * U256::from(2);
     if denominator.is_zero() {
         return U256::ZERO;
     }

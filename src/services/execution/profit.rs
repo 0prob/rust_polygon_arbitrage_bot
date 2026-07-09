@@ -3,11 +3,13 @@ use std::sync::atomic::AtomicU64;
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use rustc_hash::FxHashMap;
+use thiserror::Error;
 
 use crate::core::constants::BPS_SCALE;
 use crate::core::types::{FlashLoanSource, ProfitAssessment, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::MinimalSimResult;
+use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
 use crate::services::oracle::resolve_token_to_matic_rate;
 
 pub const ON_CHAIN_MIN_PROFIT_RATIO_BPS: u64 = 9500;
@@ -25,6 +27,18 @@ pub fn set_aave_flash_loan_fee_bps(fee_bps: u64) {
 
 // ponytail: DODO flash loan fee = pool swap fee. Most DODO pools use 0.1% = 10 bps.
 const DODO_FLASH_LOAN_FEE_BPS: u64 = 10;
+/// Cap profit-derived priority fee boost at 200 gwei (matches submit.rs).
+pub const MAX_PROFIT_PRIORITY_FEE_WEI: u128 = 200_000_000_000;
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ProfitError {
+    #[error("invalid slippage {slippage_bps} bps")]
+    InvalidSlippage { slippage_bps: u64 },
+    #[error("arithmetic overflow in {field}")]
+    ArithmeticOverflow { field: &'static str },
+    #[error("token/MATIC rate unavailable")]
+    RateUnavailable,
+}
 
 pub fn flash_loan_fee_bps(source: FlashLoanSource) -> u64 {
     match source {
@@ -51,11 +65,64 @@ pub fn on_chain_min_profit(token_profit: U256) -> Option<U256> {
     }
 }
 
-/// On-chain `minProfit` aligned with off-chain slippage-adjusted gross.
+/// Token-denominated net profit after slippage and flash fee (matches `assess_profit` basis).
 #[must_use]
-pub fn on_chain_min_profit_for_route(gross_profit: U256, slippage_bps: u64) -> Option<U256> {
-    let basis = slippage_adjusted(gross_profit, slippage_bps)?;
-    on_chain_min_profit(basis)
+pub fn modeled_net_profit_tokens(
+    gross_profit: U256,
+    amount_in: U256,
+    slippage_bps: u64,
+    flash_source: FlashLoanSource,
+) -> Option<U256> {
+    let amount_out = gross_profit.checked_add(amount_in)?;
+    let adjusted_out = slippage_adjusted(amount_out, slippage_bps)?;
+    let adjusted_gross = adjusted_out.saturating_sub(amount_in);
+    let flash_fee =
+        amount_in.checked_mul(U256::from(flash_loan_fee_bps(flash_source)))? / BPS_SCALE;
+    Some(adjusted_gross.saturating_sub(flash_fee))
+}
+
+/// On-chain `minProfit` aligned with off-chain modeled net (95% floor).
+#[must_use]
+pub fn on_chain_min_profit_for_route(
+    gross_profit: U256,
+    amount_in: U256,
+    slippage_bps: u64,
+    flash_source: FlashLoanSource,
+) -> Option<U256> {
+    let net = modeled_net_profit_tokens(gross_profit, amount_in, slippage_bps, flash_source)?;
+    on_chain_min_profit(net)
+}
+
+#[must_use]
+pub fn on_chain_min_profit_from_assessment(assessment: &ProfitAssessment) -> Option<U256> {
+    on_chain_min_profit(assessment.net_profit)
+}
+
+/// MATIC wei spent on profit-proportional priority fee uplift (submit + assess).
+#[must_use]
+pub fn profit_priority_uplift_wei(
+    expected_profit_matic_wei: U256,
+    alpha_bps: u64,
+    gas_units: u32,
+) -> U256 {
+    if alpha_bps == 0 || gas_units == 0 || expected_profit_matic_wei.is_zero() {
+        return U256::ZERO;
+    }
+    let total_boost = expected_profit_matic_wei.saturating_mul(U256::from(alpha_bps)) / BPS_SCALE;
+    let per_gas = total_boost / U256::from(gas_units);
+    let capped_per_gas = per_gas.min(U256::from(MAX_PROFIT_PRIORITY_FEE_WEI));
+    capped_per_gas.saturating_mul(U256::from(gas_units))
+}
+
+/// Safety floor in native MATIC wei (`revert_penalty × safety_bps / 10_000`).
+#[must_use]
+pub fn safety_floor_matic_wei(revert_penalty_wei: U256, safety_bps: u64) -> U256 {
+    let bps = if safety_bps == 0 {
+        DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS
+    } else {
+        safety_bps
+    };
+    revert_penalty_wei.saturating_mul(U256::from(bps)) / BPS_SCALE
 }
 
 #[must_use]
@@ -90,6 +157,8 @@ pub struct AssessProfitInput {
     pub flash_loan_source: FlashLoanSource,
     /// Net profit must exceed `gas_cost_matic * safety_multiplier_bps / 10_000`.
     pub safety_multiplier_bps: u64,
+    /// Profit-proportional priority fee alpha in bps (0 = disabled).
+    pub profit_priority_alpha_bps: u64,
 }
 
 /// Context for Brent sizing — maximizes net profit after gas/fees/slippage.
@@ -169,10 +238,97 @@ pub struct RouteProfitParams {
     pub flash_loan_source: FlashLoanSource,
 }
 
+#[derive(Clone, Copy)]
 pub struct ProfitThresholds {
     pub min_profit_matic_wei: U256,
     pub min_profit_roi_bps: u64,
     pub safety_multiplier_bps: u64,
+    pub profit_priority_alpha_bps: u64,
+}
+
+#[must_use]
+pub fn route_profit_thresholds(
+    min_profit_matic: U256,
+    min_profit_roi_bps: u64,
+    safety_multiplier_bps: u64,
+    profit_priority_alpha_bps: u64,
+    risk_bps: u64,
+) -> ProfitThresholds {
+    ProfitThresholds {
+        min_profit_matic_wei: min_profit_matic.saturating_mul(U256::from(risk_bps))
+            / U256::from(10_000u64),
+        min_profit_roi_bps,
+        safety_multiplier_bps,
+        profit_priority_alpha_bps,
+    }
+}
+
+/// How to resolve simulated gas into assessment gas units (single source of truth).
+pub enum AssessmentGas<'a> {
+    /// HF eval: per-tick prefetch table, then oracle fallback.
+    TickRoute {
+        lookup: &'a RouteGasLookup,
+        oracle: &'a GasOracle,
+        route_fp: u64,
+    },
+    /// Dispatch / capped re-opt: direct oracle lookup by route fingerprint.
+    Route {
+        oracle: &'a GasOracle,
+        route_fp: u64,
+    },
+}
+
+/// Resolve gas units for profitability assessment without double-scaling.
+#[must_use]
+pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 {
+    match gas {
+        AssessmentGas::TickRoute {
+            lookup,
+            oracle,
+            route_fp,
+        } => lookup.route_gas_or_heuristic(oracle, *route_fp, simulated_gas),
+        AssessmentGas::Route { oracle, route_fp } => {
+            oracle.route_gas_or_heuristic(*route_fp, simulated_gas)
+        }
+    }
+}
+
+pub struct RouteAssessRequest<'a> {
+    pub cycle_start: TokenIndex,
+    pub arena: &'a StateArena,
+    pub gross_profit: U256,
+    pub amount_in: U256,
+    pub simulated_gas: u32,
+    pub hop_count: u32,
+    pub slippage_bps: u64,
+    pub flash_source: FlashLoanSource,
+    pub gas: AssessmentGas<'a>,
+    pub thresholds: ProfitThresholds,
+    pub token_to_matic_rates: &'a FxHashMap<TokenIndex, U256>,
+    pub token_decimals: &'a FxHashMap<Address, u8>,
+    pub gas_price: U256,
+}
+
+/// Assess a simulated route using centralized gas resolution and thresholds.
+#[must_use]
+pub fn assess_route_from_sim(request: &RouteAssessRequest<'_>) -> ProfitAssessment {
+    let route = RouteProfitParams {
+        gross_profit: request.gross_profit,
+        amount_in: request.amount_in,
+        gas_units: assessment_gas_units(request.simulated_gas, &request.gas),
+        hop_count: request.hop_count,
+        slippage_bps: request.slippage_bps,
+        flash_loan_source: request.flash_source,
+    };
+    assess_route_profit(
+        request.cycle_start,
+        request.arena,
+        &route,
+        request.token_to_matic_rates,
+        request.token_decimals,
+        request.gas_price,
+        &request.thresholds,
+    )
 }
 
 /// Single entry point for route profitability after simulation.
@@ -203,6 +359,7 @@ pub fn assess_route_profit(
         slippage_bps: route.slippage_bps,
         flash_loan_source: route.flash_loan_source,
         safety_multiplier_bps: thresholds.safety_multiplier_bps,
+        profit_priority_alpha_bps: thresholds.profit_priority_alpha_bps,
     })
 }
 
@@ -230,6 +387,7 @@ pub fn net_profit_after_gas_from_sim(
         slippage_bps: ctx.slippage_bps,
         flash_loan_source: ctx.flash_source,
         safety_multiplier_bps: ctx.safety_multiplier_bps,
+        profit_priority_alpha_bps: 0,
     })
     .net_profit_after_gas
 }
@@ -282,22 +440,25 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         U256::ZERO
     };
 
-    let safety_bps = if input.safety_multiplier_bps == 0 {
-        DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS
+    let required_net_matic = safety_floor_matic_wei(revert_penalty, input.safety_multiplier_bps);
+    let estimated_matic = if rate_ok && !net_before_gas.is_zero() {
+        net_before_gas
+            .checked_mul(input.token_to_matic_rate)
+            .map(|v| v / scale)
+            .unwrap_or(U256::ZERO)
     } else {
-        input.safety_multiplier_bps
+        U256::ZERO
     };
-    let Some(required_net_matic) = revert_penalty
-        .checked_mul(U256::from(safety_bps))
-        .map(|v| v / BPS_SCALE)
-    else {
-        return rejected_arithmetic(input, "safety-floor overflow");
-    };
+    let priority_uplift = profit_priority_uplift_wei(
+        estimated_matic,
+        input.profit_priority_alpha_bps,
+        input.gas_units,
+    );
+    let net_after_priority = net_profit_after_gas_matic_wei.saturating_sub(priority_uplift);
 
-    let meets_absolute_min = net_profit_after_gas_matic_wei >= input.min_profit_matic_wei;
-    let meets_safety_ratio = net_profit_after_gas_matic_wei >= required_net_matic;
-    let meets_sane_matic_cap =
-        net_profit_after_gas_matic_wei <= U256::from(MAX_SANE_PROFIT_MATIC_WEI);
+    let meets_absolute_min = net_after_priority >= input.min_profit_matic_wei;
+    let meets_safety_ratio = net_after_priority >= required_net_matic;
+    let meets_sane_matic_cap = net_after_priority <= U256::from(MAX_SANE_PROFIT_MATIC_WEI);
     let roi_bps = if input.amount_in.is_zero() || net_profit_after_gas.is_zero() {
         0u64
     } else {
@@ -310,6 +471,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
 
     let should_execute = rate_ok
         && net_profit_after_gas > U256::ZERO
+        && net_after_priority > U256::ZERO
         && meets_absolute_min
         && meets_safety_ratio
         && meets_sane_matic_cap
@@ -327,7 +489,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         Some("token/MATIC rate too low or unavailable".into())
     } else if !meets_safety_ratio {
         Some(format!(
-            "net profit {net_profit_after_gas_matic_wei} MATIC wei below safety floor {required_net_matic} ({safety_bps} bps × worst-case gas)"
+            "net profit {net_after_priority} MATIC wei below safety floor {required_net_matic} (incl priority uplift {priority_uplift})"
         ))
     } else if !meets_absolute_min {
         Some("below min profit threshold".into())
@@ -355,7 +517,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         revert_penalty,
         net_profit: net_before_gas,
         net_profit_after_gas,
-        net_profit_after_gas_matic_wei,
+        net_profit_after_gas_matic_wei: net_after_priority,
         roi,
         reject_reason,
     }
@@ -396,6 +558,7 @@ mod safety_tests {
             slippage_bps: 100,
             flash_loan_source: FlashLoanSource::Balancer,
             safety_multiplier_bps: 10_000,
+            profit_priority_alpha_bps: 0,
         }
     }
 
@@ -424,7 +587,63 @@ mod safety_tests {
 
     #[test]
     fn on_chain_min_profit_rejects_invalid_slippage() {
-        assert!(on_chain_min_profit_for_route(U256::from(10u8), 10_000).is_none());
+        assert!(
+            on_chain_min_profit_for_route(
+                U256::from(10u8),
+                U256::from(100u8),
+                10_000,
+                FlashLoanSource::Balancer,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn on_chain_min_profit_matches_modeled_net() {
+        let gross = U256::from(50_000u64);
+        let amount_in = U256::from(1_000_000u64);
+        let slippage_bps = 100;
+        let input = AssessProfitInput {
+            gross_profit: gross,
+            amount_in,
+            gas_units: 0,
+            gas_price_wei: U256::ZERO,
+            token_to_matic_rate: RATE_PRECISION,
+            token_decimals: 18,
+            hop_count: 1,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            slippage_bps,
+            flash_loan_source: FlashLoanSource::Balancer,
+            safety_multiplier_bps: 0,
+            profit_priority_alpha_bps: 0,
+        };
+        let assessment = assess_profit(&input);
+        assert_eq!(
+            on_chain_min_profit_for_route(
+                gross,
+                amount_in,
+                slippage_bps,
+                FlashLoanSource::Balancer
+            ),
+            on_chain_min_profit_from_assessment(&assessment)
+        );
+    }
+
+    #[test]
+    fn priority_uplift_reduces_executable_net() {
+        let mut i = input();
+        i.profit_priority_alpha_bps = 5_000;
+        i.gas_units = 200_000;
+        i.safety_multiplier_bps = 0;
+        i.min_profit_matic_wei = U256::ZERO;
+        let without = assess_profit(&{
+            let mut c = i.clone();
+            c.profit_priority_alpha_bps = 0;
+            c
+        });
+        let with = assess_profit(&i);
+        assert!(with.net_profit_after_gas_matic_wei < without.net_profit_after_gas_matic_wei);
     }
 
     #[test]
@@ -468,5 +687,102 @@ mod safety_tests {
             result.net_profit,
             result.gross_profit.saturating_sub(result.flash_loan_fee)
         );
+    }
+
+    #[test]
+    fn route_and_tick_route_gas_match_for_single_fingerprint() {
+        let oracle = crate::services::execution::gas_oracle::GasOracle::default();
+        oracle.record_route_gas(0xABCD, 250_000);
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [0xABCD]);
+        let tick = AssessmentGas::TickRoute {
+            lookup: &lookup,
+            oracle: &oracle,
+            route_fp: 0xABCD,
+        };
+        let route = AssessmentGas::Route {
+            oracle: &oracle,
+            route_fp: 0xABCD,
+        };
+        let tick_gas = assessment_gas_units(100_000, &tick);
+        let route_gas = assessment_gas_units(100_000, &route);
+        assert_eq!(tick_gas, route_gas);
+        assert_eq!(tick_gas, 250_000);
+    }
+
+    #[test]
+    fn scaled_heuristic_gas_matches_oracle_route_lookup() {
+        let oracle = crate::services::execution::gas_oracle::GasOracle::default();
+        for _ in 0..8 {
+            oracle.record_sim_observed(100_000, 200_000);
+        }
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [0xBEEF]);
+        let tick = AssessmentGas::TickRoute {
+            lookup: &lookup,
+            oracle: &oracle,
+            route_fp: 0xBEEF,
+        };
+        let route = AssessmentGas::Route {
+            oracle: &oracle,
+            route_fp: 0xBEEF,
+        };
+        let tick_gas = assessment_gas_units(100_000, &tick);
+        let route_gas = assessment_gas_units(100_000, &route);
+        assert_eq!(tick_gas, route_gas);
+        assert!(tick_gas > 100_000);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn modeled_net_matches_assessment_zero_gas(
+            gross in 1u64..1_000_000u64,
+            amount_in in 1_000_000u64..10_000_000u64,
+            slippage in 0u64..500u64,
+        ) {
+            let gross = U256::from(gross);
+            let amount_in = U256::from(amount_in);
+            let modeled = modeled_net_profit_tokens(gross, amount_in, slippage, FlashLoanSource::Balancer);
+            let assessment = assess_profit(&AssessProfitInput {
+                gross_profit: gross,
+                amount_in,
+                gas_units: 0,
+                gas_price_wei: U256::ZERO,
+                token_to_matic_rate: RATE_PRECISION,
+                token_decimals: 18,
+                hop_count: 1,
+                min_profit_matic_wei: U256::ZERO,
+                min_profit_roi_bps: 0,
+                slippage_bps: slippage,
+                flash_loan_source: FlashLoanSource::Balancer,
+                safety_multiplier_bps: 0,
+                profit_priority_alpha_bps: 0,
+            });
+            prop_assert_eq!(modeled, Some(assessment.net_profit));
+        }
+
+        #[test]
+        fn slippage_at_or_above_10000_rejects(gross in 1u64..1000u64, amount_in in 1u64..1000u64) {
+            let input = AssessProfitInput {
+                gross_profit: U256::from(gross),
+                amount_in: U256::from(amount_in),
+                gas_units: 1,
+                gas_price_wei: U256::from(1u8),
+                token_to_matic_rate: RATE_PRECISION,
+                token_decimals: 18,
+                hop_count: 1,
+                min_profit_matic_wei: U256::ZERO,
+                min_profit_roi_bps: 0,
+                slippage_bps: 10_000,
+                flash_loan_source: FlashLoanSource::Balancer,
+                safety_multiplier_bps: 0,
+                profit_priority_alpha_bps: 0,
+            };
+            prop_assert!(!assess_profit(&input).should_execute);
+        }
     }
 }

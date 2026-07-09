@@ -22,10 +22,12 @@ use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, max_flash_borrow_wei, min_economic_amount_in,
 };
+use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::flash_policy::FlashLoanPolicy;
+use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::profit::{
-    ProfitEvalContext, ProfitThresholds, RouteProfitParams, assess_route_profit,
+    AssessmentGas, ProfitEvalContext, ProfitThresholds, RouteAssessRequest, assess_route_from_sim,
 };
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 
@@ -314,16 +316,16 @@ pub fn cycle_has_aave_listed_token(
     arena: &StateArena,
     flash_liquidity: &FlashLiquidityCache,
 ) -> bool {
+    let mut addrs = Vec::with_capacity(cycle.edges.len());
     for edge in &cycle.edges {
-        let Some(addr) = arena.token_address(edge.token_in) else {
-            continue;
-        };
-        let liquidity = flash_liquidity.snapshot(addr);
-        if liquidity.aave_listed && !liquidity.aave.is_zero() {
-            return true;
+        if let Some(addr) = arena.token_address(edge.token_in) {
+            addrs.push(addr);
         }
     }
-    false
+    flash_liquidity
+        .snapshots_for(&addrs)
+        .into_iter()
+        .any(|liquidity| liquidity.aave_listed && !liquidity.aave.is_zero())
 }
 
 /// Mixed Balancer routes need an Aave-listed token for flash borrow. Pure Balancer routes
@@ -640,8 +642,11 @@ pub struct PrepareDispatchInput<'a> {
     pub slippage_bps: u64,
     pub max_flash_loan_usd: u64,
     pub safety_multiplier_bps: u64,
-    /// Gas-oracle scale in bps (10_000 = 1.0×) applied to simulated gas.
-    pub gas_scale_bps: u64,
+    pub profit_priority_alpha_bps: u64,
+    pub route_fingerprint: u64,
+    pub gas_oracle: &'a GasOracle,
+    /// Reuse HF assessment when dispatch state matches eval (skips reassess).
+    pub existing_assessment: Option<ProfitAssessment>,
 }
 
 pub struct PreparedDispatch {
@@ -728,19 +733,10 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 );
                 return reoptimize_capped(input, plan.source, liquidity.balancer);
             }
-            let assessment = reassess_route(
-                input.evaluated,
-                plan.source,
-                input.min_profit_matic,
-                input.min_profit_roi_bps,
-                input.gas_price,
-                input.slippage_bps,
-                input.safety_multiplier_bps,
-                input.gas_scale_bps,
-                input.token_to_matic_rates,
-                input.token_decimals,
-                input.arena,
-            )?;
+            let assessment = input
+                .existing_assessment
+                .clone()
+                .or_else(|| reassess_route(input, plan.source))?;
             if !assessment.should_execute {
                 crate::debug!(
                     "prepare skip: reassess rejected ({})",
@@ -796,7 +792,16 @@ fn reoptimize_capped(
         source,
         input.safety_multiplier_bps,
     );
-    profit_ctx.gas_scale_bps = input.gas_scale_bps;
+    profit_ctx.gas_scale_bps = 10_000;
+    let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
+        input.gas_oracle,
+        [input.route_fingerprint],
+    );
+    let route_gas_costing = RouteGasCosting {
+        lookup: &route_gas,
+        oracle: input.gas_oracle,
+        fingerprint: input.route_fingerprint,
+    };
     let opt = optimize_cycle(
         input.arena,
         &input.evaluated.cycle,
@@ -807,7 +812,7 @@ fn reoptimize_capped(
         Some(cap),
         &profit_ctx,
         None,
-        None,
+        Some(route_gas_costing),
         None,
     )?;
     let optimal_input = opt.optimal_input.min(cap);
@@ -819,28 +824,29 @@ fn reoptimize_capped(
         return None;
     }
 
-    let route = RouteProfitParams {
+    let assessment = assess_route_from_sim(&RouteAssessRequest {
+        cycle_start: input.evaluated.cycle.start_token,
+        arena: input.arena,
         gross_profit: sim.profit,
         amount_in: sim.amount_in,
-        gas_units: sim.total_gas,
+        simulated_gas: sim.total_gas,
         hop_count: input.evaluated.cycle.hop_count,
         slippage_bps: input.slippage_bps,
-        flash_loan_source: source,
-    };
-    let thresholds = ProfitThresholds {
-        min_profit_matic_wei: input.min_profit_matic,
-        min_profit_roi_bps: input.min_profit_roi_bps,
-        safety_multiplier_bps: input.safety_multiplier_bps,
-    };
-    let assessment = assess_route_profit(
-        input.evaluated.cycle.start_token,
-        input.arena,
-        &route,
-        input.token_to_matic_rates,
-        input.token_decimals,
-        input.gas_price,
-        &thresholds,
-    );
+        flash_source: source,
+        gas: AssessmentGas::Route {
+            oracle: input.gas_oracle,
+            route_fp: input.route_fingerprint,
+        },
+        thresholds: ProfitThresholds {
+            min_profit_matic_wei: input.min_profit_matic,
+            min_profit_roi_bps: input.min_profit_roi_bps,
+            safety_multiplier_bps: input.safety_multiplier_bps,
+            profit_priority_alpha_bps: input.profit_priority_alpha_bps,
+        },
+        token_to_matic_rates: input.token_to_matic_rates,
+        token_decimals: input.token_decimals,
+        gas_price: input.gas_price,
+    });
 
     Some(PreparedDispatch {
         evaluated: EvaluatedRoute {
@@ -906,51 +912,33 @@ fn capped_sim_passes_sanity(
     )
 }
 
-// ponytail: 11 params, bundle into a struct when a 3rd call site appears.
-#[allow(clippy::too_many_arguments)]
 fn reassess_route(
-    evaluated: &EvaluatedRoute,
+    input: &PrepareDispatchInput<'_>,
     source: FlashLoanSource,
-    min_profit_matic: U256,
-    min_profit_roi_bps: u64,
-    gas_price: U256,
-    slippage_bps: u64,
-    safety_multiplier_bps: u64,
-    gas_scale_bps: u64,
-    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
-    token_decimals: &FxHashMap<Address, u8>,
-    arena: &StateArena,
 ) -> Option<ProfitAssessment> {
-    let gas_units = if gas_scale_bps == 10_000 {
-        evaluated.result.total_gas
-    } else {
-        crate::services::execution::support::scaled_simulated_gas(
-            evaluated.result.total_gas,
-            gas_scale_bps,
-        )
-    };
-    let route = RouteProfitParams {
-        gross_profit: evaluated.result.profit,
-        amount_in: evaluated.result.amount_in,
-        gas_units,
-        hop_count: evaluated.cycle.hop_count,
-        slippage_bps,
-        flash_loan_source: source,
-    };
-    let thresholds = ProfitThresholds {
-        min_profit_matic_wei: min_profit_matic,
-        min_profit_roi_bps,
-        safety_multiplier_bps,
-    };
-    Some(assess_route_profit(
-        evaluated.cycle.start_token,
-        arena,
-        &route,
-        token_to_matic_rates,
-        token_decimals,
-        gas_price,
-        &thresholds,
-    ))
+    Some(assess_route_from_sim(&RouteAssessRequest {
+        cycle_start: input.evaluated.cycle.start_token,
+        arena: input.arena,
+        gross_profit: input.evaluated.result.profit,
+        amount_in: input.evaluated.result.amount_in,
+        simulated_gas: input.evaluated.result.total_gas,
+        hop_count: input.evaluated.cycle.hop_count,
+        slippage_bps: input.slippage_bps,
+        flash_source: source,
+        gas: AssessmentGas::Route {
+            oracle: input.gas_oracle,
+            route_fp: input.route_fingerprint,
+        },
+        thresholds: ProfitThresholds {
+            min_profit_matic_wei: input.min_profit_matic,
+            min_profit_roi_bps: input.min_profit_roi_bps,
+            safety_multiplier_bps: input.safety_multiplier_bps,
+            profit_priority_alpha_bps: input.profit_priority_alpha_bps,
+        },
+        token_to_matic_rates: input.token_to_matic_rates,
+        token_decimals: input.token_decimals,
+        gas_price: input.gas_price,
+    }))
 }
 
 fn push_flash_token(
@@ -980,16 +968,6 @@ pub fn collect_flash_tokens_for_cycle(
     } else {
         push_flash_token(arena, cycle.start_token, seen, out);
     }
-}
-
-#[must_use]
-pub fn collect_flash_tokens(arena: &StateArena, routes: &[EvaluatedRoute]) -> Vec<Address> {
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut out = Vec::new();
-    for route in routes {
-        collect_flash_tokens_for_cycle(arena, &route.cycle, &mut seen, &mut out);
-    }
-    out
 }
 
 #[cfg(test)]

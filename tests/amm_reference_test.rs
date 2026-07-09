@@ -44,12 +44,11 @@ fn v3_swap_step_returns_uncapped_positive_output() {
     let liquidity = U256::from(1_000_000u64);
     let amount = U256::from(10u128.pow(16));
     let fee = U256::from(3000u32);
-    let step = compute_swap_step(sqrt, target, liquidity, amount, fee)
-        .expect("swap step should succeed");
+    let step =
+        compute_swap_step(sqrt, target, liquidity, amount, fee).expect("swap step should succeed");
     assert!(step.amount_out > U256::ZERO);
     assert_ne!(
-        step.amount_out,
-        liquidity,
+        step.amount_out, liquidity,
         "regression: amount_out must not be min-capped to liquidity"
     );
 }

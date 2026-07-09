@@ -76,9 +76,9 @@ pub fn decode_revert(data: &[u8]) -> Option<DecodedRevert> {
     if data.len() < 4 {
         return None;
     }
-    let sel: [u8; 4] = data[0..4]
-        .try_into()
-        .expect("revert selector length was checked above");
+    let Ok(sel) = data[0..4].try_into() else {
+        return None;
+    };
     let payload = &data[4..];
 
     match sel {
@@ -354,7 +354,10 @@ impl std::fmt::Display for DecodedRevert {
                 "BalancerVaultReentrancy: vault calls forbidden inside Balancer flash-loan callback"
             ),
             DecodedRevert::AaveReserveInactive => {
-                write!(f, "AaveReserveInactive: token reserve not active for flash loan")
+                write!(
+                    f,
+                    "AaveReserveInactive: token reserve not active for flash loan"
+                )
             }
             DecodedRevert::Unknown(sel, hex) => {
                 write!(f, "Unknown: selector=0x{sel:02x?}, data={hex}")

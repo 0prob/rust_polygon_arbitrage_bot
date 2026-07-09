@@ -24,18 +24,23 @@ pub struct V3SwapResult {
 }
 
 /// Binary search pre-sorted V3 ticks (ticks are stored sorted by tick value).
-fn next_initialized_tick(ticks: &[V3Tick], current_tick: i32, zero_for_one: bool) -> Option<i32> {
+fn next_initialized_tick_with_net(
+    ticks: &[V3Tick],
+    current_tick: i32,
+    zero_for_one: bool,
+) -> Option<(i32, i128)> {
     let i = ticks.partition_point(|t| t.tick <= current_tick);
     if zero_for_one {
-        (i > 0).then(|| ticks[i - 1].tick)
+        (i > 0).then(|| {
+            let t = &ticks[i - 1];
+            (t.tick, t.liquidity_net)
+        })
     } else {
-        (i < ticks.len()).then(|| ticks[i].tick)
+        (i < ticks.len()).then(|| {
+            let t = &ticks[i];
+            (t.tick, t.liquidity_net)
+        })
     }
-}
-
-fn tick_liquidity_net(ticks: &[V3Tick], tick: i32) -> Option<i128> {
-    let i = ticks.partition_point(|t| t.tick < tick);
-    (i < ticks.len() && ticks[i].tick == tick).then(|| ticks[i].liquidity_net)
 }
 
 fn default_no_tick_step(tick_spacing: i32) -> i32 {
@@ -87,6 +92,11 @@ pub fn simulate_v3_swap(
 
     let ticks = state.ticks.as_ref();
     let has_ticks = !ticks.is_empty();
+    let no_tick_step = if has_ticks {
+        0
+    } else {
+        default_no_tick_step(state.tick_spacing)
+    };
 
     let mut sqrt_price_x96 = state.sqrt_price_x96;
     let mut tick = fallback_tick;
@@ -103,7 +113,7 @@ pub fn simulate_v3_swap(
         }
 
         let tick_search = if zero_for_one { tick - 1 } else { tick };
-        let mut next_tick = next_initialized_tick(ticks, tick_search, zero_for_one);
+        let mut next_tick = next_initialized_tick_with_net(ticks, tick_search, zero_for_one);
 
         if next_tick.is_none() && has_ticks {
             tick_data_exhausted = true;
@@ -111,11 +121,10 @@ pub fn simulate_v3_swap(
         }
 
         if next_tick.is_none() && !has_ticks {
-            let tick_step = default_no_tick_step(state.tick_spacing);
             let raw_next = if zero_for_one {
-                tick - tick_step
+                tick - no_tick_step
             } else {
-                tick + tick_step
+                tick + no_tick_step
             };
             let cumulative = if zero_for_one {
                 initial_tick - raw_next
@@ -123,22 +132,20 @@ pub fn simulate_v3_swap(
                 raw_next - initial_tick
             };
 
-            next_tick = if cumulative > MAX_CUMULATIVE_TICK_MOVE {
-                Some(if zero_for_one {
+            let bounded = if cumulative > MAX_CUMULATIVE_TICK_MOVE {
+                if zero_for_one {
                     initial_tick - MAX_CUMULATIVE_TICK_MOVE
                 } else {
                     initial_tick + MAX_CUMULATIVE_TICK_MOVE
-                })
+                }
             } else {
-                Some(raw_next)
+                raw_next
             };
-
-            if let Some(nt) = next_tick {
-                next_tick = Some(nt.clamp(MIN_TICK, MAX_TICK));
-            }
+            next_tick = Some((bounded.clamp(MIN_TICK, MAX_TICK), 0));
         }
 
         let sqrt_price_next_tick_x96 = next_tick
+            .map(|(nt, _)| nt)
             .and_then(get_sqrt_ratio_at_tick)
             .unwrap_or(sqrt_price_limit_x96);
 
@@ -163,8 +170,8 @@ pub fn simulate_v3_swap(
         amount_calculated += step.amount_out;
 
         if sqrt_price_x96 == sqrt_price_next_tick_x96 {
-            if let Some(nt) = next_tick {
-                if let Some(liquidity_net) = tick_liquidity_net(&state.ticks, nt) {
+            if let Some((nt, liquidity_net)) = next_tick {
+                if has_ticks {
                     liquidity = if zero_for_one {
                         liquidity - liquidity_net
                     } else {
@@ -178,14 +185,14 @@ pub fn simulate_v3_swap(
             }
         } else {
             let min_tick = if zero_for_one {
-                next_tick.unwrap_or(MIN_TICK)
+                next_tick.map(|(nt, _)| nt).unwrap_or(MIN_TICK)
             } else {
                 tick
             };
             let max_tick = if zero_for_one {
                 tick
             } else {
-                next_tick.map_or(MAX_TICK, |t| t - 1)
+                next_tick.map_or(MAX_TICK, |(t, _)| t - 1)
             };
             tick =
                 get_tick_at_sqrt_ratio_in_range(sqrt_price_x96, min_tick, max_tick).unwrap_or(tick);

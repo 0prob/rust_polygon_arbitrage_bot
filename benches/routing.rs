@@ -1,17 +1,17 @@
 use alloy::primitives::{Address, U256};
 use criterion::{Criterion, criterion_group, criterion_main};
+use rpbot::config::CycleFinderMode;
 use rpbot::core::constants::MIN_HOP_TOKEN_BALANCE;
 use rpbot::core::math::uniswap_v2::simulate_v2_swap;
 use rpbot::core::math::uniswap_v3::simulate_v3_swap;
 use rpbot::core::types::{Edge, PoolState, ProtocolType, V2PoolState, V3PoolState, V3Tick};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_search::find_cycles_for_mode;
-use rpbot::pipeline::types::CycleSearchPass;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair, rescore_graph_in_place};
 use rpbot::pipeline::local_sim::simulate_route_minimal;
 use rpbot::pipeline::split_route::simulate_two_way_split;
 use rpbot::pipeline::ternary::optimize_cycle;
-use rpbot::config::CycleFinderMode;
+use rpbot::pipeline::types::CycleSearchPass;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -118,8 +118,12 @@ fn bench_graph_rescore(c: &mut Criterion) {
     let mut arena = StateArena::default();
     let mut metas = Vec::new();
     for i in 0..64u8 {
-        let t0 = arena.register_token(Address::from([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i]));
-        let t1 = arena.register_token(Address::from([i, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i]));
+        let t0 = arena.register_token(Address::from([
+            i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
+        ]));
+        let t1 = arena.register_token(Address::from([
+            i, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
+        ]));
         let pool = arena.register_pool(
             Address::from([i, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i]),
             Arc::new(PoolState::V2(V2PoolState {

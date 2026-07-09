@@ -1,11 +1,10 @@
-use alloy::primitives::U256;
+use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
-use crate::core::math::fixed_point::edge_log_weight_from_ratio;
-use crate::pipeline::spot_price::{SpotTable, compute_edge_log_weight, compute_edge_ratio};
+use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
-use crate::util::u256_to_f64;
+use alloy::primitives::U256;
 
 /// Build directed swap edges for a two-token pool (V2/V3/DODO).
 /// When `state` is set, only emits hops that pass [`PoolState::hop_pair_routable`].
@@ -186,6 +185,17 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
         0 | 1 => false,
         2 => state.hop_pair_routable(0, 1) || state.hop_pair_routable(1, 0),
         n => {
+            if meta.protocol == ProtocolType::BalancerV2 {
+                let keep = balancer_token_indices_to_expand(state, &meta.tokens, meta.bpt_index);
+                for &i in &keep {
+                    for &j in &keep {
+                        if i != j && state.hop_pair_routable(i, j) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
             for i in 0..n {
                 if meta.bpt_index == Some(i) {
                     continue;
@@ -264,17 +274,15 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
 
     rescore_graph_in_place(arena, &mut graph);
     rebuild_pool_edge_positions_full(&mut graph);
-    graph.coverage = Some(crate::pipeline::cycle_finder::cycle_capable_coverage(
-        &graph,
+    graph.coverage = Some(std::sync::Arc::new(
+        crate::pipeline::cycle_finder::cycle_capable_coverage(&graph),
     ));
     graph
 }
 
 /// Recompute edge log-weights from current pool states without rebuilding adjacency.
 pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
-    let edge_count: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
-    let mut spot_table = SpotTable::with_capacity(edge_count);
-    rescore_adjacency(arena, &mut graph.adjacency, &mut spot_table);
+    rescore_adjacency(arena, &mut graph.adjacency);
 }
 
 /// Rescore only dirty pools when the touch set is small; otherwise rescore all edges.
@@ -300,8 +308,6 @@ pub fn rescore_pools_in_place(
     if pools.is_empty() {
         return 0;
     }
-    let edge_count: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
-    let mut spot_table = SpotTable::with_capacity(edge_count);
     let mut touched_pools = rustc_hash::FxHashSet::default();
     let mut touched = 0usize;
     let mut affected_adjacencies = rustc_hash::FxHashSet::default();
@@ -318,7 +324,7 @@ pub fn rescore_pools_in_place(
             let Some(ge) = adj.get_mut(edge_pos) else {
                 continue;
             };
-            touched += rescore_graph_edge(arena, ge, &mut spot_table);
+            touched += rescore_graph_edge(arena, ge);
             affected_adjacencies.insert(adj_idx);
         }
         touched_pools.insert(pool_idx);
@@ -332,14 +338,10 @@ pub fn rescore_pools_in_place(
     touched
 }
 
-fn rescore_adjacency(
-    arena: &StateArena,
-    adjacency: &mut [Vec<GraphEdge>],
-    spot_table: &mut SpotTable,
-) {
+fn rescore_adjacency(arena: &StateArena, adjacency: &mut [Vec<GraphEdge>]) {
     for adj in adjacency.iter_mut() {
         for ge in adj.iter_mut() {
-            rescore_graph_edge(arena, ge, spot_table);
+            rescore_graph_edge(arena, ge);
         }
         sort_adjacency_edges(adj);
     }
@@ -359,22 +361,23 @@ fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
         graph.pool_edge_positions.clear();
         return;
     }
-    // First pass: count per-pool occurrences to allocate exact capacities.
+    // Single pass: max pool index + per-pool edge counts.
+    let mut counts: Vec<usize> = Vec::new();
     for adj in &graph.adjacency {
         for ge in adj {
             let idx = ge.edge.pool_index.0 as usize;
+            if idx >= counts.len() {
+                counts.resize(idx + 1, 0);
+            }
+            counts[idx] += 1;
             if idx > max_pool {
                 max_pool = idx;
             }
         }
     }
     let slot_count = max_pool + 1;
-    // Pre-size each inner Vec to avoid reallocation during push.
-    let mut counts = vec![0usize; slot_count];
-    for adj in &graph.adjacency {
-        for ge in adj {
-            counts[ge.edge.pool_index.0 as usize] += 1;
-        }
+    if counts.len() < slot_count {
+        counts.resize(slot_count, 0);
     }
     let mut slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(slot_count);
     for &c in &counts {
@@ -428,7 +431,7 @@ fn rebuild_pool_edge_positions_for_pools(
 }
 
 #[inline]
-fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut SpotTable) -> usize {
+fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
     let Some(state) = arena.pool_state(ge.edge.pool_index) else {
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
         ge.ratio = U256::ZERO;
@@ -451,12 +454,6 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge, spot_table: &mut S
         return 1;
     }
     ge.log_weight = edge_log_weight_from_ratio(ge.ratio);
-    if !ge.ratio.is_zero() {
-        let spot_f64 = u256_to_f64(ge.ratio) / 1e18;
-        if spot_f64 > 0.0 {
-            spot_table.set(&ge.edge, spot_f64);
-        }
-    }
     if !ge.log_weight.is_finite() {
         ge.log_weight = compute_edge_log_weight(ge.edge.fee_bps);
     }

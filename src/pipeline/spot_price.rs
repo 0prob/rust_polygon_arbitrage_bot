@@ -33,10 +33,7 @@ pub fn spot_probe_for_decimals(decimals: u8) -> U256 {
     };
     let dust_floor = scale / U256::from(1000u64);
     let cap = scale / U256::from(100u64);
-    exp_probe
-        .max(dust_floor)
-        .max(U256::from(1000u64))
-        .min(cap)
+    exp_probe.max(dust_floor).max(U256::from(1000u64)).min(cap)
 }
 
 #[must_use]
@@ -126,9 +123,7 @@ fn cl_spot_u256(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> Option<U
         let lo_sq = U512::from(sqrt_lo) * U512::from(sqrt_lo);
         let lo_numer = lo_sq * ONE_U512;
         let lo_term = crate::util::u512_to_u256(lo_numer >> 192);
-        hi_term
-            .checked_add(cross_term)?
-            .checked_add(lo_term)?
+        hi_term.checked_add(cross_term)?.checked_add(lo_term)?
     } else {
         let two_pow_192 = U256::from(1u128) << 192;
         let numerator = U512::from(two_pow_192) * ONE_U512;
@@ -233,38 +228,10 @@ impl SpotTable {
         self.values.insert(Self::key(edge), spot);
     }
 
-    pub fn ensure_edge(&mut self, arena: &StateArena, edge: &Edge) -> f64 {
-        let k = Self::key(edge);
-        if let Some(&v) = self.values.get(&k) {
-            return v;
-        }
-        let spot = compute_spot_price(arena, edge);
-        self.values.insert(k, spot);
-        spot
-    }
-
-    #[must_use]
-    pub fn build_for_graph(arena: &StateArena, graph: &RoutingGraph) -> Self {
-        let capacity: usize = graph.adjacency.iter().map(|adj| adj.len()).sum();
-        let mut table = Self::with_capacity(capacity);
-        table.populate_from_graph(graph);
-        for adj in &graph.adjacency {
-            for ge in adj {
-                if table.get_opt(&ge.edge).is_none() {
-                    table.ensure_edge(arena, &ge.edge);
-                }
-            }
-        }
-        table
-    }
 }
 
 #[inline]
-fn v2_marginal_spot(
-    state: &crate::core::types::V2PoolState,
-    edge: &Edge,
-    probe: U256,
-) -> f64 {
+fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge, probe: U256) -> f64 {
     spot_ratio_to_f64(v2_edge_ratio_u256(state, edge, probe))
 }
 
@@ -314,11 +281,7 @@ pub fn spot_price_from_state(state: &PoolState, edge: &Edge, token_in_decimals: 
                 _ => return 0.0,
             };
             let p = u256_to_f64(probe);
-            if p <= 0.0 {
-                0.0
-            } else {
-                u256_to_f64(out) / p
-            }
+            if p <= 0.0 { 0.0 } else { u256_to_f64(out) / p }
         }
     }
 }
@@ -342,21 +305,11 @@ pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
             cl_edge_ratio_u256(s, edge, probe).unwrap_or(U256::ZERO)
         }
         _ => {
-            let out =
-                simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap)
-                    .unwrap_or(U256::ZERO);
+            let out = simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap)
+                .unwrap_or(U256::ZERO);
             simulated_edge_ratio(out, probe).unwrap_or(U256::ZERO)
         }
     }
-}
-
-#[must_use]
-pub fn compute_edge_log_weight_with_table(table: &SpotTable, edge: &Edge) -> f64 {
-    let spot = table.get(edge);
-    if spot <= 0.0 {
-        return compute_edge_log_weight(edge.fee_bps);
-    }
-    edge_log_weight_from_spot(spot, edge.fee_bps)
 }
 
 #[must_use]
@@ -429,11 +382,9 @@ fn rescore_one_cycle(
             break;
         }
         let tin_decimals = match token_decimals {
-            Some(m) => crate::services::oracle::resolve_token_decimals_for_index(
-                edge.token_in,
-                arena,
-                m,
-            ),
+            Some(m) => {
+                crate::services::oracle::resolve_token_decimals_for_index(edge.token_in, arena, m)
+            }
             None => arena.token_decimals(edge.token_in),
         };
         let spot = match table.get_opt(edge) {
@@ -556,10 +507,7 @@ mod tests {
     fn mul_ratio_detects_overflow() {
         let huge = U256::MAX / U256::from(2u64);
         assert!(mul_ratio(huge, U256::MAX).is_none());
-        assert_eq!(
-            mul_ratio_saturating(huge, U256::MAX),
-            U256::MAX
-        );
+        assert_eq!(mul_ratio_saturating(huge, U256::MAX), U256::MAX);
     }
 
     #[test]

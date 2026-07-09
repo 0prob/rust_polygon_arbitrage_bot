@@ -1,7 +1,7 @@
-use alloy::primitives::U256;
 use crate::core::types::Edge;
 use crate::pipeline::cycle_finder::is_live_graph_edge;
 use crate::pipeline::types::RoutingGraph;
+use alloy::primitives::U256;
 
 #[derive(Clone, Copy)]
 pub struct WeightedEdge {
@@ -36,10 +36,10 @@ pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::U256;
     use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
     use crate::pipeline::types::GraphEdge;
+    use alloy::primitives::U256;
 
     fn graph_edge(weight: f64) -> GraphEdge {
         GraphEdge {

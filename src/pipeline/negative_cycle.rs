@@ -1,11 +1,11 @@
-use alloy::primitives::U256;
-use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
 use crate::core::math::fixed_point::ONE;
+use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
 use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_packed_route_calls};
 use crate::pipeline::spot_price::{hop_penalty, min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::weighted_graph::WeightedEdge;
+use alloy::primitives::U256;
 
 fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     let len = edges.len();

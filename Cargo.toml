@@ -25,6 +25,7 @@ tui = ["dep:ratatui", "dep:crossterm"]
 alloy = { version = "2.1.1", features = ["reqwest", "pubsub", "provider-ws"] }
 hypersync-client = "1.4.0"
 anyhow = "1.0.103"
+thiserror = "2.0.12"
 arc-swap = "1.9.2"
 dashmap = "6.2.1"
 figment = { version = "0.10.19", features = ["toml", "env"] }

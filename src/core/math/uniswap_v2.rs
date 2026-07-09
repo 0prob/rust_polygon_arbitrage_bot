@@ -1,5 +1,5 @@
-use alloy::primitives::{U256, U512};
 use crate::util::u512_to_u256;
+use alloy::primitives::{U256, U512};
 
 use crate::core::constants::{DEFAULT_FEE_NUMERATOR, FEE_DENOMINATOR};
 use crate::core::types::V2PoolState;
@@ -38,45 +38,6 @@ pub fn get_amount_out(
         return U256::ZERO;
     }
     u512_to_u256(result)
-}
-
-#[inline]
-#[must_use]
-pub fn get_amount_in(
-    amount_out: U256,
-    reserve_in: U256,
-    reserve_out: U256,
-    fee_numerator: U256,
-    fee_denominator: U256,
-) -> U256 {
-    if amount_out.is_zero()
-        || reserve_in.is_zero()
-        || reserve_out.is_zero()
-        || fee_numerator.is_zero()
-        || fee_denominator.is_zero()
-        || fee_numerator >= fee_denominator
-        || amount_out >= reserve_out
-    {
-        return U256::ZERO;
-    }
-
-    let Some(reserve_out_minus) = reserve_out.checked_sub(amount_out) else {
-        return U256::ZERO;
-    };
-    let numerator =
-        U512::from(reserve_in) * U512::from(amount_out) * U512::from(fee_denominator);
-    let denominator =
-        U512::from(reserve_out_minus) * U512::from(fee_numerator);
-    if denominator.is_zero() {
-        return U256::ZERO;
-    }
-    let quotient = numerator / denominator;
-    let result = u512_to_u256(quotient);
-    if numerator % denominator > U512::ZERO {
-        result.saturating_add(U256::from(1))
-    } else {
-        result
-    }
 }
 
 #[must_use]

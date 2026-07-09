@@ -70,14 +70,14 @@ fn quickswap_v2_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("QUICKSWAP_V2_ENABLED")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+        std::env::var("QUICKSWAP_V2_ENABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
     })
 }
 
 fn is_quickswap_v2_label(label: &str) -> bool {
     let b = label.as_bytes();
-    b.windows(12).any(|w| w.eq_ignore_ascii_case(b"quickswap_v2"))
+    b.windows(12)
+        .any(|w| w.eq_ignore_ascii_case(b"quickswap_v2"))
         || b.windows(8).any(|w| w.eq_ignore_ascii_case(b"quick_v2"))
 }
 
@@ -85,8 +85,7 @@ fn uniswap_v2_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("UNISWAP_V2_ENABLED")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+        std::env::var("UNISWAP_V2_ENABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -113,11 +112,17 @@ fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool
     {
         return false;
     }
-    // ponytail: FxHashSet dedup is O(n) vs the O(n²) nested loop it replaces
     if tokens.len() > 1 {
-        let mut seen = rustc_hash::FxHashSet::default();
-        if !tokens.iter().all(|t| seen.insert(*t)) {
-            return false;
+        let mut seen = [None; 8];
+        let mut seen_len = 0usize;
+        for &token in tokens {
+            if seen[..seen_len].contains(&Some(token)) {
+                return false;
+            }
+            if seen_len < seen.len() {
+                seen[seen_len] = Some(token);
+                seen_len += 1;
+            }
         }
     }
     match protocol {

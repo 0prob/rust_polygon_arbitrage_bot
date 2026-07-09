@@ -52,7 +52,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Cell::from(route.protocols.clone()),
                 Cell::from(route.route.clone()),
                 Cell::from(format!("{:.4}", route.rescored)),
-                Cell::from(format!("{:.4} MATIC", route.profit_matic)),
+                Cell::from(format!("{:.4} MATIC", route.net_profit_matic)),
                 Cell::from(format!("{}/{}", route.risk_score, route.liquidity_score)),
             ])
             .style(style),
@@ -77,7 +77,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Cell::from("protocols"),
                 Cell::from("route"),
                 Cell::from("score"),
-                Cell::from("profit"),
+                Cell::from("net"),
                 Cell::from("risk"),
             ]))
             .block(Block::default().borders(Borders::ALL).title(format!(
@@ -105,8 +105,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )),
             Line::from(format!("amount out {}", route.amount_out_token)),
             Line::from(format!(
-                "profit {:.4} MATIC / {:.2} USD",
-                route.profit_matic, route.profit_usd
+                "gross {:.4} MATIC  net {:.4} MATIC / {:.2} USD",
+                route.profit_matic, route.net_profit_matic, route.profit_usd
             )),
             Line::from(format!(
                 "gas {}  long-tail {}",

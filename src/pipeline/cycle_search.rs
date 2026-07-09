@@ -99,36 +99,23 @@ pub fn find_cycles_hybrid_multi_pass(
             }
         })
         .collect();
-    let johnson_budget: Vec<_> = passes
-        .iter()
-        .map(|p| {
-            let [_, johnson, _] = split_budget(p.max_cycles);
-            CycleSearchPass {
-                max_hops: p.max_hops,
-                max_cycles: johnson,
-            }
-        })
-        .collect();
     let bf_budget: Vec<_> = passes
         .iter()
-        .map(|p| CycleSearchPass {
-            max_hops: p.max_hops,
-            max_cycles: split_budget(p.max_cycles)[2],
+        .map(|p| {
+            let [_, johnson, bf] = split_budget(p.max_cycles);
+            CycleSearchPass {
+                max_hops: p.max_hops,
+                max_cycles: johnson + bf,
+            }
         })
         .collect();
     let base_adj = build_weighted_adjacency(graph);
 
-    let (mut dfs_cycles, (mut johnson_cycles, mut bf_cycles)) = join(
+    let (mut dfs_cycles, mut bf_cycles) = join(
         || find_cycles_multi_pass(arena, graph, &dfs_budget),
-        || {
-            join(
-                || find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &johnson_budget),
-                || find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &bf_budget),
-            )
-        },
+        || find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &bf_budget),
     );
 
-    dfs_cycles.append(&mut johnson_cycles);
     dfs_cycles.append(&mut bf_cycles);
 
     finalize_cycles(arena, dfs_cycles, passes, atomic_prefilter, probe_ctx)

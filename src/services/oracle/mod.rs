@@ -11,7 +11,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::core::constants::{POLYGON_HUB_TOKENS, WMATIC};
 use crate::core::types::{PoolTokenAddrs, TokenIndex};
@@ -58,27 +58,6 @@ pub fn resolve_token_decimals_for_index(
     arena
         .token_address(token)
         .map_or(18, |addr| resolve_token_decimals(addr, hints))
-}
-
-/// Enrich rates for all tokens reachable from a pool list.
-/// Extracts unique token indices from every `PoolMeta.tokens`, then delegates to
-/// [`enrich_token_to_matic_rates`].
-pub async fn enrich_all_token_to_matic_rates<P: Provider<Ethereum> + Clone + Send + 'static>(
-    oracle: &PriceOracle,
-    arena: &StateArena,
-    pool_metas: &[crate::pipeline::types::PoolMeta],
-    decimals: &FxHashMap<Address, u8>,
-    provider: Option<&P>,
-) -> FxHashMap<TokenIndex, U256> {
-    let mut token_set =
-        FxHashSet::with_capacity_and_hasher(pool_metas.len().saturating_mul(2), FxBuildHasher);
-    for meta in pool_metas {
-        for token in &meta.tokens {
-            token_set.insert(*token);
-        }
-    }
-    let tokens: Vec<TokenIndex> = token_set.into_iter().collect();
-    enrich_token_to_matic_rates(oracle, arena, tokens, decimals, provider).await
 }
 
 /// Builds the set of token addresses whose MATIC rate is at or above the dust floor.
@@ -164,25 +143,6 @@ pub fn merge_token_rates(
     Arc::new(merged)
 }
 
-/// Fingerprint of the resolvable token set for graph-cache invalidation.
-#[must_use]
-pub fn resolvable_fingerprint(tokens: &FxHashSet<Address>) -> u64 {
-    use std::hash::Hasher;
-
-    let mut addrs: Vec<Address> = tokens.iter().copied().collect();
-    addrs.sort_unstable();
-    let mut h = FxHasher::default();
-    h.write_usize(addrs.len());
-    for addr in addrs {
-        h.write_u64(u64::from_be_bytes(
-            addr.0[12..20]
-                .try_into()
-                .expect("address suffix is exactly eight bytes"),
-        ));
-    }
-    h.finish()
-}
-
 pub async fn enrich_token_to_matic_rates<P, I>(
     oracle: &PriceOracle,
     arena: &StateArena,
@@ -245,25 +205,24 @@ fn build_token_to_matic_rates(
         let Some(addr) = arena.token_address(*idx) else {
             continue;
         };
-        let rate = oracle
-            .token_matic_rate_per_unit_integer(&addr)
-            .or_else(|| {
-                if matic_usd > 0.0 {
-                    oracle
-                        .token_usd(&addr)
-                        .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
-                } else {
-                    None
-                }
-            })
-            .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE);
+        let rate = if addr == wmatic {
+            oracle.token_matic_rate_per_unit_integer(&wmatic)
+        } else {
+            oracle
+                .token_matic_rate_per_unit_integer(&addr)
+                .or_else(|| {
+                    if matic_usd > 0.0 {
+                        oracle
+                            .token_usd(&addr)
+                            .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
+                    } else {
+                        None
+                    }
+                })
+        }
+        .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE);
         if let Some(rate) = rate {
             out.insert(*idx, rate);
-        }
-        if addr == wmatic
-            && let Some(r) = oracle.token_matic_rate_per_unit_integer(&wmatic)
-        {
-            out.insert(*idx, r);
         }
     }
     // ponytail: fallback when no oracle feeds — mark WMATIC as self-resolving

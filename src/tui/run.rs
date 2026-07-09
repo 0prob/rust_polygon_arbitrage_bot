@@ -69,7 +69,9 @@ pub async fn run_tui(
             _ = redraw.tick(), if !app.should_quit => {
                 if manual_refresh.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
                     // The task publishes its result/error through the UI channel.
-                    let _ = manual_refresh.take().expect("finished refresh exists").await;
+                    if let Some(task) = manual_refresh.take() {
+                        let _ = task.await;
+                    }
                 }
                 if app.snapshot_refresh_pending {
                     app.snapshot_refresh_pending = false;
@@ -175,10 +177,10 @@ fn spawn_runtime_poller(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_oracle_refresh = Instant::now()
             .checked_sub(ORACLE_REFRESH_INTERVAL)
-            .expect("oracle refresh interval must fit within the monotonic clock epoch");
+            .unwrap_or_else(Instant::now);
         let mut last_portfolio_refresh = Instant::now()
             .checked_sub(PORTFOLIO_REFRESH_INTERVAL)
-            .expect("portfolio refresh interval must fit within the monotonic clock epoch");
+            .unwrap_or_else(Instant::now);
         let mut portfolio_rows = Vec::new();
         let mut route_cache = RouteBuildCache {
             generation: 0,

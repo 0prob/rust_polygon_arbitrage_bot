@@ -101,8 +101,7 @@ pub fn curve_crypto_newton_d(ann: U256, gamma: U256, xp: &[U256]) -> NewtonResul
                 / U512::from(ann),
         );
         let mul2 = (U256::from(2u8) * ONE * n * k0) / g1k0;
-        let neg_fprime = (s + (s * mul2) / ONE + (mul1 * n) / k0)
-            .saturating_sub((mul2 * d) / ONE);
+        let neg_fprime = (s + (s * mul2) / ONE + (mul1 * n) / k0).saturating_sub((mul2 * d) / ONE);
         if neg_fprime.is_zero() {
             return NewtonResult {
                 value: U256::ZERO,
@@ -153,7 +152,7 @@ pub fn curve_crypto_newton_y(
         };
     }
     let n_u256 = U256::from(n as u64);
-    let mut sorted = xp.to_vec();
+    let mut sorted: CurveXp = xp.iter().copied().collect();
     sorted[out_idx] = U256::ZERO;
     sort_desc(&mut sorted);
     let mut y = d / n_u256;

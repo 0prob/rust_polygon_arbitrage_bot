@@ -1,5 +1,5 @@
 use alloy::network::Ethereum;
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{B256, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use anyhow::{Result, anyhow};
@@ -16,7 +16,7 @@ pub const FEE_BUMP_BPS: u64 = 1500;
 const MAX_SUBMIT_ATTEMPTS: u32 = 3;
 /// ponytail: cap profit-derived priority fee boost at 200 gwei.
 /// 100 gwei was too conservative during Polygon MEV competition.
-const MAX_PROFIT_PRIORITY_FEE_WEI: u128 = 200_000_000_000;
+use crate::services::execution::profit::profit_priority_uplift_wei;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SubmitFees {
@@ -60,10 +60,13 @@ pub fn resolve_submit_fees_with_profit(
         return Some(fees);
     }
 
-    let total_boost = (expected_profit_matic_wei * U256::from(alpha_bps)) / U256::from(10_000u64);
+    let total_boost = profit_priority_uplift_wei(
+        expected_profit_matic_wei,
+        alpha_bps,
+        gas_limit.min(u64::from(u32::MAX)) as u32,
+    );
     let per_gas = total_boost / U256::from(gas_limit);
-    let capped = per_gas.min(U256::from(MAX_PROFIT_PRIORITY_FEE_WEI));
-    fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(capped);
+    fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(per_gas);
 
     let min_max_fee = snap.base_fee + fees.max_priority_fee_per_gas;
     fees.max_fee_per_gas = fees.max_fee_per_gas.max(min_max_fee);
@@ -77,14 +80,41 @@ pub fn build_transaction_request(
     fees: &SubmitFees,
     gas_limit: u64,
 ) -> Result<TransactionRequest> {
+    build_transaction_request_with_calldata(candidate, candidate.calldata.clone(), nonce, fees, gas_limit)
+}
+
+fn build_transaction_request_with_calldata(
+    candidate: &CandidateExecution,
+    calldata: Bytes,
+    nonce: u64,
+    fees: &SubmitFees,
+    gas_limit: u64,
+) -> Result<TransactionRequest> {
     Ok(TransactionRequest::default()
         .to(candidate.target_address)
-        .input(candidate.calldata.clone().into())
+        .input(calldata.into())
         .value(candidate.value)
         .nonce(nonce)
         .max_fee_per_gas(u256_to_u128(fees.max_fee_per_gas)?)
         .max_priority_fee_per_gas(u256_to_u128(fees.max_priority_fee_per_gas)?)
         .gas_limit(gas_limit))
+}
+
+async fn submit_transaction<P: Provider<Ethereum>>(
+    provider: &P,
+    tx: TransactionRequest,
+    private: Option<&PrivateSubmitConfig>,
+) -> Result<B256> {
+    if let Some(cfg) = private
+        && cfg.mode != super::private_submit::PrivateSubmitMode::Standard
+    {
+        let chain_id = cfg.chain_id;
+        let raw = sign_tx_to_raw(tx, &cfg.signer, chain_id).await?;
+        submit_signed_raw(&raw, cfg).await
+    } else {
+        let pending = provider.send_transaction(tx).await?;
+        Ok(*pending.tx_hash())
+    }
 }
 
 pub async fn submit_live_candidate<P: Provider<Ethereum>>(
@@ -96,19 +126,7 @@ pub async fn submit_live_candidate<P: Provider<Ethereum>>(
     private: Option<&PrivateSubmitConfig>,
 ) -> Result<B256> {
     let tx = build_transaction_request(candidate, nonce, fees, gas_limit)?;
-
-    let hash = if let Some(cfg) = private
-        && cfg.mode != super::private_submit::PrivateSubmitMode::Standard
-    {
-        let chain_id = cfg.chain_id;
-        let raw = sign_tx_to_raw(tx, &cfg.signer, chain_id).await?;
-        submit_signed_raw(&raw, cfg).await?
-    } else {
-        let pending = provider.send_transaction(tx).await?;
-        *pending.tx_hash()
-    };
-
-    Ok(hash)
+    submit_transaction(provider, tx, private).await
 }
 
 /// Submit with classified RPC error recovery (resync, fee bump, already-known).
@@ -121,10 +139,18 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
     gas_limit: u64,
     private: Option<&PrivateSubmitConfig>,
 ) -> Result<B256> {
+    let calldata = candidate.calldata.clone();
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        match submit_live_candidate(provider, candidate, nonce, &fees, gas_limit, private).await {
+        let tx = build_transaction_request_with_calldata(
+            candidate,
+            calldata.clone(),
+            nonce,
+            &fees,
+            gas_limit,
+        )?;
+        match submit_transaction(provider, tx, private).await {
             Ok(hash) => return Ok(hash),
             Err(e) => {
                 if attempts >= MAX_SUBMIT_ATTEMPTS {

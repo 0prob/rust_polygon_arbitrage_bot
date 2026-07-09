@@ -16,9 +16,7 @@ use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
-use crate::services::execution::{
-    ExecutionService, GasOracle, hash_cycle_edges,
-};
+use crate::services::execution::{ExecutionService, GasOracle, hash_cycle_edges};
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::partial_cache::PartialPoolCache;
@@ -190,9 +188,7 @@ pub async fn run_hf_tick(
             hot_pools.insert(addr);
         }
     }
-    let mut hot_vec = Vec::with_capacity(hot_pools.len());
-    hot_vec.extend(hot_pools);
-    let hot_pools: Arc<Vec<_>> = Arc::new(hot_vec);
+    let hot_pools: Arc<Vec<_>> = Arc::new(hot_pools.into_iter().collect());
 
     let refresh = Arc::clone(&ctx.refresh);
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
@@ -291,12 +287,13 @@ pub async fn run_hf_tick(
         flash_policy,
         max_flash_loan_usd: ctx.config.execution.max_flash_loan_usd,
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
+        profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         flash_liquidity: Arc::clone(&ctx.execution.flash_liquidity),
         execution: Arc::clone(&ctx.execution),
     };
-    let eval_arena = owned.arena.clone();
     let cycles_considered = cycles.len();
-    let eval_results = rescore_rank_and_evaluate_async(cycles, owned, sim_cap).await?;
+    let (eval_results, mut eval_arena) =
+        rescore_rank_and_evaluate_async(cycles, owned, sim_cap).await?;
     let eval_count = eval_results.len();
 
     let mut profitable: Vec<HfEvalResult> = Vec::new();
@@ -361,7 +358,7 @@ pub async fn run_hf_tick(
     if profitable_count > 0 {
         dispatch_profitable_candidates(
             &ctx,
-            &eval_arena,
+            &mut eval_arena,
             profitable,
             pool_metas_for_dispatch.as_ref(),
             dispatch_token_to_matic_rates.as_ref(),
@@ -412,7 +409,11 @@ fn near_miss_route_summary(
     if let Some(addr) = arena.token_address(cycle.start_token) {
         // Write first 6 hex chars directly without intermediate hex::encode.
         let bytes = addr.as_slice();
-        let _ = write!(buf, "0x{:02x}{:02x}..{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3]);
+        let _ = write!(
+            buf,
+            "0x{:02x}{:02x}..{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        );
     } else {
         let _ = write!(buf, "t{}", cycle.start_token.0);
     }
@@ -423,22 +424,16 @@ fn near_miss_route_summary(
         let _ = write!(buf, "->{tag}:");
         if let Some(addr) = arena.token_address(edge.token_out) {
             let bytes = addr.as_slice();
-            let _ = write!(buf, "0x{:02x}{:02x}..{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3]);
+            let _ = write!(
+                buf,
+                "0x{:02x}{:02x}..{:02x}{:02x}",
+                bytes[0], bytes[1], bytes[2], bytes[3]
+            );
         } else {
             let _ = write!(buf, "t{}", edge.token_out.0);
         }
     }
     buf
-}
-
-fn near_miss_safety_floor(
-    assessment: &crate::core::types::ProfitAssessment,
-    safety_bps: u64,
-) -> U256 {
-    assessment
-        .revert_penalty
-        .saturating_mul(U256::from(safety_bps))
-        / U256::from(BPS_SCALE)
 }
 
 fn log_near_miss_diagnostic(
@@ -454,7 +449,10 @@ fn log_near_miss_diagnostic(
     if !execution.should_log_near_miss(result.route_fingerprint, net_matic) {
         return;
     }
-    let safety_floor = near_miss_safety_floor(assessment, safety_bps);
+    let safety_floor = crate::services::execution::profit::safety_floor_matic_wei(
+        assessment.revert_penalty,
+        safety_bps,
+    );
     let gap = safety_floor.saturating_sub(net_matic);
     let roi_bps = (assessment.roi * f64::from(BPS_SCALE)).round() as u64;
     let reason = assessment.reject_reason.as_deref().unwrap_or("unknown");

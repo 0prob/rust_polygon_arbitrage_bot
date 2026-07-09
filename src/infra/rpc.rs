@@ -97,13 +97,23 @@ impl RpcPool {
     }
 
     fn state_urls_ordered_slice(&self) -> Vec<String> {
-        let urls = self.state_urls.read().clone();
+        let urls = self.state_urls.read();
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
-        let (healthy, penalized): (Vec<_>, Vec<_>) = urls
-            .into_iter()
-            .partition(|url| penalties.get(url).is_none_or(|until| now >= *until));
-        healthy.into_iter().chain(penalized).collect()
+        let mut healthy = Vec::with_capacity(urls.len());
+        let mut penalized = Vec::new();
+        for url in urls.iter() {
+            if penalties
+                .get(url.as_str())
+                .is_none_or(|until| now >= *until)
+            {
+                healthy.push(url.clone());
+            } else {
+                penalized.push(url.clone());
+            }
+        }
+        healthy.extend(penalized);
+        healthy
     }
 
     pub fn state_url(&self) -> Option<String> {
@@ -114,9 +124,14 @@ impl RpcPool {
         }
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
-        urls.iter().find(|url| {
-            penalties.get(url.as_str()).is_none_or(|until| now >= *until)
-        }).or_else(|| urls.first()).cloned()
+        urls.iter()
+            .find(|url| {
+                penalties
+                    .get(url.as_str())
+                    .is_none_or(|until| now >= *until)
+            })
+            .or_else(|| urls.first())
+            .cloned()
     }
 
     #[must_use]
@@ -332,44 +347,16 @@ impl RpcPool {
         self.validate_polygon_endpoint(&url, &provider).await?;
 
         let key = (url.clone(), executor);
-        let needs_chain = !self.polygon_validated_urls.lock().contains(&url);
-        let needs_exec = !self.validated_executors.lock().contains(&key);
-        if needs_chain || needs_exec {
-            let (chain_res, code_res) = tokio::join!(
-                async {
-                    if needs_chain {
-                        Some(provider.get_chain_id().await)
-                    } else {
-                        None
-                    }
-                },
-                async {
-                    if needs_exec {
-                        Some(provider.get_code_at(executor).await)
-                    } else {
-                        None
-                    }
-                },
+        if !self.validated_executors.lock().contains(&key) {
+            let code = provider
+                .get_code_at(executor)
+                .await
+                .with_context(|| format!("executor code check failed for {executor}"))?;
+            anyhow::ensure!(
+                !code.is_empty(),
+                "no executor bytecode at {executor} on Polygon"
             );
-            if let Some(chain) = chain_res {
-                let chain_id = chain
-                    .with_context(|| format!("chain-id check failed for RPC endpoint {url}"))?;
-                anyhow::ensure!(
-                    chain_id == crate::core::constants::POLYGON_CHAIN_ID,
-                    "RPC endpoint {url} is chain {chain_id}, expected Polygon {}",
-                    crate::core::constants::POLYGON_CHAIN_ID
-                );
-                self.polygon_validated_urls.lock().insert(url.to_string());
-            }
-            if let Some(code) = code_res {
-                let code =
-                    code.with_context(|| format!("executor code check failed for {executor}"))?;
-                anyhow::ensure!(
-                    !code.is_empty(),
-                    "no executor bytecode at {executor} on Polygon"
-                );
-                self.validated_executors.lock().insert(key);
-            }
+            self.validated_executors.lock().insert(key);
         }
         Ok(provider)
     }

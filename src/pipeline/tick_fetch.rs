@@ -375,13 +375,12 @@ async fn enrich_algebra_ticks<
                 let compressed = (word_min + offset as i32) * 256 + i32::from(bit);
                 let tick = compressed.saturating_mul(spacing);
                 let clamped: i32 = tick.clamp(-8_388_608, 8_388_607);
+                let Ok(tick_i24) = clamped.try_into() else {
+                    continue;
+                };
                 tick_calls.push(MulticallItem {
                     target: pool,
-                    data: encode_call(&IAlgebraPool::ticksCall {
-                        tick: clamped
-                            .try_into()
-                            .expect("clamped Algebra tick must fit in I24"),
-                    }),
+                    data: encode_call(&IAlgebraPool::ticksCall { tick: tick_i24 }),
                 });
                 tick_owners.push((pool, idx, clamped));
             }

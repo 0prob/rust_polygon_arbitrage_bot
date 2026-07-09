@@ -140,8 +140,38 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
                 routable_count,
                 eligible_count,
             )
+            .or_else(|| gc.graph())
+            .unwrap_or_else(|| {
+                let gg = Arc::new(crate::pipeline::graph::build_graph(
+                    &work.arena,
+                    work.pool_metas.as_ref(),
+                ));
+                gc.store(
+                    Arc::clone(&gg),
+                    None,
+                    routable_count,
+                    layout_fp,
+                    work.state_generation,
+                    eligible_count,
+                );
+                gg
+            })
         } else {
-            gc.graph().expect("graph present")
+            gc.graph().unwrap_or_else(|| {
+                let gg = Arc::new(crate::pipeline::graph::build_graph(
+                    &work.arena,
+                    work.pool_metas.as_ref(),
+                ));
+                gc.store(
+                    Arc::clone(&gg),
+                    None,
+                    routable_count,
+                    layout_fp,
+                    work.state_generation,
+                    eligible_count,
+                );
+                gg
+            })
         }
     };
 
@@ -323,6 +353,7 @@ pub async fn run_lf_tick(ctx: &LfContext) -> anyhow::Result<()> {
 
     let mut capped: Vec<FoundCycle> = cycles_arc.iter().cloned().collect();
     let mut table = SpotTable::new(arena.pool_count());
+    table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
     // Prune any that became unroutable due to dirty state updates (prevents
     // polluting HF candidate pool with now-dead cycles kept from graph cache).

@@ -71,13 +71,7 @@ impl RouteSimCache {
         None
     }
 
-    pub fn insert(
-        &self,
-        generation: u64,
-        route_fp: u64,
-        amount: U256,
-        sim: MinimalSimResult,
-    ) {
+    pub fn insert(&self, generation: u64, route_fp: u64, amount: U256, sim: MinimalSimResult) {
         if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
             self.clear_stale(generation);
             if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY

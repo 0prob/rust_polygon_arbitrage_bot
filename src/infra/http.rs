@@ -47,6 +47,7 @@ pub fn build(opts: HttpClientOpts) -> Result<Client, reqwest::Error> {
 
 /// Like [`build`], but for process-lifetime static clients (startup failure is fatal).
 #[must_use]
+#[allow(clippy::unwrap_used)] // ponytail: fatal at process init; no recovery path
 pub fn build_static(opts: HttpClientOpts, label: &'static str) -> Client {
-    build(opts).expect(label)
+    build(opts).unwrap_or_else(|_| unreachable!("{label}"))
 }

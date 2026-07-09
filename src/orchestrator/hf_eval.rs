@@ -31,8 +31,8 @@ use crate::services::execution::impact_slippage::{
     depth_impact_slippage_bps_with_base, effective_slippage_bps,
 };
 use crate::services::execution::profit::{
-    ProfitEvalContext, ProfitThresholds, RouteProfitParams, assess_route_profit,
-    net_profit_after_gas_from_sim,
+    AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
+    net_profit_after_gas_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
@@ -64,6 +64,7 @@ pub struct HfEvalInput<'a> {
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
     pub safety_multiplier_bps: u64,
+    pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: &'a FlashLiquidityCache,
     pub execution: &'a ExecutionService,
 }
@@ -83,6 +84,7 @@ pub struct HfEvalInputOwned {
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
     pub safety_multiplier_bps: u64,
+    pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
     pub execution: Arc<ExecutionService>,
 }
@@ -104,6 +106,7 @@ impl HfEvalInputOwned {
             flash_policy: self.flash_policy,
             max_flash_loan_usd: self.max_flash_loan_usd,
             safety_multiplier_bps: self.safety_multiplier_bps,
+            profit_priority_alpha_bps: self.profit_priority_alpha_bps,
             flash_liquidity: self.flash_liquidity.as_ref(),
             execution: self.execution.as_ref(),
         }
@@ -170,12 +173,7 @@ fn cycle_simulatable(
         if sim.profit.is_zero() {
             continue;
         }
-        if !local_sim::route_hop_fidelity_ok(
-            arena,
-            &cycle.edges,
-            &sim.hop_amounts,
-            spot_probe,
-        ) {
+        if !local_sim::route_hop_fidelity_ok(arena, &cycle.edges, &sim.hop_amounts, spot_probe) {
             continue;
         }
         if check_sim_sanity(SimSanityInput {
@@ -399,11 +397,11 @@ pub fn rank_cycles_by_probe_net(
     } else {
         Vec::new()
     };
+    let mut seen: rustc_hash::FxHashSet<u64> = kept
+        .iter()
+        .map(|cycle| hash_cycle_edges(&cycle.edges))
+        .collect();
     if kept.len() < max_keep && !scanned.is_empty() {
-        let mut seen: rustc_hash::FxHashSet<u64> = kept
-            .iter()
-            .map(|cycle| hash_cycle_edges(&cycle.edges))
-            .collect();
         if !near_net.is_empty() {
             near_net.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| compare_cycle_score(&a.1, &b.1)));
             for (_, cycle) in &near_net {
@@ -450,11 +448,7 @@ pub fn rank_cycles_by_probe_net(
             );
         }
     }
-    let kept_fingerprints: rustc_hash::FxHashSet<u64> = kept
-        .iter()
-        .map(|cycle| hash_cycle_edges(&cycle.edges))
-        .collect();
-    probe_seeds.retain(|fingerprint, _| kept_fingerprints.contains(fingerprint));
+    probe_seeds.retain(|fingerprint, _| seen.contains(fingerprint));
 
     if kept.is_empty() && !scanned.is_empty() {
         crate::debug!(
@@ -542,7 +536,7 @@ pub async fn rescore_rank_and_evaluate_async(
     mut cycles: Vec<Arc<FoundCycle>>,
     input: HfEvalInputOwned,
     sim_cap: usize,
-) -> anyhow::Result<Vec<HfEvalResult>> {
+) -> anyhow::Result<(Vec<HfEvalResult>, crate::pipeline::arena::StateArena)> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     crate::util::cpu_pool().spawn(move || {
         let result = crate::util::run_cpu(|| {
@@ -592,14 +586,17 @@ pub async fn rescore_rank_and_evaluate_async(
             let eval_results = evaluate_cycles_parallel(&cycles, &eval, &probe_seeds);
             let cache = &input.execution.route_sim_cache;
             let hits = cache.stats.hits.load(std::sync::atomic::Ordering::Relaxed);
-            let misses = cache.stats.misses.load(std::sync::atomic::Ordering::Relaxed);
+            let misses = cache
+                .stats
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed);
             if hits.saturating_add(misses) > 0 {
                 crate::debug!(
                     "route_sim_cache hit_rate_bps={} hits={hits} misses={misses}",
                     cache.stats.hit_rate_bps()
                 );
             }
-            eval_results
+            (eval_results, input.arena)
         });
         let _ = tx.send(result);
     });
@@ -649,6 +646,7 @@ fn probe_fallback_opt(
         resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
     let decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
+    let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
     let (mut psn, mut pzp, mut pf, mut ps) = (0u32, 0u32, 0u32, 0u32);
     let mut best: Option<(OptimizationResult, RouteSimulationResult)> = None;
     for amount in probe_fallback_amounts(cycle, input, probe_seed) {
@@ -667,7 +665,7 @@ fn probe_fallback_opt(
             input.arena,
             &cycle.edges,
             &sim.hop_amounts,
-            spot_probe_for_token(input.arena, cycle.start_token),
+            spot_probe,
         ) {
             pf += 1;
             continue;
@@ -722,7 +720,6 @@ fn evaluate_one(
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
     let fp = hash_cycle_edges(&cycle.edges);
-    let seed_fp = fp;
     if input.execution.is_route_quarantined(fp) {
         inc(&stats.quarantine);
         return None;
@@ -741,10 +738,10 @@ fn evaluate_one(
         return None;
     };
     let probe_seed = probe_seeds
-        .get(&seed_fp)
-        .or_else(|| probe_seeds.get(&fp))
+        .get(&fp)
         .map(|(amount, sim)| (*amount, *sim));
-    let base_slippage = effective_slippage_bps(input.slippage_bps, 0);
+    let base_slippage = input.slippage_bps;
+    let spot_probe = spot_probe_for_token(input.arena, cycle.start_token);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
@@ -790,7 +787,14 @@ fn evaluate_one(
                 inc(&stats.detailed_none);
                 return None;
             };
-            if validate_optimized_sim(input, cycle, &sim, opt.optimal_input, opt.search_low) {
+            if validate_optimized_sim(
+                input,
+                cycle,
+                &sim,
+                opt.optimal_input,
+                opt.search_low,
+                spot_probe,
+            ) {
                 (opt, sim, false)
             } else {
                 crate::trace!(
@@ -857,7 +861,14 @@ fn evaluate_one(
         ) {
             opt = reopt;
             sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
-            if !validate_optimized_sim(input, cycle, &sim, opt.optimal_input, opt.search_low) {
+            if !validate_optimized_sim(
+                input,
+                cycle,
+                &sim,
+                opt.optimal_input,
+                opt.search_low,
+                spot_probe,
+            ) {
                 return None;
             }
             depth_bps = depth_impact_slippage_bps_with_base(
@@ -904,32 +915,32 @@ fn assess_route_for_cycle(
     flash_source: FlashLoanSource,
 ) -> Option<ProfitAssessment> {
     let risk_bps = input.execution.route_risk_multiplier_bps(fp);
-    let min_profit =
-        input.min_profit_matic.saturating_mul(U256::from(risk_bps)) / U256::from(10_000u64);
-    let route = RouteProfitParams {
+    let thresholds = route_profit_thresholds(
+        input.min_profit_matic,
+        input.min_profit_roi_bps,
+        input.safety_multiplier_bps,
+        input.profit_priority_alpha_bps,
+        risk_bps,
+    );
+    Some(assess_route_from_sim(&RouteAssessRequest {
+        cycle_start: cycle.start_token,
+        arena: input.arena,
         gross_profit: sim.profit,
         amount_in: sim.amount_in,
-        gas_units: input
-            .route_gas
-            .route_gas_or_heuristic(input.gas_oracle, fp, sim.total_gas),
+        simulated_gas: sim.total_gas,
         hop_count: cycle.hop_count,
         slippage_bps,
-        flash_loan_source: flash_source,
-    };
-    let thresholds = ProfitThresholds {
-        min_profit_matic_wei: min_profit,
-        min_profit_roi_bps: input.min_profit_roi_bps,
-        safety_multiplier_bps: input.safety_multiplier_bps,
-    };
-    Some(assess_route_profit(
-        cycle.start_token,
-        input.arena,
-        &route,
-        input.token_to_matic_rates,
-        input.token_decimals,
-        input.gas_price,
-        &thresholds,
-    ))
+        flash_source,
+        gas: AssessmentGas::TickRoute {
+            lookup: input.route_gas,
+            oracle: input.gas_oracle,
+            route_fp: fp,
+        },
+        thresholds,
+        token_to_matic_rates: input.token_to_matic_rates,
+        token_decimals: input.token_decimals,
+        gas_price: input.gas_price,
+    }))
 }
 
 fn validate_optimized_sim(
@@ -938,6 +949,7 @@ fn validate_optimized_sim(
     sim: &RouteSimulationResult,
     optimal_input: U256,
     search_low: U256,
+    spot_probe: U256,
 ) -> bool {
     let token_to_matic_rate =
         resolve_token_to_matic_rate(cycle.start_token, input.arena, input.token_to_matic_rates);
@@ -951,12 +963,7 @@ fn validate_optimized_sim(
     .is_none_or(|cap| sim.amount_in <= cap);
 
     sim.amount_in == optimal_input
-        && local_sim::route_hop_fidelity_ok(
-            input.arena,
-            &cycle.edges,
-            &sim.hop_amounts,
-            spot_probe_for_token(input.arena, cycle.start_token),
-        )
+        && local_sim::route_hop_fidelity_ok(input.arena, &cycle.edges, &sim.hop_amounts, spot_probe)
         && !sim.profit.is_zero()
         && within_flash_cap
         && check_sim_sanity(SimSanityInput {

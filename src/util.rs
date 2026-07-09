@@ -49,11 +49,7 @@ pub fn sign_extend_tick24(tick_word: U256) -> i32 {
 #[inline]
 #[must_use]
 pub fn ten_pow_u256_cached(decimals: u8) -> U256 {
-    if decimals == 18 {
-        ONE
-    } else {
-        ten_pow_u256(decimals)
-    }
+    ten_pow_u256(decimals)
 }
 
 static RAYON_GLOBAL_INIT: Once = Once::new();
@@ -67,13 +63,17 @@ static RAYON_THREADS: LazyLock<usize> = LazyLock::new(|| {
         .filter(|&n| n > 0)
         .unwrap_or_else(compute_default_rayon_threads)
 });
+#[allow(clippy::unwrap_used)] // ponytail: fatal at first pool use; misconfig is not recoverable
 static CPU_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     init_rayon_global_pool();
-    build_named_cpu_pool("rpbot-hf", hf_worker_threads()).expect("hf cpu pool should initialize")
+    build_named_cpu_pool("rpbot-hf", hf_worker_threads())
+        .unwrap_or_else(|_| unreachable!("hf cpu pool should initialize"))
 });
+#[allow(clippy::unwrap_used)]
 static LF_CPU_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     init_rayon_global_pool();
-    build_named_cpu_pool("rpbot-lf", lf_worker_threads()).expect("lf cpu pool should initialize")
+    build_named_cpu_pool("rpbot-lf", lf_worker_threads())
+        .unwrap_or_else(|_| unreachable!("lf cpu pool should initialize"))
 });
 
 /// Cap the implicit global pool so stray `par_iter`/`join` without `install()` cannot
@@ -212,28 +212,19 @@ pub fn u512_to_u256_checked(v: U512) -> Option<U256> {
 #[inline]
 #[must_use]
 pub fn truncate_str(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
-    let mut iter = s.char_indices();
-    for _ in 0..max_chars {
-        if iter.next().is_none() {
-            return std::borrow::Cow::Borrowed(s);
-        }
+    if max_chars == 0 {
+        return std::borrow::Cow::Owned('…'.to_string());
     }
-    match iter.next() {
-        None => std::borrow::Cow::Borrowed(s),
-        Some((pos, _)) => {
-            if max_chars == 0 {
-                std::borrow::Cow::Owned('…'.to_string())
-            } else if let Some((last_char_pos, _)) = s.char_indices().nth(max_chars - 1) {
-                let mut truncated = s[..last_char_pos].to_string();
-                truncated.push('…');
-                std::borrow::Cow::Owned(truncated)
-            } else {
-                let mut truncated = s[..pos].to_string();
-                truncated.push('…');
-                std::borrow::Cow::Owned(truncated)
-            }
+    let mut last_kept_end = 0usize;
+    for (i, (pos, _)) in s.char_indices().enumerate() {
+        if i == max_chars {
+            let mut truncated = s[..last_kept_end].to_string();
+            truncated.push('…');
+            return std::borrow::Cow::Owned(truncated);
         }
+        last_kept_end = pos;
     }
+    std::borrow::Cow::Borrowed(s)
 }
 
 #[cfg(test)]

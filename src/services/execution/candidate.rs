@@ -11,7 +11,8 @@ use crate::services::execution::calldata::{
     hops_are_balancer_only,
 };
 use crate::services::execution::gas::buffer_gas_limit;
-use crate::services::execution::profit::on_chain_min_profit;
+use crate::services::execution::profit::AssessProfitInput;
+use crate::services::execution::profit::on_chain_min_profit_for_route;
 
 #[derive(Debug, Clone)]
 pub struct CandidateExecution {
@@ -111,6 +112,15 @@ fn resolve_dispatch_flash_source(
     }
 }
 
+fn resolve_dispatch(
+    flash_source: FlashLoanSource,
+    hops: &[crate::services::execution::calldata::CalldataHop],
+) -> (FlashLoanSource, ExecutorEntrypoint) {
+    let dispatch_flash_source = resolve_dispatch_flash_source(flash_source, hops);
+    let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, hops);
+    (dispatch_flash_source, entrypoint)
+}
+
 pub fn build_execution_candidate(
     arena: &StateArena,
     evaluated: &EvaluatedRoute,
@@ -142,7 +152,7 @@ pub fn build_execution_candidate(
             }),
     );
 
-    let dispatch_flash_source = resolve_dispatch_flash_source(config.flash_loan_source, &hops);
+    let (dispatch_flash_source, entrypoint) = resolve_dispatch(config.flash_loan_source, &hops);
     let encode_cfg = RouteEncodeConfig {
         slippage_bps: config.slippage_bps,
         deadline,
@@ -154,12 +164,13 @@ pub fn build_execution_candidate(
         encode_cfg,
         dispatch_flash_source,
     )?;
-    // The assessment already applies route slippage and the selected flash-loan
-    // fee. Encode that same executable profit basis instead of gross AMM output.
-    let min_profit = on_chain_min_profit(assessment.net_profit)
-        .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
-
-    let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, &hops);
+    let min_profit = on_chain_min_profit_for_route(
+        evaluated.result.profit,
+        evaluated.result.amount_in,
+        config.slippage_bps,
+        dispatch_flash_source,
+    )
+    .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
 
     // DODO flash loan: packRoute flash_token field must be the DODO pool address,
     // not the token address — the Huff contract calls flashLoan on it directly.
@@ -202,6 +213,32 @@ pub fn build_execution_candidate(
         safety_multiplier_bps: config.safety_multiplier_bps,
         state_generation: config.state_generation,
     })
+}
+
+impl CandidateExecution {
+    #[must_use]
+    pub fn profit_assessment_input(
+        &self,
+        gas_units: u32,
+        gas_price_wei: U256,
+        min_profit_matic_wei: U256,
+    ) -> AssessProfitInput {
+        AssessProfitInput {
+            gross_profit: self.gross_profit,
+            amount_in: self.amount_in,
+            gas_units,
+            gas_price_wei,
+            token_to_matic_rate: self.token_to_matic_rate,
+            token_decimals: self.token_decimals,
+            hop_count: self.hop_count,
+            min_profit_matic_wei,
+            min_profit_roi_bps: self.min_profit_roi_bps,
+            slippage_bps: self.slippage_bps,
+            flash_loan_source: self.flash_loan_source,
+            safety_multiplier_bps: self.safety_multiplier_bps,
+            profit_priority_alpha_bps: 0,
+        }
+    }
 }
 
 #[must_use]

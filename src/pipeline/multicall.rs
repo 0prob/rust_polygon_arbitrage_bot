@@ -58,7 +58,6 @@ fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
     calls
 }
 
-
 async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     provider: &P,
     items: &[MulticallItem],
@@ -69,7 +68,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     }
 
     let contract = IMulticall3::new(MULTICALL3, provider);
-    let calls = build_calls(items);  // Build once — reused across retries.
+    let calls = build_calls(items); // Build once — reused across retries.
 
     let mut attempt = 0u32;
     loop {
@@ -158,7 +157,9 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
         let bn = block_number;
         let chunk_vec: Vec<_> = chunk.to_vec();
         tasks.spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore");
+            let Ok(_permit) = sem.acquire().await else {
+                return (i, Err(anyhow::anyhow!("multicall semaphore closed")));
+            };
             let res = execute_multicall_chunk(&p, &chunk_vec, bn).await;
             (i, res)
         });

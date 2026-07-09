@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use anyhow::{Context, ensure};
-use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},

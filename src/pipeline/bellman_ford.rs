@@ -1,11 +1,10 @@
 use std::time::Duration;
 
 use crate::core::types::FoundCycle;
-use crate::pipeline::arena::StateArena;
 use crate::pipeline::deadline::DeadlineGuard;
 use crate::pipeline::negative_cycle::collect_negative_cycles_from_source;
-use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
-use crate::pipeline::weighted_graph::{WeightedEdge, build_weighted_adjacency};
+use crate::pipeline::types::CycleSearchPass;
+use crate::pipeline::weighted_graph::WeightedEdge;
 
 const BELLMAN_FORD_MAX_SOURCES: usize = 15;
 const BF_TIME_BUDGET: Duration = Duration::from_millis(250);
@@ -67,16 +66,6 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
         }
     }
     all
-}
-
-#[must_use]
-pub fn find_cycles_bellman_ford_multi_pass(
-    _arena: &StateArena,
-    graph: &RoutingGraph,
-    passes: &[CycleSearchPass],
-) -> Vec<FoundCycle> {
-    let adj = build_weighted_adjacency(graph);
-    find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes)
 }
 
 #[cfg(test)]

@@ -19,14 +19,31 @@ pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
 pub struct ProbeContext<'a> {
     pub token_to_matic_rates: Option<&'a FxHashMap<TokenIndex, U256>>,
     pub token_decimals: Option<&'a FxHashMap<Address, u8>>,
+    pub gas_price_wei: Option<U256>,
 }
 
-fn probe_amount_for_cycle(
+#[must_use]
+fn probe_beats_gas_floor(
+    sim: &crate::pipeline::types::MinimalSimResult,
+    rate: U256,
+    decimals: u8,
+    gas_price: U256,
+) -> bool {
+    if rate < crate::core::constants::MIN_TOKEN_TO_MATIC_RATE {
+        return true;
+    }
+    let scale = crate::util::ten_pow_u256_cached(decimals);
+    let profit_matic = sim.profit.saturating_mul(rate) / scale;
+    let gas_matic = U256::from(sim.total_gas).saturating_mul(gas_price);
+    profit_matic > gas_matic
+}
+
+fn probe_context_for_cycle(
     arena: &StateArena,
     cycle: &FoundCycle,
     ctx: Option<&ProbeContext<'_>>,
-) -> U256 {
-    let mut decimals = 18;
+) -> (U256, U256, u8) {
+    let mut decimals = arena.token_decimals(cycle.start_token);
     let mut rate = U256::ZERO;
     if let Some(c) = ctx {
         if let Some(token_address) = arena.token_address(cycle.start_token)
@@ -41,7 +58,7 @@ fn probe_amount_for_cycle(
             rate = r;
         }
     }
-    min_economic_amount_in(decimals, rate)
+    (min_economic_amount_in(decimals, rate), rate, decimals)
 }
 
 pub fn prefilter_cycles_by_atomic_sim_with_context(
@@ -67,15 +84,24 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
         if !is_fully_simulable_route(&cycle.edges) {
             continue;
         }
-        let probe_amount = probe_amount_for_cycle(arena, &cycle, ctx);
+        let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, &cycle, ctx);
         let probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
         let keep = match &probe {
-            Some(sim) => sim.profit > U256::ZERO,
+            Some(sim) if sim.profit > U256::ZERO => {
+                if let Some(c) = ctx {
+                    if let Some(gas_price) = c.gas_price_wei {
+                        probe_beats_gas_floor(sim, rate, decimals, gas_price)
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
             // Use exact U256 cycle_ratio > ONE to gate rescue, falling back to f64 score
             // only when cycle_ratio wasn't computed (cache restore path sets it to ZERO).
-            None
-                if cycle.cycle_ratio > ONE
-                    || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) =>
+            None if cycle.cycle_ratio > ONE
+                || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) =>
             {
                 if missing_state_rescued >= rescue_cap {
                     false
@@ -84,7 +110,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
                     true
                 }
             }
-            None => false,
+            Some(_) | None => false,
         };
         if keep {
             survivors.push(cycle);

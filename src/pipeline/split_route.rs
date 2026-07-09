@@ -3,8 +3,6 @@ use alloy::primitives::U256;
 use crate::core::types::Edge;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_hop_amount_out;
-use crate::pipeline::spot_price::spot_probe_for_token;
-
 /// Evaluate splitting `amount_in` across two parallel hops (same `token_in` → `token_out`).
 #[must_use]
 pub fn simulate_two_way_split(
@@ -27,41 +25,6 @@ pub fn simulate_two_way_split(
     let out_a = simulate_hop_amount_out(state_a, edge_a, to_a)?;
     let out_b = simulate_hop_amount_out(state_b, edge_b, to_b)?;
     Some(out_a.saturating_add(out_b))
-}
-
-/// Best 50/50 split output between two competing pools for the same pair.
-#[must_use]
-pub fn best_two_pool_split(
-    arena: &StateArena,
-    edge_a: &Edge,
-    edge_b: &Edge,
-    amount_in: U256,
-) -> Option<(U256, u64)> {
-    if amount_in.is_zero() {
-        return None;
-    }
-    let probe = spot_probe_for_token(arena, edge_a.token_in);
-    if amount_in <= probe {
-        return simulate_two_way_split(arena, edge_a, edge_b, amount_in, 5000)
-            .map(|out| (out, 5000));
-    }
-    let mut best_out = U256::ZERO;
-    let mut best_bps = 5000u64;
-    let mut bps = 1000u64;
-    while bps <= 9000 {
-        if let Some(out) = simulate_two_way_split(arena, edge_a, edge_b, amount_in, bps)
-            && out > best_out
-        {
-            best_out = out;
-            best_bps = bps;
-        }
-        bps += 1000;
-    }
-    if best_out.is_zero() {
-        None
-    } else {
-        Some((best_out, best_bps))
-    }
 }
 
 #[cfg(test)]

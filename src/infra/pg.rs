@@ -7,8 +7,8 @@ use anyhow::{Context, ensure};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::{StreamExt, stream};
 use tokio::sync::watch;
-use tokio_postgres::error::SqlState;
 use tokio_postgres::AsyncMessage;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Error as PgError, NoTls, Row, types::ToSql};
 
 use crate::services::discovery::{DiscoveredPool, TokenMeta, parse_pool_meta_row};
@@ -53,7 +53,7 @@ const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
 const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_POOL_SIZE: usize = 16;      // increased from 8: discovery + bootstrap + token + health + spare
+const MAX_POOL_SIZE: usize = 16; // increased from 8: discovery + bootstrap + token + health + spare
 const NOTIFY_CHANNEL: &str = "pool_meta_channel";
 
 /// Execute a query against the pool with a cached (per-connection) prepared statement.
@@ -152,6 +152,42 @@ impl PgClient {
         notify_flag: Arc<AtomicBool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let url = url_str.to_string();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                if *shutdown.borrow() {
+                    break;
+                }
+                match Self::run_notify_listener(&url, &notify_flag, &mut shutdown).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        crate::warn!(
+                            "pg LISTEN disconnected ({e:#}); reconnecting in {}s",
+                            backoff.as_secs()
+                        );
+                        tokio::select! {
+                            _ = shutdown.changed() => {
+                                if *shutdown.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+            crate::info!("pg LISTEN listener shut down");
+        });
+        Ok(())
+    }
+
+    async fn run_notify_listener(
+        url_str: &str,
+        notify_flag: &AtomicBool,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let (client, mut connection) = tokio_postgres::connect(url_str, NoTls)
             .await
             .context("pg LISTEN connect failed")?;
@@ -162,36 +198,32 @@ impl PgClient {
             .context("pg LISTEN pool_meta_channel failed")?;
         crate::info!("pg LISTEN subscribed to {NOTIFY_CHANNEL}");
 
-        tokio::spawn(async move {
-            let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
-            loop {
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            break;
-                        }
+        let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return Ok(());
                     }
-                    message = messages.next() => {
-                        match message {
-                            Some(Ok(AsyncMessage::Notification(notification))) => {
-                                if notification.channel() == NOTIFY_CHANNEL {
-                                    notify_flag.store(true, Ordering::Release);
-                                }
+                }
+                message = messages.next() => {
+                    match message {
+                        Some(Ok(AsyncMessage::Notification(notification))) => {
+                            if notification.channel() == NOTIFY_CHANNEL {
+                                notify_flag.store(true, Ordering::Release);
                             }
-                            Some(Ok(_)) => {}
-                            Some(Err(e)) => {
-                                crate::warn!("pg LISTEN connection driver exited: {e}");
-                                break;
-                            }
-                            None => break,
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            return Err(e.into());
+                        }
+                        None => {
+                            anyhow::bail!("pg LISTEN connection closed");
                         }
                     }
                 }
             }
-            crate::info!("pg LISTEN listener shut down");
-        });
-
-        Ok(())
+        }
     }
 
     pub async fn probe_pool_meta_count(&self) -> anyhow::Result<u64> {

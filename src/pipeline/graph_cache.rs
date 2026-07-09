@@ -129,7 +129,7 @@ impl GraphCache {
         layout_fingerprint: u64,
         routable_count: usize,
         eligible_count: usize,
-    ) -> Arc<crate::pipeline::types::RoutingGraph> {
+    ) -> Option<Arc<crate::pipeline::types::RoutingGraph>> {
         if let Some(g) = &mut self.graph {
             let gm = Arc::make_mut(g);
             crate::pipeline::graph::rescore_dirty_pools_or_full(
@@ -139,8 +139,8 @@ impl GraphCache {
                 arena_pool_count,
             );
         }
-        let g = self.graph().expect("graph must exist for dirty rescore");
-        let cyc = self.cycles();
+        let g = Arc::clone(self.graph.as_ref()?);
+        let cyc = self.cycles.as_ref().cloned();
         self.store(
             Arc::clone(&g),
             cyc,
@@ -149,15 +149,15 @@ impl GraphCache {
             new_state_generation,
             eligible_count,
         );
-        g
+        Some(g)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::U256;
     use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
+    use alloy::primitives::U256;
 
     fn dummy_cycle() -> FoundCycle {
         FoundCycle {

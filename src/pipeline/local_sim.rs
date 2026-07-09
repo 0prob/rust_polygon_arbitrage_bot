@@ -9,15 +9,12 @@ use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
 use crate::core::math::woofi::get_woofi_amount_out;
 use crate::core::types::{
-    Edge, PoolState, ProtocolType, RouteSimulationResult, TokenIndex, hop_amounts_zeroed,
+    Edge, PoolState, ProtocolType, RouteSimulationResult, hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::types::MinimalSimResult;
 use alloy::primitives::U256;
-use rustc_hash::FxHashMap;
-
-
 
 /// Per-hop gas estimate for route ranking (matches simulation constants).
 #[must_use]
@@ -195,8 +192,7 @@ pub fn cl_amount_cap(arena: &StateArena, edges: &[Edge]) -> Option<U256> {
         };
         if cl_hop_tickless(state) {
             tickless = true;
-            let hop_cap =
-                crate::pipeline::spot_price::spot_probe_for_token(arena, edge.token_in);
+            let hop_cap = crate::pipeline::spot_price::spot_probe_for_token(arena, edge.token_in);
             cap = cap.min(hop_cap);
         }
     }
@@ -338,50 +334,55 @@ pub fn route_resim_fidelity_reject(
     None
 }
 
-fn route_token_probes(arena: &StateArena, edges: &[Edge]) -> FxHashMap<TokenIndex, U256> {
-    let mut probes = FxHashMap::default();
-    for edge in edges {
-        probes
-            .entry(edge.token_in)
-            .or_insert_with(|| spot_probe_for_token(arena, edge.token_in));
-    }
-    probes
-}
-
 #[must_use]
-pub fn simulate_route_minimal(
+fn walk_route_hops(
     arena: &StateArena,
     edges: &[Edge],
     amount_in: U256,
-) -> Option<MinimalSimResult> {
-    let probes = route_token_probes(arena, edges);
+    mut hop_amounts: Option<&mut [U256]>,
+) -> Option<(U256, u32)> {
     let mut current = amount_in;
     let mut total_gas = 0u32;
+    if let Some(amounts) = hop_amounts.as_deref_mut() {
+        *amounts.first_mut()? = amount_in;
+    }
 
-    for edge in edges {
+    for (i, edge) in edges.iter().enumerate() {
         let state = arena.pool_state(edge.pool_index)?;
         if !state.is_tradable() {
             return None;
         }
-        let shallow_cap = *probes.get(&edge.token_in)?;
+        let shallow_cap = spot_probe_for_token(arena, edge.token_in);
         let hop = simulate_hop(state, edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
         current = hop.amount_out;
         total_gas += hop.gas;
+        if let Some(amounts) = hop_amounts.as_deref_mut() {
+            *amounts.get_mut(i + 1)? = current;
+        }
     }
 
-    let profit = current.saturating_sub(amount_in);
+    Some((current, total_gas))
+}
+
+pub fn simulate_route_minimal(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount_in: U256,
+) -> Option<MinimalSimResult> {
+    let (amount_out, hop_gas) = walk_route_hops(arena, edges, amount_in, None)?;
+    let profit = amount_out.saturating_sub(amount_in);
     let hop_count = edges.len();
     let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-        total_gas,
+        hop_gas,
         hop_count,
         hop_count as u32,
     );
     Some(MinimalSimResult {
         profit,
-        amount_out: current,
+        amount_out,
         total_gas,
     })
 }
@@ -393,37 +394,18 @@ pub fn simulate_route_detailed(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
-    let probes = route_token_probes(arena, edges);
     let hop_count = edges.len();
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    hop_amounts[0] = amount_in;
-    let mut total_gas = 0u32;
-    let mut current = amount_in;
-
-    for (i, edge) in edges.iter().enumerate() {
-        let state = arena.pool_state(edge.pool_index)?;
-        if !state.is_tradable() {
-            return None;
-        }
-        let shallow_cap = *probes.get(&edge.token_in)?;
-        let hop = simulate_hop(state, edge, current, shallow_cap)?;
-        if current > U256::ZERO && hop.amount_out.is_zero() {
-            return None;
-        }
-        current = hop.amount_out;
-        hop_amounts[i + 1] = current;
-        total_gas += hop.gas;
-    }
-
-    let profit = current.saturating_sub(amount_in);
+    let (amount_out, hop_gas) = walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
+    let profit = amount_out.saturating_sub(amount_in);
     let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-        total_gas,
+        hop_gas,
         hop_count,
         hop_count as u32,
     );
     Some(RouteSimulationResult {
         amount_in,
-        amount_out: current,
+        amount_out,
         profit,
         profitable: profit > U256::ZERO,
         hop_amounts,
@@ -704,7 +686,9 @@ mod tests {
         }];
         assert_eq!(
             cl_amount_cap(&arena, &edges),
-            Some(crate::pipeline::spot_price::spot_probe_for_token(&arena, t0))
+            Some(crate::pipeline::spot_price::spot_probe_for_token(
+                &arena, t0
+            ))
         );
     }
 

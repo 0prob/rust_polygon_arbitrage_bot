@@ -5,13 +5,13 @@ use rayon::prelude::*;
 use alloy::primitives::U256;
 
 use crate::core::constants::HOP_CAP;
-use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::core::math::fixed_point::ONE;
-use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
+use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
+use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::types::{CycleSearchPass, GraphEdge, RoutingGraph, compare_cycle_score};
 
 pub use crate::pipeline::spot_price::hop_penalty;
@@ -102,7 +102,9 @@ pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
                     low[*node] = low[*node].min(discovered[next]);
                 }
             } else {
-                let (finished, _) = stack.pop().expect("bridge DFS stack is non-empty");
+                let Some((finished, _)) = stack.pop() else {
+                    break;
+                };
                 let edge_id = parent_edge[finished];
                 if edge_id != usize::MAX {
                     let (pool, token) = incidence_edges[edge_id];
@@ -125,15 +127,17 @@ pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
             non_bridge_incidence_count[*pool] += 1;
         }
     }
-    let mut pool_indices = rustc_hash::FxHashSet::default();
+    let mut participating = vec![false; pool_count];
     for (pool, count) in non_bridge_incidence_count.into_iter().enumerate() {
         if count >= 2 {
-            pool_indices.insert(pool as u32);
+            participating[pool] = true;
         }
     }
+    let mut pool_indices = rustc_hash::FxHashSet::default();
     let mut token_mask = vec![false; token_count];
     for (pool, token) in incidence_edges {
-        if pool_indices.contains(&(pool as u32)) {
+        if participating[pool] {
+            pool_indices.insert(pool as u32);
             token_mask[token] = true;
         }
     }
@@ -207,8 +211,9 @@ struct ActiveGraph {
 fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     let coverage = graph
         .coverage
-        .clone()
-        .unwrap_or_else(|| cycle_capable_coverage(graph));
+        .as_ref()
+        .map(std::sync::Arc::clone)
+        .unwrap_or_else(|| std::sync::Arc::new(cycle_capable_coverage(graph)));
     let token_count = graph.adjacency.len();
     let mut compact = Vec::with_capacity(token_count);
     // min_outgoing lazily populated: only tokens with live edges get entries.
@@ -663,24 +668,9 @@ fn collect_cycles_dfs_parallel(
 }
 
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    use rustc_hash::FxHashMap;
-    use std::collections::hash_map::Entry;
-
-    let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
-    for cycle in shard_cycles.iter().flatten() {
-        let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-        match best.entry(key) {
-            Entry::Occupied(mut e) => {
-                if cycle.score < e.get().score {
-                    e.insert(cycle.clone());
-                }
-            }
-            Entry::Vacant(e) => {
-                e.insert(cycle.clone());
-            }
-        }
-    }
-    best.into_values().collect()
+    crate::pipeline::cycle_filter::dedupe_cycles_by_edges(
+        shard_cycles.iter().flat_map(|s| s.iter().cloned()),
+    )
 }
 
 #[must_use]

@@ -33,7 +33,7 @@ use crate::services::execution::nonce::NonceManager;
 use crate::services::execution::private_submit::{
     PrivateSubmitConfig, PrivateSubmitMode, resolve_submit_mode,
 };
-use crate::services::execution::profit::{AssessProfitInput, assess_profit};
+use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
 use crate::services::execution::receipt::ReceiptPoller;
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
@@ -100,10 +100,12 @@ struct RouteStatsWriter {
 impl RouteStatsWriter {
     fn spawn(path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("route-stats-writer".into())
             .spawn(move || route_stats_writer_loop(path, rx))
-            .expect("route stats writer thread");
+        {
+            crate::warn!("route stats writer thread spawn failed: {e}");
+        }
         Self { tx }
     }
 
@@ -349,6 +351,7 @@ pub enum ExecutionOutcome {
     SkippedCooldown,
     SkippedNoWallet,
     SkippedNoPrivateRpc,
+    SkippedUnprofitablePreDryRun,
     SkippedUnprofitableAfterDryRun,
     SkippedShutdown,
     Confirmed {
@@ -516,27 +519,32 @@ impl ExecutionService {
         gas_price: U256,
         min_profit_matic_wei: U256,
         realized_profit: Option<U256>,
+        profit_priority_alpha_bps: u64,
     ) -> Option<crate::core::types::ProfitAssessment> {
         let gas_units = candidate
             .simulated_gas
             .max(u32::try_from(dry_run_gas).unwrap_or(candidate.simulated_gas));
-        Some(assess_profit(&AssessProfitInput {
-            // Executor return data is post-repayment realized profit, so do
-            // not apply modeled slippage or flash-loan fees a second time.
-            gross_profit: realized_profit.unwrap_or(candidate.gross_profit),
-            amount_in: candidate.amount_in,
-            gas_units,
-            gas_price_wei: gas_price,
-            token_to_matic_rate: candidate.token_to_matic_rate,
-            token_decimals: candidate.token_decimals,
-            hop_count: candidate.hop_count,
-            min_profit_matic_wei,
-            min_profit_roi_bps: candidate.min_profit_roi_bps,
-            slippage_bps: realized_profit.map_or(candidate.slippage_bps, |_| 0),
-            flash_loan_source: realized_profit
-                .map_or(candidate.flash_loan_source, |_| FlashLoanSource::Direct),
-            safety_multiplier_bps: candidate.safety_multiplier_bps,
-        }))
+        let (gross_profit, amount_in, slippage_bps, flash_source) =
+            if let Some(realized) = realized_profit {
+                // Dry-run return is post-repayment token profit; calldata minProfit
+                // was set from modeled net at build time — reassess without re-fees.
+                (realized, candidate.amount_in, 0, FlashLoanSource::Direct)
+            } else {
+                (
+                    candidate.gross_profit,
+                    candidate.amount_in,
+                    candidate.slippage_bps,
+                    candidate.flash_loan_source,
+                )
+            };
+        let mut input =
+            candidate.profit_assessment_input(gas_units, gas_price, min_profit_matic_wei);
+        input.gross_profit = gross_profit;
+        input.amount_in = amount_in;
+        input.slippage_bps = slippage_bps;
+        input.flash_loan_source = flash_source;
+        input.profit_priority_alpha_bps = profit_priority_alpha_bps;
+        Some(assess_profit(&input))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -588,7 +596,7 @@ impl ExecutionService {
                 learned_floor,
                 risk_multiplier,
             );
-            let outcome = ExecutionOutcome::SkippedUnprofitableAfterDryRun;
+            let outcome = ExecutionOutcome::SkippedUnprofitablePreDryRun;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
             }
@@ -756,6 +764,7 @@ impl ExecutionService {
             reassess_gas_price,
             learned_floor,
             dry.realized_profit,
+            config.execution.profit_priority_fee_alpha_bps,
         )
         .is_some_and(|a| a.should_execute);
         if !dry_pass {
@@ -1320,6 +1329,7 @@ mod safety_tests {
             U256::from(1u8),
             U256::ZERO,
             Some(U256::from(900u64)),
+            0,
         )
         .expect("realized profit should produce an assessment");
 

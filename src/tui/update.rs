@@ -8,10 +8,12 @@ use alloy::sol_types::SolCall;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::AppConfig;
+use crate::core::types::FlashLoanSource;
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType};
 use crate::pipeline::local_sim::{estimate_route_gas, simulate_route_minimal};
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
+use crate::services::execution::profit::{AssessProfitInput, assess_profit};
 use crate::services::hf_snapshot::HfSnapshot;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::resolve_token_to_matic_rate;
@@ -221,7 +223,14 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             Arc::clone(&cache.simulations),
         )
     } else {
-        let opportunities = build_routes(&input.snapshot, &input.arena, input.matic_usd, 48);
+        let opportunities = build_routes(
+            &input.snapshot,
+            &input.arena,
+            input.matic_usd,
+            input.gas_gwei,
+            input.config.execution.slippage_bps,
+            48,
+        );
         let simulations = build_simulations(&input.snapshot, &opportunities, input.matic_usd);
         (Arc::new(opportunities), Arc::new(simulations))
     };
@@ -339,6 +348,8 @@ fn build_routes(
     snapshot: &HfSnapshot,
     arena: &crate::pipeline::arena::StateArena,
     matic_usd: f64,
+    gas_gwei: Option<f64>,
+    slippage_bps: u64,
     limit: usize,
 ) -> Vec<RouteSummary> {
     let mut ranked: Vec<&FoundCycle> = snapshot.cycles.iter().map(|c| c.as_ref()).collect();
@@ -375,8 +386,29 @@ fn build_routes(
         };
         let amount_in_matic = rate_to_matic(amount_in, rate, decimals);
         let profit_matic = rate_to_matic(gross_profit_token, rate, decimals);
+        let net_profit_matic = if let (Some(sim), Some(gwei)) = (sim.as_ref(), gas_gwei) {
+            let gas_price = U256::from((gwei * 1e9).max(0.0) as u128);
+            let assessment = assess_profit(&AssessProfitInput {
+                gross_profit: sim.profit,
+                amount_in,
+                gas_units: sim.total_gas,
+                gas_price_wei: gas_price,
+                token_to_matic_rate: rate,
+                token_decimals: decimals,
+                hop_count: cycle.hop_count,
+                min_profit_matic_wei: U256::ZERO,
+                min_profit_roi_bps: 0,
+                slippage_bps,
+                flash_loan_source: FlashLoanSource::Balancer,
+                safety_multiplier_bps: 0,
+                profit_priority_alpha_bps: 0,
+            });
+            u256_to_f64(assessment.net_profit_after_gas_matic_wei)
+        } else {
+            profit_matic
+        };
         let profit_usd = if matic_usd > 0.0 {
-            profit_matic * matic_usd
+            net_profit_matic * matic_usd
         } else {
             0.0
         };
@@ -413,6 +445,7 @@ fn build_routes(
                 "n/a".to_string()
             },
             profit_matic,
+            net_profit_matic,
             profit_usd,
             gas_estimate,
             risk_score,
@@ -430,7 +463,7 @@ pub fn build_route_cache(
     arena: &crate::pipeline::arena::StateArena,
     matic_usd: f64,
 ) -> RouteBuildCache {
-    let opportunities = build_routes(snapshot, arena, matic_usd, 48);
+    let opportunities = build_routes(snapshot, arena, matic_usd, None, 0, 48);
     let simulations = build_simulations(snapshot, &opportunities, matic_usd);
     RouteBuildCache {
         generation: snapshot.generation,
@@ -442,7 +475,7 @@ pub fn build_route_cache(
 fn build_simulations(
     _snapshot: &HfSnapshot,
     routes: &[RouteSummary],
-    matic_usd: f64,
+    _matic_usd: f64,
 ) -> Vec<SimulationRow> {
     routes
         .iter()
@@ -456,11 +489,7 @@ fn build_simulations(
                 amount_in,
                 amount_out,
                 gross_profit: format!("{:.4} MATIC", route.profit_matic),
-                net_profit: if matic_usd > 0.0 {
-                    format!("{:.2} USD", route.profit_usd)
-                } else {
-                    "n/a".to_string()
-                },
+                net_profit: format!("{:.4} MATIC", route.net_profit_matic),
                 gas: route.gas_estimate,
                 note: format!("{} hops, score {:.4}", route.hops, route.rescored),
             }
