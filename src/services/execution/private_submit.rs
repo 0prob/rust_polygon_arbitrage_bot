@@ -26,7 +26,7 @@ static HTTP: LazyLock<Client> = LazyLock::new(|| {
         HttpClientOpts {
             timeout: SUBMIT_TIMEOUT,
             pool_max_idle_per_host: 4,
-            max_redirects: 5,
+            max_redirects: 0,
         },
         "private submit",
     )

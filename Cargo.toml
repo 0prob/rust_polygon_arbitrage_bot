@@ -25,7 +25,7 @@ tui = ["dep:ratatui", "dep:crossterm"]
 alloy = { version = "2.1.1", features = ["reqwest", "pubsub", "provider-ws"] }
 hypersync-client = "1.4.0"
 anyhow = "1.0.103"
-thiserror = "2.0.12"
+thiserror = "2.0.18"
 arc-swap = "1.9.2"
 dashmap = "6.2.1"
 figment = { version = "0.10.19", features = ["toml", "env"] }
@@ -40,8 +40,8 @@ rayon = "1.12.0"
 smallvec = "1.15.2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-postgres = "0.7.18"
-deadpool-postgres = "0.14"
-futures-util = "0.3.31"
+deadpool-postgres = "0.14.1"
+futures-util = "0.3.32"
 
 [dev-dependencies]
 figment = { version = "0.10.19", features = ["test"] }
