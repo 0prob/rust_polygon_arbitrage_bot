@@ -11,6 +11,8 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 const ORACLE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Hermes URL length stays bounded when many distinct feed ids are requested.
+const PYTH_FETCH_CHUNK: usize = 24;
 
 use crate::abis::IChainlinkAggregator;
 use crate::core::constants::{RATE_PRECISION, WMATIC};
@@ -120,7 +122,32 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
     TokenFeed {
         token: address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
         chainlink: Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD868eE6b11a9")),
-        pyth_id: None,
+        pyth_id: Some("78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501"),
+    },
+    TokenFeed {
+        token: address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
+        chainlink: None,
+        pyth_id: Some("4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7"),
+    },
+    TokenFeed {
+        token: address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
+        chainlink: None,
+        pyth_id: Some("4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478"),
+    },
+    TokenFeed {
+        token: address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
+        chainlink: None,
+        pyth_id: Some("63f341689d98a12ef60a5cff1d7f85c70a9e17bf1575f0e7c0b2512d48b1c8b3"),
+    },
+    TokenFeed {
+        token: address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
+        chainlink: None,
+        pyth_id: Some("c63e2a7f37a04e5e614c07238bedb25dcc38927fba8fe890597a593c0b2fa4ad"),
+    },
+    TokenFeed {
+        token: address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
+        chainlink: None,
+        pyth_id: Some("9a4df90b25497f66b1afb012467e316e801ca3d839456db028892fe8c70c8016"),
     },
 ];
 
@@ -433,6 +460,15 @@ impl PriceOracle {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(PYTH_FETCH_CHUNK) {
+            let batch = self.fetch_pyth_chunk(chunk).await?;
+            out.extend(batch);
+        }
+        Ok(out)
+    }
+
+    async fn fetch_pyth_chunk(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
         match self.fetch_pyth_once(ids).await {
             Ok(prices) if !prices.is_empty() => Ok(prices),
             first => {
@@ -733,8 +769,24 @@ mod tests {
             address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
             address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
             address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
+            address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
+            address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
+            address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
+            address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
+            address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
+            address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
         ];
         assert!(tokens.iter().all(|token| pyth_feed(token).is_some()));
+    }
+
+    #[test]
+    fn polygon_hub_tokens_have_chainlink_or_pyth_feed() {
+        for token in crate::core::constants::POLYGON_HUB_TOKENS {
+            assert!(
+                chainlink_feed(&token).is_some() || pyth_feed(&token).is_some(),
+                "hub token missing oracle feed: {token}"
+            );
+        }
     }
 
     #[tokio::test]

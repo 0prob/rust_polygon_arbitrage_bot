@@ -37,6 +37,7 @@ const DECIMALS_ENRICH_BATCH: usize = 512;
 struct DiscoveryState {
     discovered: Arc<Vec<DiscoveredPool>>,
     pool_key_index: FxHashMap<String, usize>,
+    address_index: FxHashMap<Address, usize>,
     token_metas: Arc<Vec<TokenMeta>>,
     token_decimals: Arc<FxHashMap<Address, u8>>,
     discovery_cursor: DiscoveryCursor,
@@ -317,6 +318,7 @@ impl StateRefreshService {
             let mut updated = 0usize;
             // Move the index map out (no data clone) first.
             let mut index = std::mem::take(&mut state.pool_key_index);
+            let mut address_index = std::mem::take(&mut state.address_index);
             {
                 // Then make_mut on discovered; its borrow lives only inside this block.
                 let discovered = Arc::make_mut(&mut state.discovered);
@@ -326,15 +328,19 @@ impl StateRefreshService {
                     }
                     if let Some(&idx) = index.get(&pool.pool_key) {
                         discovered[idx] = pool;
+                        address_index.insert(discovered[idx].address, idx);
                         updated += 1;
                     } else {
-                        index.insert(pool.pool_key.clone(), discovered.len());
+                        let idx = discovered.len();
+                        index.insert(pool.pool_key.clone(), idx);
+                        address_index.insert(pool.address, idx);
                         discovered.push(pool);
                         added += 1;
                     }
                 }
             }
             state.pool_key_index = index;
+            state.address_index = address_index;
             state.discovery_cursor = result.cursor.clone();
             (added, updated)
         };
@@ -547,12 +553,9 @@ impl StateRefreshService {
         let before = state.discovered.len();
         let retain_filter: rustc_hash::FxHashSet<Address> = to_remove.iter().copied().collect();
         Arc::make_mut(&mut state.discovered).retain(|p| !retain_filter.contains(&p.address));
-        state.pool_key_index = state
-            .discovered
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.pool_key.clone(), i))
-            .collect();
+        let (key_index, address_index) = rebuild_discovery_indexes(state.discovered.as_ref());
+        state.pool_key_index = key_index;
+        state.address_index = address_index;
 
         for addr in &to_remove {
             state.invalid_fetch_count.remove(addr);
@@ -574,6 +577,22 @@ impl StateRefreshService {
 
     pub fn token_decimals_map(&self) -> Arc<FxHashMap<Address, u8>> {
         Arc::clone(&self.discovery_state.read().token_decimals)
+    }
+
+    /// Register tradable cached pools into a fresh arena without scanning the full
+    /// discovery set (~263k) on every LF pass.
+    pub fn sync_routable_arena(
+        &self,
+        arena: &mut crate::pipeline::arena::StateArena,
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+    ) -> Vec<crate::pipeline::types::PoolMeta> {
+        let state = self.discovery_state.read();
+        arena.sync_from_discovery(
+            &self.cache,
+            state.discovered.as_ref(),
+            &state.address_index,
+            decimal_hints,
+        )
     }
 
     pub async fn refresh_pool_states(&self, max_pools: usize) -> anyhow::Result<usize> {
@@ -708,6 +727,20 @@ impl StateRefreshService {
             pipeline.lf_hot_batch.min(pipeline.lf_bootstrap_batch)
         }
     }
+}
+
+fn rebuild_discovery_indexes(
+    pools: &[DiscoveredPool],
+) -> (FxHashMap<String, usize>, FxHashMap<Address, usize>) {
+    let mut pool_key_index =
+        FxHashMap::with_capacity_and_hasher(pools.len(), rustc_hash::FxBuildHasher);
+    let mut address_index =
+        FxHashMap::with_capacity_and_hasher(pools.len(), rustc_hash::FxBuildHasher);
+    for (idx, pool) in pools.iter().enumerate() {
+        pool_key_index.insert(pool.pool_key.clone(), idx);
+        address_index.insert(pool.address, idx);
+    }
+    (pool_key_index, address_index)
 }
 
 fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {

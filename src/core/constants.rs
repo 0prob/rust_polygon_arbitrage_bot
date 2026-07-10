@@ -37,7 +37,7 @@ pub const TICK_LENS_POLYGON: Address = address!("0xbfd8137f7d1516D3ea5cA83523914
 pub const WMATIC: Address = address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270");
 
 /// Oracle-priced hub tokens on Polygon.
-pub const POLYGON_HUB_TOKENS: [Address; 14] = [
+pub const POLYGON_HUB_TOKENS: [Address; 20] = [
     WMATIC,
     address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f"),
     address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
@@ -52,6 +52,12 @@ pub const POLYGON_HUB_TOKENS: [Address; 14] = [
     address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
     address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
     address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
+    address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
+    address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
+    address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
+    address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
+    address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
+    address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
 ];
 
 #[inline]

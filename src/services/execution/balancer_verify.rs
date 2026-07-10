@@ -8,7 +8,9 @@ use tokio::time::timeout;
 
 use crate::abis::IBalancerVault;
 use crate::core::constants::BALANCER_VAULT;
-use crate::core::types::FlashLoanSource;
+use crate::core::math::balancer::exceeds_balancer_max_in_ratio;
+use crate::core::types::{FlashLoanSource, PoolState};
+use crate::pipeline::arena::StateArena;
 use crate::services::execution::calldata::CalldataHop;
 use crate::services::execution::calldata::encoders::balancer::build_balancer_batch_swap_request;
 use crate::services::execution::profit::on_chain_min_profit_for_route;
@@ -31,6 +33,21 @@ pub enum BatchQueryOutcome {
     Timeout,
     BuildFailed,
     DecodeFailed,
+}
+
+/// True when every hop amount stays within the vault `MAX_IN_RATIO` (30%) limit.
+#[must_use]
+pub fn balancer_batch_within_max_in_ratio(arena: &StateArena, hops: &[CalldataHop]) -> bool {
+    hops.iter().all(|hop| {
+        let Some(PoolState::Balancer(state)) = arena.pool_state(hop.edge.pool_index) else {
+            return false;
+        };
+        let in_idx = hop.edge.token_in_idx as usize;
+        state
+            .balances
+            .get(in_idx)
+            .is_some_and(|bal| !exceeds_balancer_max_in_ratio(hop.amount_in, *bal))
+    })
 }
 
 /// On-chain profit for an `executeArbDirect` batch route via vault `queryBatchSwap`.
@@ -102,5 +119,19 @@ mod tests {
         assert_eq!(positive_delta(I256::ZERO), None);
         assert_eq!(positive_delta(I256::MINUS_ONE), None);
         assert_eq!(positive_delta(I256::ONE), Some(U256::from(1u8)));
+    }
+
+    #[test]
+    fn exceeds_max_in_ratio_constant_matches_vault() {
+        use crate::core::math::balancer::exceeds_balancer_max_in_ratio;
+        let bal = U256::from(1_000_000u64);
+        assert!(!exceeds_balancer_max_in_ratio(
+            U256::from(300_000u64),
+            bal
+        ));
+        assert!(exceeds_balancer_max_in_ratio(
+            U256::from(300_001u64),
+            bal
+        ));
     }
 }

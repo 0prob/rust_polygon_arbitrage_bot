@@ -425,6 +425,49 @@ fn route_uses_balancer_vault_swap(cycle: &FoundCycle) -> bool {
         .any(|e| e.protocol == ProtocolType::BalancerV2)
 }
 
+#[must_use]
+pub fn cycle_has_dodo_pool(arena: &StateArena, cycle: &FoundCycle) -> bool {
+    cycle.edges.iter().any(|edge| {
+        matches!(
+            arena.pool_state(edge.pool_index),
+            Some(PoolState::Dodo(_))
+        )
+    })
+}
+
+/// Map eval-time flash plans onto sources the executor can actually dispatch.
+/// Mixed routes cannot use Balancer flash; when Aave is unavailable, fall back to Dodo.
+#[must_use]
+pub fn align_flash_source_for_dispatch(
+    source: FlashLoanSource,
+    liquidity: &TokenFlashLiquidity,
+    balancer_only: bool,
+    has_dodo: bool,
+) -> Option<FlashLoanSource> {
+    let aave_viable = liquidity.aave_listed && !liquidity.aave.is_zero();
+    if !balancer_only
+        && matches!(
+            source,
+            FlashLoanSource::Balancer | FlashLoanSource::Direct
+        )
+    {
+        if aave_viable {
+            return Some(FlashLoanSource::AaveV3);
+        }
+        if has_dodo {
+            return Some(FlashLoanSource::Dodo);
+        }
+        return None;
+    }
+    if source == FlashLoanSource::AaveV3 && !aave_viable {
+        if has_dodo {
+            return Some(FlashLoanSource::Dodo);
+        }
+        return None;
+    }
+    Some(source)
+}
+
 /// True when every hop is a Balancer V2 vault swap (eligible for `executeArbDirect` + `batchSwap`).
 #[must_use]
 pub fn route_is_balancer_only(cycle: &FoundCycle) -> bool {
@@ -738,6 +781,7 @@ pub fn resolve_flash_source_for_cycle(
     let forbid = route_uses_balancer_vault_swap(cycle);
     let balancer_only = route_is_balancer_only(cycle);
     let plan = plan_flash_loan(policy, amount_in, liquidity, forbid, balancer_only);
+    let has_dodo = cycle_has_dodo_pool(arena, cycle);
     match plan.action {
         FlashPlanAction::Reject => {
             // ponytail: no optimistic Aave/Balancer fallback when cache is cold — caused
@@ -757,7 +801,7 @@ pub fn resolve_flash_source_for_cycle(
                 None
             }
         }
-        _ => Some(plan.source),
+        _ => align_flash_source_for_dispatch(plan.source, &liquidity, balancer_only, has_dodo),
     }
 }
 
@@ -1172,6 +1216,25 @@ pub fn collect_flash_tokens_for_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn align_dispatch_rejects_aave_when_unlisted_on_mixed_route() {
+        let liquidity = TokenFlashLiquidity {
+            balancer: U256::from(10_000u64),
+            aave: U256::ZERO,
+            aave_listed: false,
+            dodo: U256::MAX,
+        };
+        assert_eq!(
+            align_flash_source_for_dispatch(
+                FlashLoanSource::Balancer,
+                &liquidity,
+                false,
+                false,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn mixed_balancer_route_caps_to_known_aave_liquidity() {

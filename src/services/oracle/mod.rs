@@ -6,6 +6,7 @@ pub use rates::{
 };
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy::network::Ethereum;
 use alloy::primitives::Address;
@@ -154,7 +155,7 @@ where
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens: Vec<TokenIndex> = tokens.into_iter().collect();
-    let addrs = token_addresses(arena, &tokens);
+    let addrs = prefetch_addrs_for_rates(arena, &tokens);
     oracle.prefetch_token_usd(&addrs, provider).await;
     let matic_usd = match oracle.cached_matic_usd() {
         Some(usd) => usd,
@@ -174,7 +175,7 @@ where
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens: Vec<TokenIndex> = tokens.into_iter().collect();
-    let addrs = token_addresses(arena, &tokens);
+    let addrs = prefetch_addrs_for_rates(arena, &tokens);
     oracle.prefetch_token_usd_offline(&addrs).await;
     let matic_usd = oracle.get_matic_usd_offline().await;
     build_token_to_matic_rates(oracle, arena, &tokens, matic_usd)
@@ -185,6 +186,16 @@ fn token_addresses(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Address> {
         .iter()
         .filter_map(|idx| arena.token_address(*idx))
         .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+/// Cycle tokens plus static hub feeds — one prefetch warms profit conversion
+/// for spoke tokens even when they are not on the current cycle list.
+fn prefetch_addrs_for_rates(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Address> {
+    let mut addrs = token_addresses(arena, tokens);
+    addrs.extend(POLYGON_HUB_TOKENS);
     addrs.sort_unstable();
     addrs.dedup();
     addrs
@@ -239,6 +250,9 @@ fn build_token_to_matic_rates(
             }
         }
     }
+    if !out.is_empty() {
+        *oracle.rates_updated_at.write() = Some(Instant::now());
+    }
     out
 }
 
@@ -273,6 +287,18 @@ mod tests {
             changed.get(&TokenIndex(1)).copied(),
             Some(U256::from(2_000u64))
         );
+    }
+
+    #[test]
+    fn prefetch_addrs_for_rates_includes_hubs() {
+        use alloy::primitives::address;
+        let mut arena = StateArena::default();
+        let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
+        let usdc_idx = arena.register_token(usdc);
+        let addrs = prefetch_addrs_for_rates(&arena, &[usdc_idx]);
+        assert!(addrs.contains(&usdc));
+        assert!(addrs.contains(&POLYGON_HUB_TOKENS[0]));
+        assert!(addrs.len() >= POLYGON_HUB_TOKENS.len());
     }
 
     #[test]

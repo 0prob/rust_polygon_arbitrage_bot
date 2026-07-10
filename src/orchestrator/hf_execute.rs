@@ -15,11 +15,14 @@ use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
-use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
+use crate::services::execution::flash_liquidity::{
+    collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
+};
 
 use crate::core::types::FlashLoanSource;
 use crate::services::execution::balancer_verify::{
-    BatchQueryOutcome, batch_profit_covers_min, query_balancer_batch_profit,
+    BatchQueryOutcome, balancer_batch_within_max_in_ratio, batch_profit_covers_min,
+    query_balancer_batch_profit,
 };
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
@@ -29,6 +32,14 @@ use crate::services::execution::{
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
 
 const DISPATCH_CONCURRENCY: usize = 3;
+
+pub(crate) struct DispatchInputs<'a> {
+    pub(crate) pool_metas: &'a [crate::pipeline::types::PoolMeta],
+    pub(crate) token_to_matic_rates: &'a rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+    pub(crate) token_decimals: &'a rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
+    pub(crate) state_generation: u64,
+    pub(crate) skip_dispatch_refresh: bool,
+}
 
 #[derive(Default)]
 struct SkipCounts {
@@ -66,15 +77,11 @@ impl SkipCounts {
     }
 }
 
-pub async fn dispatch_profitable_candidates(
+pub(crate) async fn dispatch_profitable_candidates(
     ctx: &HfContext,
     arena: &mut StateArena,
     profitable: Vec<HfEvalResult>,
-    pool_metas: &[crate::pipeline::types::PoolMeta],
-    token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
-    token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
-    state_generation: u64,
-    skip_dispatch_refresh: bool,
+    inputs: DispatchInputs<'_>,
 ) {
     if profitable.is_empty() || *ctx.shutdown.borrow() {
         return;
@@ -111,7 +118,8 @@ pub async fn dispatch_profitable_candidates(
     let pool_metas_by_pool: FxHashMap<
         crate::core::types::PoolIndex,
         &crate::pipeline::types::PoolMeta,
-    > = pool_metas
+    > = inputs
+        .pool_metas
         .iter()
         .map(|meta| (meta.pool_index, meta))
         .collect();
@@ -127,12 +135,12 @@ pub async fn dispatch_profitable_candidates(
         operator,
         executor,
         min_profit_matic,
-        pool_metas,
+        inputs.pool_metas,
         &pool_metas_by_pool,
-        token_to_matic_rates,
-        token_decimals,
-        state_generation,
-        skip_dispatch_refresh,
+        inputs.token_to_matic_rates,
+        inputs.token_decimals,
+        inputs.state_generation,
+        inputs.skip_dispatch_refresh,
     )
     .await;
 
@@ -407,6 +415,12 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             skipped.record("prepare");
             return;
         };
+        if !balancer_batch_within_max_in_ratio(arena, &hops) {
+            skipped.record("prepare");
+            ctx.execution.quarantine_batch_query_failure(fp);
+            crate::debug!("prepare skip: fp={fp} queryBatchSwap would exceed MAX_IN_RATIO");
+            return;
+        }
         // ponytail: dry-run must queryBatchSwap too — local Balancer sim overstates profit
         // and executeArbDirect reverts with opaque ExternalCallFailed without this gate.
         match query_balancer_batch_profit(sim_provider, executor, &hops, start_token_addr).await {
@@ -493,6 +507,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         state_generation: dispatch_state_generation,
         route_fingerprint: fp,
+        flash_liquidity: liquidity,
+        has_dodo_pool: cycle_has_dodo_pool(arena, &prepared.evaluated.cycle),
     };
 
     let candidate =

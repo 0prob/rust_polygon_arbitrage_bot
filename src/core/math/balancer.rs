@@ -9,7 +9,15 @@ use super::fixed_point::{ONE, complement, mul_down, pow_down};
 
 type BalXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
 
-const MAX_IN_RATIO: U256 = U256::from_limbs([3_000_000_000_000_000_000, 0, 0, 0]);
+// Balancer WeightedMath: 30% of token-in balance (0.3e18 fixed-point).
+const MAX_IN_RATIO: U256 = U256::from_limbs([300_000_000_000_000_000, 0, 0, 0]);
+
+/// Vault rejects swaps above 30% of token-in balance (`BAL#304` / `MAX_IN_RATIO`).
+#[inline]
+#[must_use]
+pub fn exceeds_balancer_max_in_ratio(amount_in: U256, balance_in: U256) -> bool {
+    balance_in.is_zero() || amount_in > (balance_in * MAX_IN_RATIO) / ONE
+}
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 64;
 
@@ -51,7 +59,7 @@ pub fn get_balancer_weighted_amount_out(
     if bal_in.is_zero() || bal_out.is_zero() || w_in.is_zero() || w_out.is_zero() {
         return U256::ZERO;
     }
-    if fee >= ONE || amount_in > (bal_in * MAX_IN_RATIO) / ONE {
+    if fee >= ONE || exceeds_balancer_max_in_ratio(amount_in, bal_in) {
         return U256::ZERO;
     }
 
@@ -218,6 +226,9 @@ pub fn get_balancer_stable_amount_out(
     if fee >= ONE || scaling[in_idx].is_zero() || scaling[out_idx].is_zero() {
         return U256::ZERO;
     }
+    if exceeds_balancer_max_in_ratio(amount_in, state.balances[in_idx]) {
+        return U256::ZERO;
+    }
 
     let amount_in_after_fee = (amount_in * complement(fee)) / ONE;
     let scaled_amount_in = (amount_in_after_fee * scaling[in_idx]) / ONE;
@@ -294,6 +305,9 @@ pub fn get_balancer_linear_amount_out(
         || state.scaling_factors[out_idx].is_zero()
         || linear.wrapped_rate.is_zero()
     {
+        return U256::ZERO;
+    }
+    if exceeds_balancer_max_in_ratio(amount_in, state.balances[in_idx]) {
         return U256::ZERO;
     }
     let scaled_in = amount_in * state.scaling_factors[in_idx] / ONE;

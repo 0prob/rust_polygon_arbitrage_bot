@@ -14,7 +14,15 @@ use crate::core::constants::MULTICALL3;
 pub const MULTICALL_CHUNK: usize = 200;
 /// Max concurrent chunk RPCs for batched multicalls. Parallelizes IO for large
 /// refreshes (e.g. 1000+ pools) while a semaphore prevents thundering herd.
-const MAX_CONCURRENT_CHUNKS: usize = 8;
+pub const MAX_CONCURRENT_CHUNKS: usize = 8;
+
+/// Plan-batch call budget sized so `execute_multicall_at_chunked` can fan out
+/// across [`MAX_CONCURRENT_CHUNKS`] RPC chunks instead of serializing one chunk.
+#[must_use]
+pub fn plan_batch_call_budget(max_chunk: usize) -> usize {
+    let max_chunk = max_chunk.max(1);
+    max_chunk.saturating_mul(MAX_CONCURRENT_CHUNKS)
+}
 
 #[derive(Debug, Clone)]
 pub struct MulticallItem {
@@ -185,7 +193,7 @@ pub fn encode_call<C: SolCall>(call: &C) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{MULTICALL_CHUNK, is_retryable_rpc_error};
+    use super::{MULTICALL_CHUNK, is_retryable_rpc_error, plan_batch_call_budget};
 
     #[test]
     fn retries_transient_rpc_responses_only() {
@@ -206,6 +214,12 @@ mod tests {
     #[test]
     fn default_chunk_matches_config_default() {
         assert_eq!(MULTICALL_CHUNK, 200);
+    }
+
+    #[test]
+    fn plan_batch_budget_enables_parallel_chunks() {
+        assert_eq!(plan_batch_call_budget(200), 1_600);
+        assert_eq!(plan_batch_call_budget(0), 8);
     }
 
     #[test]

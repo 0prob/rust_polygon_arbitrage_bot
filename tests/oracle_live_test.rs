@@ -56,7 +56,7 @@ async fn pyth_usdc_prefetch_enables_integer_matic_rate() {
 #[ignore = "live network — run: cargo test --test oracle_live_test -- --ignored"]
 async fn pyth_extended_polygon_tokens_prefetch_enable_integer_matic_rates() {
     let oracle = hermes_oracle();
-    let feeds: [(Address, &str, &str); 7] = [
+    let feeds: [(Address, &str, &str); 13] = [
         (
             address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
             "8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
@@ -92,6 +92,36 @@ async fn pyth_extended_polygon_tokens_prefetch_enable_integer_matic_rates() {
             "1dfffdcbc958d732750f53ff7f06d24bb01364b3f62abea511a390c74b8d16a5",
             "Crypto.MANA/USD",
         ),
+        (
+            address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
+            "78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501",
+            "Crypto.UNI/USD",
+        ),
+        (
+            address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
+            "4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7",
+            "Crypto.GRT/USD",
+        ),
+        (
+            address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
+            "4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478",
+            "Crypto.COMP/USD",
+        ),
+        (
+            address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
+            "63f341689d98a12ef60a5cff1d7f85c70a9e17bf1575f0e7c0b2512d48b1c8b3",
+            "Crypto.1INCH/USD",
+        ),
+        (
+            address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
+            "c63e2a7f37a04e5e614c07238bedb25dcc38927fba8fe890597a593c0b2fa4ad",
+            "Crypto.LDO/USD",
+        ),
+        (
+            address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
+            "9a4df90b25497f66b1afb012467e316e801ca3d839456db028892fe8c70c8016",
+            "Crypto.PENDLE/USD",
+        ),
     ];
     for (_, feed_id, expected_symbol) in feeds {
         assert_eq!(
@@ -110,7 +140,7 @@ async fn pyth_extended_polygon_tokens_prefetch_enable_integer_matic_rates() {
         );
         let rate = oracle
             .token_matic_rate_per_unit_integer(&token)
-            .unwrap_or_else(|| panic!("missing token/MATIC integer rate for {token}"));
+            .expect("missing token/MATIC integer rate");
         assert!(rate >= MIN_TOKEN_TO_MATIC_RATE, "dust rate for {token}");
     }
 }

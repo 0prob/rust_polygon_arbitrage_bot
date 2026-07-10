@@ -502,11 +502,7 @@ pub async fn run_hf_tick(
     let elapsed_ms = now_ms().saturating_sub(start);
 
     if cycles_considered > 0 {
-        if profitable_count > 0 {
-            crate::info!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
-            );
-        } else if should_log_hf_summary() {
+        if profitable_count > 0 || should_log_hf_summary() {
             crate::info!(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
             );
@@ -540,11 +536,13 @@ pub async fn run_hf_tick(
             &ctx,
             &mut eval_arena,
             profitable,
-            pool_metas_for_dispatch.as_ref(),
-            dispatch_token_to_matic_rates.as_ref(),
-            dispatch_token_decimals.as_ref(),
-            evaluation_state_generation,
-            prefetch_ok,
+            crate::orchestrator::hf_execute::DispatchInputs {
+                pool_metas: pool_metas_for_dispatch.as_ref(),
+                token_to_matic_rates: dispatch_token_to_matic_rates.as_ref(),
+                token_decimals: dispatch_token_decimals.as_ref(),
+                state_generation: evaluation_state_generation,
+                skip_dispatch_refresh: prefetch_ok,
+            },
         )
         .await;
     }

@@ -12,7 +12,9 @@ use crate::abis::{IBalancerPool, IWoofiPool, IWooracle};
 use crate::core::types::{PoolState, ProtocolType, WoofiBaseTokenState, WoofiPoolState};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::pipeline::abi_cache::{BALANCER_POOL_ID, WOOFI_QUOTE_TOKEN, WOOFI_WOORACLE};
-use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall_at_chunked};
+use crate::pipeline::multicall::{
+    MulticallItem, encode_call, execute_multicall_at_chunked, plan_batch_call_budget,
+};
 use crate::services::discovery::DiscoveredPool;
 use crate::services::state_cache::StateCache;
 
@@ -281,7 +283,7 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: &P,
     woofi_pools: &[&DiscoveredPool],
     block_number: Option<u64>,
-    max_chunk: usize,
+    chunk_size: usize,
     cache: &StateCache,
     meta_cache: &PoolMetaCache,
 ) -> usize {
@@ -290,7 +292,8 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
     let mut updated = 0usize;
     for (addr, state) in
-        fetch_woofi_pools_batched(provider, woofi_pools, block_number, max_chunk, meta_cache).await
+        fetch_woofi_pools_batched(provider, woofi_pools, block_number, chunk_size, meta_cache)
+            .await
     {
         match state {
             Some(s) => {
@@ -310,7 +313,7 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     batches: &[Vec<PoolFetchPlan>],
     cache: &StateCache,
     block_number: Option<u64>,
-    max_calls: usize,
+    chunk_size: usize,
     batch_pace_ms: u64,
 ) -> usize {
     if batches.is_empty() {
@@ -320,7 +323,7 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
     let mut updated = 0usize;
     for (i, batch) in batches.iter().enumerate() {
-        updated += execute_plan_batch(provider, batch, cache, block_number, max_calls).await;
+        updated += execute_plan_batch(provider, batch, cache, block_number, chunk_size).await;
         if batch_pace_ms > 0 && i + 1 < batches.len() {
             tokio::time::sleep(pacing).await;
         }
@@ -337,7 +340,8 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
 ) -> usize {
-    let max_calls = max_multicall_calls.max(1);
+    let chunk_size = max_multicall_calls.max(1);
+    let plan_batch_calls = plan_batch_call_budget(chunk_size);
     let needs_balancer_hydrate = pools
         .iter()
         .any(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified);
@@ -374,7 +378,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
 
         for plan in plans {
             let n = plan.calls.len();
-            if batch_calls + n > max_calls && !batch.is_empty() {
+            if batch_calls + n > plan_batch_calls && !batch.is_empty() {
                 batches.push(std::mem::take(&mut batch));
                 batch_calls = 0;
             }
@@ -392,7 +396,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
             &provider_woofi,
             &woofi_pools,
             block_number,
-            max_calls,
+            chunk_size,
             cache.as_ref(),
             meta_cache,
         ),
@@ -401,7 +405,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
             &batches,
             cache.as_ref(),
             block_number,
-            max_calls,
+            chunk_size,
             batch_pace_ms,
         ),
     );
@@ -414,7 +418,7 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
     plans: &[PoolFetchPlan],
     cache: &StateCache,
     block_number: Option<u64>,
-    max_chunk: usize,
+    chunk_size: usize,
 ) -> usize {
     let total_calls: usize = plans.iter().map(|p| p.calls.len()).sum();
     let mut items = Vec::with_capacity(total_calls);
@@ -426,7 +430,7 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
 
     let results =
-        match execute_multicall_at_chunked(provider.clone(), &items, block_number, max_chunk).await
+        match execute_multicall_at_chunked(provider.clone(), &items, block_number, chunk_size).await
         {
             Ok(r) => r,
             Err(e) => {

@@ -8,7 +8,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::AppConfig;
-use crate::core::constants::HOP_CAP;
+use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS};
 use crate::core::types::{FoundCycle, PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
@@ -282,8 +282,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         ctx.cache.len()
     );
     let decimals = ctx.refresh.token_decimals_map();
-    let pool_metas =
-        Arc::new(arena.sync_from_discovery(&ctx.cache, &pools, Some(decimals.as_ref())));
+    let pool_metas = Arc::new(ctx.refresh.sync_routable_arena(
+        &mut arena,
+        Some(decimals.as_ref()),
+    ));
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 
@@ -334,6 +336,13 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             if cycle_tokens_set.insert(e.token_out) {
                 cycle_tokens.push(e.token_out);
             }
+        }
+    }
+    for hub in POLYGON_HUB_TOKENS {
+        if let Some(&idx) = arena.address_to_token().get(&hub)
+            && cycle_tokens_set.insert(idx)
+        {
+            cycle_tokens.push(idx);
         }
     }
 

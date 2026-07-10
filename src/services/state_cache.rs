@@ -125,6 +125,19 @@ impl StateCache {
         self.lookup_pool_state(address)
     }
 
+    /// Tradable, unexpired pool states keyed by address. One read-lock pass over
+    /// the cache (~tens of thousands) instead of per-pool lookups over discovery.
+    pub fn tradable_snapshot(&self) -> Vec<(Address, Arc<PoolState>)> {
+        let guard = self.inner.read();
+        guard
+            .iter()
+            .filter_map(|(address, entry)| {
+                (entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable())
+                    .then(|| (*address, Arc::clone(&entry.state)))
+            })
+            .collect()
+    }
+
     /// Read a coherent set of unexpired pool states and the generation that
     /// produced them. Holding one read lock prevents WSS/RPC writers from
     /// mixing cache generations inside a single HF evaluation arena.

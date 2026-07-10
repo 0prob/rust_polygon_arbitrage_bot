@@ -201,36 +201,40 @@ impl StateArena {
         generation
     }
 
-    /// Register tradable pools only — skips unfetched or non-tradable cache entries
-    /// so routing work stays proportional to graph-eligible pools.
+    /// Register tradable pools only — walks the cache tradable set (~19k) instead
+    /// of scanning the full discovery list (~263k) and taking one read lock per pool.
     pub fn sync_from_discovery(
         &mut self,
         cache: &StateCache,
         pools: &[DiscoveredPool],
+        address_index: &FxHashMap<Address, usize>,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
     ) -> Vec<crate::pipeline::types::PoolMeta> {
+        let mut tradable = cache.tradable_snapshot();
+        tradable.sort_unstable_by_key(|(address, _)| address_index.get(address).copied());
+
         let inner = Arc::make_mut(&mut self.inner);
-        let expected_tokens = pools
+        let expected_tokens = tradable
             .iter()
-            .map(|pool| pool.tokens.len())
+            .filter_map(|(address, _)| address_index.get(address))
+            .map(|&idx| pools.get(idx).map_or(2, |pool| pool.tokens.len()))
             .sum::<usize>()
             .max(1);
         inner.tokens.reserve(expected_tokens);
         inner.token_decimals.reserve(expected_tokens);
-        inner.pools.reserve(pools.len());
-        inner.pool_addresses.reserve(pools.len());
-        inner.address_to_pool.reserve(pools.len());
+        inner.pools.reserve(tradable.len());
+        inner.pool_addresses.reserve(tradable.len());
+        inner.address_to_pool.reserve(tradable.len());
         inner.address_to_token.reserve(expected_tokens);
 
-        let mut metas = Vec::with_capacity(pools.len().min(cache.len()).max(1));
-        for pool in pools {
-            let Some(state) = cache.get_arc(&pool.address) else {
+        let mut metas = Vec::with_capacity(tradable.len().max(1));
+        for (address, state) in tradable {
+            let Some(&idx) = address_index.get(&address) else {
                 continue;
             };
-            if !state.is_tradable() {
+            let Some(pool) = pools.get(idx) else {
                 continue;
-            }
-            let pool_index = self.register_pool(pool.address, Arc::clone(&state));
+            };
             // ponytail: borrow token addresses instead of cloning Vec — most
             // pools use the discovery order, and state-hydrated tokens (Balancer,
             // Woofi) can be borrowed directly. Dodo canonicalization is the only
@@ -258,6 +262,7 @@ impl StateArena {
                 }
                 _ => token_addrs = &pool.tokens,
             }
+            let pool_index = self.register_pool(pool.address, Arc::clone(&state));
             let mut token_indices = Vec::with_capacity(token_addrs.len());
             for &addr in token_addrs {
                 token_indices.push(self.register_token_with_hints(addr, decimal_hints));
@@ -395,8 +400,13 @@ mod tests {
             created_block: 1,
         }];
 
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect();
         let mut arena = StateArena::default();
-        let metas = arena.sync_from_discovery(&cache, &discovered, None);
+        let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
         assert_eq!(metas.len(), 1);
         let addresses: Vec<_> = metas[0]
             .tokens
@@ -502,8 +512,13 @@ mod tests {
             created_block: 1,
         }];
         let hints: FxHashMap<_, _> = [(usdc, 6u8), (weth, 18u8)].into_iter().collect();
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect();
         let mut arena = StateArena::default();
-        let metas = arena.sync_from_discovery(&cache, &discovered, Some(&hints));
+        let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, Some(&hints));
         assert_eq!(metas.len(), 1);
         let usdc_idx = metas[0].tokens[0];
         let weth_idx = metas[0].tokens[1];

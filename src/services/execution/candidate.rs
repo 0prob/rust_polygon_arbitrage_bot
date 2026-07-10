@@ -11,6 +11,9 @@ use crate::services::execution::calldata::{
     hops_are_balancer_only,
 };
 use crate::services::execution::gas::buffer_gas_limit;
+use crate::services::execution::flash_liquidity::{
+    TokenFlashLiquidity, align_flash_source_for_dispatch,
+};
 use crate::services::execution::profit::AssessProfitInput;
 use crate::services::execution::profit::on_chain_min_profit_for_route;
 
@@ -52,6 +55,8 @@ pub struct CandidateBuildConfig {
     pub safety_multiplier_bps: u64,
     pub state_generation: u64,
     pub route_fingerprint: u64,
+    pub flash_liquidity: TokenFlashLiquidity,
+    pub has_dodo_pool: bool,
 }
 
 fn dodo_pool_address_for_cycle(
@@ -98,27 +103,30 @@ fn resolve_executor_entrypoint(
 fn resolve_dispatch_flash_source(
     flash_source: FlashLoanSource,
     hops: &[crate::services::execution::calldata::CalldataHop],
-) -> FlashLoanSource {
-    if (!hops_are_balancer_only(hops)
-        && matches!(
-            flash_source,
-            FlashLoanSource::Balancer | FlashLoanSource::Direct
-        ))
-        || (flash_source == FlashLoanSource::Direct && !balancer_batch_direct_eligible(hops))
+    liquidity: &TokenFlashLiquidity,
+    has_dodo_pool: bool,
+) -> Option<FlashLoanSource> {
+    let balancer_only = hops_are_balancer_only(hops);
+    let source = if flash_source == FlashLoanSource::Direct && !balancer_batch_direct_eligible(hops)
     {
         FlashLoanSource::AaveV3
     } else {
         flash_source
-    }
+    };
+    align_flash_source_for_dispatch(source, liquidity, balancer_only, has_dodo_pool)
 }
 
 fn resolve_dispatch(
     flash_source: FlashLoanSource,
     hops: &[crate::services::execution::calldata::CalldataHop],
-) -> (FlashLoanSource, ExecutorEntrypoint) {
-    let dispatch_flash_source = resolve_dispatch_flash_source(flash_source, hops);
+    liquidity: &TokenFlashLiquidity,
+    has_dodo_pool: bool,
+) -> anyhow::Result<(FlashLoanSource, ExecutorEntrypoint)> {
+    let dispatch_flash_source =
+        resolve_dispatch_flash_source(flash_source, hops, liquidity, has_dodo_pool)
+            .ok_or_else(|| anyhow::anyhow!("no viable flash source for route"))?;
     let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, hops);
-    (dispatch_flash_source, entrypoint)
+    Ok((dispatch_flash_source, entrypoint))
 }
 
 pub fn build_execution_candidate(
@@ -152,7 +160,8 @@ pub fn build_execution_candidate(
             }),
     );
 
-    let (dispatch_flash_source, entrypoint) = resolve_dispatch(config.flash_loan_source, &hops);
+    let (dispatch_flash_source, entrypoint) =
+        resolve_dispatch(config.flash_loan_source, &hops, &config.flash_liquidity, config.has_dodo_pool)?;
     let encode_cfg = RouteEncodeConfig {
         slippage_bps: config.slippage_bps,
         deadline,
@@ -293,12 +302,21 @@ mod tests {
         }
     }
 
+    fn aave_liquidity() -> TokenFlashLiquidity {
+        TokenFlashLiquidity {
+            balancer: U256::ZERO,
+            aave: U256::from(1_000u64),
+            aave_listed: true,
+            dodo: U256::ZERO,
+        }
+    }
+
     #[test]
     fn mixed_balancer_hops_force_aave_dispatch() {
         let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
         assert_eq!(
-            resolve_dispatch_flash_source(FlashLoanSource::Balancer, &hops),
-            FlashLoanSource::AaveV3
+            resolve_dispatch_flash_source(FlashLoanSource::Balancer, &hops, &aave_liquidity(), false),
+            Some(FlashLoanSource::AaveV3)
         );
         assert_eq!(
             resolve_executor_entrypoint(FlashLoanSource::Balancer, &hops),
@@ -307,11 +325,21 @@ mod tests {
     }
 
     #[test]
+    fn mixed_balancer_hops_skip_when_aave_unavailable() {
+        let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
+        let liquidity = TokenFlashLiquidity::default();
+        assert_eq!(
+            resolve_dispatch_flash_source(FlashLoanSource::Balancer, &hops, &liquidity, false),
+            None
+        );
+    }
+
+    #[test]
     fn pure_balancer_hops_keep_direct_or_balancer_flash() {
         let hops = vec![hop(ProtocolType::BalancerV2)];
         assert_eq!(
-            resolve_dispatch_flash_source(FlashLoanSource::Direct, &hops),
-            FlashLoanSource::Direct
+            resolve_dispatch_flash_source(FlashLoanSource::Direct, &hops, &aave_liquidity(), false),
+            Some(FlashLoanSource::Direct)
         );
         assert_eq!(
             resolve_executor_entrypoint(FlashLoanSource::Direct, &hops),
@@ -326,7 +354,8 @@ mod tests {
     #[test]
     fn candidate_stores_dispatch_flash_source_not_config_source() {
         let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
-        let (dispatch, _) = resolve_dispatch(FlashLoanSource::Balancer, &hops);
+        let (dispatch, _) =
+            resolve_dispatch(FlashLoanSource::Balancer, &hops, &aave_liquidity(), false).unwrap();
         assert_eq!(dispatch, FlashLoanSource::AaveV3);
         assert_ne!(dispatch, FlashLoanSource::Balancer);
     }
@@ -341,8 +370,8 @@ mod tests {
             hop(ProtocolType::BalancerV2),
         ];
         assert_eq!(
-            resolve_dispatch_flash_source(FlashLoanSource::Direct, &hops),
-            FlashLoanSource::AaveV3
+            resolve_dispatch_flash_source(FlashLoanSource::Direct, &hops, &aave_liquidity(), false),
+            Some(FlashLoanSource::AaveV3)
         );
         assert_eq!(
             resolve_executor_entrypoint(FlashLoanSource::Direct, &hops),
