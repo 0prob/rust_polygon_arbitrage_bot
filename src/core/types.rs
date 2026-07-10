@@ -393,7 +393,7 @@ pub struct RouteSimulationResult {
 pub enum FlashLoanSource {
     /// `executeArb` — Balancer V2 vault `flashLoan`.
     Balancer,
-    /// `executeArbWithAave` — Aave V3 `flashLoan`.
+    /// `executeArbWithAave` — Aave V3 `flashLoanSimple`.
     AaveV3,
     /// `executeArbWithDodo` — DODO V2 pool `flashLoan`.
     Dodo,

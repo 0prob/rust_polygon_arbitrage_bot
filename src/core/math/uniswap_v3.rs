@@ -222,11 +222,37 @@ pub fn simulate_v3_swap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::V3PoolState;
+    use std::sync::Arc;
 
     #[test]
     fn test_resolve_v3_fee_pips_default() {
         let fee = resolve_v3_fee_pips(U256::ZERO, None);
         assert_eq!(fee, U256::from(DEFAULT_V3_FEE_PIPS));
+    }
+
+    #[test]
+    fn edge_fee_bps_override_converts_to_pips() {
+        let fee = resolve_v3_fee_pips(U256::from(5_000u32), Some(25));
+        assert_eq!(fee, U256::from(2_500u32));
+    }
+
+    #[test]
+    fn tickless_pool_is_marked_shallow() {
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(Vec::new()),
+        };
+        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30));
+        assert!(r.shallow);
+        assert!(r.amount_out > U256::ZERO);
     }
 }
 

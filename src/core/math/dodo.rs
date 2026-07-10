@@ -269,6 +269,33 @@ mod tests {
 
         assert_eq!(out, U256::from(100u64) * ONE);
     }
+
+    #[test]
+    fn dodo_amount_out_applies_lp_and_mt_fee_components() {
+        let gross_state = DodoPoolState {
+            base_reserve: U256::from(1_000u64) * ONE,
+            quote_reserve: U256::from(1_000u64) * ONE,
+            base_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            base_target: U256::from(1_000u64) * ONE,
+            quote_target: U256::from(1_000u64) * ONE,
+            r_state: DodoRState::One,
+            i: ONE,
+            k: U256::ZERO,
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        };
+        let fee_state = DodoPoolState {
+            lp_fee_rate: ONE / U256::from(10u8),
+            mt_fee_rate: ONE / U256::from(20u8),
+            ..gross_state
+        };
+        let gross = get_dodo_gross_amount_out(&gross_state, U256::from(100u64) * ONE, true);
+        let net = get_dodo_amount_out(&fee_state, U256::from(100u64) * ONE, true);
+        assert!(gross > net);
+        let expected = gross - (gross / U256::from(10u8)) - (gross / U256::from(20u8));
+        assert_eq!(net, expected);
+    }
 }
 
 #[cfg(test)]

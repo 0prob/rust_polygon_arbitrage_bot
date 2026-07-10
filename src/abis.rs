@@ -100,6 +100,17 @@ sol! {
         bytes userData;
     }
 
+    /// Balancer V2 IFlashLoanRecipient — abis/balancer-v2/IFlashLoanRecipient.sol
+    #[sol(rpc)]
+    interface IFlashLoanRecipient {
+        function receiveFlashLoan(
+            address[] memory tokens,
+            uint256[] memory amounts,
+            uint256[] memory feeAmounts,
+            bytes memory userData
+        ) external;
+    }
+
     #[sol(rpc)]
     interface IBalancerVault {
         function swap(
@@ -124,6 +135,14 @@ sol! {
             address[] memory assets,
             BalancerFundManagement memory funds
         ) external returns (int256[] memory assetDeltas);
+
+        /// Vault flash loan — `executeArb` calls this from ArbExecutor.huff (selector 0x5c38449e).
+        function flashLoan(
+            address recipient,
+            address[] memory tokens,
+            uint256[] memory amounts,
+            bytes memory userData
+        ) external;
     }
 
     #[sol(rpc)]
@@ -301,6 +320,19 @@ sol! {
         function balanceOf(address account) external view returns (uint256);
     }
 
+    /// Aave V3 IFlashLoanSimpleReceiver — abis/aave-v3/IFlashLoanSimpleReceiver.sol
+    #[sol(rpc)]
+    interface IFlashLoanSimpleReceiver {
+        function executeOperation(
+            address asset,
+            uint256 amount,
+            uint256 premium,
+            address initiator,
+            bytes calldata params
+        ) external returns (bool);
+    }
+
+    /// Aave V3 IPool flash-loan surface — abis/aave-v3/IPool.sol
     #[sol(rpc)]
     interface IAaveV3Pool {
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
@@ -321,6 +353,14 @@ sol! {
             uint128 unbacked,
             uint128 isolationModeTotalDebt
         );
+        /// `executeArbWithAave` calls this from ArbExecutor.huff (selector 0x42b0b77c).
+        function flashLoanSimple(
+            address receiverAddress,
+            address asset,
+            uint256 amount,
+            bytes calldata params,
+            uint16 referralCode
+        ) external;
     }
 
     #[sol(rpc)]

@@ -339,6 +339,7 @@ pub fn get_curve_crypto_amount_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::math::fixed_point::ONE;
 
     #[test]
     fn test_zero_amount_returns_zero() {
@@ -355,6 +356,25 @@ mod tests {
             get_curve_crypto_amount_out(&state, U256::ZERO, 0, 1),
             U256::ZERO
         );
+    }
+
+    #[test]
+    fn crypto_two_coin_swap_returns_positive_output_within_reserve() {
+        let state = CurvePoolState {
+            balances: vec![
+                U256::from(1_000_000u64) * ONE,
+                U256::from(1_000_000u64) * ONE,
+            ],
+            a: U256::from(5_000u64),
+            fee: U256::from(1_000u64),
+            rates: vec![ONE, ONE],
+            n_coins: 2,
+            gamma: Some(U256::from(10_000u64)),
+            d: None,
+        };
+        let out = get_curve_crypto_amount_out(&state, U256::from(10_000u64) * ONE, 0, 1);
+        assert!(out > U256::ZERO);
+        assert!(out <= state.balances[1]);
     }
 }
 

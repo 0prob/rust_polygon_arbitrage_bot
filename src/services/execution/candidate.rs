@@ -41,6 +41,8 @@ pub struct CandidateExecution {
     pub safety_multiplier_bps: u64,
     /// State-cache generation used to build and simulate this candidate.
     pub state_generation: u64,
+    pub state_block: u64,
+    pub state_hash: Option<alloy::primitives::B256>,
 }
 
 pub struct CandidateBuildConfig {
@@ -54,9 +56,13 @@ pub struct CandidateBuildConfig {
     pub token_to_matic_rate: U256,
     pub safety_multiplier_bps: u64,
     pub state_generation: u64,
+    pub state_block: u64,
+    pub state_hash: Option<alloy::primitives::B256>,
     pub route_fingerprint: u64,
     pub flash_liquidity: TokenFlashLiquidity,
     pub has_dodo_pool: bool,
+    /// Skip liquidity re-alignment when `prepare_evaluated_route` already validated the plan.
+    pub trust_prepared_flash: bool,
 }
 
 fn dodo_pool_address_for_cycle(
@@ -116,6 +122,17 @@ fn resolve_dispatch_flash_source(
     align_flash_source_for_dispatch(source, liquidity, balancer_only, has_dodo_pool)
 }
 
+fn structural_flash_source(
+    flash_source: FlashLoanSource,
+    hops: &[crate::services::execution::calldata::CalldataHop],
+) -> FlashLoanSource {
+    if flash_source == FlashLoanSource::Direct && !balancer_batch_direct_eligible(hops) {
+        FlashLoanSource::AaveV3
+    } else {
+        flash_source
+    }
+}
+
 fn resolve_dispatch(
     flash_source: FlashLoanSource,
     hops: &[crate::services::execution::calldata::CalldataHop],
@@ -125,6 +142,19 @@ fn resolve_dispatch(
     let dispatch_flash_source =
         resolve_dispatch_flash_source(flash_source, hops, liquidity, has_dodo_pool)
             .ok_or_else(|| anyhow::anyhow!("no viable flash source for route"))?;
+    let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, hops);
+    Ok((dispatch_flash_source, entrypoint))
+}
+
+fn resolve_dispatch_from_prepared(
+    flash_source: FlashLoanSource,
+    hops: &[crate::services::execution::calldata::CalldataHop],
+    has_dodo_pool: bool,
+) -> anyhow::Result<(FlashLoanSource, ExecutorEntrypoint)> {
+    let dispatch_flash_source = structural_flash_source(flash_source, hops);
+    if dispatch_flash_source == FlashLoanSource::Dodo && !has_dodo_pool {
+        anyhow::bail!("DODO flash requires a DODO pool in the route");
+    }
     let entrypoint = resolve_executor_entrypoint(dispatch_flash_source, hops);
     Ok((dispatch_flash_source, entrypoint))
 }
@@ -160,12 +190,16 @@ pub fn build_execution_candidate(
             }),
     );
 
-    let (dispatch_flash_source, entrypoint) = resolve_dispatch(
-        config.flash_loan_source,
-        &hops,
-        &config.flash_liquidity,
-        config.has_dodo_pool,
-    )?;
+    let (dispatch_flash_source, entrypoint) = if config.trust_prepared_flash {
+        resolve_dispatch_from_prepared(config.flash_loan_source, &hops, config.has_dodo_pool)?
+    } else {
+        resolve_dispatch(
+            config.flash_loan_source,
+            &hops,
+            &config.flash_liquidity,
+            config.has_dodo_pool,
+        )?
+    };
     let encode_cfg = RouteEncodeConfig {
         slippage_bps: config.slippage_bps,
         deadline,
@@ -189,7 +223,8 @@ pub fn build_execution_candidate(
     // DODO flash loan: packRoute flash_token field must be the DODO pool address,
     // not the token address — the Huff contract calls flashLoan on it directly.
     let flash_token = if entrypoint == ExecutorEntrypoint::DodoFlash {
-        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges).unwrap_or(start_token)
+        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges)
+            .ok_or_else(|| anyhow::anyhow!("DODO flash entrypoint but no DODO pool in route"))?
     } else {
         start_token
     };
@@ -226,6 +261,8 @@ pub fn build_execution_candidate(
         hop_count: evaluated.cycle.hop_count,
         safety_multiplier_bps: config.safety_multiplier_bps,
         state_generation: config.state_generation,
+        state_block: config.state_block,
+        state_hash: config.state_hash,
     })
 }
 

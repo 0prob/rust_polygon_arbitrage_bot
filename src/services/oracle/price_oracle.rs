@@ -55,7 +55,7 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         pyth_id: Some("ffd11c5a1cfd42f80afb2df4d9f264c15f956d68153335374ec10722edd70472"),
     },
     TokenFeed {
-        token: address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f"),
+        token: address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
         chainlink: Some(address!("0xfE4A8cc5b5B2369C1C1948aBaC52816A1C139901")),
         pyth_id: Some("eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"),
     },
@@ -732,6 +732,7 @@ pub fn bootstrap_matic_rate_per_unit() -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
 
     #[test]
     fn pyth_to_chainlink_raw_matches_eight_decimal_usd() {
@@ -809,7 +810,7 @@ mod tests {
     #[test]
     fn token_usd_to_matic_rate_uses_integer_path() {
         let wmatic = WMATIC;
-        let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
+        let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
         let oracle = PriceOracle::new(
             reqwest::Client::new(),
             "https://hermes.pyth.network".to_string(),
@@ -827,5 +828,26 @@ mod tests {
             .token_matic_rate_per_unit_integer(&usdc)
             .expect("rate");
         assert_eq!(rate, RATE_PRECISION * U256::from(2u64));
+    }
+
+    #[test]
+    fn oracle_feeds_include_canonical_usdc_e() {
+        let usdc_e = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
+        assert!(chainlink_feed(&usdc_e).is_some());
+        assert!(pyth_feed(&usdc_e).is_some());
+    }
+
+    #[test]
+    fn stale_cache_entries_do_not_count_as_fresh() {
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            0,
+        );
+        oracle.matic_usd.write().replace(PriceEntry {
+            value: 1.0,
+            updated_at: Instant::now() - Duration::from_millis(1),
+        });
+        assert!(oracle.cached_matic_usd().is_none());
     }
 }

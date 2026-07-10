@@ -24,6 +24,7 @@ const SEL_APPROVE_FAILED: [u8; 4] = [0x1b, 0x6c, 0x83, 0xab];
 const SEL_ZERO_ADDRESS: [u8; 4] = [0xd9, 0x2e, 0x23, 0x3d];
 const SEL_INVALID_CALLBACK_SOURCE: [u8; 4] = [0x93, 0x61, 0x98, 0xe9];
 const SEL_BALANCER_VAULT_REENTRANCY: [u8; 4] = [0x6b, 0xe9, 0x2d, 0xa6];
+/// Aave V3 `ReserveInactive()` — bubbled through Huff `aave_call_failed`, not an ArbExecutor error.
 const SEL_AAVE_RESERVE_INACTIVE: [u8; 4] = [0x90, 0xcd, 0x6f, 0x24];
 /// Standard Solidity `revert(string)` — produced by `require(cond, "msg")`.
 const SEL_ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];

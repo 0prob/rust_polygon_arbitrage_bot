@@ -260,10 +260,8 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
 fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
     pool_type.is_some_and(|t| {
         let b = t.as_bytes();
-        b.windows(7)
-            .any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
-            || b.windows(4)
-                .any(|w| w.eq_ignore_ascii_case(b"meta"))
+        b.windows(7).any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
+            || b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
     })
 }
 
@@ -287,10 +285,7 @@ fn decode_curve_stored_rates(
     Some(vec![ONE; n_fetched])
 }
 
-fn decode_curve_crypto_rates(
-    n_fetched: usize,
-    price_scale: Option<U256>,
-) -> Vec<U256> {
+fn decode_curve_crypto_rates(n_fetched: usize, price_scale: Option<U256>) -> Vec<U256> {
     let mut rates = vec![ONE; n_fetched];
     if n_fetched >= 2 {
         if let Some(scale) = price_scale.filter(|scale| !scale.is_zero()) {

@@ -9,8 +9,7 @@ use crate::pipeline::abi_cache::{
     BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_FEE, CURVE_GAMMA, CURVE_PRICE_SCALE,
     CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K, DODO_LP_FEE,
     DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY,
-    V3_SLOT0,
-    encode_balancer_pool_tokens, encode_extsload,
+    V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
 use crate::services::discovery::{DiscoveredPool, resolve_v4_pool_id};

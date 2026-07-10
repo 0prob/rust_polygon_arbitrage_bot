@@ -333,8 +333,8 @@ pub async fn run_pass_loop(
                             .map(str::trim)
                             .find(|line| !line.is_empty() && !line.starts_with("Caused by:"))
                             .unwrap_or(error_msg.as_str());
-                        if now.saturating_sub(hs_reconnect_log_at) >= 30_000
-                            || delay.as_millis() == 0
+                        if now.saturating_sub(hs_reconnect_log_at) >= 300_000
+                            || (delay.as_millis() == 0 && now.saturating_sub(hs_reconnect_log_at) >= 30_000)
                         {
                             crate::warn!(
                                 "hypersync height stream reconnecting in {}ms: {reason}",

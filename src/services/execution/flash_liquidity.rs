@@ -23,7 +23,7 @@ use crate::core::types::{
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
-use crate::pipeline::sim_sanity::{SimSanityInput, check_sim_sanity, max_flash_borrow_wei};
+use crate::pipeline::sim_sanity::{SimSanityInput, max_flash_borrow_wei};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::flash_policy::FlashLoanPolicy;
@@ -384,6 +384,19 @@ impl Default for FlashLiquidityCache {
     }
 }
 
+/// On-chain Aave reserve check — mirrors `ValidationLogic.validateFlashloanSimple`.
+pub async fn aave_flash_reserve_viable<P: Provider<Ethereum>>(
+    provider: &P,
+    aave_pool: Address,
+    token: Address,
+) -> bool {
+    let pool = IAaveV3Pool::new(aave_pool, provider);
+    let Ok(reserve) = pool.getReserveData(token).call().await else {
+        return false;
+    };
+    !reserve.aTokenAddress.is_zero() && aave_reserve_flash_eligible(reserve.configuration)
+}
+
 fn decode_balance(bytes: Option<&Option<alloy::primitives::Bytes>>) -> U256 {
     bytes
         .and_then(|b| b.as_ref())
@@ -402,10 +415,10 @@ fn aave_cfg_bit_set(configuration: U256, bit: u32) -> bool {
     (configuration >> bit) & U256::from(1) != U256::ZERO
 }
 
-/// Active, unfrozen, unpaused, flash-loan-enabled — else flash reverts `ReserveInactive()`.
+/// Active, unfrozen, unpaused, flash-loan-enabled — else Aave reverts `ReserveInactive()` / `FLASHLOAN_DISABLED`.
 #[inline]
 #[must_use]
-fn aave_reserve_flash_eligible(configuration: U256) -> bool {
+pub fn aave_reserve_flash_eligible(configuration: U256) -> bool {
     aave_cfg_bit_set(configuration, AAVE_CFG_ACTIVE_BIT)
         && !aave_cfg_bit_set(configuration, AAVE_CFG_FROZEN_BIT)
         && !aave_cfg_bit_set(configuration, AAVE_CFG_PAUSED_BIT)
@@ -581,7 +594,7 @@ pub fn prefer_aave_flash_start<'a>(
     let snapshots = flash.tokens_liquidity(&token_addrs, ttl);
     let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
     for (liq, token) in snapshots.into_iter().zip(token_indices) {
-        if liq.aave_listed {
+        if liq.aave_listed && !liq.aave.is_zero() {
             candidates.push((liq.aave, token));
         }
     }
@@ -741,13 +754,13 @@ fn flash_liquidity_for_cycle(
     let start_addr = arena.token_address(cycle.start_token)?;
     let snapshot = flash.token_liquidity(start_addr, ttl);
     let route_cap = route_balancer_flash_capacity(arena, cycle);
+    let has_dodo = cycle_has_dodo_pool(arena, cycle);
     Some(TokenFlashLiquidity {
         balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
         aave: snapshot.aave,
         aave_listed: snapshot.aave_listed,
-        // DODO pools transfer tokens upfront — liquidity is bounded by pool reserves.
-        // Set to U256::MAX so DODO is always tried as fallback when Balancer/Aave fail.
-        dodo: U256::MAX,
+        // Only offer DODO when the route actually swaps through a DODO pool.
+        dodo: if has_dodo { U256::MAX } else { U256::ZERO },
     })
 }
 
@@ -879,11 +892,12 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         .token_address(input.evaluated.cycle.start_token)?;
     let amount_in = input.evaluated.result.amount_in;
     let route_cap = route_balancer_flash_capacity(input.arena, &input.evaluated.cycle);
+    let has_dodo = cycle_has_dodo_pool(input.arena, &input.evaluated.cycle);
     let liquidity = TokenFlashLiquidity {
         balancer: effective_balancer_liquidity(input.liquidity.balancer, route_cap),
         aave: input.liquidity.aave,
         aave_listed: input.liquidity.aave_listed,
-        dodo: U256::MAX,
+        dodo: if has_dodo { U256::MAX } else { U256::ZERO },
     };
     let forbid_balancer_flash = route_uses_balancer_vault_swap(&input.evaluated.cycle);
     let balancer_only = route_is_balancer_only(&input.evaluated.cycle);
@@ -1115,7 +1129,7 @@ fn dispatch_sim_passes_sanity(
     {
         return false;
     }
-    check_sim_sanity(SimSanityInput {
+    crate::pipeline::sim_sanity::check_sim_sanity_for_dispatch(SimSanityInput {
         amount_in: result.amount_in,
         gross_profit: result.profit,
         search_low,
@@ -1420,6 +1434,23 @@ mod tests {
         );
         assert_eq!(plan.action, FlashPlanAction::Reject);
         assert!(!cache.has_fresh_entry(token));
+    }
+
+    #[test]
+    fn plan_auto_skips_dodo_without_dodo_pool_liquidity() {
+        let plan = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1_000u64),
+            TokenFlashLiquidity {
+                balancer: U256::ZERO,
+                aave: U256::ZERO,
+                aave_listed: false,
+                dodo: U256::ZERO,
+            },
+            false,
+            false,
+        );
+        assert_eq!(plan.action, FlashPlanAction::Reject);
     }
 
     #[test]

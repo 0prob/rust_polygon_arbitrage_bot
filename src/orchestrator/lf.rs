@@ -480,6 +480,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
             state_block: ctx.refresh.last_state_block(),
+            state_hash: ctx.refresh.last_state_hash(),
             cycles: capped.into_iter().map(Arc::new).collect(),
             token_to_matic_rates: rates,
             token_decimals: decimals,

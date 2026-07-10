@@ -650,6 +650,8 @@ impl ExecutionService {
         operator: Address,
         gas_oracle: &GasOracle,
         state_cache: &StateCache,
+        expected_state_block: u64,
+        expected_state_hash: Option<alloy::primitives::B256>,
         hypersync: Option<&HyperSyncService>,
         ui_hook: Option<&SharedUiHook>,
         shutdown: Option<&watch::Receiver<bool>>,
@@ -688,6 +690,26 @@ impl ExecutionService {
                     "candidate stale: built at generation {}, current generation {}",
                     candidate.state_generation, current_generation
                 ),
+            };
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
+
+        if candidate.state_block != expected_state_block
+            || candidate.state_hash != expected_state_hash
+        {
+            crate::debug!(
+                "dispatch skip: fp={}, stale state provenance candidate(block={}, hash={:?}) != expected(block={}, hash={:?})",
+                fp,
+                candidate.state_block,
+                candidate.state_hash,
+                expected_state_block,
+                expected_state_hash,
+            );
+            let outcome = ExecutionOutcome::SubmitFailed {
+                reason: "candidate state provenance mismatch".to_string(),
             };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -754,7 +776,7 @@ impl ExecutionService {
 
         let dry = dry_run_candidate(sim_provider, candidate, operator).await;
 
-        if !dry.success {
+        if !dry.success || !dry.semantic_success || dry.realized_profit.is_none() {
             let sim_fidelity_miss = matches!(
                 dry.decoded_revert,
                 Some(DecodedRevert::InsufficientProfit {
@@ -782,7 +804,13 @@ impl ExecutionService {
                 }
             );
             let outcome = ExecutionOutcome::DryRunFailed {
-                reason: dry.error.unwrap_or_else(|| "unknown".into()),
+                reason: dry.error.unwrap_or_else(|| {
+                    if !dry.semantic_success {
+                        "dry-run did not produce a decodable realized profit".into()
+                    } else {
+                        "unknown".into()
+                    }
+                }),
             };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -1459,6 +1487,8 @@ mod safety_tests {
             hop_count: 2,
             safety_multiplier_bps: 10_000,
             state_generation: 1,
+            state_block: 1,
+            state_hash: None,
         };
 
         let assessment = ExecutionService::reassess_assessment(
@@ -1516,6 +1546,8 @@ mod safety_tests {
             hop_count: 1,
             safety_multiplier_bps: 0,
             state_generation: cache.generation(),
+            state_block: 0,
+            state_hash: None,
         };
 
         assert!(ExecutionService::candidate_matches_state_generation(

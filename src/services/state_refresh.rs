@@ -2,8 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
+use alloy::primitives::B256;
 use alloy::providers::Provider;
+use alloy::rpc::types::BlockId;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -60,6 +63,7 @@ pub struct StateRefreshService {
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
     last_state_block: AtomicU64,
+    last_state_hash: parking_lot::RwLock<Option<B256>>,
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
     /// Set to true by the LISTEN/NOTIFY task when a pool_meta_channel notification arrives.
@@ -91,6 +95,7 @@ impl StateRefreshService {
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
             last_state_block: AtomicU64::new(0),
+            last_state_hash: parking_lot::RwLock::new(None),
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
             pg_notify_pending: Arc::new(AtomicBool::new(false)),
@@ -154,6 +159,10 @@ impl StateRefreshService {
 
     pub fn last_state_block(&self) -> u64 {
         self.last_state_block.load(Ordering::Acquire)
+    }
+
+    pub fn last_state_hash(&self) -> Option<B256> {
+        *self.last_state_hash.read()
     }
 
     #[inline]
@@ -672,6 +681,15 @@ impl StateRefreshService {
                 }
             };
             let pinned_block = provider.get_block_number().await.ok().or(cached_block);
+            let pinned_hash = match pinned_block {
+                Some(block) => provider
+                    .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|b| b.header.hash),
+                None => None,
+            };
             let (updated, attempted) = fetch_missing_pool_states(
                 provider,
                 Arc::clone(&self.cache),
@@ -688,6 +706,9 @@ impl StateRefreshService {
             if updated > 0 {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
+                }
+                if let Some(hash) = pinned_hash {
+                    *self.last_state_hash.write() = Some(hash);
                 }
                 if idx > 0 {
                     crate::info!(

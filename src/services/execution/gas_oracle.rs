@@ -189,6 +189,11 @@ impl GasOracle {
         self.conservative_gas_price().unwrap_or(U256::ZERO)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_fee_snapshot_for_test(&self, fees: FeeSnapshot) {
+        self.snapshot.store(Some(Arc::new(fees)));
+    }
+
     pub async fn refresh_once<P: Provider<Ethereum>>(&self, provider: &P) -> anyhow::Result<()> {
         let block = provider
             .get_block_by_number(BlockNumberOrTag::Latest)

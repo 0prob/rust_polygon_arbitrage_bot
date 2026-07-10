@@ -1,3 +1,6 @@
+# LF ticks average ~2.5s refresh; interval must exceed that to avoid perpetual backlog.
+lf_interval_ms = 3000
+
 [execution]
 # 0.01 MATIC net profit floor — lower threshold captures more marginal opportunities
 min_profit_matic_wei = "10000000000000000"
@@ -17,8 +20,8 @@ ternary_search_iterations = 18
 # Hot-pool WSS patches; requires WSS_URL or POLYGON_WSS_URLS in .env
 stream_enabled = true
 # Per-tick pool refresh cap (hot pools rotate; full sweep every lf_full_sweep_interval passes).
-lf_hot_batch = 800
-lf_full_sweep_interval = 30
+lf_hot_batch = 500
+lf_full_sweep_interval = 45
 cycle_refind_interval = 8
 # Raise sim/score caps to eval more candidates per HF tick -> more chance of net>0 after gas.
 hf_sim_cap = 300

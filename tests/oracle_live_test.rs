@@ -41,7 +41,7 @@ async fn pyth_matic_usd_feed_resolves() {
 #[ignore = "live network — run: cargo test --test oracle_live_test -- --ignored"]
 async fn pyth_usdc_prefetch_enables_integer_matic_rate() {
     let oracle = hermes_oracle();
-    let usdc: Address = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
+    let usdc: Address = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
     let _ = oracle.get_matic_usd_offline().await;
     oracle.prefetch_token_usd_offline(&[usdc]).await;
     let usd = oracle.token_usd(&usdc).expect("USDC/USD from Pyth");

@@ -11,14 +11,19 @@ pub fn estimate_route_calls(edges: &[Edge]) -> usize {
     edges.iter().map(|e| estimate_hop_calls(e.protocol)).sum()
 }
 
+/// Pure Balancer routes eligible for `executeArbDirect` + one vault `batchSwap`.
+#[must_use]
+pub fn balancer_direct_batch_eligible(edges: &[Edge]) -> bool {
+    !edges.is_empty()
+        && edges.iter().all(|e| e.protocol == ProtocolType::BalancerV2)
+        && edges.len() <= MAX_BALANCER_BATCH_HOPS
+}
+
 /// Exact packed-call count for execution gating when a route can collapse into a
 /// Balancer batch call.
 #[must_use]
 pub fn estimate_packed_route_calls(edges: &[Edge]) -> usize {
-    if !edges.is_empty()
-        && edges.iter().all(|e| e.protocol == ProtocolType::BalancerV2)
-        && edges.len() <= MAX_BALANCER_BATCH_HOPS
-    {
+    if balancer_direct_batch_eligible(edges) {
         return 1;
     }
     estimate_route_calls(edges)

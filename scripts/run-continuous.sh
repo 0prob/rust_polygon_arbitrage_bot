@@ -25,7 +25,7 @@ while true; do
     echo "[runner] starting bot (restart #$RESTART_COUNT)..." >> "$RUN_LOG"
 
     # Run with timeout protection (1 hour max per run, the main loop handles disconnects internally)
-    if RPBOT_LOG=info EXECUTION_MODE=dry-run \
+    if CONFIG_PATH=./config.toml RPBOT_LOG=info EXECUTION_MODE=dry-run \
         timeout 3600 "$BOT_BIN" >> "$RUN_LOG" 2>&1; then
         EXIT_CODE=$?
         echo "[runner] bot exited normally (code=$EXIT_CODE)" >> "$RUN_LOG"

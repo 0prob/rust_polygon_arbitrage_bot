@@ -1,11 +1,12 @@
 use alloy::network::Ethereum;
-use alloy::primitives::U256;
+use alloy::primitives::{B256, U256};
 use alloy::providers::Provider;
 use futures_util::{StreamExt, stream};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::FoundCycle;
 use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::HfEvalResult;
@@ -16,7 +17,7 @@ use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
 use crate::services::execution::flash_liquidity::{
-    collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
+    aave_flash_reserve_viable, collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
 };
 
 use crate::core::types::FlashLoanSource;
@@ -39,6 +40,8 @@ pub(crate) struct DispatchInputs<'a> {
         &'a rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     pub(crate) token_decimals: &'a rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     pub(crate) state_generation: u64,
+    pub(crate) state_block: u64,
+    pub(crate) state_hash: Option<B256>,
     pub(crate) skip_dispatch_refresh: bool,
 }
 
@@ -137,6 +140,8 @@ pub(crate) async fn dispatch_profitable_candidates(
         inputs.token_to_matic_rates,
         inputs.token_decimals,
         inputs.state_generation,
+        inputs.state_block,
+        inputs.state_hash,
         inputs.skip_dispatch_refresh,
     )
     .await;
@@ -161,6 +166,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     state_generation: u64,
+    state_block: u64,
+    state_hash: Option<B256>,
     skip_dispatch_refresh: bool,
 ) {
     if ctx.execution.global_is_quarantined() {
@@ -248,6 +255,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                     token_to_matic_rates,
                     token_decimals,
                     dispatch_state_generation,
+                    state_block,
+                    state_hash,
                     pools_refreshed,
                     flash_policy,
                     gas_price,
@@ -284,6 +293,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     dispatch_state_generation: u64,
+    state_block: u64,
+    state_hash: Option<B256>,
     pools_refreshed: bool,
     flash_policy: crate::services::execution::flash_policy::FlashLoanPolicy,
     gas_price: U256,
@@ -401,6 +412,25 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         return;
     };
 
+    if prepared.flash_source == FlashLoanSource::AaveV3
+        && !aave_flash_reserve_viable(sim_provider, AAVE_V3_POOL, start_token_addr).await
+    {
+        skipped.record("prepare");
+        ctx.execution
+            .flash_liquidity
+            .mark_aave_inactive(start_token_addr);
+        if log_prepare_skip {
+            crate::info!(
+                "prepare skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
+            );
+        } else {
+            crate::debug!(
+                "dispatch skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
+            );
+        }
+        return;
+    }
+
     if prepared.flash_source == FlashLoanSource::Direct
         && route_is_balancer_only(&prepared.evaluated.cycle)
     {
@@ -504,9 +534,12 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         token_to_matic_rate,
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         state_generation: dispatch_state_generation,
+        state_block,
+        state_hash,
         route_fingerprint: fp,
         flash_liquidity: liquidity,
         has_dodo_pool: cycle_has_dodo_pool(arena, &prepared.evaluated.cycle),
+        trust_prepared_flash: true,
     };
 
     let candidate =
@@ -514,7 +547,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         {
             Ok(c) => c,
             Err(e) => {
-                crate::debug!("prepare skip: build failed fp={fp}: {e:#}");
+                crate::warn!("dispatch build failed: fp={fp}: {e:#}");
                 skipped.record("build");
                 return;
             }
@@ -544,6 +577,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             operator,
             &ctx.gas_oracle,
             &ctx.cache,
+            ctx.refresh.last_state_block(),
+            ctx.refresh.last_state_hash(),
             ctx.hypersync.as_deref(),
             Some(&ctx.ui_hook),
             Some(&ctx.shutdown),
@@ -587,6 +622,39 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     );
 }
 
+/// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
+pub(crate) async fn refresh_and_resim_profitable(
+    refresh: &crate::services::state_refresh::StateRefreshService,
+    cache: &crate::services::state_cache::StateCache,
+    arena: &mut StateArena,
+    profitable: Vec<HfEvalResult>,
+) -> Vec<HfEvalResult> {
+    if profitable.is_empty() {
+        return profitable;
+    }
+    let pools = collect_route_pool_addresses(arena, &profitable);
+    if !pools.is_empty()
+        && refresh
+            .refresh_pool_states_for(&pools, pools.len())
+            .await
+            .is_ok()
+    {
+        arena.apply_hot_cache(cache, &pools);
+    }
+    profitable
+        .into_iter()
+        .filter_map(|mut result| {
+            let amount = result.opt.optimal_input;
+            let sim = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
+            if sim.profit.is_zero() {
+                return None;
+            }
+            result.sim = sim;
+            Some(result)
+        })
+        .collect()
+}
+
 /// Drop Balancer-only candidates whose vault `queryBatchSwap` disagrees with local sim.
 pub(crate) async fn filter_balancer_onchain_verified<
     P: Provider<Ethereum> + Clone + Send + 'static,
@@ -613,6 +681,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
         let fp = result.route_fingerprint;
         let Some(start_token) = arena.token_address(result.cycle.start_token) else {
             execution.quarantine_batch_query_failure(fp);
+            crate::info!("hf batch-filter: fp={fp} reject=missing_start_token");
             continue;
         };
         let Some(hops) = build_calldata_hops(
@@ -622,28 +691,67 @@ pub(crate) async fn filter_balancer_onchain_verified<
             &pool_metas_by_pool,
         ) else {
             execution.quarantine_batch_query_failure(fp);
+            crate::info!(
+                "hf batch-filter: fp={fp} reject=calldata_build_failed modeled={} net_matic={}",
+                result.sim.profit,
+                result.assessment.net_profit_after_gas_matic_wei,
+            );
             continue;
         };
         if !balancer_batch_within_max_in_ratio(arena, &hops) {
             execution.quarantine_batch_query_failure(fp);
+            crate::info!(
+                "hf batch-filter: fp={fp} reject=max_in_ratio modeled={} net_matic={}",
+                result.sim.profit,
+                result.assessment.net_profit_after_gas_matic_wei,
+            );
             continue;
         }
         let slippage = result.effective_slippage_bps.max(slippage_bps);
-        let accept =
-            match query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await {
-                BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
-                    on_chain_profit,
-                    result.sim.profit,
-                    result.sim.amount_in,
-                    slippage,
-                    result.cycle.hop_count,
-                ),
-                _ => false,
-            };
+        let outcome = query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await;
+        let accept = match &outcome {
+            BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
+                *on_chain_profit,
+                result.sim.profit,
+                result.sim.amount_in,
+                slippage,
+                result.cycle.hop_count,
+            ),
+            _ => false,
+        };
         if accept {
             verified.push(result);
         } else {
             execution.quarantine_batch_query_failure(fp);
+            let modeled = result.sim.profit;
+            let net_matic = result.assessment.net_profit_after_gas_matic_wei;
+            match outcome {
+                BatchQueryOutcome::Profit(on_chain) => {
+                    crate::info!(
+                        "hf batch-filter: fp={fp} reject=on_chain_profit_below_min on_chain={on_chain} modeled={modeled} net_matic={net_matic} slippage_bps={slippage}"
+                    );
+                }
+                BatchQueryOutcome::NonPositiveDelta(delta) => {
+                    crate::info!(
+                        "hf batch-filter: fp={fp} reject=non_positive_delta delta={delta} modeled={modeled} net_matic={net_matic}"
+                    );
+                }
+                BatchQueryOutcome::RpcError(reason) => {
+                    crate::info!(
+                        "hf batch-filter: fp={fp} reject=rpc_error reason={reason} modeled={modeled} net_matic={net_matic}"
+                    );
+                }
+                BatchQueryOutcome::Timeout => {
+                    crate::info!(
+                        "hf batch-filter: fp={fp} reject=timeout modeled={modeled} net_matic={net_matic}"
+                    );
+                }
+                BatchQueryOutcome::BuildFailed | BatchQueryOutcome::DecodeFailed => {
+                    crate::info!(
+                        "hf batch-filter: fp={fp} reject=batch_query_build_decode modeled={modeled} net_matic={net_matic}"
+                    );
+                }
+            }
         }
     }
     verified

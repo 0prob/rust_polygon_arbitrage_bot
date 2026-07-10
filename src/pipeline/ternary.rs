@@ -9,7 +9,8 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{cl_amount_cap, simulate_route_minimal};
 use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, check_sim_sanity_fast, min_economic_amount_in,
+    SimSanityInput, check_sim_sanity, check_sim_sanity_fast, check_sim_sanity_for_dispatch,
+    min_economic_amount_in,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -475,25 +476,31 @@ pub fn optimize_cycle(
         crate::trace!("optimize_cycle: optimal sim zero profit optimal={optimal} low={low}");
         return None;
     }
-    if let Err(reason) = check_sim_sanity(SimSanityInput {
+    let sanity_input = SimSanityInput {
         amount_in: optimal,
         gross_profit: sim.profit,
         search_low: low,
         token_decimals: start_decimals,
         token_to_matic_rate: start_rate,
-    }) {
+    };
+    if check_sim_sanity_for_dispatch(sanity_input).is_err() {
         crate::trace!(
-            "optimize_cycle: sanity({reason:?}) optimal={optimal} profit={} low={low}",
+            "optimize_cycle: sanity optimal={optimal} profit={} low={low}",
             sim.profit
         );
         return None;
     }
+    let search_low = if check_sim_sanity(sanity_input).is_ok() {
+        low
+    } else {
+        U256::ZERO
+    };
     Some(OptimizationResult {
         optimal_input: optimal,
         expected_gross: sim.amount_out,
         net_profit: sim.profit,
         total_gas: sim.total_gas,
-        search_low: low,
+        search_low,
     })
 }
 

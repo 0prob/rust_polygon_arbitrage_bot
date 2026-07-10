@@ -2,6 +2,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use alloy::primitives::B256;
 use alloy::primitives::U256;
 use arc_swap::ArcSwap;
 
@@ -14,6 +15,7 @@ use crate::services::discovery::DiscoveredPool;
 pub struct HfSnapshot {
     pub generation: u64,
     pub state_block: u64,
+    pub state_hash: Option<B256>,
     pub cycles: Vec<Arc<FoundCycle>>,
     pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
     pub token_decimals: Arc<FxHashMap<alloy::primitives::Address, u8>>,
@@ -29,6 +31,7 @@ impl Default for HfSnapshot {
         Self {
             generation: 0,
             state_block: 0,
+            state_hash: None,
             cycles: Vec::new(),
             token_to_matic_rates: Arc::new(FxHashMap::default()),
             token_decimals: Arc::new(FxHashMap::default()),
@@ -84,6 +87,7 @@ impl Default for SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::B256;
 
     #[test]
     fn read_returns_consistent_generation_after_publish() {
@@ -92,6 +96,7 @@ mod tests {
 
         store.publish(HfSnapshot {
             state_block: 42,
+            state_hash: None,
             ..Default::default()
         });
 
@@ -109,5 +114,21 @@ mod tests {
         let first = store.read();
         let second = store.read();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn publish_preserves_state_hash() {
+        let store = SnapshotStore::new();
+        let hash = B256::repeat_byte(7);
+
+        store.publish(HfSnapshot {
+            state_block: 99,
+            state_hash: Some(hash),
+            ..Default::default()
+        });
+
+        let snap = store.read();
+        assert_eq!(snap.state_block, 99);
+        assert_eq!(snap.state_hash, Some(hash));
     }
 }

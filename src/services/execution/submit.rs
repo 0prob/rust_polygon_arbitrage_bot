@@ -211,3 +211,34 @@ pub async fn submit_replacement<P: Provider<Ethereum>>(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::execution::FeeSnapshot;
+
+    #[test]
+    fn bump_fees_scales_both_fee_fields() {
+        let fees = SubmitFees {
+            max_fee_per_gas: U256::from(100u64),
+            max_priority_fee_per_gas: U256::from(20u64),
+        };
+        let bumped = bump_fees(fees, FEE_BUMP_BPS);
+        assert_eq!(bumped.max_fee_per_gas, U256::from(115u64));
+        assert_eq!(bumped.max_priority_fee_per_gas, U256::from(23u64));
+    }
+
+    #[test]
+    fn submit_fee_resolution_respects_base_plus_priority_floor() {
+        let oracle = GasOracle::default();
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(10u64),
+            priority_fee: U256::from(2u64),
+        });
+
+        let fees = resolve_submit_fees_with_profit(&oracle, U256::from(1_000u64), 5_000, 100)
+            .expect("snapshot should resolve");
+        assert!(fees.max_priority_fee_per_gas >= U256::from(2u64));
+        assert!(fees.max_fee_per_gas >= U256::from(12u64));
+    }
+}

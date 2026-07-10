@@ -8,9 +8,9 @@ fn contains_ignore_case(s: &str, needle: &str) -> bool {
 
 /// Map PostgreSQL `protocol` + optional `poolType` to a simulation protocol family.
 #[must_use]
-pub fn resolve_protocol_from_pg(protocol: &str, pool_type: Option<&str>) -> ProtocolType {
-    let base = normalize_protocol(protocol);
-    match base {
+pub fn resolve_protocol_from_pg(protocol: &str, pool_type: Option<&str>) -> Option<ProtocolType> {
+    let base = normalize_protocol(protocol)?;
+    Some(match base {
         ProtocolType::CurveStable | ProtocolType::CurveCrypto => {
             if pool_type.is_some_and(|t| contains_ignore_case(t, "crypto"))
                 || contains_ignore_case(protocol, "crypto")
@@ -21,7 +21,43 @@ pub fn resolve_protocol_from_pg(protocol: &str, pool_type: Option<&str>) -> Prot
             }
         }
         _ => base,
+    })
+}
+
+/// Map raw HyperIndex protocol labels to simulation protocol families.
+#[must_use]
+pub fn normalize_protocol(raw: &str) -> Option<ProtocolType> {
+    if contains_ignore_case(raw, "woofi") {
+        return Some(ProtocolType::Woofi);
     }
+    if contains_ignore_case(raw, "dodo") {
+        return Some(ProtocolType::Dodo);
+    }
+    if contains_ignore_case(raw, "balancer") {
+        return Some(ProtocolType::BalancerV2);
+    }
+    if contains_ignore_case(raw, "curve") {
+        if contains_ignore_case(raw, "crypto") {
+            return Some(ProtocolType::CurveCrypto);
+        }
+        return Some(ProtocolType::CurveStable);
+    }
+    // QuickSwap V4 is Algebra Integral, not Uniswap V4 PoolManager. Keep both
+    // Algebra generations on the concentrated-liquidity adapter; the original
+    // label is preserved for callback/factory selection at execution time.
+    if is_algebra_protocol_label(raw) {
+        return Some(ProtocolType::UniswapV3);
+    }
+    if contains_ignore_case(raw, "v4") {
+        return Some(ProtocolType::UniswapV4);
+    }
+    if contains_ignore_case(raw, "v3") || contains_ignore_case(raw, "elastic") {
+        return Some(ProtocolType::UniswapV3);
+    }
+    if contains_ignore_case(raw, "v2") {
+        return Some(ProtocolType::UniswapV2);
+    }
+    None
 }
 
 /// Normalize Balancer pool types supported by the local quote engine.
@@ -42,42 +78,6 @@ pub fn normalize_balancer_pool_type(pool_type: Option<&str>) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Map raw HyperIndex protocol labels to simulation protocol families.
-#[must_use]
-pub fn normalize_protocol(raw: &str) -> ProtocolType {
-    if contains_ignore_case(raw, "woofi") {
-        return ProtocolType::Woofi;
-    }
-    if contains_ignore_case(raw, "dodo") {
-        return ProtocolType::Dodo;
-    }
-    if contains_ignore_case(raw, "balancer") {
-        return ProtocolType::BalancerV2;
-    }
-    if contains_ignore_case(raw, "curve") {
-        if contains_ignore_case(raw, "crypto") {
-            return ProtocolType::CurveCrypto;
-        }
-        return ProtocolType::CurveStable;
-    }
-    // QuickSwap V4 is Algebra Integral, not Uniswap V4 PoolManager. Keep both
-    // Algebra generations on the concentrated-liquidity adapter; the original
-    // label is preserved for callback/factory selection at execution time.
-    if is_algebra_protocol_label(raw) {
-        return ProtocolType::UniswapV3;
-    }
-    if contains_ignore_case(raw, "v4") {
-        return ProtocolType::UniswapV4;
-    }
-    if contains_ignore_case(raw, "v3") || contains_ignore_case(raw, "elastic") {
-        return ProtocolType::UniswapV3;
-    }
-    if contains_ignore_case(raw, "v2") {
-        return ProtocolType::UniswapV2;
-    }
-    ProtocolType::UniswapV2
 }
 
 #[must_use]
@@ -144,22 +144,36 @@ mod tests {
 
     #[test]
     fn test_normalize_uniswap_v2() {
-        assert_eq!(normalize_protocol("UNISWAP_V2"), ProtocolType::UniswapV2);
+        assert_eq!(
+            normalize_protocol("UNISWAP_V2"),
+            Some(ProtocolType::UniswapV2)
+        );
     }
 
     #[test]
     fn quickswap_generations_use_algebra_adapter() {
-        assert_eq!(normalize_protocol("QUICKSWAP_V3"), ProtocolType::UniswapV3);
-        assert_eq!(normalize_protocol("QUICKSWAP_V4"), ProtocolType::UniswapV3);
+        assert_eq!(
+            normalize_protocol("QUICKSWAP_V3"),
+            Some(ProtocolType::UniswapV3)
+        );
+        assert_eq!(
+            normalize_protocol("QUICKSWAP_V4"),
+            Some(ProtocolType::UniswapV3)
+        );
         assert!(is_algebra_protocol_label("QUICKSWAP_V4"));
         assert!(is_algebra_integral_protocol_label("QUICKSWAP_V4"));
         assert!(!is_algebra_integral_protocol_label("QUICKSWAP_V3"));
-        assert_eq!(normalize_protocol("UNISWAP_V4"), ProtocolType::UniswapV4);
+        assert_eq!(
+            normalize_protocol("UNISWAP_V4"),
+            Some(ProtocolType::UniswapV4)
+        );
     }
 
     #[test]
     fn unknown_protocol_is_not_implicitly_v2() {
         assert!(!is_known_protocol_label("NEW_UNKNOWN_DEX"));
+        assert_eq!(normalize_protocol("NEW_UNKNOWN_DEX"), None);
+        assert_eq!(resolve_protocol_from_pg("NEW_UNKNOWN_DEX", None), None);
     }
 
     #[test]

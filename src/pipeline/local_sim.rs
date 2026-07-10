@@ -1,6 +1,6 @@
 use crate::core::constants::{
-    GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP, GAS_V3_BASE, GAS_V4_BASE,
-    GAS_WOOFI_HOP, HOP_CAP_USIZE,
+    GAS_BALANCER_DIRECT_BATCH, GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP,
+    GAS_V3_BASE, GAS_V4_BASE, GAS_WOOFI_HOP, HOP_CAP_USIZE,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
 use crate::core::math::curve::get_curve_stable_amount_out;
@@ -30,13 +30,22 @@ pub fn estimate_hop_gas(protocol: ProtocolType) -> u32 {
     }
 }
 
+/// Hop gas budget for ranking: one `batchSwap` for pure Balancer direct routes, else per-hop sum.
+#[must_use]
+pub fn route_hop_gas_budget(edges: &[Edge]) -> u32 {
+    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+        return GAS_BALANCER_DIRECT_BATCH;
+    }
+    edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum()
+}
+
 /// Conservative gas units for a full route (overhead + per-hop + tick premium + storage reads).
 #[must_use]
 pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     if edges.is_empty() {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
     }
-    let hop_gas: u32 = edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum();
+    let hop_gas = route_hop_gas_budget(edges);
     let cold_slots = edges.len() as u32;
     crate::services::execution::gas::estimate_route_gas_from_hops_evm(
         hop_gas,
@@ -271,9 +280,6 @@ pub fn route_hop_fidelity_reject(
 ) -> Option<HopFidelityReject> {
     for (i, edge) in edges.iter().enumerate() {
         let amount_in = hop_amounts.get(i).copied().unwrap_or(U256::ZERO);
-        if amount_in <= spot_probe {
-            continue;
-        }
         let Some(state) = arena.pool_state(edge.pool_index) else {
             return Some(HopFidelityReject::MissingPool(i));
         };
@@ -297,7 +303,13 @@ pub fn route_hop_fidelity_reject(
             (
                 PoolState::V3(_) | PoolState::V4(_),
                 ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
-            ) if cl_hop_shallow_at_amount(state, edge, amount_in) => {
+            ) if cl_hop_tickless(state) => {
+                return Some(HopFidelityReject::ShallowCl(i));
+            }
+            (
+                PoolState::V3(_) | PoolState::V4(_),
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
+            ) if amount_in > spot_probe && cl_hop_shallow_at_amount(state, edge, amount_in) => {
                 return Some(HopFidelityReject::ShallowCl(i));
             }
             _ => {}
@@ -382,9 +394,10 @@ pub fn simulate_route_minimal(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
-    let (amount_out, hop_gas) = walk_route_hops(arena, edges, amount_in, None)?;
+    let (amount_out, _) = walk_route_hops(arena, edges, amount_in, None)?;
     let profit = amount_out.saturating_sub(amount_in);
     let hop_count = edges.len();
+    let hop_gas = route_hop_gas_budget(edges);
     let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
         hop_gas,
         hop_count,
@@ -406,8 +419,9 @@ pub fn simulate_route_detailed(
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    let (amount_out, hop_gas) = walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
+    let (amount_out, _) = walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
     let profit = amount_out.saturating_sub(amount_in);
+    let hop_gas = route_hop_gas_budget(edges);
     let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
         hop_gas,
         hop_count,
@@ -476,6 +490,39 @@ mod tests {
             1,
         );
         assert_eq!(sim.total_gas, expected);
+    }
+
+    #[test]
+    fn balancer_direct_batch_uses_single_batch_gas_not_per_hop_sum() {
+        use crate::core::constants::GAS_BALANCER_DIRECT_BATCH;
+        use crate::services::execution::gas::estimate_route_gas_from_hops_evm;
+
+        let edges = [
+            Edge {
+                pool_index: crate::core::types::PoolIndex(0),
+                token_in: crate::core::types::TokenIndex(0),
+                token_out: crate::core::types::TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 0,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: crate::core::types::PoolIndex(1),
+                token_in: crate::core::types::TokenIndex(1),
+                token_out: crate::core::types::TokenIndex(0),
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 0,
+                zero_for_one: true,
+            },
+        ];
+        let batch = estimate_route_gas(&edges);
+        let per_hop = estimate_route_gas_from_hops_evm(GAS_BALANCER_HOP * 2, 2, 2);
+        assert_eq!(route_hop_gas_budget(&edges), GAS_BALANCER_DIRECT_BATCH);
+        assert!(batch < per_hop / 2);
     }
 
     #[test]
@@ -610,10 +657,9 @@ mod tests {
             },
         ];
         let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
-        // First assertion: only first hop matters (matches old route_cl_fidelity_ok semantics)
         let mut first_only = hop_amounts_zeroed(edges.len());
         first_only[0] = probe;
-        assert!(route_hop_fidelity_ok(&arena, &edges, &first_only, probe));
+        assert!(!route_hop_fidelity_ok(&arena, &edges, &first_only, probe));
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = probe;
         hop_amounts[1] = U256::from(10u128.pow(18));
@@ -749,6 +795,12 @@ mod tests {
             Some(crate::pipeline::spot_price::spot_probe_for_token(
                 &arena, t0
             ))
+        );
+        let mut hop_amounts = hop_amounts_zeroed(edges.len());
+        hop_amounts[0] = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
+        assert_eq!(
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts, U256::ZERO),
+            Some(HopFidelityReject::ShallowCl(0))
         );
     }
 

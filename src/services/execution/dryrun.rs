@@ -14,6 +14,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct DryRunResult {
+    pub semantic_success: bool,
     pub success: bool,
     pub gas_used: Option<u64>,
     /// Exact post-repayment profit returned by executors that support it.
@@ -83,6 +84,7 @@ fn is_gas_limit_rpc_error(msg: &str) -> bool {
 
 fn gas_overflow_dry_run_success(realized_profit: Option<U256>) -> DryRunResult {
     DryRunResult {
+        semantic_success: true,
         success: true,
         gas_used: None,
         realized_profit,
@@ -99,6 +101,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
     let tx = build_tx(candidate, from);
     match timeout(RPC_TIMEOUT, provider.estimate_gas(tx)).await {
         Ok(Ok(gas)) => DryRunResult {
+            semantic_success: true,
             success: true,
             gas_used: Some(gas),
             realized_profit: None,
@@ -109,6 +112,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
             gas_overflow_dry_run_success(None)
         }
         Ok(Err(err)) => DryRunResult {
+            semantic_success: false,
             success: false,
             gas_used: None,
             realized_profit: None,
@@ -175,6 +179,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                     }
                 });
             return DryRunResult {
+                semantic_success: false,
                 success: false,
                 gas_used: None,
                 realized_profit: None,
@@ -184,6 +189,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
         }
         Err(_) => {
             return DryRunResult {
+                semantic_success: false,
                 success: false,
                 gas_used: None,
                 realized_profit: None,
@@ -196,6 +202,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
     let tx = build_tx(candidate, from);
     match timeout(RPC_TIMEOUT, provider.estimate_gas(tx)).await {
         Ok(Ok(gas)) => DryRunResult {
+            semantic_success: true,
             success: true,
             gas_used: Some(gas),
             realized_profit,
@@ -210,6 +217,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 return gas_overflow_dry_run_success(realized_profit);
             }
             DryRunResult {
+                semantic_success: false,
                 success: false,
                 gas_used: None,
                 realized_profit: None,
@@ -222,6 +230,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 gas_overflow_dry_run_success(realized_profit)
             } else {
                 DryRunResult {
+                    semantic_success: false,
                     success: false,
                     gas_used: None,
                     realized_profit: None,
@@ -263,6 +272,8 @@ mod tests {
             hop_count: 2,
             safety_multiplier_bps: 30_000,
             state_generation: 1,
+            state_block: 1,
+            state_hash: None,
         };
 
         let tx = build_tx(&candidate, Address::repeat_byte(3));

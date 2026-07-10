@@ -114,6 +114,19 @@ pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
     Ok(())
 }
 
+/// Dispatch/Brent final check: pinned-at-floor can be a real high-ROI arb on shallow pools.
+/// Retry without the Brent pin heuristic (same as probe fallback).
+pub fn check_sim_sanity_for_dispatch(input: SimSanityInput) -> Result<(), SimSanityReject> {
+    match check_sim_sanity(input) {
+        Ok(()) => Ok(()),
+        Err(SimSanityReject::OptimizerPinnedAtFloor) => check_sim_sanity(SimSanityInput {
+            search_low: U256::ZERO,
+            ..input
+        }),
+        Err(reason) => Err(reason),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +166,26 @@ mod tests {
             }),
             Err(SimSanityReject::InsaneProfitMatic)
         ));
+    }
+
+    #[test]
+    fn dispatch_sanity_allows_pinned_high_roi_when_probe_fallback_would() {
+        let rate = U256::from(10u128.pow(18));
+        let economic = min_economic_amount_in(18, rate);
+        let amount_in = economic;
+        let profit = amount_in / U256::from(5u64);
+        let input = SimSanityInput {
+            amount_in,
+            gross_profit: profit,
+            search_low: economic,
+            token_decimals: 18,
+            token_to_matic_rate: rate,
+        };
+        assert!(matches!(
+            check_sim_sanity(input),
+            Err(SimSanityReject::OptimizerPinnedAtFloor)
+        ));
+        assert!(check_sim_sanity_for_dispatch(input).is_ok());
     }
 
     #[test]

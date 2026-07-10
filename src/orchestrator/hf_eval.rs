@@ -15,7 +15,8 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
 use crate::pipeline::local_sim::{self, simulate_route_detailed, simulate_route_minimal};
 use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, max_flash_borrow_wei, min_economic_amount_in,
+    SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch, max_flash_borrow_wei,
+    min_economic_amount_in,
 };
 use crate::pipeline::spot_price::{spot_probe_for_decimals, spot_probe_for_token};
 use crate::pipeline::ternary::{RouteGasCosting, optimize_cycle};
@@ -946,12 +947,15 @@ fn evaluate_one(
     } else {
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
     };
-    if probe_only {
-        assessment.should_execute = false;
-        assessment.reject_reason = Some(
-            assessment
-                .reject_reason
-                .unwrap_or_else(|| "Brent did not converge; probe-only assessment".into()),
+    if probe_only && !assessment.should_execute {
+        assessment.reject_reason = assessment
+            .reject_reason
+            .or_else(|| Some("Brent did not converge; probe-only assessment".into()));
+    } else if probe_only {
+        crate::info!(
+            "hf probe-dispatch: fp={fp} input={} net_matic={} (Brent fallback, probe sizing validated)",
+            opt.optimal_input,
+            assessment.net_profit_after_gas_matic_wei,
         );
     }
 
@@ -1025,7 +1029,7 @@ fn validate_optimized_sim(
         && local_sim::route_hop_fidelity_ok(input.arena, &cycle.edges, &sim.hop_amounts, spot_probe)
         && !sim.profit.is_zero()
         && within_flash_cap
-        && check_sim_sanity(SimSanityInput {
+        && check_sim_sanity_for_dispatch(SimSanityInput {
             amount_in: sim.amount_in,
             gross_profit: sim.profit,
             search_low,

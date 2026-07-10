@@ -872,4 +872,17 @@ mod tests {
             Ok(())
         });
     }
+
+    #[test]
+    fn load_fails_closed_for_invalid_config_path() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("DOTENV_PATH", "/non/existent/.env.for.test");
+            jail.create_file("invalid.toml", "this is not toml\n")?;
+            jail.set_env("CONFIG_PATH", "invalid.toml");
+            let result = AppConfig::load();
+            assert!(result.is_err());
+            Ok(())
+        });
+    }
 }

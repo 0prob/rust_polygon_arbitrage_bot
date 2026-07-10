@@ -6,12 +6,14 @@ use super::fixed_point::ONE;
 const WOOFI_FEE_DENOMINATOR: U256 = U256::from_limbs([100_000, 0, 0, 0]);
 
 fn mul_div_triple(a: U256, b: U256, c: U256, d: U256, e: U256) -> U256 {
-    if let Some(ab) = a.checked_mul(b)
-        && let Some(abc) = ab.checked_mul(c)
-        && let Some(de) = d.checked_mul(e)
-        && !de.is_zero()
-    {
-        return abc / de;
+    if let Some(ab) = a.checked_mul(b) {
+        if let Some(abc) = ab.checked_mul(c) {
+            if let Some(de) = d.checked_mul(e) {
+                if !de.is_zero() {
+                    return abc / de;
+                }
+            }
+        }
     }
     // U512 fallback: if the division result exceeds U256::MAX, return zero.
     let result = U512::from(a) * U512::from(b) * U512::from(c) / (U512::from(d) * U512::from(e));
@@ -311,6 +313,30 @@ mod tests {
         let out = get_woofi_amount_out(&state, amount_in, false, false, Some(0), Some(1));
 
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn quote_path_requires_feasible_oracle_state_and_reserve() {
+        let state = WoofiPoolState {
+            tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+            quote_reserve: U256::ZERO,
+            base_states: vec![base_state(
+                U256::from(1_000_000u64) * U256::from(10u128.pow(18)),
+            )],
+            fee: U256::ZERO,
+        };
+
+        assert_eq!(
+            get_woofi_amount_out(
+                &state,
+                U256::from(10u64) * U256::from(10u128.pow(18)),
+                false,
+                true,
+                Some(0),
+                None
+            ),
+            U256::ZERO
+        );
     }
 }
 

@@ -39,7 +39,7 @@ pub const WMATIC: Address = address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
 /// Oracle-priced hub tokens on Polygon.
 pub const POLYGON_HUB_TOKENS: [Address; 20] = [
     WMATIC,
-    address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f"),
+    address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
     address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
     address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"),
     address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"),
@@ -95,9 +95,11 @@ pub const GAS_V2_HOP: u32 = 110_000;
 pub const GAS_V3_BASE: u32 = 200_000;
 pub const GAS_V4_BASE: u32 = 220_000;
 pub const GAS_CURVE_HOP: u32 = 270_000;
-/// Balancer batchSwap high gas (2.6M/3.7M live). 1M base + buffers(5k bps)/observed. Raised from 400k after profit estimation
-/// was consistently overstating Balancer route profitability by 4-6x vs actual on-chain cost.
+/// Per-hop seed for mixed/Aave-flash Balancer vault swaps (each hop is a separate call).
 pub const GAS_BALANCER_HOP: u32 = 1_000_000;
+/// Single vault `batchSwap` for `executeArbDirect` (≤4 hops collapse to one call).
+/// Calibrated ~720k sim / 1.87M live on Polygon; HF ranking uses this + overhead (~800k for 2-hop).
+pub const GAS_BALANCER_DIRECT_BATCH: u32 = 580_000;
 pub const GAS_DODO_HOP: u32 = 200_000;
 pub const GAS_WOOFI_HOP: u32 = 160_000;
 /// Per-tick-crossed gas increment for V3/V4 pools.

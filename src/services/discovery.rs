@@ -180,11 +180,12 @@ fn resolve_pool_identity(
     // Prefer explicit `address` column for 20-byte pool contracts.
     if let Some(raw) = address_raw {
         let hex = raw.strip_prefix("0x").or(Some(raw));
-        if hex.is_some_and(|h| h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
-            && let Ok(addr) = raw.parse::<Address>()
-            && is_plausible_contract_address(addr)
-        {
-            address = addr;
+        if hex.is_some_and(|h| h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit())) {
+            if let Ok(addr) = raw.parse::<Address>() {
+                if is_plausible_contract_address(addr) {
+                    address = addr;
+                }
+            }
         }
     }
 
@@ -271,7 +272,7 @@ fn parse_pool_meta_impl(
         return None;
     }
 
-    let proto = resolve_protocol_from_pg(protocol, pool_type_raw);
+    let proto = resolve_protocol_from_pg(protocol, pool_type_raw)?;
     if !has_supported_token_shape(proto, &tokens) {
         return None;
     }

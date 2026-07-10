@@ -15,7 +15,7 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    dispatch_profitable_candidates, filter_balancer_onchain_verified,
+    dispatch_profitable_candidates, filter_balancer_onchain_verified, refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
@@ -493,6 +493,9 @@ pub async fn run_hf_tick(
         && let Some(executor) = ctx.config.execution.executor_address
         && let Ok(sim_provider) = ctx.rpc.connect_simulation()
     {
+        profitable =
+            refresh_and_resim_profitable(&ctx.refresh, &ctx.cache, &mut eval_arena, profitable)
+                .await;
         profitable = filter_balancer_onchain_verified(
             &ctx.execution,
             &eval_arena,
@@ -559,6 +562,8 @@ pub async fn run_hf_tick(
                 token_to_matic_rates: dispatch_token_to_matic_rates.as_ref(),
                 token_decimals: dispatch_token_decimals.as_ref(),
                 state_generation: evaluation_state_generation,
+                state_block: snap.state_block,
+                state_hash: snap.state_hash,
                 skip_dispatch_refresh: prefetch_ok,
             },
         )
