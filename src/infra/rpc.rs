@@ -227,7 +227,7 @@ impl RpcPool {
             tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()),
             tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()),
         );
-        let _block = block_res.ok().and_then(|r| r.ok());
+        let _block = block_res.ok().and_then(|r| r.ok())?;
         let chain_id = chain_res.ok().and_then(|r| r.ok())?;
         if chain_id != crate::core::constants::POLYGON_CHAIN_ID {
             return None;

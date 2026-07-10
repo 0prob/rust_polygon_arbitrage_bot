@@ -452,7 +452,14 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     let mut updated = 0usize;
     for (plan, start, end) in spans {
-        let slice = &results[start..end];
+        let Some(slice) = results.get(start..end) else {
+            crate::warn!(
+                "multicall batch returned {} results for {} requested items",
+                results.len(),
+                items.len()
+            );
+            return updated;
+        };
         if let Some(state) = decode_plan(plan, slice) {
             cache.insert(plan.pool.address, state);
             updated += 1;

@@ -22,9 +22,11 @@ struct WoofiMetaEntry {
 
 #[derive(Debug)]
 pub struct PoolMetaCache {
-    inner: RwLock<PoolMetaData>,
-    path: PathBuf,
-    write_seq: AtomicU64,
+    inner: std::sync::Arc<RwLock<PoolMetaData>>,
+    path: std::sync::Arc<PathBuf>,
+    write_seq: std::sync::Arc<AtomicU64>,
+    persist_revision: std::sync::Arc<AtomicU64>,
+    persist_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PoolMetaCache {
@@ -34,9 +36,11 @@ impl PoolMetaCache {
             .and_then(|raw| serde_json::from_slice(&raw).ok())
             .unwrap_or_default();
         Self {
-            inner: RwLock::new(data),
-            path,
-            write_seq: AtomicU64::new(0),
+            inner: std::sync::Arc::new(RwLock::new(data)),
+            path: std::sync::Arc::new(path),
+            write_seq: std::sync::Arc::new(AtomicU64::new(0)),
+            persist_revision: std::sync::Arc::new(AtomicU64::new(0)),
+            persist_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -79,19 +83,41 @@ impl PoolMetaCache {
     /// Clones data under read lock then releases it before serializing to prevent
     /// stalling concurrent `set_*` callers that need the write lock.
     fn persist(&self) {
-        let cloned = {
-            let data = self.inner.read();
-            (*data).clone()
-        };
-        let Ok(raw) = serde_json::to_vec(&cloned) else {
+        self.persist_revision.fetch_add(1, Ordering::AcqRel);
+        if self.persist_running.swap(true, Ordering::AcqRel) {
             return;
-        };
-        let path = self.path.clone();
-        let seq = self.write_seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.{seq}.tmp"));
+        }
+        let inner = std::sync::Arc::clone(&self.inner);
+        let path = std::sync::Arc::clone(&self.path);
+        let revision = std::sync::Arc::clone(&self.persist_revision);
+        let running = std::sync::Arc::clone(&self.persist_running);
+        let write_seq = std::sync::Arc::clone(&self.write_seq);
         tokio::task::spawn_blocking(move || {
-            if std::fs::write(&tmp, &raw).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+            loop {
+                let target_revision = revision.load(Ordering::Acquire);
+                let cloned = {
+                    let data = inner.read();
+                    (*data).clone()
+                };
+                let Ok(raw) = serde_json::to_vec(&cloned) else {
+                    running.store(false, Ordering::Release);
+                    return;
+                };
+                let seq = write_seq.fetch_add(1, Ordering::Relaxed);
+                let tmp = path.with_extension(format!("json.{seq}.tmp"));
+                let wrote = std::fs::write(&tmp, &raw).is_ok();
+                if wrote {
+                    let _ = std::fs::rename(&tmp, &*path);
+                }
+                if revision.load(Ordering::Acquire) == target_revision {
+                    running.store(false, Ordering::Release);
+                    if revision.load(Ordering::Acquire) == target_revision {
+                        break;
+                    }
+                    if running.swap(true, Ordering::AcqRel) {
+                        break;
+                    }
+                }
             }
         });
     }
