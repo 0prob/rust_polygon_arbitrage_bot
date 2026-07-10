@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -7,8 +8,11 @@ use alloy::primitives::U256;
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
-use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 
 use crate::abis::{IAaveV3Pool, IERC20Metadata};
 use crate::core::constants::{AAVE_V3_POOL, BALANCER_VAULT};
@@ -19,9 +23,7 @@ use crate::core::types::{
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
-use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, max_flash_borrow_wei,
-};
+use crate::pipeline::sim_sanity::{SimSanityInput, check_sim_sanity, max_flash_borrow_wei};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::flash_policy::FlashLoanPolicy;
@@ -80,99 +82,228 @@ struct CachedLiquidity {
     fetched_at: Instant,
 }
 
+/// Immutable, atomically published flash-liquidity map (LF/HF readers hold `Arc` snapshots).
+#[derive(Debug, Clone)]
+pub struct FlashLiquiditySnapshot {
+    generation: u64,
+    entries: FxHashMap<Address, CachedLiquidity>,
+}
+
+impl FlashLiquiditySnapshot {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn token_liquidity(&self, token: Address, ttl: Duration) -> TokenFlashLiquidity {
+        self.entries
+            .get(&token)
+            .filter(|e| e.fetched_at.elapsed() < ttl)
+            .map(|e| e.snapshot)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn tokens_liquidity(&self, tokens: &[Address], ttl: Duration) -> Vec<TokenFlashLiquidity> {
+        tokens
+            .iter()
+            .map(|token| self.token_liquidity(*token, ttl))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn has_fresh(&self, token: Address, ttl: Duration) -> bool {
+        self.entries
+            .get(&token)
+            .is_some_and(|e| e.fetched_at.elapsed() < ttl)
+    }
+}
+
+impl Default for FlashLiquiditySnapshot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            entries: FxHashMap::default(),
+        }
+    }
+}
+
+/// Lock-free flash liquidity handoff: background refresh builds a new map, then `store`s it.
 #[derive(Debug)]
 pub struct FlashLiquidityCache {
-    entries: RwLock<FxHashMap<Address, CachedLiquidity>>,
+    inner: ArcSwap<FlashLiquiditySnapshot>,
     ttl: Duration,
     balancer_vault: Address,
     aave_pool: Address,
+    /// Tokens merged from HF/LF ticks for the background refresher.
+    hot_tokens: Mutex<FxHashSet<Address>>,
 }
 
 impl FlashLiquidityCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(FxHashMap::default()),
+            inner: ArcSwap::from_pointee(FlashLiquiditySnapshot::default()),
             ttl: CACHE_TTL,
             balancer_vault: BALANCER_VAULT,
             aave_pool: AAVE_V3_POOL,
+            hot_tokens: Mutex::new(FxHashSet::default()),
         }
     }
-}
 
-impl Default for FlashLiquidityCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FlashLiquidityCache {
     #[must_use]
     pub fn with_addresses(balancer_vault: Address, aave_pool: Address) -> Self {
         Self {
-            entries: RwLock::new(FxHashMap::default()),
+            inner: ArcSwap::from_pointee(FlashLiquiditySnapshot::default()),
             ttl: CACHE_TTL,
             balancer_vault,
             aave_pool,
+            hot_tokens: Mutex::new(FxHashSet::default()),
         }
     }
 
-    pub fn snapshot(&self, token: Address) -> TokenFlashLiquidity {
-        self.snapshots_for(std::slice::from_ref(&token))
-            .first()
-            .copied()
-            .unwrap_or_default()
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        self.ttl
     }
 
-    /// Batch-read flash liquidity under a single lock (hot path for cycle ranking).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.load().generation
+    }
+
+    /// Latest published snapshot — lock-free; safe to call on every route evaluation.
+    pub fn load(&self) -> Arc<FlashLiquiditySnapshot> {
+        self.inner.load_full()
+    }
+
+    fn publish(&self, entries: FxHashMap<Address, CachedLiquidity>) {
+        let generation = self.inner.load().generation.saturating_add(1);
+        self.inner.store(Arc::new(FlashLiquiditySnapshot {
+            generation,
+            entries,
+        }));
+    }
+
+    /// Merge tokens into the background refresher's hot set.
+    pub fn track_hot_tokens(&self, tokens: &[Address]) {
+        let mut hot = self.hot_tokens.lock();
+        for token in tokens {
+            hot.insert(*token);
+        }
+    }
+
+    fn hot_token_list(&self) -> Vec<Address> {
+        self.hot_tokens.lock().iter().copied().collect()
+    }
+
+    pub fn snapshot(&self, token: Address) -> TokenFlashLiquidity {
+        let snap = self.inner.load();
+        snap.token_liquidity(token, self.ttl)
+    }
+
+    /// Batch-read flash liquidity from the current published snapshot.
     #[must_use]
     pub fn snapshots_for(&self, tokens: &[Address]) -> Vec<TokenFlashLiquidity> {
-        let guard = self.entries.read();
-        tokens
-            .iter()
-            .map(|token| {
-                guard
-                    .get(token)
-                    .filter(|e| e.fetched_at.elapsed() < self.ttl)
-                    .map(|e| e.snapshot)
-                    .unwrap_or_default()
-            })
-            .collect()
+        let snap = self.inner.load();
+        snap.tokens_liquidity(tokens, self.ttl)
     }
 
     #[must_use]
     pub fn has_fresh_entry(&self, token: Address) -> bool {
-        let guard = self.entries.read();
-        guard
-            .get(&token)
-            .is_some_and(|e| e.fetched_at.elapsed() < self.ttl)
+        let snap = self.inner.load();
+        snap.has_fresh(token, self.ttl)
     }
 
-    /// Drop cached liquidity so the next HF tick re-fetches (e.g. after ReserveInactive).
+    /// Drop cached liquidity so the next refresh re-fetches (e.g. after ReserveInactive).
     pub fn invalidate(&self, token: Address) {
-        self.entries.write().remove(&token);
+        self.invalidate_batch(std::slice::from_ref(&token));
+    }
+
+    /// Drop stale entries for a refresh batch that failed or timed out.
+    pub fn invalidate_batch(&self, tokens: &[Address]) {
+        let current = self.inner.load_full();
+        let mut next = current.entries.clone();
+        for token in tokens {
+            next.remove(token);
+        }
+        self.publish(next);
+    }
+
+    /// Pin Aave as inactive after on-chain `ReserveInactive` so HF eval stops routing through it.
+    pub fn mark_aave_inactive(&self, token: Address) {
+        let current = self.inner.load_full();
+        let mut next = current.entries.clone();
+        let prior = next
+            .get(&token)
+            .map(|e| e.snapshot)
+            .unwrap_or_default();
+        next.insert(
+            token,
+            CachedLiquidity {
+                snapshot: TokenFlashLiquidity {
+                    balancer: prior.balancer,
+                    aave: U256::ZERO,
+                    aave_listed: false,
+                    dodo: prior.dodo,
+                },
+                fetched_at: Instant::now(),
+            },
+        );
+        self.publish(next);
+    }
+
+    pub fn start_background(
+        self: Arc<Self>,
+        provider: alloy::providers::DynProvider,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let poll = self.ttl;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(poll);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let tokens = self.hot_token_list();
+                        if tokens.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = self.refresh(&provider, &tokens).await {
+                            crate::debug!("background flash liquidity refresh failed: {e:#}");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn refresh<P: Provider<Ethereum> + Clone + Send + 'static>(
         &self,
         provider: &P,
         tokens: &[Address],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        self.track_hot_tokens(tokens);
+        let current = self.inner.load_full();
         let mut to_fetch = Vec::with_capacity(tokens.len());
         let now = Instant::now();
-        {
-            let guard = self.entries.read();
-            for token in tokens {
-                let stale = guard
-                    .get(token)
-                    .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= self.ttl);
-                if stale {
-                    to_fetch.push(*token);
-                }
+        for token in tokens {
+            let stale = current
+                .entries
+                .get(token)
+                .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= self.ttl);
+            if stale {
+                to_fetch.push(*token);
             }
         }
         if to_fetch.is_empty() {
-            return Ok(());
+            return Ok(current.generation);
         }
 
         let mut items = Vec::with_capacity(to_fetch.len() * 2);
@@ -221,7 +352,7 @@ impl FlashLiquidityCache {
             execute_multicall(provider, &aave_items).await?
         };
 
-        let mut guard = self.entries.write();
+        let mut next_entries = current.entries.clone();
         let mut aave_index = 0usize;
         for (i, token) in to_fetch.iter().enumerate() {
             let base = i * 2;
@@ -234,7 +365,7 @@ impl FlashLiquidityCache {
             } else {
                 U256::ZERO
             };
-            guard.insert(
+            next_entries.insert(
                 *token,
                 CachedLiquidity {
                     snapshot: TokenFlashLiquidity {
@@ -247,7 +378,14 @@ impl FlashLiquidityCache {
                 },
             );
         }
-        Ok(())
+        self.publish(next_entries);
+        Ok(self.generation())
+    }
+}
+
+impl Default for FlashLiquidityCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -326,7 +464,8 @@ pub fn rotate_cycle_to_start(cycle: &FoundCycle, new_start: TokenIndex) -> Optio
 pub fn cycle_has_aave_listed_token(
     cycle: &FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
 ) -> bool {
     let mut addrs = Vec::with_capacity(cycle.edges.len());
     for edge in &cycle.edges {
@@ -334,10 +473,32 @@ pub fn cycle_has_aave_listed_token(
             addrs.push(addr);
         }
     }
-    flash_liquidity
-        .snapshots_for(&addrs)
+    flash
+        .tokens_liquidity(&addrs, ttl)
         .into_iter()
         .any(|liquidity| liquidity.aave_listed && !liquidity.aave.is_zero())
+}
+
+fn cycle_flash_cache_warm(
+    cycle: &FoundCycle,
+    arena: &StateArena,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
+) -> bool {
+    let mut seen = rustc_hash::FxHashSet::default();
+    for edge in &cycle.edges {
+        let token = edge.token_in;
+        if !seen.insert(token) {
+            continue;
+        }
+        let Some(addr) = arena.token_address(token) else {
+            continue;
+        };
+        if flash.has_fresh(addr, ttl) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Mixed Balancer routes need an Aave-listed token for flash borrow. Pure Balancer routes
@@ -345,7 +506,8 @@ pub fn cycle_has_aave_listed_token(
 pub fn balancer_route_flash_feasible(
     cycle: &FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
 ) -> bool {
     if !route_uses_balancer_vault_swap(cycle) {
         return true;
@@ -353,14 +515,19 @@ pub fn balancer_route_flash_feasible(
     if route_is_balancer_only(cycle) {
         return true;
     }
-    cycle_has_aave_listed_token(cycle, arena, flash_liquidity)
+    // ponytail: cold cache must not reject every mixed Balancer route before refresh lands.
+    if !cycle_flash_cache_warm(cycle, arena, flash, ttl) {
+        return true;
+    }
+    cycle_has_aave_listed_token(cycle, arena, flash, ttl)
 }
 /// Mixed Balancer routes forbid Balancer flash loans (`BalancerVaultReentrancy`). Prefer an Aave-listed token
 /// already present in the cycle as the flash borrow asset.
 pub fn prefer_aave_flash_start<'a>(
     cycle: &'a FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
 ) -> Cow<'a, FoundCycle> {
     if !route_uses_balancer_vault_swap(cycle) {
         return Cow::Borrowed(cycle);
@@ -380,7 +547,7 @@ pub fn prefer_aave_flash_start<'a>(
         token_addrs.push(addr);
         token_indices.push(token);
     }
-    let snapshots = flash_liquidity.snapshots_for(&token_addrs);
+    let snapshots = flash.tokens_liquidity(&token_addrs, ttl);
     let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
     for (liq, token) in snapshots.into_iter().zip(token_indices) {
         if liq.aave_listed {
@@ -537,10 +704,11 @@ fn plan_single(
 fn flash_liquidity_for_cycle(
     cycle: &FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
 ) -> Option<TokenFlashLiquidity> {
     let start_addr = arena.token_address(cycle.start_token)?;
-    let snapshot = flash_liquidity.snapshot(start_addr);
+    let snapshot = flash.token_liquidity(start_addr, ttl);
     let route_cap = route_balancer_flash_capacity(arena, cycle);
     Some(TokenFlashLiquidity {
         balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
@@ -557,7 +725,8 @@ fn flash_liquidity_for_cycle(
 pub fn resolve_flash_source_for_cycle(
     cycle: &FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
     policy: FlashLoanPolicy,
     amount_in: U256,
 ) -> Option<FlashLoanSource> {
@@ -565,7 +734,7 @@ pub fn resolve_flash_source_for_cycle(
         return None;
     }
     let start_addr = arena.token_address(cycle.start_token)?;
-    let liquidity = flash_liquidity_for_cycle(cycle, arena, flash_liquidity)?;
+    let liquidity = flash_liquidity_for_cycle(cycle, arena, flash, ttl)?;
     let forbid = route_uses_balancer_vault_swap(cycle);
     let balancer_only = route_is_balancer_only(cycle);
     let plan = plan_flash_loan(policy, amount_in, liquidity, forbid, balancer_only);
@@ -576,7 +745,7 @@ pub fn resolve_flash_source_for_cycle(
             if balancer_only && forbid {
                 Some(FlashLoanSource::Direct)
             } else {
-                if flash_liquidity.has_fresh_entry(start_addr) {
+                if flash.has_fresh(start_addr, ttl) {
                     crate::debug!(
                         "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={} dodo={}",
                         liquidity.balancer,
@@ -820,6 +989,8 @@ fn reoptimize_capped(
         input.safety_multiplier_bps,
     );
     profit_ctx.gas_scale_bps = 10_000;
+    profit_ctx.hop_count = input.evaluated.cycle.hop_count;
+    profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
         input.gas_oracle,
         [input.route_fingerprint],
@@ -882,7 +1053,9 @@ fn reoptimize_capped(
     })
 }
 
-fn prepare_profit_thresholds(input: &PrepareDispatchInput<'_>) -> crate::services::execution::profit::ProfitThresholds {
+fn prepare_profit_thresholds(
+    input: &PrepareDispatchInput<'_>,
+) -> crate::services::execution::profit::ProfitThresholds {
     route_profit_thresholds(
         input.min_profit_matic,
         input.min_profit_roi_bps,
@@ -1099,7 +1272,9 @@ mod tests {
             U256::from(1u128 << AAVE_CFG_ACTIVE_BIT) | U256::from(1u128 << AAVE_CFG_FLASH_BIT);
         assert!(aave_reserve_flash_eligible(active_flash));
         assert!(!aave_reserve_flash_eligible(U256::ZERO));
-        assert!(!aave_reserve_flash_eligible(U256::from(1u128 << AAVE_CFG_FLASH_BIT)));
+        assert!(!aave_reserve_flash_eligible(U256::from(
+            1u128 << AAVE_CFG_FLASH_BIT
+        )));
         let frozen = active_flash | U256::from(1u128 << AAVE_CFG_FROZEN_BIT);
         assert!(!aave_reserve_flash_eligible(frozen));
         let paused = active_flash | U256::from(1u128 << AAVE_CFG_PAUSED_BIT);
@@ -1114,7 +1289,13 @@ mod tests {
             aave_listed: true,
             dodo: U256::ZERO,
         };
-        let unit = plan_flash_loan(FlashLoanPolicy::Auto, U256::from(1u64), liquidity, false, false);
+        let unit = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1u64),
+            liquidity,
+            false,
+            false,
+        );
         let economic = plan_flash_loan(
             FlashLoanPolicy::Auto,
             U256::from(1_000u64),
@@ -1130,17 +1311,52 @@ mod tests {
 
     #[test]
     fn prepare_thresholds_apply_route_risk_multiplier() {
-        let thresholds = route_profit_thresholds(
-            U256::from(10_000_000_000_000_000u64),
-            0,
-            10_000,
-            0,
-            30_000,
-        );
+        let thresholds =
+            route_profit_thresholds(U256::from(10_000_000_000_000_000u64), 0, 10_000, 0, 30_000);
         assert_eq!(
             thresholds.min_profit_matic_wei,
             U256::from(30_000_000_000_000_000u64)
         );
+    }
+
+    impl FlashLiquidityCache {
+        fn seed_token(&self, token: Address, liquidity: TokenFlashLiquidity) {
+            let current = self.load();
+            let mut next = current.entries.clone();
+            next.insert(
+                token,
+                CachedLiquidity {
+                    snapshot: liquidity,
+                    fetched_at: Instant::now(),
+                },
+            );
+            let generation = current.generation.saturating_add(1);
+            self.inner.store(Arc::new(FlashLiquiditySnapshot {
+                generation,
+                entries: next,
+            }));
+        }
+    }
+
+    #[test]
+    fn mark_aave_inactive_pins_negative_snapshot() {
+        let cache = FlashLiquidityCache::new();
+        let token = Address::repeat_byte(0xcd);
+        cache.seed_token(
+            token,
+            TokenFlashLiquidity {
+                balancer: U256::from(1_000u64),
+                aave: U256::from(5_000u64),
+                aave_listed: true,
+                dodo: U256::MAX,
+            },
+        );
+        cache.mark_aave_inactive(token);
+        let liquidity = cache.snapshot(token);
+        assert!(!liquidity.aave_listed);
+        assert!(liquidity.aave.is_zero());
+        assert_eq!(liquidity.balancer, U256::from(1_000u64));
+        assert!(cache.has_fresh_entry(token));
     }
 
     #[test]

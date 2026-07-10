@@ -6,10 +6,18 @@ async fn main() -> anyhow::Result<()> {
     rpbot::log::init();
     rpbot::log::set_stderr_enabled(false);
 
-    let (bridge, rx) = TuiBridge::channel();
+    let (bridge, rx, snapshot_rx) = TuiBridge::channel();
     let hook = bridge.hook();
 
-    let ctx = bootstrap(Some(hook)).await?;
+    #[cfg(feature = "tui")]
+    {
+        let ctx = bootstrap(Some(hook), Some(bridge.snapshot_sender())).await?;
+        return run_tui(ctx, bridge, rx, snapshot_rx).await;
+    }
 
-    run_tui(ctx, bridge, rx).await
+    #[cfg(not(feature = "tui"))]
+    {
+        let ctx = bootstrap(Some(hook)).await?;
+        run_tui(ctx, bridge, rx, snapshot_rx).await
+    }
 }

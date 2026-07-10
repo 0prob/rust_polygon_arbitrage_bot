@@ -35,9 +35,6 @@ use crate::services::discovery::{
 pub fn apply_event(app: &mut App, event: UiEvent) {
     match event {
         UiEvent::Input(input) => handle_input(app, &input),
-        UiEvent::Snapshot(snapshot) => {
-            app.set_snapshot(*snapshot);
-        }
         UiEvent::LfTick {
             search_ms,
             discoveries,
@@ -212,6 +209,10 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             0.0
         },
         snapshot_age_ms: 0,
+        rates_age_ms: input
+            .snapshot
+            .rates_built_at
+            .map_or(u64::MAX, |t| t.elapsed().as_millis() as u64),
     };
 
     let graph = build_graph_snapshot(
@@ -376,12 +377,7 @@ fn build_routes(
             resolve_token_to_matic_rate(cycle.start_token, snapshot.token_to_matic_rates.as_ref());
         let decimals = arena.token_decimals(cycle.start_token);
         let amount_in = min_economic_amount_in(decimals, rate);
-        // Negative graph score ⇒ candidate arb; skip sim for clearly unprofitable routes.
-        let sim = if cycle.score < 0.0 {
-            simulate_route_minimal(arena, &cycle.edges, amount_in)
-        } else {
-            None
-        };
+        let sim = simulate_route_minimal(arena, &cycle.edges, amount_in);
         let simulation_available = sim.is_some();
         let (amount_out_token, gross_profit_token, gas_estimate) = match sim {
             Some(ref sim) => (sim.amount_out, sim.profit, sim.total_gas),
@@ -813,12 +809,67 @@ fn kv(key: impl Into<String>, value: impl Into<String>, severity: Severity) -> K
 
 #[cfg(test)]
 mod tests {
-    use super::format_amount;
-    use alloy::primitives::U256;
+    use super::{build_routes, format_amount};
+    use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolState, ProtocolType, V2PoolState};
+    use crate::pipeline::arena::StateArena;
+    use crate::services::hf_snapshot::HfSnapshot;
+    use alloy::primitives::{Address, U256};
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
 
     #[test]
     fn format_amount_preserves_fractional_leading_zeroes() {
         assert_eq!(format_amount(U256::from(1_005_000u64), 6), "1.005");
         assert_eq!(format_amount(U256::from(5_000u64), 6), "0.005");
+    }
+
+    #[test]
+    fn build_routes_populates_simulation_values_for_positive_score_cycles() {
+        let mut arena = StateArena::default();
+        let token_in = arena.register_token(Address::from([1u8; 20]));
+        let token_out = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000_000_000_000_000_000_000u128),
+                reserve1: U256::from(2_000_000_000_000_000_000_000_000u128),
+                fee: U256::from(30u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let cycle = FoundCycle {
+            start_token: token_in,
+            edges: CycleEdges::from_slice(&[Edge {
+                pool_index: pool,
+                token_in,
+                token_out,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 1.0,
+            cycle_ratio: U256::ZERO,
+        };
+        let mut token_to_matic_rates = FxHashMap::default();
+        token_to_matic_rates.insert(token_in, U256::from(1_000_000_000_000_000_000u128));
+        token_to_matic_rates.insert(token_out, U256::from(1_000_000_000_000_000_000u128));
+
+        let snapshot = HfSnapshot {
+            arena: arena.clone(),
+            cycles: vec![Arc::new(cycle)],
+            token_to_matic_rates: Arc::new(token_to_matic_rates),
+            ..Default::default()
+        };
+        let routes = build_routes(&snapshot, &arena, 0.0, None, 50, 10_000, 8);
+        assert_eq!(routes.len(), 1);
+        assert_ne!(routes[0].amount_out_token, "n/a");
+        assert!(!routes[0].route.is_empty());
+        assert!(routes[0].route.contains("->"));
     }
 }

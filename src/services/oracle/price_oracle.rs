@@ -6,7 +6,7 @@ use alloy::primitives::U256;
 use alloy::primitives::{Address, I256, address};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
@@ -36,7 +36,8 @@ const PYTH_MATIC_USD_ID: &str = "ffd11c5a1cfd42f80afb2df4d9f264c15f956d681533353
 /// Zero rates are rejected downstream by MIN_TOKEN_TO_MATIC_RATE — no trade
 /// executes without a real price. The real MATIC/USD is fetched every tick.
 const DEFAULT_MATIC_USD: f64 = 0.0;
-const CACHE_TTL: Duration = Duration::from_secs(10);
+#[allow(dead_code)]
+const DEFAULT_CACHE_TTL_MS: u64 = 10_000;
 
 #[derive(Clone, Copy)]
 struct TokenFeed {
@@ -81,6 +82,46 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("b0948a5e5313200c632b51bb5ca32f6de0d36e9950a942d19751e833f70dabfd"),
     },
+    TokenFeed {
+        token: address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
+        chainlink: None,
+        pyth_id: Some("8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221"),
+    },
+    TokenFeed {
+        token: address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),
+        chainlink: None,
+        pyth_id: Some("2b9ab1e972a281585084148ba1389800799bd4be63b957507db1349314e47445"),
+    },
+    TokenFeed {
+        token: address!("0x172370d5cd63279efa6d502dab29171933a610af"),
+        chainlink: None,
+        pyth_id: Some("a19d04ac696c7a6616d291c7e5d1377cc8be437c327b75adb5dc1bad745fcae8"),
+    },
+    TokenFeed {
+        token: address!("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a"),
+        chainlink: None,
+        pyth_id: Some("26e4f737fde0263a9eea10ae63ac36dcedab2aaf629261a994e1eeb6ee0afe53"),
+    },
+    TokenFeed {
+        token: address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
+        chainlink: None,
+        pyth_id: Some("07ad7b4a7662d19a6bc675f6b467172d2f3947fa653ca97555a9b20236406628"),
+    },
+    TokenFeed {
+        token: address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
+        chainlink: None,
+        pyth_id: Some("cb7a1d45139117f8d3da0a4b67264579aa905e3b124efede272634f094e1e9d1"),
+    },
+    TokenFeed {
+        token: address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
+        chainlink: None,
+        pyth_id: Some("1dfffdcbc958d732750f53ff7f06d24bb01364b3f62abea511a390c74b8d16a5"),
+    },
+    TokenFeed {
+        token: address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
+        chainlink: Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD868eE6b11a9")),
+        pyth_id: None,
+    },
 ];
 
 #[derive(Clone)]
@@ -100,11 +141,15 @@ pub struct PriceOracle {
     custom_pyth: parking_lot::RwLock<FxHashMap<Address, String>>,
     /// Config-driven Chainlink feed overrides (token -> aggregator address).
     custom_chainlink: parking_lot::RwLock<FxHashMap<Address, Address>>,
+    /// Configurable cache TTL — overrides DEFAULT_CACHE_TTL_MS.
+    cache_ttl: Duration,
+    /// Monotonic clock of the last successful rate-build across all tokens.
+    pub rates_updated_at: parking_lot::RwLock<Option<Instant>>,
 }
 
 impl PriceOracle {
     #[must_use]
-    pub fn new(http: Client, pyth_hermes_url: String) -> Self {
+    pub fn new(http: Client, pyth_hermes_url: String, cache_ttl_ms: u64) -> Self {
         Self {
             http,
             pyth_hermes_url,
@@ -113,6 +158,8 @@ impl PriceOracle {
             chainlink_usd_raw: parking_lot::RwLock::new(FxHashMap::default()),
             custom_pyth: parking_lot::RwLock::new(FxHashMap::default()),
             custom_chainlink: parking_lot::RwLock::new(FxHashMap::default()),
+            cache_ttl: Duration::from_millis(cache_ttl_ms),
+            rates_updated_at: parking_lot::RwLock::new(None),
         }
     }
 
@@ -124,15 +171,15 @@ impl PriceOracle {
         self.custom_chainlink.write().insert(token, feed);
     }
 
-    fn fresh(entry: &PriceEntry) -> bool {
-        entry.updated_at.elapsed() < CACHE_TTL
+    fn fresh(&self, entry: &PriceEntry) -> bool {
+        entry.updated_at.elapsed() < self.cache_ttl
     }
 
     pub fn cached_matic_usd(&self) -> Option<f64> {
         self.matic_usd
             .read()
             .as_ref()
-            .filter(|entry| Self::fresh(entry))
+            .filter(|entry| self.fresh(entry))
             .map(|entry| entry.value)
     }
 
@@ -140,7 +187,7 @@ impl PriceOracle {
         {
             let cache = self.matic_usd.read();
             if let Some(entry) = cache.as_ref()
-                && Self::fresh(entry)
+                && self.fresh(entry)
             {
                 return entry.value;
             }
@@ -183,7 +230,7 @@ impl PriceOracle {
         {
             let cache = self.matic_usd.read();
             if let Some(entry) = cache.as_ref()
-                && Self::fresh(entry)
+                && self.fresh(entry)
             {
                 return entry.value;
             }
@@ -206,7 +253,7 @@ impl PriceOracle {
             let cache = self.token_usd.read();
             for token in tokens {
                 if let Some(entry) = cache.get(token)
-                    && Self::fresh(entry)
+                    && self.fresh(entry)
                 {
                     continue;
                 }
@@ -233,24 +280,21 @@ impl PriceOracle {
             let mut cache = self.token_usd.write();
             let mut chainlink_raw = self.chainlink_usd_raw.write();
             for (id, tokens) in pyth_ids {
-                let Some(usd) = prices.get(&id).copied() else {
+                let Some(quote) = prices.get(&id) else {
                     continue;
                 };
-                if usd <= 0.0 {
+                if quote.usd <= 0.0 {
                     continue;
                 }
-                let raw = usd_to_chainlink_raw(usd);
                 for token in tokens {
                     cache.insert(
                         token,
                         PriceEntry {
-                            value: usd,
+                            value: quote.usd,
                             updated_at: now,
                         },
                     );
-                    if let Some(raw) = raw {
-                        chainlink_raw.insert(token, raw);
-                    }
+                    chainlink_raw.insert(token, quote.chainlink_raw);
                 }
             }
         }
@@ -266,7 +310,7 @@ impl PriceOracle {
             let cache = self.token_usd.read();
             for token in tokens {
                 if let Some(entry) = cache.get(token)
-                    && Self::fresh(entry)
+                    && self.fresh(entry)
                 {
                     continue;
                 }
@@ -330,7 +374,7 @@ impl PriceOracle {
         {
             let cache = self.token_usd.read();
             for token in &need {
-                if cache.get(token).is_some_and(Self::fresh) {
+                if cache.get(token).is_some_and(|e| self.fresh(e)) {
                     continue;
                 }
                 if let Some(id) = self.pyth_feed_dyn(token) {
@@ -345,24 +389,21 @@ impl PriceOracle {
                 let mut cache = self.token_usd.write();
                 let mut chainlink_raw = self.chainlink_usd_raw.write();
                 for (id, tokens) in pyth_ids {
-                    let Some(usd) = prices.get(&id).copied() else {
+                    let Some(quote) = prices.get(&id) else {
                         continue;
                     };
-                    if usd <= 0.0 {
+                    if quote.usd <= 0.0 {
                         continue;
                     }
-                    let raw = usd_to_chainlink_raw(usd);
                     for token in tokens {
                         cache.insert(
                             token,
                             PriceEntry {
-                                value: usd,
+                                value: quote.usd,
                                 updated_at: now,
                             },
                         );
-                        if let Some(raw) = raw {
-                            chainlink_raw.insert(token, raw);
-                        }
+                        chainlink_raw.insert(token, quote.chainlink_raw);
                     }
                 }
             }
@@ -381,11 +422,14 @@ impl PriceOracle {
 
     async fn fetch_pyth_matic_usd(&self) -> Option<f64> {
         let prices = self.fetch_pyth(&[PYTH_MATIC_USD_ID]).await.ok()?;
-        let usd = prices.get(PYTH_MATIC_USD_ID).copied()?;
-        (usd > 0.0).then_some(usd)
+        let quote = prices.get(PYTH_MATIC_USD_ID)?;
+        self.chainlink_usd_raw
+            .write()
+            .insert(WMATIC, quote.chainlink_raw);
+        (quote.usd > 0.0).then_some(quote.usd)
     }
 
-    async fn fetch_pyth(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, f64>> {
+    async fn fetch_pyth(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -400,20 +444,11 @@ impl PriceOracle {
         }
     }
 
-    async fn fetch_pyth_once(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, f64>> {
+    async fn fetch_pyth_once(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut url = reqwest::Url::parse(&format!(
-            "{}/v2/updates/price/latest",
-            self.pyth_hermes_url.trim_end_matches('/')
-        ))?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for id in ids {
-                pairs.append_pair("ids[]", id);
-            }
-        }
+        let url = pyth_updates_url(&self.pyth_hermes_url, ids)?;
         let resp = self
             .http
             .get(url)
@@ -424,13 +459,13 @@ impl PriceOracle {
         let body: PythHermesResponse = resp.json().await?;
         let mut out = HashMap::with_capacity(body.parsed.len());
         for item in body.parsed {
-            let Some(raw) = item.price.mantissa.as_f64() else {
+            let Some(mantissa) = item.price.mantissa.as_i128() else {
                 continue;
             };
-            let usd = raw * 10f64.powi(item.price.expo);
-            if usd > 0.0 {
-                out.insert(item.id, usd);
-            }
+            let Some(quote) = pyth_fields_to_quote(mantissa, item.price.expo) else {
+                continue;
+            };
+            out.insert(item.id, quote);
         }
         Ok(out)
     }
@@ -448,6 +483,22 @@ impl PriceOracle {
         let rate = chainlink_usd_to_matic_rate_per_unit(token_raw, matic_raw);
         if rate.is_zero() { None } else { Some(rate) }
     }
+}
+
+fn pyth_updates_url(base_url: &str, ids: &[&str]) -> anyhow::Result<Url> {
+    let mut url = Url::parse(&format!(
+        "{}/v2/updates/price/latest",
+        base_url.trim_end_matches('/')
+    ))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("encoding", "hex");
+        pairs.append_pair("parsed", "true");
+        for id in ids {
+            pairs.append_pair("ids[]", id);
+        }
+    }
+    Ok(url)
 }
 
 #[inline]
@@ -545,12 +596,54 @@ enum PythMantissa {
     Num(f64),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PythQuote {
+    usd: f64,
+    chainlink_raw: I256,
+}
+
 impl PythMantissa {
-    fn as_f64(&self) -> Option<f64> {
+    fn as_i128(&self) -> Option<i128> {
         match self {
             Self::Str(s) => s.parse().ok(),
-            Self::Num(n) => Some(*n),
+            Self::Num(n) => {
+                if *n > i128::MAX as f64 || *n < i128::MIN as f64 {
+                    None
+                } else {
+                    Some(*n as i128)
+                }
+            }
         }
+    }
+}
+
+/// Pyth mantissa×10^expo → Chainlink-style 8-decimal USD answer (integer only).
+#[must_use]
+fn pyth_to_chainlink_raw(mantissa: i128, expo: i32) -> Option<I256> {
+    if mantissa <= 0 {
+        return None;
+    }
+    let shift = expo + CHAINLINK_USD_DECIMALS as i32;
+    let raw_i128 = if shift >= 0 {
+        let factor = 10i128.checked_pow(shift as u32)?;
+        mantissa.checked_mul(factor)?
+    } else {
+        let divisor = 10i128.checked_pow((-shift) as u32)?;
+        mantissa.checked_div(divisor)?
+    };
+    if raw_i128 <= 0 {
+        return None;
+    }
+    I256::try_from(raw_i128).ok()
+}
+
+fn pyth_fields_to_quote(mantissa: i128, expo: i32) -> Option<PythQuote> {
+    let chainlink_raw = pyth_to_chainlink_raw(mantissa, expo)?;
+    let usd = chainlink_answer_to_usd(chainlink_raw)?;
+    if usd > 0.0 {
+        Some(PythQuote { usd, chainlink_raw })
+    } else {
+        None
     }
 }
 
@@ -605,9 +698,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pyth_to_chainlink_raw_matches_eight_decimal_usd() {
+        let raw = pyth_to_chainlink_raw(73_717_820, -8).expect("raw");
+        assert_eq!(raw, I256::from(U256::from(73_717_820u64)));
+        let quote = pyth_fields_to_quote(100_000_000, -8).expect("quote");
+        assert_eq!(quote.usd, 1.0);
+        assert_eq!(quote.chainlink_raw, I256::from(U256::from(100_000_000u64)));
+    }
+
+    #[test]
     fn usd_to_chainlink_raw_rounds_to_eight_decimals() {
         let raw = usd_to_chainlink_raw(0.7371782).expect("raw");
         assert_eq!(raw, I256::from(U256::from(73_717_820u64)));
+    }
+
+    #[test]
+    fn pyth_updates_url_requests_parsed_prices() {
+        let url =
+            pyth_updates_url("https://hermes.pyth.network/", &["feed-a", "feed-b"]).expect("url");
+        let query = url.query().expect("query");
+        assert!(query.contains("encoding=hex"));
+        assert!(query.contains("parsed=true"));
+        assert!(query.contains("ids%5B%5D=feed-a"));
+        assert!(query.contains("ids%5B%5D=feed-b"));
+    }
+
+    #[test]
+    fn built_in_pyth_feeds_cover_extended_polygon_tokens() {
+        let tokens = [
+            address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
+            address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),
+            address!("0x172370d5cd63279efa6d502dab29171933a610af"),
+            address!("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a"),
+            address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
+            address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
+            address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
+        ];
+        assert!(tokens.iter().all(|token| pyth_feed(token).is_some()));
     }
 
     #[tokio::test]
@@ -616,6 +743,7 @@ mod tests {
         let oracle = PriceOracle::new(
             reqwest::Client::new(),
             "https://hermes.pyth.network".to_string(),
+            DEFAULT_CACHE_TTL_MS,
         );
         let usd = oracle.get_matic_usd_offline().await;
         assert!(usd > 0.01 && usd < 100.0, "MATIC/USD: {usd}");
@@ -633,6 +761,7 @@ mod tests {
         let oracle = PriceOracle::new(
             reqwest::Client::new(),
             "https://hermes.pyth.network".to_string(),
+            DEFAULT_CACHE_TTL_MS,
         );
         oracle
             .chainlink_usd_raw

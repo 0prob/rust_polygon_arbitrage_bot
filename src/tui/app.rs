@@ -126,6 +126,7 @@ pub struct OverviewSnapshot {
     pub gas_gwei: Option<f64>,
     pub win_rate: f64,
     pub snapshot_age_ms: u64,
+    pub rates_age_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +692,7 @@ mod tests {
                 gas_gwei: None,
                 win_rate: 0.0,
                 snapshot_age_ms: 0,
+                rates_age_ms: 0,
             },
             graph: GraphSnapshot {
                 health: GraphHealth {
@@ -798,6 +800,7 @@ mod tests {
                 gas_gwei: None,
                 win_rate: 0.0,
                 snapshot_age_ms: 0,
+                rates_age_ms: 0,
             },
             graph: GraphSnapshot {
                 health: GraphHealth {

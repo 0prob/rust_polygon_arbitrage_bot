@@ -19,7 +19,7 @@ use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
 
 use crate::core::types::FlashLoanSource;
 use crate::services::execution::balancer_verify::{
-    batch_profit_covers_min, query_balancer_batch_profit,
+    BatchQueryOutcome, batch_profit_covers_min, query_balancer_batch_profit,
 };
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
@@ -54,8 +54,12 @@ impl SkipCounts {
         let fidelity = self.fidelity.load(Ordering::Relaxed);
         let prepare = self.prepare.load(Ordering::Relaxed);
         let build = self.build.load(Ordering::Relaxed);
-        if quarantine + fidelity + prepare + build > 0 {
+        if build > 0 || quarantine > 0 || fidelity > 0 {
             crate::info!(
+                "dispatch summary: quarantine={quarantine}, fidelity={fidelity}, prepare={prepare}, build={build}",
+            );
+        } else if prepare > 0 {
+            crate::debug!(
                 "dispatch summary: quarantine={quarantine}, fidelity={fidelity}, prepare={prepare}, build={build}",
             );
         }
@@ -404,37 +408,77 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             skipped.record("prepare");
             return;
         };
-        match query_balancer_batch_profit(sim_provider, executor, &hops, start_token_addr).await {
-            Some(on_chain_profit)
-                if batch_profit_covers_min(
-                    on_chain_profit,
-                    prepared.evaluated.result.profit,
-                    prepared.evaluated.result.amount_in,
-                    slippage_bps,
-                ) => {}
-            Some(on_chain_profit) => {
-                skipped.record("prepare");
-                if log_prepare_skip {
-                    crate::info!(
-                        "prepare skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+        if !ctx.config.is_dry_run() {
+            match query_balancer_batch_profit(sim_provider, executor, &hops, start_token_addr).await
+            {
+                BatchQueryOutcome::Profit(on_chain_profit)
+                    if batch_profit_covers_min(
+                        on_chain_profit,
                         prepared.evaluated.result.profit,
-                    );
-                } else {
-                    crate::debug!(
-                        "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
-                        prepared.evaluated.result.profit,
-                    );
+                        prepared.evaluated.result.amount_in,
+                        slippage_bps,
+                        prepared.evaluated.cycle.hop_count,
+                    ) => {}
+                BatchQueryOutcome::Profit(on_chain_profit) => {
+                    skipped.record("prepare");
+                    ctx.execution.quarantine_batch_query_failure(fp);
+                    if log_prepare_skip {
+                        crate::info!(
+                            "prepare skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                            prepared.evaluated.result.profit,
+                        );
+                    } else {
+                        crate::debug!(
+                            "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                            prepared.evaluated.result.profit,
+                        );
+                    }
+                    return;
                 }
-                return;
-            }
-            None => {
-                skipped.record("prepare");
-                if log_prepare_skip {
-                    crate::info!("prepare skip: fp={fp} queryBatchSwap unprofitable or failed");
-                } else {
-                    crate::debug!("dispatch skip: fp={fp} queryBatchSwap unprofitable or failed");
+                BatchQueryOutcome::NonPositiveDelta(delta) => {
+                    skipped.record("prepare");
+                    ctx.execution.quarantine_batch_query_failure(fp);
+                    if log_prepare_skip {
+                        crate::info!(
+                            "prepare skip: fp={fp} queryBatchSwap non-positive delta {delta} (modeled={})",
+                            prepared.evaluated.result.profit,
+                        );
+                    } else {
+                        crate::debug!(
+                            "dispatch skip: fp={fp} queryBatchSwap non-positive delta {delta} (modeled={})",
+                            prepared.evaluated.result.profit,
+                        );
+                    }
+                    return;
                 }
-                return;
+                BatchQueryOutcome::RpcError(reason) => {
+                    skipped.record("prepare");
+                    ctx.execution.quarantine_batch_query_failure(fp);
+                    if log_prepare_skip {
+                        crate::info!("prepare skip: fp={fp} queryBatchSwap RPC error: {reason}");
+                    } else {
+                        crate::debug!("dispatch skip: fp={fp} queryBatchSwap RPC error: {reason}");
+                    }
+                    return;
+                }
+                other => {
+                    skipped.record("prepare");
+                    ctx.execution.quarantine_batch_query_failure(fp);
+                    let reason = match other {
+                        BatchQueryOutcome::Timeout => "timeout",
+                        BatchQueryOutcome::BuildFailed => "build failed",
+                        BatchQueryOutcome::DecodeFailed => "decode failed",
+                        BatchQueryOutcome::Profit(_)
+                        | BatchQueryOutcome::NonPositiveDelta(_)
+                        | BatchQueryOutcome::RpcError(_) => unreachable!(),
+                    };
+                    if log_prepare_skip {
+                        crate::info!("prepare skip: fp={fp} queryBatchSwap {reason}");
+                    } else {
+                        crate::debug!("dispatch skip: fp={fp} queryBatchSwap {reason}");
+                    }
+                    return;
+                }
             }
         }
     }

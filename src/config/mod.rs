@@ -120,6 +120,8 @@ pub struct PipelineConfig {
     pub hf_max_dispatch: usize,
     #[serde(default = "default_graph_rebuild_interval")]
     pub graph_rebuild_interval: u64,
+    #[serde(default = "default_cycle_refind_interval")]
+    pub cycle_refind_interval: u64,
     #[serde(default)]
     pub pool_meta_cache_path: String,
     #[serde(default)]
@@ -172,6 +174,9 @@ pub struct OracleConfig {
     pub pyth_feeds: String,
     #[serde(default)]
     pub chainlink_feeds: String,
+    /// Oracle USD price cache TTL in milliseconds (default 10_000 = 10s).
+    #[serde(default = "default_cache_ttl_ms")]
+    pub cache_ttl_ms: u64,
 }
 
 fn default_pg_url() -> String {
@@ -274,6 +279,9 @@ fn default_hf_max_dispatch() -> usize {
 fn default_graph_rebuild_interval() -> u64 {
     60
 }
+fn default_cycle_refind_interval() -> u64 {
+    crate::pipeline::graph_cache::default_cycle_refind_interval()
+}
 fn default_stream_max_pools() -> usize {
     500
 }
@@ -288,6 +296,9 @@ fn default_pyth_hermes_url() -> String {
 }
 fn default_tick_word_range() -> i16 {
     10
+}
+fn default_cache_ttl_ms() -> u64 {
+    10_000
 }
 
 impl Default for RpcConfig {
@@ -354,6 +365,7 @@ impl Default for PipelineConfig {
             hf_sim_cap: default_hf_sim_cap(),
             hf_max_dispatch: default_hf_max_dispatch(),
             graph_rebuild_interval: default_graph_rebuild_interval(),
+            cycle_refind_interval: default_cycle_refind_interval(),
             pool_meta_cache_path: ".rpbot-pool-meta.json".to_string(),
             stream_enabled: false,
             stream_max_pools: default_stream_max_pools(),
@@ -370,6 +382,7 @@ impl Default for OracleConfig {
             tick_word_range: default_tick_word_range(),
             pyth_feeds: String::new(),
             chainlink_feeds: String::new(),
+            cache_ttl_ms: default_cache_ttl_ms(),
         }
     }
 }
@@ -472,6 +485,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("hf_sim_cap") => "pipeline.hf_sim_cap",
         k if k.eq_ignore_ascii_case("hf_max_dispatch") => "pipeline.hf_max_dispatch",
         k if k.eq_ignore_ascii_case("graph_rebuild_interval") => "pipeline.graph_rebuild_interval",
+        k if k.eq_ignore_ascii_case("cycle_refind_interval") => "pipeline.cycle_refind_interval",
         k if k.eq_ignore_ascii_case("stream_enabled") => "pipeline.stream_enabled",
         k if k.eq_ignore_ascii_case("stream_max_pools") => "pipeline.stream_max_pools",
         k if k.eq_ignore_ascii_case("indexer_max_lag_blocks") => "pipeline.indexer_max_lag_blocks",
@@ -488,6 +502,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("routing_cycle_finder") => "routing.cycle_finder",
         k if k.eq_ignore_ascii_case("oracle_pyth_hermes_url") => "oracle.pyth_hermes_url",
         k if k.eq_ignore_ascii_case("tick_word_range") => "oracle.tick_word_range",
+        k if k.eq_ignore_ascii_case("oracle_cache_ttl_ms") => "oracle.cache_ttl_ms",
         k if k.eq_ignore_ascii_case("rpc_batch_pace_ms") => "rpc.batch_pace_ms",
         k if k.eq_ignore_ascii_case("request_timeout_ms") => "rpc.request_timeout_ms",
         k if k.eq_ignore_ascii_case("rpc_request_timeout_ms") => "rpc.request_timeout_ms",

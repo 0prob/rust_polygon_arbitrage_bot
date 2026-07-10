@@ -699,15 +699,13 @@ impl StateRefreshService {
 
     pub fn lf_refresh_batch(&self, pass: u64) -> usize {
         let pipeline = &self.config.pipeline;
-        let hot_len = self.discovery_state.read().hot_addresses.len();
         let full_sweep = pass == 1 || pass.is_multiple_of(pipeline.lf_full_sweep_interval);
         if full_sweep {
             pipeline.lf_bootstrap_batch
         } else {
-            pipeline
-                .lf_hot_batch
-                .max(hot_len)
-                .min(pipeline.lf_bootstrap_batch)
+            // Cap per-tick refresh; hot pools rotate via select_fetch_targets priority
+            // instead of forcing a full hot-set sweep every LF pass.
+            pipeline.lf_hot_batch.min(pipeline.lf_bootstrap_batch)
         }
     }
 }

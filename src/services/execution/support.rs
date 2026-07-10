@@ -221,12 +221,23 @@ pub fn profit_reassess_gas(
     observed_route_gas: Option<u32>,
     simulated_gas: u32,
     dry_run_gas: Option<u64>,
-    _gas_fallback: bool,
+    gas_fallback: bool,
+    sim_scale_bps: u64,
 ) -> u64 {
     if let Some(g) = dry_run_gas {
         return g;
     }
-    u64::from(observed_route_gas.unwrap_or(simulated_gas))
+    if let Some(observed) = observed_route_gas {
+        return u64::from(observed);
+    }
+    if gas_fallback {
+        u64::from(scaled_simulated_gas(
+            simulated_gas,
+            sim_scale_bps.max(GAS_FALLBACK_MIN_SCALE_BPS),
+        ))
+    } else {
+        u64::from(simulated_gas)
+    }
 }
 
 /// Basis for submit gas limit: prefer dry-run observation, else route history, else scaled heuristic.
@@ -341,7 +352,7 @@ pub fn depth_impact_slippage_bps_with_base(
         base.amount_out
     };
 
-    let probe_in = amount_in.saturating_mul(U256::from(10_100u64)) / BPS_SCALE;
+    let probe_in = amount_in.saturating_mul(U256::from(10_500u64)) / BPS_SCALE;
     if probe_in == amount_in {
         return 0;
     }
@@ -377,23 +388,29 @@ mod tests {
     }
 
     #[test]
-    fn profit_reassess_gas_skips_fallback_scale() {
-        assert_eq!(profit_reassess_gas(None, 640_000, None, true), 640_000);
+    fn profit_reassess_gas_scales_on_fallback_without_dry_run() {
         assert_eq!(
-            profit_reassess_gas(Some(1_276_000), 640_000, None, true),
+            profit_reassess_gas(None, 640_000, None, true, 10_000),
+            1_280_000
+        );
+        assert_eq!(
+            profit_reassess_gas(Some(1_276_000), 640_000, None, true, 10_000),
             1_276_000
         );
         assert_eq!(
-            profit_reassess_gas(None, 640_000, Some(700_000), false),
+            profit_reassess_gas(None, 640_000, Some(700_000), false, 10_000),
             700_000
         );
     }
 
     #[test]
     fn profit_reassess_gas_ignores_fallback_flag_when_no_dry_run() {
-        assert_eq!(profit_reassess_gas(None, 640_000, None, false), 640_000);
         assert_eq!(
-            profit_reassess_gas(Some(700_000), 640_000, None, false),
+            profit_reassess_gas(None, 640_000, None, false, 10_000),
+            640_000
+        );
+        assert_eq!(
+            profit_reassess_gas(Some(700_000), 640_000, None, false, 10_000),
             700_000
         );
     }

@@ -168,6 +168,7 @@ pub fn build_execution_candidate(
         evaluated.result.profit,
         evaluated.result.amount_in,
         config.slippage_bps,
+        evaluated.cycle.hop_count,
         dispatch_flash_source,
     )
     .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;

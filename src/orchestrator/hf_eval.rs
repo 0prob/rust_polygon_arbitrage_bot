@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use alloy::primitives::Address;
 use alloy::primitives::U256;
@@ -66,6 +67,7 @@ pub struct HfEvalInput<'a> {
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: &'a FlashLiquidityCache,
+    pub flash_ttl: Duration,
     pub execution: &'a ExecutionService,
 }
 
@@ -108,6 +110,7 @@ impl HfEvalInputOwned {
             safety_multiplier_bps: self.safety_multiplier_bps,
             profit_priority_alpha_bps: self.profit_priority_alpha_bps,
             flash_liquidity: self.flash_liquidity.as_ref(),
+            flash_ttl: self.flash_liquidity.ttl(),
             execution: self.execution.as_ref(),
         }
     }
@@ -195,7 +198,8 @@ fn cycle_simulatable(
 fn cycle_flash_evaluable(
     cycle: &FoundCycle,
     arena: &StateArena,
-    flash_liquidity: &FlashLiquidityCache,
+    flash: &crate::services::execution::flash_liquidity::FlashLiquiditySnapshot,
+    flash_ttl: Duration,
     flash_policy: FlashLoanPolicy,
     token_decimals: &FxHashMap<Address, u8>,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
@@ -203,11 +207,12 @@ fn cycle_flash_evaluable(
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let economic = min_economic_amount_in(decimals, rate);
-    balancer_route_flash_feasible(cycle, arena, flash_liquidity)
+    balancer_route_flash_feasible(cycle, arena, flash, flash_ttl)
         && resolve_flash_source_for_cycle(
             cycle,
             arena,
-            flash_liquidity,
+            flash,
+            flash_ttl,
             flash_policy,
             economic,
         )
@@ -224,15 +229,18 @@ fn simulatable_score_fallback(
     flash_policy: FlashLoanPolicy,
     max_keep: usize,
 ) -> Vec<FoundCycle> {
+    let flash_ttl = flash_liquidity.ttl();
     let mut fallback: Vec<FoundCycle> = scanned
         .iter()
         .filter_map(|cycle| {
-            let ready = prefer_aave_flash_start(cycle, arena, flash_liquidity);
+            let flash = flash_liquidity.load();
+            let ready = prefer_aave_flash_start(cycle, arena, &flash, flash_ttl);
             if cycle_simulatable(arena, &ready, token_decimals, token_to_matic_rates)
                 && cycle_flash_evaluable(
                     &ready,
                     arena,
-                    flash_liquidity,
+                    &flash,
+                    flash_ttl,
                     flash_policy,
                     token_decimals,
                     token_to_matic_rates,
@@ -291,6 +299,7 @@ pub fn rank_cycles_by_probe_net(
     route_gas: &RouteGasLookup,
     flash_liquidity: &FlashLiquidityCache,
     safety_multiplier_bps: u64,
+    profit_priority_alpha_bps: u64,
     execution: &ExecutionService,
 ) -> (Vec<FoundCycle>, FxHashMap<u64, (U256, MinimalSimResult)>) {
     if cycles.is_empty() || max_keep == 0 {
@@ -307,8 +316,10 @@ pub fn rank_cycles_by_probe_net(
         FxHashMap::with_capacity_and_hasher(probe_stop_at, FxBuildHasher);
     let mut skip = SkipCounters::default();
     let mut near_net: Vec<(U256, FoundCycle)> = Vec::new();
+    let flash_ttl = flash_liquidity.ttl();
     for cycle_arc in &scanned {
-        let cycle = prefer_aave_flash_start(cycle_arc, arena, flash_liquidity);
+        let flash = flash_liquidity.load();
+        let cycle = prefer_aave_flash_start(cycle_arc, arena, &flash, flash_ttl);
         let fp = hash_cycle_edges(&cycle.edges);
         if execution.is_route_quarantined(fp) {
             skip.quarantine += 1;
@@ -318,7 +329,7 @@ pub fn rank_cycles_by_probe_net(
             skip.rate += 1;
             continue;
         }
-        if !balancer_route_flash_feasible(&cycle, arena, flash_liquidity) {
+        if !balancer_route_flash_feasible(&cycle, arena, &flash, flash_ttl) {
             skip.flash += 1;
             continue;
         }
@@ -338,7 +349,8 @@ pub fn rank_cycles_by_probe_net(
         let Some(flash_source) = resolve_flash_source_for_cycle(
             &cycle,
             arena,
-            flash_liquidity,
+            &flash,
+            flash_ttl,
             flash_policy,
             probe_amount,
         ) else {
@@ -357,6 +369,8 @@ pub fn rank_cycles_by_probe_net(
             safety_multiplier_bps,
         );
         ctx.gas_scale_bps = 10_000;
+        ctx.hop_count = cycle.edges.len() as u32;
+        ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
         let mut ranked_probe = probe;
         ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
         let net = net_profit_after_gas_from_sim(&ranked_probe, probe_amount, &ctx);
@@ -394,11 +408,13 @@ pub fn rank_cycles_by_probe_net(
     }
 
     rescue.retain(|cycle| {
+        let flash = flash_liquidity.load();
         cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
             && cycle_flash_evaluable(
                 cycle,
                 arena,
-                flash_liquidity,
+                &flash,
+                flash_ttl,
                 flash_policy,
                 token_decimals,
                 token_to_matic_rates,
@@ -423,11 +439,13 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
+                let flash = flash_liquidity.load();
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
                         cycle,
                         arena,
-                        flash_liquidity,
+                        &flash,
+                        flash_ttl,
                         flash_policy,
                         token_decimals,
                         token_to_matic_rates,
@@ -481,9 +499,9 @@ pub fn rank_cycles_by_probe_net(
             skip.probe,
             skip.net,
         );
-    } else if kept.len() <= 3 && scanned.len() > kept.len() {
+    } else if kept.len() * 4 < scanned.len() {
         crate::debug!(
-            "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={}",
+            "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} near_net={}",
             kept.len(),
             scanned.len(),
             skip.rate,
@@ -491,6 +509,7 @@ pub fn rank_cycles_by_probe_net(
             skip.flash_source,
             skip.probe,
             skip.net,
+            near_net.len(),
         );
     }
 
@@ -557,7 +576,7 @@ pub async fn rescore_rank_and_evaluate_async(
     mut cycles: Vec<Arc<FoundCycle>>,
     input: HfEvalInputOwned,
     sim_cap: usize,
-) -> anyhow::Result<(Vec<HfEvalResult>, crate::pipeline::arena::StateArena)> {
+) -> anyhow::Result<(Vec<HfEvalResult>, crate::pipeline::arena::StateArena, usize)> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     crate::util::cpu_pool().spawn(move || {
         let result = crate::util::run_cpu(|| {
@@ -598,6 +617,7 @@ pub async fn rescore_rank_and_evaluate_async(
                 &route_gas,
                 input.flash_liquidity.as_ref(),
                 input.safety_multiplier_bps,
+                input.profit_priority_alpha_bps,
                 input.execution.as_ref(),
             );
             if !cycles.is_empty() {
@@ -617,7 +637,8 @@ pub async fn rescore_rank_and_evaluate_async(
                     cache.stats.hit_rate_bps()
                 );
             }
-            (eval_results, input.arena)
+            let probe_kept = cycles.len();
+            (eval_results, input.arena, probe_kept)
         });
         let _ = tx.send(result);
     });
@@ -747,7 +768,9 @@ fn evaluate_one(
         inc(&stats.quarantine);
         return None;
     }
-    if !balancer_route_flash_feasible(cycle, input.arena, input.flash_liquidity) {
+    let flash = input.flash_liquidity.load();
+    let flash_ttl = input.flash_ttl;
+    if !balancer_route_flash_feasible(cycle, input.arena, &flash, flash_ttl) {
         inc(&stats.flash);
         return None;
     }
@@ -763,25 +786,35 @@ fn evaluate_one(
     let Some(flash_source_brent) = resolve_flash_source_for_cycle(
         cycle,
         input.arena,
-        input.flash_liquidity,
+        &flash,
+        flash_ttl,
         input.flash_policy,
         brent_probe_amount,
     ) else {
         inc(&stats.flash_source);
         return None;
     };
+    let brent_slippage = probe_seed
+        .map(|(amount, sim)| {
+            let depth =
+                depth_impact_slippage_bps_with_base(input.arena, &cycle.edges, amount, Some(&sim));
+            effective_slippage_bps(input.slippage_bps, depth)
+        })
+        .unwrap_or(base_slippage);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
         input.token_to_matic_rates,
         input.token_decimals,
         input.gas_price,
-        base_slippage,
+        brent_slippage,
         flash_source_brent,
         input.safety_multiplier_bps,
     );
     // Match probe ranking: pre-resolve route gas, do not scale twice in Brent.
     profit_ctx.gas_scale_bps = 10_000;
+    profit_ctx.hop_count = cycle.edges.len() as u32;
+    profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let route_gas_costing = RouteGasCosting {
         lookup: input.route_gas,
         oracle: input.gas_oracle,
@@ -847,10 +880,12 @@ fn evaluate_one(
         }
     };
 
+    let flash = input.flash_liquidity.load();
     let Some(flash_source) = resolve_flash_source_for_cycle(
         cycle,
         input.arena,
-        input.flash_liquidity,
+        &flash,
+        flash_ttl,
         input.flash_policy,
         opt.optimal_input,
     ) else {
@@ -885,6 +920,8 @@ fn evaluate_one(
                 input.safety_multiplier_bps,
             );
             depth_ctx.gas_scale_bps = 10_000;
+            depth_ctx.hop_count = cycle.edges.len() as u32;
+            depth_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
             if let Some(reopt) = optimize_cycle(
                 input.arena,
                 cycle,

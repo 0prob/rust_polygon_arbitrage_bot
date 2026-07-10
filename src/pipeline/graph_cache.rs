@@ -8,10 +8,17 @@ const POOL_COUNT_REBUILD_DELTA: usize = 64;
 const WARM_POOL_COUNT_REBUILD_DELTA: usize = 256;
 /// Routable pool count treated as a warm graph for rebuild throttling.
 const WARM_POOL_THRESHOLD: usize = 3_000;
+const DEFAULT_CYCLE_REFIND_INTERVAL: u64 = 8;
+
+#[must_use]
+pub fn default_cycle_refind_interval() -> u64 {
+    DEFAULT_CYCLE_REFIND_INTERVAL
+}
 
 #[derive(Default)]
 pub struct GraphCache {
     rebuild_interval: u64,
+    cycle_refind_interval: u64,
     graph: Option<Arc<crate::pipeline::types::RoutingGraph>>,
     cycles: Option<Arc<Vec<FoundCycle>>>,
     lf_pass_count: u64,
@@ -24,8 +31,14 @@ pub struct GraphCache {
 impl GraphCache {
     #[must_use]
     pub fn with_rebuild_interval(interval: u64) -> Self {
+        Self::with_intervals(interval, default_cycle_refind_interval())
+    }
+
+    #[must_use]
+    pub fn with_intervals(rebuild_interval: u64, cycle_refind_interval: u64) -> Self {
         Self {
-            rebuild_interval: interval.max(1),
+            rebuild_interval: rebuild_interval.max(1),
+            cycle_refind_interval: cycle_refind_interval.max(1),
             ..Self::default()
         }
     }
@@ -66,11 +79,17 @@ impl GraphCache {
         &self,
         routable_pool_count: usize,
         layout_fingerprint: u64,
-        state_generation: u64,
+        _state_generation: u64,
     ) -> bool {
-        self.needs_connectivity_rebuild(routable_pool_count, layout_fingerprint)
-            || self.cached_state_generation != state_generation
-            || self.cycles.as_ref().is_none_or(|c| c.is_empty())
+        if self.needs_connectivity_rebuild(routable_pool_count, layout_fingerprint) {
+            return true;
+        }
+        if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
+            return true;
+        }
+        // LF rescoring reflects pool-state deltas; full enumeration is periodic.
+        self.lf_pass_count
+            .is_multiple_of(self.cycle_refind_interval)
     }
 
     pub fn store(
@@ -208,7 +227,7 @@ mod tests {
             800,
         );
         assert!(!cache.needs_connectivity_rebuild(1_050, 1));
-        assert!(cache.needs_cycle_refind(1_050, 1, 6));
+        assert!(!cache.needs_cycle_refind(1_050, 1, 6));
     }
 
     #[test]
@@ -229,8 +248,8 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_forces_cycle_refind() {
-        let mut cache = GraphCache::with_rebuild_interval(60);
+    fn state_generation_change_does_not_force_cycle_refind() {
+        let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
             Arc::new(crate::pipeline::types::RoutingGraph::default()),
@@ -241,6 +260,25 @@ mod tests {
             800,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 5));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6));
+    }
+
+    #[test]
+    fn cycle_refind_runs_on_interval_pass() {
+        let mut cache = GraphCache::with_intervals(60, 8);
+        for _ in 0..7 {
+            cache.advance_pass();
+        }
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            1_000,
+            1,
+            5,
+            800,
+        );
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6));
+        cache.advance_pass();
         assert!(cache.needs_cycle_refind(1_000, 1, 6));
     }
 
@@ -313,8 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_forces_refind() {
-        let mut cache = GraphCache::with_rebuild_interval(60);
+    fn state_generation_change_does_not_force_refind_without_interval() {
+        let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
             Arc::new(crate::pipeline::types::RoutingGraph::default()),
@@ -325,6 +363,6 @@ mod tests {
             800,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 7));
-        assert!(cache.needs_cycle_refind(1_000, 1, 8));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 8));
     }
 }

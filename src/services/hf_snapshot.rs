@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy::primitives::U256;
 use arc_swap::ArcSwap;
@@ -9,7 +10,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 use crate::services::discovery::DiscoveredPool;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HfSnapshot {
     pub generation: u64,
     pub state_block: u64,
@@ -19,6 +20,24 @@ pub struct HfSnapshot {
     pub pool_metas: Arc<Vec<PoolMeta>>,
     pub arena: StateArena,
     pub discovered_pools: Arc<Vec<DiscoveredPool>>,
+    /// Monotonic clock snapshot of when oracle rates were last built for this snapshot.
+    pub rates_built_at: Option<Instant>,
+}
+
+impl Default for HfSnapshot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state_block: 0,
+            cycles: Vec::new(),
+            token_to_matic_rates: Arc::new(FxHashMap::default()),
+            token_decimals: Arc::new(FxHashMap::default()),
+            pool_metas: Arc::new(Vec::new()),
+            arena: StateArena::default(),
+            discovered_pools: Arc::new(Vec::new()),
+            rates_built_at: None,
+        }
+    }
 }
 
 /// Lock-free LF → HF snapshot handoff.

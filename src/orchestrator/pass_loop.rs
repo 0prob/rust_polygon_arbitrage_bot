@@ -17,6 +17,8 @@ use crate::infra::wss_feed::spawn_pool_log_feed;
 use crate::orchestrator::hf::{HfContext, run_hf_tick};
 use crate::orchestrator::lf::{LfContext, spawn_lf_background};
 use crate::orchestrator::ui_hook::SharedUiHook;
+#[cfg(feature = "tui")]
+use crate::orchestrator::ui_snapshot::spawn_snapshot_publisher;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::graph_cache::GraphCache;
 use crate::services::execution::ExecutionService;
@@ -44,6 +46,8 @@ pub struct RuntimeContext {
     pub arena: Arc<parking_lot::Mutex<StateArena>>,
     pub lf_tick_lock: Arc<Mutex<()>>,
     pub ui_hook: SharedUiHook,
+    #[cfg(feature = "tui")]
+    pub ui_snapshot_tx: Option<watch::Sender<Option<Arc<crate::tui::app::DashboardSnapshot>>>>,
 }
 
 impl RuntimeContext {
@@ -53,6 +57,7 @@ impl RuntimeContext {
         hypersync: Option<HyperSyncService>,
     ) -> anyhow::Result<Self> {
         let rebuild_interval = config.pipeline.graph_rebuild_interval;
+        let cycle_refind_interval = config.pipeline.cycle_refind_interval;
         let config = Arc::new(config);
         let wallet = Arc::new(wallet);
         let rpc = Arc::new(RpcPool::from_config(&config));
@@ -72,6 +77,7 @@ impl RuntimeContext {
         let price_oracle = Arc::new(PriceOracle::new(
             rpc.http().clone(),
             config.oracle.pyth_hermes_url.clone(),
+            config.oracle.cache_ttl_ms,
         ));
         register_configured_oracle_feeds(&price_oracle, &config.oracle);
         Ok(Self {
@@ -87,18 +93,31 @@ impl RuntimeContext {
             gas_oracle,
             price_oracle,
             hypersync: hypersync.map(Arc::new),
-            graph_cache: Arc::new(parking_lot::Mutex::new(GraphCache::with_rebuild_interval(
+            graph_cache: Arc::new(parking_lot::Mutex::new(GraphCache::with_intervals(
                 rebuild_interval,
+                cycle_refind_interval,
             ))),
             arena: Arc::new(parking_lot::Mutex::new(StateArena::default())),
             lf_tick_lock: Arc::new(Mutex::new(())),
             ui_hook: Arc::new(()),
+            #[cfg(feature = "tui")]
+            ui_snapshot_tx: None,
         })
     }
 
     #[must_use]
     pub fn with_ui_hook(mut self, hook: SharedUiHook) -> Self {
         self.ui_hook = hook;
+        self
+    }
+
+    #[cfg(feature = "tui")]
+    #[must_use]
+    pub fn with_ui_snapshot_tx(
+        mut self,
+        tx: watch::Sender<Option<Arc<crate::tui::app::DashboardSnapshot>>>,
+    ) -> Self {
+        self.ui_snapshot_tx = Some(tx);
         self
     }
 
@@ -211,8 +230,19 @@ pub async fn run_pass_loop(
     if let Ok(provider) = ctx.rpc.connect_state() {
         ctx.gas_oracle
             .clone()
-            .start_background(provider, shutdown.clone());
+            .start_background(provider.clone(), shutdown.clone());
+        Arc::clone(&ctx.execution.flash_liquidity).start_background(provider, shutdown.clone());
     }
+
+    #[cfg(feature = "tui")]
+    let snapshot_handle = ctx.ui_snapshot_tx.clone().map(|tx| {
+        spawn_snapshot_publisher(
+            Arc::clone(&ctx),
+            tx,
+            std::time::Instant::now(),
+            shutdown.clone(),
+        )
+    });
 
     let mut height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
     let mut hs_reconnect_log_at = 0u64;
@@ -234,6 +264,10 @@ pub async fn run_pass_loop(
     } else {
         None
     };
+    let stream_hf_min_interval = Duration::from_millis(ctx.config.hf_interval_ms.max(1));
+    let mut last_stream_hf_at = std::time::Instant::now()
+        .checked_sub(stream_hf_min_interval)
+        .unwrap_or_else(std::time::Instant::now);
 
     let spawn_hf_tick = {
         let hf_task = Arc::clone(&hf_task);
@@ -335,7 +369,11 @@ pub async fn run_pass_loop(
             }, if stream_rx.is_some() => {
                 match result {
                     Ok(()) => {
-                        spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), true);
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_stream_hf_at) >= stream_hf_min_interval {
+                            last_stream_hf_at = now;
+                            spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), true);
+                        }
                     }
                     Err(_) => {
                         // Attempt to re-subscribe on error. If the trigger is
@@ -382,6 +420,16 @@ pub async fn run_pass_loop(
         .is_err()
     {
         crate::warn!("lf background task did not exit within 2s of shutdown");
+    }
+    #[cfg(feature = "tui")]
+    if let Some(handle) = snapshot_handle {
+        handle.abort();
+        if tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .is_err()
+        {
+            crate::warn!("ui snapshot task did not exit within 2s of shutdown");
+        }
     }
     Ok(())
 }

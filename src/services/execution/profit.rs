@@ -71,10 +71,12 @@ pub fn modeled_net_profit_tokens(
     gross_profit: U256,
     amount_in: U256,
     slippage_bps: u64,
+    hop_count: u32,
     flash_source: FlashLoanSource,
 ) -> Option<U256> {
+    let route_slippage = compound_slippage_bps(slippage_bps, hop_count);
     let amount_out = gross_profit.checked_add(amount_in)?;
-    let adjusted_out = slippage_adjusted(amount_out, slippage_bps)?;
+    let adjusted_out = slippage_adjusted(amount_out, route_slippage)?;
     let adjusted_gross = adjusted_out.saturating_sub(amount_in);
     let flash_fee =
         amount_in.checked_mul(U256::from(flash_loan_fee_bps(flash_source)))? / BPS_SCALE;
@@ -87,9 +89,16 @@ pub fn on_chain_min_profit_for_route(
     gross_profit: U256,
     amount_in: U256,
     slippage_bps: u64,
+    hop_count: u32,
     flash_source: FlashLoanSource,
 ) -> Option<U256> {
-    let net = modeled_net_profit_tokens(gross_profit, amount_in, slippage_bps, flash_source)?;
+    let net = modeled_net_profit_tokens(
+        gross_profit,
+        amount_in,
+        slippage_bps,
+        hop_count,
+        flash_source,
+    )?;
     on_chain_min_profit(net)
 }
 
@@ -138,6 +147,41 @@ pub fn slippage_adjusted(amount_out: U256, slippage_bps: u64) -> Option<U256> {
     }
 }
 
+/// Per-hop slippage compounded to match calldata `min_out` applied on every hop.
+#[must_use]
+pub fn compound_slippage_bps(per_hop_bps: u64, hop_count: u32) -> u64 {
+    if per_hop_bps >= 10_000 {
+        return 10_000;
+    }
+    let per_hop = per_hop_bps;
+    if hop_count <= 1 || per_hop == 0 {
+        return per_hop;
+    }
+    let complement = 10_000u64 - per_hop;
+    let mut retained = 10_000u128;
+    for _ in 0..hop_count {
+        retained = retained * u128::from(complement) / 10_000u128;
+        if retained == 0 {
+            return 9_999;
+        }
+    }
+    (10_000 - u64::try_from(retained).unwrap_or(0)).min(9_999)
+}
+
+#[inline]
+fn ceil_div(numer: U256, denom: U256) -> Option<U256> {
+    if denom.is_zero() {
+        return None;
+    }
+    let q = numer / denom;
+    let r = numer % denom;
+    Some(if r.is_zero() {
+        q
+    } else {
+        q.saturating_add(U256::from(1u8))
+    })
+}
+
 /// Default 2.5× worst-case gas loss buffer before submitting (25_000 bps = 2.5×).
 pub const DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS: u64 = 25_000;
 
@@ -173,6 +217,8 @@ pub struct ProfitEvalContext {
     /// Gas-oracle scale in bps (10_000 = 1.0×). Applied to simulated gas before
     /// cost deduction so the Brent objective matches the final assessment.
     pub gas_scale_bps: u64,
+    pub profit_priority_alpha_bps: u64,
+    pub hop_count: u32,
 }
 
 impl ProfitEvalContext {
@@ -224,6 +270,8 @@ impl ProfitEvalContext {
             token_decimals,
             safety_multiplier_bps,
             gas_scale_bps: 10_000,
+            profit_priority_alpha_bps: 0,
+            hop_count: 1,
         }
     }
 }
@@ -380,13 +428,13 @@ pub fn net_profit_after_gas_from_sim(
         gas_price_wei: ctx.gas_price,
         token_to_matic_rate: ctx.token_to_matic_rate,
         token_decimals: ctx.token_decimals,
-        hop_count: 0,
+        hop_count: ctx.hop_count,
         min_profit_matic_wei: U256::ZERO,
         min_profit_roi_bps: 0,
         slippage_bps: ctx.slippage_bps,
         flash_loan_source: ctx.flash_source,
         safety_multiplier_bps: ctx.safety_multiplier_bps,
-        profit_priority_alpha_bps: 0,
+        profit_priority_alpha_bps: ctx.profit_priority_alpha_bps,
     })
     .net_profit_after_gas
 }
@@ -402,9 +450,10 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         return rejected_arithmetic(input, "flash-loan fee overflow");
     };
 
-    // Slippage reduces output, never input. Apply to amount_out, not gross_profit.
+    // Slippage reduces output, never input. Compound per-hop tolerance to match calldata.
+    let route_slippage_bps = compound_slippage_bps(input.slippage_bps, input.hop_count);
     let amount_out = input.gross_profit.saturating_add(input.amount_in);
-    let Some(adjusted_out) = slippage_adjusted(amount_out, input.slippage_bps) else {
+    let Some(adjusted_out) = slippage_adjusted(amount_out, route_slippage_bps) else {
         return rejected_arithmetic(input, "invalid slippage or slippage arithmetic overflow");
     };
     let adjusted_gross = adjusted_out.saturating_sub(input.amount_in);
@@ -423,25 +472,28 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         let Some(scaled_gas) = gas_cost_wei.checked_mul(scale) else {
             return rejected_arithmetic(input, "token-denominated gas cost overflow");
         };
-        scaled_gas / input.token_to_matic_rate
+        let Some(cost) = ceil_div(scaled_gas, input.token_to_matic_rate) else {
+            return rejected_arithmetic(input, "token-denominated gas cost overflow");
+        };
+        cost
     } else {
         U256::MAX
     };
 
     let net_profit_after_gas = net_before_gas.saturating_sub(gas_cost_in_tokens);
-    let net_profit_after_gas_matic_wei = if rate_ok {
-        let Some(native_profit) = net_profit_after_gas.checked_mul(input.token_to_matic_rate)
-        else {
+    let native_gross_profit_wei = if rate_ok {
+        let Some(native_profit) = adjusted_gross.checked_mul(input.token_to_matic_rate) else {
             return rejected_arithmetic(input, "native profit conversion overflow");
         };
         native_profit / scale
     } else {
         U256::ZERO
     };
+    let net_profit_after_gas_matic_wei = native_gross_profit_wei.saturating_sub(gas_cost_wei);
 
     let required_net_matic = safety_floor_matic_wei(revert_penalty, input.safety_multiplier_bps);
-    let estimated_matic = if rate_ok && !net_before_gas.is_zero() {
-        net_before_gas
+    let estimated_matic = if rate_ok && !adjusted_gross.is_zero() {
+        adjusted_gross
             .checked_mul(input.token_to_matic_rate)
             .map(|v| v / scale)
             .unwrap_or(U256::ZERO)
@@ -591,6 +643,7 @@ mod safety_tests {
                 U256::from(10u8),
                 U256::from(100u8),
                 10_000,
+                1,
                 FlashLoanSource::Balancer,
             )
             .is_none()
@@ -623,6 +676,7 @@ mod safety_tests {
                 gross,
                 amount_in,
                 slippage_bps,
+                1,
                 FlashLoanSource::Balancer
             ),
             on_chain_min_profit_from_assessment(&assessment)
@@ -661,6 +715,12 @@ mod safety_tests {
                 .as_deref()
                 .is_some_and(|r| r.contains("sane cap"))
         );
+    }
+
+    #[test]
+    fn compound_slippage_matches_per_hop_product() {
+        assert_eq!(compound_slippage_bps(50, 1), 50);
+        assert_eq!(compound_slippage_bps(50, 4), 200);
     }
 
     #[test]
@@ -745,7 +805,7 @@ mod proptests {
         ) {
             let gross = U256::from(gross);
             let amount_in = U256::from(amount_in);
-            let modeled = modeled_net_profit_tokens(gross, amount_in, slippage, FlashLoanSource::Balancer);
+            let modeled = modeled_net_profit_tokens(gross, amount_in, slippage, 1, FlashLoanSource::Balancer);
             let assessment = assess_profit(&AssessProfitInput {
                 gross_profit: gross,
                 amount_in,

@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use tokio::sync::watch;
+use tokio::time::timeout;
 
 use crate::config::AppConfig;
 use crate::config::WalletSecrets;
@@ -16,7 +19,9 @@ use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
-use crate::services::execution::{ExecutionService, GasOracle, hash_cycle_edges};
+use crate::services::execution::{
+    ExecutionService, GasOracle, hash_cycle_edges, rotate_cycle_to_start,
+};
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::partial_cache::PartialPoolCache;
@@ -48,6 +53,74 @@ pub struct HfTickResult {
 }
 
 const HF_ACTIVITY_WINDOW_MS: u64 = 300_000;
+const HF_SUMMARY_INTERVAL_MS: u64 = 15_000;
+const HF_BEST_EVAL_INTERVAL_MS: u64 = 60_000;
+const HF_EVAL_BUDGET: Duration = Duration::from_secs(30);
+const HF_FLASH_REFRESH_BUDGET: Duration = Duration::from_secs(15);
+static HF_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
+static HF_BEST_EVAL_LOG_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
+fn cycle_with_reliable_start(
+    cycle: &Arc<FoundCycle>,
+    token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+) -> Option<Arc<FoundCycle>> {
+    if has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+        return Some(Arc::clone(cycle));
+    }
+    for edge in &cycle.edges {
+        if has_reliable_matic_rate(edge.token_in, token_to_matic_rates) {
+            return rotate_cycle_to_start(cycle, edge.token_in).map(Arc::new);
+        }
+    }
+    None
+}
+
+fn should_log_hf_summary() -> bool {
+    let now = now_ms();
+    let last = HF_SUMMARY_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HF_SUMMARY_INTERVAL_MS {
+        return false;
+    }
+    HF_SUMMARY_LOG_AT.store(now, Ordering::Relaxed);
+    true
+}
+
+fn should_log_best_eval() -> bool {
+    let now = now_ms();
+    let last = HF_BEST_EVAL_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HF_BEST_EVAL_INTERVAL_MS {
+        return false;
+    }
+    HF_BEST_EVAL_LOG_AT.store(now, Ordering::Relaxed);
+    true
+}
+
+struct BestEvalDiag {
+    fp: u64,
+    hops: u32,
+    gross: U256,
+    net_matic: U256,
+    gas_matic: U256,
+    slippage: U256,
+    flash_fee: U256,
+    reject: Option<String>,
+}
+
+fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
+    let reason = diag.reject.as_deref().unwrap_or("unknown");
+    crate::info!(
+        "hf best-eval: fp={} hops={} gross={} net_matic={} gas_matic={} slippage={} flash_fee={} reject={}",
+        diag.fp,
+        diag.hops,
+        diag.gross,
+        diag.net_matic,
+        diag.gas_matic,
+        diag.slippage,
+        diag.flash_fee,
+        reason,
+    );
+}
 
 fn cycle_activity_score(
     cycle: &FoundCycle,
@@ -78,55 +151,63 @@ fn select_cycles_for_rescore(
     execution: &ExecutionService,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     rescore_cap: usize,
-) -> (Vec<Arc<FoundCycle>>, FxHashSet<Address>) {
+) -> (Vec<Arc<FoundCycle>>, FxHashSet<Address>, usize, usize) {
     let activity_now = now_ms();
-    let mut candidates: Vec<(usize, u64)> = Vec::with_capacity(snap_cycles.len());
-    for (i, cycle) in snap_cycles.iter().enumerate() {
+    let mut candidates: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len());
+    let mut quarantine_skipped = 0usize;
+    let mut rate_skipped = 0usize;
+    for cycle in snap_cycles {
         let fp = hash_cycle_edges(&cycle.edges);
         if execution.is_route_quarantined(fp) {
+            quarantine_skipped += 1;
             continue;
         }
-        if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+        let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
+            rate_skipped += 1;
             continue;
-        }
-        candidates.push((i, 0));
+        };
+        candidates.push((ready, 0));
     }
     if candidates.is_empty() {
-        return (Vec::new(), FxHashSet::default());
+        return (
+            Vec::new(),
+            FxHashSet::default(),
+            quarantine_skipped,
+            rate_skipped,
+        );
     }
 
     let prefilter_cap = rescore_cap.saturating_mul(3).max(rescore_cap + 1);
     if candidates.len() > prefilter_cap {
         let pivot = prefilter_cap - 1;
         candidates.select_nth_unstable_by(pivot, |a, b| {
-            compare_cycle_score(&snap_cycles[a.0], &snap_cycles[b.0])
+            compare_cycle_score(a.0.as_ref(), b.0.as_ref())
         });
         candidates.truncate(prefilter_cap);
     }
 
-    for (idx, score) in &mut candidates {
-        *score = cycle_activity_score(&snap_cycles[*idx], arena, partial_cache, activity_now);
+    for (cycle, score) in &mut candidates {
+        *score = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now);
     }
     // ponytail: all candidates already passed has_reliable_matic_rate filter
     // above, so sort by activity score then cycle score directly.
     candidates.sort_by(|a, b| {
         b.1.cmp(&a.1)
-            .then_with(|| compare_cycle_score(&snap_cycles[a.0], &snap_cycles[b.0]))
+            .then_with(|| compare_cycle_score(a.0.as_ref(), b.0.as_ref()))
     });
     candidates.truncate(rescore_cap);
 
     let mut cycles = Vec::with_capacity(candidates.len());
     let mut hot_pools = FxHashSet::default();
-    for (idx, _) in candidates {
-        let cycle = &snap_cycles[idx];
+    for (cycle, _) in candidates {
         for edge in &cycle.edges {
             if let Some(addr) = arena.pool_address(edge.pool_index) {
                 hot_pools.insert(addr);
             }
         }
-        cycles.push(Arc::clone(cycle));
+        cycles.push(cycle);
     }
-    (cycles, hot_pools)
+    (cycles, hot_pools, quarantine_skipped, rate_skipped)
 }
 
 pub async fn run_hf_tick(
@@ -147,8 +228,11 @@ pub async fn run_hf_tick(
     }
 
     let start = now_ms();
-    let snap = ctx.snapshots.read();
+    let pipeline = &ctx.config.pipeline;
+    let rescore_cap = pipeline.hf_score_cap;
+    let sim_cap = pipeline.hf_sim_cap;
 
+    let mut snap = ctx.snapshots.read();
     if snap.cycles.is_empty() {
         return Ok(HfTickResult {
             cycles_considered: 0,
@@ -158,15 +242,17 @@ pub async fn run_hf_tick(
         });
     }
 
-    let pipeline = &ctx.config.pipeline;
-    let rescore_cap = pipeline.hf_score_cap;
-    let sim_cap = pipeline.hf_sim_cap;
-    let token_to_matic_rates = Arc::clone(&snap.token_to_matic_rates);
-    let token_decimals = Arc::clone(&snap.token_decimals);
-    let pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
-    let arena_base = snap.arena.clone();
-
-    let (cycles, mut hot_pools) = select_cycles_for_rescore(
+    let snap_generation = snap.generation;
+    let mut token_to_matic_rates = Arc::clone(&snap.token_to_matic_rates);
+    let mut token_decimals = Arc::clone(&snap.token_decimals);
+    let mut pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
+    let mut arena_base = snap.arena.clone();
+    let mut snap_cycle_count = snap.cycles.len();
+    let mut cycles;
+    let mut hot_pools_set;
+    let mut quarantine_skipped;
+    let mut rate_skipped;
+    (cycles, hot_pools_set, quarantine_skipped, rate_skipped) = select_cycles_for_rescore(
         &snap.cycles,
         &arena_base,
         &ctx.partial_cache,
@@ -174,8 +260,12 @@ pub async fn run_hf_tick(
         &token_to_matic_rates,
         rescore_cap,
     );
-    drop(snap);
     if cycles.is_empty() {
+        if should_log_hf_summary() {
+            crate::info!(
+                "hf tick: 0 cycles after filter (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped})"
+            );
+        }
         return Ok(HfTickResult {
             cycles_considered: 0,
             profitable_count: 0,
@@ -185,10 +275,10 @@ pub async fn run_hf_tick(
     }
     if stream_triggered && pipeline.stream_enabled {
         for addr in ctx.partial_cache.tracked_addresses() {
-            hot_pools.insert(addr);
+            hot_pools_set.insert(addr);
         }
     }
-    let hot_pools: Arc<Vec<_>> = Arc::new(hot_pools.into_iter().collect());
+    let mut hot_pools: Arc<Vec<_>> = Arc::new(hot_pools_set.into_iter().collect());
 
     let mut arena = arena_base;
     let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
@@ -235,6 +325,41 @@ pub async fn run_hf_tick(
             .flush_to_state_cache(&ctx.cache, hot_pools.as_ref());
     }
 
+    let latest_generation = ctx.snapshots.generation();
+    if latest_generation != snap_generation {
+        snap = ctx.snapshots.read();
+        token_to_matic_rates = Arc::clone(&snap.token_to_matic_rates);
+        token_decimals = Arc::clone(&snap.token_decimals);
+        pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
+        arena_base = snap.arena.clone();
+        snap_cycle_count = snap.cycles.len();
+        let selected = select_cycles_for_rescore(
+            &snap.cycles,
+            &arena_base,
+            &ctx.partial_cache,
+            &ctx.execution,
+            &token_to_matic_rates,
+            rescore_cap,
+        );
+        cycles = selected.0;
+        hot_pools = Arc::new(selected.1.into_iter().collect());
+        quarantine_skipped = selected.2;
+        rate_skipped = selected.3;
+        if cycles.is_empty() {
+            if should_log_hf_summary() {
+                crate::info!(
+                    "hf tick: 0 cycles after refresh (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped})"
+                );
+            }
+            return Ok(HfTickResult {
+                cycles_considered: 0,
+                profitable_count: 0,
+                best_profit: U256::ZERO,
+                elapsed_ms: now_ms().saturating_sub(start),
+            });
+        }
+    }
+
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
     ctx.execution
         .route_sim_cache
@@ -253,13 +378,24 @@ pub async fn run_hf_tick(
     if !flash_token_list.is_empty() {
         match ctx.rpc.connect_state() {
             Ok(provider) => {
-                if let Err(e) = ctx
-                    .execution
-                    .flash_liquidity
-                    .refresh(&provider, &flash_token_list)
-                    .await
-                {
-                    crate::warn!("hf flash liquidity refresh failed: {e:#}");
+                let flash = Arc::clone(&ctx.execution.flash_liquidity);
+                let tokens = flash_token_list.clone();
+                flash.track_hot_tokens(&tokens);
+                let refresh = flash.refresh(&provider, &tokens);
+                match timeout(HF_FLASH_REFRESH_BUDGET, refresh).await {
+                    Ok(Ok(_generation)) => {}
+                    Ok(Err(e)) => {
+                        crate::warn!("hf flash liquidity refresh failed: {e:#}");
+                        flash.invalidate_batch(&tokens);
+                    }
+                    Err(_) => {
+                        crate::warn!(
+                            "hf flash liquidity refresh timed out after {}ms (tokens={})",
+                            HF_FLASH_REFRESH_BUDGET.as_millis(),
+                            tokens.len()
+                        );
+                        flash.invalidate_batch(&tokens);
+                    }
                 }
             }
             Err(e) => {
@@ -291,20 +427,59 @@ pub async fn run_hf_tick(
         execution: Arc::clone(&ctx.execution),
     };
     let cycles_considered = cycles.len();
-    let (eval_results, mut eval_arena) =
-        rescore_rank_and_evaluate_async(cycles, owned, sim_cap).await?;
+    let (eval_results, mut eval_arena, probe_kept) = match timeout(
+        HF_EVAL_BUDGET,
+        rescore_rank_and_evaluate_async(cycles, owned, sim_cap),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            crate::warn!(
+                "hf eval timed out after {}ms (cycles={cycles_considered}, sim_cap={sim_cap})",
+                HF_EVAL_BUDGET.as_millis()
+            );
+            return Ok(HfTickResult {
+                cycles_considered,
+                profitable_count: 0,
+                best_profit: U256::ZERO,
+                elapsed_ms: now_ms().saturating_sub(start),
+            });
+        }
+    };
     let eval_count = eval_results.len();
 
     let mut profitable: Vec<HfEvalResult> = Vec::new();
     let mut best_profit_matic = U256::ZERO;
     let mut best_near_miss: Option<HfEvalResult> = None;
+    let mut best_gross_diag: Option<BestEvalDiag> = None;
 
-    for result in eval_results {
+    for result in eval_results.iter() {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
         if matic > best_profit_matic {
             best_profit_matic = matic;
         }
+        let assessment = &result.assessment;
+        let gross_dominated = best_gross_diag
+            .as_ref()
+            .is_none_or(|best| assessment.gross_profit > best.gross);
+        if gross_dominated && !assessment.gross_profit.is_zero() {
+            best_gross_diag = Some(BestEvalDiag {
+                fp: result.route_fingerprint,
+                hops: result.cycle.hop_count,
+                gross: assessment.gross_profit,
+                net_matic: assessment.net_profit_after_gas_matic_wei,
+                gas_matic: assessment.revert_penalty,
+                slippage: assessment.slippage_deduction,
+                flash_fee: assessment.flash_loan_fee,
+                reject: assessment.reject_reason.clone(),
+            });
+        }
+    }
 
+    for result in eval_results {
+        let matic = result.assessment.net_profit_after_gas_matic_wei;
         if result.assessment.should_execute {
             profitable.push(result);
         } else if matic > U256::ZERO {
@@ -329,11 +504,11 @@ pub async fn run_hf_tick(
     if cycles_considered > 0 {
         if profitable_count > 0 {
             crate::info!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})"
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
             );
-        } else {
-            crate::debug!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, evaluated={eval_count})"
+        } else if should_log_hf_summary() {
+            crate::info!(
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
             );
         }
         if eval_count == 0 {
@@ -351,6 +526,12 @@ pub async fn run_hf_tick(
                 ctx.config.execution.profit_safety_multiplier_bps,
                 ctx.config.min_profit_matic,
             );
+        } else if profitable_count == 0
+            && best_profit_matic.is_zero()
+            && should_log_best_eval()
+            && let Some(ref diag) = best_gross_diag
+        {
+            log_best_eval_diagnostic(diag);
         }
     }
 

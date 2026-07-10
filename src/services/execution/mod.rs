@@ -47,7 +47,8 @@ pub use candidate::{
     hash_cycle_edges,
 };
 pub use flash_liquidity::{
-    FlashLiquidityCache, PrepareDispatchInput, PreparedDispatch, balancer_route_flash_feasible,
+    FlashLiquidityCache, FlashLiquiditySnapshot, PrepareDispatchInput, PreparedDispatch,
+    balancer_route_flash_feasible,
     collect_flash_tokens_for_cycle, cycle_has_aave_listed_token, prefer_aave_flash_start,
     prepare_evaluated_route, resolve_flash_source_for_cycle, rotate_cycle_to_start,
 };
@@ -57,8 +58,8 @@ pub use gas_oracle::{GasOracle, ROUTE_GAS_CACHE_MIN_ROUTES, RouteGasLookup};
 pub use profit::{
     AssessProfitInput, AssessmentGas, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitError,
     ProfitEvalContext, ProfitThresholds, RouteAssessRequest, RouteProfitParams, assess_profit,
-    assess_route_from_sim, assess_route_profit, assessment_gas_units, modeled_net_profit_tokens,
-    on_chain_min_profit_for_route, on_chain_min_profit_from_assessment, profit_priority_uplift_wei,
-    safety_floor_matic_wei,
+    assess_route_from_sim, assess_route_profit, assessment_gas_units, compound_slippage_bps,
+    modeled_net_profit_tokens, on_chain_min_profit_for_route, on_chain_min_profit_from_assessment,
+    profit_priority_uplift_wei, safety_floor_matic_wei,
 };
 pub use service::{ExecutionOutcome, ExecutionService};

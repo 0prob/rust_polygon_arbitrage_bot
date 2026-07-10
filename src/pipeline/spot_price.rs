@@ -90,18 +90,18 @@ fn cl_has_ticks(state: &ConcentratedLiquidityPoolState) -> bool {
     !state.ticks.is_empty()
 }
 
-/// CL edge ratio: probe simulation when tick bitmap is loaded, else instantaneous spot.
+/// CL edge ratio via probe simulation (tickless pools use shallow sim, not spot).
 #[inline]
 fn cl_edge_ratio_u256(
     state: &ConcentratedLiquidityPoolState,
     edge: &Edge,
     probe: U256,
 ) -> Option<U256> {
-    if cl_has_ticks(state) {
-        let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
-        return simulated_edge_ratio(r.amount_out, probe);
+    if probe.is_zero() {
+        return cl_spot_u256(state, edge);
     }
-    cl_spot_u256(state, edge)
+    let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
+    simulated_edge_ratio(r.amount_out, probe)
 }
 
 /// Compute CL V3/V4 spot price ratio as U256 fixed-point (tickless fallback).

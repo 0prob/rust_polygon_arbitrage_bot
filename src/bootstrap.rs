@@ -96,6 +96,7 @@ pub fn build_runtime(
 ///
 /// The config/wallet load (which may do filesystem reads for .env / PRIVATE_KEY_FILE / config.toml)
 /// is performed via `spawn_blocking` so it does not occupy an async worker thread.
+#[cfg(not(feature = "tui"))]
 pub async fn bootstrap(ui_hook: Option<SharedUiHook>) -> anyhow::Result<Arc<RuntimeContext>> {
     let (config, wallet) = tokio::task::spawn_blocking(load_config_and_wallet)
         .await
@@ -118,6 +119,46 @@ pub async fn bootstrap(ui_hook: Option<SharedUiHook>) -> anyhow::Result<Arc<Runt
     let mut runtime = build_runtime(config, wallet, hypersync)?;
     if let Some(hook) = ui_hook {
         runtime = runtime.with_ui_hook(hook);
+    }
+    let ctx = Arc::new(runtime);
+
+    spawn_pg_probe(pg_url);
+    spawn_hypersync_probe(ctx.hypersync.clone());
+
+    Ok(ctx)
+}
+
+#[cfg(feature = "tui")]
+pub async fn bootstrap(
+    ui_hook: Option<SharedUiHook>,
+    ui_snapshot_tx: Option<
+        tokio::sync::watch::Sender<Option<Arc<crate::tui::app::DashboardSnapshot>>>,
+    >,
+) -> anyhow::Result<Arc<RuntimeContext>> {
+    let (config, wallet) = tokio::task::spawn_blocking(load_config_and_wallet)
+        .await
+        .context("config load task panicked")??;
+
+    log_startup(&config);
+
+    let pg_url = config.pg_url.clone();
+    let token_present = std::env::var("ENVIO_API_TOKEN")
+        .ok()
+        .is_some_and(|t| !t.trim().is_empty());
+    let hypersync = try_from_env(&config.rpc);
+    match (&hypersync, token_present) {
+        (None, true) => {
+            crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled")
+        }
+        (None, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
+        _ => {}
+    }
+    let mut runtime = build_runtime(config, wallet, hypersync)?;
+    if let Some(hook) = ui_hook {
+        runtime = runtime.with_ui_hook(hook);
+    }
+    if let Some(tx) = ui_snapshot_tx {
+        runtime = runtime.with_ui_snapshot_tx(tx);
     }
     let ctx = Arc::new(runtime);
 

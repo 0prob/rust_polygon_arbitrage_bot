@@ -39,6 +39,7 @@ struct LfCpuWork {
     pool_metas: Arc<Vec<crate::pipeline::types::PoolMeta>>,
     dirty_pools: Vec<PoolIndex>,
     state_generation: u64,
+    lf_pass: u64,
     max_paths: usize,
     max_hops: u32,
     cycle_finder: crate::config::CycleFinderMode,
@@ -180,6 +181,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         needs_rebuild || gc.needs_cycle_refind(routable_count, layout_fp, work.state_generation)
     };
     let cycles = if need_cycle_refind {
+        crate::debug!("lf cycle refind: pass={}", work.lf_pass);
         let passes = cycle_search_passes(work.max_hops, work.max_paths);
         let result = find_cycles_for_mode(
             work.cycle_finder,
@@ -238,6 +240,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let lf_started = crate::util::now_ms();
     let lf_pass = ctx.graph_cache.lock().advance_pass();
     let refresh_batch = ctx.refresh.lf_refresh_batch(lf_pass);
+    if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
+        crate::info!("lf refresh: pass={lf_pass} batch={refresh_batch}");
+    }
 
     let discovery_started = crate::util::now_ms();
     let _ = ctx.refresh.maybe_discover().await?;
@@ -284,6 +289,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         pool_metas: Arc::clone(&pool_metas),
         dirty_pools,
         state_generation,
+        lf_pass,
         max_paths,
         max_hops,
         cycle_finder: ctx.config.routing.cycle_finder,
@@ -456,6 +462,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     *ctx.arena.lock() = arena.clone();
+    let snapshot_now = std::time::Instant::now();
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
             state_block: ctx.refresh.last_state_block(),
@@ -465,6 +472,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             pool_metas,
             arena,
             discovered_pools: pools_snapshot,
+            rates_built_at: Some(snapshot_now),
             ..Default::default()
         });
     // Publish first so the TUI poller cannot pair fresh LF metrics with the

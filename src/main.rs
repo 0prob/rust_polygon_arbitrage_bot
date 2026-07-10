@@ -11,6 +11,9 @@ async fn main() -> anyhow::Result<()> {
     rpbot::config::load_dotenv();
     rpbot::log::init();
 
+    #[cfg(feature = "tui")]
+    let ctx = bootstrap(None, None).await?;
+    #[cfg(not(feature = "tui"))]
     let ctx = bootstrap(None).await?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

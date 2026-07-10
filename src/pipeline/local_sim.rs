@@ -209,7 +209,7 @@ pub fn cl_amount_cap(arena: &StateArena, edges: &[Edge]) -> Option<U256> {
 }
 
 /// Max gross-profit erosion (bps) tolerated between eval and post-refresh resim.
-const RESIM_PROFIT_DRIFT_BPS: u64 = 5000;
+const RESIM_PROFIT_DRIFT_BPS: u64 = 1000;
 /// Max per-hop amount drift (bps) tolerated between eval and post-refresh resim.
 const RESIM_HOP_DRIFT_BPS: u64 = 200;
 

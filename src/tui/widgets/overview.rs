@@ -227,7 +227,7 @@ fn sparkline(
 }
 
 fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::DashboardSnapshot) {
-    let lines: SmallVec<[Line; 5]> = SmallVec::from_buf([
+    let lines: SmallVec<[Line; 6]> = SmallVec::from_buf([
         Line::from(format!(
             "indexer lag {} blocks",
             snapshot.graph.health.indexer_lag_blocks
@@ -246,6 +246,7 @@ fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::Das
             "snapshot age {} ms",
             snapshot.captured_at.elapsed().as_millis()
         )),
+        Line::from(format!("rates age {} ms", snapshot.overview.rates_age_ms)),
         Line::from(format!(
             "stale indexer {}",
             snapshot.graph.health.stale_indexer

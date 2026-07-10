@@ -36,14 +36,15 @@ use crate::services::execution::private_submit::{
 use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
 use crate::services::execution::receipt::ReceiptPoller;
-use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
+use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
 use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit_with_recovery};
 use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
-const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 5;
+const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 2;
+const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -263,6 +264,14 @@ impl ExecutionService {
 }
 
 impl ExecutionService {
+    #[must_use]
+    fn candidate_matches_state_generation(
+        candidate: &CandidateExecution,
+        state_cache: &StateCache,
+    ) -> bool {
+        candidate.state_generation == state_cache.generation()
+    }
+
     fn write_route_event(&self, line: String) {
         self.route_stats_writer.enqueue(line);
     }
@@ -470,6 +479,14 @@ impl ExecutionService {
         true
     }
 
+    /// Longer cooldown when vault `queryBatchSwap` disagrees with local sim.
+    pub fn quarantine_batch_query_failure(&self, fingerprint: u64) {
+        self.quarantine
+            .write()
+            .insert(fingerprint, Instant::now() + BATCH_QUERY_FAIL_QUARANTINE);
+        self.prepare_skip_counts.write().remove(&fingerprint);
+    }
+
     /// Cool down routes that repeatedly fail dispatch prepare after HF marked profitable.
     pub fn record_prepare_skip(&self, fingerprint: u64) {
         let count = {
@@ -590,15 +607,15 @@ impl ExecutionService {
 
     fn reassess_assessment(
         candidate: &CandidateExecution,
-        dry_run_gas: u64,
+        gas_limit: u64,
         gas_price: U256,
         min_profit_matic_wei: U256,
         realized_profit: Option<U256>,
         profit_priority_alpha_bps: u64,
     ) -> Option<crate::core::types::ProfitAssessment> {
-        let gas_units = candidate
-            .simulated_gas
-            .max(u32::try_from(dry_run_gas).unwrap_or(candidate.simulated_gas));
+        let gas_units = u32::try_from(gas_limit)
+            .unwrap_or(u32::MAX)
+            .max(candidate.simulated_gas);
         let (gross_profit, amount_in, slippage_bps, flash_source) =
             if let Some(realized) = realized_profit {
                 // Dry-run return is post-repayment token profit; calldata minProfit
@@ -632,7 +649,7 @@ impl ExecutionService {
         candidate: &CandidateExecution,
         operator: Address,
         gas_oracle: &GasOracle,
-        _state_cache: &StateCache,
+        state_cache: &StateCache,
         hypersync: Option<&HyperSyncService>,
         ui_hook: Option<&SharedUiHook>,
         shutdown: Option<&watch::Receiver<bool>>,
@@ -657,6 +674,26 @@ impl ExecutionService {
         }
 
         let now = Instant::now();
+
+        let current_generation = state_cache.generation();
+        if !Self::candidate_matches_state_generation(candidate, state_cache) {
+            crate::debug!(
+                "dispatch skip: fp={}, stale candidate generation {} != current {}",
+                fp,
+                candidate.state_generation,
+                current_generation,
+            );
+            let outcome = ExecutionOutcome::SubmitFailed {
+                reason: format!(
+                    "candidate stale: built at generation {}, current generation {}",
+                    candidate.state_generation, current_generation
+                ),
+            };
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
 
         let risk_multiplier = self.route_risk_multiplier_bps(fp);
         let learned_floor = candidate
@@ -725,11 +762,8 @@ impl ExecutionService {
                     ..
                 }) if final_balance.is_zero()
             );
-            if matches!(
-                dry.decoded_revert,
-                Some(DecodedRevert::AaveReserveInactive)
-            ) {
-                self.flash_liquidity.invalidate(candidate.profit_token);
+            if matches!(dry.decoded_revert, Some(DecodedRevert::AaveReserveInactive)) {
+                self.flash_liquidity.mark_aave_inactive(candidate.profit_token);
             }
             if sim_fidelity_miss {
                 self.quarantine_route_soft(fp, now);
@@ -845,10 +879,11 @@ impl ExecutionService {
             candidate.simulated_gas,
             dry.gas_used,
             gas_fallback,
+            gas_oracle.sim_scale_bps(),
         );
         let dry_pass = Self::reassess_assessment(
             candidate,
-            profit_gas,
+            final_gas,
             reassess_gas_price,
             learned_floor,
             dry.realized_profit,
@@ -1454,6 +1489,44 @@ mod safety_tests {
         );
         assert_eq!(service.route_risk_multiplier_bps(7), 25_000);
         assert_eq!(service.route_risk_multiplier_bps(8), 10_000);
+    }
+
+    #[test]
+    fn candidate_generation_must_match_state_cache() {
+        let cache = StateCache::new(8, std::time::Duration::from_secs(60));
+        let candidate = CandidateExecution {
+            route_fingerprint: 1,
+            calldata: Default::default(),
+            target_address: Address::ZERO,
+            value: U256::ZERO,
+            profit_token: Address::ZERO,
+            expected_profit_matic_wei: U256::ZERO,
+            gas_limit: None,
+            simulated_gas: 1,
+            route_hash: Default::default(),
+            gross_profit: U256::ZERO,
+            amount_in: U256::ZERO,
+            token_decimals: 18,
+            token_to_matic_rate: U256::from(1u8),
+            slippage_bps: 0,
+            flash_loan_source: FlashLoanSource::Balancer,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            hop_count: 1,
+            safety_multiplier_bps: 0,
+            state_generation: cache.generation(),
+        };
+
+        assert!(ExecutionService::candidate_matches_state_generation(
+            &candidate, &cache
+        ));
+        cache.insert(
+            Address::repeat_byte(1),
+            crate::core::types::PoolState::Invalid,
+        );
+        assert!(!ExecutionService::candidate_matches_state_generation(
+            &candidate, &cache
+        ));
     }
 
     #[test]

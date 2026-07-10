@@ -16,11 +16,14 @@ ternary_search_iterations = 18
 [pipeline]
 # Hot-pool WSS patches; requires WSS_URL or POLYGON_WSS_URLS in .env
 stream_enabled = true
+# Per-tick pool refresh cap (hot pools rotate; full sweep every lf_full_sweep_interval passes).
+lf_hot_batch = 800
+lf_full_sweep_interval = 30
+cycle_refind_interval = 8
 # Raise sim/score caps to eval more candidates per HF tick -> more chance of net>0 after gas.
 hf_sim_cap = 300
 hf_score_cap = 400
 hf_prefetch_count = 300
 
 [oracle]
-# Additional Pyth price feeds beyond the built-in 8 tokens
-pyth_feeds = "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39=8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221,0xd6df932a45c0f255f85145f286ea0b292b21c90b=2b9ab1e972a281585084148ba1389800799bd4be63b957507db1349314e47445,0x172370d5cd63279efa6d502dab29171933a610af=a19d04ac696c7a6616d291c7e5d1377cc8be437c327b75adb5dc1bad745fcae8,0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a=26e4f737fde0263a9eea10ae63ac36dcedab2aaf629261a994e1eeb6ee0afe53,0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3=07ad7b4a7662d19a6bc675f6b467172d2f3947fa653ca97555a9b20236406628,0x7205705771547cf79272831ef1209d0b73ac0f20=4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7,0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee=cb7a1d45139117f8d3da0a4b67264579aa905e3b124efede272634f094e1e9d1,0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4=1dfffdcbc958d732750f53ff7f06d24bb01364b3f62abea511a390c74b8d16a5"
+pyth_feeds = ""

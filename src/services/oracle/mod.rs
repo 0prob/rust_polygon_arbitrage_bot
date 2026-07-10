@@ -218,6 +218,14 @@ fn build_token_to_matic_rates(
         }
         .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE);
         if let Some(rate) = rate {
+            // ponytail: log source path — integer (Chainlink) vs f64 (Pyth) for debugging
+            let path =
+                if addr == wmatic || oracle.token_matic_rate_per_unit_integer(&addr).is_some() {
+                    "int"
+                } else {
+                    "f64"
+                };
+            crate::trace!("rate {} {rate} path={path}", addr);
             out.insert(*idx, rate);
         }
     }

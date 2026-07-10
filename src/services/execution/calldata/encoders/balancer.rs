@@ -114,6 +114,18 @@ pub fn build_balancer_batch_swap_request(
     })
 }
 
+/// Limits for Vault flash-swap `batchSwap`: input asset capped at `MAX`, others at `MIN`
+/// so the Vault can lend/settle without executor pre-funding.
+fn build_flash_swap_limits(assets: &[Address], hops: &[CalldataHop]) -> Vec<I256> {
+    let mut limits = vec![I256::MIN; assets.len()];
+    if let Some(first) = hops.first()
+        && let Some(idx) = assets.iter().position(|a| *a == first.token_in)
+    {
+        limits[idx] = I256::MAX;
+    }
+    limits
+}
+
 /// Encode an all-Balancer route as one vault `batchSwap` flash-swap call for `executeArbDirect`.
 pub fn encode_balancer_batch_route(
     hops: &[CalldataHop],
@@ -121,8 +133,7 @@ pub fn encode_balancer_batch_route(
     deadline: U256,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     let req = build_balancer_batch_swap_request(hops, recipient)?;
-    // Flash-swap limits: zero means the vault may pull owed tokens at settlement.
-    let limits = vec![I256::ZERO; req.assets.len()];
+    let limits = build_flash_swap_limits(&req.assets, hops);
     let batch = IBalancerVault::batchSwapCall {
         kind: BALANCER_GIVEN_IN,
         swaps: req.swaps,
@@ -132,11 +143,52 @@ pub fn encode_balancer_batch_route(
         deadline,
     };
 
-    Ok(vec![
-        ExecutorCall {
-            target: BALANCER_VAULT,
-            value: U256::ZERO,
-            data: batch.abi_encode().into(),
-        },
-    ])
+    Ok(vec![ExecutorCall {
+        target: BALANCER_VAULT,
+        value: U256::ZERO,
+        data: batch.abi_encode().into(),
+    }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
+    use alloy::primitives::address;
+
+    fn hop(token_in: Address, token_out: Address, amount_in: u128) -> CalldataHop {
+        CalldataHop {
+            edge: Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                fee_bps: 30,
+                zero_for_one: true,
+                protocol: ProtocolType::BalancerV2,
+            },
+            pool_address: address!("0x1111111111111111111111111111111111111111"),
+            token_in,
+            token_out,
+            amount_in: U256::from(amount_in),
+            amount_out: U256::from(1u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        }
+    }
+
+    #[test]
+    fn flash_swap_limits_cap_input_and_open_outputs() {
+        let wmatic = address!("0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270");
+        let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
+        let hops = [hop(wmatic, usdc, 1_000), hop(usdc, wmatic, 1_000)];
+        let assets = vec![wmatic, usdc];
+        let limits = build_flash_swap_limits(&assets, &hops);
+        assert_eq!(limits[0], I256::MAX);
+        assert_eq!(limits[1], I256::MIN);
+    }
 }
