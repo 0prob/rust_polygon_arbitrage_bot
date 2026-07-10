@@ -131,10 +131,33 @@ impl StateCache {
         let guard = self.inner.read();
         guard
             .iter()
-            .filter_map(|(address, entry)| {
-                (entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable())
-                    .then(|| (*address, Arc::clone(&entry.state)))
+            .filter(|(_, entry)| {
+                entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable()
             })
+            .map(|(address, entry)| (*address, Arc::clone(&entry.state)))
+            .collect()
+    }
+
+    /// Tradable pools sorted by discovery index in one read-lock pass.
+    pub fn tradable_by_discovery_index(
+        &self,
+        address_index: &FxHashMap<Address, usize>,
+    ) -> Vec<(Address, Arc<PoolState>)> {
+        let guard = self.inner.read();
+        let mut out: Vec<(usize, Address, Arc<PoolState>)> = guard
+            .iter()
+            .filter(|(_, entry)| {
+                entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable()
+            })
+            .filter_map(|(address, entry)| {
+                address_index
+                    .get(address)
+                    .map(|&idx| (idx, *address, Arc::clone(&entry.state)))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(idx, _, _)| *idx);
+        out.into_iter()
+            .map(|(_, address, state)| (address, state))
             .collect()
     }
 
@@ -186,10 +209,15 @@ impl StateCache {
             if count & EVICT_INTERVAL_MASK == 0 {
                 guard.retain(|_, v| v.updated_at.elapsed() <= self.ttl);
             }
-            if guard.len() >= self.max_entries
-                && let Some(key) = guard.keys().next().copied()
-            {
-                guard.remove(&key);
+            if guard.len() >= self.max_entries {
+                // Evict the oldest entry instead of an arbitrary hash-map slot.
+                if let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.updated_at)
+                    .map(|(addr, _)| *addr)
+                {
+                    guard.remove(&oldest);
+                }
             }
         }
         guard.insert(

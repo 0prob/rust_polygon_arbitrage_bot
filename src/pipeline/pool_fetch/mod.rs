@@ -161,6 +161,9 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(info_bytes) else {
                 continue;
             };
+            if !info.enabled {
+                continue;
+            }
             if *token_addr == meta.quote {
                 quote_reserve = U256::from(info.reserve);
                 continue;
@@ -292,8 +295,7 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
     let mut updated = 0usize;
     for (addr, state) in
-        fetch_woofi_pools_batched(provider, woofi_pools, block_number, chunk_size, meta_cache)
-            .await
+        fetch_woofi_pools_batched(provider, woofi_pools, block_number, chunk_size, meta_cache).await
     {
         match state {
             Some(s) => {
@@ -429,15 +431,24 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         spans.push((plan, start, items.len()));
     }
 
-    let results =
-        match execute_multicall_at_chunked(provider.clone(), &items, block_number, chunk_size).await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                crate::warn!("multicall batch failed ({} items): {e}", items.len());
-                return 0;
-            }
-        };
+    let results = match execute_multicall_at_chunked(
+        provider.clone(),
+        &items,
+        block_number,
+        chunk_size,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = e;
+            crate::warn!(
+                "multicall batch failed ({} items): provider rejected batch",
+                items.len()
+            );
+            return 0;
+        }
+    };
 
     let mut updated = 0usize;
     for (plan, start, end) in spans {

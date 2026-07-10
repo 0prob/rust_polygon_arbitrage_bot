@@ -217,6 +217,10 @@ sol! {
         function _LP_FEE_RATE_() external view returns (uint256);
         function _BASE_TOKEN_() external view returns (address);
         function _QUOTE_TOKEN_() external view returns (address);
+        function getPMMStateForCall() external view returns (
+            uint256 i, uint256 K, uint256 B, uint256 Q,
+            uint256 B0, uint256 Q0, uint256 R
+        );
     }
 
     /// DODO V2 flash loan interface — shared by DVM/DPP/DSP pools.
@@ -233,6 +237,7 @@ sol! {
         function fee() external view returns (uint256);
         function balances(uint256 i) external view returns (uint256);
         function gamma() external view returns (uint256);
+        function price_scale() external view returns (uint256);
         function stored_rates() external view returns (uint256[]);
     }
 

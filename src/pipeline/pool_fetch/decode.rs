@@ -2,12 +2,16 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
 use std::sync::Arc;
 
-use crate::abis::{IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurvePool};
+use crate::abis::{
+    IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurvePool, IDodoPoolState,
+};
 use crate::core::math::balancer::balancer_swap_fee_from_pool_meta_fee;
 use crate::core::math::fixed_point::ONE;
+
+const DODO_FEE_RATE_SCALE: U256 = U256::from_limbs([100_000_000_000_000, 0, 0, 0]); // 1e14
 use crate::core::types::{
     BalancerLinearState, BalancerPoolKind, BalancerPoolState, CurvePoolState, DodoPoolState,
-    PoolState, ProtocolType, V2PoolState, V3PoolState, V4PoolState,
+    DodoRState, PoolState, ProtocolType, V2PoolState, V3PoolState, V4PoolState,
 };
 use crate::core::v4_storage::{decode_v4_liquidity, decode_v4_slot0};
 use crate::pipeline::abi_cache::{decode_abi_word, decode_algebra_global_state};
@@ -106,20 +110,44 @@ fn decode_v3_head(
         })
 }
 
+fn decode_v3_head_from_results(
+    plan: &PoolFetchPlan,
+    results: &[Option<Bytes>],
+) -> Option<(U256, i32, bool, Option<U256>, u16)> {
+    let mut global_bytes = None;
+    let mut slot0_bytes = None;
+    for (result, kind) in results.iter().zip(plan.kinds.iter()) {
+        match kind {
+            CallKind::V3GlobalState => global_bytes = result.as_ref(),
+            CallKind::V3Slot0 => slot0_bytes = result.as_ref(),
+            _ => {}
+        }
+    }
+    if let Some(bytes) = global_bytes
+        && let Some(head) = decode_v3_head(bytes, true)
+    {
+        return Some(head);
+    }
+    slot0_bytes.and_then(|bytes| decode_v3_head(bytes, false))
+}
+
 fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let slot0_bytes = results.first()?.as_ref()?;
-    let prefer_algebra = plan.kinds.first().copied() == Some(CallKind::V3GlobalState);
-    let (sqrt, tick, unlocked, algebra_fee, obs_card) =
-        decode_v3_head(slot0_bytes, prefer_algebra)?;
-    let liq_bytes = results.get(1)?.as_ref()?;
+    let (sqrt, tick, unlocked, algebra_fee, obs_card) = decode_v3_head_from_results(plan, results)?;
+    let liq_idx = plan
+        .kinds
+        .iter()
+        .position(|k| *k == CallKind::V3Liquidity)
+        .unwrap_or(1);
+    let liq_bytes = results.get(liq_idx)?.as_ref()?;
     let liquidity = decode_u256(liq_bytes)?.as_limbs()[0] as u128;
     if sqrt.is_zero() || liquidity == 0 {
         return None;
     }
+    let fee_idx = plan.kinds.iter().position(|k| *k == CallKind::V3Fee);
     let fee_pips = algebra_fee
         .or_else(|| {
-            results
-                .get(2)
+            fee_idx
+                .and_then(|idx| results.get(idx))
                 .and_then(|b| b.as_ref())
                 .and_then(|b| decode_u256(b).map(|v| v.as_limbs()[0] as u32))
                 .map(U256::from)
@@ -166,7 +194,7 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
     }))
 }
 
-fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let base = decode_u256(results.first()?.as_ref()?)?;
     let quote = decode_u256(results.get(1)?.as_ref()?)?;
     let base_token = decode_address(results.get(2)?.as_ref()?)?;
@@ -174,6 +202,14 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
     let i = decode_u256(results.get(4)?.as_ref()?)?;
     let k = decode_u256(results.get(5)?.as_ref()?)?;
     let lp_fee_rate = decode_u256(results.get(6)?.as_ref()?)?;
+    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(results.get(7)?.as_ref()?)
+        .ok()?;
+    let r_state = match pmm.R {
+        r if r == U256::ZERO => DodoRState::One,
+        r if r == U256::ONE => DodoRState::AboveOne,
+        r if r == U256::from(2u8) => DodoRState::BelowOne,
+        _ => return None,
+    };
     if base.is_zero()
         || quote.is_zero()
         || base_token.is_zero()
@@ -181,21 +217,30 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
         || i.is_zero()
         || k > ONE
         || lp_fee_rate >= ONE
+        || U256::from(pmm.B) != base
+        || U256::from(pmm.Q) != quote
+        || U256::from(pmm.B0).is_zero()
+        || U256::from(pmm.Q0).is_zero()
     {
         return None;
     }
+    let mt_fee_rate = dodo_mt_fee_from_indexer_bps(plan.pool.fee_bps, lp_fee_rate);
     Some(PoolState::Dodo(DodoPoolState {
         base_reserve: base,
         quote_reserve: quote,
         base_token,
         quote_token,
+        base_target: U256::from(pmm.B0),
+        quote_target: U256::from(pmm.Q0),
+        r_state,
         i,
         k,
         lp_fee_rate,
+        mt_fee_rate,
     }))
 }
 
-fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Vec<U256>> {
     let n_fetched = super::plans::curve_balance_slots(plan.pool.tokens.len());
     let mut balances = Vec::with_capacity(n_fetched);
     for i in 0..n_fetched {
@@ -206,21 +251,65 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
             .unwrap_or(U256::ZERO);
         balances.push(b);
     }
-    let n_coins = balances.len();
+    if balances.iter().any(U256::is_zero) {
+        return None;
+    }
+    Some(balances)
+}
+
+fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
+    pool_type.is_some_and(|t| {
+        let b = t.as_bytes();
+        b.windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
+            || b.windows(4)
+                .any(|w| w.eq_ignore_ascii_case(b"meta"))
+    })
+}
+
+fn decode_curve_stored_rates(
+    plan: &PoolFetchPlan,
+    results: &[Option<Bytes>],
+    n_fetched: usize,
+    rates_idx: usize,
+) -> Option<Vec<U256>> {
+    let decoded = results
+        .get(rates_idx)
+        .and_then(|b| b.as_ref())
+        .and_then(|b| ICurvePool::stored_ratesCall::abi_decode_returns(b).ok())
+        .map(|r| r.iter().map(|&x| U256::from(x)).collect::<Vec<_>>())?;
+    if decoded.len() == n_fetched && !decoded.iter().any(U256::is_zero) {
+        return Some(decoded);
+    }
+    if curve_pool_requires_stored_rates(plan.pool.pool_type.as_deref()) {
+        return None;
+    }
+    Some(vec![ONE; n_fetched])
+}
+
+fn decode_curve_crypto_rates(
+    n_fetched: usize,
+    price_scale: Option<U256>,
+) -> Vec<U256> {
+    let mut rates = vec![ONE; n_fetched];
+    if n_fetched >= 2 {
+        if let Some(scale) = price_scale.filter(|scale| !scale.is_zero()) {
+            rates[1] = scale;
+        }
+    }
+    rates
+}
+
+fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+    let balances = decode_curve_balances(plan, results)?;
+    let n_fetched = balances.len();
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
     let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
     let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
-    let rates = results
-        .get(rates_idx)
-        .and_then(|b| b.as_ref())
-        .and_then(|b| ICurvePool::stored_ratesCall::abi_decode_returns(b).ok())
-        .map_or_else(
-            || vec![ONE; n_fetched],
-            |r| r.iter().map(|&x| U256::from(x)).collect(),
-        );
-    if rates.len() != n_fetched || rates.iter().any(U256::is_zero) || a.is_zero() {
+    let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
+    if a.is_zero() {
         return None;
     }
     Some(PoolState::Curve(CurvePoolState {
@@ -228,27 +317,56 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
         a,
         fee,
         rates,
-        n_coins: n_coins as u8,
+        n_coins: n_fetched as u8,
         gamma: None,
         d: None,
     }))
 }
 
 fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let mut state = decode_curve_stable(plan, results)?;
-    if let PoolState::Curve(ref mut c) = state {
-        let n_fetched = super::plans::curve_balance_slots(plan.pool.tokens.len());
-        let gamma_idx = n_fetched + 3;
-        c.gamma = results
-            .get(gamma_idx)
-            .and_then(|b| b.as_ref())
-            .and_then(|b| ICurvePool::gammaCall::abi_decode_returns(b).ok())
-            .map(U256::from);
-        if c.gamma.is_none_or(|gamma| gamma.is_zero()) {
-            return None;
-        }
+    let balances = decode_curve_balances(plan, results)?;
+    let n_fetched = balances.len();
+    let a_idx = n_fetched;
+    let fee_idx = n_fetched + 1;
+    let gamma_idx = n_fetched + 2;
+    let price_scale_idx = n_fetched + 3;
+    let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
+    let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
+    let gamma = results
+        .get(gamma_idx)
+        .and_then(|b| b.as_ref())
+        .and_then(|b| ICurvePool::gammaCall::abi_decode_returns(b).ok())
+        .map(U256::from)?;
+    if gamma.is_zero() || a.is_zero() {
+        return None;
     }
-    Some(state)
+    let price_scale = results
+        .get(price_scale_idx)
+        .and_then(|b| b.as_ref())
+        .and_then(|b| ICurvePool::price_scaleCall::abi_decode_returns(b).ok())
+        .map(U256::from);
+    let rates = decode_curve_crypto_rates(n_fetched, price_scale);
+    Some(PoolState::Curve(CurvePoolState {
+        balances,
+        a,
+        fee,
+        rates,
+        n_coins: n_fetched as u8,
+        gamma: Some(gamma),
+        d: None,
+    }))
+}
+
+fn dodo_mt_fee_from_indexer_bps(fee_bps: u32, lp_fee_rate: U256) -> U256 {
+    if fee_bps == 0 {
+        return U256::ZERO;
+    }
+    let total = U256::from(fee_bps) * DODO_FEE_RATE_SCALE;
+    if total > lp_fee_rate && total < ONE {
+        total - lp_fee_rate
+    } else {
+        U256::ZERO
+    }
 }
 
 fn decode_balancer_linear(

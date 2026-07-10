@@ -6,10 +6,11 @@ use crate::core::v4_storage::{V4_LIQUIDITY_OFFSET, compute_v4_pool_field_slot};
 use crate::pipeline::abi_cache::{
     ALGEBRA_GLOBAL_STATE, BALANCER_AMP, BALANCER_LINEAR_MAIN, BALANCER_LINEAR_RATE,
     BALANCER_LINEAR_TARGETS, BALANCER_LINEAR_WRAPPED, BALANCER_SCALING, BALANCER_SWAP_FEE,
-    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_FEE, CURVE_GAMMA, CURVE_STORED_RATES,
-    DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K, DODO_LP_FEE, DODO_QUOTE_RESERVE,
-    DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens,
-    encode_extsload,
+    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_FEE, CURVE_GAMMA, CURVE_PRICE_SCALE,
+    CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K, DODO_LP_FEE,
+    DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY,
+    V3_SLOT0,
+    encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
 use crate::services::discovery::{DiscoveredPool, resolve_v4_pool_id};
@@ -30,10 +31,12 @@ pub(super) enum CallKind {
     DodoI,
     DodoK,
     DodoLpFee,
+    DodoPmmState,
     CurveBalance(usize),
     CurveA,
     CurveFee,
     CurveRates,
+    CurvePriceScale,
     BalancerTokens,
     BalancerSwapFee,
     BalancerWeights,
@@ -108,6 +111,8 @@ fn build_v3_plan(plan: &mut PoolFetchPlan) {
             ALGEBRA_GLOBAL_STATE.clone(),
             CallKind::V3GlobalState,
         );
+        // Fallback when globalState reverts on mislabeled or hybrid pools.
+        push_call(plan, plan.pool.address, V3_SLOT0.clone(), CallKind::V3Slot0);
     } else {
         push_call(plan, plan.pool.address, V3_SLOT0.clone(), CallKind::V3Slot0);
     }
@@ -153,6 +158,7 @@ fn build_dodo_plan(plan: &mut PoolFetchPlan) {
     push_call(plan, addr, DODO_I.clone(), CallKind::DodoI);
     push_call(plan, addr, DODO_K.clone(), CallKind::DodoK);
     push_call(plan, addr, DODO_LP_FEE.clone(), CallKind::DodoLpFee);
+    push_call(plan, addr, DODO_PMM_STATE.clone(), CallKind::DodoPmmState);
 }
 
 pub(super) fn curve_balance_slots(token_count: usize) -> usize {
@@ -176,18 +182,25 @@ fn build_curve_plan(plan: &mut PoolFetchPlan) {
         CURVE_FEE.clone(),
         CallKind::CurveFee,
     );
-    push_call(
-        plan,
-        plan.pool.address,
-        CURVE_STORED_RATES.clone(),
-        CallKind::CurveRates,
-    );
     if plan.pool.protocol == ProtocolType::CurveCrypto {
         push_call(
             plan,
             plan.pool.address,
             CURVE_GAMMA.clone(),
             CallKind::CurveGamma,
+        );
+        push_call(
+            plan,
+            plan.pool.address,
+            CURVE_PRICE_SCALE.clone(),
+            CallKind::CurvePriceScale,
+        );
+    } else {
+        push_call(
+            plan,
+            plan.pool.address,
+            CURVE_STORED_RATES.clone(),
+            CallKind::CurveRates,
         );
     }
 }

@@ -10,14 +10,9 @@ use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
 use crate::pipeline::weighted_graph::build_weighted_adjacency;
 use rayon::join;
 
-fn split_budget(total: usize) -> [usize; 3] {
-    let base = total / 3;
-    let rem = total % 3;
-    [
-        base + usize::from(rem > 0),
-        base + usize::from(rem > 1),
-        base,
-    ]
+fn split_hybrid_budget(total: usize) -> (usize, usize) {
+    let dfs = total.div_ceil(2);
+    (dfs, total.saturating_sub(dfs))
 }
 
 fn finalize_cycles(
@@ -92,7 +87,7 @@ pub fn find_cycles_hybrid_multi_pass(
     let dfs_budget: Vec<_> = passes
         .iter()
         .map(|p| {
-            let [dfs, _, _] = split_budget(p.max_cycles);
+            let (dfs, _) = split_hybrid_budget(p.max_cycles);
             CycleSearchPass {
                 max_hops: p.max_hops,
                 max_cycles: dfs,
@@ -102,10 +97,10 @@ pub fn find_cycles_hybrid_multi_pass(
     let bf_budget: Vec<_> = passes
         .iter()
         .map(|p| {
-            let [_, johnson, bf] = split_budget(p.max_cycles);
+            let (_, bf) = split_hybrid_budget(p.max_cycles);
             CycleSearchPass {
                 max_hops: p.max_hops,
-                max_cycles: johnson + bf,
+                max_cycles: bf,
             }
         })
         .collect();
@@ -144,11 +139,11 @@ mod tests {
     }
 
     #[test]
-    fn split_budget_uses_all_capacity() {
-        assert_eq!(split_budget(0), [0, 0, 0]);
-        assert_eq!(split_budget(1), [1, 0, 0]);
-        assert_eq!(split_budget(2), [1, 1, 0]);
-        assert_eq!(split_budget(3), [1, 1, 1]);
-        assert_eq!(split_budget(5), [2, 2, 1]);
+    fn split_hybrid_budget_uses_all_capacity() {
+        assert_eq!(split_hybrid_budget(0), (0, 0));
+        assert_eq!(split_hybrid_budget(1), (1, 0));
+        assert_eq!(split_hybrid_budget(2), (1, 1));
+        assert_eq!(split_hybrid_budget(3), (2, 1));
+        assert_eq!(split_hybrid_budget(5), (3, 2));
     }
 }

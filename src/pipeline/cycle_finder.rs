@@ -685,7 +685,7 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
         match best.entry(key) {
             Entry::Occupied(mut e) => {
                 if cycle.score < e.get().score {
-                    e.insert(cycle.clone());
+                    *e.get_mut() = cycle.clone();
                 }
             }
             Entry::Vacant(e) => {

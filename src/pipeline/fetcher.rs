@@ -37,7 +37,7 @@ const FETCHABLE_PROTOCOLS: [ProtocolType; 8] = [
 pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: P,
     cache: Arc<StateCache>,
-    pools: &[DiscoveredPool],
+    pools: &[&DiscoveredPool],
     max_pools: usize,
     max_multicall_calls: usize,
     batch_pace_ms: u64,
@@ -45,7 +45,7 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
 ) -> (usize, bool) {
-    let targets = select_fetch_targets(pools, cache.as_ref(), max_pools, priority);
+    let targets = select_fetch_targets(pools.iter().copied(), cache.as_ref(), max_pools, priority);
     if targets.is_empty() {
         return (0, false);
     }
@@ -105,7 +105,7 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
 }
 
 fn select_fetch_targets<'a>(
-    pools: &'a [DiscoveredPool],
+    pools: impl IntoIterator<Item = &'a DiscoveredPool>,
     cache: &StateCache,
     max_pools: usize,
     priority: &[Address],
@@ -120,7 +120,9 @@ fn select_fetch_targets<'a>(
     let mut per_protocol: [Vec<(&'a DiscoveredPool, u8)>; FETCHABLE_PROTOCOLS.len()] =
         std::array::from_fn(|_| Vec::new());
     cache.for_each_fetch_candidate(
-        pools.iter().filter(|p| is_fetchable_protocol(p.protocol)),
+        pools
+            .into_iter()
+            .filter(|p| is_fetchable_protocol(p.protocol)),
         |pool, class| {
             if let Some(slot) = pool.protocol.fetch_slot() {
                 per_protocol[slot].push((pool, class));

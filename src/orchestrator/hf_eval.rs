@@ -47,7 +47,6 @@ struct SkipCounters {
     flash_source: u32,
     probe: u32,
     net: u32,
-    quarantine: u32,
 }
 
 pub struct HfEvalInput<'a> {
@@ -167,6 +166,7 @@ fn cycle_simulatable(
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let probe = min_economic_amount_in(decimals, rate);
     let spot_probe = spot_probe_for_decimals(decimals);
+    let _ = spot_probe;
     for amount in [probe, spot_probe] {
         let Some(min_sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
             continue;
@@ -174,15 +174,9 @@ fn cycle_simulatable(
         if min_sim.profit.is_zero() {
             continue;
         }
-        let Some(sim) = simulate_route_detailed(arena, &cycle.edges, amount) else {
-            continue;
-        };
-        if !local_sim::route_hop_fidelity_ok(arena, &cycle.edges, &sim.hop_amounts, spot_probe) {
-            continue;
-        }
         if check_sim_sanity(SimSanityInput {
             amount_in: amount,
-            gross_profit: sim.profit,
+            gross_profit: min_sim.profit,
             search_low: amount,
             token_decimals: decimals,
             token_to_matic_rate: rate,
@@ -208,15 +202,8 @@ fn cycle_flash_evaluable(
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let economic = min_economic_amount_in(decimals, rate);
     balancer_route_flash_feasible(cycle, arena, flash, flash_ttl)
-        && resolve_flash_source_for_cycle(
-            cycle,
-            arena,
-            flash,
-            flash_ttl,
-            flash_policy,
-            economic,
-        )
-        .is_some()
+        && resolve_flash_source_for_cycle(cycle, arena, flash, flash_ttl, flash_policy, economic)
+            .is_some()
 }
 
 /// Score-ranked fallback when probe ranking yields nothing simulatable at Brent size.
@@ -230,10 +217,10 @@ fn simulatable_score_fallback(
     max_keep: usize,
 ) -> Vec<FoundCycle> {
     let flash_ttl = flash_liquidity.ttl();
+    let flash = flash_liquidity.load();
     let mut fallback: Vec<FoundCycle> = scanned
         .iter()
         .filter_map(|cycle| {
-            let flash = flash_liquidity.load();
             let ready = prefer_aave_flash_start(cycle, arena, &flash, flash_ttl);
             if cycle_simulatable(arena, &ready, token_decimals, token_to_matic_rates)
                 && cycle_flash_evaluable(
@@ -300,7 +287,6 @@ pub fn rank_cycles_by_probe_net(
     flash_liquidity: &FlashLiquidityCache,
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
-    execution: &ExecutionService,
 ) -> (Vec<FoundCycle>, FxHashMap<u64, (U256, MinimalSimResult)>) {
     if cycles.is_empty() || max_keep == 0 {
         return (Vec::new(), FxHashMap::default());
@@ -317,14 +303,10 @@ pub fn rank_cycles_by_probe_net(
     let mut skip = SkipCounters::default();
     let mut near_net: Vec<(U256, FoundCycle)> = Vec::new();
     let flash_ttl = flash_liquidity.ttl();
+    let flash = flash_liquidity.load();
     for cycle_arc in &scanned {
-        let flash = flash_liquidity.load();
         let cycle = prefer_aave_flash_start(cycle_arc, arena, &flash, flash_ttl);
         let fp = hash_cycle_edges(&cycle.edges);
-        if execution.is_route_quarantined(fp) {
-            skip.quarantine += 1;
-            continue;
-        }
         if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
             skip.rate += 1;
             continue;
@@ -408,7 +390,6 @@ pub fn rank_cycles_by_probe_net(
     }
 
     rescue.retain(|cycle| {
-        let flash = flash_liquidity.load();
         cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
             && cycle_flash_evaluable(
                 cycle,
@@ -439,7 +420,6 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
-                let flash = flash_liquidity.load();
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
                         cycle,
@@ -618,7 +598,6 @@ pub async fn rescore_rank_and_evaluate_async(
                 input.flash_liquidity.as_ref(),
                 input.safety_multiplier_bps,
                 input.profit_priority_alpha_bps,
-                input.execution.as_ref(),
             );
             if !cycles.is_empty() {
                 crate::debug!("probe rank kept {} cycles for Brent", cycles.len());
@@ -880,7 +859,6 @@ fn evaluate_one(
         }
     };
 
-    let flash = input.flash_liquidity.load();
     let Some(flash_source) = resolve_flash_source_for_cycle(
         cycle,
         input.arena,

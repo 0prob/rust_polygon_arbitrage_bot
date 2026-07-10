@@ -164,9 +164,21 @@ pub struct DodoPoolState {
     pub quote_reserve: U256,
     pub base_token: Address,
     pub quote_token: Address,
+    pub base_target: U256,
+    pub quote_target: U256,
+    pub r_state: DodoRState,
     pub i: U256,
     pub k: U256,
     pub lp_fee_rate: U256,
+    /// Maintainer fee on gross PMM output (1e18 scale); derived from indexer total fee.
+    pub mt_fee_rate: U256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DodoRState {
+    One,
+    AboveOne,
+    BelowOne,
 }
 
 #[derive(Debug, Clone)]

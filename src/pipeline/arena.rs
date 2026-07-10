@@ -18,17 +18,43 @@ struct ArenaInner {
     pool_addresses: Vec<Address>,
     address_to_pool: FxHashMap<Address, PoolIndex>,
     address_to_token: FxHashMap<Address, TokenIndex>,
+    /// Cached layout fingerprint — refreshed on register, not on every LF read.
+    layout_fingerprint: u64,
+}
+
+fn compute_layout_fingerprint(inner: &ArenaInner) -> u64 {
+    let mut h = FxHasher::default();
+    h.write_u32(inner.tokens.len() as u32);
+    for addr in &inner.tokens {
+        h.write(addr.as_slice());
+    }
+    h.write_usize(inner.pools.len());
+    for addr in &inner.pool_addresses {
+        h.write(addr.as_slice());
+    }
+    h.finish()
 }
 
 /// Contiguous memory store for tokens and pool states.
 ///
 /// Heavy vectors live behind `Arc` so HF ticks can clone cheaply and overlay hot
 /// pool states from cache without copying the full arena.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StateArena {
     inner: Arc<ArenaInner>,
     /// Per-pool hot overlay indexed by `PoolIndex.0` (O(1) lookup on HF path).
     hot_overlay: Vec<Option<Arc<PoolState>>>,
+}
+
+impl Default for StateArena {
+    fn default() -> Self {
+        let mut inner = ArenaInner::default();
+        inner.layout_fingerprint = compute_layout_fingerprint(&inner);
+        Self {
+            inner: Arc::new(inner),
+            hot_overlay: Vec::new(),
+        }
+    }
 }
 
 impl Clone for StateArena {
@@ -52,20 +78,7 @@ impl StateArena {
     /// membership order cannot reuse stale edges that point at the wrong pools.
     #[must_use]
     pub fn routing_layout_fingerprint(&self) -> u64 {
-        let mut h = FxHasher::default();
-        h.write_u32(self.token_count());
-        for i in 0..self.token_count() {
-            if let Some(addr) = self.token_address(TokenIndex(i)) {
-                h.write(addr.as_slice());
-            }
-        }
-        h.write_usize(self.pool_count());
-        for i in 0..self.pool_count() {
-            if let Some(addr) = self.pool_address(PoolIndex(i as u32)) {
-                h.write(addr.as_slice());
-            }
-        }
-        h.finish()
+        self.inner.layout_fingerprint
     }
 
     #[must_use]
@@ -150,6 +163,7 @@ impl StateArena {
         inner.tokens.push(address);
         inner.token_decimals.push(dec);
         inner.address_to_token.insert(address, idx);
+        inner.layout_fingerprint = compute_layout_fingerprint(inner);
         idx
     }
 
@@ -179,6 +193,7 @@ impl StateArena {
         inner.pools.push(state);
         inner.pool_addresses.push(address);
         inner.address_to_pool.insert(address, idx);
+        inner.layout_fingerprint = compute_layout_fingerprint(inner);
         idx
     }
 
@@ -210,8 +225,7 @@ impl StateArena {
         address_index: &FxHashMap<Address, usize>,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
     ) -> Vec<crate::pipeline::types::PoolMeta> {
-        let mut tradable = cache.tradable_snapshot();
-        tradable.sort_unstable_by_key(|(address, _)| address_index.get(address).copied());
+        let tradable = cache.tradable_by_discovery_index(address_index);
 
         let inner = Arc::make_mut(&mut self.inner);
         let expected_tokens = tradable

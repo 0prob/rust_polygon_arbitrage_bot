@@ -163,6 +163,11 @@ mod tests {
     }
 
     #[test]
+    fn curve_crypto_is_fetchable() {
+        assert!(is_fetchable_protocol(ProtocolType::CurveCrypto));
+    }
+
+    #[test]
     fn balancer_pool_type_normalization_is_explicit_and_case_insensitive() {
         assert_eq!(
             normalize_balancer_pool_type(Some("WeightedPool")),

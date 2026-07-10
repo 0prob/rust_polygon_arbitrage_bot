@@ -282,10 +282,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         ctx.cache.len()
     );
     let decimals = ctx.refresh.token_decimals_map();
-    let pool_metas = Arc::new(ctx.refresh.sync_routable_arena(
-        &mut arena,
-        Some(decimals.as_ref()),
-    ));
+    let pool_metas = Arc::new(
+        ctx.refresh
+            .sync_routable_arena(&mut arena, Some(decimals.as_ref())),
+    );
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 

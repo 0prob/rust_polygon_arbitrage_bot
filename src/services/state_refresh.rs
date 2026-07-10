@@ -604,7 +604,8 @@ impl StateRefreshService {
             hot.len(),
             max_pools
         );
-        self.refresh_pools_impl(&pools, max_pools, hot.as_ref())
+        let pool_refs: Vec<&DiscoveredPool> = pools.iter().collect();
+        self.refresh_pools_impl(&pool_refs, max_pools, hot.as_ref())
             .await
     }
 
@@ -622,13 +623,13 @@ impl StateRefreshService {
         // building a HashMap from all discovered pools (which can be 10k+ entries).
         let mut addrs: Vec<Address> = addresses.to_vec();
         addrs.sort_unstable();
-        let mut pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
+        let mut pool_refs: Vec<&DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
         let mut ai = 0usize;
         let mut pi = 0usize;
         while ai < addrs.len() && pi < all.len() {
             match addrs[ai].cmp(&all[pi].address) {
                 std::cmp::Ordering::Equal => {
-                    pools.push(all[pi].clone());
+                    pool_refs.push(&all[pi]);
                     ai += 1;
                     pi += 1;
                 }
@@ -636,15 +637,16 @@ impl StateRefreshService {
                 std::cmp::Ordering::Greater => pi += 1,
             }
         }
-        if pools.is_empty() {
+        if pool_refs.is_empty() {
             return Ok(0);
         }
-        self.refresh_pools_impl(&pools, max_pools, addresses).await
+        self.refresh_pools_impl(&pool_refs, max_pools, addresses)
+            .await
     }
 
     async fn refresh_pools_impl(
         &self,
-        pools: &[DiscoveredPool],
+        pools: &[&DiscoveredPool],
         max_pools: usize,
         hot: &[Address],
     ) -> anyhow::Result<usize> {

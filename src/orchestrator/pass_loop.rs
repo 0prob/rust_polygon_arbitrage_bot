@@ -164,17 +164,15 @@ pub async fn run_pass_loop(
 ) -> anyhow::Result<()> {
     info!("pass loop started");
 
-    ctx.rpc.probe_and_rank_state_urls().await;
     ctx.rpc
         .spawn_periodic_probe(shutdown.clone(), std::time::Duration::from_secs(600));
-
-    match ctx.refresh.maybe_discover().await {
-        Ok(added) => {
-            if added > 0 {
-                info!("initial discovery added {added} pools");
-            }
-        }
-        Err(e) => crate::warn!("initial pool discovery failed: {e:#}"),
+    // Rank RPC endpoints in the background; LF owns initial PG bootstrap via
+    // maybe_discover on its first tick so HF/WSS can start without blocking.
+    {
+        let rpc = Arc::clone(&ctx.rpc);
+        tokio::spawn(async move {
+            rpc.probe_and_rank_state_urls().await;
+        });
     }
 
     let daily_loss_guard = spawn_daily_loss_guard(&ctx, &shutdown);

@@ -66,6 +66,32 @@ fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
     calls
 }
 
+async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
+    provider: &P,
+    items: &[MulticallItem],
+    block_number: Option<u64>,
+) -> anyhow::Result<Vec<Option<Bytes>>> {
+    let mut pending: Vec<(usize, usize)> = vec![(0, items.len())];
+    let mut out = vec![None; items.len()];
+    while let Some((start, end)) = pending.pop() {
+        let slice = &items[start..end];
+        match execute_multicall_chunk(provider, slice, block_number).await {
+            Ok(results) => {
+                for (i, result) in results.into_iter().enumerate() {
+                    out[start + i] = result;
+                }
+            }
+            Err(_e) if slice.len() > 1 => {
+                let mid = start + slice.len() / 2;
+                pending.push((mid, end));
+                pending.push((start, mid));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     provider: &P,
     items: &[MulticallItem],
@@ -76,7 +102,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
     }
 
     let contract = IMulticall3::new(MULTICALL3, provider);
-    let calls = build_calls(items); // Build once — reused across retries.
+    let mut calls = build_calls(items);
 
     let mut attempt = 0u32;
     loop {
@@ -102,6 +128,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
                 if is_retryable_rpc_error(&e) && attempt < 4 {
                     retry_sleep(attempt).await;
                     attempt += 1;
+                    calls = build_calls(items);
                     continue;
                 }
                 return Err(e);
@@ -152,23 +179,25 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
         return execute_multicall_chunk(&provider, items, block_number).await;
     }
 
-    let chunks: Vec<_> = items.chunks(max_chunk).collect();
-    let num_chunks = chunks.len();
+    let items = Arc::new(items.to_vec());
+    let num_chunks = items.len().div_ceil(max_chunk);
     let sem = Arc::new(tokio::sync::Semaphore::new(
         MAX_CONCURRENT_CHUNKS.min(num_chunks).max(1),
     ));
 
     let mut tasks = tokio::task::JoinSet::new();
-    for (i, chunk) in chunks.into_iter().enumerate() {
+    for i in 0..num_chunks {
+        let start = i * max_chunk;
+        let end = (start + max_chunk).min(items.len());
         let sem = Arc::clone(&sem);
         let p = provider.clone();
         let bn = block_number;
-        let chunk_vec: Vec<_> = chunk.to_vec();
+        let items = Arc::clone(&items);
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
                 return (i, Err(anyhow::anyhow!("multicall semaphore closed")));
             };
-            let res = execute_multicall_chunk(&p, &chunk_vec, bn).await;
+            let res = execute_multicall_chunk_resilient(&p, &items[start..end], bn).await;
             (i, res)
         });
     }

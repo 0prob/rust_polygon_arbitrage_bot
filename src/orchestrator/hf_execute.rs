@@ -35,7 +35,8 @@ const DISPATCH_CONCURRENCY: usize = 3;
 
 pub(crate) struct DispatchInputs<'a> {
     pub(crate) pool_metas: &'a [crate::pipeline::types::PoolMeta],
-    pub(crate) token_to_matic_rates: &'a rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+    pub(crate) token_to_matic_rates:
+        &'a rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     pub(crate) token_decimals: &'a rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     pub(crate) state_generation: u64,
     pub(crate) skip_dispatch_refresh: bool,
@@ -65,12 +66,8 @@ impl SkipCounts {
         let fidelity = self.fidelity.load(Ordering::Relaxed);
         let prepare = self.prepare.load(Ordering::Relaxed);
         let build = self.build.load(Ordering::Relaxed);
-        if build > 0 || quarantine > 0 || fidelity > 0 {
+        if build > 0 || quarantine > 0 || fidelity > 0 || prepare > 0 {
             crate::info!(
-                "dispatch summary: quarantine={quarantine}, fidelity={fidelity}, prepare={prepare}, build={build}",
-            );
-        } else if prepare > 0 {
-            crate::debug!(
                 "dispatch summary: quarantine={quarantine}, fidelity={fidelity}, prepare={prepare}, build={build}",
             );
         }
@@ -215,15 +212,16 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         true
     };
 
-    if flash_stale && !flash_tokens.is_empty()
+    if flash_stale
+        && !flash_tokens.is_empty()
         && let Err(_e) = ctx
             .execution
             .flash_liquidity
             .refresh(sim_provider, &flash_tokens)
             .await
-        {
-            crate::warn!("flash liquidity refresh failed: {_e}");
-        }
+    {
+        crate::warn!("flash liquidity refresh failed: {_e}");
+    }
 
     let skipped = Arc::new(SkipCounts::default());
     let shutdown = ctx.shutdown.clone();
@@ -587,6 +585,68 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
         tick_pools.len(),
         v4_targets.len(),
     );
+}
+
+/// Drop Balancer-only candidates whose vault `queryBatchSwap` disagrees with local sim.
+pub(crate) async fn filter_balancer_onchain_verified<
+    P: Provider<Ethereum> + Clone + Send + 'static,
+>(
+    execution: &crate::services::execution::ExecutionService,
+    arena: &StateArena,
+    candidates: Vec<HfEvalResult>,
+    sim_provider: &P,
+    executor: alloy::primitives::Address,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    slippage_bps: u64,
+) -> Vec<HfEvalResult> {
+    let pool_metas_by_pool: FxHashMap<
+        crate::core::types::PoolIndex,
+        &crate::pipeline::types::PoolMeta,
+    > = pool_metas.iter().map(|m| (m.pool_index, m)).collect();
+
+    let mut verified = Vec::with_capacity(candidates.len());
+    for result in candidates {
+        if !route_is_balancer_only(&result.cycle) {
+            verified.push(result);
+            continue;
+        }
+        let fp = result.route_fingerprint;
+        let Some(start_token) = arena.token_address(result.cycle.start_token) else {
+            execution.quarantine_batch_query_failure(fp);
+            continue;
+        };
+        let Some(hops) = build_calldata_hops(
+            arena,
+            &result.cycle.edges,
+            &result.sim.hop_amounts,
+            &pool_metas_by_pool,
+        ) else {
+            execution.quarantine_batch_query_failure(fp);
+            continue;
+        };
+        if !balancer_batch_within_max_in_ratio(arena, &hops) {
+            execution.quarantine_batch_query_failure(fp);
+            continue;
+        }
+        let slippage = result.effective_slippage_bps.max(slippage_bps);
+        let accept =
+            match query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await {
+                BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
+                    on_chain_profit,
+                    result.sim.profit,
+                    result.sim.amount_in,
+                    slippage,
+                    result.cycle.hop_count,
+                ),
+                _ => false,
+            };
+        if accept {
+            verified.push(result);
+        } else {
+            execution.quarantine_batch_query_failure(fp);
+        }
+    }
+    verified
 }
 
 fn collect_route_pool_addresses(

@@ -83,8 +83,7 @@ struct CachedLiquidity {
 }
 
 /// Immutable, atomically published flash-liquidity map (LF/HF readers hold `Arc` snapshots).
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FlashLiquiditySnapshot {
     generation: u64,
     entries: FxHashMap<Address, CachedLiquidity>,
@@ -120,7 +119,6 @@ impl FlashLiquiditySnapshot {
             .is_some_and(|e| e.fetched_at.elapsed() < ttl)
     }
 }
-
 
 /// Lock-free flash liquidity handoff: background refresh builds a new map, then `store`s it.
 #[derive(Debug)]
@@ -233,10 +231,7 @@ impl FlashLiquidityCache {
         self.aave_inactive_pins.lock().insert(token);
         let current = self.inner.load_full();
         let mut next = current.entries.clone();
-        let prior = next
-            .get(&token)
-            .map(|e| e.snapshot)
-            .unwrap_or_default();
+        let prior = next.get(&token).map(|e| e.snapshot).unwrap_or_default();
         next.insert(
             token,
             CachedLiquidity {
@@ -427,12 +422,10 @@ fn route_uses_balancer_vault_swap(cycle: &FoundCycle) -> bool {
 
 #[must_use]
 pub fn cycle_has_dodo_pool(arena: &StateArena, cycle: &FoundCycle) -> bool {
-    cycle.edges.iter().any(|edge| {
-        matches!(
-            arena.pool_state(edge.pool_index),
-            Some(PoolState::Dodo(_))
-        )
-    })
+    cycle
+        .edges
+        .iter()
+        .any(|edge| matches!(arena.pool_state(edge.pool_index), Some(PoolState::Dodo(_))))
 }
 
 /// Map eval-time flash plans onto sources the executor can actually dispatch.
@@ -445,12 +438,7 @@ pub fn align_flash_source_for_dispatch(
     has_dodo: bool,
 ) -> Option<FlashLoanSource> {
     let aave_viable = liquidity.aave_listed && !liquidity.aave.is_zero();
-    if !balancer_only
-        && matches!(
-            source,
-            FlashLoanSource::Balancer | FlashLoanSource::Direct
-        )
-    {
+    if !balancer_only && matches!(source, FlashLoanSource::Balancer | FlashLoanSource::Direct) {
         if aave_viable {
             return Some(FlashLoanSource::AaveV3);
         }
@@ -1226,12 +1214,7 @@ mod tests {
             dodo: U256::MAX,
         };
         assert_eq!(
-            align_flash_source_for_dispatch(
-                FlashLoanSource::Balancer,
-                &liquidity,
-                false,
-                false,
-            ),
+            align_flash_source_for_dispatch(FlashLoanSource::Balancer, &liquidity, false, false,),
             None
         );
     }

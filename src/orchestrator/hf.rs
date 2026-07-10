@@ -14,7 +14,9 @@ use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
-use crate::orchestrator::hf_execute::dispatch_profitable_candidates;
+use crate::orchestrator::hf_execute::{
+    dispatch_profitable_candidates, filter_balancer_onchain_verified,
+};
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
@@ -379,22 +381,21 @@ pub async fn run_hf_tick(
         match ctx.rpc.connect_state() {
             Ok(provider) => {
                 let flash = Arc::clone(&ctx.execution.flash_liquidity);
-                let tokens = flash_token_list.clone();
-                flash.track_hot_tokens(&tokens);
-                let refresh = flash.refresh(&provider, &tokens);
+                flash.track_hot_tokens(&flash_token_list);
+                let refresh = flash.refresh(&provider, &flash_token_list);
                 match timeout(HF_FLASH_REFRESH_BUDGET, refresh).await {
                     Ok(Ok(_generation)) => {}
                     Ok(Err(e)) => {
                         crate::warn!("hf flash liquidity refresh failed: {e:#}");
-                        flash.invalidate_batch(&tokens);
+                        flash.invalidate_batch(&flash_token_list);
                     }
                     Err(_) => {
                         crate::warn!(
                             "hf flash liquidity refresh timed out after {}ms (tokens={})",
                             HF_FLASH_REFRESH_BUDGET.as_millis(),
-                            tokens.len()
+                            flash_token_list.len()
                         );
-                        flash.invalidate_batch(&tokens);
+                        flash.invalidate_batch(&flash_token_list);
                     }
                 }
             }
@@ -455,7 +456,7 @@ pub async fn run_hf_tick(
     let mut best_near_miss: Option<HfEvalResult> = None;
     let mut best_gross_diag: Option<BestEvalDiag> = None;
 
-    for result in eval_results.iter() {
+    for result in eval_results {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
         if matic > best_profit_matic {
             best_profit_matic = matic;
@@ -476,11 +477,7 @@ pub async fn run_hf_tick(
                 reject: assessment.reject_reason.clone(),
             });
         }
-    }
-
-    for result in eval_results {
-        let matic = result.assessment.net_profit_after_gas_matic_wei;
-        if result.assessment.should_execute {
+        if assessment.should_execute {
             profitable.push(result);
         } else if matic > U256::ZERO {
             let dominated = best_near_miss
@@ -490,6 +487,27 @@ pub async fn run_hf_tick(
                 best_near_miss = Some(result);
             }
         }
+    }
+
+    if !profitable.is_empty()
+        && let Some(executor) = ctx.config.execution.executor_address
+        && let Ok(sim_provider) = ctx.rpc.connect_simulation()
+    {
+        profitable = filter_balancer_onchain_verified(
+            &ctx.execution,
+            &eval_arena,
+            profitable,
+            &sim_provider,
+            executor,
+            pool_metas_for_dispatch.as_ref(),
+            ctx.config.execution.slippage_bps,
+        )
+        .await;
+        best_profit_matic = profitable
+            .iter()
+            .map(|r| r.assessment.net_profit_after_gas_matic_wei)
+            .max()
+            .unwrap_or(U256::ZERO);
     }
 
     profitable.sort_unstable_by(|a, b| {

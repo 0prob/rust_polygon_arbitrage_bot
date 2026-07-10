@@ -142,8 +142,8 @@ pub fn get_woofi_amount_out(
         let Some(base) = state.base_states.get(idx) else {
             return U256::ZERO;
         };
-        let fee_adjusted = apply_woofi_fee(amount_in, base.fee_rate);
-        let quote_out = calc_quote_amount_sell_base(base, fee_adjusted, None);
+        let gross_quote_out = calc_quote_amount_sell_base(base, amount_in, None);
+        let quote_out = apply_woofi_fee(gross_quote_out, base.fee_rate);
         if state.quote_reserve.is_zero() || quote_out > state.quote_reserve {
             return U256::ZERO;
         }
@@ -180,14 +180,13 @@ pub fn get_woofi_amount_out(
     if amount_in > sell.reserve || sell.reserve.is_zero() {
         return U256::ZERO;
     }
-    let shared_spread = sell.spread.max(buy.spread) / U256::from(2);
-    let fee_rate = sell.fee_rate.max(buy.fee_rate);
-    let fee_adjusted = apply_woofi_fee(amount_in, fee_rate);
-    let quote_amount = calc_quote_amount_sell_base(sell, fee_adjusted, Some(shared_spread));
+    let quote_gross = calc_quote_amount_sell_base(sell, amount_in, None);
+    let quote_amount = apply_woofi_fee(quote_gross, sell.fee_rate);
     if quote_amount.is_zero() || quote_amount > state.quote_reserve {
         return U256::ZERO;
     }
-    let base_out = calc_base_amount_sell_quote(buy, quote_amount, Some(shared_spread));
+    let quote_after_buy_fee = apply_woofi_fee(quote_amount, buy.fee_rate);
+    let base_out = calc_base_amount_sell_quote(buy, quote_after_buy_fee, None);
     if buy.reserve.is_zero() || base_out > buy.reserve {
         return U256::ZERO;
     }
@@ -248,7 +247,7 @@ mod tests {
                 Address::with_last_byte(2),
                 Address::with_last_byte(3),
             ],
-            quote_reserve: U256::from(1_000_000u64) * U256::from(10u128.pow(6)),
+            quote_reserve: U256::from(1_000_000_000_000u64) * U256::from(10u128.pow(6)),
             base_states: vec![
                 base_state(U256::from(10u128.pow(18))),
                 base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18))),
@@ -264,6 +263,54 @@ mod tests {
             Some(1),
         );
         assert_eq!(out, U256::ZERO);
+    }
+
+    #[test]
+    fn sell_base_charges_fee_on_quote_output() {
+        let mut base = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
+        base.coeff = U256::from(100_000_000_000_000u64);
+        base.fee_rate = U256::from(100u64);
+        let amount_in = U256::from(10u64) * U256::from(10u128.pow(18));
+        let gross = calc_quote_amount_sell_base(&base, amount_in, None);
+        let state = WoofiPoolState {
+            tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+            quote_reserve: U256::from(1_000_000u64) * U256::from(10u128.pow(6)),
+            base_states: vec![base.clone()],
+            fee: U256::ZERO,
+        };
+
+        let out = get_woofi_amount_out(&state, amount_in, false, true, Some(0), None);
+
+        assert_eq!(out, apply_woofi_fee(gross, base.fee_rate));
+    }
+
+    #[test]
+    fn base_to_base_matches_two_official_quote_legs() {
+        let mut sell = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
+        sell.spread = U256::from(1_000_000_000_000_000u64);
+        sell.fee_rate = U256::from(25u64);
+        let mut buy = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
+        buy.spread = U256::from(3_000_000_000_000_000u64);
+        buy.fee_rate = U256::from(75u64);
+        let amount_in = U256::from(10u64) * U256::from(10u128.pow(18));
+        let quote_gross = calc_quote_amount_sell_base(&sell, amount_in, None);
+        let quote_after_fee = apply_woofi_fee(quote_gross, sell.fee_rate);
+        let expected =
+            calc_base_amount_sell_quote(&buy, apply_woofi_fee(quote_after_fee, buy.fee_rate), None);
+        let state = WoofiPoolState {
+            tokens: vec![
+                Address::with_last_byte(1),
+                Address::with_last_byte(2),
+                Address::with_last_byte(3),
+            ],
+            quote_reserve: U256::from(1_000_000_000_000u64) * U256::from(10u128.pow(6)),
+            base_states: vec![sell, buy],
+            fee: U256::ZERO,
+        };
+
+        let out = get_woofi_amount_out(&state, amount_in, false, false, Some(0), Some(1));
+
+        assert_eq!(out, expected);
     }
 }
 

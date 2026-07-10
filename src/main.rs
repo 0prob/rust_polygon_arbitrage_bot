@@ -1,6 +1,7 @@
 use anyhow::Context;
 use tokio::signal;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use rpbot::bootstrap::bootstrap;
@@ -17,10 +18,21 @@ async fn main() -> anyhow::Result<()> {
     let ctx = bootstrap(None).await?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut pass_handle = tokio::spawn(run_pass_loop(ctx, shutdown_rx));
+    let pass_handle = tokio::spawn(run_pass_loop(ctx, shutdown_rx));
 
-    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    match await_pass_loop(pass_handle, shutdown_tx).await {
+        Ok(()) => rpbot::info!("shutdown complete"),
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn await_pass_loop(
+    mut pass_handle: JoinHandle<anyhow::Result<()>>,
+    shutdown_tx: watch::Sender<bool>,
+) -> anyhow::Result<()> {
     let outcome = tokio::select! {
         biased;
         () = shutdown_signal() => {
@@ -40,17 +52,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match outcome {
-        Ok(Ok(())) => rpbot::info!("shutdown complete"),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             rpbot::error!("pass loop failed: {e:#}");
-            return Err(e).context("pass loop failed");
+            Err(e).context("pass loop failed")
         }
         Err(e) => {
             rpbot::error!("pass loop task panicked: {e}");
             anyhow::bail!("pass loop task panicked: {e}");
         }
     }
-    Ok(())
 }
 
 async fn shutdown_signal() {

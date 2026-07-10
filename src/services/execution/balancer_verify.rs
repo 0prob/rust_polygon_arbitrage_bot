@@ -125,13 +125,7 @@ mod tests {
     fn exceeds_max_in_ratio_constant_matches_vault() {
         use crate::core::math::balancer::exceeds_balancer_max_in_ratio;
         let bal = U256::from(1_000_000u64);
-        assert!(!exceeds_balancer_max_in_ratio(
-            U256::from(300_000u64),
-            bal
-        ));
-        assert!(exceeds_balancer_max_in_ratio(
-            U256::from(300_001u64),
-            bal
-        ));
+        assert!(!exceeds_balancer_max_in_ratio(U256::from(300_000u64), bal));
+        assert!(exceeds_balancer_max_in_ratio(U256::from(300_001u64), bal));
     }
 }

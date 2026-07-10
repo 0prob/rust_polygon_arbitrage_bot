@@ -10,10 +10,10 @@ use crate::services::execution::calldata::{
     ExecutorEntrypoint, RouteEncodeConfig, build_arb_calldata, build_calldata_hops, encode_route,
     hops_are_balancer_only,
 };
-use crate::services::execution::gas::buffer_gas_limit;
 use crate::services::execution::flash_liquidity::{
     TokenFlashLiquidity, align_flash_source_for_dispatch,
 };
+use crate::services::execution::gas::buffer_gas_limit;
 use crate::services::execution::profit::AssessProfitInput;
 use crate::services::execution::profit::on_chain_min_profit_for_route;
 
@@ -160,8 +160,12 @@ pub fn build_execution_candidate(
             }),
     );
 
-    let (dispatch_flash_source, entrypoint) =
-        resolve_dispatch(config.flash_loan_source, &hops, &config.flash_liquidity, config.has_dodo_pool)?;
+    let (dispatch_flash_source, entrypoint) = resolve_dispatch(
+        config.flash_loan_source,
+        &hops,
+        &config.flash_liquidity,
+        config.has_dodo_pool,
+    )?;
     let encode_cfg = RouteEncodeConfig {
         slippage_bps: config.slippage_bps,
         deadline,
@@ -315,7 +319,12 @@ mod tests {
     fn mixed_balancer_hops_force_aave_dispatch() {
         let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
         assert_eq!(
-            resolve_dispatch_flash_source(FlashLoanSource::Balancer, &hops, &aave_liquidity(), false),
+            resolve_dispatch_flash_source(
+                FlashLoanSource::Balancer,
+                &hops,
+                &aave_liquidity(),
+                false
+            ),
             Some(FlashLoanSource::AaveV3)
         );
         assert_eq!(

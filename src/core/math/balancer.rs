@@ -49,6 +49,13 @@ pub fn get_balancer_weighted_amount_out(
     if in_idx >= state.weights.len() || out_idx >= state.weights.len() {
         return U256::ZERO;
     }
+    let scaling = &state.scaling_factors;
+    if scaling.len() != state.balances.len()
+        || scaling[in_idx].is_zero()
+        || scaling[out_idx].is_zero()
+    {
+        return U256::ZERO;
+    }
 
     let bal_in = state.balances[in_idx];
     let bal_out = state.balances[out_idx];
@@ -68,12 +75,19 @@ pub fn get_balancer_weighted_amount_out(
         return U256::ZERO;
     }
     let amount_in_after_fee = (amount_in * fee_complement) / ONE;
-    let denominator = bal_in + amount_in_after_fee;
+    let scaled_amount_in = (amount_in_after_fee * scaling[in_idx]) / ONE;
+    if scaled_amount_in.is_zero() {
+        return U256::ZERO;
+    }
+
+    let scaled_bal_in = (bal_in * scaling[in_idx]) / ONE;
+    let scaled_bal_out = (bal_out * scaling[out_idx]) / ONE;
+    let denominator = scaled_bal_in + scaled_amount_in;
     if denominator.is_zero() {
         return U256::ZERO;
     }
 
-    let base = (bal_in * ONE) / denominator;
+    let base = (scaled_bal_in * ONE) / denominator;
     if base.is_zero() || base > ONE {
         return U256::ZERO;
     }
@@ -88,7 +102,11 @@ pub fn get_balancer_weighted_amount_out(
         return U256::ZERO;
     }
 
-    let amount_out = (bal_out * (ONE - power)) / ONE;
+    let scaled_amount_out = (scaled_bal_out * (ONE - power)) / ONE;
+    if scaled_amount_out.is_zero() {
+        return U256::ZERO;
+    }
+    let amount_out = (scaled_amount_out * ONE) / scaling[out_idx];
     if amount_out.is_zero() {
         U256::ZERO
     } else {

@@ -1,6 +1,6 @@
 use alloy::primitives::U256;
 
-use crate::core::types::DodoPoolState;
+use crate::core::types::{DodoPoolState, DodoRState};
 
 use alloy::primitives::U512;
 
@@ -97,6 +97,21 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
     if v2 > v1 { U256::ZERO } else { v1 - v2 }
 }
 
+fn general_integrate(v0: U256, v1: U256, v2: U256, i: U256, k: U256) -> U256 {
+    if v0.is_zero() || v1 < v2 || v2.is_zero() || i.is_zero() || k > ONE {
+        return U256::ZERO;
+    }
+    let delta = v1 - v2;
+    let fair_amount = U512::from(i) * U512::from(delta);
+    if k.is_zero() {
+        return u512_to_u256(fair_amount / ONE_U512);
+    }
+    let ratio = U512::from(ONE) * U512::from(v0) * U512::from(v0) / U512::from(v1) / U512::from(v2);
+    let penalty = U512::from(k) * ratio / ONE_U512;
+    let factor = U512::from(ONE - k) + penalty;
+    u512_to_u256(factor * fair_amount / U512::from(ONE2))
+}
+
 #[must_use]
 pub fn get_dodo_gross_amount_out(
     state: &DodoPoolState,
@@ -116,14 +131,64 @@ pub fn get_dodo_gross_amount_out(
         return U256::ZERO;
     }
 
-    if base_to_quote {
-        solve_quadratic_function_for_trade(q, q, amount_in, i, k)
-    } else {
-        let inverse_i = reciprocal_floor(i);
-        if inverse_i.is_zero() {
-            return U256::ZERO;
+    let inverse_i = reciprocal_floor(i);
+    match (state.r_state, base_to_quote) {
+        (DodoRState::One, true) => solve_quadratic_function_for_trade(
+            state.quote_target,
+            state.quote_target,
+            amount_in,
+            i,
+            k,
+        ),
+        (DodoRState::One, false) => solve_quadratic_function_for_trade(
+            state.base_target,
+            state.base_target,
+            amount_in,
+            inverse_i,
+            k,
+        ),
+        (DodoRState::AboveOne, true) => {
+            let back_in = state.base_target.saturating_sub(b);
+            let back_out = q.saturating_sub(state.quote_target);
+            if amount_in < back_in {
+                general_integrate(state.base_target, b + amount_in, b, i, k).min(back_out)
+            } else if amount_in == back_in {
+                back_out
+            } else {
+                back_out
+                    + solve_quadratic_function_for_trade(
+                        state.quote_target,
+                        state.quote_target,
+                        amount_in - back_in,
+                        i,
+                        k,
+                    )
+            }
         }
-        solve_quadratic_function_for_trade(b, b, amount_in, inverse_i, k)
+        (DodoRState::AboveOne, false) => {
+            solve_quadratic_function_for_trade(state.base_target, b, amount_in, inverse_i, k)
+        }
+        (DodoRState::BelowOne, true) => {
+            solve_quadratic_function_for_trade(state.quote_target, q, amount_in, i, k)
+        }
+        (DodoRState::BelowOne, false) => {
+            let back_in = state.quote_target.saturating_sub(q);
+            let back_out = b.saturating_sub(state.base_target);
+            if amount_in < back_in {
+                general_integrate(state.quote_target, q + amount_in, q, inverse_i, k).min(back_out)
+            } else if amount_in == back_in {
+                back_out
+            } else {
+                back_out
+                    + solve_quadratic_function_for_trade(
+                        state.base_target,
+                        state.base_target,
+                        amount_in - back_in,
+                        inverse_i,
+                        k,
+                    )
+            }
+        }
     }
 }
 
@@ -136,11 +201,12 @@ pub fn get_dodo_amount_out(state: &DodoPoolState, amount_in: U256, base_to_quote
     }
 
     let lp = state.lp_fee_rate;
-    if lp >= ONE {
+    let mt = state.mt_fee_rate;
+    if lp >= ONE || mt >= ONE || lp.saturating_add(mt) >= ONE {
         return U256::ZERO;
     }
 
-    gross - mul_floor(gross, lp)
+    gross - mul_floor(gross, lp) - mul_floor(gross, mt)
 }
 
 #[must_use]
@@ -172,11 +238,36 @@ mod tests {
             quote_reserve: U256::from(1000u64),
             base_token: Address::ZERO,
             quote_token: Address::ZERO,
+            base_target: U256::from(1000u64),
+            quote_target: U256::from(1000u64),
+            r_state: DodoRState::One,
             i: U256::from(1u64),
             k: U256::ZERO,
             lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
         };
         assert_eq!(get_dodo_amount_out(&state, U256::ZERO, true), U256::ZERO);
+    }
+
+    #[test]
+    fn above_one_trade_to_target_returns_quote_surplus() {
+        let state = DodoPoolState {
+            base_reserve: U256::from(900u64) * ONE,
+            quote_reserve: U256::from(1_100u64) * ONE,
+            base_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            base_target: U256::from(1_000u64) * ONE,
+            quote_target: U256::from(1_000u64) * ONE,
+            r_state: DodoRState::AboveOne,
+            i: ONE,
+            k: U256::from(100_000_000_000_000_000u64),
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        };
+
+        let out = get_dodo_gross_amount_out(&state, U256::from(100u64) * ONE, true);
+
+        assert_eq!(out, U256::from(100u64) * ONE);
     }
 }
 
@@ -206,9 +297,13 @@ mod proptests {
                 quote_reserve,
                 base_token: Address::ZERO,
                 quote_token: Address::ZERO,
+                base_target: base_reserve,
+                quote_target: quote_reserve,
+                r_state: DodoRState::One,
                 i,
                 k,
                 lp_fee_rate: U256::ZERO,
+                mt_fee_rate: U256::ZERO,
             };
 
             let out = get_dodo_amount_out(&state, amount_in, true);
