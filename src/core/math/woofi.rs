@@ -6,14 +6,12 @@ use super::fixed_point::ONE;
 const WOOFI_FEE_DENOMINATOR: U256 = U256::from_limbs([100_000, 0, 0, 0]);
 
 fn mul_div_triple(a: U256, b: U256, c: U256, d: U256, e: U256) -> U256 {
-    if let Some(ab) = a.checked_mul(b) {
-        if let Some(abc) = ab.checked_mul(c) {
-            if let Some(de) = d.checked_mul(e) {
-                if !de.is_zero() {
-                    return abc / de;
-                }
-            }
-        }
+    if let Some(ab) = a.checked_mul(b)
+        && let Some(abc) = ab.checked_mul(c)
+        && let Some(de) = d.checked_mul(e)
+        && !de.is_zero()
+    {
+        return abc / de;
     }
     // U512 fallback: if the division result exceeds U256::MAX, return zero.
     let result = U512::from(a) * U512::from(b) * U512::from(c) / (U512::from(d) * U512::from(e));

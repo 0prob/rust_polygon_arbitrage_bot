@@ -18,11 +18,12 @@ use crate::services::execution::profit::on_chain_min_profit_for_route;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const BALANCER_GIVEN_IN: u8 = 0;
 
-fn positive_delta(delta: I256) -> Option<U256> {
-    if delta <= I256::ZERO {
+/// Net vault delta for the profit token: negative means the vault sends tokens (profit).
+fn profit_from_vault_delta(delta: I256) -> Option<U256> {
+    if delta >= I256::ZERO {
         return None;
     }
-    U256::try_from(delta).ok()
+    U256::try_from(-delta).ok()
 }
 
 /// Outcome of vault `queryBatchSwap` simulation for an `executeArbDirect` batch route.
@@ -83,7 +84,7 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     let Some(delta) = deltas.get(idx).copied() else {
         return BatchQueryOutcome::DecodeFailed;
     };
-    match positive_delta(delta) {
+    match profit_from_vault_delta(delta) {
         Some(profit) => BatchQueryOutcome::Profit(profit),
         None => BatchQueryOutcome::NonPositiveDelta(delta),
     }
@@ -115,10 +116,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn positive_delta_rejects_non_positive() {
-        assert_eq!(positive_delta(I256::ZERO), None);
-        assert_eq!(positive_delta(I256::MINUS_ONE), None);
-        assert_eq!(positive_delta(I256::ONE), Some(U256::from(1u8)));
+    fn profit_from_vault_delta_matches_balancer_convention() {
+        assert_eq!(profit_from_vault_delta(I256::ZERO), None);
+        assert_eq!(profit_from_vault_delta(I256::ONE), None);
+        assert_eq!(
+            profit_from_vault_delta(I256::MINUS_ONE),
+            Some(U256::from(1u8))
+        );
+        assert_eq!(
+            profit_from_vault_delta(I256::unchecked_from(-58312062848374169i128)),
+            Some(U256::from(58312062848374169u128)),
+        );
     }
 
     #[test]

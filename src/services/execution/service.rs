@@ -1194,7 +1194,7 @@ impl ExecutionService {
 
             self.quarantine_route(fp, now, RouteFailureKind::Timeout);
             let outcome = ExecutionOutcome::ReceiptTimeout {
-                tx_hash: tx_hash_str,
+                tx_hash: tx_hash_str.to_string(),
             };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -1287,13 +1287,28 @@ impl ExecutionService {
             candidate.target_address,
             Some(candidate.profit_token),
         );
-        let gas_cost = receipt
-            .effective_gas_price
-            .and_then(|price| U256::from(receipt.gas_used).checked_mul(U256::from(price)))
-            .unwrap_or_else(|| {
-                crate::warn!("no effective_gas_price in success receipt fp={fp}");
-                U256::ZERO
-            });
+        let Some(effective_gas_price) = receipt.effective_gas_price else {
+            crate::error!(
+                "confirmed transaction had no effective_gas_price; refusing PnL attribution: fp={fp}, hash={tx_hash_str}"
+            );
+            self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+            return ExecutionOutcome::Confirmed {
+                tx_hash: tx_hash_str.to_string(),
+                gas_used: receipt.gas_used,
+                profit_wei: parsed_profit.unwrap_or(U256::ZERO),
+            };
+        };
+        let Some(gas_cost) =
+            U256::from(receipt.gas_used).checked_mul(U256::from(effective_gas_price))
+        else {
+            crate::error!("receipt gas cost overflow; refusing PnL attribution: fp={fp}");
+            self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+            return ExecutionOutcome::Confirmed {
+                tx_hash: tx_hash_str.to_string(),
+                gas_used: receipt.gas_used,
+                profit_wei: parsed_profit.unwrap_or(U256::ZERO),
+            };
+        };
         let profit_wei = parsed_profit.unwrap_or(U256::ZERO);
         let profit_matic_wei = parsed_profit.and_then(|profit| {
             token_profit_to_matic_wei(

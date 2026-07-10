@@ -49,7 +49,7 @@ fn default_no_tick_step(tick_spacing: i32) -> i32 {
 
 #[must_use]
 pub fn resolve_v3_fee_pips(pool_fee: U256, edge_fee_bps: Option<u32>) -> U256 {
-    if let Some(bps) = edge_fee_bps {
+    if let Some(bps) = edge_fee_bps.filter(|bps| *bps > 0 && *bps < 10_000) {
         return U256::from(bps) * U256::from(100); // bps -> pips (1e4 -> 1e6)
     }
     if !pool_fee.is_zero() {

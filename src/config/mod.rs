@@ -874,11 +874,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn load_fails_closed_for_invalid_config_path() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             jail.set_env("DOTENV_PATH", "/non/existent/.env.for.test");
-            jail.create_file("invalid.toml", "this is not toml\n")?;
+            jail.create_file("invalid.toml", "this is not toml\n")
+                .expect("create invalid config fixture");
             jail.set_env("CONFIG_PATH", "invalid.toml");
             let result = AppConfig::load();
             assert!(result.is_err());

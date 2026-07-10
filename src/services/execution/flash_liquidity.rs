@@ -173,12 +173,15 @@ impl FlashLiquidityCache {
         self.inner.load_full()
     }
 
-    fn publish(&self, entries: FxHashMap<Address, CachedLiquidity>) {
-        let generation = self.inner.load().generation.saturating_add(1);
-        self.inner.store(Arc::new(FlashLiquiditySnapshot {
-            generation,
-            entries,
-        }));
+    fn publish_updates(&self, updates: FxHashMap<Address, CachedLiquidity>) {
+        self.inner.rcu(|current| {
+            let mut entries = current.entries.clone();
+            entries.extend(updates.iter().map(|(token, value)| (*token, value.clone())));
+            Arc::new(FlashLiquiditySnapshot {
+                generation: current.generation.saturating_add(1),
+                entries,
+            })
+        });
     }
 
     /// Merge tokens into the background refresher's hot set.
@@ -218,33 +221,41 @@ impl FlashLiquidityCache {
 
     /// Drop stale entries for a refresh batch that failed or timed out.
     pub fn invalidate_batch(&self, tokens: &[Address]) {
-        let current = self.inner.load_full();
-        let mut next = current.entries.clone();
-        for token in tokens {
-            next.remove(token);
-        }
-        self.publish(next);
+        self.inner.rcu(|current| {
+            let mut entries = current.entries.clone();
+            for token in tokens {
+                entries.remove(token);
+            }
+            Arc::new(FlashLiquiditySnapshot {
+                generation: current.generation.saturating_add(1),
+                entries,
+            })
+        });
     }
 
     /// Pin Aave as inactive after on-chain `ReserveInactive` so HF eval stops routing through it.
     pub fn mark_aave_inactive(&self, token: Address) {
         self.aave_inactive_pins.lock().insert(token);
-        let current = self.inner.load_full();
-        let mut next = current.entries.clone();
-        let prior = next.get(&token).map(|e| e.snapshot).unwrap_or_default();
-        next.insert(
-            token,
-            CachedLiquidity {
-                snapshot: TokenFlashLiquidity {
-                    balancer: prior.balancer,
-                    aave: U256::ZERO,
-                    aave_listed: false,
-                    dodo: prior.dodo,
+        self.inner.rcu(|current| {
+            let mut entries = current.entries.clone();
+            let prior = entries.get(&token).map(|e| e.snapshot).unwrap_or_default();
+            entries.insert(
+                token,
+                CachedLiquidity {
+                    snapshot: TokenFlashLiquidity {
+                        balancer: prior.balancer,
+                        aave: U256::ZERO,
+                        aave_listed: false,
+                        dodo: prior.dodo,
+                    },
+                    fetched_at: Instant::now(),
                 },
-                fetched_at: Instant::now(),
-            },
-        );
-        self.publish(next);
+            );
+            Arc::new(FlashLiquiditySnapshot {
+                generation: current.generation.saturating_add(1),
+                entries,
+            })
+        });
     }
 
     pub fn start_background(
@@ -345,7 +356,8 @@ impl FlashLiquidityCache {
             execute_multicall(provider, &aave_items).await?
         };
 
-        let mut next_entries = current.entries.clone();
+        let mut updates =
+            FxHashMap::with_capacity_and_hasher(to_fetch.len(), rustc_hash::FxBuildHasher);
         let mut aave_index = 0usize;
         let inactive_pins = self.aave_inactive_pins.lock();
         for (i, token) in to_fetch.iter().enumerate() {
@@ -360,7 +372,7 @@ impl FlashLiquidityCache {
             } else {
                 U256::ZERO
             };
-            next_entries.insert(
+            updates.insert(
                 *token,
                 CachedLiquidity {
                     snapshot: TokenFlashLiquidity {
@@ -373,7 +385,7 @@ impl FlashLiquidityCache {
                 },
             );
         }
-        self.publish(next_entries);
+        self.publish_updates(updates);
         Ok(self.generation())
     }
 }

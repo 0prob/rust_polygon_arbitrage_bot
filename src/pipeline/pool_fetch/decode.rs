@@ -287,10 +287,10 @@ fn decode_curve_stored_rates(
 
 fn decode_curve_crypto_rates(n_fetched: usize, price_scale: Option<U256>) -> Vec<U256> {
     let mut rates = vec![ONE; n_fetched];
-    if n_fetched >= 2 {
-        if let Some(scale) = price_scale.filter(|scale| !scale.is_zero()) {
-            rates[1] = scale;
-        }
+    if n_fetched >= 2
+        && let Some(scale) = price_scale.filter(|scale| !scale.is_zero())
+    {
+        rates[1] = scale;
     }
     rates
 }

@@ -304,8 +304,8 @@ pub fn rank_cycles_by_probe_net(
     let mut skip = SkipCounters::default();
     let mut near_net: Vec<(U256, FoundCycle)> = Vec::new();
     let flash_ttl = flash_liquidity.ttl();
-    let flash = flash_liquidity.load();
     for cycle_arc in &scanned {
+        let flash = flash_liquidity.load();
         let cycle = prefer_aave_flash_start(cycle_arc, arena, &flash, flash_ttl);
         let fp = hash_cycle_edges(&cycle.edges);
         if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
@@ -390,6 +390,7 @@ pub fn rank_cycles_by_probe_net(
         profitable_ranked.push((net, cycle.into_owned()));
     }
 
+    let flash = flash_liquidity.load();
     rescue.retain(|cycle| {
         cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
             && cycle_flash_evaluable(
@@ -421,6 +422,7 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
+                let flash = flash_liquidity.load();
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
                         cycle,

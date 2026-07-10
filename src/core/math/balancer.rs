@@ -16,7 +16,10 @@ const MAX_IN_RATIO: U256 = U256::from_limbs([300_000_000_000_000_000, 0, 0, 0]);
 #[inline]
 #[must_use]
 pub fn exceeds_balancer_max_in_ratio(amount_in: U256, balance_in: U256) -> bool {
-    balance_in.is_zero() || amount_in > (balance_in * MAX_IN_RATIO) / ONE
+    balance_in.is_zero()
+        || balance_in
+            .checked_mul(MAX_IN_RATIO)
+            .is_none_or(|limit| amount_in > limit / ONE)
 }
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 64;
@@ -74,14 +77,25 @@ pub fn get_balancer_weighted_amount_out(
     if fee_complement.is_zero() {
         return U256::ZERO;
     }
-    let amount_in_after_fee = (amount_in * fee_complement) / ONE;
-    let scaled_amount_in = (amount_in_after_fee * scaling[in_idx]) / ONE;
+    let Some(amount_in_after_fee) = amount_in.checked_mul(fee_complement).map(|v| v / ONE) else {
+        return U256::ZERO;
+    };
+    let Some(scaled_amount_in) = amount_in_after_fee
+        .checked_mul(scaling[in_idx])
+        .map(|v| v / ONE)
+    else {
+        return U256::ZERO;
+    };
     if scaled_amount_in.is_zero() {
         return U256::ZERO;
     }
 
-    let scaled_bal_in = (bal_in * scaling[in_idx]) / ONE;
-    let scaled_bal_out = (bal_out * scaling[out_idx]) / ONE;
+    let Some(scaled_bal_in) = bal_in.checked_mul(scaling[in_idx]).map(|v| v / ONE) else {
+        return U256::ZERO;
+    };
+    let Some(scaled_bal_out) = bal_out.checked_mul(scaling[out_idx]).map(|v| v / ONE) else {
+        return U256::ZERO;
+    };
     let denominator = scaled_bal_in + scaled_amount_in;
     if denominator.is_zero() {
         return U256::ZERO;
@@ -102,7 +116,9 @@ pub fn get_balancer_weighted_amount_out(
         return U256::ZERO;
     }
 
-    let scaled_amount_out = (scaled_bal_out * (ONE - power)) / ONE;
+    let Some(scaled_amount_out) = scaled_bal_out.checked_mul(ONE - power).map(|v| v / ONE) else {
+        return U256::ZERO;
+    };
     if scaled_amount_out.is_zero() {
         return U256::ZERO;
     }

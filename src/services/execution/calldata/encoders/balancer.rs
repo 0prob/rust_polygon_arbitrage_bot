@@ -114,10 +114,10 @@ pub fn build_balancer_batch_swap_request(
     })
 }
 
-/// Limits for Vault flash-swap `batchSwap`: input asset capped at `MAX`, others at `MIN`
-/// so the Vault can lend/settle without executor pre-funding.
+/// Limits for Vault `batchSwap` flash routes. Vault checks `delta <= limit` per asset;
+/// non-input assets must use `0` (not `I256::MIN`) so zero-net intermediates pass.
 fn build_flash_swap_limits(assets: &[Address], hops: &[CalldataHop]) -> Vec<I256> {
-    let mut limits = vec![I256::MIN; assets.len()];
+    let mut limits = vec![I256::ZERO; assets.len()];
     if let Some(first) = hops.first()
         && let Some(idx) = assets.iter().position(|a| *a == first.token_in)
     {
@@ -189,6 +189,6 @@ mod tests {
         let assets = vec![wmatic, usdc];
         let limits = build_flash_swap_limits(&assets, &hops);
         assert_eq!(limits[0], I256::MAX);
-        assert_eq!(limits[1], I256::MIN);
+        assert_eq!(limits[1], I256::ZERO);
     }
 }

@@ -270,8 +270,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                 .await;
             }
         })
-        .buffer_unordered(DISPATCH_CONCURRENCY)
-        .collect::<Vec<()>>()
+        .for_each_concurrent(DISPATCH_CONCURRENCY, |dispatch| async move {
+            dispatch.await;
+        })
         .await;
 
     skipped.log_if_any();

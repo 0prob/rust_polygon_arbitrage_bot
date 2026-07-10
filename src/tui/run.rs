@@ -31,7 +31,7 @@ pub async fn run_tui(
     let tx = bridge.sender();
     let input_thread = spawn_input_thread(tx.clone()).context("spawn input thread")?;
 
-    draw_frame(&mut terminal, &app)?;
+    draw_frame_blocking(&mut terminal, &app)?;
 
     let mut redraw = tokio::time::interval(REDRAW_INTERVAL);
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -60,7 +60,7 @@ pub async fn run_tui(
                 }
                 if input_event {
                     app.rebuild_route_view();
-                    draw_frame(&mut terminal, &app)?;
+                    draw_frame_blocking(&mut terminal, &app)?;
                     needs_redraw = false;
                 }
             }
@@ -79,7 +79,7 @@ pub async fn run_tui(
                 // this single terminal write. Only draw if needed.
                 if needs_redraw {
                     app.rebuild_route_view();
-                    draw_frame(&mut terminal, &app)?;
+                    draw_frame_blocking(&mut terminal, &app)?;
                     needs_redraw = false;
                 }
             }
@@ -117,4 +117,8 @@ fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
         .terminal()
         .draw(|frame| super::widgets::render(frame, app))?;
     Ok(())
+}
+
+fn draw_frame_blocking(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
+    tokio::task::block_in_place(|| draw_frame(terminal, app))
 }
