@@ -88,7 +88,7 @@ fn handle_paste(app: &mut App, text: &str) {
         app.search.push(ch);
     }
     app.sync_search_lower();
-    app.rebuild_route_view();
+    app.mark_route_view_dirty();
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -105,12 +105,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Backspace => {
                 app.search.pop();
                 app.sync_search_lower();
-                app.rebuild_route_view();
+                app.mark_route_view_dirty();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.search.push(c);
                 app.sync_search_lower();
-                app.rebuild_route_view();
+                app.mark_route_view_dirty();
             }
             _ => {}
         },
@@ -123,6 +123,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('/') => {
                 app.search.clear();
                 app.sync_search_lower();
+                app.mark_route_view_dirty();
                 app.input_mode = InputMode::Search;
             }
             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
@@ -149,7 +150,7 @@ fn cycle_sort(app: &mut App) {
         SortMode::Hops => SortMode::Freshness,
         SortMode::Freshness => SortMode::Score,
     };
-    app.rebuild_route_view();
+    app.mark_route_view_dirty();
     app.push_activity(
         Severity::Info,
         format!("sort = {:?}", app.sort_mode).replace("SortMode::", ""),

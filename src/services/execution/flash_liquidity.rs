@@ -84,6 +84,7 @@ struct CachedLiquidity {
 
 /// Immutable, atomically published flash-liquidity map (LF/HF readers hold `Arc` snapshots).
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct FlashLiquiditySnapshot {
     generation: u64,
     entries: FxHashMap<Address, CachedLiquidity>,
@@ -120,14 +121,6 @@ impl FlashLiquiditySnapshot {
     }
 }
 
-impl Default for FlashLiquiditySnapshot {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            entries: FxHashMap::default(),
-        }
-    }
-}
 
 /// Lock-free flash liquidity handoff: background refresh builds a new map, then `store`s it.
 #[derive(Debug)]
@@ -138,6 +131,8 @@ pub struct FlashLiquidityCache {
     aave_pool: Address,
     /// Tokens merged from HF/LF ticks for the background refresher.
     hot_tokens: Mutex<FxHashSet<Address>>,
+    /// Dry-run `ReserveInactive` pins — refresh must not resurrect Aave for these tokens.
+    aave_inactive_pins: Mutex<FxHashSet<Address>>,
 }
 
 impl FlashLiquidityCache {
@@ -149,6 +144,7 @@ impl FlashLiquidityCache {
             balancer_vault: BALANCER_VAULT,
             aave_pool: AAVE_V3_POOL,
             hot_tokens: Mutex::new(FxHashSet::default()),
+            aave_inactive_pins: Mutex::new(FxHashSet::default()),
         }
     }
 
@@ -160,6 +156,7 @@ impl FlashLiquidityCache {
             balancer_vault,
             aave_pool,
             hot_tokens: Mutex::new(FxHashSet::default()),
+            aave_inactive_pins: Mutex::new(FxHashSet::default()),
         }
     }
 
@@ -233,6 +230,7 @@ impl FlashLiquidityCache {
 
     /// Pin Aave as inactive after on-chain `ReserveInactive` so HF eval stops routing through it.
     pub fn mark_aave_inactive(&self, token: Address) {
+        self.aave_inactive_pins.lock().insert(token);
         let current = self.inner.load_full();
         let mut next = current.entries.clone();
         let prior = next
@@ -354,10 +352,12 @@ impl FlashLiquidityCache {
 
         let mut next_entries = current.entries.clone();
         let mut aave_index = 0usize;
+        let inactive_pins = self.aave_inactive_pins.lock();
         for (i, token) in to_fetch.iter().enumerate() {
             let base = i * 2;
             let balancer = decode_balance(results.get(base));
-            let aave_listed = reserves[i].is_some();
+            let aave_pinned = inactive_pins.contains(token);
+            let aave_listed = !aave_pinned && reserves[i].is_some();
             let aave = if aave_listed {
                 let balance = decode_balance(aave_results.get(aave_index));
                 aave_index += 1;

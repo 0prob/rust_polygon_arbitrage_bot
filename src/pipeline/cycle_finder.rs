@@ -16,7 +16,9 @@ use crate::pipeline::types::{CycleSearchPass, GraphEdge, RoutingGraph, compare_c
 pub use crate::pipeline::spot_price::hop_penalty;
 
 const MAX_CYCLES_PER_PASS: usize = 50_000;
-const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(500);
+const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(350);
+/// Cap parallel DFS shards — unbounded hub enumeration burns the shared deadline.
+const DFS_MAX_START_SOURCES: usize = 32;
 /// Amortize elapsed-time checks during DFS enumeration.
 /// Prune DFS branches once log-weight exceeds this (spot-weighted graphs only).
 const LOG_WEIGHT_PRUNE_THRESHOLD: f64 = 0.0;
@@ -271,7 +273,11 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.0.cmp(&b.0.0))
     });
-    let start_tokens = scored_div.into_iter().map(|(t, _, _)| t).collect();
+    let start_tokens = scored_div
+        .into_iter()
+        .take(DFS_MAX_START_SOURCES)
+        .map(|(t, _, _)| t)
+        .collect();
     // Convert sparse Option<f64> to dense f64 with INFINITY sentinel
     // Only needed for tokens that reached min_outgoing — others get INFINITY
     // which makes can_still_be_negative return false immediately.

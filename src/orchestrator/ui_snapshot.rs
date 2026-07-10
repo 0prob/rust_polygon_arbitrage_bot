@@ -119,40 +119,62 @@ async fn build_ui_snapshot(
         Vec::new()
     };
 
-    if refresh_oracle || matic_usd <= 0.0 {
-        let provider = ctx.rpc.connect_state().ok();
-        let provider_ref = provider.as_ref();
-        let refreshed = if let Some(provider) = provider_ref {
-            ctx.price_oracle.get_matic_usd(Some(provider)).await
-        } else {
-            ctx.price_oracle.get_matic_usd_offline().await
-        };
+    let oracle_task = if refresh_oracle || matic_usd <= 0.0 {
+        let ctx = Arc::clone(&ctx);
+        let route_tokens = route_tokens.clone();
+        Some(tokio::spawn(async move {
+            let provider = ctx.rpc.connect_state().ok();
+            let provider_ref = provider.as_ref();
+            let refreshed = if let Some(provider) = provider_ref {
+                ctx.price_oracle.get_matic_usd(Some(provider)).await
+            } else {
+                ctx.price_oracle.get_matic_usd_offline().await
+            };
+            if let Some(provider) = provider_ref {
+                ctx.price_oracle
+                    .prefetch_token_usd(&route_tokens, Some(provider))
+                    .await;
+            } else {
+                ctx.price_oracle
+                    .prefetch_token_usd_offline(&route_tokens)
+                    .await;
+            }
+            refreshed
+        }))
+    } else {
+        None
+    };
+
+    let portfolio_task = if refresh_portfolio {
+        let ctx = Arc::clone(&ctx);
+        let snap = Arc::clone(&snap);
+        let route_tokens = route_tokens.clone();
+        Some(tokio::spawn(async move {
+            let provider = ctx.rpc.connect_state().ok();
+            let provider_ref = provider.as_ref();
+            let balance_account = portfolio_balance_account(&ctx);
+            build_portfolio_rows(
+                provider_ref,
+                &ctx.price_oracle,
+                &snap,
+                &route_tokens,
+                balance_account,
+            )
+            .await
+        }))
+    } else {
+        None
+    };
+
+    if let Some(task) = oracle_task {
+        let refreshed = task.await.context("oracle refresh task failed")?;
         if refreshed > 0.0 {
             matic_usd = refreshed;
         }
-        if let Some(provider) = provider_ref {
-            ctx.price_oracle
-                .prefetch_token_usd(&route_tokens, Some(provider))
-                .await;
-        } else {
-            ctx.price_oracle
-                .prefetch_token_usd_offline(&route_tokens)
-                .await;
-        }
     }
 
-    if refresh_portfolio {
-        let provider = ctx.rpc.connect_state().ok();
-        let provider_ref = provider.as_ref();
-        let balance_account = portfolio_balance_account(&ctx);
-        portfolio_rows = build_portfolio_rows(
-            provider_ref,
-            &ctx.price_oracle,
-            &snap,
-            &route_tokens,
-            balance_account,
-        )
-        .await;
+    if let Some(task) = portfolio_task {
+        portfolio_rows = task.await.context("portfolio refresh task failed")?;
     }
 
     if snap.generation != route_cache.generation {

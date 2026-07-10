@@ -59,6 +59,7 @@ pub async fn run_tui(
                     break;
                 }
                 if input_event {
+                    app.rebuild_route_view();
                     draw_frame(&mut terminal, &app)?;
                     needs_redraw = false;
                 }
@@ -68,6 +69,7 @@ pub async fn run_tui(
                     && let Some(snapshot) = snapshot_rx.borrow().as_ref()
                 {
                     app.set_snapshot((**snapshot).clone());
+                    app.rebuild_route_view();
                     needs_redraw = true;
                 }
             }
@@ -76,6 +78,7 @@ pub async fn run_tui(
                 // non-input events arriving in this window are coalesced into
                 // this single terminal write. Only draw if needed.
                 if needs_redraw {
+                    app.rebuild_route_view();
                     draw_frame(&mut terminal, &app)?;
                     needs_redraw = false;
                 }

@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use alloy::primitives::U256;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::hash_map::Entry;
 
@@ -61,6 +62,48 @@ fn probe_context_for_cycle(
     (min_economic_amount_in(decimals, rate), rate, decimals)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefilterVerdict {
+    Keep,
+    Rescue,
+    Reject,
+}
+
+fn prefilter_verdict_for_cycle(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    ctx: Option<&ProbeContext<'_>>,
+) -> PrefilterVerdict {
+    if !is_fully_simulable_route(&cycle.edges) {
+        return PrefilterVerdict::Reject;
+    }
+    let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
+    let probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
+    match &probe {
+        Some(sim) if sim.profit > U256::ZERO => {
+            if let Some(c) = ctx {
+                if let Some(gas_price) = c.gas_price_wei {
+                    if probe_beats_gas_floor(sim, rate, decimals, gas_price) {
+                        PrefilterVerdict::Keep
+                    } else {
+                        PrefilterVerdict::Reject
+                    }
+                } else {
+                    PrefilterVerdict::Keep
+                }
+            } else {
+                PrefilterVerdict::Keep
+            }
+        }
+        // Use exact U256 cycle_ratio > ONE to gate rescue, falling back to f64 score
+        // only when cycle_ratio wasn't computed (cache restore path sets it to ZERO).
+        None if cycle.cycle_ratio > ONE || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) => {
+            PrefilterVerdict::Rescue
+        }
+        Some(_) | None => PrefilterVerdict::Reject,
+    }
+}
+
 pub fn prefilter_cycles_by_atomic_sim_with_context(
     arena: &StateArena,
     cycles: Vec<FoundCycle>,
@@ -74,31 +117,23 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
     cycles.sort_unstable_by(compare_cycle_score);
     let rescue_cap = graph_negative_rescue_cap(max_keep);
     let sim_candidates = cycles.len().min(max_keep.saturating_add(rescue_cap));
+    let candidates: Vec<FoundCycle> = cycles.into_iter().take(sim_candidates).collect();
+    let mut ranked: Vec<(usize, FoundCycle, PrefilterVerdict)> = candidates
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, cycle)| {
+            let verdict = prefilter_verdict_for_cycle(arena, &cycle, ctx);
+            (index, cycle, verdict)
+        })
+        .collect();
+    ranked.sort_unstable_by_key(|(index, _, _)| *index);
+
     let mut missing_state_rescued = 0usize;
     let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
-    for cycle in cycles.into_iter().take(sim_candidates) {
-        if !is_fully_simulable_route(&cycle.edges) {
-            continue;
-        }
-        let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, &cycle, ctx);
-        let probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
-        let keep = match &probe {
-            Some(sim) if sim.profit > U256::ZERO => {
-                if let Some(c) = ctx {
-                    if let Some(gas_price) = c.gas_price_wei {
-                        probe_beats_gas_floor(sim, rate, decimals, gas_price)
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            }
-            // Use exact U256 cycle_ratio > ONE to gate rescue, falling back to f64 score
-            // only when cycle_ratio wasn't computed (cache restore path sets it to ZERO).
-            None if cycle.cycle_ratio > ONE
-                || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) =>
-            {
+    for (_, cycle, verdict) in ranked {
+        let keep = match verdict {
+            PrefilterVerdict::Keep => true,
+            PrefilterVerdict::Rescue => {
                 if missing_state_rescued >= rescue_cap {
                     false
                 } else {
@@ -106,7 +141,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
                     true
                 }
             }
-            Some(_) | None => false,
+            PrefilterVerdict::Reject => false,
         };
         if keep {
             survivors.push(cycle);

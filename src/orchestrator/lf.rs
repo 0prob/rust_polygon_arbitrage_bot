@@ -48,6 +48,8 @@ struct LfCpuWork {
 struct LfCpuResult {
     graph: Arc<crate::pipeline::types::RoutingGraph>,
     cycles: Arc<Vec<crate::core::types::FoundCycle>>,
+    /// Cycle enumeration only (0 when graph cache reused).
+    enumeration_ms: u64,
 }
 
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
@@ -180,9 +182,11 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         let gc = work.graph_cache.lock();
         needs_rebuild || gc.needs_cycle_refind(routable_count, layout_fp, work.state_generation)
     };
+    let mut enumeration_ms = 0u64;
     let cycles = if need_cycle_refind {
         crate::debug!("lf cycle refind: pass={}", work.lf_pass);
         let passes = cycle_search_passes(work.max_hops, work.max_paths);
+        let enum_started = crate::util::now_ms();
         let result = find_cycles_for_mode(
             work.cycle_finder,
             &work.arena,
@@ -191,6 +195,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             true,
             None,
         );
+        enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
         let cycles = Arc::new(finalize_enumerated_cycles(result, work.max_paths));
         work.graph_cache.lock().store(
             Arc::clone(&graph),
@@ -206,7 +211,11 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         gc.cycles().unwrap_or_default()
     };
 
-    LfCpuResult { graph, cycles }
+    LfCpuResult {
+        graph,
+        cycles,
+        enumeration_ms,
+    }
 }
 
 async fn run_lf_cpu_async(work: LfCpuWork) -> anyhow::Result<LfCpuResult> {
@@ -297,12 +306,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // ponytail: skip enrich_all_token_to_matic_rates — prior_rates from last tick
     // is sufficient for resolvable set computation. Cycle-token enrichment below
     // provides fresh rates for profit evaluation, saving one oracle RPC pass.
-    let cycle_search = async {
-        let started = crate::util::now_ms();
-        let result = run_lf_cpu_async(cpu_work).await;
-        (result, crate::util::now_ms().saturating_sub(started))
-    };
-    let (cpu, cycle_search_ms) = cycle_search.await;
+    let cpu = run_lf_cpu_async(cpu_work).await;
     let cpu = cpu?;
     if *shutdown.borrow() {
         return Ok(());
@@ -314,6 +318,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     let cycles_arc = cpu.cycles;
     let routing_graph = cpu.graph;
+    let cycle_search_ms = cpu.enumeration_ms;
 
     // ponytail: collect unique cycle tokens without intermediate HashSet→Vec copy
     let mut cycle_tokens: Vec<TokenIndex> = Vec::new();

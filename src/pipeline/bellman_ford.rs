@@ -7,7 +7,7 @@ use crate::pipeline::types::CycleSearchPass;
 use crate::pipeline::weighted_graph::WeightedEdge;
 
 const BELLMAN_FORD_MAX_SOURCES: usize = 15;
-const BF_TIME_BUDGET: Duration = Duration::from_millis(250);
+const BF_TIME_BUDGET: Duration = Duration::from_millis(175);
 
 #[must_use]
 pub fn find_cycles_bellman_ford_multi_pass_with_adj(

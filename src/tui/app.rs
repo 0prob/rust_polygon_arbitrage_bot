@@ -255,6 +255,7 @@ pub struct App {
     search_lower: String,
     route_view_key: u64,
     route_view_indices: Vec<usize>,
+    route_view_dirty: bool,
 }
 
 impl Default for App {
@@ -294,6 +295,7 @@ impl App {
             search_lower: String::new(),
             route_view_key: 0,
             route_view_indices: Vec::new(),
+            route_view_dirty: true,
         }
     }
 
@@ -305,6 +307,9 @@ impl App {
     #[must_use]
     pub fn selected_route(&self) -> Option<&RouteSummary> {
         let snapshot = self.snapshot.as_ref()?;
+        if self.route_view_dirty {
+            return None;
+        }
         self.route_view_indices
             .get(self.selected_index)
             .and_then(|&idx| snapshot.opportunities.get(idx))
@@ -323,6 +328,9 @@ impl App {
     #[must_use]
     pub fn route_view(&self) -> Option<(&DashboardSnapshot, &[usize])> {
         let snapshot = self.snapshot.as_ref()?;
+        if self.route_view_dirty {
+            return None;
+        }
         Some((snapshot, self.route_view_indices.as_slice()))
     }
 
@@ -355,6 +363,7 @@ impl App {
         snapshot.overview.snapshot_age_ms = snapshot.captured_at.elapsed().as_millis() as u64;
         self.last_cycle_count = snapshot.overview.cycle_count;
         self.snapshot = Some(snapshot);
+        self.route_view_dirty = true;
         self.rebuild_route_view();
         let row_count = self.current_rows_len();
         if row_count == 0 {
@@ -368,7 +377,11 @@ impl App {
 
     pub fn rebuild_route_view(&mut self) {
         let key = self.route_view_cache_key();
+        if self.route_view_dirty {
+            self.route_view_key = 0;
+        }
         if key == self.route_view_key {
+            self.route_view_dirty = false;
             self.normalize_route_selection();
             return;
         }
@@ -401,6 +414,7 @@ impl App {
             }
         }
         self.route_view_indices = indices;
+        self.route_view_dirty = false;
         self.normalize_route_selection();
     }
 
@@ -412,6 +426,10 @@ impl App {
             snapshot.generation.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    pub fn mark_route_view_dirty(&mut self) {
+        self.route_view_dirty = true;
     }
 
     pub fn select_next(&mut self) {
@@ -466,6 +484,7 @@ impl App {
         self.search.clear();
         self.search_lower.clear();
         self.input_mode = InputMode::Normal;
+        self.route_view_dirty = true;
         self.rebuild_route_view();
         self.select_top();
     }
@@ -476,6 +495,9 @@ impl App {
 
     #[must_use]
     pub fn current_rows_len(&self) -> usize {
+        if self.route_view_dirty && matches!(self.tab, Tab::Opportunities) {
+            return 0;
+        }
         match self.tab {
             Tab::Trades => self.trade_history.len(),
             Tab::Opportunities => self.route_view_indices.len(),
