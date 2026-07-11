@@ -9,7 +9,7 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::AppConfig;
 use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS};
-use crate::core::types::{FoundCycle, PoolIndex, TokenIndex};
+use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
@@ -374,8 +374,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         .await;
     }
 
-    let mut capped: Vec<FoundCycle> = Vec::with_capacity(cycles_arc.len());
-    capped.extend(cycles_arc.iter().cloned());
+    let mut capped = Arc::try_unwrap(cycles_arc).unwrap_or_else(|arc| (*arc).clone());
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);

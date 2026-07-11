@@ -83,7 +83,7 @@ pub const MIN_ECONOMIC_VALUE_MATIC_WEI: u128 = 10u128.pow(17);
 pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 100_000;
 /// Reject simulated gross profit above this MATIC notional (phantom-state guard).
 /// Raised from 1 → 50 POL to accommodate small-cap probe returns that are still
-/// small relative to the $50k flash loan cap ($3.75 vs $50k notional).
+/// small relative to the configured USD flash loan cap ($3.75 vs $50k notional).
 pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 50u128 * 10u128.pow(18);
 
 /// Per-hop gas seeds for route simulation (Polygon executor context).

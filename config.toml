@@ -15,7 +15,7 @@ batch_pace_ms = 8
 
 [execution]
 min_profit_matic_wei = "10000000000000000"
-profit_safety_multiplier_bps = 10000
+profit_safety_multiplier_bps = 25000
 flash_loan_source = "auto"
 
 [routing]
@@ -31,7 +31,7 @@ cycle_refind_interval = 8
 hf_sim_cap = 100
 hf_score_cap = 120
 hf_prefetch_count = 50
-hf_prefetch_budget_ms = 1000
+hf_prefetch_budget_ms = 2500
 hf_max_dispatch = 4
 
 [oracle]

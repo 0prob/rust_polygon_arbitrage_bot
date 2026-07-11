@@ -283,6 +283,7 @@ fn bench_optimize_cycle(c: &mut Criterion) {
                 &rates,
                 &decimals,
                 None,
+                1.0,
                 Some(8),
                 None,
                 &profit_ctx,

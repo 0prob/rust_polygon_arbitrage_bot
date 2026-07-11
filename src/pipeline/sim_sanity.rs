@@ -38,18 +38,50 @@ pub fn min_economic_amount_in(token_decimals: u8, token_to_matic_rate: U256) -> 
     economic.max(dust_floor).max(absolute_floor)
 }
 
-/// Max borrow in start-token wei from the configured MATIC-notional flash cap.
+/// MATIC/USD for flash-cap sizing when the oracle cache is cold.
+pub const FLASH_CAP_MATIC_USD_FALLBACK: f64 = 0.75;
+
+#[inline]
+#[must_use]
+pub fn matic_usd_for_flash_cap(matic_usd: f64) -> f64 {
+    if matic_usd > 0.0 {
+        matic_usd
+    } else {
+        FLASH_CAP_MATIC_USD_FALLBACK
+    }
+}
+
+/// USD notional cap → MATIC wei (`max_flash_loan_usd` is denominated in US dollars).
+#[must_use]
+pub fn max_flash_loan_matic_wei_from_usd(usd_cap: u64, matic_usd: f64) -> Option<U256> {
+    if usd_cap == 0 {
+        return None;
+    }
+    let matic_usd = matic_usd_for_flash_cap(matic_usd);
+    let matic_usd_micros = (matic_usd * 1_000_000.0).round();
+    if !matic_usd_micros.is_finite() || matic_usd_micros <= 0.0 {
+        return None;
+    }
+    let matic_usd_micros = u64::try_from(matic_usd_micros as u128).ok()?;
+    let numer = U256::from(usd_cap)
+        .checked_mul(ONE)?
+        .checked_mul(U256::from(1_000_000u64))?;
+    Some(numer / U256::from(matic_usd_micros))
+}
+
+/// Max borrow in start-token wei from the configured USD flash cap.
 #[must_use]
 pub fn max_flash_borrow_wei(
-    max_flash_loan_matic: u64,
+    max_flash_loan_usd: u64,
     token_decimals: u8,
     token_to_matic_rate: U256,
+    matic_usd: f64,
 ) -> Option<U256> {
     if token_to_matic_rate.is_zero() {
         return None;
     }
+    let max_matic_wei = max_flash_loan_matic_wei_from_usd(max_flash_loan_usd, matic_usd)?;
     let scale = ten_pow_u256(token_decimals);
-    let max_matic_wei = U256::from(max_flash_loan_matic).checked_mul(ONE)?;
     max_matic_wei
         .checked_mul(scale)?
         .checked_div(token_to_matic_rate)
@@ -215,10 +247,17 @@ mod tests {
 
     #[test]
     fn max_flash_borrow_scales_with_rate() {
-        let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18))).expect("cap");
+        let cap =
+            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0).expect("cap");
         assert_eq!(cap, U256::from(50_000u64) * ONE);
         let low_rate_cap =
-            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(15))).expect("cap");
+            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(15)), 1.0).expect("cap");
         assert!(low_rate_cap > cap);
+    }
+
+    #[test]
+    fn max_flash_borrow_uses_usd_not_matic_units() {
+        let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 0.5).expect("cap");
+        assert_eq!(cap, U256::from(100_000u64) * ONE);
     }
 }

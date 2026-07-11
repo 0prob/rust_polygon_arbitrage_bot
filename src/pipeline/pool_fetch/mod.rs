@@ -322,11 +322,12 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         return 0;
     }
 
+    let pace_batches = batch_pace_ms > 0 && batches.len() > 1;
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
     let mut updated = 0usize;
     for (i, batch) in batches.iter().enumerate() {
         updated += execute_plan_batch(provider, batch, cache, block_number, chunk_size).await;
-        if batch_pace_ms > 0 && i + 1 < batches.len() {
+        if pace_batches && i + 1 < batches.len() {
             tokio::time::sleep(pacing).await;
         }
     }

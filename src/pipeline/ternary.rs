@@ -10,7 +10,7 @@ use crate::pipeline::local_sim::{cl_amount_cap, simulate_route_minimal};
 use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, check_sim_sanity_fast, check_sim_sanity_for_dispatch,
-    min_economic_amount_in,
+    max_flash_borrow_wei, min_economic_amount_in,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -222,6 +222,7 @@ fn get_dynamic_search_bounds(
     start_rate: U256,
     start_decimals: u8,
     max_flash_loan_usd: u64,
+    matic_usd: f64,
     liquidity_cap: Option<U256>,
 ) -> (U256, U256) {
     let mut min_capacity = U256::MAX;
@@ -277,8 +278,10 @@ fn get_dynamic_search_bounds(
         if min_economic <= max_search_low && low < min_economic {
             low = min_economic;
         }
-        let max_wei = (U256::from(max_flash_loan_usd) * ONE * start_scale) / start_rate;
-        if high > max_wei {
+        if let Some(max_wei) =
+            max_flash_borrow_wei(max_flash_loan_usd, start_decimals, start_rate, matic_usd)
+            && high > max_wei
+        {
             high = max_wei;
         }
     }
@@ -330,6 +333,7 @@ pub fn optimize_cycle(
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
     token_decimals: &FxHashMap<Address, u8>,
     max_flash_loan_usd: Option<u64>,
+    matic_usd: f64,
     max_iterations: Option<u32>,
     liquidity_cap: Option<U256>,
     profit_ctx: &ProfitEvalContext,
@@ -350,19 +354,21 @@ pub fn optimize_cycle(
         start_rate,
         start_decimals,
         max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
+        matic_usd,
         liquidity_cap,
     );
     if high < economic_floor {
         high = economic_floor.saturating_mul(U256::from(100u8));
-        if !start_rate.is_zero() {
-            let scale = ten_pow_u256_cached(start_decimals);
-            let max_wei = (U256::from(max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD))
-                * ONE
-                * scale)
-                / start_rate;
-            if high > max_wei {
-                high = max_wei;
-            }
+        if !start_rate.is_zero()
+            && let Some(max_wei) = max_flash_borrow_wei(
+                max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
+                start_decimals,
+                start_rate,
+                matic_usd,
+            )
+            && high > max_wei
+        {
+            high = max_wei;
         }
     }
     if low < economic_floor {

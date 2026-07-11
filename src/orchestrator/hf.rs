@@ -19,6 +19,7 @@ use crate::orchestrator::hf_execute::{
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
+use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -28,6 +29,7 @@ use crate::services::execution::{
 };
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::has_reliable_matic_rate;
+use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::partial_cache::PartialPoolCache;
 use crate::services::state_cache::StateCache;
 use crate::services::state_refresh::StateRefreshService;
@@ -42,6 +44,7 @@ pub struct HfContext {
     pub snapshots: Arc<SnapshotStore>,
     pub execution: Arc<ExecutionService>,
     pub gas_oracle: Arc<GasOracle>,
+    pub price_oracle: Arc<PriceOracle>,
     pub wallet: Arc<WalletSecrets>,
     pub rpc: Arc<RpcPool>,
     pub hypersync: Option<Arc<HyperSyncService>>,
@@ -283,7 +286,6 @@ pub async fn run_hf_tick(
     }
     let mut hot_pools: Arc<Vec<_>> = Arc::new(hot_pools_set.into_iter().collect());
 
-    let mut arena = arena_base;
     let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
         crate::warn!("hf tick skipped: gas oracle has no fee snapshot yet");
         return Ok(HfTickResult {
@@ -364,6 +366,7 @@ pub async fn run_hf_tick(
         }
     }
 
+    let mut arena = arena_base;
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
     ctx.execution
         .route_sim_cache
@@ -385,10 +388,11 @@ pub async fn run_hf_tick(
     }
 
     let flash_policy = ctx.config.flash_policy;
+    let matic_usd = matic_usd_for_flash_cap(ctx.price_oracle.cached_matic_usd().unwrap_or(0.0));
 
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
-    let owned = HfEvalInputOwned {
+    let reassess_ctx = Arc::new(HfEvalInputOwned {
         arena,
         token_to_matic_rates,
         token_decimals,
@@ -401,15 +405,16 @@ pub async fn run_hf_tick(
         slippage_bps: ctx.config.execution.slippage_bps,
         flash_policy,
         max_flash_loan_usd: ctx.config.execution.max_flash_loan_usd,
+        matic_usd,
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         flash_liquidity: Arc::clone(&ctx.execution.flash_liquidity),
         execution: Arc::clone(&ctx.execution),
-    };
+    });
     let cycles_considered = cycles.len();
     let (eval_results, mut eval_arena, probe_kept) = match timeout(
         HF_EVAL_BUDGET,
-        rescore_rank_and_evaluate_async(cycles, owned, sim_cap),
+        rescore_rank_and_evaluate_async(cycles, (*reassess_ctx).clone(), sim_cap),
     )
     .await
     {
@@ -468,13 +473,21 @@ pub async fn run_hf_tick(
         }
     }
 
+    let mut skip_dispatch_refresh = prefetch_ok;
     if !profitable.is_empty()
         && let Some(executor) = ctx.config.execution.executor_address
         && let Ok(sim_provider) = ctx.rpc.connect_simulation()
     {
-        profitable =
-            refresh_and_resim_profitable(&ctx.refresh, &ctx.cache, &mut eval_arena, profitable)
-                .await;
+        let (resimmed, resim_refreshed) = refresh_and_resim_profitable(
+            &ctx.refresh,
+            &ctx.cache,
+            &mut eval_arena,
+            profitable,
+            reassess_ctx.as_ref(),
+        )
+        .await;
+        profitable = resimmed;
+        skip_dispatch_refresh = prefetch_ok || resim_refreshed;
         profitable = filter_balancer_onchain_verified(
             Arc::clone(&ctx.execution),
             &eval_arena,
@@ -483,6 +496,7 @@ pub async fn run_hf_tick(
             executor,
             pool_metas_for_dispatch.as_ref(),
             ctx.config.execution.slippage_bps,
+            Arc::clone(&reassess_ctx),
         )
         .await;
         best_profit_matic = profitable
@@ -549,7 +563,7 @@ pub async fn run_hf_tick(
                 state_generation: evaluation_state_generation,
                 state_block: snap.state_block,
                 state_hash: snap.state_hash,
-                skip_dispatch_refresh: prefetch_ok,
+                skip_dispatch_refresh,
             },
         )
         .await;

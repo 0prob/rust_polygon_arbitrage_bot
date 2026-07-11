@@ -6,7 +6,7 @@ use alloy::primitives::Address;
 use alloy::primitives::U256;
 use anyhow::Context;
 use rayon::prelude::*;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxHashMap;
 
 use crate::core::types::{
     FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
@@ -50,6 +50,36 @@ struct SkipCounters {
     net: u32,
 }
 
+impl SkipCounters {
+    fn merge(&mut self, other: SkipCounters) {
+        self.rate += other.rate;
+        self.flash += other.flash;
+        self.flash_source += other.flash_source;
+        self.probe += other.probe;
+        self.net += other.net;
+    }
+}
+
+#[derive(Default)]
+struct ProbeRankPartial {
+    profitable: Vec<(U256, FoundCycle)>,
+    rescue: Vec<FoundCycle>,
+    near_net: Vec<(U256, FoundCycle)>,
+    seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
+    skip: SkipCounters,
+}
+
+impl ProbeRankPartial {
+    fn merge(mut self, other: Self) -> Self {
+        self.profitable.extend(other.profitable);
+        self.rescue.extend(other.rescue);
+        self.near_net.extend(other.near_net);
+        self.seeds.extend(other.seeds);
+        self.skip.merge(other.skip);
+        self
+    }
+}
+
 pub struct HfEvalInput<'a> {
     pub arena: &'a StateArena,
     pub token_to_matic_rates: &'a FxHashMap<TokenIndex, U256>,
@@ -64,6 +94,7 @@ pub struct HfEvalInput<'a> {
     pub slippage_bps: u64,
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
+    pub matic_usd: f64,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: &'a FlashLiquidityCache,
@@ -85,6 +116,7 @@ pub struct HfEvalInputOwned {
     pub slippage_bps: u64,
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
+    pub matic_usd: f64,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
@@ -107,6 +139,7 @@ impl HfEvalInputOwned {
             slippage_bps: self.slippage_bps,
             flash_policy: self.flash_policy,
             max_flash_loan_usd: self.max_flash_loan_usd,
+            matic_usd: self.matic_usd,
             safety_multiplier_bps: self.safety_multiplier_bps,
             profit_priority_alpha_bps: self.profit_priority_alpha_bps,
             flash_liquidity: self.flash_liquidity.as_ref(),
@@ -123,6 +156,8 @@ pub struct HfEvalResult {
     pub sim: RouteSimulationResult,
     pub assessment: ProfitAssessment,
     pub effective_slippage_bps: u64,
+    /// Set when `filter_balancer_onchain_verified` already ran `queryBatchSwap`.
+    pub balancer_batch_verified: bool,
 }
 
 /// Economic probe first, then decimal-aware spot probe for tickless CL routes.
@@ -274,6 +309,107 @@ pub fn probe_rank_window(max_keep: usize, total: usize) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn rank_one_cycle_probe(
+    cycle_arc: &Arc<FoundCycle>,
+    arena: &StateArena,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+    token_decimals: &FxHashMap<Address, u8>,
+    gas_price: U256,
+    base_slippage: u64,
+    flash_policy: FlashLoanPolicy,
+    gas_oracle: &GasOracle,
+    route_gas: &RouteGasLookup,
+    flash: &crate::services::execution::flash_liquidity::FlashLiquiditySnapshot,
+    flash_ttl: Duration,
+    safety_multiplier_bps: u64,
+    profit_priority_alpha_bps: u64,
+) -> ProbeRankPartial {
+    let mut out = ProbeRankPartial::default();
+    let cycle = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl);
+    let fp = hash_cycle_edges(&cycle.edges);
+    if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+        out.skip.rate = 1;
+        return out;
+    }
+    if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
+        out.skip.flash = 1;
+        return out;
+    }
+    let start_decimals =
+        resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
+    let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
+    let Some((probe_amount, probe)) = try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
+    else {
+        if cycle.score < 0.0 {
+            out.rescue.push(cycle.into_owned());
+        } else {
+            out.skip.probe = 1;
+        }
+        return out;
+    };
+    let Some(flash_source) = resolve_flash_source_for_cycle(
+        &cycle,
+        arena,
+        flash,
+        flash_ttl,
+        flash_policy,
+        probe_amount,
+    ) else {
+        out.skip.flash_source = 1;
+        return out;
+    };
+
+    let mut ctx = ProfitEvalContext::with_safety_multiplier(
+        cycle.start_token,
+        arena,
+        token_to_matic_rates,
+        token_decimals,
+        gas_price,
+        base_slippage,
+        flash_source,
+        safety_multiplier_bps,
+    );
+    ctx.gas_scale_bps = 10_000;
+    ctx.hop_count = cycle.edges.len() as u32;
+    ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
+    let mut ranked_probe = probe;
+    ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
+    let net = net_profit_after_gas_from_sim(&ranked_probe, probe_amount, &ctx);
+    out.seeds.insert(fp, (probe_amount, probe));
+    if net.is_zero() {
+        let hop_count = cycle.edges.len();
+        if !probe.profit.is_zero()
+            && cycle_simulatable(arena, &cycle, token_decimals, token_to_matic_rates)
+        {
+            out.near_net.push((probe.profit, cycle.into_owned()));
+        }
+        out.skip.net = 1;
+        if probe.profit.is_zero() {
+            crate::trace!(
+                "probe net=0 (zero sim profit): fp={fp:#x} hops={hop_count} probe_amt={probe_amount} gas={} rate={rate} dec={start_decimals}",
+                ranked_probe.total_gas,
+            );
+        } else {
+            crate::trace!(
+                "probe net=0 (gas eats profit): fp={fp:#x} hops={hop_count} sim_profit={} probe_amt={probe_amount} gas={} gas_cost_in_token={} rate={rate} dec={start_decimals}",
+                probe.profit,
+                ranked_probe.total_gas,
+                ctx.gas_price,
+            );
+        }
+        return out;
+    }
+    let hop_count = cycle.edges.len();
+    crate::debug!(
+        "probe net>0: fp={fp:#x} hops={hop_count} net={net} probe_amt={probe_amount} sim_profit={} gas={} rate={rate} dec={start_decimals}",
+        probe.profit,
+        ranked_probe.total_gas,
+    );
+    out.profitable.push((net, cycle.into_owned()));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn rank_cycles_by_probe_net(
     arena: &StateArena,
     cycles: Vec<Arc<FoundCycle>>,
@@ -297,100 +433,33 @@ pub fn rank_cycles_by_probe_net(
     let probe_stop_at = probe_rank_window(max_keep, cycles.len());
     let scanned: Vec<Arc<FoundCycle>> = cycles.into_iter().take(probe_stop_at).collect();
     let base_slippage = effective_slippage_bps(slippage_bps, 0);
-    let mut profitable_ranked: Vec<(U256, FoundCycle)> = Vec::new();
-    let mut rescue: Vec<FoundCycle> = Vec::new();
-    let mut probe_seeds: FxHashMap<u64, (U256, MinimalSimResult)> =
-        FxHashMap::with_capacity_and_hasher(probe_stop_at, FxBuildHasher);
-    let mut skip = SkipCounters::default();
-    let mut near_net: Vec<(U256, FoundCycle)> = Vec::new();
     let flash_ttl = flash_liquidity.ttl();
-    for cycle_arc in &scanned {
-        let flash = flash_liquidity.load();
-        let cycle = prefer_aave_flash_start(cycle_arc, arena, &flash, flash_ttl);
-        let fp = hash_cycle_edges(&cycle.edges);
-        if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
-            skip.rate += 1;
-            continue;
-        }
-        if !balancer_route_flash_feasible(&cycle, arena, &flash, flash_ttl) {
-            skip.flash += 1;
-            continue;
-        }
-        let start_decimals =
-            resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
-        let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-        let Some((probe_amount, probe)) =
-            try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
-        else {
-            if cycle.score < 0.0 {
-                rescue.push(cycle.into_owned());
-            } else {
-                skip.probe += 1;
-            }
-            continue;
-        };
-        let Some(flash_source) = resolve_flash_source_for_cycle(
-            &cycle,
-            arena,
-            &flash,
-            flash_ttl,
-            flash_policy,
-            probe_amount,
-        ) else {
-            skip.flash_source += 1;
-            continue;
-        };
-
-        let mut ctx = ProfitEvalContext::with_safety_multiplier(
-            cycle.start_token,
-            arena,
-            token_to_matic_rates,
-            token_decimals,
-            gas_price,
-            base_slippage,
-            flash_source,
-            safety_multiplier_bps,
-        );
-        ctx.gas_scale_bps = 10_000;
-        ctx.hop_count = cycle.edges.len() as u32;
-        ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
-        let mut ranked_probe = probe;
-        ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
-        let net = net_profit_after_gas_from_sim(&ranked_probe, probe_amount, &ctx);
-        probe_seeds.insert(fp, (probe_amount, probe));
-        if net.is_zero() {
-            let hop_count = cycle.edges.len();
-            if !probe.profit.is_zero()
-                && cycle_simulatable(arena, &cycle, token_decimals, token_to_matic_rates)
-            {
-                near_net.push((probe.profit, cycle.into_owned()));
-            }
-            skip.net += 1;
-            if probe.profit.is_zero() {
-                crate::trace!(
-                    "probe net=0 (zero sim profit): fp={fp:#x} hops={hop_count} probe_amt={probe_amount} gas={} rate={rate} dec={start_decimals}",
-                    ranked_probe.total_gas,
-                );
-            } else {
-                crate::trace!(
-                    "probe net=0 (gas eats profit): fp={fp:#x} hops={hop_count} sim_profit={} probe_amt={probe_amount} gas={} gas_cost_in_token={} rate={rate} dec={start_decimals}",
-                    probe.profit,
-                    ranked_probe.total_gas,
-                    ctx.gas_price,
-                );
-            }
-            continue;
-        }
-        let hop_count = cycle.edges.len();
-        crate::debug!(
-            "probe net>0: fp={fp:#x} hops={hop_count} net={net} probe_amt={probe_amount} sim_profit={} gas={} rate={rate} dec={start_decimals}",
-            probe.profit,
-            ranked_probe.total_gas,
-        );
-        profitable_ranked.push((net, cycle.into_owned()));
-    }
-
     let flash = flash_liquidity.load();
+    let partial = scanned
+        .par_iter()
+        .map(|cycle_arc| {
+            rank_one_cycle_probe(
+                cycle_arc,
+                arena,
+                token_to_matic_rates,
+                token_decimals,
+                gas_price,
+                base_slippage,
+                flash_policy,
+                gas_oracle,
+                route_gas,
+                &flash,
+                flash_ttl,
+                safety_multiplier_bps,
+                profit_priority_alpha_bps,
+            )
+        })
+        .reduce(ProbeRankPartial::default, ProbeRankPartial::merge);
+    let profitable_ranked = partial.profitable;
+    let mut rescue = partial.rescue;
+    let mut probe_seeds = partial.seeds;
+    let skip = partial.skip;
+    let mut near_net = partial.near_net;
     rescue.retain(|cycle| {
         cycle_simulatable(arena, cycle, token_decimals, token_to_matic_rates)
             && cycle_flash_evaluable(
@@ -422,7 +491,6 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
-                let flash = flash_liquidity.load();
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
                         cycle,
@@ -651,7 +719,12 @@ fn probe_fallback_amounts(
         }
         // Skip spot probe if it exceeds the flash loan cap for this token.
         if candidate == spot
-            && let Some(cap) = max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate)
+            && let Some(cap) = max_flash_borrow_wei(
+                input.max_flash_loan_usd,
+                dec,
+                rate,
+                input.matic_usd,
+            )
             && spot > cap
         {
             continue;
@@ -809,6 +882,7 @@ fn evaluate_one(
         input.token_to_matic_rates,
         input.token_decimals,
         Some(input.max_flash_loan_usd),
+        input.matic_usd,
         Some(input.brent_iters),
         None,
         &profit_ctx,
@@ -909,6 +983,7 @@ fn evaluate_one(
                 input.token_to_matic_rates,
                 input.token_decimals,
                 Some(input.max_flash_loan_usd),
+                input.matic_usd,
                 Some(input.brent_iters),
                 None,
                 &depth_ctx,
@@ -968,7 +1043,25 @@ fn evaluate_one(
         sim,
         assessment,
         effective_slippage_bps: slippage_bps,
+        balancer_batch_verified: false,
     })
+}
+
+/// Recompute profitability after `sim` was updated (resim, on-chain verify, etc.).
+#[must_use]
+pub fn reassess_hf_eval_result(
+    result: &HfEvalResult,
+    input: &HfEvalInput<'_>,
+    flash_source: FlashLoanSource,
+) -> Option<ProfitAssessment> {
+    assess_route_for_cycle(
+        input,
+        &result.sim,
+        &result.cycle,
+        result.route_fingerprint,
+        result.effective_slippage_bps.max(input.slippage_bps),
+        flash_source,
+    )
 }
 
 fn assess_route_for_cycle(
@@ -1024,6 +1117,7 @@ fn validate_optimized_sim(
         input.max_flash_loan_usd,
         token_decimals,
         token_to_matic_rate,
+        input.matic_usd,
     )
     .is_none_or(|cap| sim.amount_in <= cap);
 

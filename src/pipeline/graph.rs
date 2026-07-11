@@ -633,10 +633,7 @@ pub fn pool_meta_from_pair(
 mod tests {
     use super::*;
     use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
-    use crate::core::types::{
-        BalancerPoolKind, BalancerPoolState, CurvePoolState, PoolState, V2PoolState,
-        WoofiBaseTokenState, WoofiPoolState,
-    };
+    use crate::core::types::{BalancerPoolKind, BalancerPoolState, PoolState, V2PoolState};
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
 

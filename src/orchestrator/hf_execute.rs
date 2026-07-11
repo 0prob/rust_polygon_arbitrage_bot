@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::FoundCycle;
 use crate::orchestrator::hf::HfContext;
-use crate::orchestrator::hf_eval::HfEvalResult;
+use crate::core::types::FlashLoanSource;
+use crate::orchestrator::hf_eval::{HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result};
+use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
+use crate::services::execution::gas_oracle::RouteGasLookup;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
 use crate::pipeline::spot_price::spot_probe_for_token;
@@ -20,7 +23,7 @@ use crate::services::execution::flash_liquidity::{
     aave_flash_reserve_viable, collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
 };
 
-use crate::core::types::FlashLoanSource;
+use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 use crate::services::execution::balancer_verify::{
     BatchQueryOutcome, balancer_batch_within_max_in_ratio, batch_profit_covers_min,
     query_balancer_batch_profit,
@@ -183,6 +186,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let base_slippage_bps = ctx.config.execution.slippage_bps;
     let min_profit_roi_bps = ctx.config.execution.min_profit_roi_bps;
     let max_flash_loan_usd = ctx.config.execution.max_flash_loan_usd;
+    let matic_usd = matic_usd_for_flash_cap(ctx.price_oracle.cached_matic_usd().unwrap_or(0.0));
     let deadline_secs = ctx.config.execution.deadline_secs;
 
     let mut flash_seen = rustc_hash::FxHashSet::default();
@@ -274,6 +278,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                     base_slippage_bps,
                     min_profit_roi_bps,
                     max_flash_loan_usd,
+                    matic_usd,
                     deadline_secs,
                     &skipped,
                 )
@@ -313,10 +318,12 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     base_slippage_bps: u64,
     min_profit_roi_bps: u64,
     max_flash_loan_usd: u64,
+    matic_usd: f64,
     deadline_secs: u64,
     skipped: &Arc<SkipCounts>,
 ) {
     let fp = evaluated.route_fingerprint;
+    let balancer_batch_verified = evaluated.balancer_batch_verified;
     if ctx.execution.is_route_quarantined(fp) {
         skipped.record("quarantine");
         return;
@@ -407,6 +414,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         gas_price,
         slippage_bps,
         max_flash_loan_usd,
+        matic_usd,
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         route_fingerprint: fp,
@@ -448,6 +456,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     if prepared.flash_source == FlashLoanSource::Direct
         && route_is_balancer_only(&prepared.evaluated.cycle)
+        && !balancer_batch_verified
     {
         let Some(hops) = build_calldata_hops(
             arena,
@@ -647,11 +656,13 @@ pub(crate) async fn refresh_and_resim_profitable(
     cache: &crate::services::state_cache::StateCache,
     arena: &mut StateArena,
     profitable: Vec<HfEvalResult>,
-) -> Vec<HfEvalResult> {
+    reassess: &HfEvalInputOwned,
+) -> (Vec<HfEvalResult>, bool) {
     if profitable.is_empty() {
-        return profitable;
+        return (profitable, false);
     }
     let pools = collect_route_pool_addresses(arena, &profitable);
+    let mut pools_refreshed = false;
     if !pools.is_empty()
         && refresh
             .refresh_pool_states_for(&pools, pools.len())
@@ -659,8 +670,16 @@ pub(crate) async fn refresh_and_resim_profitable(
             .is_ok()
     {
         arena.apply_hot_cache(cache, &pools);
+        pools_refreshed = true;
     }
-    profitable
+    let route_gas = RouteGasLookup::for_fingerprints(
+        reassess.gas_oracle.as_ref(),
+        profitable.iter().map(|r| r.route_fingerprint),
+    );
+    let eval = reassess.as_eval_input(&route_gas);
+    let flash = reassess.flash_liquidity.load();
+    let flash_ttl = reassess.flash_liquidity.ttl();
+    let filtered = profitable
         .into_iter()
         .filter_map(|mut result| {
             let amount = result.opt.optimal_input;
@@ -669,9 +688,23 @@ pub(crate) async fn refresh_and_resim_profitable(
                 return None;
             }
             result.sim = sim;
+            let flash_source = resolve_flash_source_for_cycle(
+                &result.cycle,
+                arena,
+                &flash,
+                flash_ttl,
+                reassess.flash_policy,
+                result.sim.amount_in,
+            )?;
+            let assessment = reassess_hf_eval_result(&result, &eval, flash_source)?;
+            if !assessment.should_execute {
+                return None;
+            }
+            result.assessment = assessment;
             Some(result)
         })
-        .collect()
+        .collect();
+    (filtered, pools_refreshed)
 }
 
 const BATCH_VERIFY_CONCURRENCY: usize = 3;
@@ -694,6 +727,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
     executor: alloy::primitives::Address,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     slippage_bps: u64,
+    reassess: Arc<HfEvalInputOwned>,
 ) -> Vec<HfEvalResult> {
     let pool_metas_by_pool: FxHashMap<
         crate::core::types::PoolIndex,
@@ -747,8 +781,22 @@ pub(crate) async fn filter_balancer_onchain_verified<
         .map(|job| {
             let sim_provider = sim_provider.clone();
             let execution = Arc::clone(&execution);
+            let reassess = Arc::clone(&reassess);
             async move {
-                verify_balancer_batch_job(execution.as_ref(), job, &sim_provider, executor).await
+                let route_gas = RouteGasLookup::for_fingerprints(
+                    reassess.gas_oracle.as_ref(),
+                    [job.result.route_fingerprint],
+                );
+                let eval = reassess.as_eval_input(&route_gas);
+                verify_balancer_batch_job(
+                    execution.as_ref(),
+                    job,
+                    &sim_provider,
+                    executor,
+                    &eval,
+                    &route_gas,
+                )
+                .await
             }
         })
         .buffer_unordered(BATCH_VERIFY_CONCURRENCY)
@@ -766,6 +814,8 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     job: BalancerVerifyJob,
     sim_provider: &P,
     executor: alloy::primitives::Address,
+    eval: &HfEvalInput<'_>,
+    _route_gas: &RouteGasLookup,
 ) -> Option<HfEvalResult> {
     let BalancerVerifyJob {
         result,
@@ -791,6 +841,18 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             accepted.sim.profit = on_chain_profit;
             accepted.sim.amount_out = accepted.sim.amount_in.saturating_add(on_chain_profit);
             accepted.sim.profitable = true;
+            let assessment =
+                reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
+            if !assessment.should_execute {
+                execution.quarantine_batch_query_failure(fp);
+                crate::info!(
+                    "hf batch-filter: fp={fp} reject=reassess_after_on_chain on_chain={on_chain_profit} net_matic={}",
+                    assessment.net_profit_after_gas_matic_wei,
+                );
+                return None;
+            }
+            accepted.assessment = assessment;
+            accepted.balancer_batch_verified = true;
         }
         return Some(accepted);
     }

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::U256;
 use parking_lot::Mutex as ParkingMutex;
@@ -149,6 +150,7 @@ impl RuntimeContext {
             snapshots: Arc::clone(&self.snapshots),
             execution: Arc::clone(&self.execution),
             gas_oracle: Arc::clone(&self.gas_oracle),
+            price_oracle: Arc::clone(&self.price_oracle),
             wallet: Arc::clone(&self.wallet),
             rpc: Arc::clone(&self.rpc),
             hypersync: self.hypersync.clone(),
@@ -208,6 +210,7 @@ pub async fn run_pass_loop(
     let mut hf_timer = interval(Duration::from_millis(ctx.config.hf_interval_ms.max(1)));
     hf_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let hf_inflight = Arc::new(Semaphore::new(1));
+    let hf_pending = Arc::new(AtomicBool::new(false));
     let hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>> = Arc::new(ParkingMutex::new(None)); // ponytail: simple shared handle tracking
 
     if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
@@ -268,25 +271,6 @@ pub async fn run_pass_loop(
         .checked_sub(stream_hf_min_interval)
         .unwrap_or_else(std::time::Instant::now);
 
-    let spawn_hf_tick = {
-        let hf_task = Arc::clone(&hf_task);
-        move |hf_ctx: Arc<HfContext>, hf_inflight: Arc<Semaphore>, stream_triggered: bool| {
-            let Ok(permit) = hf_inflight.try_acquire_owned() else {
-                return;
-            };
-            let hf_task = Arc::clone(&hf_task);
-            *hf_task.lock() = Some(tokio::spawn(async move {
-                let _permit = permit;
-                if stream_triggered {
-                    let _ = hf_ctx.partial_cache.trigger().take_stream_triggered();
-                }
-                if let Err(e) = run_hf_tick(hf_ctx, stream_triggered).await {
-                    crate::warn!("hf tick failed: {e:#}");
-                }
-            }));
-        }
-    };
-
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -295,7 +279,13 @@ pub async fn run_pass_loop(
                 }
             }
             _ = hf_timer.tick() => {
-                spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), false);
+                schedule_hf_tick(
+                    Arc::clone(&hf_ctx),
+                    Arc::clone(&hf_inflight),
+                    Arc::clone(&hf_task),
+                    Arc::clone(&hf_pending),
+                    false,
+                );
             }
             event = async {
                 match height_rx.as_mut() {
@@ -310,9 +300,11 @@ pub async fn run_pass_loop(
                         if let Some(hs) = ctx.hypersync.as_ref() {
                             hs.record_height(height);
                         }
-                        spawn_hf_tick(
+                        schedule_hf_tick(
                             Arc::clone(&hf_ctx),
                             Arc::clone(&hf_inflight),
+                            Arc::clone(&hf_task),
+                            Arc::clone(&hf_pending),
                             false,
                         );
                     }
@@ -371,7 +363,13 @@ pub async fn run_pass_loop(
                         let now = std::time::Instant::now();
                         if now.duration_since(last_stream_hf_at) >= stream_hf_min_interval {
                             last_stream_hf_at = now;
-                            spawn_hf_tick(Arc::clone(&hf_ctx), Arc::clone(&hf_inflight), true);
+                            schedule_hf_tick(
+                                Arc::clone(&hf_ctx),
+                                Arc::clone(&hf_inflight),
+                                Arc::clone(&hf_task),
+                                Arc::clone(&hf_pending),
+                                true,
+                            );
                         }
                     }
                     Err(_) => {
@@ -485,6 +483,43 @@ fn spawn_daily_loss_guard(
             }
         }
     }))
+}
+
+fn schedule_hf_tick(
+    hf_ctx: Arc<HfContext>,
+    hf_inflight: Arc<Semaphore>,
+    hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>>,
+    hf_pending: Arc<AtomicBool>,
+    stream_triggered: bool,
+) {
+    let hf_inflight_acquire = Arc::clone(&hf_inflight);
+    let hf_inflight_coalesce = Arc::clone(&hf_inflight);
+    let Ok(permit) = hf_inflight_acquire.try_acquire_owned() else {
+        hf_pending.store(true, Ordering::Release);
+        return;
+    };
+    let hf_ctx_run = Arc::clone(&hf_ctx);
+    let hf_task_store = Arc::clone(&hf_task);
+    let hf_task_coalesce = Arc::clone(&hf_task);
+    let hf_pending_coalesce = Arc::clone(&hf_pending);
+    *hf_task_store.lock() = Some(tokio::spawn(async move {
+        let _permit = permit;
+        if stream_triggered {
+            let _ = hf_ctx_run.partial_cache.trigger().take_stream_triggered();
+        }
+        if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
+            crate::warn!("hf tick failed: {e:#}");
+        }
+        if hf_pending_coalesce.swap(false, Ordering::AcqRel) {
+            schedule_hf_tick(
+                hf_ctx_run,
+                hf_inflight_coalesce,
+                hf_task_coalesce,
+                hf_pending_coalesce,
+                false,
+            );
+        }
+    }));
 }
 
 fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {

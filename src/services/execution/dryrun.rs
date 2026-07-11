@@ -92,12 +92,23 @@ fn is_gas_limit_rpc_error(msg: &str) -> bool {
         || msg.contains("intrinsic gas too high")
 }
 
-fn gas_overflow_dry_run_success(realized_profit: Option<U256>) -> DryRunResult {
+fn gas_overflow_dry_run_failure() -> DryRunResult {
+    DryRunResult {
+        semantic_success: false,
+        success: false,
+        gas_used: None,
+        realized_profit: None,
+        error: Some("eth_call exceeded gas limit and estimate_gas also failed".into()),
+        decoded_revert: None,
+    }
+}
+
+fn gas_overflow_estimate_fallback(realized_profit: U256) -> DryRunResult {
     DryRunResult {
         semantic_success: true,
         success: true,
         gas_used: None,
-        realized_profit,
+        realized_profit: Some(realized_profit),
         error: None,
         decoded_revert: None,
     }
@@ -118,9 +129,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
             error: None,
             decoded_revert: None,
         },
-        Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => {
-            gas_overflow_dry_run_success(None)
-        }
+        Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => gas_overflow_dry_run_failure(),
         Ok(Err(err)) => DryRunResult {
             semantic_success: false,
             success: false,
@@ -129,7 +138,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
             error: Some(err.to_string()),
             decoded_revert: None,
         },
-        Err(_) => gas_overflow_dry_run_success(None),
+        Err(_) => gas_overflow_dry_run_failure(),
     }
 }
 
@@ -224,7 +233,9 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
             // estimate_gas even when the callback is otherwise valid.
             let msg = err.to_string();
             if is_gas_limit_rpc_error(&msg) {
-                return gas_overflow_dry_run_success(realized_profit);
+                return realized_profit
+                    .map(gas_overflow_estimate_fallback)
+                    .unwrap_or_else(gas_overflow_dry_run_failure);
             }
             DryRunResult {
                 semantic_success: false,
@@ -236,8 +247,8 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
             }
         }
         Err(_) => {
-            if realized_profit.is_some() {
-                gas_overflow_dry_run_success(realized_profit)
+            if let Some(profit) = realized_profit {
+                gas_overflow_estimate_fallback(profit)
             } else {
                 DryRunResult {
                     semantic_success: false,

@@ -671,9 +671,8 @@ pub fn balancer_route_flash_feasible(
     if route_is_balancer_only(cycle) {
         return true;
     }
-    // ponytail: cold cache must not reject every mixed Balancer route before refresh lands.
     if !cycle_flash_cache_warm(cycle, arena, flash, ttl) {
-        return true;
+        return false;
     }
     cycle_has_aave_listed_token(cycle, arena, flash, ttl)
 }
@@ -967,6 +966,7 @@ pub struct PrepareDispatchInput<'a> {
     pub gas_price: U256,
     pub slippage_bps: u64,
     pub max_flash_loan_usd: u64,
+    pub matic_usd: f64,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub route_fingerprint: u64,
@@ -1034,6 +1034,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         input.max_flash_loan_usd,
         token_decimals,
         token_to_matic_rate,
+        input.matic_usd,
     );
     if plan.action != FlashPlanAction::Reject
         && let Some(cap) = flash_borrow_cap
@@ -1086,7 +1087,9 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
             let assessment = input
                 .existing_assessment
                 .clone()
-                .filter(|a| a.should_execute)
+                .filter(|a| {
+                    a.should_execute && a.gross_profit == input.evaluated.result.profit
+                })
                 .or_else(|| reassess_route(input, plan.source))?;
             if !assessment.should_execute {
                 prepare_skip_log(
@@ -1164,6 +1167,7 @@ fn reoptimize_capped(
         input.token_to_matic_rates,
         input.token_decimals,
         Some(input.max_flash_loan_usd),
+        input.matic_usd,
         Some(input.brent_iters),
         Some(cap),
         &profit_ctx,
@@ -1237,6 +1241,7 @@ fn dispatch_sim_passes_sanity(
         input.max_flash_loan_usd,
         token_decimals,
         token_to_matic_rate,
+        input.matic_usd,
     ) && result.amount_in > cap
     {
         return false;
