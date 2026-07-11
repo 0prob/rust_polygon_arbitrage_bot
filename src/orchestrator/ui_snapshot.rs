@@ -47,6 +47,7 @@ pub fn spawn_snapshot_publisher(
         let mut portfolio_rows = Vec::new();
         let mut route_cache = RouteBuildCache {
             generation: 0,
+            gas_gwei: None,
             opportunities: Arc::new(Vec::new()),
             simulations: Arc::new(Vec::new()),
         };
@@ -177,7 +178,12 @@ async fn build_ui_snapshot(
         portfolio_rows = task.await.context("portfolio refresh task failed")?;
     }
 
-    if snap.generation != route_cache.generation {
+    let gas_gwei = ctx
+        .gas_oracle
+        .snapshot()
+        .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
+
+    if snap.generation != route_cache.generation || route_cache.gas_gwei != gas_gwei {
         let hot_pools = hot_pool_addresses(&snap);
         let mut arena = snap.arena.clone();
         arena.apply_hot_cache(&ctx.cache, &hot_pools);
@@ -190,6 +196,7 @@ async fn build_ui_snapshot(
                 &snap_arc,
                 &arena,
                 matic,
+                gas_gwei,
                 slippage_bps,
                 safety_multiplier_bps,
             )
@@ -198,11 +205,6 @@ async fn build_ui_snapshot(
         .context("route cache build task failed")?;
     }
     let input_arena = crate::pipeline::arena::StateArena::default();
-
-    let gas_gwei = ctx
-        .gas_oracle
-        .snapshot()
-        .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
 
     let hypersync_height = ctx.hypersync.as_ref().and_then(|hs| hs.latest_height());
 

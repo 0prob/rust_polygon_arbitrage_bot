@@ -36,8 +36,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(sections[0]);
 
     let pnl_matic = snapshot.overview.daily_pnl_wei as f64 / 1e18;
-    let profitable_share = if snapshot.overview.cycle_count > 0 {
-        (app.last_profitable_count as f64 / snapshot.overview.cycle_count as f64) * 100.0
+    let profitable_share = if app.last_cycles_considered > 0 {
+        (app.last_profitable_count as f64 / app.last_cycles_considered as f64) * 100.0
     } else {
         0.0
     };
@@ -71,9 +71,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format!("search {} ms", snapshot.overview.search_ms),
         format!(
             "HF {} ms | age {} ms",
-            snapshot.overview.hf_ms, snapshot.overview.snapshot_age_ms
+            snapshot.overview.hf_ms,
+            snapshot.captured_at.elapsed().as_millis()
         ),
-        if snapshot.overview.snapshot_age_ms > 2_500 {
+        if snapshot.captured_at.elapsed().as_millis() > 2_500 {
             theme::warn()
         } else {
             theme::good()

@@ -187,6 +187,7 @@ pub struct RuntimeSnapshotInput {
 #[derive(Clone)]
 pub struct RouteBuildCache {
     pub generation: u64,
+    pub gas_gwei: Option<f64>,
     pub opportunities: Arc<Vec<RouteSummary>>,
     pub simulations: Arc<Vec<SimulationRow>>,
 }
@@ -462,6 +463,7 @@ pub fn build_route_cache(
     snapshot: &HfSnapshot,
     arena: &crate::pipeline::arena::StateArena,
     matic_usd: f64,
+    gas_gwei: Option<f64>,
     slippage_bps: u64,
     safety_multiplier_bps: u64,
 ) -> RouteBuildCache {
@@ -469,7 +471,7 @@ pub fn build_route_cache(
         snapshot,
         arena,
         matic_usd,
-        None,
+        gas_gwei,
         slippage_bps,
         safety_multiplier_bps,
         48,
@@ -477,6 +479,7 @@ pub fn build_route_cache(
     let simulations = build_simulations(&opportunities);
     RouteBuildCache {
         generation: snapshot.generation,
+        gas_gwei,
         opportunities: Arc::new(opportunities),
         simulations: Arc::new(simulations),
     }

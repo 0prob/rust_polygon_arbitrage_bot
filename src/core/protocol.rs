@@ -113,11 +113,15 @@ pub fn is_known_protocol_label(raw: &str) -> bool {
 /// from the indexer — each wrong-fee pool contaminates all cycles through it.
 #[must_use]
 pub fn fee_to_bps(protocol_label: &str, raw_fee: Option<u32>) -> u32 {
+    let is_curve = contains_ignore_case(protocol_label, "curve");
     let is_v3_or_v4 =
         contains_ignore_case(protocol_label, "v4") || contains_ignore_case(protocol_label, "v3");
     let raw = raw_fee.unwrap_or(if is_v3_or_v4 { 3000 } else { 30 });
     if raw == 0 || raw >= 0x800000 {
         return 30;
+    }
+    if is_curve {
+        return (raw / 1_000_000).min(9_999);
     }
     (raw / if is_v3_or_v4 { 100 } else { 1 }).min(9_999)
 }
@@ -179,6 +183,12 @@ mod tests {
     #[test]
     fn curve_crypto_is_fetchable() {
         assert!(is_fetchable_protocol(ProtocolType::CurveCrypto));
+    }
+
+    #[test]
+    fn curve_fee_units_are_converted_to_basis_points() {
+        assert_eq!(fee_to_bps("CURVE_STABLE", Some(4_000_000)), 4);
+        assert_eq!(fee_to_bps("CURVE_CRYPTO", Some(5_000_000)), 5);
     }
 
     #[test]
