@@ -1,32 +1,38 @@
-# LF ticks average ~2.5s refresh; interval must exceed that to avoid perpetual backlog.
-lf_interval_ms = 3000
+# Tuned for lowest paid / PAYG tiers (see .env.example provider table):
+#   dRPC PAYG state primary ($6/1M req, 5K RPS) — Chainstack Dev 25 RPS or Growth 250 RPS failover
+#   Alchemy PAYG execution only (10K CU/s; eth_call=26 CU — keep off state multicall path)
+#   Ankr freemium fallback (~30 RPS), PublicNode last resort
+#
+# Measured from this host: dRPC ~262ms, Alchemy ~468ms, Ankr ~558ms (20-parallel burst: all OK)
+
+lf_interval_ms = 4000
+hf_interval_ms = 200
+max_multicall_calls = 180
+
+[rpc]
+request_timeout_ms = 10000
+batch_pace_ms = 8
 
 [execution]
-# 0.01 MATIC net profit floor — lower threshold captures more marginal opportunities
 min_profit_matic_wei = "10000000000000000"
-# 1.0x: cover gas only, net profit above gas is enough
 profit_safety_multiplier_bps = 10000
-# Balancer-first waterfall with Aave fallback for mixed routes
 flash_loan_source = "auto"
 
 [routing]
-# 300: Larger pool for more cycle diversity. LF runs in background with try_lock.
 enumeration_max_paths = 500
 max_hops = 4
-# More Brent iterations reduces probe-only near-misses on flat profit curves.
 ternary_search_iterations = 18
 
 [pipeline]
-# Hot-pool WSS patches; requires WSS_URL or POLYGON_WSS_URLS in .env
 stream_enabled = true
-# Per-tick pool refresh cap (hot pools rotate; full sweep every lf_full_sweep_interval passes).
-lf_hot_batch = 500
-lf_full_sweep_interval = 45
+lf_hot_batch = 400
+lf_full_sweep_interval = 60
 cycle_refind_interval = 8
-# Raise sim/score caps to eval more candidates per HF tick -> more chance of net>0 after gas.
-hf_sim_cap = 300
-hf_score_cap = 400
-hf_prefetch_count = 300
+hf_sim_cap = 100
+hf_score_cap = 120
+hf_prefetch_count = 50
+hf_prefetch_budget_ms = 1000
+hf_max_dispatch = 4
 
 [oracle]
 pyth_feeds = ""

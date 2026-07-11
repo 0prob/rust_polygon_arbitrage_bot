@@ -200,6 +200,7 @@ fn bench_cycle_search(c: &mut Criterion) {
                 CycleFinderMode::Hybrid,
                 black_box(&arena),
                 black_box(&graph),
+                black_box(&metas),
                 black_box(&passes),
                 false,
                 None,

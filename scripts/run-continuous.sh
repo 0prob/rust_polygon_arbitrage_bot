@@ -5,6 +5,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 LOG_DIR="./target/run-logs"
 mkdir -p "$LOG_DIR"
+PIDFILE="$LOG_DIR/runner.pid"
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "[runner] already running (pid=$(cat "$PIDFILE"))"
+    exit 1
+fi
+echo $$ >"$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
 
 RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
 BOT_BIN="./target/release/rpbot"

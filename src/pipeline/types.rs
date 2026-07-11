@@ -1,15 +1,44 @@
 use alloy::primitives::{Address, FixedBytes, U256};
+use smallvec::SmallVec;
 
+use crate::core::constants::MAX_POOL_TOKENS;
 use crate::core::types::{Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
+
+/// Graph traversal phase for hub-and-spoke pool abstraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphHopPhase {
+    /// Token-to-token swap on a 2-token pool (classic edge).
+    #[default]
+    Direct,
+    /// Token deposits into a virtual pool hub node.
+    EnterPool,
+    /// Virtual pool hub exits to a token (weight resolved lazily on traversal).
+    ExitPool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphEdge {
     pub edge: Edge,
+    pub phase: GraphHopPhase,
+    /// Destination graph node index (token id or virtual hub id).
+    pub target_node: u32,
     pub log_weight: f64,
     /// U256 fixed-point ratio: spot_price * (1 - fee_bps/10000) scaled to ONE (1e18).
     /// ratio > ONE means the edge is profitable (more output than input).
     /// U256::ZERO = dead/unroutable edge.
+    /// Enter/Exit hub legs use ONE as a neutral placeholder until paired.
     pub ratio: U256,
+}
+
+/// Virtual pool hub node in the routing graph (pool-as-a-node abstraction).
+#[derive(Debug, Clone)]
+pub struct VirtualPoolHub {
+    pub pool_index: PoolIndex,
+    pub protocol: ProtocolType,
+    /// Funded token leg indices for exit fan-out (pool-local indices).
+    pub exit_legs: SmallVec<[u8; MAX_POOL_TOKENS]>,
+    /// When true, `pool_index` on enter edges selects the active V4 pool context.
+    pub v4_singleton: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -28,10 +57,14 @@ pub struct PoolMeta {
 
 #[derive(Debug, Clone, Default)]
 pub struct RoutingGraph {
-    /// `adjacency[token.0]` = outgoing edges from that token.
+    /// `adjacency[node]` = outgoing edges from that graph node (tokens + virtual hubs).
     pub adjacency: Vec<Vec<GraphEdge>>,
     pub token_count: u32,
-    /// Reverse index: pool_index.0 → list of (adjacency_token_index, edge_index_in_list)
+    /// Virtual pool hub metadata; hub node id = `token_count + hub_index`.
+    pub virtual_hubs: Vec<VirtualPoolHub>,
+    /// Shared singleton hub node for all Uniswap V4 pools (PoolManager).
+    pub v4_singleton_hub: Option<u32>,
+    /// Reverse index: pool_index.0 → list of (adjacency_node_index, edge_index_in_list)
     pub pool_edge_positions: Vec<Vec<(usize, usize)>>,
     /// Cached cycle-capable coverage from Tarjan bridge search.
     /// Only recomputed when graph topology changes (not on rescore).
@@ -68,21 +101,59 @@ impl RoutingGraph {
         Self {
             adjacency: vec![Vec::new(); token_count as usize],
             token_count,
+            virtual_hubs: Vec::new(),
+            v4_singleton_hub: None,
             pool_edge_positions: Vec::new(),
             coverage: None,
         }
     }
 
-    pub fn add_edge(&mut self, from: TokenIndex, graph_edge: GraphEdge) {
-        if let Some(slot) = self.adjacency.get_mut(from.0 as usize) {
-            let pos = slot.len();
-            let pool_idx = graph_edge.edge.pool_index.0 as usize;
-            slot.push(graph_edge);
-            if pool_idx >= self.pool_edge_positions.len() {
-                self.pool_edge_positions.resize(pool_idx + 1, Vec::new());
-            }
-            self.pool_edge_positions[pool_idx].push((from.0 as usize, pos));
+    #[inline]
+    #[must_use]
+    pub fn node_count(&self) -> u32 {
+        self.adjacency.len() as u32
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_virtual_node(&self, node: u32) -> bool {
+        node >= self.token_count
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn virtual_hub_index(&self, node: u32) -> Option<usize> {
+        if !self.is_virtual_node(node) {
+            return None;
         }
+        let idx = node.saturating_sub(self.token_count) as usize;
+        self.virtual_hubs.get(idx).map(|_| idx)
+    }
+
+    pub fn add_direct_edge(&mut self, from: TokenIndex, graph_edge: GraphEdge) {
+        self.push_edge_at(from.0, graph_edge);
+    }
+
+    pub fn push_edge_at(&mut self, from_node: u32, mut graph_edge: GraphEdge) {
+        if graph_edge.phase == GraphHopPhase::Direct {
+            graph_edge.target_node = graph_edge.edge.token_out.0;
+        }
+        let idx = from_node as usize;
+        if idx >= self.adjacency.len() {
+            self.adjacency.resize(idx + 1, Vec::new());
+        }
+        let pos = self.adjacency[idx].len();
+        let pool_idx = graph_edge.edge.pool_index.0 as usize;
+        self.adjacency[idx].push(graph_edge);
+        if pool_idx >= self.pool_edge_positions.len() {
+            self.pool_edge_positions.resize(pool_idx + 1, Vec::new());
+        }
+        self.pool_edge_positions[pool_idx].push((idx, pos));
+    }
+
+    /// Legacy helper — direct token edges only.
+    pub fn add_edge(&mut self, from: TokenIndex, graph_edge: GraphEdge) {
+        self.add_direct_edge(from, graph_edge);
     }
 
     /// Pools with at least one live (tradable) directed edge in adjacency.

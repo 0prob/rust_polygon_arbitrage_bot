@@ -90,17 +90,23 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     }
 }
 
-/// Reject Direct routes when vault simulation shows less profit than calldata minProfit floor.
+/// Reject Direct routes when vault `queryBatchSwap` profit cannot satisfy calldata `minProfit`.
+///
+/// The floor must be derived from on-chain gross, not local sim — Balancer batch sim
+/// routinely overstates profit vs `queryBatchSwap`, which caused viable Direct routes
+/// to be filtered while only overstated mixed AaveFlash routes reached dispatch.
 #[must_use]
 pub fn batch_profit_covers_min(
     on_chain_profit: U256,
-    modeled_gross: U256,
     amount_in: U256,
     slippage_bps: u64,
     hop_count: u32,
 ) -> bool {
+    if on_chain_profit.is_zero() {
+        return false;
+    }
     let Some(min_profit) = on_chain_min_profit_for_route(
-        modeled_gross,
+        on_chain_profit,
         amount_in,
         slippage_bps,
         hop_count,
@@ -127,6 +133,23 @@ mod tests {
             profit_from_vault_delta(I256::unchecked_from(-58312062848374169i128)),
             Some(U256::from(58312062848374169u128)),
         );
+    }
+
+    #[test]
+    fn batch_profit_covers_min_uses_on_chain_gross_not_modeled() {
+        let on_chain = U256::from(111_906_298_841_187_462u128);
+        let modeled = U256::from(296_685_017_513_143_239u128);
+        let amount_in = U256::from(7_978_784_081_956_178u128);
+        assert!(batch_profit_covers_min(on_chain, amount_in, 476, 2));
+        let modeled_floor = on_chain_min_profit_for_route(
+            modeled,
+            amount_in,
+            476,
+            2,
+            FlashLoanSource::Direct,
+        )
+        .expect("modeled floor");
+        assert!(on_chain < modeled_floor);
     }
 
     #[test]

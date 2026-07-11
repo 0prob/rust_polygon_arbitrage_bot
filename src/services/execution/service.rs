@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
 use tokio::sync::watch;
 
@@ -43,8 +43,10 @@ use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit
 use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
+const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
 const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 2;
 const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
+const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -120,6 +122,7 @@ pub struct ExecutionService {
     last_submit: RwLock<FxHashMap<u64, Instant>>,
     last_global_submit: Mutex<Option<Instant>>,
     quarantine: RwLock<FxHashMap<u64, Instant>>,
+    route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
     global_quarantine_until: Mutex<Option<Instant>>,
     fail_counts: RwLock<FxHashMap<u64, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
@@ -242,6 +245,7 @@ impl ExecutionService {
             last_submit: RwLock::new(FxHashMap::default()),
             last_global_submit: parking_lot::Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
+            route_hash_quarantine: RwLock::new(FxHashMap::default()),
             global_quarantine_until: parking_lot::Mutex::new(None),
             fail_counts: RwLock::new(FxHashMap::default()),
             nonce: RwLock::new(None),
@@ -449,6 +453,34 @@ impl ExecutionService {
         self.any_quarantined(&[fingerprint])
     }
 
+    pub fn is_route_hash_quarantined(&self, route_hash: &FixedBytes<32>) -> bool {
+        let q = self.route_hash_quarantine.read();
+        let now = Instant::now();
+        q.get(route_hash).is_some_and(|expiry| now < *expiry)
+    }
+
+    fn route_cooldown(&self, config: &AppConfig) -> Duration {
+        if config.is_dry_run() {
+            DRY_RUN_PASS_COOLDOWN
+        } else {
+            ROUTE_COOLDOWN
+        }
+    }
+
+    pub fn is_route_on_cooldown(&self, fingerprint: u64, config: &AppConfig) -> bool {
+        let cooldown = self.route_cooldown(config);
+        let last = self.last_submit.read();
+        let now = Instant::now();
+        last.get(&fingerprint)
+            .is_some_and(|t| now.saturating_duration_since(*t) < cooldown)
+    }
+
+    fn quarantine_route_hash(&self, route_hash: FixedBytes<32>, now: Instant) {
+        self.route_hash_quarantine
+            .write()
+            .insert(route_hash, now + STRUCTURAL_DRY_RUN_QUARANTINE);
+    }
+
     /// Suppress duplicate near-miss spam when fp and net MATIC are unchanged.
     pub fn should_log_near_miss(&self, fingerprint: u64, net_matic: U256) -> bool {
         let mut last = self.last_near_miss_log.lock();
@@ -607,20 +639,34 @@ impl ExecutionService {
 
     fn reassess_assessment(
         candidate: &CandidateExecution,
-        gas_limit: u64,
+        profit_gas: u64,
         gas_price: U256,
         min_profit_matic_wei: U256,
         realized_profit: Option<U256>,
         profit_priority_alpha_bps: u64,
     ) -> Option<crate::core::types::ProfitAssessment> {
-        let gas_units = u32::try_from(gas_limit)
-            .unwrap_or(u32::MAX)
-            .max(candidate.simulated_gas);
+        // Dry-run gas is authoritative for profit reassessment; submit gas limit
+        // (and simulated_gas heuristic) must not inflate the post-dry-run floor.
+        let gas_units = u32::try_from(profit_gas).unwrap_or(u32::MAX);
         let (gross_profit, amount_in, slippage_bps, flash_source) =
-            if let Some(realized) = realized_profit {
+            if let Some(realized) = realized_profit.filter(|p| !p.is_zero()) {
                 // Dry-run return is post-repayment token profit; calldata minProfit
                 // was set from modeled net at build time — reassess without re-fees.
                 (realized, candidate.amount_in, 0, FlashLoanSource::Direct)
+            } else if realized_profit.is_some() {
+                // Some Polygon RPC eth_call paths return 0 despite a successful swap sim;
+                // fall back to build-time gross (vault queryBatchSwap for Direct routes).
+                crate::debug!(
+                    "dry-run realized_profit=0: fp={}, using candidate gross={}",
+                    candidate.route_fingerprint,
+                    candidate.gross_profit,
+                );
+                (
+                    candidate.gross_profit,
+                    candidate.amount_in,
+                    candidate.slippage_bps,
+                    candidate.flash_loan_source,
+                )
             } else {
                 (
                     candidate.gross_profit,
@@ -760,11 +806,25 @@ impl ExecutionService {
             return outcome;
         }
 
+        if self.is_route_hash_quarantined(&candidate.route_hash) {
+            crate::debug!(
+                "dispatch skip: fp={}, route_hash={} quarantined (structural dry-run failure)",
+                fp,
+                candidate.route_hash,
+            );
+            let outcome = ExecutionOutcome::SkippedQuarantined;
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
+
+        let route_cooldown = self.route_cooldown(config);
         if let Some(last) = self.last_submit.read().get(&fp)
-            && now.saturating_duration_since(*last) < ROUTE_COOLDOWN
+            && now.saturating_duration_since(*last) < route_cooldown
         {
             crate::debug!(
-                "dispatch skip: fp={}, route cooldown active (last={last:?})",
+                "dispatch skip: fp={}, route cooldown active ({route_cooldown:?}, last={last:?})",
                 fp
             );
             let outcome = ExecutionOutcome::SkippedCooldown;
@@ -793,9 +853,16 @@ impl ExecutionService {
             } else {
                 self.quarantine_route(fp, now, RouteFailureKind::DryRun);
             }
+            if matches!(
+                dry.decoded_revert,
+                Some(DecodedRevert::ExternalCallFailed { .. })
+            ) {
+                self.quarantine_route_hash(candidate.route_hash, now);
+            }
             crate::info!(
-                "dry-run failed: fp={}, reason={}{}",
+                "dry-run failed: fp={}, route_hash={}, reason={}{}",
                 fp,
+                candidate.route_hash,
                 dry.error.as_deref().unwrap_or("unknown"),
                 if sim_fidelity_miss {
                     " (sim fidelity miss — soft cooldown)"
@@ -843,10 +910,13 @@ impl ExecutionService {
             );
         } else {
             crate::info!(
-                "dry-run pass: fp={}, gas_used={}, sim_gas={}",
+                "dry-run pass: fp={}, gas_used={}, sim_gas={}, realized_profit={}",
                 fp,
                 gas_used,
-                candidate.simulated_gas
+                candidate.simulated_gas,
+                dry.realized_profit
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "none".into()),
             );
         }
         gas_oracle.record_sim_observed(candidate.simulated_gas, gas_used);
@@ -910,18 +980,22 @@ impl ExecutionService {
             gas_fallback,
             gas_oracle.sim_scale_bps(),
         );
-        let dry_pass = Self::reassess_assessment(
+        let reassess = Self::reassess_assessment(
             candidate,
-            final_gas,
+            profit_gas,
             reassess_gas_price,
             learned_floor,
             dry.realized_profit,
             config.execution.profit_priority_fee_alpha_bps,
-        )
-        .is_some_and(|a| a.should_execute);
+        );
+        let dry_pass = reassess.as_ref().is_some_and(|a| a.should_execute);
         if !dry_pass {
+            let reject = reassess
+                .as_ref()
+                .and_then(|a| a.reject_reason.as_deref())
+                .unwrap_or("unknown");
             crate::info!(
-                "dispatch skip: fp={}, unprofitable after dry-run (profit_matic={}, profit_gas={}, submit_gas={}, reassess_fee_gwei={}, submit_max_fee_gwei={})",
+                "dispatch skip: fp={}, unprofitable after dry-run (profit_matic={}, profit_gas={}, submit_gas={}, reassess_fee_gwei={}, submit_max_fee_gwei={}, reject={reject})",
                 fp,
                 candidate.expected_profit_matic_wei,
                 profit_gas,
@@ -937,6 +1011,7 @@ impl ExecutionService {
         }
 
         if config.is_dry_run() {
+            self.last_submit.write().insert(fp, now);
             let outcome = ExecutionOutcome::DryRunPassed { gas_used };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -1519,6 +1594,67 @@ mod safety_tests {
         assert_eq!(assessment.gross_profit, U256::from(900u64));
         assert_eq!(assessment.slippage_deduction, U256::ZERO);
         assert_eq!(assessment.flash_loan_fee, U256::ZERO);
+    }
+
+    #[test]
+    fn dry_run_reassess_uses_observed_gas_not_submit_limit() {
+        let candidate = CandidateExecution {
+            route_fingerprint: 9,
+            calldata: Default::default(),
+            target_address: Address::repeat_byte(9),
+            value: U256::ZERO,
+            profit_token: Address::repeat_byte(10),
+            expected_profit_matic_wei: U256::from(878_359_083_215_296_116u128),
+            gas_limit: None,
+            simulated_gas: 795_000,
+            route_hash: Default::default(),
+            gross_profit: U256::from(1_128_473_000_000_000_000u128),
+            amount_in: U256::from(7_978_784_081_956_178u128),
+            token_decimals: 18,
+            token_to_matic_rate: U256::from(1_000_000_000_000_000_000u128),
+            slippage_bps: 50,
+            flash_loan_source: FlashLoanSource::Direct,
+            min_profit_matic_wei: U256::from(10_000_000_000_000_000u128),
+            min_profit_roi_bps: 0,
+            hop_count: 2,
+            safety_multiplier_bps: 10_000,
+            state_generation: 1,
+            state_block: 1,
+            state_hash: None,
+        };
+        let gas_price = U256::from(314_608_528_420u64);
+        let realized = U256::from(300_000_000_000_000_000u128);
+        let dry_run_gas = 186_903u64;
+        let submit_limit = 874_501u64;
+
+        let with_observed = ExecutionService::reassess_assessment(
+            &candidate,
+            dry_run_gas,
+            gas_price,
+            candidate.min_profit_matic_wei,
+            Some(realized),
+            1_000,
+        )
+        .expect("dry-run reassess");
+        let with_submit_limit = ExecutionService::reassess_assessment(
+            &candidate,
+            submit_limit,
+            gas_price,
+            candidate.min_profit_matic_wei,
+            Some(realized),
+            1_000,
+        )
+        .expect("submit-limit reassess");
+
+        assert!(
+            with_observed.should_execute,
+            "observed dry-run gas should keep marginal routes executable: {:?}",
+            with_observed.reject_reason
+        );
+        assert!(
+            !with_submit_limit.should_execute,
+            "inflated submit gas must not reject routes that dry-run validated"
+        );
     }
 
     #[test]

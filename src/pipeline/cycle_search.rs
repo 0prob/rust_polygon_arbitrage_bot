@@ -41,6 +41,7 @@ pub fn find_cycles_for_mode(
     mode: CycleFinderMode,
     arena: &StateArena,
     graph: &RoutingGraph,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
@@ -54,12 +55,13 @@ pub fn find_cycles_for_mode(
             return find_cycles_hybrid_multi_pass(
                 arena,
                 graph,
+                pool_metas,
                 passes,
                 atomic_prefilter,
                 probe_ctx,
             );
         }
-        CycleFinderMode::Dfs => find_cycles_multi_pass(graph, passes),
+        CycleFinderMode::Dfs => find_cycles_multi_pass(graph, arena, pool_metas, passes),
         // Johnson reweighting assumes the absence of negative cycles, but this
         // router deliberately searches for them. Fall back to the weighted
         // Bellman-Ford path instead of applying an invalid transform.
@@ -76,6 +78,7 @@ pub fn find_cycles_for_mode(
 pub fn find_cycles_hybrid_multi_pass(
     arena: &StateArena,
     graph: &RoutingGraph,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
@@ -107,7 +110,7 @@ pub fn find_cycles_hybrid_multi_pass(
     let base_adj = build_weighted_adjacency(graph);
 
     let (mut dfs_cycles, mut bf_cycles) = join(
-        || find_cycles_multi_pass(graph, &dfs_budget),
+        || find_cycles_multi_pass(graph, arena, pool_metas, &dfs_budget),
         || find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &bf_budget),
     );
 

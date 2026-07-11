@@ -23,7 +23,8 @@ pub mod profit_logs {
 }
 pub mod rpc_errors {
     pub use super::support::{
-        SubmitAction, classify_submit_error, extract_tx_hash_from_error, is_transient_receipt_error,
+        SubmitAction, classify_submit_error, extract_tx_hash_from_error, is_rpc_rate_limited,
+        is_transient_receipt_error,
     };
 }
 pub mod gas {

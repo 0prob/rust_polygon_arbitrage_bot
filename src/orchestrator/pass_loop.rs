@@ -228,8 +228,9 @@ pub async fn run_pass_loop(
     if let Ok(provider) = ctx.rpc.connect_state() {
         ctx.gas_oracle
             .clone()
-            .start_background(provider.clone(), shutdown.clone());
-        Arc::clone(&ctx.execution.flash_liquidity).start_background(provider, shutdown.clone());
+            .start_background(provider, shutdown.clone());
+        Arc::clone(&ctx.execution.flash_liquidity)
+            .start_background(Arc::clone(&ctx.rpc), shutdown.clone());
     }
 
     #[cfg(feature = "tui")]

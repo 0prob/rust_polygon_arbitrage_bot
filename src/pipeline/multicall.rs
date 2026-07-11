@@ -34,10 +34,17 @@ async fn retry_sleep(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(250u64 << attempt)).await;
 }
 
+fn is_rate_limited_rpc_error(e: &anyhow::Error) -> bool {
+    crate::services::execution::rpc_errors::is_rpc_rate_limited(e)
+}
+
 fn is_retryable_rpc_error(e: &anyhow::Error) -> bool {
+    if is_rate_limited_rpc_error(e) {
+        return false;
+    }
     let msg = e.to_string();
     // Fast path: case-sensitive patterns (numbers, fixed codes) skip allocation.
-    if msg.contains("429") || msg.contains("error code 15") {
+    if msg.contains("error code 15") {
         return true;
     }
     // Case-insensitive patterns — scan bytes without allocating a lowered copy.
@@ -125,6 +132,9 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
             }
             Err(e) => {
                 let e: anyhow::Error = e.into();
+                if is_rate_limited_rpc_error(&e) {
+                    return Err(e);
+                }
                 if is_retryable_rpc_error(&e) && attempt < 4 {
                     retry_sleep(attempt).await;
                     attempt += 1;
@@ -228,12 +238,16 @@ mod tests {
     fn retries_transient_rpc_responses_only() {
         for message in [
             "error code -32000: header not found",
-            "429 Too Many Requests",
-            "provider usage limit exceeded",
-            "error code 15: Too many request, try again later",
             "error code 26: Unknown block",
         ] {
             assert!(is_retryable_rpc_error(&anyhow::anyhow!(message)));
+        }
+        for message in [
+            "429 Too Many Requests",
+            "provider usage limit exceeded",
+            "error code 15: Too many request, try again later",
+        ] {
+            assert!(!is_retryable_rpc_error(&anyhow::anyhow!(message)));
         }
         assert!(!is_retryable_rpc_error(&anyhow::anyhow!(
             "execution reverted"

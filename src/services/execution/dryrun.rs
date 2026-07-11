@@ -24,7 +24,17 @@ pub struct DryRunResult {
 }
 
 fn decode_realized_profit(output: &[u8]) -> Option<U256> {
-    (output.len() == 32).then(|| U256::from_be_slice(output))
+    if output.is_empty() {
+        return None;
+    }
+    // Standard ABI uint256 return; some RPCs pad to 32 bytes only.
+    if output.len() == 32 {
+        return Some(U256::from_be_slice(output));
+    }
+    if output.len() > 32 {
+        return Some(U256::from_be_slice(&output[output.len() - 32..]));
+    }
+    None
 }
 
 fn build_tx(candidate: &CandidateExecution, from: Address) -> TransactionRequest {
@@ -294,10 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn realized_profit_requires_one_abi_word() {
+    fn realized_profit_accepts_standard_and_padded_abi_word() {
         let encoded = U256::from(42u8).to_be_bytes::<32>();
         assert_eq!(decode_realized_profit(&encoded), Some(U256::from(42u8)));
         assert_eq!(decode_realized_profit(&[]), None);
-        assert_eq!(decode_realized_profit(&[0u8; 64]), None);
+        let mut padded = [0u8; 64];
+        padded[63] = 42;
+        assert_eq!(decode_realized_profit(&padded), Some(U256::from(42u8)));
+        assert_eq!(decode_realized_profit(&[0u8; 64]), Some(U256::ZERO));
     }
 }

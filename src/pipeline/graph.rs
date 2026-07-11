@@ -1,13 +1,28 @@
+use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
-use crate::pipeline::types::{GraphEdge, PoolMeta, RoutingGraph};
+use crate::pipeline::types::{
+    GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub,
+};
 use alloy::primitives::U256;
+use rayon::prelude::*;
+use smallvec::SmallVec;
 
 /// Max parallel edges per `(token_in, token_out, protocol)` after rescoring.
 const MAX_PARALLEL_EDGES_PER_PAIR: usize = 2;
+
+/// Pending token-in context when traversing a virtual pool hub node.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingHubSwap {
+    pub pool_index: PoolIndex,
+    pub token_in: TokenIndex,
+    pub token_in_idx: u8,
+    pub protocol: ProtocolType,
+    pub fee_bps: u32,
+}
 
 #[inline]
 fn pair_zero_for_one(token_in_idx: u8) -> bool {
@@ -17,6 +32,11 @@ fn pair_zero_for_one(token_in_idx: u8) -> bool {
 #[inline]
 fn multi_zero_for_one(token_in_idx: u8, token_out_idx: u8) -> bool {
     token_in_idx < token_out_idx
+}
+
+#[inline]
+fn uses_hub_spoke(meta: &PoolMeta) -> bool {
+    meta.protocol == ProtocolType::UniswapV4 || meta.tokens.len() > 2
 }
 
 /// Build directed swap edges for a two-token pool (V2/V3/DODO).
@@ -81,100 +101,184 @@ pub fn edges_for_pair(
     out
 }
 
-/// Full multi-token edge expansion (Balancer/Curve/Woofi); skips `bpt_index`.
-/// When `state` is set, only emits hops that pass [`PoolState::hop_pair_routable`].
-#[must_use]
-pub fn edges_for_multi_token(
-    pool_index: PoolIndex,
-    protocol: ProtocolType,
-    tokens: &[TokenIndex],
-    fee_bps: u32,
-    bpt_index: Option<usize>,
-    state: Option<&PoolState>,
-) -> Vec<Edge> {
-    let n = tokens.len();
-    let mut out = Vec::with_capacity(n.saturating_mul(4).max(2));
-    for (i, &tin) in tokens.iter().enumerate() {
-        if bpt_index == Some(i) {
+pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallVec<[u8; 8]> {
+    let mut out = SmallVec::new();
+    for i in 0..meta.tokens.len() {
+        if meta.bpt_index == Some(i) {
             continue;
         }
-        for (j, &tout) in tokens.iter().enumerate() {
-            if i == j || bpt_index == Some(j) {
-                continue;
-            }
-            if let Some(state) = state
-                && !state.hop_pair_routable(i, j)
-            {
-                continue;
-            }
-            out.push(Edge {
-                pool_index,
-                token_in: tin,
-                token_out: tout,
-                token_in_idx: i as u8,
-                token_out_idx: j as u8,
-                protocol,
-                fee_bps,
-                zero_for_one: multi_zero_for_one(i as u8, j as u8),
-            });
+        if state.hop_token_funded(i) {
+            out.push(i as u8);
         }
     }
     out
 }
 
-fn balancer_token_indices_to_expand(
-    state: &PoolState,
-    tokens: &[TokenIndex],
-    bpt_index: Option<usize>,
-) -> Vec<usize> {
-    let PoolState::Balancer(balancer) = state else {
-        return vec![];
-    };
-    let mut ranked: Vec<(usize, U256)> = tokens
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| bpt_index != Some(*i))
-        .map(|(i, _)| (i, balancer.balances.get(i).copied().unwrap_or_default()))
-        .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    let max_tokens = ranked.len().min(2);
-    ranked.truncate(max_tokens);
-    ranked.sort_by_key(|(i, _)| *i);
-    ranked.into_iter().map(|(i, _)| i).collect()
-}
-
-fn edges_for_balancer_multi_token(
+fn ensure_per_pool_hub(
+    graph: &mut RoutingGraph,
     pool_index: PoolIndex,
-    tokens: &[TokenIndex],
-    fee_bps: u32,
-    bpt_index: Option<usize>,
-    state: &PoolState,
     protocol: ProtocolType,
-) -> Vec<Edge> {
-    let keep = balancer_token_indices_to_expand(state, tokens, bpt_index);
-    let mut out = Vec::with_capacity(keep.len().saturating_mul(keep.len().saturating_sub(1)));
-    for &i in &keep {
-        for &j in &keep {
-            if i == j {
-                continue;
-            }
-            if !state.hop_pair_routable(i, j) {
-                continue;
-            }
-            out.push(Edge {
+    exit_legs: SmallVec<[u8; 8]>,
+) -> u32 {
+    let node = graph.token_count + graph.virtual_hubs.len() as u32;
+    graph.virtual_hubs.push(VirtualPoolHub {
+        pool_index,
+        protocol,
+        exit_legs,
+        v4_singleton: false,
+    });
+    graph.adjacency.push(Vec::new());
+    node
+}
+
+fn ensure_v4_singleton_hub(graph: &mut RoutingGraph) -> u32 {
+    if let Some(node) = graph.v4_singleton_hub {
+        return node;
+    }
+    let node = graph.token_count + graph.virtual_hubs.len() as u32;
+    graph.virtual_hubs.push(VirtualPoolHub {
+        pool_index: PoolIndex(0),
+        protocol: ProtocolType::UniswapV4,
+        exit_legs: SmallVec::new(),
+        v4_singleton: true,
+    });
+    graph.v4_singleton_hub = Some(node);
+    graph.adjacency.push(Vec::new());
+    node
+}
+
+fn push_enter_edge(
+    graph: &mut RoutingGraph,
+    from_token: TokenIndex,
+    hub_node: u32,
+    pool_index: PoolIndex,
+    token_in_idx: u8,
+    protocol: ProtocolType,
+    fee_bps: u32,
+) {
+    graph.push_edge_at(
+        from_token.0,
+        GraphEdge {
+            edge: Edge {
                 pool_index,
-                token_in: tokens[i],
-                token_out: tokens[j],
-                token_in_idx: i as u8,
-                token_out_idx: j as u8,
+                token_in: from_token,
+                token_out: from_token,
+                token_in_idx,
+                token_out_idx: token_in_idx,
                 protocol,
                 fee_bps,
-                zero_for_one: multi_zero_for_one(i as u8, j as u8),
-            });
+                zero_for_one: pair_zero_for_one(token_in_idx),
+            },
+            phase: GraphHopPhase::EnterPool,
+            target_node: hub_node,
+            log_weight: 0.0,
+            ratio: ONE,
+        },
+    );
+}
+
+fn push_exit_edge(
+    graph: &mut RoutingGraph,
+    hub_node: u32,
+    pool_index: PoolIndex,
+    to_token: TokenIndex,
+    token_out_idx: u8,
+    protocol: ProtocolType,
+    fee_bps: u32,
+) {
+    graph.push_edge_at(
+        hub_node,
+        GraphEdge {
+            edge: Edge {
+                pool_index,
+                token_in: to_token,
+                token_out: to_token,
+                token_in_idx: token_out_idx,
+                token_out_idx,
+                protocol,
+                fee_bps,
+                zero_for_one: pair_zero_for_one(token_out_idx),
+            },
+            phase: GraphHopPhase::ExitPool,
+            target_node: to_token.0,
+            log_weight: 0.0,
+            ratio: ONE,
+        },
+    );
+}
+
+fn attach_hub_spoke_pool(graph: &mut RoutingGraph, meta: &PoolMeta, state: &PoolState) {
+    let funded = funded_token_indices(state, meta);
+    if funded.len() < 2 {
+        return;
+    }
+
+    let hub_node = if meta.protocol == ProtocolType::UniswapV4 {
+        ensure_v4_singleton_hub(graph)
+    } else {
+        ensure_per_pool_hub(graph, meta.pool_index, meta.protocol, funded.clone())
+    };
+
+    for &leg in &funded {
+        let token = meta.tokens[leg as usize];
+        push_enter_edge(
+            graph,
+            token,
+            hub_node,
+            meta.pool_index,
+            leg,
+            meta.protocol,
+            meta.fee_bps,
+        );
+    }
+
+    if meta.protocol != ProtocolType::UniswapV4 {
+        for &leg in &funded {
+            let token = meta.tokens[leg as usize];
+            push_exit_edge(
+                graph,
+                hub_node,
+                meta.pool_index,
+                token,
+                leg,
+                meta.protocol,
+                meta.fee_bps,
+            );
         }
     }
-    out
+}
+
+/// Resolve a hub enter+exit pair into a concrete swap edge with live weight.
+#[must_use]
+pub fn resolve_lazy_swap_edge(
+    arena: &StateArena,
+    pending: PendingHubSwap,
+    token_out: TokenIndex,
+    token_out_idx: u8,
+) -> Option<(Edge, f64, U256)> {
+    let state = arena.pool_state(pending.pool_index)?;
+    if !state.hop_pair_routable(pending.token_in_idx as usize, token_out_idx as usize) {
+        return None;
+    }
+    let edge = Edge {
+        pool_index: pending.pool_index,
+        token_in: pending.token_in,
+        token_out,
+        token_in_idx: pending.token_in_idx,
+        token_out_idx,
+        protocol: pending.protocol,
+        fee_bps: pending.fee_bps,
+        zero_for_one: multi_zero_for_one(pending.token_in_idx, token_out_idx),
+    };
+    let ratio = compute_edge_ratio(arena, &edge);
+    if ratio.is_zero() {
+        return None;
+    }
+    let mut log_weight = edge_log_weight_from_ratio(ratio);
+    if !log_weight.is_finite() {
+        log_weight = compute_edge_log_weight(edge.fee_bps);
+    }
+    Some((edge, log_weight, ratio))
 }
 
 /// Pools that would receive at least one directed edge on the next graph build.
@@ -196,28 +300,16 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
     };
     match meta.tokens.len() {
         0 | 1 => false,
-        2 => state.hop_pair_routable(0, 1) || state.hop_pair_routable(1, 0),
-        n => {
-            if meta.protocol == ProtocolType::BalancerV2 {
-                let keep = balancer_token_indices_to_expand(state, &meta.tokens, meta.bpt_index);
-                for &i in &keep {
-                    for &j in &keep {
-                        if i != j && state.hop_pair_routable(i, j) {
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            }
-            for i in 0..n {
-                if meta.bpt_index == Some(i) {
-                    continue;
-                }
-                for j in 0..n {
-                    if i == j || meta.bpt_index == Some(j) {
-                        continue;
-                    }
-                    if state.hop_pair_routable(i, j) {
+        2 if !uses_hub_spoke(meta) => {
+            state.hop_pair_routable(0, 1) || state.hop_pair_routable(1, 0)
+        }
+        _ => {
+            let funded = funded_token_indices(state, meta);
+            for (pos, &i) in funded.iter().enumerate() {
+                for &j in &funded[pos + 1..] {
+                    if state.hop_pair_routable(i as usize, j as usize)
+                        || state.hop_pair_routable(j as usize, i as usize)
+                    {
                         return true;
                     }
                 }
@@ -228,12 +320,22 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
 }
 
 fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
-    if adj.len() <= max_per_pair || max_per_pair == 0 {
+    if max_per_pair == 0 {
         return;
     }
     use std::cmp::Reverse;
 
-    adj.sort_by(|a, b| {
+    let drained: Vec<GraphEdge> = adj.drain(..).collect();
+    let (mut direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
+        .into_iter()
+        .partition(|ge| ge.phase == GraphHopPhase::Direct);
+    if direct.len() <= max_per_pair {
+        direct.append(&mut hub_legs);
+        *adj = direct;
+        return;
+    }
+
+    direct.sort_by(|a, b| {
         (
             a.edge.token_out.0,
             a.edge.protocol as u8,
@@ -250,38 +352,33 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
     let mut out_len = 0usize;
     let mut group_kept = 0usize;
     let mut cur_key = (u32::MAX, u8::MAX);
-    for i in 0..adj.len() {
-        let key = (adj[i].edge.token_out.0, adj[i].edge.protocol as u8);
+    for i in 0..direct.len() {
+        let key = (direct[i].edge.token_out.0, direct[i].edge.protocol as u8);
         if key != cur_key {
             cur_key = key;
             group_kept = 0;
         }
         if group_kept < max_per_pair {
             if out_len != i {
-                adj.swap(out_len, i);
+                direct.swap(out_len, i);
             }
             out_len += 1;
             group_kept += 1;
         }
     }
-    adj.truncate(out_len);
+    direct.truncate(out_len);
+    direct.append(&mut hub_legs);
+    *adj = direct;
 }
 
 fn thin_parallel_edges_in_graph(graph: &mut RoutingGraph) {
-    for adj in &mut graph.adjacency {
+    let token_slots = graph.token_count as usize;
+    for adj in graph.adjacency.iter_mut().take(token_slots) {
         thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR);
         sort_adjacency_edges(adj);
     }
-}
-
-#[inline]
-fn push_graph_edge(graph: &mut RoutingGraph, edge: Edge) {
-    if let Some(slot) = graph.adjacency.get_mut(edge.token_in.0 as usize) {
-        slot.push(GraphEdge {
-            edge,
-            log_weight: 0.0,
-            ratio: U256::ZERO,
-        });
+    for adj in graph.adjacency.iter_mut().skip(token_slots) {
+        sort_adjacency_edges(adj);
     }
 }
 
@@ -296,7 +393,9 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
             continue;
         };
 
-        if meta.tokens.len() == 2 {
+        if uses_hub_spoke(meta) {
+            attach_hub_spoke_pool(&mut graph, meta, state);
+        } else if meta.tokens.len() == 2 {
             for edge in edges_for_pair(
                 meta.pool_index,
                 meta.protocol,
@@ -305,29 +404,16 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
                 meta.fee_bps,
                 Some(state),
             ) {
-                push_graph_edge(&mut graph, edge);
-            }
-        } else if meta.tokens.len() > 2 {
-            let edges = match state {
-                PoolState::Balancer(_) => edges_for_balancer_multi_token(
-                    meta.pool_index,
-                    &meta.tokens,
-                    meta.fee_bps,
-                    meta.bpt_index,
-                    state,
-                    meta.protocol,
-                ),
-                _ => edges_for_multi_token(
-                    meta.pool_index,
-                    meta.protocol,
-                    &meta.tokens,
-                    meta.fee_bps,
-                    meta.bpt_index,
-                    Some(state),
-                ),
-            };
-            for edge in edges {
-                push_graph_edge(&mut graph, edge);
+                graph.push_edge_at(
+                    edge.token_in.0,
+                    GraphEdge {
+                        edge,
+                        phase: GraphHopPhase::Direct,
+                        target_node: edge.token_out.0,
+                        log_weight: 0.0,
+                        ratio: U256::ZERO,
+                    },
+                );
             }
         }
     }
@@ -400,29 +486,25 @@ pub fn rescore_pools_in_place(
 }
 
 fn rescore_adjacency(arena: &StateArena, adjacency: &mut [Vec<GraphEdge>]) {
-    for adj in adjacency.iter_mut() {
+    adjacency.par_iter_mut().for_each(|adj| {
         for ge in adj.iter_mut() {
             rescore_graph_edge(arena, ge);
         }
         sort_adjacency_edges(adj);
-    }
+    });
 }
 
 fn sort_adjacency_edges(adj: &mut [GraphEdge]) {
-    // ponytail: total_cmp is branchless for finite values (log_weights are never NaN).
     adj.sort_by(|a, b| a.log_weight.total_cmp(&b.log_weight));
 }
 
 fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
-    // Single-pass: find max pool index AND populate positions simultaneously.
     let mut max_pool = 0usize;
-    // Pre-scan for empty graph early exit.
     let all_empty = graph.adjacency.iter().all(Vec::is_empty);
     if all_empty {
         graph.pool_edge_positions.clear();
         return;
     }
-    // Single pass: max pool index + per-pool edge counts.
     let mut counts: Vec<usize> = Vec::new();
     for adj in &graph.adjacency {
         for ge in adj {
@@ -493,6 +575,14 @@ fn rebuild_pool_edge_positions_for_pools(
 
 #[inline]
 fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
+    match ge.phase {
+        GraphHopPhase::EnterPool | GraphHopPhase::ExitPool => {
+            ge.log_weight = 0.0;
+            ge.ratio = ONE;
+            return 1;
+        }
+        GraphHopPhase::Direct => {}
+    }
     let Some(state) = arena.pool_state(ge.edge.pool_index) else {
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
         ge.ratio = U256::ZERO;
@@ -505,10 +595,6 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
         ge.ratio = U256::ZERO;
         return 1;
     }
-    // Compute U256 ratio first (once), then derive log_weight from it.
-    // This avoids the double simulation that happened when both ensure_edge
-    // (line 378) and compute_edge_ratio (line 384) independently called
-    // simulate_hop_amount_out for complex pools (Balancer, Curve, Dodo).
     ge.ratio = compute_edge_ratio(arena, &ge.edge);
     if ge.ratio.is_zero() {
         ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
@@ -517,15 +603,6 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
     ge.log_weight = edge_log_weight_from_ratio(ge.ratio);
     if !ge.log_weight.is_finite() {
         ge.log_weight = compute_edge_log_weight(ge.edge.fee_bps);
-    }
-    // ponytail: multi-token pools (Balancer, Curve) create n*(n-1) edges vs 2 for
-    // 2-token pools, over-representing them in DFS enumeration. Apply a mild
-    // per-extra-token penalty so their edge count doesn't bias cycle discovery.
-    if let PoolState::Balancer(s) = state {
-        let n = s.balances.len();
-        if n > 2 {
-            ge.log_weight += (n as f64 - 2.0) * 0.02;
-        }
     }
     1
 }
@@ -557,37 +634,39 @@ mod tests {
     use super::*;
     use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
     use crate::core::types::{
-        BalancerPoolKind, BalancerPoolState, PoolState, V2PoolState, WoofiBaseTokenState,
-        WoofiPoolState,
+        BalancerPoolKind, BalancerPoolState, CurvePoolState, PoolState, V2PoolState,
+        WoofiBaseTokenState, WoofiPoolState,
     };
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
 
+    fn direct_ge(pool: u32, tin: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
+        GraphEdge {
+            edge: Edge {
+                pool_index: PoolIndex(pool),
+                token_in: TokenIndex(tin),
+                token_out: TokenIndex(tout),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            phase: GraphHopPhase::Direct,
+            target_node: tout,
+            log_weight: -0.01,
+            ratio: U256::from(ratio),
+        }
+    }
+
     #[test]
     fn thin_parallel_edges_keeps_top_two_by_ratio() {
-        fn ge(pool: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
-            GraphEdge {
-                edge: Edge {
-                    pool_index: PoolIndex(pool),
-                    token_in: TokenIndex(4),
-                    token_out: TokenIndex(tout),
-                    token_in_idx: 0,
-                    token_out_idx: 1,
-                    protocol,
-                    fee_bps: 30,
-                    zero_for_one: true,
-                },
-                log_weight: -0.01,
-                ratio: U256::from(ratio),
-            }
-        }
-
         let mut adj = vec![
-            ge(1, 5, ProtocolType::BalancerV2, 1_010_000_000_000_000_000),
-            ge(2, 5, ProtocolType::BalancerV2, 1_020_000_000_000_000_000),
-            ge(3, 5, ProtocolType::BalancerV2, 1_015_000_000_000_000_000),
-            ge(4, 5, ProtocolType::BalancerV2, 1_005_000_000_000_000_000),
-            ge(10, 6, ProtocolType::UniswapV3, 1_010_000_000_000_000_000),
+            direct_ge(1, 4, 5, ProtocolType::BalancerV2, 1_010_000_000_000_000_000),
+            direct_ge(2, 4, 5, ProtocolType::BalancerV2, 1_020_000_000_000_000_000),
+            direct_ge(3, 4, 5, ProtocolType::BalancerV2, 1_015_000_000_000_000_000),
+            direct_ge(4, 4, 5, ProtocolType::BalancerV2, 1_005_000_000_000_000_000),
+            direct_ge(10, 4, 6, ProtocolType::UniswapV3, 1_010_000_000_000_000_000),
         ];
         thin_parallel_edges_in_place(&mut adj, 2);
         assert_eq!(adj.len(), 3);
@@ -612,7 +691,63 @@ mod tests {
     }
 
     #[test]
-    fn multi_token_edges_skip_underfunded_pairs() {
+    fn hub_spoke_balancer_uses_linear_edge_count() {
+        let mut arena = StateArena::default();
+        let tokens: Vec<TokenIndex> = (0u8..8)
+            .map(|i| arena.register_token(Address::from([i; 20])))
+            .collect();
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let pool = arena.register_pool(
+            Address::from([9u8; 20]),
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: None,
+                tokens: (0u8..8).map(|b| Address::from([b; 20])).collect(),
+                balances: vec![funded; 8],
+                weights: vec![funded; 8],
+                scaling_factors: vec![funded; 8],
+                amp: funded,
+                amp_precision: U256::from(1u64),
+                fee: U256::ZERO,
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::BalancerV2,
+            tokens,
+            fee_bps: 10,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let graph = build_graph(&arena, std::slice::from_ref(&meta));
+        assert_eq!(graph.virtual_hubs.len(), 1);
+        let hub = graph.token_count;
+        let enter = graph
+            .adjacency
+            .iter()
+            .take(graph.token_count as usize)
+            .map(|adj| adj.iter().filter(|ge| ge.phase == GraphHopPhase::EnterPool).count())
+            .sum::<usize>();
+        let exit = graph.adjacency[hub as usize]
+            .iter()
+            .filter(|ge| ge.phase == GraphHopPhase::ExitPool)
+            .count();
+        assert_eq!(enter, 8);
+        assert_eq!(exit, 8);
+        assert_eq!(enter + exit, 16);
+    }
+
+    #[test]
+    fn hub_spoke_skips_underfunded_legs() {
+        let mut arena = StateArena::default();
         let tokens = [
             TokenIndex(0),
             TokenIndex(1),
@@ -620,160 +755,56 @@ mod tests {
             TokenIndex(3),
             TokenIndex(4),
         ];
+        for (i, token) in tokens.iter().enumerate() {
+            arena.register_token(Address::from([i as u8; 20]));
+            let _ = token;
+        }
+        let a = arena.register_token(Address::from([10u8; 20]));
+        let b = arena.register_token(Address::from([11u8; 20]));
+        let c = arena.register_token(Address::from([12u8; 20]));
+        let d = arena.register_token(Address::from([13u8; 20]));
+        let e = arena.register_token(Address::from([14u8; 20]));
         let funded = MIN_HOP_TOKEN_BALANCE;
         let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
-        let state = PoolState::Balancer(BalancerPoolState {
-            pool_id: None,
-            tokens: vec![],
-            balances: vec![funded, funded, dust, dust, dust],
-            weights: vec![funded; 5],
-            scaling_factors: vec![funded; 5],
-            amp: funded,
-            amp_precision: U256::from(1u64),
-            fee: U256::ZERO,
-            pool_type: BalancerPoolKind::Weighted,
-            linear: None,
+        let pool = arena.register_pool(
+            Address::from([15u8; 20]),
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: None,
+                tokens: (0u8..5).map(|b| Address::from([b; 20])).collect(),
+                balances: vec![funded, funded, dust, dust, dust],
+                weights: vec![funded; 5],
+                scaling_factors: vec![funded; 5],
+                amp: funded,
+                amp_precision: U256::from(1u64),
+                fee: U256::ZERO,
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::BalancerV2,
+            tokens: vec![a, b, c, d, e],
+            fee_bps: 10,
             bpt_index: None,
-            is_updating: false,
-            last_change_block: 0,
-        });
-
-        let all_pairs = edges_for_multi_token(
-            PoolIndex(0),
-            ProtocolType::BalancerV2,
-            &tokens,
-            10,
-            None,
-            None,
-        );
-        assert_eq!(all_pairs.len(), 20);
-
-        let gated = edges_for_multi_token(
-            PoolIndex(0),
-            ProtocolType::BalancerV2,
-            &tokens,
-            10,
-            None,
-            Some(&state),
-        );
-        assert_eq!(gated.len(), 2);
-    }
-
-    #[test]
-    fn balancer_multi_token_edges_are_liquidity_capped() {
-        let tokens = [
-            TokenIndex(0),
-            TokenIndex(1),
-            TokenIndex(2),
-            TokenIndex(3),
-            TokenIndex(4),
-            TokenIndex(5),
-        ];
-        let state = PoolState::Balancer(BalancerPoolState {
             pool_id: None,
-            tokens: vec![
-                Address::from([0u8; 20]),
-                Address::from([1u8; 20]),
-                Address::from([2u8; 20]),
-                Address::from([3u8; 20]),
-                Address::from([4u8; 20]),
-                Address::from([5u8; 20]),
-            ],
-            balances: vec![
-                MIN_HOP_TOKEN_BALANCE,
-                MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
-                MIN_HOP_TOKEN_BALANCE + U256::from(2u64),
-                MIN_HOP_TOKEN_BALANCE + U256::from(3u64),
-                MIN_HOP_TOKEN_BALANCE - U256::from(1u64),
-                MIN_HOP_TOKEN_BALANCE - U256::from(2u64),
-            ],
-            weights: vec![U256::from(1u64); 6],
-            scaling_factors: vec![U256::from(1u64); 6],
-            amp: U256::from(1u64),
-            amp_precision: U256::from(1u64),
-            fee: U256::ZERO,
-            pool_type: BalancerPoolKind::Weighted,
-            linear: None,
-            bpt_index: None,
-            is_updating: false,
-            last_change_block: 0,
-        });
-
-        let edges = edges_for_balancer_multi_token(
-            PoolIndex(0),
-            &tokens,
-            10,
-            None,
-            &state,
-            ProtocolType::BalancerV2,
-        );
-
-        assert_eq!(edges.len(), 2);
-        assert!(
-            edges
-                .iter()
-                .all(|e| { matches!(e.token_in.0, 2 | 3) && matches!(e.token_out.0, 2 | 3) })
-        );
-    }
-
-    #[test]
-    fn woofi_multi_base_edges_skip_underfunded_bases() {
-        let tokens = [TokenIndex(0), TokenIndex(1), TokenIndex(2), TokenIndex(3)];
-        let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
-        let state = PoolState::Woofi(WoofiPoolState {
-            tokens: vec![],
-            quote_reserve: funded,
-            base_states: vec![
-                WoofiBaseTokenState {
-                    price: U256::from(1u8),
-                    spread: U256::ZERO,
-                    coeff: U256::ZERO,
-                    reserve: funded,
-                    base_dec: U256::from(1u8),
-                    quote_dec: U256::from(1u8),
-                    price_dec: U256::from(1u8),
-                    fee_rate: U256::ZERO,
-                    max_gamma: U256::ZERO,
-                    max_notional_swap: U256::ZERO,
-                },
-                WoofiBaseTokenState {
-                    price: U256::from(1u8),
-                    spread: U256::ZERO,
-                    coeff: U256::ZERO,
-                    reserve: dust,
-                    base_dec: U256::from(1u8),
-                    quote_dec: U256::from(1u8),
-                    price_dec: U256::from(1u8),
-                    fee_rate: U256::ZERO,
-                    max_gamma: U256::ZERO,
-                    max_notional_swap: U256::ZERO,
-                },
-                WoofiBaseTokenState {
-                    price: U256::from(1u8),
-                    spread: U256::ZERO,
-                    coeff: U256::ZERO,
-                    reserve: dust,
-                    base_dec: U256::from(1u8),
-                    quote_dec: U256::from(1u8),
-                    price_dec: U256::from(1u8),
-                    fee_rate: U256::ZERO,
-                    max_gamma: U256::ZERO,
-                    max_notional_swap: U256::ZERO,
-                },
-            ],
-            fee: U256::ZERO,
-        });
-
-        let gated = edges_for_multi_token(
-            PoolIndex(0),
-            ProtocolType::Woofi,
-            &tokens,
-            0,
-            None,
-            Some(&state),
-        );
-        assert_eq!(gated.len(), 2);
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let graph = build_graph(&arena, std::slice::from_ref(&meta));
+        let enter = graph
+            .adjacency
+            .iter()
+            .take(graph.token_count as usize)
+            .flat_map(|adj| adj.iter())
+            .filter(|ge| ge.phase == GraphHopPhase::EnterPool)
+            .count();
+        assert_eq!(enter, 2);
     }
 
     #[test]
@@ -806,10 +837,8 @@ mod tests {
     #[test]
     fn graph_keeps_long_tail_edge_connected_to_priced_token() {
         let mut arena = StateArena::default();
-        let priced_addr = Address::from([1u8; 20]);
-        let tail_addr = Address::from([2u8; 20]);
-        let priced = arena.register_token(priced_addr);
-        let tail = arena.register_token(tail_addr);
+        let priced = arena.register_token(Address::from([1u8; 20]));
+        let tail = arena.register_token(Address::from([2u8; 20]));
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {

@@ -45,10 +45,28 @@ pub fn log_startup(config: &AppConfig) {
         config.discovery_bootstrap_batch,
         config.discovery_interval_ms,
     );
+    let pipeline = &config.pipeline;
+    crate::info!(
+        "pipeline (stream={}, hf_prefetch={}/{}ms, hf_sim={}/{}, enum_paths={})",
+        pipeline.stream_enabled,
+        pipeline.hf_prefetch_count,
+        pipeline.hf_prefetch_budget_ms,
+        pipeline.hf_sim_cap,
+        pipeline.hf_score_cap,
+        config.routing.enumeration_max_paths,
+    );
+    crate::info!(
+        "rpc (state_urls={}, timeout={}ms, batch_pace={}ms, multicall_chunk={})",
+        config.rpc.polygon_rpc_urls.len(),
+        config.rpc.request_timeout_ms,
+        config.rpc.batch_pace_ms,
+        config.max_multicall_calls,
+    );
 
     if config.state_rpc_url().is_none() {
         crate::warn!("no STATE_RPC_URL / POLYGON_RPC_URL configured — pool refresh disabled");
     }
+    config.warn_suboptimal();
 }
 
 /// Non-blocking postgres probe; does not delay runtime startup.

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -16,6 +17,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::abis::{IAaveV3Pool, IERC20Metadata};
 use crate::core::constants::{AAVE_V3_POOL, BALANCER_VAULT};
+use crate::infra::rpc::{RpcPool, rpc_host_label};
+use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::core::types::{
     EvaluatedRoute, FlashLoanSource, FoundCycle, PoolState, ProfitAssessment, ProtocolType,
     TokenIndex,
@@ -131,6 +134,8 @@ pub struct FlashLiquidityCache {
     hot_tokens: Mutex<FxHashSet<Address>>,
     /// Dry-run `ReserveInactive` pins — refresh must not resurrect Aave for these tokens.
     aave_inactive_pins: Mutex<FxHashSet<Address>>,
+    /// Prevents HF tick + background + dispatch from hammering the same multicall batch.
+    refresh_inflight: AtomicBool,
 }
 
 impl FlashLiquidityCache {
@@ -143,6 +148,7 @@ impl FlashLiquidityCache {
             aave_pool: AAVE_V3_POOL,
             hot_tokens: Mutex::new(FxHashSet::default()),
             aave_inactive_pins: Mutex::new(FxHashSet::default()),
+            refresh_inflight: AtomicBool::new(false),
         }
     }
 
@@ -155,6 +161,7 @@ impl FlashLiquidityCache {
             aave_pool,
             hot_tokens: Mutex::new(FxHashSet::default()),
             aave_inactive_pins: Mutex::new(FxHashSet::default()),
+            refresh_inflight: AtomicBool::new(false),
         }
     }
 
@@ -260,7 +267,7 @@ impl FlashLiquidityCache {
 
     pub fn start_background(
         self: Arc<Self>,
-        provider: alloy::providers::DynProvider,
+        rpc: Arc<RpcPool>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let poll = self.ttl;
@@ -279,11 +286,45 @@ impl FlashLiquidityCache {
                         if tokens.is_empty() {
                             continue;
                         }
-                        if let Err(e) = self.refresh(&provider, &tokens).await {
+                        if let Err(e) = self.refresh_with_fallback(&rpc, &tokens).await {
                             crate::debug!("background flash liquidity refresh failed: {e:#}");
                         }
                     }
                 }
+            }
+        });
+    }
+
+    /// Fire-and-forget refresh for the HF tick path — never blocks the tick on RPC IO.
+    pub fn spawn_refresh_if_stale(self: &Arc<Self>, rpc: Arc<RpcPool>, tokens: &[Address]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.track_hot_tokens(tokens);
+        if !tokens.iter().any(|token| !self.has_fresh_entry(*token)) {
+            return;
+        }
+        if self
+            .refresh_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let cache = Arc::clone(self);
+        let tokens = tokens.to_vec();
+        tokio::spawn(async move {
+            struct InflightGuard<'a>(&'a AtomicBool);
+            impl Drop for InflightGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = InflightGuard(&cache.refresh_inflight);
+            if let Err(e) = cache.refresh_with_fallback(&rpc, &tokens).await
+                && !is_rpc_rate_limited(&e)
+            {
+                crate::debug!("hf flash liquidity refresh failed: {e:#}");
             }
         });
     }
@@ -294,24 +335,83 @@ impl FlashLiquidityCache {
         tokens: &[Address],
     ) -> anyhow::Result<u64> {
         self.track_hot_tokens(tokens);
-        let current = self.inner.load_full();
-        let mut to_fetch = Vec::with_capacity(tokens.len());
-        let now = Instant::now();
-        for token in tokens {
-            let stale = current
-                .entries
-                .get(token)
-                .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= self.ttl);
-            if stale {
-                to_fetch.push(*token);
+        let to_fetch = self.stale_tokens(tokens);
+        if to_fetch.is_empty() {
+            return Ok(self.generation());
+        }
+        self.fetch_and_publish(provider, &to_fetch).await?;
+        Ok(self.generation())
+    }
+
+    /// Walk state RPC candidates on failure/rate-limit instead of pinning to one endpoint.
+    pub async fn refresh_with_fallback(
+        &self,
+        rpc: &RpcPool,
+        tokens: &[Address],
+    ) -> anyhow::Result<u64> {
+        self.track_hot_tokens(tokens);
+        let to_fetch = self.stale_tokens(tokens);
+        if to_fetch.is_empty() {
+            return Ok(self.generation());
+        }
+        let candidates = rpc.state_url_candidates();
+        anyhow::ensure!(!candidates.is_empty(), "no state RPC configured");
+        let mut last_err: Option<anyhow::Error> = None;
+        for (idx, url) in candidates.iter().enumerate() {
+            let provider = match rpc.connect_state_at(url) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match self.fetch_and_publish(&provider, &to_fetch).await {
+                Ok(()) => return Ok(self.generation()),
+                Err(e) => {
+                    if is_rpc_rate_limited(&e) {
+                        rpc.deprioritize_state_url(url);
+                        crate::debug!(
+                            "flash liquidity refresh rate-limited on {}",
+                            rpc_host_label(url)
+                        );
+                    } else if idx + 1 < candidates.len() {
+                        rpc.deprioritize_state_url(url);
+                    }
+                    last_err = Some(e);
+                }
             }
         }
-        if to_fetch.is_empty() {
-            return Ok(current.generation);
-        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("flash liquidity refresh failed on all state RPCs")
+        }))
+    }
 
+    fn stale_tokens(&self, tokens: &[Address]) -> Vec<Address> {
+        let current = self.inner.load_full();
+        let now = Instant::now();
+        tokens
+            .iter()
+            .copied()
+            .filter(|token| {
+                current
+                    .entries
+                    .get(token)
+                    .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= self.ttl)
+            })
+            .collect()
+    }
+
+    async fn fetch_and_publish<P: Provider<Ethereum> + Clone + Send + 'static>(
+        &self,
+        provider: &P,
+        to_fetch: &[Address],
+    ) -> anyhow::Result<()> {
+        if to_fetch.is_empty() {
+            return Ok(());
+        }
+        let now = Instant::now();
         let mut items = Vec::with_capacity(to_fetch.len() * 2);
-        for token in &to_fetch {
+        for token in to_fetch {
             items.push(MulticallItem {
                 target: *token,
                 data: encode_call(&IERC20Metadata::balanceOfCall {
@@ -386,7 +486,7 @@ impl FlashLiquidityCache {
             );
         }
         self.publish_updates(updates);
-        Ok(self.generation())
+        Ok(())
     }
 }
 

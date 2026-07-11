@@ -11,7 +11,12 @@ use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
-use crate::pipeline::types::{CycleSearchPass, GraphEdge, RoutingGraph, compare_cycle_score};
+use crate::pipeline::arena::StateArena;
+use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
+use crate::pipeline::types::{
+    CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_score,
+    pool_meta_at,
+};
 
 pub use crate::pipeline::spot_price::hop_penalty;
 
@@ -28,7 +33,10 @@ pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
 #[inline]
 #[must_use]
 pub fn is_live_graph_edge(ge: &GraphEdge) -> bool {
-    !ge.ratio.is_zero()
+    match ge.phase {
+        GraphHopPhase::EnterPool | GraphHopPhase::ExitPool => true,
+        GraphHopPhase::Direct => !ge.ratio.is_zero(),
+    }
 }
 
 /// Structural cycle coverage for the current live routing graph.
@@ -45,15 +53,43 @@ pub struct CycleCapableCoverage {
 
 #[must_use]
 pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
-    let token_count = graph.adjacency.len();
+    let token_count = graph.token_count as usize;
     let pool_count = graph.pool_edge_positions.len();
     let node_count = token_count.saturating_add(pool_count);
     let mut incidences = rustc_hash::FxHashSet::default();
-    for edges in &graph.adjacency {
+    for edges in graph.adjacency.iter().take(token_count) {
         for ge in edges {
-            if is_live_graph_edge(ge) {
-                incidences.insert((ge.edge.pool_index.0 as usize, ge.edge.token_in.0 as usize));
-                incidences.insert((ge.edge.pool_index.0 as usize, ge.edge.token_out.0 as usize));
+            if !is_live_graph_edge(ge) {
+                continue;
+            }
+            match ge.phase {
+                GraphHopPhase::Direct => {
+                    incidences.insert((
+                        ge.edge.pool_index.0 as usize,
+                        ge.edge.token_in.0 as usize,
+                    ));
+                    incidences.insert((
+                        ge.edge.pool_index.0 as usize,
+                        ge.edge.token_out.0 as usize,
+                    ));
+                }
+                GraphHopPhase::EnterPool => {
+                    incidences.insert((
+                        ge.edge.pool_index.0 as usize,
+                        ge.edge.token_in.0 as usize,
+                    ));
+                }
+                GraphHopPhase::ExitPool => {}
+            }
+        }
+    }
+    for edges in graph.adjacency.iter().skip(token_count) {
+        for ge in edges {
+            if ge.phase == GraphHopPhase::ExitPool && is_live_graph_edge(ge) {
+                incidences.insert((
+                    ge.edge.pool_index.0 as usize,
+                    ge.edge.token_out.0 as usize,
+                ));
             }
         }
     }
@@ -216,8 +252,9 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         .as_ref()
         .map(std::sync::Arc::clone)
         .unwrap_or_else(|| std::sync::Arc::new(cycle_capable_coverage(graph)));
-    let token_count = graph.adjacency.len();
-    let mut compact = Vec::with_capacity(token_count);
+    let token_count = graph.token_count as usize;
+    let node_count = graph.adjacency.len();
+    let mut compact = Vec::with_capacity(node_count);
     // min_outgoing lazily populated: only tokens with live edges get entries.
     // Use a sparse representation: None for dead/unreachable tokens.
     let mut min_outgoing: Vec<Option<f64>> = vec![None; token_count];
@@ -227,8 +264,9 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     // ponytail: single pass for live edges + diversity scoring (was double iteration).
     let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
 
-    for (index, edges) in graph.adjacency.iter().enumerate() {
-        if !coverage.token_mask.get(index).copied().unwrap_or(false) {
+    for index in 0..node_count {
+        let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
+        if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
             compact.push(Vec::new());
             continue;
         }
@@ -239,31 +277,35 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
             if !is_live_graph_edge(ge) {
                 continue;
             }
-            let bit = 1u16 << (ge.edge.protocol as u8);
-            if proto_bits & bit == 0 {
-                protos += 1;
-                proto_bits |= bit;
+            if index < token_count {
+                let bit = 1u16 << (ge.edge.protocol as u8);
+                if proto_bits & bit == 0 {
+                    protos += 1;
+                    proto_bits |= bit;
+                }
+                if ge.phase == GraphHopPhase::Direct {
+                    let w = ge.log_weight;
+                    match min_outgoing[index] {
+                        Some(ref mut best) if w < *best => *best = w,
+                        None => min_outgoing[index] = Some(w),
+                        _ => {}
+                    }
+                    if w < global_min {
+                        global_min = w;
+                    }
+                    if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio[index] {
+                        max_outgoing_ratio[index] = ge.ratio;
+                    }
+                    if ge.ratio > global_max_ratio {
+                        global_max_ratio = ge.ratio;
+                    }
+                }
             }
             live.push(*ge);
-            let w = ge.log_weight;
-            match min_outgoing[index] {
-                Some(ref mut best) if w < *best => *best = w,
-                None => min_outgoing[index] = Some(w),
-                _ => {}
-            }
-            if w < global_min {
-                global_min = w;
-            }
-            if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio[index] {
-                max_outgoing_ratio[index] = ge.ratio;
-            }
-            if ge.ratio > global_max_ratio {
-                global_max_ratio = ge.ratio;
-            }
         }
         let len = live.len();
         compact.push(live);
-        if len > 0 {
+        if index < token_count && len > 0 {
             scored_div.push((TokenIndex(index as u32), protos as usize, len));
         }
     }
@@ -396,7 +438,33 @@ fn can_still_find_profitable_cycle(
     )
 }
 
+fn hub_exit_legs(
+    graph: &RoutingGraph,
+    hub_node: u32,
+    pending: PendingHubSwap,
+    pool_metas: &[PoolMeta],
+    arena: &StateArena,
+) -> smallvec::SmallVec<[u8; 8]> {
+    if graph.v4_singleton_hub == Some(hub_node) {
+        let Some(meta) = pool_meta_at(pool_metas, pending.pool_index) else {
+            return smallvec::SmallVec::new();
+        };
+        let Some(state) = arena.pool_state(pending.pool_index) else {
+            return smallvec::SmallVec::new();
+        };
+        return crate::pipeline::graph::funded_token_indices(state, meta);
+    }
+    graph
+        .virtual_hub_index(hub_node)
+        .and_then(|idx| graph.virtual_hubs.get(idx))
+        .map(|hub| hub.exit_legs.clone())
+        .unwrap_or_default()
+}
+
 fn collect_cycles_dfs_single_start(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    pool_metas: &[PoolMeta],
     prep: &ActiveGraph,
     start: TokenIndex,
     hop_limit: u32,
@@ -404,11 +472,9 @@ fn collect_cycles_dfs_single_start(
     budget: &SharedDeadlineGuard,
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
-    // Track visited pools via FxHashSet instead of vec![0u8; pool_slot_count].
-    // At most HOP_CAP=8 pools are in-use simultaneously — a hash set with ≤8
-    // entries is cheaper to insert/check/clear than zeroing a Vec of thousands.
+    let token_count = graph.token_count as usize;
     let mut used_pools: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
-    let mut used_tokens = vec![false; prep.adjacency.len()];
+    let mut used_tokens = vec![false; token_count];
     let mut path = Vec::with_capacity(hop_cap as usize);
     let mut cycles = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
@@ -423,9 +489,13 @@ fn collect_cycles_dfs_single_start(
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
+        graph: &RoutingGraph,
+        arena: &StateArena,
+        pool_metas: &[PoolMeta],
         prep: &ActiveGraph,
         start: TokenIndex,
-        curr: TokenIndex,
+        curr_node: u32,
+        pending: Option<PendingHubSwap>,
         path: &mut Vec<Edge>,
         used_pools: &mut rustc_hash::FxHashSet<u32>,
         used_tokens: &mut [bool],
@@ -444,6 +514,84 @@ fn collect_cycles_dfs_single_start(
             return;
         }
 
+        if graph.is_virtual_node(curr_node) {
+            let Some(pending) = pending else {
+                return;
+            };
+            let pool_id = pending.pool_index.0;
+            if !pool_mark(used_pools, pool_id) {
+                return;
+            }
+            let exit_legs = hub_exit_legs(graph, curr_node, pending, pool_metas, arena);
+            for out_leg in exit_legs {
+                if budget.tick() || cycles.len() >= max_cycles {
+                    break;
+                }
+                let Some(meta) = pool_meta_at(pool_metas, pending.pool_index) else {
+                    continue;
+                };
+                let out_idx = out_leg as usize;
+                if out_idx >= meta.tokens.len() {
+                    continue;
+                }
+                let token_out = meta.tokens[out_idx];
+                let Some((edge, edge_log_w, ratio)) = resolve_lazy_swap_edge(
+                    arena,
+                    pending,
+                    token_out,
+                    out_leg,
+                ) else {
+                    continue;
+                };
+                if ratio < ONE {
+                    continue;
+                }
+                let next_log_w = log_w + edge_log_w;
+                let next_ratio = mul_ratio_saturating(product_ratio, ratio);
+                if !can_still_find_profitable_cycle(
+                    next_log_w,
+                    next_ratio,
+                    hops + 1,
+                    hop_cap,
+                    token_out,
+                    prep,
+                ) {
+                    continue;
+                }
+                let hop_calls = estimate_hop_calls(edge.protocol);
+                if route_calls + hop_calls > MAX_ROUTE_CALLS {
+                    continue;
+                }
+                path.push(edge);
+                dfs(
+                    graph,
+                    arena,
+                    pool_metas,
+                    prep,
+                    start,
+                    token_out.0,
+                    None,
+                    path,
+                    used_pools,
+                    used_tokens,
+                    hops + 1,
+                    next_log_w,
+                    next_ratio,
+                    cum_fee + clamp_fee_bps(edge.fee_bps),
+                    route_calls + hop_calls,
+                    hop_cap,
+                    max_cycles,
+                    budget,
+                    cycles,
+                    seen,
+                );
+                path.pop();
+            }
+            pool_unmark(used_pools, pool_id);
+            return;
+        }
+
+        let curr = TokenIndex(curr_node);
         if hops >= 2 && curr == start {
             if route_calls > MAX_ROUTE_CALLS
                 || product_ratio <= ONE
@@ -461,8 +609,6 @@ fn collect_cycles_dfs_single_start(
                 return;
             }
             seen.insert(fp);
-            // ponytail: SmallVec::from(&[T]) copies inline (≤HOP_CAP=8) without
-            // iterator adaptor overhead — avoids .iter().copied().collect() dispatch.
             let edges: CycleEdges = CycleEdges::from(path.as_slice());
             cycles.push(FoundCycle {
                 start_token: start,
@@ -476,73 +622,113 @@ fn collect_cycles_dfs_single_start(
             return;
         }
 
-        if used_tokens[curr.0 as usize] || hops >= hop_cap {
+        if used_tokens[curr_node as usize] || hops >= hop_cap {
             return;
         }
         if !can_still_find_profitable_cycle(log_w, product_ratio, hops, hop_cap, curr, prep) {
             return;
         }
-        let next_edges = match prep.adjacency.get(curr.0 as usize) {
+        let next_edges = match prep.adjacency.get(curr_node as usize) {
             Some(e) if !e.is_empty() => e,
             _ => return,
         };
 
-        used_tokens[curr.0 as usize] = true;
+        used_tokens[curr_node as usize] = true;
 
         for ge in next_edges {
             if budget.tick() || cycles.len() >= max_cycles {
                 break;
             }
-            if ge.ratio.is_zero() || ge.ratio < ONE {
-                continue;
-            }
-            let pool_id = ge.edge.pool_index.0;
-            if !pool_mark(used_pools, pool_id) {
-                continue;
-            }
-            let next_log_w = log_w + ge.log_weight;
-            let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
-            if !can_still_find_profitable_cycle(
-                next_log_w,
-                next_ratio,
-                hops + 1,
-                hop_cap,
-                ge.edge.token_out,
-                prep,
-            ) {
-                pool_unmark(used_pools, pool_id);
-                continue;
-            }
-            let hop_calls = estimate_hop_calls(ge.edge.protocol);
-            if route_calls + hop_calls > MAX_ROUTE_CALLS {
-                pool_unmark(used_pools, pool_id);
-                continue;
-            }
+            match ge.phase {
+                GraphHopPhase::EnterPool => {
+                    let pending = PendingHubSwap {
+                        pool_index: ge.edge.pool_index,
+                        token_in: ge.edge.token_in,
+                        token_in_idx: ge.edge.token_in_idx,
+                        protocol: ge.edge.protocol,
+                        fee_bps: ge.edge.fee_bps,
+                    };
+                    dfs(
+                        graph,
+                        arena,
+                        pool_metas,
+                        prep,
+                        start,
+                        ge.target_node,
+                        Some(pending),
+                        path,
+                        used_pools,
+                        used_tokens,
+                        hops,
+                        log_w,
+                        product_ratio,
+                        cum_fee,
+                        route_calls,
+                        hop_cap,
+                        max_cycles,
+                        budget,
+                        cycles,
+                        seen,
+                    );
+                }
+                GraphHopPhase::Direct => {
+                    if ge.ratio.is_zero() || ge.ratio < ONE {
+                        continue;
+                    }
+                    let pool_id = ge.edge.pool_index.0;
+                    if !pool_mark(used_pools, pool_id) {
+                        continue;
+                    }
+                    let next_log_w = log_w + ge.log_weight;
+                    let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
+                    if !can_still_find_profitable_cycle(
+                        next_log_w,
+                        next_ratio,
+                        hops + 1,
+                        hop_cap,
+                        ge.edge.token_out,
+                        prep,
+                    ) {
+                        pool_unmark(used_pools, pool_id);
+                        continue;
+                    }
+                    let hop_calls = estimate_hop_calls(ge.edge.protocol);
+                    if route_calls + hop_calls > MAX_ROUTE_CALLS {
+                        pool_unmark(used_pools, pool_id);
+                        continue;
+                    }
 
-            path.push(ge.edge);
-            dfs(
-                prep,
-                start,
-                ge.edge.token_out,
-                path,
-                used_pools,
-                used_tokens,
-                hops + 1,
-                next_log_w,
-                next_ratio,
-                cum_fee + clamp_fee_bps(ge.edge.fee_bps),
-                route_calls + hop_calls,
-                hop_cap,
-                max_cycles,
-                budget,
-                cycles,
-                seen,
-            );
-            path.pop();
-            pool_unmark(used_pools, pool_id);
+                    path.push(ge.edge);
+                    dfs(
+                        graph,
+                        arena,
+                        pool_metas,
+                        prep,
+                        start,
+                        ge.target_node,
+                        None,
+                        path,
+                        used_pools,
+                        used_tokens,
+                        hops + 1,
+                        next_log_w,
+                        next_ratio,
+                        cum_fee + clamp_fee_bps(ge.edge.fee_bps),
+                        route_calls + hop_calls,
+                        hop_cap,
+                        max_cycles,
+                        budget,
+                        cycles,
+                        seen,
+                    );
+                    path.pop();
+                    pool_unmark(used_pools, pool_id);
+                }
+                GraphHopPhase::ExitPool => {}
+            }
         }
 
-        used_tokens[curr.0 as usize] = false;
+        used_tokens[curr_node as usize] = false;
     }
 
     let first_edges = match prep.adjacency.get(start.0 as usize) {
@@ -555,52 +741,93 @@ fn collect_cycles_dfs_single_start(
         if budget.tick() || cycles.len() >= max_cycles {
             break;
         }
-        if ge.ratio.is_zero() || ge.ratio < ONE {
-            continue;
+        match ge.phase {
+            GraphHopPhase::EnterPool => {
+                let pending = PendingHubSwap {
+                    pool_index: ge.edge.pool_index,
+                    token_in: ge.edge.token_in,
+                    token_in_idx: ge.edge.token_in_idx,
+                    protocol: ge.edge.protocol,
+                    fee_bps: ge.edge.fee_bps,
+                };
+                dfs(
+                    graph,
+                    arena,
+                    pool_metas,
+                    prep,
+                    start,
+                    ge.target_node,
+                    Some(pending),
+                    &mut path,
+                    &mut used_pools,
+                    &mut used_tokens,
+                    0,
+                    0.0,
+                    ONE,
+                    0,
+                    0,
+                    hop_cap,
+                    max_cycles,
+                    budget,
+                    &mut cycles,
+                    &mut seen,
+                );
+            }
+            GraphHopPhase::Direct => {
+                if ge.ratio.is_zero() || ge.ratio < ONE {
+                    continue;
+                }
+                let pool_id = ge.edge.pool_index.0;
+                let next_ratio_preview = mul_ratio_saturating(ONE, ge.ratio);
+                if !can_still_find_profitable_cycle(
+                    ge.log_weight,
+                    next_ratio_preview,
+                    1,
+                    hop_cap,
+                    ge.edge.token_out,
+                    prep,
+                ) {
+                    continue;
+                }
+                pool_mark(&mut used_pools, pool_id);
+                let hop_calls = estimate_hop_calls(ge.edge.protocol);
+                path.push(ge.edge);
+                dfs(
+                    graph,
+                    arena,
+                    pool_metas,
+                    prep,
+                    start,
+                    ge.target_node,
+                    None,
+                    &mut path,
+                    &mut used_pools,
+                    &mut used_tokens,
+                    1,
+                    ge.log_weight,
+                    ge.ratio,
+                    clamp_fee_bps(ge.edge.fee_bps),
+                    hop_calls,
+                    hop_cap,
+                    max_cycles,
+                    budget,
+                    &mut cycles,
+                    &mut seen,
+                );
+                path.pop();
+                pool_unmark(&mut used_pools, pool_id);
+            }
+            GraphHopPhase::ExitPool => {}
         }
-        let pool_id = ge.edge.pool_index.0;
-        let next_ratio_preview = mul_ratio_saturating(ONE, ge.ratio);
-        if !can_still_find_profitable_cycle(
-            ge.log_weight,
-            next_ratio_preview,
-            1,
-            hop_cap,
-            ge.edge.token_out,
-            prep,
-        ) {
-            continue;
-        }
-        pool_mark(&mut used_pools, pool_id);
-        let hop_calls = estimate_hop_calls(ge.edge.protocol);
-        path.push(ge.edge);
-        // Start product_ratio = edge.ratio (ONE * edge.ratio / ONE = edge.ratio)
-        let initial_product = ge.ratio;
-        dfs(
-            prep,
-            start,
-            ge.edge.token_out,
-            &mut path,
-            &mut used_pools,
-            &mut used_tokens,
-            1,
-            ge.log_weight,
-            initial_product,
-            clamp_fee_bps(ge.edge.fee_bps),
-            hop_calls,
-            hop_cap,
-            max_cycles,
-            budget,
-            &mut cycles,
-            &mut seen,
-        );
-        path.pop();
-        pool_unmark(&mut used_pools, pool_id);
     }
     used_tokens[start.0 as usize] = false;
     cycles
 }
 
 fn collect_cycles_dfs_parallel(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    pool_metas: &[PoolMeta],
     prep: &ActiveGraph,
     hop_limit: u32,
     max_cycles: usize,
@@ -616,7 +843,16 @@ fn collect_cycles_dfs_parallel(
         .par_iter()
         .zip(shard_caps.par_iter())
         .map(|(start, cap)| {
-            collect_cycles_dfs_single_start(prep, *start, hop_limit, *cap, budget.as_ref())
+            collect_cycles_dfs_single_start(
+                graph,
+                arena,
+                pool_metas,
+                prep,
+                *start,
+                hop_limit,
+                *cap,
+                budget.as_ref(),
+            )
         })
         .collect();
 
@@ -647,6 +883,9 @@ fn collect_cycles_dfs_parallel(
                 (
                     i,
                     collect_cycles_dfs_single_start(
+                        graph,
+                        arena,
+                        pool_metas,
                         prep,
                         start_tokens[i],
                         hop_limit,
@@ -699,7 +938,12 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 }
 
 #[must_use]
-pub fn find_cycles_multi_pass(graph: &RoutingGraph, passes: &[CycleSearchPass]) -> Vec<FoundCycle> {
+pub fn find_cycles_multi_pass(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    pool_metas: &[PoolMeta],
+    passes: &[CycleSearchPass],
+) -> Vec<FoundCycle> {
     if passes.is_empty() {
         return Vec::new();
     }
@@ -711,6 +955,9 @@ pub fn find_cycles_multi_pass(graph: &RoutingGraph, passes: &[CycleSearchPass]) 
     let mut all = Vec::new();
     for pass in passes {
         let mut shard = collect_cycles_dfs_parallel(
+            graph,
+            arena,
+            pool_metas,
             &prep,
             pass.max_hops,
             pass.max_cycles.min(MAX_CYCLES_PER_PASS),
@@ -841,7 +1088,7 @@ pub fn apply_protocol_diverse_selection(
 mod tests {
     use super::*;
     use crate::core::types::{PoolIndex, ProtocolType};
-    use crate::pipeline::types::GraphEdge;
+    use crate::pipeline::types::{GraphEdge, GraphHopPhase};
 
     fn graph_edge(pool: u32, from: TokenIndex, to: TokenIndex) -> GraphEdge {
         GraphEdge {
@@ -855,6 +1102,8 @@ mod tests {
                 fee_bps: 30,
                 zero_for_one: true,
             },
+            phase: GraphHopPhase::Direct,
+            target_node: to.0,
             log_weight: -0.01,
             ratio: U256::from(1_000_000_000_000_000_000u64), // ONE
         }
@@ -952,6 +1201,8 @@ mod tests {
                     fee_bps: 30,
                     zero_for_one: true,
                 },
+                phase: GraphHopPhase::Direct,
+                target_node: b.0,
                 log_weight: 0.10,
                 ratio: U256::from(1_000_000_000_000_000_000u64),
             },
@@ -969,14 +1220,18 @@ mod tests {
                     fee_bps: 30,
                     zero_for_one: true,
                 },
+                phase: GraphHopPhase::Direct,
+                target_node: a.0,
                 log_weight: -1.0,
                 ratio: U256::from(1_000_000_000_000_000_001u64),
             },
         );
 
+        let arena = StateArena::default();
+        let metas: &[PoolMeta] = &[];
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![a];
-        let cycles = collect_cycles_dfs_parallel(&prep, 2, 10);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, metas, &prep, 2, 10);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
@@ -1060,6 +1315,8 @@ mod tests {
                     fee_bps: 30,
                     zero_for_one: true,
                 },
+                phase: GraphHopPhase::Direct,
+                target_node: token_out.0,
                 log_weight: -1.0,
                 ratio: U256::from(1_000_000_000_000_000_001u64),
             }
@@ -1078,9 +1335,11 @@ mod tests {
             graph.add_edge(token, edge(pool + 1, token, hub));
         }
 
+        let arena = StateArena::default();
+        let metas: &[PoolMeta] = &[];
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![dead, hub];
-        let cycles = collect_cycles_dfs_parallel(&prep, 2, 4);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, metas, &prep, 2, 4);
         assert_eq!(cycles.len(), 3);
     }
 }

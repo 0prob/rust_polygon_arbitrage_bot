@@ -233,9 +233,15 @@ pub fn build_arb_calldata(
     for b in data_bytes.iter().take(100) {
         let _ = write!(hex_preview, "{b:02x}");
     }
+    let call_targets: String = calls
+        .iter()
+        .map(|c| format!("{:#x}", c.target))
+        .collect::<Vec<_>>()
+        .join(",");
     crate::info!(
-        "calldata len={}, preview=0x{}..., route_hash={}, entrypoint={entrypoint:?}",
+        "calldata len={}, calls={}, preview=0x{}..., route_hash={}, entrypoint={entrypoint:?}, targets=[{call_targets}]",
         data_bytes.len(),
+        calls.len(),
         hex_preview,
         route_hash,
     );

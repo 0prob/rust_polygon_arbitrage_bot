@@ -191,6 +191,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             work.cycle_finder,
             &work.arena,
             &graph,
+            work.pool_metas.as_ref(),
             passes.as_slice(),
             true,
             None,

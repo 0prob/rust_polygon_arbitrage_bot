@@ -20,7 +20,9 @@ use crate::orchestrator::hf_execute::{
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
-use crate::services::execution::flash_liquidity::collect_flash_tokens_for_cycle;
+use crate::services::execution::flash_liquidity::{
+    collect_flash_tokens_for_cycle, route_is_balancer_only,
+};
 use crate::services::execution::{
     ExecutionService, GasOracle, hash_cycle_edges, rotate_cycle_to_start,
 };
@@ -58,7 +60,6 @@ const HF_ACTIVITY_WINDOW_MS: u64 = 300_000;
 const HF_SUMMARY_INTERVAL_MS: u64 = 15_000;
 const HF_BEST_EVAL_INTERVAL_MS: u64 = 60_000;
 const HF_EVAL_BUDGET: Duration = Duration::from_secs(30);
-const HF_FLASH_REFRESH_BUDGET: Duration = Duration::from_secs(15);
 static HF_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_BEST_EVAL_LOG_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -309,14 +310,15 @@ pub async fn run_hf_tick(
     };
 
     if let Some(handle) = prefetch {
-        const PREFETCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
-        match tokio::time::timeout(PREFETCH_BUDGET, handle).await {
+        let prefetch_budget =
+            std::time::Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+        match tokio::time::timeout(prefetch_budget, handle).await {
             Ok(Ok(Ok(_))) => prefetch_ok = true,
             Ok(Ok(Err(e))) => crate::debug!("hf prefetch failed: {e:#}"),
             Ok(Err(e)) => crate::debug!("hf prefetch task failed: {e}"),
             Err(_) => crate::debug!(
                 "hf prefetch timed out after {}ms",
-                PREFETCH_BUDGET.as_millis()
+                prefetch_budget.as_millis()
             ),
         }
     }
@@ -378,31 +380,8 @@ pub async fn run_hf_tick(
         );
     }
     if !flash_token_list.is_empty() {
-        match ctx.rpc.connect_state() {
-            Ok(provider) => {
-                let flash = Arc::clone(&ctx.execution.flash_liquidity);
-                flash.track_hot_tokens(&flash_token_list);
-                let refresh = flash.refresh(&provider, &flash_token_list);
-                match timeout(HF_FLASH_REFRESH_BUDGET, refresh).await {
-                    Ok(Ok(_generation)) => {}
-                    Ok(Err(e)) => {
-                        crate::warn!("hf flash liquidity refresh failed: {e:#}");
-                        flash.invalidate_batch(&flash_token_list);
-                    }
-                    Err(_) => {
-                        crate::warn!(
-                            "hf flash liquidity refresh timed out after {}ms (tokens={})",
-                            HF_FLASH_REFRESH_BUDGET.as_millis(),
-                            flash_token_list.len()
-                        );
-                        flash.invalidate_batch(&flash_token_list);
-                    }
-                }
-            }
-            Err(e) => {
-                crate::warn!("hf flash liquidity refresh skipped: state RPC unavailable: {e:#}")
-            }
-        }
+        Arc::clone(&ctx.execution.flash_liquidity)
+            .spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_token_list);
     }
 
     let flash_policy = ctx.config.flash_policy;
@@ -497,7 +476,7 @@ pub async fn run_hf_tick(
             refresh_and_resim_profitable(&ctx.refresh, &ctx.cache, &mut eval_arena, profitable)
                 .await;
         profitable = filter_balancer_onchain_verified(
-            &ctx.execution,
+            Arc::clone(&ctx.execution),
             &eval_arena,
             profitable,
             &sim_provider,
@@ -514,9 +493,15 @@ pub async fn run_hf_tick(
     }
 
     profitable.sort_unstable_by(|a, b| {
-        b.assessment
-            .net_profit_after_gas_matic_wei
-            .cmp(&a.assessment.net_profit_after_gas_matic_wei)
+        let a_direct = route_is_balancer_only(&a.cycle);
+        let b_direct = route_is_balancer_only(&b.cycle);
+        b_direct
+            .cmp(&a_direct)
+            .then_with(|| {
+                b.assessment
+                    .net_profit_after_gas_matic_wei
+                    .cmp(&a.assessment.net_profit_after_gas_matic_wei)
+            })
     });
     profitable.truncate(pipeline.hf_max_dispatch);
     let profitable_count = profitable.len();

@@ -127,6 +127,16 @@ pub fn is_transient_receipt_error(err: &impl std::fmt::Display) -> bool {
         || ic(&msg, "server error")
 }
 
+/// True when the RPC rejected the request due to provider rate limiting.
+#[must_use]
+pub fn is_rpc_rate_limited(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("429")
+        || ic(&msg, "rate limit")
+        || ic(&msg, "usage limit")
+        || ic(&msg, "too many request")
+}
+
 #[must_use]
 pub fn extract_tx_hash_from_error(err: &str) -> Option<B256> {
     err.split("0x").skip(1).find_map(|segment| {

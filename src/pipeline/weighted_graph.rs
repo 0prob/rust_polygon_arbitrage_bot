@@ -1,6 +1,6 @@
 use crate::core::types::Edge;
 use crate::pipeline::cycle_finder::is_live_graph_edge;
-use crate::pipeline::types::RoutingGraph;
+use crate::pipeline::types::{GraphHopPhase, RoutingGraph};
 use alloy::primitives::U256;
 
 #[derive(Clone, Copy)]
@@ -19,7 +19,7 @@ pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> 
     for edges in &graph.adjacency {
         let mut list = Vec::with_capacity(edges.len());
         for ge in edges {
-            if !is_live_graph_edge(ge) {
+            if ge.phase != GraphHopPhase::Direct || !is_live_graph_edge(ge) {
                 continue;
             }
             list.push(WeightedEdge {
@@ -38,7 +38,7 @@ mod tests {
     use super::*;
     use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
-    use crate::pipeline::types::GraphEdge;
+    use crate::pipeline::types::{GraphEdge, GraphHopPhase};
     use alloy::primitives::U256;
 
     fn graph_edge(weight: f64) -> GraphEdge {
@@ -53,6 +53,8 @@ mod tests {
                 fee_bps: 30,
                 zero_for_one: true,
             },
+            phase: GraphHopPhase::Direct,
+            target_node: 1,
             log_weight: weight,
             ratio: U256::ZERO,
         }

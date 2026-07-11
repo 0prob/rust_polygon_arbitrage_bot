@@ -112,6 +112,8 @@ pub struct PipelineConfig {
     pub lf_full_sweep_interval: u64,
     #[serde(default = "default_hf_prefetch_count")]
     pub hf_prefetch_count: usize,
+    #[serde(default = "default_hf_prefetch_budget_ms")]
+    pub hf_prefetch_budget_ms: u64,
     #[serde(default = "default_hf_score_cap")]
     pub hf_score_cap: usize,
     #[serde(default = "default_hf_sim_cap")]
@@ -265,7 +267,10 @@ fn default_lf_full_sweep_interval() -> u64 {
     10
 }
 fn default_hf_prefetch_count() -> usize {
-    100
+    80
+}
+fn default_hf_prefetch_budget_ms() -> u64 {
+    1_200
 }
 fn default_hf_score_cap() -> usize {
     120
@@ -361,6 +366,7 @@ impl Default for PipelineConfig {
             lf_hot_batch: default_lf_hot_batch(),
             lf_full_sweep_interval: default_lf_full_sweep_interval(),
             hf_prefetch_count: default_hf_prefetch_count(),
+            hf_prefetch_budget_ms: default_hf_prefetch_budget_ms(),
             hf_score_cap: default_hf_score_cap(),
             hf_sim_cap: default_hf_sim_cap(),
             hf_max_dispatch: default_hf_max_dispatch(),
@@ -481,6 +487,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("lf_hot_batch") => "pipeline.lf_hot_batch",
         k if k.eq_ignore_ascii_case("lf_full_sweep_interval") => "pipeline.lf_full_sweep_interval",
         k if k.eq_ignore_ascii_case("hf_prefetch_count") => "pipeline.hf_prefetch_count",
+        k if k.eq_ignore_ascii_case("hf_prefetch_budget_ms") => "pipeline.hf_prefetch_budget_ms",
         k if k.eq_ignore_ascii_case("hf_score_cap") => "pipeline.hf_score_cap",
         k if k.eq_ignore_ascii_case("hf_sim_cap") => "pipeline.hf_sim_cap",
         k if k.eq_ignore_ascii_case("hf_max_dispatch") => "pipeline.hf_max_dispatch",
@@ -517,6 +524,11 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
 
 fn env_provider() -> Env {
     Env::raw().filter_map(|key| env_key_to_figment_path(key.as_str()).map(Into::into))
+}
+
+fn dedupe_preserve_order(urls: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|url| seen.insert(url.clone()));
 }
 
 fn split_rpc_urls(raw: &str) -> Vec<String> {
@@ -589,6 +601,7 @@ impl AppConfig {
             .extract_lossy()
             .map_err(|e| anyhow::anyhow!("config: {e}"))?;
         apply_conditional_env_overrides(&mut config)?;
+        config.normalize();
 
         config.min_profit_matic = config
             .execution
@@ -603,6 +616,56 @@ impl AppConfig {
         config.flash_policy = parse_flash_policy(&config.execution.flash_loan_source);
 
         Ok(config)
+    }
+
+    /// Coalesce duplicates and clamp values that commonly fight each other across TOML/env.
+    pub fn normalize(&mut self) {
+        dedupe_preserve_order(&mut self.rpc.polygon_rpc_urls);
+        dedupe_preserve_order(&mut self.rpc.polygon_wss_urls);
+
+        if self.pipeline.hf_score_cap < self.pipeline.hf_sim_cap {
+            self.pipeline.hf_score_cap = self.pipeline.hf_sim_cap;
+        }
+
+        let mc = self.max_multicall_calls.max(1) as usize;
+        let prefetch_cap = mc.saturating_mul(2).min(200);
+        if self.pipeline.hf_prefetch_count > prefetch_cap {
+            self.pipeline.hf_prefetch_count = prefetch_cap;
+        }
+    }
+
+    /// Non-fatal hints for configs that work but waste RPC budget or backlog LF/HF.
+    pub fn warn_suboptimal(&self) {
+        if self.rpc.polygon_rpc_urls.len() > 1 && self.rpc.batch_pace_ms == 0 {
+            crate::warn!(
+                "RPC_BATCH_PACE_MS=0 with {} state RPCs — bursts may trigger rate limits; try 5–10ms",
+                self.rpc.polygon_rpc_urls.len()
+            );
+        }
+        if self.lf_interval_ms < 2_500 && !self.pipeline.stream_enabled {
+            crate::warn!(
+                "LF_INTERVAL_MS={} is below typical refresh latency (~2.5s) — LF may backlog",
+                self.lf_interval_ms
+            );
+        }
+        if self.routing.enumeration_max_paths > 1_000 {
+            crate::warn!(
+                "ROUTING_ENUMERATION_MAX_PATHS={} is high — cycle search may dominate LF ticks",
+                self.routing.enumeration_max_paths
+            );
+        }
+        if self.pipeline.hf_prefetch_count > 120 {
+            crate::warn!(
+                "HF_PREFETCH_COUNT={} is high — prefetch often times out; try 60–100",
+                self.pipeline.hf_prefetch_count
+            );
+        }
+        if self.rpc.request_timeout_ms > 20_000 {
+            crate::debug!(
+                "RPC request_timeout_ms={} is long — slow endpoints will block workers",
+                self.rpc.request_timeout_ms
+            );
+        }
     }
 
     pub fn validate(&self, wallet: &WalletSecrets) -> anyhow::Result<()> {
@@ -755,6 +818,24 @@ mod tests {
             CycleFinderMode::parse("HYBRID").expect("case-insensitive hybrid alias should parse"),
             CycleFinderMode::Hybrid
         );
+    }
+
+    #[test]
+    fn normalize_dedupes_rpc_urls_and_clamps_prefetch() {
+        let mut config = AppConfig::default();
+        config.rpc.polygon_rpc_urls = vec![
+            "https://a.example".into(),
+            "https://b.example".into(),
+            "https://a.example".into(),
+        ];
+        config.max_multicall_calls = 50;
+        config.pipeline.hf_prefetch_count = 500;
+        config.pipeline.hf_sim_cap = 100;
+        config.pipeline.hf_score_cap = 50;
+        config.normalize();
+        assert_eq!(config.rpc.polygon_rpc_urls.len(), 2);
+        assert_eq!(config.pipeline.hf_prefetch_count, 100);
+        assert_eq!(config.pipeline.hf_score_cap, 100);
     }
 
     #[test]

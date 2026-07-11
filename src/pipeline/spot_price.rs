@@ -199,12 +199,14 @@ impl SpotTable {
 
     /// Pre-fill spot prices from graph edge ratios (avoids re-simulating at rescore time).
     pub fn populate_from_graph(&mut self, graph: &RoutingGraph) {
+        use crate::pipeline::types::GraphHopPhase;
         for adj in &graph.adjacency {
             for ge in adj {
-                if !ge.ratio.is_zero() {
-                    let spot = u256_to_f64(ge.ratio) / ONE_F64;
-                    self.set(&ge.edge, spot);
+                if ge.phase != GraphHopPhase::Direct || ge.ratio.is_zero() {
+                    continue;
                 }
+                let spot = u256_to_f64(ge.ratio) / ONE_F64;
+                self.set(&ge.edge, spot);
             }
         }
     }
