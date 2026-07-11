@@ -740,15 +740,24 @@ impl StateRefreshService {
     }
 
     pub fn lf_refresh_batch(&self, pass: u64) -> usize {
-        let pipeline = &self.config.pipeline;
-        let full_sweep = pass == 1 || pass.is_multiple_of(pipeline.lf_full_sweep_interval);
-        if full_sweep {
-            pipeline.lf_bootstrap_batch
-        } else {
-            // Cap per-tick refresh; hot pools rotate via select_fetch_targets priority
-            // instead of forcing a full hot-set sweep every LF pass.
-            pipeline.lf_hot_batch.min(pipeline.lf_bootstrap_batch)
-        }
+        refresh_batch_for(pass, self.cache.len(), &self.config.pipeline)
+    }
+}
+
+fn refresh_batch_for(
+    pass: u64,
+    cache_size: usize,
+    pipeline: &crate::config::PipelineConfig,
+) -> usize {
+    let bootstrap_batch = pipeline.lf_bootstrap_batch;
+    let warm_cache_target = bootstrap_batch.saturating_mul(4);
+    let full_sweep = pass == 1
+        || cache_size < warm_cache_target
+        || pass.is_multiple_of(pipeline.lf_full_sweep_interval);
+    if full_sweep {
+        bootstrap_batch
+    } else {
+        pipeline.lf_hot_batch.min(bootstrap_batch)
     }
 }
 
@@ -772,5 +781,19 @@ fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
     }
     for (label, count) in &page.rejected {
         *acc.rejected.entry(label.clone()).or_default() += count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refresh_batch_for;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn keeps_bootstrap_batch_until_cache_is_warm() {
+        let config = AppConfig::default();
+        assert_eq!(refresh_batch_for(2, 3_000, &config.pipeline), 3_000);
+        assert_eq!(refresh_batch_for(2, 11_999, &config.pipeline), 3_000);
+        assert_eq!(refresh_batch_for(2, 12_000, &config.pipeline), 500);
     }
 }

@@ -255,6 +255,8 @@ pub struct App {
     search_lower: String,
     route_view_key: u64,
     route_view_indices: Vec<usize>,
+    route_sort_key: Option<(u64, SortMode)>,
+    route_sort_indices: Vec<usize>,
     route_view_dirty: bool,
 }
 
@@ -295,6 +297,8 @@ impl App {
             search_lower: String::new(),
             route_view_key: 0,
             route_view_indices: Vec::new(),
+            route_sort_key: None,
+            route_sort_indices: Vec::new(),
             route_view_dirty: true,
         }
     }
@@ -391,29 +395,35 @@ impl App {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let needle = self.search_lower.as_str();
-        let mut indices: Vec<usize> = snapshot
-            .opportunities
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| needle.is_empty() || row.search_blob.contains(needle))
-            .map(|(idx, _)| idx)
-            .collect();
         let rows = snapshot.opportunities.as_ref();
-        match self.sort_mode {
-            SortMode::Score => {
-                indices.sort_by(|a, b| rows[*b].rescored.total_cmp(&rows[*a].rescored));
+        let sort_key = (snapshot.generation, self.sort_mode);
+        if self.route_sort_key != Some(sort_key) {
+            self.route_sort_indices.clear();
+            self.route_sort_indices.extend(0..rows.len());
+            match self.sort_mode {
+                SortMode::Score => self
+                    .route_sort_indices
+                    .sort_by(|a, b| rows[*b].rescored.total_cmp(&rows[*a].rescored)),
+                SortMode::Profit => self
+                    .route_sort_indices
+                    .sort_by(|a, b| rows[*b].profit_matic.total_cmp(&rows[*a].profit_matic)),
+                SortMode::Risk => self
+                    .route_sort_indices
+                    .sort_by_key(|idx| rows[*idx].risk_score),
+                SortMode::Hops => self.route_sort_indices.sort_by_key(|idx| rows[*idx].hops),
+                SortMode::Freshness => self
+                    .route_sort_indices
+                    .sort_by_key(|idx| std::cmp::Reverse(rows[*idx].fingerprint)),
             }
-            SortMode::Profit => {
-                indices.sort_by(|a, b| rows[*b].profit_matic.total_cmp(&rows[*a].profit_matic));
-            }
-            SortMode::Risk => indices.sort_by_key(|idx| rows[*idx].risk_score),
-            SortMode::Hops => indices.sort_by_key(|idx| rows[*idx].hops),
-            SortMode::Freshness => {
-                indices.sort_by_key(|idx| std::cmp::Reverse(rows[*idx].fingerprint));
-            }
+            self.route_sort_key = Some(sort_key);
         }
-        self.route_view_indices = indices;
+        let needle = self.search_lower.as_str();
+        self.route_view_indices.extend(
+            self.route_sort_indices
+                .iter()
+                .copied()
+                .filter(|&idx| needle.is_empty() || rows[idx].search_blob.contains(needle)),
+        );
         self.route_view_dirty = false;
         self.normalize_route_selection();
     }
@@ -790,6 +800,7 @@ mod tests {
         let (_, indices) = app.route_view().expect("view");
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
+        assert_eq!(app.route_sort_indices, vec![1, 0]);
     }
 
     #[test]

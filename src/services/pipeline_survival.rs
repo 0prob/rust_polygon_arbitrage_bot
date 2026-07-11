@@ -33,8 +33,7 @@ impl PipelineSurvival {
         graph: &RoutingGraph,
     ) -> Self {
         let discovered = count_discovered(pools);
-        let cached = count_cache_stage(pools, cache, false);
-        let tradable = count_cache_stage(pools, cache, true);
+        let (cached, tradable) = count_cache_stages(pools, cache);
         let arena = count_metas(pool_metas);
         let (graph_counts, arena_no_graph) = count_graph_partition(pool_metas, graph);
         let cycle_capable = count_cycle_capable_pools(pool_metas, graph);
@@ -155,22 +154,22 @@ fn count_discovered(pools: &[DiscoveredPool]) -> BTreeMap<String, usize> {
     counts
 }
 
-fn count_cache_stage(
+fn count_cache_stages(
     pools: &[DiscoveredPool],
     cache: &StateCache,
-    only_tradable: bool,
-) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut cached = BTreeMap::new();
+    let mut tradable = BTreeMap::new();
     for pool in pools {
         let Some(state) = cache.get_arc(&pool.address) else {
             continue;
         };
-        if only_tradable && !state.is_tradable() {
-            continue;
+        *cached.entry(pool.protocol_label.clone()).or_default() += 1;
+        if state.is_tradable() {
+            *tradable.entry(pool.protocol_label.clone()).or_default() += 1;
         }
-        *counts.entry(pool.protocol_label.clone()).or_default() += 1;
     }
-    counts
+    (cached, tradable)
 }
 
 fn count_metas(metas: &[PoolMeta]) -> BTreeMap<String, usize> {

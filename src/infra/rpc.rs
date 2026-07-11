@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
@@ -30,6 +31,7 @@ pub struct RpcPool {
     validated_executors: Arc<Mutex<FxHashSet<(String, Address)>>>,
     failed_executors: Arc<Mutex<FxHashSet<(String, Address)>>>,
     state_url_penalties: Arc<RwLock<FxHashMap<String, Instant>>>,
+    state_probe_inflight: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RpcPool {
@@ -95,6 +97,7 @@ impl RpcPool {
             validated_executors: Arc::new(Mutex::new(FxHashSet::default())),
             failed_executors: Arc::new(Mutex::new(FxHashSet::default())),
             state_url_penalties: Arc::new(RwLock::new(FxHashMap::default())),
+            state_probe_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -179,6 +182,18 @@ impl RpcPool {
 
     /// Probe state HTTP endpoints in parallel and reorder by latency (fastest first).
     pub async fn probe_and_rank_state_urls(&self) {
+        if self
+            .state_probe_inflight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.probe_and_rank_state_urls_inner().await;
+        self.state_probe_inflight.store(false, Ordering::Release);
+    }
+
+    async fn probe_and_rank_state_urls_inner(&self) {
         let urls = self.state_urls.read().clone();
         if urls.len() <= 1 {
             return;
@@ -445,6 +460,19 @@ mod tests {
         let ordered = pool.state_url_candidates();
         assert_eq!(ordered[0], "https://slow.example");
         assert_eq!(ordered[1], "https://fast.example");
+    }
+
+    #[tokio::test]
+    async fn concurrent_state_probe_is_coalesced() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://fast.example".into());
+        config.rpc.polygon_rpc_urls = vec!["https://slow.example".into()];
+        let pool = RpcPool::from_config(&config);
+        pool.state_probe_inflight.store(true, Ordering::Release);
+
+        pool.probe_and_rank_state_urls().await;
+
+        assert!(pool.state_probe_inflight.load(Ordering::Acquire));
     }
 
     #[test]

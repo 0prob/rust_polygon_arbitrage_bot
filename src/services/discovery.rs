@@ -91,7 +91,7 @@ fn uniswap_v2_enabled() -> bool {
 
 fn is_uniswap_v2_label(label: &str) -> bool {
     let b = label.as_bytes();
-    b.windows(11).any(|w| w.eq_ignore_ascii_case(b"uniswap_v2"))
+    b.windows(10).any(|w| w.eq_ignore_ascii_case(b"uniswap_v2"))
 }
 
 #[must_use]
@@ -564,6 +564,13 @@ mod tests {
             None,
         );
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn v2_labels_match_their_exact_toggle_names() {
+        assert!(is_quickswap_v2_label("QUICKSWAP_V2"));
+        assert!(is_uniswap_v2_label("UNISWAP_V2"));
+        assert!(!is_uniswap_v2_label("UNISWAP_V3"));
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn default_discovery_interval_ms() -> u64 {
     5_000
 }
 fn default_discovery_bootstrap_batch() -> usize {
-    5_000
+    20_000
 }
 fn default_lf_interval_ms() -> u64 {
     1_000
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn default_config_has_discovery_bootstrap_batch() {
         let config = AppConfig::default();
-        assert_eq!(config.discovery_bootstrap_batch, 5_000);
+        assert_eq!(config.discovery_bootstrap_batch, 20_000);
     }
 
     #[test]
@@ -857,7 +857,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             let config: AppConfig = AppConfig::figment().extract_lossy()?;
-            assert_eq!(config.discovery_bootstrap_batch, 5_000);
+            assert_eq!(config.discovery_bootstrap_batch, 20_000);
             assert_eq!(config.execution.mode, "dry-run");
             assert_eq!(config.rpc.batch_pace_ms, 5);
             assert_eq!(config.rpc.request_timeout_ms, 30_000);
