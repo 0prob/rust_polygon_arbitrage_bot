@@ -15,7 +15,6 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::types::{
     CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_score,
-    pool_meta_at,
 };
 
 pub use crate::pipeline::spot_price::hop_penalty;
@@ -29,6 +28,20 @@ const DFS_MAX_START_SOURCES: usize = 32;
 const LOG_WEIGHT_PRUNE_THRESHOLD: f64 = 0.0;
 /// Edges rescored to this weight are non-tradable — skip during enumeration.
 pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
+
+type PoolMetaIndex<'a> = Vec<Option<&'a PoolMeta>>;
+
+fn index_pool_metas(pool_metas: &[PoolMeta]) -> PoolMetaIndex<'_> {
+    let mut index = vec![None; pool_metas
+        .iter()
+        .map(|meta| meta.pool_index.0 as usize)
+        .max()
+        .map_or(0, |max| max + 1)];
+    for meta in pool_metas {
+        index[meta.pool_index.0 as usize] = Some(meta);
+    }
+    index
+}
 
 #[inline]
 #[must_use]
@@ -442,11 +455,14 @@ fn hub_exit_legs(
     graph: &RoutingGraph,
     hub_node: u32,
     pending: PendingHubSwap,
-    pool_metas: &[PoolMeta],
+    pool_metas: &PoolMetaIndex<'_>,
     arena: &StateArena,
 ) -> smallvec::SmallVec<[u8; 8]> {
     if graph.v4_singleton_hub == Some(hub_node) {
-        let Some(meta) = pool_meta_at(pool_metas, pending.pool_index) else {
+        let Some(meta) = pool_metas
+            .get(pending.pool_index.0 as usize)
+            .and_then(Option::as_ref)
+        else {
             return smallvec::SmallVec::new();
         };
         let Some(state) = arena.pool_state(pending.pool_index) else {
@@ -465,7 +481,7 @@ fn hub_exit_legs(
 fn collect_cycles_dfs_single_start(
     graph: &RoutingGraph,
     arena: &StateArena,
-    pool_metas: &[PoolMeta],
+    pool_metas: &PoolMetaIndex<'_>,
     prep: &ActiveGraph,
     start: TokenIndex,
     hop_limit: u32,
@@ -492,7 +508,7 @@ fn collect_cycles_dfs_single_start(
     fn dfs(
         graph: &RoutingGraph,
         arena: &StateArena,
-        pool_metas: &[PoolMeta],
+        pool_metas: &PoolMetaIndex<'_>,
         prep: &ActiveGraph,
         start: TokenIndex,
         curr_node: u32,
@@ -530,7 +546,10 @@ fn collect_cycles_dfs_single_start(
                 if budget.tick() || cycles.len() >= max_cycles {
                     break;
                 }
-                let Some(meta) = pool_meta_at(pool_metas, pending.pool_index) else {
+                let Some(meta) = pool_metas
+                    .get(pending.pool_index.0 as usize)
+                    .and_then(Option::as_ref)
+                else {
                     continue;
                 };
                 let out_idx = out_leg as usize;
@@ -828,7 +847,7 @@ fn collect_cycles_dfs_single_start(
 fn collect_cycles_dfs_parallel(
     graph: &RoutingGraph,
     arena: &StateArena,
-    pool_metas: &[PoolMeta],
+    pool_metas: &PoolMetaIndex<'_>,
     prep: &ActiveGraph,
     hop_limit: u32,
     max_cycles: usize,
@@ -950,6 +969,7 @@ pub fn find_cycles_multi_pass(
     }
 
     let prep = prepare_active_graph(graph);
+    let pool_metas = index_pool_metas(pool_metas);
     if prep.start_tokens.is_empty() {
         return Vec::new();
     }
@@ -958,7 +978,7 @@ pub fn find_cycles_multi_pass(
         let mut shard = collect_cycles_dfs_parallel(
             graph,
             arena,
-            pool_metas,
+            &pool_metas,
             &prep,
             pass.max_hops,
             pass.max_cycles.min(MAX_CYCLES_PER_PASS),
@@ -1229,10 +1249,10 @@ mod tests {
         );
 
         let arena = StateArena::default();
-        let metas: &[PoolMeta] = &[];
+        let metas = index_pool_metas(&[]);
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![a];
-        let cycles = collect_cycles_dfs_parallel(&graph, &arena, metas, &prep, 2, 10);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 10);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
@@ -1337,10 +1357,10 @@ mod tests {
         }
 
         let arena = StateArena::default();
-        let metas: &[PoolMeta] = &[];
+        let metas = index_pool_metas(&[]);
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![dead, hub];
-        let cycles = collect_cycles_dfs_parallel(&graph, &arena, metas, &prep, 2, 4);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4);
         assert_eq!(cycles.len(), 3);
     }
 }

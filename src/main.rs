@@ -9,6 +9,10 @@ use rpbot::orchestrator::run_pass_loop;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if rpbot::cli::help_requested(std::env::args()) {
+        rpbot::cli::print_help()?;
+        return Ok(());
+    }
     rpbot::config::load_dotenv();
     rpbot::log::init();
 
