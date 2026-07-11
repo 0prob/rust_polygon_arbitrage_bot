@@ -16,6 +16,8 @@ use crate::services::state_cache::StateCache;
 /// Extra never-fetched slots per LF batch for CLMM / multi-token protocols that
 /// are often starved by V2 volume in plain round-robin.
 const CLMM_MULTI_FETCH_BIAS: usize = 2;
+/// Extra V4 hydration slots per round — large indexer set, singleton-hub graph depends on live slot0.
+const V4_FETCH_BIAS: usize = 4;
 
 /// Fetchable protocol families — round-robin ensures each gets hydration slots per batch.
 const FETCHABLE_PROTOCOLS: [ProtocolType; 8] = [
@@ -173,8 +175,8 @@ fn select_fetch_targets<'a>(
             let queue = &per_protocol[slot];
             let cursor = &mut cursors[slot];
             let take = match FETCHABLE_PROTOCOLS[slot] {
+                ProtocolType::UniswapV4 => V4_FETCH_BIAS,
                 ProtocolType::UniswapV3
-                | ProtocolType::UniswapV4
                 | ProtocolType::BalancerV2
                 | ProtocolType::CurveStable
                 | ProtocolType::CurveCrypto => CLMM_MULTI_FETCH_BIAS,

@@ -62,7 +62,7 @@ impl ProtocolType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Edge {
     pub pool_index: PoolIndex,
     pub token_in: TokenIndex,

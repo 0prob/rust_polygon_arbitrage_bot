@@ -133,7 +133,7 @@ pub struct ExecutionService {
     pub consecutive_fails: AtomicU32,
     route_stats: RwLock<FxHashMap<u64, RouteStats>>,
     _route_stats_path: PathBuf,
-    last_near_miss_log: Mutex<Option<(u64, U256)>>,
+    last_near_miss_log: Mutex<Option<Instant>>,
     last_dispatch_log: Mutex<Option<(u64, U256)>>,
     last_prepare_skip_log: Mutex<Option<u64>>,
     prepare_skip_counts: RwLock<FxHashMap<u64, u32>>,
@@ -481,13 +481,17 @@ impl ExecutionService {
             .insert(route_hash, now + STRUCTURAL_DRY_RUN_QUARANTINE);
     }
 
-    /// Suppress duplicate near-miss spam when fp and net MATIC are unchanged.
-    pub fn should_log_near_miss(&self, fingerprint: u64, net_matic: U256) -> bool {
+    /// Suppress near-miss spam: HF ticks every ~200ms but pool-index fingerprints drift.
+    pub fn should_log_near_miss(&self, _fingerprint: u64, _net_matic: U256) -> bool {
+        const COOLDOWN: Duration = Duration::from_secs(30);
+        let now = Instant::now();
         let mut last = self.last_near_miss_log.lock();
-        if *last == Some((fingerprint, net_matic)) {
+        if let Some(prev) = *last
+            && now.duration_since(prev) < COOLDOWN
+        {
             return false;
         }
-        *last = Some((fingerprint, net_matic));
+        *last = Some(now);
         true
     }
 

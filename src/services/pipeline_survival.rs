@@ -241,3 +241,18 @@ fn meta_label(meta: &PoolMeta) -> String {
         .clone()
         .unwrap_or_else(|| format!("{:?}", meta.protocol))
 }
+
+/// Live routing-graph pool counts keyed by protocol label (for TUI / diagnostics).
+#[must_use]
+pub fn graph_active_protocol_counts(
+    metas: &[PoolMeta],
+    graph: &RoutingGraph,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for meta in metas {
+        if graph.pool_has_live_edges(meta.pool_index) {
+            *counts.entry(meta_label(meta)).or_default() += 1;
+        }
+    }
+    counts
+}

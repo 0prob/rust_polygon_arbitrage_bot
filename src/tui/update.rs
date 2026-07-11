@@ -256,28 +256,33 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
     }
 }
 
+fn protocol_label_for_meta(meta: &crate::pipeline::types::PoolMeta) -> String {
+    meta.protocol_label.clone().unwrap_or_else(|| {
+        match meta.protocol {
+            ProtocolType::UniswapV2 => "uniswap-v2",
+            ProtocolType::UniswapV3 => "uniswap-v3",
+            ProtocolType::UniswapV4 => "uniswap-v4",
+            ProtocolType::BalancerV2 => "balancer-v2",
+            ProtocolType::CurveStable => "curve-stable",
+            ProtocolType::CurveCrypto => "curve-crypto",
+            ProtocolType::Dodo => "dodo",
+            ProtocolType::Woofi => "woofi",
+        }
+        .to_string()
+    })
+}
+
 fn build_graph_snapshot(
     snap: &HfSnapshot,
     hypersync_height: Option<u64>,
     indexer_lag_blocks: u64,
     stale_indexer: bool,
 ) -> GraphSnapshot {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut arena_counts: BTreeMap<String, usize> = BTreeMap::new();
     for meta in snap.pool_metas.iter() {
-        let label = meta
-            .protocol_label
-            .as_deref()
-            .unwrap_or(match meta.protocol {
-                ProtocolType::UniswapV2 => "uniswap-v2",
-                ProtocolType::UniswapV3 => "uniswap-v3",
-                ProtocolType::UniswapV4 => "uniswap-v4",
-                ProtocolType::BalancerV2 => "balancer-v2",
-                ProtocolType::CurveStable => "curve-stable",
-                ProtocolType::CurveCrypto => "curve-crypto",
-                ProtocolType::Dodo => "dodo",
-                ProtocolType::Woofi => "woofi",
-            });
-        *counts.entry(label).or_default() += 1;
+        *arena_counts
+            .entry(protocol_label_for_meta(meta))
+            .or_default() += 1;
     }
 
     let mut token_counts: HashMap<u32, usize> = HashMap::new();
@@ -303,13 +308,28 @@ fn build_graph_snapshot(
         })
         .collect();
 
-    let protocol_count = counts.len();
-    let protocol_counts = counts
-        .into_iter()
-        .map(|(key, value)| KeyValueRow {
-            key: key.to_string(),
-            value: value.to_string(),
-            severity: Severity::Info,
+    let mut protocol_labels: BTreeMap<String, ()> = BTreeMap::new();
+    for label in arena_counts.keys() {
+        protocol_labels.insert(label.clone(), ());
+    }
+    for label in snap.graph_active_by_protocol.keys() {
+        protocol_labels.insert(label.clone(), ());
+    }
+    let protocol_count = protocol_labels.len();
+    let protocol_counts = protocol_labels
+        .into_keys()
+        .map(|label| {
+            let arena = arena_counts.get(&label).copied().unwrap_or(0);
+            let graph = snap.graph_active_by_protocol.get(&label).copied().unwrap_or(0);
+            KeyValueRow {
+                key: label,
+                value: format!("{graph}/{arena} graph/arena"),
+                severity: if graph == 0 && arena > 0 {
+                    Severity::Warn
+                } else {
+                    Severity::Info
+                },
+            }
         })
         .collect();
 

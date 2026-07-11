@@ -189,19 +189,21 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
 /// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
 /// iterator chain directly without an intermediate `.collect()`.
 pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
-    let mut best: FxHashMap<u64, Vec<FoundCycle>> = FxHashMap::default();
+    use crate::core::types::CycleEdges;
+    let mut best: FxHashMap<CycleEdges, FoundCycle> = FxHashMap::default();
     for cycle in cycles {
-        let key = cycle_key(&cycle.edges);
-        let bucket = best.entry(key).or_default();
-        if let Some(existing) = bucket.iter_mut().find(|c| c.edges == cycle.edges) {
-            if cycle.score < existing.score {
-                *existing = cycle;
+        match best.entry(cycle.edges.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if cycle.score < e.get().score {
+                    e.insert(cycle);
+                }
             }
-        } else {
-            bucket.push(cycle);
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(cycle);
+            }
         }
     }
-    let mut out: Vec<FoundCycle> = best.into_values().flatten().collect();
+    let mut out: Vec<FoundCycle> = best.into_values().collect();
     out.sort_unstable_by(compare_cycle_score);
     out
 }

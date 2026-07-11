@@ -49,6 +49,8 @@ pub fn collect_negative_cycles_from_source(
     active: &mut Vec<usize>,
     next_active: &mut Vec<usize>,
     in_next: &mut [bool],
+    visited_scratch: &mut [u32],
+    visited_gen: &mut u32,
     should_stop: &mut impl FnMut() -> bool,
 ) {
     let mut touched = Vec::<usize>::new();
@@ -127,13 +129,23 @@ pub fn collect_negative_cycles_from_source(
                 continue;
             }
 
-            let mut visited: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+            *visited_gen = visited_gen.wrapping_add(1);
+            if *visited_gen == 0 {
+                visited_scratch.fill(0);
+                *visited_gen = 1;
+            }
+            let generation = *visited_gen;
             let mut curr = Some(TokenIndex(u_idx as u32));
             while let Some(c) = curr {
-                if !visited.insert(c.0) {
+                let idx = c.0 as usize;
+                if idx >= visited_scratch.len() {
                     break;
                 }
-                curr = pred_node[c.0 as usize];
+                if visited_scratch[idx] == generation {
+                    break;
+                }
+                visited_scratch[idx] = generation;
+                curr = pred_node[idx];
             }
             let Some(cycle_start) = curr else {
                 continue;

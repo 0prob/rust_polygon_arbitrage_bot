@@ -31,8 +31,8 @@ fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
         return (0, 0);
     }
     if hub_heavy {
-        // ponytail: Bellman-Ford only walks Direct edges; hub-spoke pools need DFS budget.
-        let bf = (total / 8).max(1).min(total);
+        // Bellman-Ford only walks Direct edges; V4/Balancer hub-spoke pools need DFS.
+        let bf = (total / 16).max(1).min(total);
         (total.saturating_sub(bf), bf)
     } else {
         let dfs = total.div_ceil(2);
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn hub_heavy_budget_favors_dfs() {
-        assert_eq!(split_hybrid_budget(500, true), (438, 62));
+        assert_eq!(split_hybrid_budget(500, true), (469, 31));
         assert_eq!(split_hybrid_budget(8, true), (7, 1));
     }
 }

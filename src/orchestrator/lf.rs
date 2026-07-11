@@ -178,6 +178,29 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         }
     };
 
+    let mut graph = graph;
+    let missing_graph_pools = {
+        let g = Arc::make_mut(&mut graph);
+        crate::pipeline::graph::attach_missing_eligible_pools(
+            &work.arena,
+            g,
+            work.pool_metas.as_ref(),
+        )
+    };
+    if missing_graph_pools > 0 {
+        crate::info!(
+            "lf graph patch: attached {missing_graph_pools} eligible pools missing from cached adjacency"
+        );
+        work.graph_cache.lock().store(
+            Arc::clone(&graph),
+            None,
+            routable_count,
+            layout_fp,
+            work.state_generation,
+            eligible_count,
+        );
+    }
+
     let need_cycle_refind = {
         let gc = work.graph_cache.lock();
         needs_rebuild || gc.needs_cycle_refind(routable_count, layout_fp, work.state_generation)
@@ -477,6 +500,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     *ctx.arena.lock() = arena.clone();
     let snapshot_now = std::time::Instant::now();
+    let graph_active_by_protocol = Arc::new(
+        crate::services::pipeline_survival::graph_active_protocol_counts(
+            pool_metas.as_ref(),
+            routing_graph.as_ref(),
+        ),
+    );
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
             state_block: ctx.refresh.last_state_block(),
@@ -487,6 +516,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             pool_metas,
             arena,
             discovered_pools: pools_snapshot,
+            graph_active_by_protocol,
             rates_built_at: Some(snapshot_now),
             ..Default::default()
         });

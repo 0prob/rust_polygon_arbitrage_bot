@@ -7,7 +7,7 @@
 
 lf_interval_ms = 4000
 hf_interval_ms = 200
-max_multicall_calls = 180
+max_multicall_calls = 200
 
 [rpc]
 request_timeout_ms = 10000
@@ -19,17 +19,17 @@ profit_safety_multiplier_bps = 25000
 flash_loan_source = "auto"
 
 [routing]
-enumeration_max_paths = 500
+enumeration_max_paths = 650
 max_hops = 4
 ternary_search_iterations = 18
 
 [pipeline]
 stream_enabled = true
-lf_hot_batch = 400
+lf_hot_batch = 600
 lf_full_sweep_interval = 60
 cycle_refind_interval = 8
-hf_sim_cap = 100
-hf_score_cap = 120
+hf_sim_cap = 120
+hf_score_cap = 150
 hf_prefetch_count = 50
 hf_prefetch_budget_ms = 2500
 hf_max_dispatch = 4

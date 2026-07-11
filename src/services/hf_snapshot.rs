@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,6 +23,8 @@ pub struct HfSnapshot {
     pub pool_metas: Arc<Vec<PoolMeta>>,
     pub arena: StateArena,
     pub discovered_pools: Arc<Vec<DiscoveredPool>>,
+    /// Pools with at least one live directed edge in the routing graph, by protocol label.
+    pub graph_active_by_protocol: Arc<BTreeMap<String, usize>>,
     /// Monotonic clock snapshot of when oracle rates were last built for this snapshot.
     pub rates_built_at: Option<Instant>,
 }
@@ -38,6 +41,7 @@ impl Default for HfSnapshot {
             pool_metas: Arc::new(Vec::new()),
             arena: StateArena::default(),
             discovered_pools: Arc::new(Vec::new()),
+            graph_active_by_protocol: Arc::new(BTreeMap::new()),
             rates_built_at: None,
         }
     }

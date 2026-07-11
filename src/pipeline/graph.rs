@@ -382,48 +382,105 @@ fn thin_parallel_edges_in_graph(graph: &mut RoutingGraph) {
     }
 }
 
+fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &PoolMeta) -> bool {
+    if graph.pool_has_live_edges(meta.pool_index) {
+        return false;
+    }
+    let Some(state) = arena
+        .pool_state(meta.pool_index)
+        .filter(|s| s.is_tradable())
+    else {
+        return false;
+    };
+    if !pool_has_admissible_edges(arena, meta) {
+        return false;
+    }
+
+    if uses_hub_spoke(meta) {
+        attach_hub_spoke_pool(graph, meta, state);
+    } else if meta.tokens.len() == 2 {
+        for edge in edges_for_pair(
+            meta.pool_index,
+            meta.protocol,
+            meta.tokens[0],
+            meta.tokens[1],
+            meta.fee_bps,
+            Some(state),
+        ) {
+            graph.push_edge_at(
+                edge.token_in.0,
+                GraphEdge {
+                    edge,
+                    phase: GraphHopPhase::Direct,
+                    target_node: edge.token_out.0,
+                    log_weight: 0.0,
+                    ratio: U256::ZERO,
+                },
+            );
+        }
+    } else {
+        return false;
+    }
+    graph.pool_has_live_edges(meta.pool_index)
+}
+
+fn finalize_graph_topology(arena: &StateArena, graph: &mut RoutingGraph) {
+    rescore_graph_in_place(arena, graph);
+    thin_parallel_edges_in_graph(graph);
+    rebuild_pool_edge_positions_full(graph);
+    graph.coverage = Some(std::sync::Arc::new(
+        crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
+    ));
+}
+
+/// Eligible arena pools that have no live edges in the cached graph yet.
+#[must_use]
+pub fn count_eligible_pools_missing_from_graph(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    graph: &RoutingGraph,
+) -> usize {
+    pools
+        .iter()
+        .filter(|meta| {
+            pool_has_admissible_edges(arena, meta) && !graph.pool_has_live_edges(meta.pool_index)
+        })
+        .count()
+}
+
+/// Attach pools that became tradable since the last connectivity build.
+///
+/// Rescoring alone never adds adjacency for new arena members; without this pass
+/// V4 (and other) pools can sit in the arena with `no_graph` until a full rebuild.
+#[must_use]
+pub fn attach_missing_eligible_pools(
+    arena: &StateArena,
+    graph: &mut RoutingGraph,
+    pools: &[PoolMeta],
+) -> usize {
+    let mut attached = 0usize;
+    for meta in pools {
+        if graph.pool_has_live_edges(meta.pool_index) {
+            continue;
+        }
+        if attach_pool_to_graph(graph, arena, meta) {
+            attached += 1;
+        }
+    }
+    if attached > 0 {
+        finalize_graph_topology(arena, graph);
+    }
+    attached
+}
+
 pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
     let mut graph = RoutingGraph::new(arena.token_count());
 
     for meta in pools {
-        let Some(state) = arena
-            .pool_state(meta.pool_index)
-            .filter(|s| s.is_tradable())
-        else {
-            continue;
-        };
-
-        if uses_hub_spoke(meta) {
-            attach_hub_spoke_pool(&mut graph, meta, state);
-        } else if meta.tokens.len() == 2 {
-            for edge in edges_for_pair(
-                meta.pool_index,
-                meta.protocol,
-                meta.tokens[0],
-                meta.tokens[1],
-                meta.fee_bps,
-                Some(state),
-            ) {
-                graph.push_edge_at(
-                    edge.token_in.0,
-                    GraphEdge {
-                        edge,
-                        phase: GraphHopPhase::Direct,
-                        target_node: edge.token_out.0,
-                        log_weight: 0.0,
-                        ratio: U256::ZERO,
-                    },
-                );
-            }
-        }
+        attach_pool_to_graph(&mut graph, arena, meta);
     }
 
-    rescore_graph_in_place(arena, &mut graph);
-    thin_parallel_edges_in_graph(&mut graph);
-    rebuild_pool_edge_positions_full(&mut graph);
-    graph.coverage = Some(std::sync::Arc::new(
-        crate::pipeline::cycle_finder::cycle_capable_coverage(&graph),
-    ));
+    finalize_graph_topology(arena, &mut graph);
     graph
 }
 
@@ -1020,6 +1077,68 @@ mod tests {
             .log_weight;
         assert_ne!(before, after);
         assert_eq!(untouched, still);
+    }
+
+    fn v4_pool_state() -> Arc<PoolState> {
+        Arc::new(PoolState::V4(crate::core::types::V4PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            tick: 0,
+            liquidity: 1_000_000,
+            fee: U256::from(3000u32),
+            tick_spacing: 60,
+            ticks: Arc::from([] as [crate::core::types::V3Tick; 0]),
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+        }))
+    }
+
+    #[test]
+    fn v4_pools_use_singleton_hub_with_enter_edges() {
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([1u8; 20]));
+        let b = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(Address::from([3u8; 20]), v4_pool_state());
+        let mut meta = pool_meta_from_pair(pool, ProtocolType::UniswapV4, a, b, 30);
+        meta.pool_id = Some(alloy::primitives::FixedBytes::ZERO);
+        let graph = build_graph(&arena, std::slice::from_ref(&meta));
+        assert!(graph.v4_singleton_hub.is_some());
+        assert!(graph.pool_has_live_edges(pool));
+        let enter = graph
+            .adjacency
+            .iter()
+            .take(graph.token_count as usize)
+            .flat_map(|adj| adj.iter())
+            .filter(|ge| ge.phase == GraphHopPhase::EnterPool)
+            .count();
+        assert_eq!(enter, 2);
+    }
+
+    #[test]
+    fn attach_missing_eligible_pools_adds_late_v4_members() {
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([1u8; 20]));
+        let b = arena.register_token(Address::from([2u8; 20]));
+        let pool0 = arena.register_pool(Address::from([3u8; 20]), v4_pool_state());
+        let mut meta0 = pool_meta_from_pair(pool0, ProtocolType::UniswapV4, a, b, 30);
+        meta0.pool_id = Some(alloy::primitives::FixedBytes::ZERO);
+        let mut graph = RoutingGraph::new(arena.token_count());
+
+        let pool1 = arena.register_pool(Address::from([4u8; 20]), v4_pool_state());
+        let c = arena.register_token(Address::from([5u8; 20]));
+        let d = arena.register_token(Address::from([6u8; 20]));
+        let mut meta1 = pool_meta_from_pair(pool1, ProtocolType::UniswapV4, c, d, 30);
+        meta1.pool_id = Some(alloy::primitives::FixedBytes::repeat_byte(1));
+
+        attach_pool_to_graph(&mut graph, &arena, &meta0);
+        finalize_graph_topology(&arena, &mut graph);
+        assert!(graph.pool_has_live_edges(pool0));
+        assert!(!graph.pool_has_live_edges(pool1));
+
+        let attached =
+            attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]);
+        assert_eq!(attached, 1);
+        assert!(graph.pool_has_live_edges(pool1));
     }
 
     #[test]

@@ -61,14 +61,6 @@ pub fn v2_callback_protocol_id(label: Option<&str>) -> u8 {
         8
     } else if ic(l, "quickswap_v2") || ic(l, "quick_v2") {
         9
-    } else if ic(l, "dfyn") {
-        10
-    } else if ic(l, "meshswap") || ic(l, "mesh_swap") {
-        12
-    } else if ic(l, "jetswap") || ic(l, "jet_swap") {
-        13
-    } else if ic(l, "cometh") {
-        14
     } else {
         7
     }

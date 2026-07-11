@@ -29,6 +29,8 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
     let mut active = Vec::with_capacity(token_count);
     let mut next_active = Vec::with_capacity(token_count);
     let mut in_next = vec![false; token_count];
+    let mut visited_scratch = vec![0u32; token_count];
+    let mut visited_gen = 0u32;
 
     let mut deadline = DeadlineGuard::new(BF_TIME_BUDGET);
     let sources: Vec<_> =
@@ -58,6 +60,8 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
                 &mut active,
                 &mut next_active,
                 &mut in_next,
+                &mut visited_scratch,
+                &mut visited_gen,
                 &mut || deadline.tick(),
             );
         }

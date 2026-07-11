@@ -20,7 +20,7 @@ use crate::pipeline::types::{
 pub use crate::pipeline::spot_price::hop_penalty;
 
 const MAX_CYCLES_PER_PASS: usize = 50_000;
-const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(350);
+const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(500);
 /// Cap parallel DFS shards — unbounded hub enumeration burns the shared deadline.
 const DFS_MAX_START_SOURCES: usize = 32;
 /// Amortize elapsed-time checks during DFS enumeration.
@@ -935,13 +935,11 @@ fn collect_cycles_dfs_parallel(
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
     use std::collections::hash_map::Entry;
 
-    use crate::pipeline::cycle_filter::cycle_key;
     use crate::pipeline::types::compare_cycle_score;
 
-    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
+    let mut best: rustc_hash::FxHashMap<CycleEdges, FoundCycle> = rustc_hash::FxHashMap::default();
     for cycle in shard_cycles.iter().flat_map(|s| s.iter()) {
-        let key = cycle_key(&cycle.edges);
-        match best.entry(key) {
+        match best.entry(cycle.edges.clone()) {
             Entry::Occupied(mut e) => {
                 if cycle.score < e.get().score {
                     *e.get_mut() = cycle.clone();
