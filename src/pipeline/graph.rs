@@ -320,12 +320,12 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
 }
 
 fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
-    if max_per_pair == 0 {
+    if max_per_pair == 0 || adj.len() <= max_per_pair {
         return;
     }
     use std::cmp::Reverse;
 
-    let drained: Vec<GraphEdge> = adj.drain(..).collect();
+    let drained = std::mem::take(adj);
     let (mut direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
         .into_iter()
         .partition(|ge| ge.phase == GraphHopPhase::Direct);

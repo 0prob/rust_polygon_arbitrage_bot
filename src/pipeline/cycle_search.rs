@@ -10,9 +10,34 @@ use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
 use crate::pipeline::weighted_graph::build_weighted_adjacency;
 use rayon::join;
 
-fn split_hybrid_budget(total: usize) -> (usize, usize) {
-    let dfs = total.div_ceil(2);
-    (dfs, total.saturating_sub(dfs))
+fn graph_hub_heavy(graph: &RoutingGraph) -> bool {
+    let token_slots = graph.token_count as usize;
+    let mut enter = 0usize;
+    let mut direct = 0usize;
+    for adj in graph.adjacency.iter().take(token_slots) {
+        for ge in adj {
+            match ge.phase {
+                crate::pipeline::types::GraphHopPhase::EnterPool => enter += 1,
+                crate::pipeline::types::GraphHopPhase::Direct => direct += 1,
+                crate::pipeline::types::GraphHopPhase::ExitPool => {}
+            }
+        }
+    }
+    enter > direct
+}
+
+fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    if hub_heavy {
+        // ponytail: Bellman-Ford only walks Direct edges; hub-spoke pools need DFS budget.
+        let bf = (total / 8).max(1).min(total);
+        (total.saturating_sub(bf), bf)
+    } else {
+        let dfs = total.div_ceil(2);
+        (dfs, total.saturating_sub(dfs))
+    }
 }
 
 fn finalize_cycles(
@@ -87,10 +112,11 @@ pub fn find_cycles_hybrid_multi_pass(
         return Vec::new();
     }
 
+    let hub_heavy = graph_hub_heavy(graph);
     let dfs_budget: Vec<_> = passes
         .iter()
         .map(|p| {
-            let (dfs, _) = split_hybrid_budget(p.max_cycles);
+            let (dfs, _) = split_hybrid_budget(p.max_cycles, hub_heavy);
             CycleSearchPass {
                 max_hops: p.max_hops,
                 max_cycles: dfs,
@@ -100,7 +126,7 @@ pub fn find_cycles_hybrid_multi_pass(
     let bf_budget: Vec<_> = passes
         .iter()
         .map(|p| {
-            let (_, bf) = split_hybrid_budget(p.max_cycles);
+            let (_, bf) = split_hybrid_budget(p.max_cycles, hub_heavy);
             CycleSearchPass {
                 max_hops: p.max_hops,
                 max_cycles: bf,
@@ -143,10 +169,16 @@ mod tests {
 
     #[test]
     fn split_hybrid_budget_uses_all_capacity() {
-        assert_eq!(split_hybrid_budget(0), (0, 0));
-        assert_eq!(split_hybrid_budget(1), (1, 0));
-        assert_eq!(split_hybrid_budget(2), (1, 1));
-        assert_eq!(split_hybrid_budget(3), (2, 1));
-        assert_eq!(split_hybrid_budget(5), (3, 2));
+        assert_eq!(split_hybrid_budget(0, false), (0, 0));
+        assert_eq!(split_hybrid_budget(1, false), (1, 0));
+        assert_eq!(split_hybrid_budget(2, false), (1, 1));
+        assert_eq!(split_hybrid_budget(3, false), (2, 1));
+        assert_eq!(split_hybrid_budget(5, false), (3, 2));
+    }
+
+    #[test]
+    fn hub_heavy_budget_favors_dfs() {
+        assert_eq!(split_hybrid_budget(500, true), (438, 62));
+        assert_eq!(split_hybrid_budget(8, true), (7, 1));
     }
 }

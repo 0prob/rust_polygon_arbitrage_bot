@@ -717,6 +717,7 @@ struct BalancerVerifyJob {
 }
 
 /// Drop Balancer-only candidates whose vault `queryBatchSwap` disagrees with local sim.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn filter_balancer_onchain_verified<
     P: Provider<Ethereum> + Clone + Send + 'static,
 >(

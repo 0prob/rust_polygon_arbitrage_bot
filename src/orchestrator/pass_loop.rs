@@ -510,7 +510,8 @@ fn schedule_hf_tick(
         if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
             crate::warn!("hf tick failed: {e:#}");
         }
-        if hf_pending_coalesce.swap(false, Ordering::AcqRel) {
+        drop(_permit);
+        if take_pending_hf_tick(&hf_pending_coalesce) {
             schedule_hf_tick(
                 hf_ctx_run,
                 hf_inflight_coalesce,
@@ -520,6 +521,10 @@ fn schedule_hf_tick(
             );
         }
     }));
+}
+
+fn take_pending_hf_tick(hf_pending: &AtomicBool) -> bool {
+    hf_pending.swap(false, Ordering::AcqRel)
 }
 
 fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {
@@ -546,5 +551,19 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
             continue;
         };
         oracle.register_chainlink_feed(token, feed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_pending_hf_tick;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn pending_hf_tick_is_consumed_once() {
+        let pending = AtomicBool::new(true);
+        assert!(take_pending_hf_tick(&pending));
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(!take_pending_hf_tick(&pending));
     }
 }

@@ -13,10 +13,12 @@ pub struct WeightedEdge {
 }
 
 /// Build Johnson/Bellman-Ford adjacency from graph edge weights (already rescored).
+/// Only token nodes are included — virtual hub slots carry Enter/Exit legs, not Direct swaps.
 #[must_use]
 pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> {
-    let mut out = Vec::with_capacity(graph.token_count as usize);
-    for edges in &graph.adjacency {
+    let token_slots = graph.token_count as usize;
+    let mut out = Vec::with_capacity(token_slots);
+    for edges in graph.adjacency.iter().take(token_slots) {
         let mut list = Vec::with_capacity(edges.len());
         for ge in edges {
             if ge.phase != GraphHopPhase::Direct || !is_live_graph_edge(ge) {
@@ -58,6 +60,24 @@ mod tests {
             log_weight: weight,
             ratio: U256::ZERO,
         }
+    }
+
+    #[test]
+    fn weighted_adjacency_ignores_virtual_hub_slots() {
+        let mut graph = RoutingGraph::new(2);
+        let live = graph_edge(-0.1);
+        graph.add_edge(TokenIndex(0), live);
+        graph
+            .virtual_hubs
+            .push(crate::pipeline::types::VirtualPoolHub {
+                pool_index: PoolIndex(9),
+                protocol: ProtocolType::BalancerV2,
+                exit_legs: smallvec::smallvec![0, 1],
+                v4_singleton: false,
+            });
+        graph.adjacency.push(vec![graph_edge(0.0)]);
+        let adj = build_weighted_adjacency(&graph);
+        assert_eq!(adj.len(), 2);
     }
 
     #[test]

@@ -2,7 +2,6 @@ use alloy::primitives::Address;
 use alloy::primitives::U256;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
-use std::collections::hash_map::Entry;
 
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
@@ -190,24 +189,19 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
 /// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
 /// iterator chain directly without an intermediate `.collect()`.
 pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
-    // ponytail: single flat map avoids Vec-per-bucket allocation and the
-    // subsequent flatten. FxHash collisions are 1-in-2^64 — for practical
-    // cycle counts (~50k) the birthday-collision probability is negligible.
-    let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
+    let mut best: FxHashMap<u64, Vec<FoundCycle>> = FxHashMap::default();
     for cycle in cycles {
         let key = cycle_key(&cycle.edges);
-        match best.entry(key) {
-            Entry::Occupied(mut e) => {
-                if cycle.score < e.get().score {
-                    e.insert(cycle);
-                }
+        let bucket = best.entry(key).or_default();
+        if let Some(existing) = bucket.iter_mut().find(|c| c.edges == cycle.edges) {
+            if cycle.score < existing.score {
+                *existing = cycle;
             }
-            Entry::Vacant(e) => {
-                e.insert(cycle);
-            }
+        } else {
+            bucket.push(cycle);
         }
     }
-    let mut out: Vec<FoundCycle> = best.into_values().collect();
+    let mut out: Vec<FoundCycle> = best.into_values().flatten().collect();
     out.sort_unstable_by(compare_cycle_score);
     out
 }

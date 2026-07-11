@@ -364,7 +364,16 @@ fn walk_route_hops(
 ) -> Option<(U256, u32)> {
     let mut current = amount_in;
     let mut total_gas = 0u32;
-    let shallow_caps = route_spot_probes(arena, edges);
+    let shallow_caps = if edges.iter().any(|edge| {
+        matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        )
+    }) {
+        route_spot_probes(arena, edges)
+    } else {
+        [U256::MAX; HOP_CAP_USIZE]
+    };
     if let Some(amounts) = hop_amounts.as_deref_mut() {
         *amounts.first_mut()? = amount_in;
     }

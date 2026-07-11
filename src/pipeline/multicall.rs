@@ -93,7 +93,7 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                 pending.push((mid, end));
                 pending.push((start, mid));
             }
-            Err(e) => return Err(e),
+            Err(_e) => {}
         }
     }
     Ok(out)

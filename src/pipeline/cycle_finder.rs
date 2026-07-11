@@ -9,7 +9,7 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
-use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
+use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_packed_route_calls};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
@@ -461,6 +461,7 @@ fn hub_exit_legs(
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_cycles_dfs_single_start(
     graph: &RoutingGraph,
     arena: &StateArena,
@@ -503,7 +504,6 @@ fn collect_cycles_dfs_single_start(
         log_w: f64,
         product_ratio: U256,
         cum_fee: u32,
-        route_calls: usize,
         hop_cap: u32,
         max_cycles: usize,
         budget: &SharedDeadlineGuard,
@@ -524,6 +524,9 @@ fn collect_cycles_dfs_single_start(
             }
             let exit_legs = hub_exit_legs(graph, curr_node, pending, pool_metas, arena);
             for out_leg in exit_legs {
+                if out_leg == pending.token_in_idx {
+                    continue;
+                }
                 if budget.tick() || cycles.len() >= max_cycles {
                     break;
                 }
@@ -558,11 +561,11 @@ fn collect_cycles_dfs_single_start(
                 ) {
                     continue;
                 }
-                let hop_calls = estimate_hop_calls(edge.protocol);
-                if route_calls + hop_calls > MAX_ROUTE_CALLS {
+                path.push(edge);
+                if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS {
+                    path.pop();
                     continue;
                 }
-                path.push(edge);
                 dfs(
                     graph,
                     arena,
@@ -578,7 +581,6 @@ fn collect_cycles_dfs_single_start(
                     next_log_w,
                     next_ratio,
                     cum_fee + clamp_fee_bps(edge.fee_bps),
-                    route_calls + hop_calls,
                     hop_cap,
                     max_cycles,
                     budget,
@@ -593,7 +595,7 @@ fn collect_cycles_dfs_single_start(
 
         let curr = TokenIndex(curr_node);
         if hops >= 2 && curr == start {
-            if route_calls > MAX_ROUTE_CALLS
+            if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS
                 || product_ratio <= ONE
                 || product_ratio < min_profitable_cycle_ratio(hops)
             {
@@ -663,7 +665,6 @@ fn collect_cycles_dfs_single_start(
                         log_w,
                         product_ratio,
                         cum_fee,
-                        route_calls,
                         hop_cap,
                         max_cycles,
                         budget,
@@ -692,13 +693,12 @@ fn collect_cycles_dfs_single_start(
                         pool_unmark(used_pools, pool_id);
                         continue;
                     }
-                    let hop_calls = estimate_hop_calls(ge.edge.protocol);
-                    if route_calls + hop_calls > MAX_ROUTE_CALLS {
+                    path.push(ge.edge);
+                    if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS {
+                        path.pop();
                         pool_unmark(used_pools, pool_id);
                         continue;
                     }
-
-                    path.push(ge.edge);
                     dfs(
                         graph,
                         arena,
@@ -714,7 +714,6 @@ fn collect_cycles_dfs_single_start(
                         next_log_w,
                         next_ratio,
                         cum_fee + clamp_fee_bps(ge.edge.fee_bps),
-                        route_calls + hop_calls,
                         hop_cap,
                         max_cycles,
                         budget,
@@ -765,7 +764,6 @@ fn collect_cycles_dfs_single_start(
                     0.0,
                     ONE,
                     0,
-                    0,
                     hop_cap,
                     max_cycles,
                     budget,
@@ -790,8 +788,12 @@ fn collect_cycles_dfs_single_start(
                     continue;
                 }
                 pool_mark(&mut used_pools, pool_id);
-                let hop_calls = estimate_hop_calls(ge.edge.protocol);
                 path.push(ge.edge);
+                if estimate_packed_route_calls(&path) > MAX_ROUTE_CALLS {
+                    path.pop();
+                    pool_unmark(&mut used_pools, pool_id);
+                    continue;
+                }
                 dfs(
                     graph,
                     arena,
@@ -807,7 +809,6 @@ fn collect_cycles_dfs_single_start(
                     ge.log_weight,
                     ge.ratio,
                     clamp_fee_bps(ge.edge.fee_bps),
-                    hop_calls,
                     hop_cap,
                     max_cycles,
                     budget,

@@ -8,6 +8,7 @@ const POOL_COUNT_REBUILD_DELTA: usize = 64;
 const WARM_POOL_COUNT_REBUILD_DELTA: usize = 256;
 /// Routable pool count treated as a warm graph for rebuild throttling.
 const WARM_POOL_THRESHOLD: usize = 3_000;
+const ELIGIBLE_POOL_REBUILD_DELTA: usize = 64;
 const DEFAULT_CYCLE_REFIND_INTERVAL: u64 = 8;
 
 #[must_use]
@@ -113,7 +114,11 @@ impl GraphCache {
     /// Pools losing eligibility only need edge rescoring (dead edges).
     #[must_use]
     pub fn connectivity_stale(&self, eligible_pool_count: usize) -> bool {
-        self.graph.is_some() && eligible_pool_count > self.cached_eligible_pool_count
+        if self.graph.is_none() || eligible_pool_count <= self.cached_eligible_pool_count {
+            return false;
+        }
+        let delta = eligible_pool_count - self.cached_eligible_pool_count;
+        delta >= ELIGIBLE_POOL_REBUILD_DELTA.max(self.cached_eligible_pool_count / 20)
     }
 
     #[must_use]
@@ -346,8 +351,8 @@ mod tests {
         );
         assert!(!cache.connectivity_stale(800));
         assert!(!cache.connectivity_stale(799));
-        assert!(cache.connectivity_stale(801));
-        assert!(cache.connectivity_stale(850));
+        assert!(!cache.connectivity_stale(801));
+        assert!(cache.connectivity_stale(864));
     }
 
     #[test]
