@@ -65,7 +65,7 @@ cd ../sol && ./script/deploy_mainnet.sh
 # Set EXECUTOR_ADDRESS in .env to the logged address
 ```
 
-Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The shipped `config.toml` lowers `min_profit_matic_wei` to 0.01 MATIC, raises HF caps, and sets `enumeration_max_paths = 500`.
+Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The shipped `config.toml` lowers `min_profit_matic_wei` to 0.01 MATIC, tunes HF parameters (score cap 150, prefetch 50, max dispatch 4, prefetch budget 2500ms), and sets `enumeration_max_paths = 650`.
 
 ## Run
 
@@ -85,6 +85,7 @@ Useful env vars:
 
 ```bash
 RPBOT_LOG=info                          # log level filter (error|warn|info|debug|trace)
+RPBOT_LOG_DIR=/tmp/bot                  # component JSONL log directory
 EXECUTION_MODE=dry-run                  # default-safe mode
 ROUTING_CYCLE_FINDER=hybrid             # hybrid | dfs | johnson | bellman-ford
 BLOXROUTE_AUTH_HEADER=your_bloxroute_auth   # private mempool via bloXroute BDN
@@ -138,6 +139,6 @@ Pool metadata flows from PostgreSQL → `StateRefreshService` → `StateCache` �
 
 Set `STREAM_ENABLED=true` and `WSS_URL` (or rely on `wss://` auto-conversion from `STATE_RPC_URL`). Live submits should use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER` for direct mempool injection (not the public execution RPC).
 
-Logs are structured JSON lines to stderr. Default level is `info`; set `RPBOT_LOG=debug` for more detail. In release builds, `debug!` and `trace!` compile away.
+Live logs use a compact, `tput`-colored stdout format with fixed level and component columns. The same events are buffered asynchronously as JSONL under `/tmp/bot/run-<timestamp>-<pid>/{system,infra,state,oracle,routing,orchestrator,execution,tui}.jsonl`; private run directories prevent mixed sessions, the newest 10 runs are retained, and each active component is capped at 16 MiB. Set `RPBOT_LOG=debug` for more detail or `RPBOT_LOG_DIR` to move the run directories. The TUI suppresses stdout logs while retaining the component files.
 
 When the TUI is running, `UiBridge` receives snapshot and event updates from the orchestrator for live display.

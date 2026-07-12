@@ -211,6 +211,7 @@ pub async fn run_pass_loop(
     hf_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let hf_inflight = Arc::new(Semaphore::new(1));
     let hf_pending = Arc::new(AtomicBool::new(false));
+    let hf_stream_pending = Arc::new(AtomicBool::new(false));
     let hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>> = Arc::new(ParkingMutex::new(None)); // ponytail: simple shared handle tracking
 
     if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
@@ -228,13 +229,13 @@ pub async fn run_pass_loop(
         });
     }
 
-    if let Ok(provider) = ctx.rpc.connect_state() {
-        ctx.gas_oracle
-            .clone()
-            .start_background(provider, shutdown.clone());
-        Arc::clone(&ctx.execution.flash_liquidity)
-            .start_background(Arc::clone(&ctx.rpc), shutdown.clone());
-    }
+    Arc::clone(&ctx.execution.flash_liquidity)
+        .start_background(Arc::clone(&ctx.rpc), shutdown.clone());
+    spawn_gas_oracle_background(
+        Arc::clone(&ctx.gas_oracle),
+        Arc::clone(&ctx.rpc),
+        shutdown.clone(),
+    );
 
     #[cfg(feature = "tui")]
     let snapshot_handle = ctx.ui_snapshot_tx.clone().map(|tx| {
@@ -284,6 +285,7 @@ pub async fn run_pass_loop(
                     Arc::clone(&hf_inflight),
                     Arc::clone(&hf_task),
                     Arc::clone(&hf_pending),
+                    Arc::clone(&hf_stream_pending),
                     false,
                 );
             }
@@ -305,6 +307,7 @@ pub async fn run_pass_loop(
                             Arc::clone(&hf_inflight),
                             Arc::clone(&hf_task),
                             Arc::clone(&hf_pending),
+                            Arc::clone(&hf_stream_pending),
                             false,
                         );
                     }
@@ -368,6 +371,7 @@ pub async fn run_pass_loop(
                                 Arc::clone(&hf_inflight),
                                 Arc::clone(&hf_task),
                                 Arc::clone(&hf_pending),
+                                Arc::clone(&hf_stream_pending),
                                 true,
                             );
                         }
@@ -397,12 +401,14 @@ pub async fn run_pass_loop(
         handle.abort();
     }
     let hf_join = hf_task.lock().take();
-    if let Some(handle) = hf_join
-        && tokio::time::timeout(Duration::from_secs(5), handle)
+    if let Some(mut handle) = hf_join
+        && tokio::time::timeout(Duration::from_secs(5), &mut handle)
             .await
             .is_err()
     {
-        crate::warn!("hf task did not exit within 5s of shutdown");
+        handle.abort();
+        let _ = handle.await;
+        crate::warn!("hf task aborted after 5s shutdown timeout");
     }
     if let (Some(executor), Ok(provider)) = (
         ctx.config.execution.executor_address,
@@ -411,12 +417,11 @@ pub async fn run_pass_loop(
         let operator = ctx.wallet.operator_address(executor);
         ctx.execution.shutdown_resync(&provider, operator).await;
     }
-    lf_handle.abort();
-    if tokio::time::timeout(Duration::from_secs(2), lf_handle)
+    if tokio::time::timeout(Duration::from_secs(5), lf_handle)
         .await
         .is_err()
     {
-        crate::warn!("lf background task did not exit within 2s of shutdown");
+        crate::warn!("lf background task did not exit within 5s of shutdown");
     }
     #[cfg(feature = "tui")]
     if let Some(handle) = snapshot_handle {
@@ -485,23 +490,61 @@ fn spawn_daily_loss_guard(
     }))
 }
 
+/// Start fee polling once state RPC is reachable (retries if startup connect fails).
+fn spawn_gas_oracle_background(
+    gas_oracle: Arc<GasOracle>,
+    rpc: Arc<RpcPool>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let retry = Duration::from_secs(5);
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            match rpc.connect_state() {
+                Ok(provider) => {
+                    gas_oracle.start_background(provider, shutdown);
+                    return;
+                }
+                Err(e) => {
+                    crate::warn!("gas oracle waiting for state RPC: {e:#}");
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(retry) => {}
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn schedule_hf_tick(
     hf_ctx: Arc<HfContext>,
     hf_inflight: Arc<Semaphore>,
     hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>>,
     hf_pending: Arc<AtomicBool>,
+    hf_stream_pending: Arc<AtomicBool>,
     stream_triggered: bool,
 ) {
     let hf_inflight_acquire = Arc::clone(&hf_inflight);
     let hf_inflight_coalesce = Arc::clone(&hf_inflight);
     let Ok(permit) = hf_inflight_acquire.try_acquire_owned() else {
         hf_pending.store(true, Ordering::Release);
+        if stream_triggered {
+            hf_stream_pending.store(true, Ordering::Release);
+        }
         return;
     };
     let hf_ctx_run = Arc::clone(&hf_ctx);
     let hf_task_store = Arc::clone(&hf_task);
     let hf_task_coalesce = Arc::clone(&hf_task);
     let hf_pending_coalesce = Arc::clone(&hf_pending);
+    let hf_stream_pending_coalesce = Arc::clone(&hf_stream_pending);
     *hf_task_store.lock() = Some(tokio::spawn(async move {
         let _permit = permit;
         if stream_triggered {
@@ -512,12 +555,14 @@ fn schedule_hf_tick(
         }
         drop(_permit);
         if take_pending_hf_tick(&hf_pending_coalesce) {
+            let coalesced_stream = take_pending_hf_stream(&hf_stream_pending_coalesce);
             schedule_hf_tick(
                 hf_ctx_run,
                 hf_inflight_coalesce,
                 hf_task_coalesce,
                 hf_pending_coalesce,
-                false,
+                hf_stream_pending_coalesce,
+                coalesced_stream,
             );
         }
     }));
@@ -525,6 +570,10 @@ fn schedule_hf_tick(
 
 fn take_pending_hf_tick(hf_pending: &AtomicBool) -> bool {
     hf_pending.swap(false, Ordering::AcqRel)
+}
+
+fn take_pending_hf_stream(hf_stream_pending: &AtomicBool) -> bool {
+    hf_stream_pending.swap(false, Ordering::AcqRel)
 }
 
 fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {
@@ -556,7 +605,7 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
 
 #[cfg(test)]
 mod tests {
-    use super::take_pending_hf_tick;
+    use super::{take_pending_hf_stream, take_pending_hf_tick};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -565,5 +614,13 @@ mod tests {
         assert!(take_pending_hf_tick(&pending));
         assert!(!pending.load(Ordering::Acquire));
         assert!(!take_pending_hf_tick(&pending));
+    }
+
+    #[test]
+    fn pending_hf_stream_is_consumed_once() {
+        let pending = AtomicBool::new(true);
+        assert!(take_pending_hf_stream(&pending));
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(!take_pending_hf_stream(&pending));
     }
 }

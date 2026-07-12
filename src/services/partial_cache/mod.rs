@@ -278,6 +278,12 @@ impl PartialPoolCache {
     pub fn tracked_addresses(&self) -> Vec<Address> {
         self.pools.iter().map(|e| *e.key()).collect()
     }
+
+    /// Pools patched since the last flush — small vs the full WSS target set.
+    #[must_use]
+    pub fn dirty_addresses(&self) -> Vec<Address> {
+        self.dirty.lock().iter().copied().collect()
+    }
 }
 
 impl Default for PartialPoolCache {

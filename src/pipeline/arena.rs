@@ -249,6 +249,24 @@ impl StateArena {
             let Some(pool) = pools.get(idx) else {
                 continue;
             };
+            let bpt_hint = match state.as_ref() {
+                PoolState::Balancer(b) => b.bpt_index,
+                _ => None,
+            };
+            let token_count = match state.as_ref() {
+                PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
+                PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
+                _ => pool.tokens.len(),
+            };
+            if !crate::pipeline::graph::pool_state_graph_eligible(
+                state.as_ref(),
+                pool.protocol,
+                token_count,
+                bpt_hint,
+                pool.fee_bps,
+            ) {
+                continue;
+            }
             // ponytail: borrow token addresses instead of cloning Vec — most
             // pools use the discovery order, and state-hydrated tokens (Balancer,
             // Woofi) can be borrowed directly. Dodo canonicalization is the only
@@ -493,6 +511,48 @@ mod tests {
         };
         assert_eq!(s.reserve0, U256::from(42_000u64));
         assert_eq!(s.block_timestamp_last, 2);
+    }
+
+    #[test]
+    fn sync_skips_tradable_pools_without_graph_edges() {
+        let pool_address = Address::with_last_byte(21);
+        let a = Address::with_last_byte(22);
+        let b = Address::with_last_byte(23);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let cache = StateCache::default();
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: dust,
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        let discovered = [DiscoveredPool {
+            pool_key: pool_address.to_string(),
+            address: pool_address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "TEST_V2".into(),
+            tokens: vec![a, b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect();
+        let mut arena = StateArena::default();
+        let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
+        assert!(metas.is_empty());
     }
 
     #[test]

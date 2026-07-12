@@ -14,20 +14,32 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     rpbot::config::load_dotenv();
-    rpbot::log::init();
+    rpbot::log::init()?;
 
     #[cfg(feature = "tui")]
-    let ctx = bootstrap(None, None).await?;
+    let bootstrap_result = bootstrap(None, None).await;
     #[cfg(not(feature = "tui"))]
-    let ctx = bootstrap(None).await?;
+    let bootstrap_result = bootstrap(None).await;
+    let ctx = match bootstrap_result {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            rpbot::error!("bootstrap failed: {error:#}");
+            rpbot::log::shutdown();
+            return Err(error);
+        }
+    };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let pass_handle = tokio::spawn(run_pass_loop(ctx, shutdown_rx));
 
     match await_pass_loop(pass_handle, shutdown_tx).await {
         Ok(()) => rpbot::info!("shutdown complete"),
-        Err(e) => return Err(e),
+        Err(e) => {
+            rpbot::log::shutdown();
+            return Err(e);
+        }
     }
+    rpbot::log::shutdown();
     Ok(())
 }
 

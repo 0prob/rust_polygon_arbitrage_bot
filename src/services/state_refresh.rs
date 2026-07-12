@@ -133,7 +133,7 @@ impl StateRefreshService {
         let count = {
             let state = self.discovery_state.read();
             self.cache
-                .count_tradable_iter(state.discovered.iter().map(|p| &p.address))
+                .count_tradable_in_discovery(&state.address_index)
         };
         self.routable_pool_count.store(count, Ordering::Relaxed);
         self.routable_pool_count_generation
@@ -527,25 +527,20 @@ impl StateRefreshService {
     }
 
     fn prune_dead_pools(&self) {
-        let addresses: Vec<Address> = self
-            .discovery_state
-            .read()
-            .discovered
-            .iter()
-            .map(|p| p.address)
-            .collect();
-        let (_, invalid, _) = self.cache.classify_for_fetch(&addresses);
+        let invalid_set: rustc_hash::FxHashSet<Address> = {
+            let state = self.discovery_state.read();
+            self.cache
+                .pools_past_invalid_retry(state.discovered.as_ref())
+                .into_iter()
+                .collect()
+        };
 
         let mut state = self.discovery_state.write();
         let mut to_remove: Vec<Address> = Vec::new();
 
-        let invalid_set: rustc_hash::FxHashSet<Address> = invalid.into_iter().copied().collect();
-
-        for addr in &addresses {
-            if !invalid_set.contains(addr) {
-                state.invalid_fetch_count.remove(addr);
-            }
-        }
+        state
+            .invalid_fetch_count
+            .retain(|addr, _| invalid_set.contains(addr));
 
         for addr in &invalid_set {
             let entry = state.invalid_fetch_count.entry(*addr).or_insert(0);

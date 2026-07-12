@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ponytail: ~50 lines, zero deps — grep | tail is the dashboard
 set -euo pipefail
+shopt -s nullglob
 
 cd "$(dirname "$0")/.."
 LOG_DIR="./target/run-logs"
@@ -20,6 +21,7 @@ BACKOFF=2
 MAX_BACKOFF=60
 RESTART_COUNT=0
 START_TS=$(date +%s)
+BOT_LOG_ROOT=${RPBOT_LOG_DIR:-/tmp/bot}
 
 cleanup() {
     echo "[runner] shutting down..." | tee -a "$RUN_LOG"
@@ -33,7 +35,7 @@ while true; do
     echo "[runner] starting bot (restart #$RESTART_COUNT)..." >> "$RUN_LOG"
 
     # Run with timeout protection (1 hour max per run, the main loop handles disconnects internally)
-    if CONFIG_PATH=./config.toml RPBOT_LOG=info EXECUTION_MODE=dry-run \
+    if CONFIG_PATH=./config.toml RPBOT_LOG=info RPBOT_LOG_DIR="$BOT_LOG_ROOT" EXECUTION_MODE=dry-run \
         timeout 3600 "$BOT_BIN" >> "$RUN_LOG" 2>&1; then
         EXIT_CODE=$?
         echo "[runner] bot exited normally (code=$EXIT_CODE)" >> "$RUN_LOG"
@@ -58,9 +60,15 @@ while true; do
     grep 'assess failed\|near-miss' "$RUN_LOG" | tail -3 >> "$RUN_LOG" 2>/dev/null || true
     # Dispatch
     grep 'dispatch' "$RUN_LOG" | tail -3 >> "$RUN_LOG" 2>/dev/null || true
-    # Errors/warnings
-    grep -c '"lvl":"WARN"' "$RUN_LOG" | xargs -I{} echo "warnings: {}" >> "$RUN_LOG" 2>/dev/null || true
-    grep -c '"lvl":"ERROR"' "$RUN_LOG" | xargs -I{} echo "errors: {}" >> "$RUN_LOG" 2>/dev/null || true
+    LATEST_COMPONENT_RUN=$(find "$BOT_LOG_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'run-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)
+    COMPONENT_LOGS=("$LATEST_COMPONENT_RUN"/*.jsonl)
+    if [ "${#COMPONENT_LOGS[@]}" -eq 0 ]; then
+        echo "warnings: 0" >> "$RUN_LOG"
+        echo "errors: 0" >> "$RUN_LOG"
+    else
+        grep -h -c '"level":"WARN"' "${COMPONENT_LOGS[@]}" 2>/dev/null | awk '{s+=$1} END {print "warnings: " s+0}' >> "$RUN_LOG" || true
+        grep -h -c '"level":"ERROR"' "${COMPONENT_LOGS[@]}" 2>/dev/null | awk '{s+=$1} END {print "errors: " s+0}' >> "$RUN_LOG" || true
+    fi
 
     echo "========================" >> "$RUN_LOG"
 

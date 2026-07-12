@@ -1,6 +1,7 @@
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
+use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
@@ -290,45 +291,111 @@ pub fn count_graph_eligible_pools(arena: &StateArena, pools: &[PoolMeta]) -> usi
         .count()
 }
 
-#[inline]
-fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
-    let Some(state) = arena
-        .pool_state(meta.pool_index)
-        .filter(|s| s.is_tradable())
-    else {
-        return false;
-    };
-    match meta.tokens.len() {
-        0 | 1 => false,
-        2 if !uses_hub_spoke(meta) => {
-            state.hop_pair_routable(0, 1) || state.hop_pair_routable(1, 0)
+fn direct_pair_has_marginal_spot(
+    state: &PoolState,
+    protocol: ProtocolType,
+    fee_bps: u32,
+) -> bool {
+    for (tin, tout, zfo) in [(0u8, 1u8, true), (1u8, 0u8, false)] {
+        if !state.hop_pair_routable(tin as usize, tout as usize) {
+            continue;
         }
-        _ => {
-            let funded = funded_token_indices(state, meta);
-            for (pos, &i) in funded.iter().enumerate() {
-                for &j in &funded[pos + 1..] {
-                    if state.hop_pair_routable(i as usize, j as usize)
-                        || state.hop_pair_routable(j as usize, i as usize)
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
+        let edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(u32::from(tin)),
+            token_out: TokenIndex(u32::from(tout)),
+            token_in_idx: tin,
+            token_out_idx: tout,
+            protocol,
+            fee_bps,
+            zero_for_one: zfo,
+        };
+        if spot_price_from_state(state, &edge, 18) > 0.0 {
+            return true;
         }
     }
+    false
+}
+
+/// Tradable pool would emit at least one routable graph edge (arena sync gate).
+#[must_use]
+pub fn pool_state_graph_eligible(
+    state: &PoolState,
+    protocol: ProtocolType,
+    token_count: usize,
+    bpt_index: Option<usize>,
+    fee_bps: u32,
+) -> bool {
+    if !state.is_tradable() || token_count < 2 {
+        return false;
+    }
+    let hub_spoke = protocol == ProtocolType::UniswapV4 || token_count > 2;
+    if token_count == 2 && !hub_spoke {
+        return direct_pair_has_marginal_spot(state, protocol, fee_bps);
+    }
+    let mut funded = SmallVec::<[u8; 8]>::new();
+    for i in 0..token_count {
+        if bpt_index == Some(i) {
+            continue;
+        }
+        if state.hop_token_funded(i) {
+            funded.push(i as u8);
+        }
+    }
+    for (pos, &i) in funded.iter().enumerate() {
+        for &j in &funded[pos + 1..] {
+            if state.hop_pair_routable(i as usize, j as usize)
+                || state.hop_pair_routable(j as usize, i as usize)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
+    let Some(state) = arena.pool_state(meta.pool_index) else {
+        return false;
+    };
+    let token_count = match state {
+        PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
+        PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
+        _ => meta.tokens.len(),
+    };
+    let bpt_index = meta.bpt_index.or(match state {
+        PoolState::Balancer(b) => b.bpt_index,
+        _ => None,
+    });
+    pool_state_graph_eligible(
+        state,
+        meta.protocol,
+        token_count,
+        bpt_index,
+        meta.fee_bps,
+    )
+}
+
+#[inline]
+fn is_prunable_direct_edge(ge: &GraphEdge) -> bool {
+    ge.phase == GraphHopPhase::Direct
+        && (ge.ratio.is_zero() || ge.log_weight >= DEAD_EDGE_LOG_WEIGHT)
 }
 
 fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
-    if max_per_pair == 0 || adj.len() <= max_per_pair {
-        return;
-    }
     use std::cmp::Reverse;
 
     let drained = std::mem::take(adj);
     let (mut direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
         .into_iter()
         .partition(|ge| ge.phase == GraphHopPhase::Direct);
+    direct.retain(|ge| !is_prunable_direct_edge(ge));
+    if max_per_pair == 0 {
+        direct.append(&mut hub_legs);
+        *adj = direct;
+        return;
+    }
     if direct.len() <= max_per_pair {
         direct.append(&mut hub_legs);
         *adj = direct;
@@ -371,15 +438,37 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
     *adj = direct;
 }
 
-fn thin_parallel_edges_in_graph(graph: &mut RoutingGraph) {
-    let token_slots = graph.token_count as usize;
-    for adj in graph.adjacency.iter_mut().take(token_slots) {
-        thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR);
+/// Drop dead/unprofitable direct edges, re-thin parallel routes, and refresh coverage.
+fn compact_token_adjacency(
+    graph: &mut RoutingGraph,
+    token_slots: Option<&[usize]>,
+    touched_pools: Option<&rustc_hash::FxHashSet<usize>>,
+) {
+    let token_count = graph.token_count as usize;
+    let touch_all = token_slots.is_none();
+    for adj_idx in 0..token_count {
+        if !touch_all
+            && !token_slots
+                .is_some_and(|slots| slots.binary_search(&adj_idx).is_ok())
+        {
+            continue;
+        }
+        if let Some(adj) = graph.adjacency.get_mut(adj_idx) {
+            thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR);
+            sort_adjacency_edges(adj);
+        }
+    }
+    for adj in graph.adjacency.iter_mut().skip(token_count) {
         sort_adjacency_edges(adj);
     }
-    for adj in graph.adjacency.iter_mut().skip(token_slots) {
-        sort_adjacency_edges(adj);
+    if let Some(pools) = touched_pools {
+        rebuild_pool_edge_positions_for_pools(graph, pools);
+    } else {
+        rebuild_pool_edge_positions_full(graph);
     }
+    graph.coverage = Some(std::sync::Arc::new(
+        crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
+    ));
 }
 
 fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &PoolMeta) -> bool {
@@ -426,11 +515,6 @@ fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &Poo
 
 fn finalize_graph_topology(arena: &StateArena, graph: &mut RoutingGraph) {
     rescore_graph_in_place(arena, graph);
-    thin_parallel_edges_in_graph(graph);
-    rebuild_pool_edge_positions_full(graph);
-    graph.coverage = Some(std::sync::Arc::new(
-        crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
-    ));
 }
 
 /// Eligible arena pools that have no live edges in the cached graph yet.
@@ -487,6 +571,7 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
 /// Recompute edge log-weights from current pool states without rebuilding adjacency.
 pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
     rescore_adjacency(arena, &mut graph.adjacency);
+    compact_token_adjacency(graph, None, None);
 }
 
 /// Rescore only dirty pools when the touch set is small; otherwise rescore all edges.
@@ -533,12 +618,24 @@ pub fn rescore_pools_in_place(
         }
         touched_pools.insert(pool_idx);
     }
-    for adj_idx in &affected_adjacencies {
-        if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
-            sort_adjacency_edges(adj);
+    let token_count = graph.token_count as usize;
+    let mut compact_slots: Vec<usize> = affected_adjacencies
+        .iter()
+        .copied()
+        .filter(|idx| *idx < token_count)
+        .collect();
+    compact_slots.sort_unstable();
+    compact_slots.dedup();
+    if compact_slots.is_empty() {
+        for adj_idx in &affected_adjacencies {
+            if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
+                sort_adjacency_edges(adj);
+            }
         }
+        rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
+    } else {
+        compact_token_adjacency(graph, Some(&compact_slots), Some(&touched_pools));
     }
-    rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
     touched
 }
 
@@ -547,7 +644,6 @@ fn rescore_adjacency(arena: &StateArena, adjacency: &mut [Vec<GraphEdge>]) {
         for ge in adj.iter_mut() {
             rescore_graph_edge(arena, ge);
         }
-        sort_adjacency_edges(adj);
     });
 }
 
@@ -1018,6 +1114,93 @@ mod tests {
         assert_eq!(graph.active_pool_count(), 1);
         assert!(graph.pool_has_live_edges(live_pool));
         assert!(!graph.pool_has_live_edges(dust_pool));
+    }
+
+    #[test]
+    fn pool_state_graph_eligible_requires_routable_pair() {
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let one_sided = PoolState::V2(V2PoolState {
+            reserve0: funded,
+            reserve1: dust,
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 0,
+        });
+        assert!(!pool_state_graph_eligible(
+            &one_sided,
+            ProtocolType::UniswapV2,
+            2,
+            None,
+            30,
+        ));
+        let two_sided = PoolState::V2(V2PoolState {
+            reserve0: funded,
+            reserve1: funded + U256::from(1u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 0,
+        });
+        assert!(pool_state_graph_eligible(
+            &two_sided,
+            ProtocolType::UniswapV2,
+            2,
+            None,
+            30,
+        ));
+    }
+
+    #[test]
+    fn rescore_prunes_dead_parallel_edges() {
+        let mut arena = StateArena::default();
+        let hub = arena.register_token(Address::from([50u8; 20]));
+        let leaf = arena.register_token(Address::from([51u8; 20]));
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let live_pool = arena.register_pool(
+            Address::from([52u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded + U256::from(10u64),
+                reserve1: funded + U256::from(100u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let dying_pool = arena.register_pool(
+            Address::from([53u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded + U256::from(5u64),
+                reserve1: funded + U256::from(100u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let metas = [
+            pool_meta_from_pair(live_pool, ProtocolType::UniswapV2, hub, leaf, 30),
+            pool_meta_from_pair(dying_pool, ProtocolType::UniswapV2, hub, leaf, 30),
+        ];
+        let mut graph = build_graph(&arena, &metas);
+        assert_eq!(graph.adjacency[hub.0 as usize].len(), 2);
+
+        arena.register_pool(
+            Address::from([53u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: dust,
+                reserve1: dust,
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        rescore_graph_in_place(&arena, &mut graph);
+        let live_pools: Vec<u32> = graph.adjacency[hub.0 as usize]
+            .iter()
+            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .map(|ge| ge.edge.pool_index.0)
+            .collect();
+        assert_eq!(live_pools, vec![live_pool.0]);
     }
 
     #[test]

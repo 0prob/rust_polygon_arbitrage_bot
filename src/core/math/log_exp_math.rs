@@ -45,7 +45,7 @@ fn ln(a: U256) -> U256 {
 
     let o20 = ONE_20;
     for &(threshold, factor) in &LN_STEPS {
-        if av >= threshold {
+        if av >= factor {
             av = (av * o20) / factor;
             sum += threshold;
         }

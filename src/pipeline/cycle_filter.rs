@@ -12,7 +12,16 @@ use crate::pipeline::types::compare_cycle_score;
 
 #[must_use]
 pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
-    (max_keep / 8).clamp(4, 16).min(max_keep)
+    if max_keep == 0 {
+        return 0;
+    }
+    // Spot-profitable routes often fail dust probes; reserve ~25% for Brent rescue.
+    (max_keep / 4).clamp(32, 256).min(max_keep)
+}
+
+#[inline]
+fn cycle_spot_negative(cycle: &FoundCycle) -> bool {
+    cycle.cycle_ratio > ONE || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0)
 }
 
 /// Token metadata for per-cycle probe sizing during atomic prefilter.
@@ -84,6 +93,9 @@ fn prefilter_verdict_for_cycle(
                 if let Some(gas_price) = c.gas_price_wei {
                     if probe_beats_gas_floor(sim, rate, decimals, gas_price) {
                         PrefilterVerdict::Keep
+                    } else if cycle_spot_negative(cycle) {
+                        // Dust probe profit may not cover gas; Brent can find size.
+                        PrefilterVerdict::Rescue
                     } else {
                         PrefilterVerdict::Reject
                     }
@@ -94,11 +106,9 @@ fn prefilter_verdict_for_cycle(
                 PrefilterVerdict::Keep
             }
         }
-        // Use exact U256 cycle_ratio > ONE to gate rescue, falling back to f64 score
-        // only when cycle_ratio wasn't computed (cache restore path sets it to ZERO).
-        None if cycle.cycle_ratio > ONE || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0) => {
-            PrefilterVerdict::Rescue
-        }
+        // Simulable at probe size but zero profit, or sim failed: rescue when the
+        // graph still shows a spot-negative cycle (cycle_ratio / score).
+        Some(_) | None if cycle_spot_negative(cycle) => PrefilterVerdict::Rescue,
         Some(_) | None => PrefilterVerdict::Reject,
     }
 }
@@ -117,19 +127,14 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
     let rescue_cap = graph_negative_rescue_cap(max_keep);
     let sim_candidates = cycles.len().min(max_keep.saturating_add(rescue_cap));
     let candidates: Vec<FoundCycle> = cycles.into_iter().take(sim_candidates).collect();
-    let mut ranked: Vec<(usize, FoundCycle, PrefilterVerdict)> = candidates
-        .into_par_iter()
-        .enumerate()
-        .map(|(index, cycle)| {
-            let verdict = prefilter_verdict_for_cycle(arena, &cycle, ctx);
-            (index, cycle, verdict)
-        })
+    let verdicts: Vec<PrefilterVerdict> = candidates
+        .par_iter()
+        .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
         .collect();
-    ranked.sort_unstable_by_key(|(index, _, _)| *index);
 
     let mut missing_state_rescued = 0usize;
     let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
-    for (_, cycle, verdict) in ranked {
+    for (cycle, verdict) in candidates.into_iter().zip(verdicts) {
         let keep = match verdict {
             PrefilterVerdict::Keep => true,
             PrefilterVerdict::Rescue => {
@@ -318,5 +323,93 @@ mod tests {
         let second = dedupe_cycles_by_edges(vec![forward, reverse]);
         assert_eq!(cycle_key(&first[0].edges), cycle_key(&second[0].edges));
         assert_eq!(cycle_key(&first[1].edges), cycle_key(&second[1].edges));
+    }
+
+    #[test]
+    fn rescue_cap_scales_with_enumeration_budget() {
+        assert_eq!(graph_negative_rescue_cap(650), 162);
+        assert_eq!(graph_negative_rescue_cap(32), 32);
+        assert_eq!(graph_negative_rescue_cap(0), 0);
+    }
+
+    #[test]
+    fn spot_negative_cycle_survives_zero_profit_probe_rescue() {
+        let mut arena = crate::pipeline::arena::StateArena::default();
+        let a = arena.register_token(Address::from([1u8; 20]));
+        let b = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            std::sync::Arc::new(crate::core::types::PoolState::V2(
+                crate::core::types::V2PoolState {
+                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                        * U256::from(1100u64),
+                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                        * U256::from(900u64),
+                    fee: U256::from(997u64),
+                    fee_denominator: U256::from(1_000u64),
+                    block_timestamp_last: 0,
+                },
+            )),
+        );
+        let pool2 = arena.register_pool(
+            Address::from([4u8; 20]),
+            std::sync::Arc::new(crate::core::types::PoolState::V2(
+                crate::core::types::V2PoolState {
+                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                        * U256::from(900u64),
+                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                        * U256::from(1100u64),
+                    fee: U256::from(997u64),
+                    fee_denominator: U256::from(1_000u64),
+                    block_timestamp_last: 0,
+                },
+            )),
+        );
+        let graph_negative = FoundCycle {
+            start_token: a,
+            edges: CycleEdges::from_slice(&[
+                Edge {
+                    pool_index: pool,
+                    token_in: a,
+                    token_out: b,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                Edge {
+                    pool_index: pool2,
+                    token_in: b,
+                    token_out: a,
+                    token_in_idx: 1,
+                    token_out_idx: 0,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: -0.01,
+            cumulative_fee_bps: 60,
+            score: -0.01,
+            cycle_ratio: U256::from(1_001_000_000_000_000_000u64),
+        };
+        // Tiny probe: simulable but not profitable at dust size.
+        let dust = U256::from(1_000u64);
+        let probe = simulate_route_minimal(&arena, &graph_negative.edges, dust);
+        assert!(
+            probe.as_ref().is_none_or(|sim| sim.profit.is_zero()),
+            "dust probe should not show profit for marginal 2-hop cycle"
+        );
+
+        let kept = prefilter_cycles_by_atomic_sim_with_context(
+            &arena,
+            vec![graph_negative.clone()],
+            8,
+            None,
+        );
+        assert_eq!(kept.len(), 1, "spot-negative cycle should be rescued");
+        assert_eq!(kept[0].cycle_ratio, graph_negative.cycle_ratio);
     }
 }

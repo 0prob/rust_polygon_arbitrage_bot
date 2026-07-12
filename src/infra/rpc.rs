@@ -37,9 +37,9 @@ pub struct RpcPool {
 impl std::fmt::Debug for RpcPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RpcPool")
-            .field("state_urls", &*self.state_urls.read())
-            .field("execution_url", &self.execution_url)
-            .field("private_url", &self.private_url)
+            .field("state_url_count", &self.state_urls.read().len())
+            .field("execution_configured", &self.execution_url.is_some())
+            .field("private_configured", &self.private_url.is_some())
             .field("require_private_submit", &self.require_private_submit)
             .field(
                 "cached_http_providers",
@@ -307,11 +307,12 @@ impl RpcPool {
         if let Some(provider) = guard.get(url) {
             return Ok(provider.clone());
         }
+        let endpoint = rpc_host_label(url);
         let provider = ProviderBuilder::new()
             .connect_reqwest(
                 self.http.clone(),
                 url.parse()
-                    .with_context(|| format!("invalid RPC URL: {url}"))?,
+                    .with_context(|| format!("invalid RPC URL: {endpoint}"))?,
             )
             .erased();
         guard.insert(url.to_string(), provider.clone());
@@ -342,13 +343,14 @@ impl RpcPool {
         if self.polygon_validated_urls.lock().contains(url) {
             return Ok(());
         }
+        let endpoint = rpc_host_label(url);
         let chain_id = provider
             .get_chain_id()
             .await
-            .with_context(|| format!("chain-id check failed for RPC endpoint {url}"))?;
+            .with_context(|| format!("chain-id check failed for RPC endpoint {endpoint}"))?;
         anyhow::ensure!(
             chain_id == crate::core::constants::POLYGON_CHAIN_ID,
-            "RPC endpoint {url} is chain {chain_id}, expected Polygon {}",
+            "RPC endpoint {endpoint} is chain {chain_id}, expected Polygon {}",
             crate::core::constants::POLYGON_CHAIN_ID
         );
         self.polygon_validated_urls.lock().insert(url.to_string());
@@ -393,12 +395,13 @@ impl RpcPool {
             return Ok(provider.clone());
         }
         let wallet = EthereumWallet::from(signer.clone());
+        let endpoint = rpc_host_label(&url);
         let provider = ProviderBuilder::new()
             .wallet(wallet)
             .connect_reqwest(
                 self.http.clone(),
                 url.parse()
-                    .with_context(|| format!("invalid RPC URL: {url}"))?,
+                    .with_context(|| format!("invalid RPC URL: {endpoint}"))?,
             )
             .erased();
         guard.insert(key, provider.clone());
@@ -422,7 +425,7 @@ pub fn rpc_host_label(url: &str) -> String {
     url.parse::<reqwest::Url>()
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
-        .unwrap_or_else(|| url.to_string())
+        .unwrap_or_else(|| "invalid-endpoint".to_string())
 }
 
 #[cfg(test)]

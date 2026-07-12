@@ -239,7 +239,9 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
         BALANCER_SCALING.clone(),
         CallKind::BalancerScalingFactors,
     );
-    if plan.pool.pool_type.as_deref() == Some("linear") {
+    if plan.pool.pool_type.as_deref() == Some("linear")
+        || (plan.pool.pool_type.is_none() && plan.pool.tokens.len() >= 3)
+    {
         push_call(
             plan,
             plan.pool.address,

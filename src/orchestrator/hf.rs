@@ -15,7 +15,8 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    dispatch_profitable_candidates, filter_balancer_onchain_verified, refresh_and_resim_profitable,
+    dispatch_profitable_candidates, filter_balancer_onchain_verified,
+    probe_near_miss_balancer, refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
@@ -105,6 +106,8 @@ fn should_log_best_eval() -> bool {
 struct BestEvalDiag {
     fp: u64,
     hops: u32,
+    input: U256,
+    sim_gas: u32,
     gross: U256,
     net_matic: U256,
     gas_matic: U256,
@@ -116,9 +119,11 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} gross={} net_matic={} gas_matic={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} input={} sim_gas={} gross={} net_matic={} gas_matic={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
+        diag.input,
+        diag.sim_gas,
         diag.gross,
         diag.net_matic,
         diag.gas_matic,
@@ -280,7 +285,7 @@ pub async fn run_hf_tick(
         });
     }
     if stream_triggered && pipeline.stream_enabled {
-        for addr in ctx.partial_cache.tracked_addresses() {
+        for addr in ctx.partial_cache.dirty_addresses() {
             hot_pools_set.insert(addr);
         }
     }
@@ -393,7 +398,7 @@ pub async fn run_hf_tick(
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
     let reassess_ctx = Arc::new(HfEvalInputOwned {
-        arena,
+        arena: Arc::new(arena),
         token_to_matic_rates,
         token_decimals,
         gas_oracle: Arc::clone(&ctx.gas_oracle),
@@ -414,7 +419,7 @@ pub async fn run_hf_tick(
     let cycles_considered = cycles.len();
     let (eval_results, mut eval_arena, probe_kept) = match timeout(
         HF_EVAL_BUDGET,
-        rescore_rank_and_evaluate_async(cycles, (*reassess_ctx).clone(), sim_cap),
+        rescore_rank_and_evaluate_async(cycles, Arc::clone(&reassess_ctx), sim_cap),
     )
     .await
     {
@@ -439,6 +444,7 @@ pub async fn run_hf_tick(
     let mut best_profit_matic = U256::ZERO;
     let mut best_near_miss: Option<HfEvalResult> = None;
     let mut best_gross_diag: Option<BestEvalDiag> = None;
+    let mut best_gross_probe: Option<HfEvalResult> = None;
 
     for result in eval_results {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
@@ -453,6 +459,8 @@ pub async fn run_hf_tick(
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
                 hops: result.cycle.hop_count,
+                input: result.sim.amount_in,
+                sim_gas: result.sim.total_gas,
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
                 gas_matic: assessment.revert_penalty,
@@ -460,6 +468,9 @@ pub async fn run_hf_tick(
                 flash_fee: assessment.flash_loan_fee,
                 reject: assessment.reject_reason.clone(),
             });
+            if route_is_balancer_only(&result.cycle) {
+                best_gross_probe = Some(result.clone());
+            }
         }
         if assessment.should_execute {
             profitable.push(result);
@@ -474,23 +485,27 @@ pub async fn run_hf_tick(
     }
 
     let mut skip_dispatch_refresh = prefetch_ok;
+    let mut dispatch_state_generation = evaluation_state_generation;
     if !profitable.is_empty()
         && let Some(executor) = ctx.config.execution.executor_address
         && let Ok(sim_provider) = ctx.rpc.connect_simulation()
     {
-        let (resimmed, resim_refreshed) = refresh_and_resim_profitable(
+        let (resimmed, resim_refreshed, resim_generation) = refresh_and_resim_profitable(
             &ctx.refresh,
             &ctx.cache,
-            &mut eval_arena,
+            Arc::make_mut(&mut eval_arena),
             profitable,
             reassess_ctx.as_ref(),
         )
         .await;
         profitable = resimmed;
         skip_dispatch_refresh = prefetch_ok || resim_refreshed;
+        if resim_refreshed {
+            dispatch_state_generation = resim_generation;
+        }
         profitable = filter_balancer_onchain_verified(
             Arc::clone(&ctx.execution),
-            &eval_arena,
+            eval_arena.as_ref(),
             profitable,
             &sim_provider,
             executor,
@@ -537,30 +552,58 @@ pub async fn run_hf_tick(
             log_near_miss_diagnostic(
                 &ctx.execution,
                 near_miss,
-                &eval_arena,
+                eval_arena.as_ref(),
                 pool_metas_for_dispatch.as_ref(),
                 ctx.config.execution.profit_safety_multiplier_bps,
                 ctx.config.min_profit_matic,
             );
+            if route_is_balancer_only(&near_miss.cycle)
+                && let Some(executor) = ctx.config.execution.executor_address
+                && let Ok(sim_provider) = ctx.rpc.connect_simulation()
+            {
+                probe_near_miss_balancer(
+                    &ctx.execution,
+                    eval_arena.as_ref(),
+                    near_miss,
+                    pool_metas_for_dispatch.as_ref(),
+                    &sim_provider,
+                    executor,
+                )
+                .await;
+            }
         } else if profitable_count == 0
             && best_profit_matic.is_zero()
             && should_log_best_eval()
             && let Some(ref diag) = best_gross_diag
         {
             log_best_eval_diagnostic(diag);
+            if let Some(ref probe) = best_gross_probe
+                && let Some(executor) = ctx.config.execution.executor_address
+                && let Ok(sim_provider) = ctx.rpc.connect_simulation()
+            {
+                probe_near_miss_balancer(
+                    &ctx.execution,
+                    eval_arena.as_ref(),
+                    probe,
+                    pool_metas_for_dispatch.as_ref(),
+                    &sim_provider,
+                    executor,
+                )
+                .await;
+            }
         }
     }
 
     if profitable_count > 0 {
         dispatch_profitable_candidates(
             &ctx,
-            &mut eval_arena,
+            Arc::make_mut(&mut eval_arena),
             profitable,
             crate::orchestrator::hf_execute::DispatchInputs {
                 pool_metas: pool_metas_for_dispatch.as_ref(),
                 token_to_matic_rates: dispatch_token_to_matic_rates.as_ref(),
                 token_decimals: dispatch_token_decimals.as_ref(),
-                state_generation: evaluation_state_generation,
+                state_generation: dispatch_state_generation,
                 state_block: snap.state_block,
                 state_hash: snap.state_hash,
                 skip_dispatch_refresh,

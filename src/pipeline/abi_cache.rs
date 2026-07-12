@@ -50,7 +50,7 @@ pub fn encode_balancer_pool_tokens(pool_id: FixedBytes<32>) -> Bytes {
     Bytes::copy_from_slice(&buf)
 }
 
-/// Algebra `globalState()` — six ABI words (price, tick, lastFee, pluginConfig, communityFee, unlocked).
+/// Algebra `globalState()` supports Integral's six-word and V1.9's seven-word layouts.
 #[inline]
 #[must_use]
 pub fn decode_algebra_global_state(bytes: &[u8]) -> Option<(U256, i32, bool, U256)> {
@@ -60,7 +60,9 @@ pub fn decode_algebra_global_state(bytes: &[u8]) -> Option<(U256, i32, bool, U25
     let price = U256::from_be_slice(&bytes[0..32]);
     let tick = crate::util::sign_extend_tick24(U256::from_be_slice(&bytes[32..64]));
     let last_fee = U256::from_be_slice(&bytes[64..96]).as_limbs()[0] as u32;
-    let unlocked = U256::from_be_slice(&bytes[160..192]).as_limbs()[0] != 0;
+    let unlocked_offset = if bytes.len() >= 224 { 192 } else { 160 };
+    let unlocked = U256::from_be_slice(&bytes[unlocked_offset..unlocked_offset + 32]).as_limbs()[0]
+        != 0;
     Some((price, tick, unlocked, U256::from(last_fee)))
 }
 
@@ -187,5 +189,21 @@ mod tests {
         assert_eq!(tick, -1);
         assert!(unlocked);
         assert_eq!(fee, U256::from(5u64));
+    }
+
+    #[test]
+    fn algebra_v19_global_state_reads_seventh_word_unlock_flag() {
+        // Given: Algebra V1.9's seven-word globalState response.
+        let mut bytes = vec![0u8; 224];
+        bytes[31] = 9;
+        bytes[95] = 100;
+        bytes[223] = 1;
+
+        // When: the shared Algebra decoder reads the response.
+        let (_, _, unlocked, fee) = decode_algebra_global_state(&bytes).expect("decode");
+
+        // Then: fee and the final-word unlock flag survive decoding.
+        assert!(unlocked);
+        assert_eq!(fee, U256::from(100u64));
     }
 }

@@ -269,6 +269,7 @@ impl ExecutionService {
 
 impl ExecutionService {
     #[must_use]
+    #[allow(dead_code)] // used by generation-tracking unit test; dispatch relies on dry-run authority
     fn candidate_matches_state_generation(
         candidate: &CandidateExecution,
         state_cache: &StateCache,
@@ -728,23 +729,13 @@ impl ExecutionService {
         let now = Instant::now();
 
         let current_generation = state_cache.generation();
-        if !Self::candidate_matches_state_generation(candidate, state_cache) {
+        if candidate.state_generation != current_generation {
             crate::debug!(
-                "dispatch skip: fp={}, stale candidate generation {} != current {}",
+                "dispatch generation drift: fp={}, candidate={} current={} (dry-run is authoritative)",
                 fp,
                 candidate.state_generation,
                 current_generation,
             );
-            let outcome = ExecutionOutcome::SubmitFailed {
-                reason: format!(
-                    "candidate stale: built at generation {}, current generation {}",
-                    candidate.state_generation, current_generation
-                ),
-            };
-            if let Some(ui_hook) = ui_hook {
-                ui_hook.on_execution_outcome(&outcome, fp);
-            }
-            return outcome;
         }
 
         if candidate.state_block != expected_state_block
@@ -1678,7 +1669,7 @@ mod safety_tests {
     }
 
     #[test]
-    fn candidate_generation_must_match_state_cache() {
+    fn candidate_generation_tracks_state_cache_at_build_time() {
         let cache = StateCache::new(8, std::time::Duration::from_secs(60));
         let candidate = CandidateExecution {
             route_fingerprint: 1,

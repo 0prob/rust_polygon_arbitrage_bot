@@ -20,7 +20,7 @@ use crate::pipeline::types::{
 pub use crate::pipeline::spot_price::hop_penalty;
 
 const MAX_CYCLES_PER_PASS: usize = 50_000;
-const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(500);
+const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(1000);
 /// Cap parallel DFS shards — unbounded hub enumeration burns the shared deadline.
 const DFS_MAX_START_SOURCES: usize = 32;
 /// Amortize elapsed-time checks during DFS enumeration.

@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
+use crate::infra::rpc::rpc_host_label;
 use crate::services::partial_cache::{
     PartialPoolCache, StreamAddressSet, V2_SYNC_TOPIC, V3_SWAP_TOPIC,
 };
@@ -86,7 +87,7 @@ impl PoolLogFeed {
                             .await
                         {
                             Err(e) => {
-                                warn!("WSS subscription error ({url}): {e}");
+                                warn!("WSS subscription error ({}): {e}", rpc_host_label(&url));
                                 *self.sticky_url.lock() = None;
                             }
                             Ok(()) => {
@@ -167,7 +168,7 @@ impl PoolLogFeed {
                 }
                 maybe_log = log_rx.recv() => {
                     let Some(log) = maybe_log else {
-                        warn!("WSS feed disconnected ({wss_url}), reconnecting...");
+                        warn!("WSS feed disconnected ({}), reconnecting...", rpc_host_label(wss_url));
                         return Ok(());
                     };
                     self.handle_log(&log);
@@ -179,12 +180,12 @@ impl PoolLogFeed {
                         .and_then(|r| r.ok())
                         .is_none()
                     {
-                        warn!("WSS ping failed ({wss_url}), reconnecting...");
+                        warn!("WSS ping failed ({}), reconnecting...", rpc_host_label(wss_url));
                         return Ok(());
                     }
                 }
                 () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
-                    warn!("WSS feed idle timeout ({wss_url}), reconnecting...");
+                    warn!("WSS feed idle timeout ({}), reconnecting...", rpc_host_label(wss_url));
                     return Ok(());
                 }
             }
@@ -302,14 +303,18 @@ async fn select_wss_url(urls: &[String], sticky: Option<&str>) -> Option<String>
     if sticky.is_some()
         && let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s))
     {
-        crate::debug!("WSS sticky reconnect ({url}, probe skipped)");
+        crate::debug!(
+            "WSS sticky reconnect ({}, probe skipped)",
+            rpc_host_label(url)
+        );
         return Some(url.to_string());
     }
 
     let candidates = ordered_wss_urls(urls, sticky);
     let (url, latency) = probe_wss_urls(&candidates).await?;
     info!(
-        "WSS endpoint selected ({url}, probe_ms={})",
+        "WSS endpoint selected ({}, probe_ms={})",
+        rpc_host_label(&url),
         latency.as_millis()
     );
     Some(url)

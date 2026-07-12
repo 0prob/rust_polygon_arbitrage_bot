@@ -6,7 +6,10 @@ use alloy::primitives::Address;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use std::collections::BTreeMap;
+
 use crate::core::types::{PoolIndex, PoolState};
+use crate::services::discovery::DiscoveredPool;
 
 const DEFAULT_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_INVALID_RETRY_TTL: Duration = Duration::from_secs(30);
@@ -99,6 +102,59 @@ impl StateCache {
                 })
             })
             .count()
+    }
+
+    /// Tradable pools in the discovery index — one read lock over ~50k cache entries
+    /// instead of ~263k discovered rows.
+    pub fn count_tradable_in_discovery(&self, address_index: &FxHashMap<Address, usize>) -> usize {
+        let guard = self.inner.read();
+        guard
+            .iter()
+            .filter(|(addr, entry)| {
+                address_index.contains_key(*addr)
+                    && entry.updated_at.elapsed() <= self.ttl
+                    && entry.state.is_tradable()
+            })
+            .count()
+    }
+
+    /// Per-protocol cached vs tradable counts for pipeline survival (single read lock).
+    pub fn count_discovery_stages_by_protocol(
+        &self,
+        pools: &[DiscoveredPool],
+    ) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+        let mut cached = BTreeMap::new();
+        let mut tradable = BTreeMap::new();
+        let guard = self.inner.read();
+        for pool in pools {
+            let Some(entry) = guard.get(&pool.address) else {
+                continue;
+            };
+            if entry.updated_at.elapsed() > self.ttl {
+                continue;
+            }
+            let label = pool.protocol_label.clone();
+            *cached.entry(label.clone()).or_default() += 1;
+            if entry.state.is_tradable() {
+                *tradable.entry(label).or_default() += 1;
+            }
+        }
+        (cached, tradable)
+    }
+
+    /// Pools eligible for dead-pool pruning (invalid past retry TTL, one read lock).
+    pub fn pools_past_invalid_retry(&self, pools: &[DiscoveredPool]) -> Vec<Address> {
+        let guard = self.inner.read();
+        pools
+            .iter()
+            .filter_map(|pool| {
+                let entry = guard.get(&pool.address)?;
+                if entry.updated_at.elapsed() > self.ttl || entry.state.is_tradable() {
+                    return None;
+                }
+                (entry.updated_at.elapsed() > self.invalid_retry_ttl).then_some(pool.address)
+            })
+            .collect()
     }
 
     /// Monotonic version for execution-time stale-state rejection.
@@ -202,6 +258,52 @@ impl StateCache {
         true
     }
 
+    fn eviction_tier_candidate(
+        best: Option<(Address, Instant)>,
+        addr: Address,
+        updated_at: Instant,
+    ) -> Option<(Address, Instant)> {
+        match best {
+            None => Some((addr, updated_at)),
+            Some((_, best_at)) if updated_at < best_at => Some((addr, updated_at)),
+            Some((best_addr, best_at)) if updated_at == best_at && addr < best_addr => {
+                Some((addr, updated_at))
+            }
+            Some(current) => Some(current),
+        }
+    }
+
+    fn pick_eviction_victim(
+        guard: &FxHashMap<Address, CachedEntry>,
+        ttl: Duration,
+    ) -> Option<Address> {
+        let mut expired = None;
+        let mut invalid = None;
+        let mut untradable = None;
+        let mut tradable = None;
+        for (addr, entry) in guard {
+            let updated_at = entry.updated_at;
+            if updated_at.elapsed() > ttl {
+                expired = Self::eviction_tier_candidate(expired, *addr, updated_at);
+                continue;
+            }
+            if matches!(*entry.state, PoolState::Invalid) {
+                invalid = Self::eviction_tier_candidate(invalid, *addr, updated_at);
+                continue;
+            }
+            if !entry.state.is_tradable() {
+                untradable = Self::eviction_tier_candidate(untradable, *addr, updated_at);
+                continue;
+            }
+            tradable = Self::eviction_tier_candidate(tradable, *addr, updated_at);
+        }
+        expired
+            .or(invalid)
+            .or(untradable)
+            .or(tradable)
+            .map(|(addr, _)| addr)
+    }
+
     pub fn insert(&self, address: Address, state: PoolState) {
         let mut guard = self.inner.write();
         if guard.len() >= self.max_entries && !guard.contains_key(&address) {
@@ -209,15 +311,10 @@ impl StateCache {
             if count & EVICT_INTERVAL_MASK == 0 {
                 guard.retain(|_, v| v.updated_at.elapsed() <= self.ttl);
             }
-            if guard.len() >= self.max_entries {
-                // Evict the oldest entry instead of an arbitrary hash-map slot.
-                if let Some(oldest) = guard
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.updated_at)
-                    .map(|(addr, _)| *addr)
-                {
-                    guard.remove(&oldest);
-                }
+            if guard.len() >= self.max_entries
+                && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
+            {
+                guard.remove(&victim);
             }
         }
         guard.insert(
@@ -341,6 +438,64 @@ mod tests {
         // not invalid, because the global TTL check fires before the invalid check.
         assert!(invalid.is_empty());
         assert_eq!(stale, vec![&expired]);
+    }
+
+    #[test]
+    fn eviction_prefers_invalid_over_tradable() {
+        let cache = StateCache::new(2, Duration::from_secs(600));
+        let tradable = Address::with_last_byte(10);
+        let invalid = Address::with_last_byte(11);
+        let newcomer = Address::with_last_byte(12);
+        cache.insert(
+            tradable,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
+                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                    + alloy::primitives::U256::from(1u64),
+                fee: alloy::primitives::U256::from(997u64),
+                fee_denominator: alloy::primitives::U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        cache.insert(invalid, PoolState::Invalid);
+        assert_eq!(cache.len(), 2);
+        cache.insert(newcomer, PoolState::Invalid);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&tradable).is_some());
+        assert!(cache.get(&newcomer).is_some());
+        assert!(cache.get(&invalid).is_none());
+    }
+
+    #[test]
+    fn count_tradable_in_discovery_uses_index_not_full_scan() {
+        let cache = StateCache::default();
+        let in_index = Address::with_last_byte(20);
+        let off_index = Address::with_last_byte(21);
+        let mut index = FxHashMap::default();
+        index.insert(in_index, 0usize);
+        cache.insert(
+            in_index,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
+                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                    + alloy::primitives::U256::from(1u64),
+                fee: alloy::primitives::U256::from(997u64),
+                fee_denominator: alloy::primitives::U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        cache.insert(
+            off_index,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
+                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                    + alloy::primitives::U256::from(1u64),
+                fee: alloy::primitives::U256::from(997u64),
+                fee_denominator: alloy::primitives::U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        assert_eq!(cache.count_tradable_in_discovery(&index), 1);
     }
 
     #[test]

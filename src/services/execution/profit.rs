@@ -410,18 +410,17 @@ pub fn assess_route_profit(
     })
 }
 
-#[must_use]
-pub fn net_profit_after_gas_from_sim(
+fn probe_assess_input(
     sim: &MinimalSimResult,
     amount_in: U256,
     ctx: &ProfitEvalContext,
-) -> U256 {
+) -> AssessProfitInput {
     let gas_units = if ctx.gas_scale_bps == 10_000 {
         sim.total_gas
     } else {
         crate::services::execution::support::scaled_simulated_gas(sim.total_gas, ctx.gas_scale_bps)
     };
-    assess_profit(&AssessProfitInput {
+    AssessProfitInput {
         gross_profit: sim.profit,
         amount_in,
         gas_units,
@@ -435,8 +434,26 @@ pub fn net_profit_after_gas_from_sim(
         flash_loan_source: ctx.flash_source,
         safety_multiplier_bps: ctx.safety_multiplier_bps,
         profit_priority_alpha_bps: ctx.profit_priority_alpha_bps,
-    })
-    .net_profit_after_gas
+    }
+}
+
+#[must_use]
+pub fn net_profit_after_gas_from_sim(
+    sim: &MinimalSimResult,
+    amount_in: U256,
+    ctx: &ProfitEvalContext,
+) -> U256 {
+    assess_profit(&probe_assess_input(sim, amount_in, ctx)).net_profit_after_gas
+}
+
+/// MATIC-denominated net after gas + priority uplift (probe ranking).
+#[must_use]
+pub fn net_profit_matic_from_sim(
+    sim: &MinimalSimResult,
+    amount_in: U256,
+    ctx: &ProfitEvalContext,
+) -> U256 {
+    assess_profit(&probe_assess_input(sim, amount_in, ctx)).net_profit_after_gas_matic_wei
 }
 
 #[must_use]

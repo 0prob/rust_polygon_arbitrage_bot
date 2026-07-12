@@ -403,10 +403,29 @@ fn classify_balancer_pool(
     amp_valid: bool,
     weights_valid: bool,
 ) -> Option<BalancerPoolKind> {
+    if has_linear_state {
+        return Some(BalancerPoolKind::Linear);
+    }
     match pool_type {
-        Some("linear") if has_linear_state => Some(BalancerPoolKind::Linear),
-        Some("stable") | None if amp_valid => Some(BalancerPoolKind::Stable),
-        Some("weighted") | None if weights_valid => Some(BalancerPoolKind::Weighted),
+        Some("linear") | Some("stable") | Some("weighted") if !has_linear_state => {
+            match pool_type {
+                Some("stable") if amp_valid => Some(BalancerPoolKind::Stable),
+                Some("weighted") if weights_valid => Some(BalancerPoolKind::Weighted),
+                _ => None,
+            }
+        }
+        None => {
+            if weights_valid && !amp_valid {
+                Some(BalancerPoolKind::Weighted)
+            } else if amp_valid && !weights_valid {
+                Some(BalancerPoolKind::Stable)
+            } else if weights_valid {
+                // Both probes succeeded: weighted pools must not use stable math.
+                Some(BalancerPoolKind::Weighted)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -454,7 +473,9 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
     if scaling_factors.len() != n || scaling_factors.iter().any(U256::is_zero) {
         return None;
     }
-    let linear = if plan.pool.pool_type.as_deref() == Some("linear") {
+    let probe_linear = plan.pool.pool_type.as_deref() == Some("linear")
+        || (plan.pool.pool_type.is_none() && n >= 3);
+    let linear = if probe_linear {
         decode_balancer_linear(&tokens.tokens, results.get(5..))
     } else {
         None
@@ -579,6 +600,18 @@ mod tests {
             None
         );
         assert_eq!(classify_balancer_pool(None, false, false, false), None);
+        assert_eq!(
+            classify_balancer_pool(None, false, true, true),
+            Some(BalancerPoolKind::Weighted)
+        );
+        assert_eq!(
+            classify_balancer_pool(None, false, false, true),
+            Some(BalancerPoolKind::Weighted)
+        );
+        assert_eq!(
+            classify_balancer_pool(None, true, true, true),
+            Some(BalancerPoolKind::Linear)
+        );
     }
 
     #[test]

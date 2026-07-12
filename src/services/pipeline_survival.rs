@@ -158,18 +158,7 @@ fn count_cache_stages(
     pools: &[DiscoveredPool],
     cache: &StateCache,
 ) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
-    let mut cached = BTreeMap::new();
-    let mut tradable = BTreeMap::new();
-    for pool in pools {
-        let Some(state) = cache.get_arc(&pool.address) else {
-            continue;
-        };
-        *cached.entry(pool.protocol_label.clone()).or_default() += 1;
-        if state.is_tradable() {
-            *tradable.entry(pool.protocol_label.clone()).or_default() += 1;
-        }
-    }
-    (cached, tradable)
+    cache.count_discovery_stages_by_protocol(pools)
 }
 
 fn count_metas(metas: &[PoolMeta]) -> BTreeMap<String, usize> {
@@ -203,7 +192,13 @@ fn count_graph_partition(
 }
 
 fn count_cycle_capable_pools(metas: &[PoolMeta], graph: &RoutingGraph) -> BTreeMap<String, usize> {
-    let coverage = crate::pipeline::cycle_finder::cycle_capable_coverage(graph);
+    let owned;
+    let coverage = if let Some(arc) = &graph.coverage {
+        arc.as_ref()
+    } else {
+        owned = crate::pipeline::cycle_finder::cycle_capable_coverage(graph);
+        &owned
+    };
     let mut counts = BTreeMap::new();
     for meta in metas {
         if coverage.pool_indices.contains(&meta.pool_index.0) {
@@ -231,7 +226,7 @@ pub fn log_index_parse_stats(stats: &ParseStats) {
     );
     for (label, count) in &stats.rejected {
         if *count > 0 {
-            crate::info!("  index rejected {label}: {count}");
+            crate::debug!("index rejected: protocol={label} count={count}");
         }
     }
 }

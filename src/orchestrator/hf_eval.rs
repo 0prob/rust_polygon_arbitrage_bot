@@ -34,7 +34,7 @@ use crate::services::execution::impact_slippage::{
 };
 use crate::services::execution::profit::{
     AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
-    net_profit_after_gas_from_sim, route_profit_thresholds,
+    net_profit_matic_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
@@ -104,7 +104,7 @@ pub struct HfEvalInput<'a> {
 
 #[derive(Clone)]
 pub struct HfEvalInputOwned {
-    pub arena: StateArena,
+    pub arena: Arc<StateArena>,
     pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
     pub token_decimals: Arc<FxHashMap<Address, u8>>,
     pub gas_oracle: Arc<GasOracle>,
@@ -149,6 +149,7 @@ impl HfEvalInputOwned {
     }
 }
 
+#[derive(Clone)]
 pub struct HfEvalResult {
     pub route_fingerprint: u64,
     pub cycle: FoundCycle,
@@ -202,7 +203,6 @@ fn cycle_simulatable(
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let probe = min_economic_amount_in(decimals, rate);
     let spot_probe = spot_probe_for_decimals(decimals);
-    let _ = spot_probe;
     for amount in [probe, spot_probe] {
         let Some(min_sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
             continue;
@@ -374,9 +374,9 @@ fn rank_one_cycle_probe(
     ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
     let mut ranked_probe = probe;
     ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
-    let net = net_profit_after_gas_from_sim(&ranked_probe, probe_amount, &ctx);
+    let net_matic = net_profit_matic_from_sim(&ranked_probe, probe_amount, &ctx);
     out.seeds.insert(fp, (probe_amount, probe));
-    if net.is_zero() {
+    if net_matic.is_zero() {
         let hop_count = cycle.edges.len();
         if !probe.profit.is_zero()
             && cycle_simulatable(arena, &cycle, token_decimals, token_to_matic_rates)
@@ -401,11 +401,11 @@ fn rank_one_cycle_probe(
     }
     let hop_count = cycle.edges.len();
     crate::debug!(
-        "probe net>0: fp={fp:#x} hops={hop_count} net={net} probe_amt={probe_amount} sim_profit={} gas={} rate={rate} dec={start_decimals}",
+        "probe matic>0: fp={fp:#x} hops={hop_count} net_matic={net_matic} probe_amt={probe_amount} sim_profit={} gas={} rate={rate} dec={start_decimals}",
         probe.profit,
         ranked_probe.total_gas,
     );
-    out.profitable.push((net, cycle.into_owned()));
+    out.profitable.push((net_matic, cycle.into_owned()));
     out
 }
 
@@ -483,17 +483,18 @@ pub fn rank_cycles_by_probe_net(
         .iter()
         .map(|cycle| hash_cycle_edges(&cycle.edges))
         .collect();
+    let near_net_count = near_net.len();
     if kept.len() < max_keep && !scanned.is_empty() {
-        if !near_net.is_empty() {
+        if near_net_count > 0 {
             near_net.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| compare_cycle_score(&a.1, &b.1)));
-            for (_, cycle) in &near_net {
+            for (_, cycle) in near_net.drain(..) {
                 if kept.len() >= max_keep {
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
-                        cycle,
+                        &cycle,
                         arena,
                         &flash,
                         flash_ttl,
@@ -502,7 +503,7 @@ pub fn rank_cycles_by_probe_net(
                         token_to_matic_rates,
                     )
                 {
-                    kept.push(cycle.clone());
+                    kept.push(cycle);
                 }
             }
         }
@@ -526,15 +527,14 @@ pub fn rank_cycles_by_probe_net(
                 }
             }
         }
-        if had_net_ranked || !near_net.is_empty() {
+        if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} skip_net={} near_net={} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
                 skip.probe,
                 skip.net,
-                near_net.len(),
             );
         }
     }
@@ -560,7 +560,7 @@ pub fn rank_cycles_by_probe_net(
             skip.flash_source,
             skip.probe,
             skip.net,
-            near_net.len(),
+            near_net_count,
         );
     }
 
@@ -625,9 +625,9 @@ pub fn evaluate_cycles_parallel(
 
 pub async fn rescore_rank_and_evaluate_async(
     mut cycles: Vec<Arc<FoundCycle>>,
-    input: HfEvalInputOwned,
+    input: Arc<HfEvalInputOwned>,
     sim_cap: usize,
-) -> anyhow::Result<(Vec<HfEvalResult>, crate::pipeline::arena::StateArena, usize)> {
+) -> anyhow::Result<(Vec<HfEvalResult>, Arc<StateArena>, usize)> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     crate::util::cpu_pool().spawn(move || {
         let result = crate::util::run_cpu(|| {
@@ -688,7 +688,7 @@ pub async fn rescore_rank_and_evaluate_async(
                 );
             }
             let probe_kept = cycles.len();
-            (eval_results, input.arena, probe_kept)
+            (eval_results, Arc::clone(&input.arena), probe_kept)
         });
         let _ = tx.send(result);
     });

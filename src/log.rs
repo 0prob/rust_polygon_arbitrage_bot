@@ -1,22 +1,15 @@
-// Structured JSON logging with compile-time level gating.
-//
-// Env: RPBOT_LOG=debug    (default: info)
-// Levels: error, warn, info, debug, trace
-//
-// In builds without debug_assertions (typically release): trace! and debug! compile away.
-// info! and warn! are always present. error! is always present.
-//
-// Output: JSON lines to stderr with ms-precision timestamps.
-//   {"ts":1700000000123,"lvl":"INFO","module":"orchestrator::hf","msg":"hf tick"}
-//
-// Usage:
-//   info!("hf tick");
-//   info!("hf tick: cycles={}", cycles);
-//   warn!("pool {} stale", addr);
-//   error!("submit failed: {}", e);
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::thread::JoinHandle;
 
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use parking_lot::Mutex;
+
+mod format;
+mod storage;
+
+use format::{LogFiles, Palette, component_for_module, write_stdout};
 
 pub const LEVEL_ERROR: u8 = 1;
 pub const LEVEL_WARN: u8 = 2;
@@ -24,99 +17,244 @@ pub const LEVEL_INFO: u8 = 3;
 pub const LEVEL_DEBUG: u8 = 4;
 pub const LEVEL_TRACE: u8 = 5;
 
-pub static LOG_LEVEL: AtomicU8 = AtomicU8::new(LEVEL_INFO);
-static STDERR_ENABLED: AtomicBool = AtomicBool::new(true);
+const QUEUE_CAPACITY: usize = 8_192;
+const DEFAULT_LOG_DIR: &str = "/tmp/bot";
+const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
-pub fn set_stderr_enabled(enabled: bool) {
-    STDERR_ENABLED.store(enabled, Ordering::Relaxed);
+pub static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(LEVEL_INFO);
+static STDOUT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static DROPPED_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOGGER: OnceLock<Logger> = OnceLock::new();
+static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub(super) struct Event {
+    pub(super) timestamp_ms: u64,
+    pub(super) level: &'static str,
+    pub(super) module: &'static str,
+    pub(super) message: String,
+}
+
+enum Command {
+    Event(Event),
+    Shutdown,
+}
+
+struct Logger {
+    sender: SyncSender<Command>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub fn set_stdout_enabled(enabled: bool) {
+    STDOUT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn set_level(level: &str) {
-    let lvl = if level.eq_ignore_ascii_case("error") {
+    LOG_LEVEL.store(parse_level(level), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Active run directory (`RPBOT_LOG_DIR/run-<ts>-<pid>/`), set after successful `init`.
+#[must_use]
+pub fn run_dir() -> Option<&'static Path> {
+    RUN_DIR.get().map(PathBuf::as_path)
+}
+
+pub fn init() -> io::Result<()> {
+    if let Ok(value) = std::env::var("RPBOT_LOG") {
+        set_level(&value);
+    }
+    if LOGGER.get().is_some() {
+        return Ok(());
+    }
+    let root = std::env::var_os("RPBOT_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_DIR));
+    let run_dir = prepare_run_dir(&root)?;
+    let _ = RUN_DIR.set(run_dir.clone());
+    let (sender, receiver) = sync_channel(QUEUE_CAPACITY);
+    let worker = std::thread::Builder::new()
+        .name("rpbot-log".into())
+        .spawn(move || run_writer(&run_dir, receiver))?;
+    let logger = Logger {
+        sender,
+        worker: Mutex::new(Some(worker)),
+    };
+    LOGGER
+        .set(logger)
+        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "logger already initialized"))?;
+    Ok(())
+}
+
+pub fn shutdown() {
+    let Some(logger) = LOGGER.get() else {
+        return;
+    };
+    let _ = logger.sender.send(Command::Shutdown);
+    if let Some(handle) = logger.worker.lock().take() {
+        let _ = handle.join();
+    }
+}
+
+pub fn log(level: &'static str, module: &'static str, mut message: String) {
+    let Some(logger) = LOGGER.get() else {
+        return;
+    };
+    if message.len() > MAX_MESSAGE_BYTES {
+        let boundary = message.floor_char_boundary(MAX_MESSAGE_BYTES);
+        message.truncate(boundary);
+        message.push_str(" [truncated]");
+    }
+    let event = Event {
+        timestamp_ms: crate::util::now_ms(),
+        level,
+        module,
+        message,
+    };
+    if let Err(error) = logger.sender.try_send(Command::Event(event)) {
+        match error {
+            TrySendError::Full(_) | TrySendError::Disconnected(_) => {
+                DROPPED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
+    let palette = Palette::detect();
+    let mut files = LogFiles::new(run_dir);
+    let flush_interval = std::time::Duration::from_millis(250);
+    let mut next_flush = std::time::Instant::now() + flush_interval;
+    loop {
+        let command = match receiver
+            .recv_timeout(next_flush.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(command) => command,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = files.flush() {
+                    let _ = format::write_sink_error(&error, &palette);
+                }
+                next_flush = std::time::Instant::now() + flush_interval;
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        match command {
+            Command::Event(event) => {
+                let component = component_for_module(event.module);
+                if STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = write_stdout(&event, component, &palette);
+                }
+                if let Err(error) = files.write(&event, component) {
+                    let _ = format::write_sink_error(&error, &palette);
+                }
+                let dropped = DROPPED_EVENTS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    let warning = Event {
+                        timestamp_ms: crate::util::now_ms(),
+                        level: "WARN",
+                        module: "rpbot::log",
+                        message: format!("log queue saturated; dropped_events={dropped}"),
+                    };
+                    if STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = write_stdout(&warning, "system", &palette);
+                    }
+                    let _ = files.write(&warning, "system");
+                }
+                if std::time::Instant::now() >= next_flush {
+                    if let Err(error) = files.flush() {
+                        let _ = format::write_sink_error(&error, &palette);
+                    }
+                    next_flush = std::time::Instant::now() + flush_interval;
+                }
+            }
+            Command::Shutdown => {
+                if let Err(error) = files.flush() {
+                    let _ = format::write_sink_error(&error, &palette);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn prepare_run_dir(root: &Path) -> io::Result<PathBuf> {
+    storage::secure_directory(root)?;
+    let run_dir = root.join(format!(
+        "run-{}-{}",
+        crate::util::now_ms(),
+        std::process::id()
+    ));
+    storage::create_private_directory(&run_dir)?;
+    storage::prune_run_directories(root, 10)?;
+    Ok(run_dir)
+}
+
+fn parse_level(level: &str) -> u8 {
+    if level.eq_ignore_ascii_case("error") {
         LEVEL_ERROR
     } else if level.eq_ignore_ascii_case("warn") {
         LEVEL_WARN
-    } else if level.eq_ignore_ascii_case("info") {
-        LEVEL_INFO
     } else if level.eq_ignore_ascii_case("debug") {
         LEVEL_DEBUG
     } else if level.eq_ignore_ascii_case("trace") {
         LEVEL_TRACE
     } else {
         LEVEL_INFO
-    };
-    LOG_LEVEL.store(lvl, Ordering::Relaxed);
-}
-
-pub fn init() {
-    if let Ok(val) = std::env::var("RPBOT_LOG") {
-        set_level(&val);
     }
-}
-
-thread_local! {
-    static LOG_BUF: RefCell<String> = RefCell::new(String::with_capacity(512));
-}
-
-#[inline]
-fn write_now_ms(out: &mut String) {
-    use std::fmt::Write;
-    let _ = write!(out, "{}", crate::util::now_ms());
-}
-
-fn push_escaped(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str(r#"\""#),
-            '\n' => out.push_str(r"\n"),
-            '\\' => out.push_str(r"\\"),
-            '\r' => out.push_str(r"\r"),
-            '\t' => out.push_str(r"\t"),
-            _ => out.push(c),
-        }
-    }
-}
-
-pub fn log_json(level: &str, module: &str, msg: &str) {
-    use std::io::Write;
-    if !STDERR_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-    LOG_BUF.with(|buf| {
-        let mut out = buf.borrow_mut();
-        out.clear();
-        out.push_str(r#"{"ts":"#);
-        write_now_ms(&mut out);
-        out.push_str(r#","lvl":""#);
-        out.push_str(level);
-        out.push_str(r#"","module":""#);
-        out.push_str(module);
-        out.push_str(r#"","msg":""#);
-        push_escaped(&mut out, msg);
-        out.push_str(r#""}"#);
-        out.push('\n');
-        let _ = std::io::stderr().lock().write_all(out.as_bytes());
-    });
 }
 
 #[macro_export]
 macro_rules! log_if {
-    ($lvl:expr, $thresh:expr, $($arg:tt)*) => {
-        if $crate::log::LOG_LEVEL.load(::std::sync::atomic::Ordering::Relaxed) >= $thresh {
-            $crate::log::log_json($lvl, module_path!(), &format!($($arg)*))
+    ($level:expr, $threshold:expr, $($arg:tt)*) => {
+        if $crate::log::LOG_LEVEL.load(::std::sync::atomic::Ordering::Relaxed) >= $threshold {
+            $crate::log::log($level, module_path!(), format!($($arg)*))
         }
     };
 }
 
 #[macro_export]
-macro_rules! error { ($($arg:tt)*) => { $crate::log_if!("ERROR", $crate::log::LEVEL_ERROR, $($arg)*) }}
+macro_rules! error { ($($arg:tt)*) => { $crate::log_if!("ERROR", $crate::log::LEVEL_ERROR, $($arg)*) } }
 #[macro_export]
-macro_rules! warn  { ($($arg:tt)*) => { $crate::log_if!("WARN",  $crate::log::LEVEL_WARN,  $($arg)*) }}
+macro_rules! warn { ($($arg:tt)*) => { $crate::log_if!("WARN", $crate::log::LEVEL_WARN, $($arg)*) } }
 #[macro_export]
-macro_rules! info  { ($($arg:tt)*) => { $crate::log_if!("INFO",  $crate::log::LEVEL_INFO,  $($arg)*) }}
+macro_rules! info { ($($arg:tt)*) => { $crate::log_if!("INFO", $crate::log::LEVEL_INFO, $($arg)*) } }
+#[macro_export]
+macro_rules! debug { ($($arg:tt)*) => { $crate::log_if!("DEBUG", $crate::log::LEVEL_DEBUG, $($arg)*) } }
+#[macro_export]
+macro_rules! trace { ($($arg:tt)*) => { $crate::log_if!("TRACE", $crate::log::LEVEL_TRACE, $($arg)*) } }
 
-#[macro_export]
-macro_rules! debug { ($($arg:tt)*) => { $crate::log_if!("DEBUG", $crate::log::LEVEL_DEBUG, $($arg)*) }}
+#[cfg(test)]
+mod tests {
+    use super::format::{component_for_module, render_terminal};
 
-#[macro_export]
-macro_rules! trace { ($($arg:tt)*) => { $crate::log_if!("TRACE", $crate::log::LEVEL_TRACE, $($arg)*) }}
+    #[test]
+    fn routes_modules_to_stable_component_logs() {
+        assert_eq!(component_for_module("rpbot::infra::rpc"), "infra");
+        assert_eq!(
+            component_for_module("rpbot::orchestrator::hf"),
+            "orchestrator"
+        );
+        assert_eq!(
+            component_for_module("rpbot::pipeline::cycle_finder"),
+            "routing"
+        );
+        assert_eq!(
+            component_for_module("rpbot::services::pipeline_survival"),
+            "routing"
+        );
+        assert_eq!(
+            component_for_module("rpbot::services::execution::service"),
+            "execution"
+        );
+        assert_eq!(
+            component_for_module("rpbot::services::oracle::price_oracle"),
+            "oracle"
+        );
+        assert_eq!(component_for_module("rpbot::bootstrap"), "system");
+    }
+
+    #[test]
+    fn terminal_line_is_concise_and_sanitized() {
+        let line = render_terminal("WARN", "execution", "failed\n\u{1b}[2J", "", "");
+        assert_eq!(line, "WARN  execution    failed\\n\\u{1b}[2J\n");
+    }
+}

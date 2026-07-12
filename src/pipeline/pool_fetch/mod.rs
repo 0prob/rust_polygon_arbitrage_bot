@@ -72,10 +72,12 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     let phase1_results = if phase1.is_empty() {
         Vec::new()
     } else {
-        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await
-        {
+        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await {
             Ok(r) => r,
-            Err(_) => return owners.into_iter().map(|addr| (addr, None)).collect(),
+            Err(error) => {
+                crate::debug!("woofi state phase1 failed: {error:#}");
+                return owners.into_iter().map(|addr| (addr, None)).collect();
+            }
         }
     };
 
@@ -98,6 +100,12 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             .unwrap_or(Address::ZERO);
         phase1_idx += 1;
         if quote.is_zero() || wooracle.is_zero() {
+            crate::debug!(
+                "woofi state metadata invalid: pool={} quote={} oracle={}",
+                pool.address,
+                quote,
+                wooracle
+            );
             continue;
         }
         meta_cache.set_woofi_meta(&pool.address, quote, wooracle);
@@ -117,7 +125,15 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(metas.len());
     for (meta_idx, meta) in metas.iter().enumerate() {
         let start = phase2.len();
+        // Quote reserve: indexer rows often omit the quote token from `tokens`.
+        phase2.push(MulticallItem {
+            target: meta.address,
+            data: encode_call(&IWoofiPool::tokenInfosCall { base: meta.quote }),
+        });
         for token in &meta.tokens {
+            if *token == meta.quote {
+                continue;
+            }
             phase2.push(MulticallItem {
                 target: meta.address,
                 data: encode_call(&IWoofiPool::tokenInfosCall { base: *token }),
@@ -134,10 +150,19 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
         spans.push((meta_idx, start, phase2.len()));
     }
 
-    let Ok(phase2_results) =
-        execute_multicall_at_chunked(provider.clone(), &phase2, block_number, max_chunk).await
-    else {
-        return owners.into_iter().map(|addr| (addr, None)).collect();
+    let phase2_results = match execute_multicall_at_chunked(
+        provider.clone(),
+        &phase2,
+        block_number,
+        max_chunk,
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            crate::debug!("woofi state phase2 failed: {error:#}");
+            return owners.into_iter().map(|addr| (addr, None)).collect();
+        }
     };
 
     let mut out: Vec<(Address, Option<PoolState>)> =
@@ -149,23 +174,23 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
         let mut base_states = Vec::new();
         let mut state_tokens = Vec::new();
         let mut quote_reserve = U256::ZERO;
-        for (t, token_addr) in meta.tokens.iter().enumerate() {
-            let base = phase2_results.get(start + t * 3).and_then(|r| r.as_ref());
-            let oracle = phase2_results
-                .get(start + t * 3 + 1)
-                .and_then(|r| r.as_ref());
-            let decimals = phase2_results
-                .get(start + t * 3 + 2)
-                .and_then(|r| r.as_ref());
+        let mut cursor = start;
+        if let Some(quote_bytes) = phase2_results.get(cursor).and_then(|r| r.as_ref())
+            && let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(quote_bytes)
+        {
+            quote_reserve = U256::from(info.reserve);
+        }
+        cursor += 1;
+        for token_addr in meta.tokens.iter().filter(|t| **t != meta.quote) {
+            let base = phase2_results.get(cursor).and_then(|r| r.as_ref());
+            let oracle = phase2_results.get(cursor + 1).and_then(|r| r.as_ref());
+            let decimals = phase2_results.get(cursor + 2).and_then(|r| r.as_ref());
+            cursor += 3;
             let Some(info_bytes) = base else { continue };
             let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(info_bytes) else {
                 continue;
             };
             if !info.enabled {
-                continue;
-            }
-            if *token_addr == meta.quote {
-                quote_reserve = U256::from(info.reserve);
                 continue;
             }
             let Some(oracle_bytes) = oracle else { continue };

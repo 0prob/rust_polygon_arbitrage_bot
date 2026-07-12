@@ -470,6 +470,39 @@ mod tests {
     }
 
     #[test]
+    fn weighted_quote_does_not_drain_live_pool_balance() {
+        // Given: the live weighted-pool state that produced a phantom cycle.
+        let state = BalancerPoolState {
+            pool_id: None,
+            tokens: vec![],
+            balances: vec![
+                U256::from(5_470_183_738_152_410u64),
+                U256::ZERO,
+                U256::from(3_527_960_702_014_628u64),
+            ],
+            weights: vec![
+                U256::from(333_400_000_000_000_000u64),
+                U256::from(333_300_000_000_000_000u64),
+                U256::from(333_300_000_000_000_000u64),
+            ],
+            scaling_factors: vec![ONE, ONE * U256::from(1_000_000_000_000u64), ONE],
+            amp: U256::ZERO,
+            amp_precision: U256::ZERO,
+            fee: U256::from(3_000_000_000_000_000u64),
+            pool_type: BalancerPoolKind::Weighted,
+            linear: None,
+            bpt_index: None,
+            is_updating: false,
+            last_change_block: 0,
+        };
+
+        // When: the observed input is quoted from token 0 to token 2.
+        let amount_out = simulate_balancer_swap(&state, U256::from(1_000_000_000_000_000u64), 0, 2);
+        // Then: the quote must remain strictly below the pool's output balance.
+        assert!(amount_out < state.balances[2]);
+    }
+
+    #[test]
     fn linear_main_wrapped_quotes_match_reference_formulas_in_target_band() {
         let state = linear_state(U256::from(100) * ONE, U256::ZERO, U256::from(2) * ONE);
 
