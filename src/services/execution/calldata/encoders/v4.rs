@@ -119,7 +119,7 @@ fn v4_static_fields(arena: &StateArena, hop: &CalldataHop) -> (u32, i32, Address
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex, V4PoolState};
+    use crate::core::types::{Edge, ProtocolType, TokenIndex, V4PoolState};
     use std::sync::Arc;
 
     #[test]

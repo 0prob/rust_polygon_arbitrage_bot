@@ -431,22 +431,24 @@ mod tests {
             )
             .is_some()
         );
-        assert!(parse_pool_meta_row(
-            pool_id,
-            "UNISWAP_V4",
-            &[
-                "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270".to_string(),
-                "0x2791bca1f2de4661ed88a30c99a7a9449aa84174".to_string(),
-            ],
-            Some(3000),
-            None,
-            None,
-            Some("0x0000000000000000000000000000000000000000"),
-            None,
-            Some(1),
-            None,
-        )
-        .is_none());
+        assert!(
+            parse_pool_meta_row(
+                pool_id,
+                "UNISWAP_V4",
+                &[
+                    "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270".to_string(),
+                    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174".to_string(),
+                ],
+                Some(3000),
+                None,
+                None,
+                Some("0x0000000000000000000000000000000000000000"),
+                None,
+                Some(1),
+                None,
+            )
+            .is_none()
+        );
         assert!(
             parse_pool_meta_row(
                 pool_id,

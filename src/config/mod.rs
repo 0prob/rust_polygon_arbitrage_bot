@@ -843,8 +843,10 @@ mod tests {
     fn state_read_urls_orders_primary_then_failover() {
         let mut config = AppConfig::default();
         config.rpc.state_rpc_url = Some("https://state.example".into());
-        config.rpc.polygon_rpc_urls =
-            vec!["https://poly-a.example".into(), "https://state.example".into()];
+        config.rpc.polygon_rpc_urls = vec![
+            "https://poly-a.example".into(),
+            "https://state.example".into(),
+        ];
         assert_eq!(
             config.state_read_urls(),
             vec![
@@ -867,9 +869,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.execution.mode = "live".into();
         config.execution.executor_address = Some(Address::repeat_byte(0x11));
-        config.execution.private_key = Some(
-            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78627d".into(),
-        );
+        config.execution.private_key =
+            Some("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78627d".into());
         config.rpc.execution_rpc_url = "https://exec.example".into();
         config.rpc.private_rpc_url = Some("https://private.example".into());
         let wallet = WalletSecrets::load(&mut config).expect("test wallet");
@@ -970,7 +971,10 @@ mod tests {
                 "config.toml",
                 "[rpc]\npolygon_rpc_urls = [\"https://toml.example\"]\n",
             )?;
-            jail.set_env("POLYGON_RPC_URLS", "https://env-a.example,https://env-b.example");
+            jail.set_env(
+                "POLYGON_RPC_URLS",
+                "https://env-a.example,https://env-b.example",
+            );
             let mut config: AppConfig = AppConfig::figment().extract_lossy()?;
             apply_conditional_env_overrides(&mut config)
                 .expect("conditional env overrides should succeed");

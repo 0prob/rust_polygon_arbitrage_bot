@@ -7,21 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::core::constants::AAVE_V3_POOL;
+use crate::core::types::FlashLoanSource;
 use crate::core::types::FoundCycle;
 use crate::orchestrator::hf::HfContext;
-use crate::core::types::FlashLoanSource;
-use crate::orchestrator::hf_eval::{HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result};
-use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
-use crate::services::execution::gas_oracle::RouteGasLookup;
+use crate::orchestrator::hf_eval::{
+    HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
+};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
 use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
+use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
 use crate::services::execution::flash_liquidity::{
     aave_flash_reserve_viable, collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
 };
+use crate::services::execution::gas_oracle::RouteGasLookup;
 
 use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 use crate::services::execution::balancer_verify::{
@@ -591,7 +593,10 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             }
         };
 
-    if ctx.execution.is_route_hash_quarantined(&candidate.route_hash) {
+    if ctx
+        .execution
+        .is_route_hash_quarantined(&candidate.route_hash)
+    {
         skipped.record("quarantine");
         return;
     }
@@ -842,8 +847,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
         slippage,
     } = job;
     let fp = result.route_fingerprint;
-    let outcome =
-        query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await;
+    let outcome = query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await;
     let accept = match &outcome {
         BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
             *on_chain_profit,
@@ -859,8 +863,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             accepted.sim.profit = on_chain_profit;
             accepted.sim.amount_out = accepted.sim.amount_in.saturating_add(on_chain_profit);
             accepted.sim.profitable = true;
-            let assessment =
-                reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
+            let assessment = reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
             if !assessment.should_execute {
                 execution.quarantine_batch_query_failure(fp);
                 crate::debug!(
@@ -933,7 +936,10 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         &result.sim.hop_amounts,
         &pool_metas_by_pool,
     ) else {
-        crate::info!("hf near-miss-verify: fp={fp} reject=calldata_build_failed modeled={}", result.sim.profit);
+        crate::info!(
+            "hf near-miss-verify: fp={fp} reject=calldata_build_failed modeled={}",
+            result.sim.profit
+        );
         return;
     };
     let modeled = result.sim.profit;
@@ -984,12 +990,8 @@ fn log_phantom_balancer_diag(
                     BalancerPoolKind::Stable => "stable",
                     BalancerPoolKind::Linear => "linear",
                 };
-                let sim_out = crate::core::math::balancer::simulate_balancer_swap(
-                    s,
-                    h.amount_in,
-                    tin,
-                    tout,
-                );
+                let sim_out =
+                    crate::core::math::balancer::simulate_balancer_swap(s, h.amount_in, tin, tout);
                 format!(
                     "pool={addr} kind={kind} tin={tin} tout={tout} bal_in={} bal_out={} amt_in={} sim_out={sim_out} bpt={:?}",
                     s.balances.get(tin).copied().unwrap_or_default(),

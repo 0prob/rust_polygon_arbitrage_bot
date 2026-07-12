@@ -74,7 +74,8 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     let phase1_results = if phase1.is_empty() {
         Vec::new()
     } else {
-        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await {
+        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await
+        {
             Ok(r) => r,
             Err(error) => {
                 crate::debug!("woofi state phase1 failed: {error:#}");

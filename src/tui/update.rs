@@ -317,7 +317,11 @@ fn build_graph_snapshot(
         .into_keys()
         .map(|label| {
             let arena = arena_counts.get(&label).copied().unwrap_or(0);
-            let graph = snap.graph_active_by_protocol.get(&label).copied().unwrap_or(0);
+            let graph = snap
+                .graph_active_by_protocol
+                .get(&label)
+                .copied()
+                .unwrap_or(0);
             KeyValueRow {
                 key: label,
                 value: format!("{graph}/{arena} graph/arena"),

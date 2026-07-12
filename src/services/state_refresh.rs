@@ -132,8 +132,7 @@ impl StateRefreshService {
 
         let count = {
             let state = self.discovery_state.read();
-            self.cache
-                .count_tradable_in_discovery(&state.address_index)
+            self.cache.count_tradable_in_discovery(&state.address_index)
         };
         self.routable_pool_count.store(count, Ordering::Relaxed);
         self.routable_pool_count_generation

@@ -366,8 +366,7 @@ impl App {
             snapshot.overview.search_ms = self.last_search_ms;
             snapshot.overview.hf_ms = self.last_hf_ms;
             snapshot.overview.profitable_routes = self.last_profitable_count;
-            snapshot.overview.snapshot_age_ms =
-                snapshot.captured_at.elapsed().as_millis() as u64;
+            snapshot.overview.snapshot_age_ms = snapshot.captured_at.elapsed().as_millis() as u64;
             self.last_cycle_count = snapshot.overview.cycle_count;
         }
         self.snapshot = Some(snapshot);

@@ -61,8 +61,8 @@ pub fn decode_algebra_global_state(bytes: &[u8]) -> Option<(U256, i32, bool, U25
     let tick = crate::util::sign_extend_tick24(U256::from_be_slice(&bytes[32..64]));
     let last_fee = U256::from_be_slice(&bytes[64..96]).as_limbs()[0] as u32;
     let unlocked_offset = if bytes.len() >= 224 { 192 } else { 160 };
-    let unlocked = U256::from_be_slice(&bytes[unlocked_offset..unlocked_offset + 32]).as_limbs()[0]
-        != 0;
+    let unlocked =
+        U256::from_be_slice(&bytes[unlocked_offset..unlocked_offset + 32]).as_limbs()[0] != 0;
     Some((price, tick, unlocked, U256::from(last_fee)))
 }
 

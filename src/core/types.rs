@@ -250,15 +250,12 @@ impl PoolState {
             PoolState::Woofi(s) => {
                 let quote_idx = s.base_states.len();
                 if token_idx < quote_idx {
-                    s.base_states
-                        .get(token_idx)
-                        .is_some_and(|base| {
-                            base.reserve >= (base.base_dec / U256::from(1_000u64)).max(U256::ONE)
-                        })
+                    s.base_states.get(token_idx).is_some_and(|base| {
+                        base.reserve >= (base.base_dec / U256::from(1_000u64)).max(U256::ONE)
+                    })
                 } else if token_idx == quote_idx {
                     s.base_states.first().is_some_and(|base| {
-                        s.quote_reserve
-                            >= (base.quote_dec / U256::from(1_000u64)).max(U256::ONE)
+                        s.quote_reserve >= (base.quote_dec / U256::from(1_000u64)).max(U256::ONE)
                     })
                 } else {
                     false

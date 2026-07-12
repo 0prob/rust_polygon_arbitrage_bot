@@ -80,7 +80,8 @@ mod tests {
         let edges: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::BalancerV2), 4).collect();
         assert_eq!(estimate_packed_route_calls(&edges), 1);
         assert_eq!(estimate_route_calls(&edges), 8);
-        let over_batch: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::BalancerV2), 5).collect();
+        let over_batch: Vec<Edge> =
+            std::iter::repeat_n(edge(ProtocolType::BalancerV2), 5).collect();
         assert_eq!(estimate_packed_route_calls(&over_batch), 10);
     }
 }

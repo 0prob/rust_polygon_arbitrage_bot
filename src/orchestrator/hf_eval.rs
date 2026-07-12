@@ -345,8 +345,7 @@ fn rank_one_cycle_probe(
         }
         return out;
     }
-    let start_decimals =
-        resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
+    let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let Some((probe_amount, probe)) = try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
     else {
@@ -357,14 +356,9 @@ fn rank_one_cycle_probe(
         }
         return out;
     };
-    let Some(flash_source) = resolve_flash_source_for_cycle(
-        &cycle,
-        arena,
-        flash,
-        flash_ttl,
-        flash_policy,
-        probe_amount,
-    ) else {
+    let Some(flash_source) =
+        resolve_flash_source_for_cycle(&cycle, arena, flash, flash_ttl, flash_policy, probe_amount)
+    else {
         out.skip.flash_source = 1;
         if out.flash_diag.is_none() {
             let start_addr = arena
@@ -561,10 +555,7 @@ pub fn rank_cycles_by_probe_net(
     probe_seeds.retain(|fingerprint, _| seen.contains(fingerprint));
 
     if kept.is_empty() && !scanned.is_empty() {
-        let sample = partial
-            .flash_diag
-            .as_deref()
-            .unwrap_or("none");
+        let sample = partial.flash_diag.as_deref().unwrap_or("none");
         crate::info!(
             "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
@@ -743,12 +734,8 @@ fn probe_fallback_amounts(
         }
         // Skip spot probe if it exceeds the flash loan cap for this token.
         if candidate == spot
-            && let Some(cap) = max_flash_borrow_wei(
-                input.max_flash_loan_usd,
-                dec,
-                rate,
-                input.matic_usd,
-            )
+            && let Some(cap) =
+                max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate, input.matic_usd)
             && spot > cap
         {
             continue;

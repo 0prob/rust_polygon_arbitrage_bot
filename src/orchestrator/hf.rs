@@ -15,8 +15,8 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    dispatch_profitable_candidates, filter_balancer_onchain_verified,
-    probe_near_miss_balancer, refresh_and_resim_profitable,
+    dispatch_profitable_candidates, filter_balancer_onchain_verified, probe_near_miss_balancer,
+    refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
@@ -98,8 +98,7 @@ fn near_miss_verify_provider(
     execution_mode: &str,
 ) -> anyhow::Result<alloy::providers::DynProvider> {
     if execution_mode.eq_ignore_ascii_case("dry-run") {
-        rpc.connect_state()
-            .or_else(|_| rpc.connect_simulation())
+        rpc.connect_state().or_else(|_| rpc.connect_simulation())
     } else {
         rpc.connect_simulation()
     }
@@ -559,13 +558,11 @@ pub async fn run_hf_tick(
     profitable.sort_unstable_by(|a, b| {
         let a_direct = route_is_balancer_only(&a.cycle);
         let b_direct = route_is_balancer_only(&b.cycle);
-        b_direct
-            .cmp(&a_direct)
-            .then_with(|| {
-                b.assessment
-                    .net_profit_after_gas_matic_wei
-                    .cmp(&a.assessment.net_profit_after_gas_matic_wei)
-            })
+        b_direct.cmp(&a_direct).then_with(|| {
+            b.assessment
+                .net_profit_after_gas_matic_wei
+                .cmp(&a.assessment.net_profit_after_gas_matic_wei)
+        })
     });
     profitable.truncate(pipeline.hf_max_dispatch);
     let profitable_count = profitable.len();

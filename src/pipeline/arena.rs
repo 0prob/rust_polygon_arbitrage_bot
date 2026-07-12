@@ -322,8 +322,7 @@ mod tests {
     use crate::core::types::{V2PoolState, WoofiBaseTokenState, WoofiPoolState};
     use alloy::primitives::U256;
 
-    const MIN_HOP_TOKEN_BALANCE: U256 =
-        U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
+    const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn v2_state() -> Arc<PoolState> {
         Arc::new(PoolState::V2(V2PoolState {

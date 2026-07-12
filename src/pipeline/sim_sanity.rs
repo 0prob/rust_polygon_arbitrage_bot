@@ -247,8 +247,7 @@ mod tests {
 
     #[test]
     fn max_flash_borrow_scales_with_rate() {
-        let cap =
-            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0).expect("cap");
+        let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0).expect("cap");
         assert_eq!(cap, U256::from(50_000u64) * ONE);
         let low_rate_cap =
             max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(15)), 1.0).expect("cap");

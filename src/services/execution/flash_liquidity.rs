@@ -17,12 +17,11 @@ use tokio::time::MissedTickBehavior;
 
 use crate::abis::{IAaveV3Pool, IERC20Metadata};
 use crate::core::constants::{AAVE_V3_POOL, BALANCER_VAULT};
-use crate::infra::rpc::{RpcPool, rpc_host_label};
-use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::core::types::{
     EvaluatedRoute, FlashLoanSource, FoundCycle, PoolState, ProfitAssessment, ProtocolType,
     TokenIndex,
 };
+use crate::infra::rpc::{RpcPool, rpc_host_label};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
@@ -35,6 +34,7 @@ use crate::services::execution::profit::{
     AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
     route_profit_thresholds,
 };
+use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -381,9 +381,8 @@ impl FlashLiquidityCache {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("flash liquidity refresh failed on all state RPCs")
-        }))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("flash liquidity refresh failed on all state RPCs")))
     }
 
     fn stale_tokens(&self, tokens: &[Address]) -> Vec<Address> {
@@ -1087,9 +1086,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
             let assessment = input
                 .existing_assessment
                 .clone()
-                .filter(|a| {
-                    a.should_execute && a.gross_profit == input.evaluated.result.profit
-                })
+                .filter(|a| a.should_execute && a.gross_profit == input.evaluated.result.profit)
                 .or_else(|| reassess_route(input, plan.source))?;
             if !assessment.should_execute {
                 prepare_skip_log(

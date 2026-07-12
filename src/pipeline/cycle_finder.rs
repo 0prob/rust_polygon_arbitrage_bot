@@ -7,12 +7,12 @@ use alloy::primitives::U256;
 use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
+use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
-use crate::pipeline::arena::StateArena;
-use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::types::{
     CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_score,
 };
@@ -32,11 +32,14 @@ pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
 type PoolMetaIndex<'a> = Vec<Option<&'a PoolMeta>>;
 
 pub(crate) fn index_pool_metas(pool_metas: &[PoolMeta]) -> PoolMetaIndex<'_> {
-    let mut index = vec![None; pool_metas
-        .iter()
-        .map(|meta| meta.pool_index.0 as usize)
-        .max()
-        .map_or(0, |max| max + 1)];
+    let mut index = vec![
+        None;
+        pool_metas
+            .iter()
+            .map(|meta| meta.pool_index.0 as usize)
+            .max()
+            .map_or(0, |max| max + 1)
+    ];
     for meta in pool_metas {
         index[meta.pool_index.0 as usize] = Some(meta);
     }
@@ -77,20 +80,12 @@ pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
             }
             match ge.phase {
                 GraphHopPhase::Direct => {
-                    incidences.insert((
-                        ge.edge.pool_index.0 as usize,
-                        ge.edge.token_in.0 as usize,
-                    ));
-                    incidences.insert((
-                        ge.edge.pool_index.0 as usize,
-                        ge.edge.token_out.0 as usize,
-                    ));
+                    incidences.insert((ge.edge.pool_index.0 as usize, ge.edge.token_in.0 as usize));
+                    incidences
+                        .insert((ge.edge.pool_index.0 as usize, ge.edge.token_out.0 as usize));
                 }
                 GraphHopPhase::EnterPool => {
-                    incidences.insert((
-                        ge.edge.pool_index.0 as usize,
-                        ge.edge.token_in.0 as usize,
-                    ));
+                    incidences.insert((ge.edge.pool_index.0 as usize, ge.edge.token_in.0 as usize));
                 }
                 GraphHopPhase::ExitPool => {}
             }
@@ -99,10 +94,7 @@ pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
     for edges in graph.adjacency.iter().skip(token_count) {
         for ge in edges {
             if ge.phase == GraphHopPhase::ExitPool && is_live_graph_edge(ge) {
-                incidences.insert((
-                    ge.edge.pool_index.0 as usize,
-                    ge.edge.token_out.0 as usize,
-                ));
+                incidences.insert((ge.edge.pool_index.0 as usize, ge.edge.token_out.0 as usize));
             }
         }
     }
@@ -617,12 +609,9 @@ fn collect_cycles_dfs_single_start(
                     continue;
                 }
                 let token_out = meta.tokens[out_idx];
-                let Some((edge, edge_log_w, ratio)) = resolve_lazy_swap_edge(
-                    arena,
-                    pending,
-                    token_out,
-                    out_leg,
-                ) else {
+                let Some((edge, edge_log_w, ratio)) =
+                    resolve_lazy_swap_edge(arena, pending, token_out, out_leg)
+                else {
                     continue;
                 };
                 if ratio < ONE {
@@ -1042,8 +1031,8 @@ pub fn find_cycles_multi_pass_with_prep(
         let mut shard = collect_cycles_dfs_parallel(
             graph,
             arena,
-            &pool_metas,
-            &prep,
+            pool_metas,
+            prep,
             pass.max_hops,
             pass.max_cycles.min(MAX_CYCLES_PER_PASS),
             &budget,
@@ -1333,8 +1322,7 @@ mod tests {
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![a];
         let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
-        let cycles =
-            collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 10, &budget);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 10, &budget);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
@@ -1443,8 +1431,7 @@ mod tests {
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![dead, hub];
         let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
-        let cycles =
-            collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4, &budget);
+        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4, &budget);
         assert_eq!(cycles.len(), 3);
     }
 }

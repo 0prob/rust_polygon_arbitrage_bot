@@ -1,13 +1,11 @@
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
-use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
-use crate::pipeline::types::{
-    GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub,
-};
+use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
 use alloy::primitives::U256;
 use rayon::prelude::*;
 use smallvec::SmallVec;
@@ -291,11 +289,7 @@ pub fn count_graph_eligible_pools(arena: &StateArena, pools: &[PoolMeta]) -> usi
         .count()
 }
 
-fn direct_pair_has_marginal_spot(
-    state: &PoolState,
-    protocol: ProtocolType,
-    fee_bps: u32,
-) -> bool {
+fn direct_pair_has_marginal_spot(state: &PoolState, protocol: ProtocolType, fee_bps: u32) -> bool {
     for (tin, tout, zfo) in [(0u8, 1u8, true), (1u8, 0u8, false)] {
         if !state.hop_pair_routable(tin as usize, tout as usize) {
             continue;
@@ -368,13 +362,7 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
         PoolState::Balancer(b) => b.bpt_index,
         _ => None,
     });
-    pool_state_graph_eligible(
-        state,
-        meta.protocol,
-        token_count,
-        bpt_index,
-        meta.fee_bps,
-    )
+    pool_state_graph_eligible(state, meta.protocol, token_count, bpt_index, meta.fee_bps)
 }
 
 #[inline]
@@ -448,10 +436,7 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
     let mut topology_changed = graph.coverage.is_none();
     let mut reindex_pools = rustc_hash::FxHashSet::default();
     for adj_idx in 0..token_count {
-        if !touch_all
-            && !token_slots
-                .is_some_and(|slots| slots.binary_search(&adj_idx).is_ok())
-        {
+        if !touch_all && !token_slots.is_some_and(|slots| slots.binary_search(&adj_idx).is_ok()) {
             continue;
         }
         if let Some(adj) = graph.adjacency.get_mut(adj_idx) {
@@ -660,43 +645,6 @@ fn sort_adjacency_edges(adj: &mut [GraphEdge]) {
     adj.sort_by(|a, b| a.log_weight.total_cmp(&b.log_weight));
 }
 
-fn rebuild_pool_edge_positions_full(graph: &mut RoutingGraph) {
-    let mut max_pool = 0usize;
-    let all_empty = graph.adjacency.iter().all(Vec::is_empty);
-    if all_empty {
-        graph.pool_edge_positions.clear();
-        return;
-    }
-    let mut counts: Vec<usize> = Vec::new();
-    for adj in &graph.adjacency {
-        for ge in adj {
-            let idx = ge.edge.pool_index.0 as usize;
-            if idx >= counts.len() {
-                counts.resize(idx + 1, 0);
-            }
-            counts[idx] += 1;
-            if idx > max_pool {
-                max_pool = idx;
-            }
-        }
-    }
-    let slot_count = max_pool + 1;
-    if counts.len() < slot_count {
-        counts.resize(slot_count, 0);
-    }
-    let mut slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(slot_count);
-    for &c in &counts {
-        slots.push(Vec::with_capacity(c));
-    }
-    for (adj_idx, adj) in graph.adjacency.iter().enumerate() {
-        for (pos, ge) in adj.iter().enumerate() {
-            let idx = ge.edge.pool_index.0 as usize;
-            slots[idx].push((adj_idx, pos));
-        }
-    }
-    graph.pool_edge_positions = slots;
-}
-
 fn rebuild_pool_edge_positions_for_pools(
     graph: &mut RoutingGraph,
     pools: &rustc_hash::FxHashSet<usize>,
@@ -798,8 +746,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
 
-    const MIN_HOP_TOKEN_BALANCE: U256 =
-        U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
+    const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn direct_ge(pool: u32, tin: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
         GraphEdge {
@@ -895,7 +842,11 @@ mod tests {
             .adjacency
             .iter()
             .take(graph.token_count as usize)
-            .map(|adj| adj.iter().filter(|ge| ge.phase == GraphHopPhase::EnterPool).count())
+            .map(|adj| {
+                adj.iter()
+                    .filter(|ge| ge.phase == GraphHopPhase::EnterPool)
+                    .count()
+            })
             .sum::<usize>();
         let exit = graph.adjacency[hub as usize]
             .iter()
@@ -1363,8 +1314,7 @@ mod tests {
         assert!(graph.pool_has_live_edges(pool0));
         assert!(!graph.pool_has_live_edges(pool1));
 
-        let attached =
-            attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]);
+        let attached = attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]);
         assert_eq!(attached, 1);
         assert!(graph.pool_has_live_edges(pool1));
     }

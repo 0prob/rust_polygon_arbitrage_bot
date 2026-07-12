@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use rayon::join;
+
 use crate::config::CycleFinderMode;
 use crate::core::types::FoundCycle;
 use crate::pipeline::arena::StateArena;
@@ -5,15 +9,12 @@ use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
 use crate::pipeline::cycle_filter::{
     ProbeContext, dedupe_cycles_by_edges, prefilter_cycles_by_atomic_sim_with_context,
 };
-use std::sync::Arc;
-
 use crate::pipeline::cycle_finder::{
     find_cycles_multi_pass, find_cycles_multi_pass_with_prep, index_pool_metas,
     prepare_active_graph,
 };
 use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
 use crate::pipeline::weighted_graph::build_weighted_adjacency;
-use rayon::join;
 
 fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
     if total == 0 {

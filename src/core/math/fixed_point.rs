@@ -87,6 +87,9 @@ mod tests {
         let base = U256::from(845_837_069_060_167_155u64);
         let exponent = U256::from(1_000_300_030_003_000_300u64);
         let out = pow_down(base, exponent);
-        assert!(!out.is_zero(), "pow_down returned zero for live-pool inputs");
+        assert!(
+            !out.is_zero(),
+            "pow_down returned zero for live-pool inputs"
+        );
     }
 }

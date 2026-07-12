@@ -344,10 +344,8 @@ mod tests {
             Address::from([3u8; 20]),
             std::sync::Arc::new(crate::core::types::PoolState::V2(
                 crate::core::types::V2PoolState {
-                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE
-                        * U256::from(1100u64),
-                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
-                        * U256::from(900u64),
+                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
+                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
                     fee: U256::from(997u64),
                     fee_denominator: U256::from(1_000u64),
                     block_timestamp_last: 0,
@@ -358,10 +356,8 @@ mod tests {
             Address::from([4u8; 20]),
             std::sync::Arc::new(crate::core::types::PoolState::V2(
                 crate::core::types::V2PoolState {
-                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE
-                        * U256::from(900u64),
-                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
-                        * U256::from(1100u64),
+                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
+                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
                     fee: U256::from(997u64),
                     fee_denominator: U256::from(1_000u64),
                     block_timestamp_last: 0,

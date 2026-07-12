@@ -39,6 +39,7 @@ wallet/
 
 # Runtime data & journals
 .rpbot-*
+.debug-journal.md
 opportunities.jsonl
 *.jsonl
 

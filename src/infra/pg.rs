@@ -317,11 +317,8 @@ impl PgClient {
         )
         .await?;
         let has_more = rows.len() == POOL_META_INCREMENTAL_LIMIT as usize;
-        let (pools, max_created, max_updated) = parse_incremental_rows(
-            &rows,
-            initial_created,
-            initial_updated,
-        );
+        let (pools, max_created, max_updated) =
+            parse_incremental_rows(&rows, initial_created, initial_updated);
         Ok((pools, max_created, max_updated, has_more))
     }
 

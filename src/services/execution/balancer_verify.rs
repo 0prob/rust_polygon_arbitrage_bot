@@ -141,14 +141,9 @@ mod tests {
         let modeled = U256::from(296_685_017_513_143_239u128);
         let amount_in = U256::from(7_978_784_081_956_178u128);
         assert!(batch_profit_covers_min(on_chain, amount_in, 476, 2));
-        let modeled_floor = on_chain_min_profit_for_route(
-            modeled,
-            amount_in,
-            476,
-            2,
-            FlashLoanSource::Direct,
-        )
-        .expect("modeled floor");
+        let modeled_floor =
+            on_chain_min_profit_for_route(modeled, amount_in, 476, 2, FlashLoanSource::Direct)
+                .expect("modeled floor");
         assert!(on_chain < modeled_floor);
     }
 

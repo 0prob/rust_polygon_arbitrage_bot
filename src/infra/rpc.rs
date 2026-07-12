@@ -225,8 +225,7 @@ impl RpcPool {
     async fn probe_http_latency(&self, url: &str) -> Option<Duration> {
         let started = Instant::now();
         let provider = self.cached_http_provider(url).ok()?;
-        let block_res =
-            tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()).await;
+        let block_res = tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()).await;
         block_res.ok().and_then(|r| r.ok())?;
         if !self.polygon_validated_urls.lock().contains(url) {
             let chain_res = tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()).await;
