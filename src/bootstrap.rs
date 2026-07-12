@@ -57,7 +57,7 @@ pub fn log_startup(config: &AppConfig) {
     );
     crate::info!(
         "rpc (state_urls={}, timeout={}ms, batch_pace={}ms, multicall_chunk={})",
-        config.rpc.polygon_rpc_urls.len(),
+        config.state_read_urls().len(),
         config.rpc.request_timeout_ms,
         config.rpc.batch_pace_ms,
         config.max_multicall_calls,
@@ -66,8 +66,8 @@ pub fn log_startup(config: &AppConfig) {
         crate::info!("logs: {}", dir.display());
     }
 
-    if config.state_rpc_url().is_none() {
-        crate::warn!("no STATE_RPC_URL / POLYGON_RPC_URL configured — pool refresh disabled");
+    if config.state_read_urls().is_empty() {
+        crate::warn!("no STATE_RPC_URL / POLYGON_RPC_URL(S) configured — pool refresh disabled");
     }
     config.warn_suboptimal();
 }

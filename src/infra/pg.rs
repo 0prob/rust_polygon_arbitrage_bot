@@ -39,6 +39,7 @@ static POOL_META_INCREMENTAL_SQL: LazyLock<String> = LazyLock::new(|| {
             WHERE "updatedAtBlock" > $2 AND "createdBlock" <= $3
         ) AS combined
         ORDER BY "sortBlock" ASC
+        LIMIT $4
         "#
     )
 });
@@ -53,6 +54,8 @@ const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
 const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Cap incremental catch-up rows per query so a long indexer gap cannot OOM the bot.
+const POOL_META_INCREMENTAL_LIMIT: i64 = 10_000;
 const MAX_POOL_SIZE: usize = 16; // increased from 8: discovery + bootstrap + token + health + spare
 const NOTIFY_CHANNEL: &str = "pool_meta_channel";
 
@@ -260,7 +263,7 @@ impl PgClient {
     pub async fn fetch_pool_meta_incremental(
         &self,
         cursor: &DiscoveryCursor,
-    ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64)> {
+    ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64, bool)> {
         ensure!(
             cursor.last_block > 0,
             "pool discovery not bootstrapped — use keyset bootstrap first"
@@ -278,14 +281,21 @@ impl PgClient {
         let rows = pg_query_retry(
             &self.pool,
             POOL_META_INCREMENTAL_SQL.as_str(),
-            &[&last_block, &updated_wm_i32, &last_block],
+            &[
+                &last_block,
+                &updated_wm_i32,
+                &last_block,
+                &POOL_META_INCREMENTAL_LIMIT,
+            ],
         )
         .await?;
-        Ok(parse_incremental_rows(
+        let has_more = rows.len() == POOL_META_INCREMENTAL_LIMIT as usize;
+        let (pools, max_created, max_updated) = parse_incremental_rows(
             &rows,
             initial_created,
             initial_updated,
-        ))
+        );
+        Ok((pools, max_created, max_updated, has_more))
     }
 
     pub async fn fetch_all_token_metas(&self) -> anyhow::Result<Vec<TokenMeta>> {
@@ -514,5 +524,6 @@ mod tests {
             "incremental sql missing quoted columns: {incremental}"
         );
         assert!(incremental.contains(r#"ORDER BY "sortBlock" ASC"#));
+        assert!(incremental.contains("LIMIT $4"));
     }
 }

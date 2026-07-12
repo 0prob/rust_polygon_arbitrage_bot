@@ -417,17 +417,32 @@ impl StateRefreshService {
         &self,
         cursor: &DiscoveryCursor,
     ) -> anyhow::Result<DiscoveryResult> {
-        let (pools, last_block, last_updated_block) =
-            self.pg.fetch_pool_meta_incremental(cursor).await?;
+        let mut work_cursor = cursor.clone();
+        let mut pools = Vec::new();
+        loop {
+            let (page, last_block, last_updated_block, has_more) =
+                self.pg.fetch_pool_meta_incremental(&work_cursor).await?;
+            pools.extend(page);
+            work_cursor = DiscoveryCursor {
+                last_block: last_block.max(work_cursor.last_block),
+                last_updated_block: last_updated_block
+                    .max(work_cursor.last_updated_block)
+                    .max(last_block),
+            };
+            if !has_more {
+                break;
+            }
+            crate::debug!(
+                "pg incremental page (total={}, last_block={}, last_updated_block={})",
+                pools.len(),
+                work_cursor.last_block,
+                work_cursor.last_updated_block,
+            );
+        }
 
         Ok(DiscoveryResult {
             pools,
-            cursor: DiscoveryCursor {
-                last_block: last_block.max(cursor.last_block),
-                last_updated_block: last_updated_block
-                    .max(cursor.last_updated_block)
-                    .max(last_block),
-            },
+            cursor: work_cursor,
             complete: true,
         })
     }

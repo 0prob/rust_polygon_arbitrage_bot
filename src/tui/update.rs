@@ -71,11 +71,8 @@ fn handle_input(app: &mut App, event: &Event) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, *key),
         Event::Paste(text) => handle_paste(app, text),
-        Event::Resize(_, _)
-        | Event::FocusGained
-        | Event::FocusLost
-        | Event::Key(_)
-        | Event::Mouse(_) => {}
+        Event::Resize(_, _) => app.mark_route_view_dirty(),
+        Event::FocusGained | Event::FocusLost | Event::Key(_) | Event::Mouse(_) => {}
     }
 }
 

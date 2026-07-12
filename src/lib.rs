@@ -8,6 +8,7 @@ pub mod log;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod services;
+pub mod shutdown;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod util;

@@ -123,7 +123,7 @@ pub fn get_balancer_weighted_amount_out(
         return U256::ZERO;
     }
     let amount_out = (scaled_amount_out * ONE) / scaling[out_idx];
-    if amount_out.is_zero() {
+    if amount_out.is_zero() || amount_out > bal_out {
         U256::ZERO
     } else {
         amount_out
@@ -295,7 +295,8 @@ pub fn get_balancer_stable_amount_out(
         return U256::ZERO;
     }
     let amount_out = (scaled_amount_out * ONE) / scaling[out_idx];
-    if amount_out.is_zero() {
+    let bal_out = state.balances[out_idx];
+    if amount_out.is_zero() || amount_out > bal_out {
         U256::ZERO
     } else {
         amount_out

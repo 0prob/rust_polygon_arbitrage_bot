@@ -234,7 +234,7 @@ pub struct App {
     pub sort_mode: SortMode,
     pub selected_index: usize,
     pub scroll: usize,
-    pub snapshot: Option<DashboardSnapshot>,
+    pub snapshot: Option<Arc<DashboardSnapshot>>,
     pub activity: VecDeque<ActivityItem>,
     pub trade_history: VecDeque<TradeRow>,
     pub chart_cycles: VecDeque<u64>,
@@ -335,7 +335,7 @@ impl App {
         if self.route_view_dirty {
             return None;
         }
-        Some((snapshot, self.route_view_indices.as_slice()))
+        Some((snapshot.as_ref(), self.route_view_indices.as_slice()))
     }
 
     pub fn push_activity(&mut self, severity: Severity, message: impl Into<String>) {
@@ -356,16 +356,20 @@ impl App {
         self.trade_history.push_back(row);
     }
 
-    pub fn set_snapshot(&mut self, mut snapshot: DashboardSnapshot) {
+    pub fn set_snapshot(&mut self, mut snapshot: Arc<DashboardSnapshot>) {
         // LF/HF timings arrive on the event stream, while the slower runtime
         // poller builds snapshots independently.  Do not let placeholder
         // values from that poller erase measurements already observed by the
         // UI.
-        snapshot.overview.search_ms = self.last_search_ms;
-        snapshot.overview.hf_ms = self.last_hf_ms;
-        snapshot.overview.profitable_routes = self.last_profitable_count;
-        snapshot.overview.snapshot_age_ms = snapshot.captured_at.elapsed().as_millis() as u64;
-        self.last_cycle_count = snapshot.overview.cycle_count;
+        {
+            let snapshot = Arc::make_mut(&mut snapshot);
+            snapshot.overview.search_ms = self.last_search_ms;
+            snapshot.overview.hf_ms = self.last_hf_ms;
+            snapshot.overview.profitable_routes = self.last_profitable_count;
+            snapshot.overview.snapshot_age_ms =
+                snapshot.captured_at.elapsed().as_millis() as u64;
+            self.last_cycle_count = snapshot.overview.cycle_count;
+        }
         self.snapshot = Some(snapshot);
         self.route_view_dirty = true;
         self.rebuild_route_view();
@@ -658,6 +662,7 @@ impl App {
         self.last_cycle_count = cycles;
         self.last_search_ms = search_ms;
         if let Some(snapshot) = self.snapshot.as_mut() {
+            let snapshot = Arc::make_mut(snapshot);
             snapshot.overview.cycle_count = cycles;
             snapshot.overview.search_ms = search_ms;
         }
@@ -678,6 +683,7 @@ impl App {
         self.last_hf_ms = elapsed_ms;
         self.last_best_profit_wei = Some(best_profit_wei.to_string());
         if let Some(snapshot) = self.snapshot.as_mut() {
+            let snapshot = Arc::make_mut(snapshot);
             snapshot.overview.profitable_routes = profitable_count;
             snapshot.overview.hf_ms = elapsed_ms;
         }
@@ -687,7 +693,7 @@ impl App {
 
     pub fn apply_gas_sample(&mut self, gwei: f64) {
         if let Some(snapshot) = self.snapshot.as_mut() {
-            snapshot.overview.gas_gwei = Some(gwei);
+            Arc::make_mut(snapshot).overview.gas_gwei = Some(gwei);
         }
         push_series(&mut self.chart_gas_gwei, gwei.max(0.0).round() as u64, 120);
     }
@@ -707,7 +713,7 @@ mod tests {
     #[test]
     fn route_view_respects_search_filter() {
         let mut app = App::new();
-        app.set_snapshot(DashboardSnapshot {
+        app.set_snapshot(Arc::new(DashboardSnapshot {
             generation: 1,
             captured_at: Instant::now(),
             overview: OverviewSnapshot {
@@ -791,7 +797,7 @@ mod tests {
             portfolio: Vec::new(),
             diagnostics: Vec::new(),
             config: Vec::new(),
-        });
+        }));
 
         assert_eq!(app.route_view().expect("view").1.len(), 2);
         app.search = "wmatic".to_string();
@@ -856,7 +862,7 @@ mod tests {
             diagnostics: Vec::new(),
             config: Vec::new(),
         };
-        app.set_snapshot(snapshot);
+        app.set_snapshot(Arc::new(snapshot));
 
         let overview = &app
             .snapshot

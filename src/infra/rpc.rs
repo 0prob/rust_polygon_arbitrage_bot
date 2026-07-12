@@ -66,20 +66,7 @@ impl RpcPool {
             "rpc pool",
         );
 
-        let mut state_urls = Vec::new();
-        if let Some(url) = config
-            .rpc
-            .state_rpc_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-        {
-            state_urls.push(url.to_string());
-        }
-        for url in &config.rpc.polygon_rpc_urls {
-            if !url.is_empty() && !state_urls.contains(url) {
-                state_urls.push(url.clone());
-            }
-        }
+        let state_urls = config.state_read_urls();
 
         Self {
             http,
@@ -238,14 +225,16 @@ impl RpcPool {
     async fn probe_http_latency(&self, url: &str) -> Option<Duration> {
         let started = Instant::now();
         let provider = self.cached_http_provider(url).ok()?;
-        let (block_res, chain_res) = tokio::join!(
-            tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()),
-            tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()),
-        );
-        let _block = block_res.ok().and_then(|r| r.ok())?;
-        let chain_id = chain_res.ok().and_then(|r| r.ok())?;
-        if chain_id != crate::core::constants::POLYGON_CHAIN_ID {
-            return None;
+        let block_res =
+            tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()).await;
+        block_res.ok().and_then(|r| r.ok())?;
+        if !self.polygon_validated_urls.lock().contains(url) {
+            let chain_res = tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()).await;
+            let chain_id = chain_res.ok().and_then(|r| r.ok())?;
+            if chain_id != crate::core::constants::POLYGON_CHAIN_ID {
+                return None;
+            }
+            self.polygon_validated_urls.lock().insert(url.to_string());
         }
         Some(started.elapsed())
     }

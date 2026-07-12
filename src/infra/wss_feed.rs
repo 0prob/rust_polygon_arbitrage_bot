@@ -36,6 +36,15 @@ const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Coalesce rapid LF stream-target updates before tearing down subscriptions.
 const WSS_ADDR_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// Why a live subscription session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionExit {
+    /// LF stream targets changed; keep the current endpoint.
+    AddressChange,
+    /// Transport or health-check failure; clear sticky and re-probe endpoints.
+    Unhealthy,
+}
+
 pub struct PoolLogFeed {
     wss_urls: Vec<String>,
     sticky_url: Arc<Mutex<Option<String>>>,
@@ -90,8 +99,11 @@ impl PoolLogFeed {
                                 warn!("WSS subscription error ({}): {e}", rpc_host_label(&url));
                                 *self.sticky_url.lock() = None;
                             }
-                            Ok(()) => {
+                            Ok(SubscriptionExit::AddressChange) => {
                                 *self.sticky_url.lock() = Some(url);
+                            }
+                            Ok(SubscriptionExit::Unhealthy) => {
+                                *self.sticky_url.lock() = None;
                             }
                         }
                     }
@@ -120,7 +132,7 @@ impl PoolLogFeed {
         addresses: &[Address],
         mut shutdown: watch::Receiver<bool>,
         addr_rx: &mut watch::Receiver<Vec<Address>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SubscriptionExit> {
         let ws = WsConnect::new(wss_url.to_string());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
 
@@ -156,7 +168,7 @@ impl PoolLogFeed {
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        return Ok(());
+                        return Ok(SubscriptionExit::AddressChange);
                     }
                 }
                 _ = addr_rx.changed() => {
@@ -164,12 +176,12 @@ impl PoolLogFeed {
                     while addr_rx.has_changed().unwrap_or(false) {
                         tokio::time::sleep(WSS_ADDR_DEBOUNCE).await;
                     }
-                    return Ok(());
+                    return Ok(SubscriptionExit::AddressChange);
                 }
                 maybe_log = log_rx.recv() => {
                     let Some(log) = maybe_log else {
                         warn!("WSS feed disconnected ({}), reconnecting...", rpc_host_label(wss_url));
-                        return Ok(());
+                        return Ok(SubscriptionExit::Unhealthy);
                     };
                     self.handle_log(&log);
                 }
@@ -181,12 +193,12 @@ impl PoolLogFeed {
                         .is_none()
                     {
                         warn!("WSS ping failed ({}), reconnecting...", rpc_host_label(wss_url));
-                        return Ok(());
+                        return Ok(SubscriptionExit::Unhealthy);
                     }
                 }
                 () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
                     warn!("WSS feed idle timeout ({}), reconnecting...", rpc_host_label(wss_url));
-                    return Ok(());
+                    return Ok(SubscriptionExit::Unhealthy);
                 }
             }
         }

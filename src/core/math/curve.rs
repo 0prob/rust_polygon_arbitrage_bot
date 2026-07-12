@@ -161,7 +161,7 @@ pub fn get_curve_stable_amount_out(
         return U256::ZERO;
     };
 
-    let dy = xp[token_out_idx] - y - ONE_U256;
+    let dy = xp[token_out_idx].saturating_sub(y).saturating_sub(ONE_U256);
     if dy.is_zero() {
         return U256::ZERO;
     }

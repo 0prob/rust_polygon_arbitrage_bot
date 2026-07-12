@@ -56,31 +56,51 @@ pub struct TuiBridgeHook {
 
 impl PipelineUiHook for TuiBridgeHook {
     fn on_lf_complete(&self, cycles: usize, search_ms: u64, discoveries: usize) {
-        let _ = self.tx.try_send(UiEvent::LfTick {
-            search_ms,
-            discoveries,
-            cycles,
-        });
+        if self
+            .tx
+            .try_send(UiEvent::LfTick {
+                search_ms,
+                discoveries,
+                cycles,
+            })
+            .is_err()
+        {
+            crate::debug!("tui event channel full — dropped lf tick");
+        }
     }
 
     fn on_hf_tick(&self, result: &HfTickResult, cycles_considered: usize) {
-        let _ = self.tx.try_send(UiEvent::HfTick {
-            cycles_considered,
-            profitable_count: result.profitable_count,
-            best_profit_wei: result.best_profit.to_string(),
-            elapsed_ms: result.elapsed_ms,
-        });
+        if self
+            .tx
+            .try_send(UiEvent::HfTick {
+                cycles_considered,
+                profitable_count: result.profitable_count,
+                best_profit_wei: result.best_profit.to_string(),
+                elapsed_ms: result.elapsed_ms,
+            })
+            .is_err()
+        {
+            crate::debug!("tui event channel full — dropped hf tick");
+        }
     }
 
     fn on_gas_update(&self, gwei: f64) {
-        let _ = self.tx.try_send(UiEvent::GasUpdate { gwei });
+        if self.tx.try_send(UiEvent::GasUpdate { gwei }).is_err() {
+            crate::debug!("tui event channel full — dropped gas update");
+        }
     }
 
     fn on_execution_outcome(&self, outcome: &ExecutionOutcome, route_fingerprint: u64) {
-        let _ = self.tx.try_send(UiEvent::ExecutionOutcome {
-            outcome: outcome.clone(),
-            route_fingerprint,
-        });
+        if self
+            .tx
+            .try_send(UiEvent::ExecutionOutcome {
+                outcome: outcome.clone(),
+                route_fingerprint,
+            })
+            .is_err()
+        {
+            crate::warn!("tui event channel full — dropped execution outcome");
+        }
     }
 }
 

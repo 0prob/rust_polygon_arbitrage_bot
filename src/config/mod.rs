@@ -513,9 +513,12 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("rpc_batch_pace_ms") => "rpc.batch_pace_ms",
         k if k.eq_ignore_ascii_case("request_timeout_ms") => "rpc.request_timeout_ms",
         k if k.eq_ignore_ascii_case("rpc_request_timeout_ms") => "rpc.request_timeout_ms",
+        k if k.eq_ignore_ascii_case("execution_rpc") => "rpc.execution_rpc_url",
+        k if k.eq_ignore_ascii_case("execution_rpc_url") => "rpc.execution_rpc_url",
+        k if k.eq_ignore_ascii_case("executor_address") => "execution.executor_address",
         k if k.eq_ignore_ascii_case("hyper_sync_url") => "rpc.hyper_sync_url",
         k if k.eq_ignore_ascii_case("wss_url") => "rpc.wss_url",
-        // POLYGON_WSS_URLS is comma-split in apply_conditional_env_overrides (like POLYGON_RPC_URLS).
+        // POLYGON_RPC_URLS / POLYGON_WSS_URLS are comma-split in apply_conditional_env_overrides.
         k if k.eq_ignore_ascii_case("private_rpc_url") => "rpc.private_rpc_url",
         k if k.eq_ignore_ascii_case("state_rpc_url") => "rpc.state_rpc_url",
         _ => return None,
@@ -527,8 +530,8 @@ fn env_provider() -> Env {
 }
 
 fn dedupe_preserve_order(urls: &mut Vec<String>) {
-    let mut seen = std::collections::HashSet::new();
-    urls.retain(|url| seen.insert(url.clone()));
+    let mut seen = std::collections::HashSet::with_capacity(urls.len());
+    urls.retain(|url| !url.is_empty() && seen.insert(url.clone()));
 }
 
 fn split_rpc_urls(raw: &str) -> Vec<String> {
@@ -542,39 +545,27 @@ fn split_rpc_urls(raw: &str) -> Vec<String> {
     urls
 }
 
-/// Env overrides that need fallbacks, comma-split lists, or fill-if-empty semantics.
+/// Env overrides that need comma-split lists or aliases not covered by figment paths.
 fn apply_conditional_env_overrides(config: &mut AppConfig) -> anyhow::Result<()> {
-    if config.rpc.wss_url.is_none()
-        && let Some(url) = env_var("POLYGON_WSS_URL")
-    {
+    if let Some(url) = env_var("POLYGON_WSS_URL") {
         config.rpc.wss_url = Some(url);
     }
-    if config.rpc.polygon_wss_urls.is_empty()
-        && let Some(urls) = env_var("POLYGON_WSS_URLS")
-    {
+    if let Some(urls) = env_var("POLYGON_WSS_URLS") {
         config.rpc.polygon_wss_urls = split_rpc_urls(&urls);
     }
-    if config.rpc.execution_rpc_url.is_empty()
-        && let Some(url) = env_var("EXECUTION_RPC_URL").or_else(|| env_var("EXECUTION_RPC"))
-    {
+    if let Some(url) = env_var("EXECUTION_RPC_URL").or_else(|| env_var("EXECUTION_RPC")) {
         config.rpc.execution_rpc_url = url;
     }
-    if config.execution.executor_address.is_none()
-        && let Some(addr) = env_var("EXECUTOR_ADDRESS")
-    {
+    if let Some(addr) = env_var("EXECUTOR_ADDRESS") {
         config.execution.executor_address = Some(addr.parse()?);
     }
-    if config.execution.private_key.is_none()
-        && let Some(key) = env_var("PRIVATE_KEY")
-    {
+    if let Some(key) = env_var("PRIVATE_KEY") {
         config.execution.private_key = Some(key);
     }
-    if config.rpc.polygon_rpc_urls.is_empty() {
-        if let Some(urls) = env_var("POLYGON_RPC_URLS") {
-            config.rpc.polygon_rpc_urls = split_rpc_urls(&urls);
-        } else if let Some(url) = env_var("POLYGON_RPC_URL") {
-            config.rpc.polygon_rpc_urls.push(url);
-        }
+    if let Some(urls) = env_var("POLYGON_RPC_URLS") {
+        config.rpc.polygon_rpc_urls = split_rpc_urls(&urls);
+    } else if let Some(url) = env_var("POLYGON_RPC_URL") {
+        config.rpc.polygon_rpc_urls = vec![url];
     }
     Ok(())
 }
@@ -623,11 +614,22 @@ impl AppConfig {
         dedupe_preserve_order(&mut self.rpc.polygon_rpc_urls);
         dedupe_preserve_order(&mut self.rpc.polygon_wss_urls);
 
+        self.lf_interval_ms = self.lf_interval_ms.max(1);
+        self.hf_interval_ms = self.hf_interval_ms.max(1);
+        self.discovery_interval_ms = self.discovery_interval_ms.max(1);
+        self.discovery_bootstrap_batch = self.discovery_bootstrap_batch.max(1);
+        self.max_multicall_calls = self.max_multicall_calls.max(1);
+        self.rpc.request_timeout_ms = self.rpc.request_timeout_ms.max(1);
+        self.rpc.batch_pace_ms = self.rpc.batch_pace_ms.min(60_000);
+
         if self.pipeline.hf_score_cap < self.pipeline.hf_sim_cap {
             self.pipeline.hf_score_cap = self.pipeline.hf_sim_cap;
         }
+        if self.pipeline.hf_max_dispatch > self.pipeline.hf_sim_cap {
+            self.pipeline.hf_max_dispatch = self.pipeline.hf_sim_cap;
+        }
 
-        let mc = self.max_multicall_calls.max(1) as usize;
+        let mc = self.max_multicall_calls as usize;
         let prefetch_cap = mc.saturating_mul(2).min(200);
         if self.pipeline.hf_prefetch_count > prefetch_cap {
             self.pipeline.hf_prefetch_count = prefetch_cap;
@@ -636,10 +638,18 @@ impl AppConfig {
 
     /// Non-fatal hints for configs that work but waste RPC budget or backlog LF/HF.
     pub fn warn_suboptimal(&self) {
-        if self.rpc.polygon_rpc_urls.len() > 1 && self.rpc.batch_pace_ms == 0 {
+        let state_urls = self.state_read_urls();
+        if state_urls.len() > 1 && self.rpc.batch_pace_ms == 0 {
             crate::warn!(
                 "RPC_BATCH_PACE_MS=0 with {} state RPCs — bursts may trigger rate limits; try 5–10ms",
-                self.rpc.polygon_rpc_urls.len()
+                state_urls.len()
+            );
+        }
+        if !self.rpc.execution_rpc_url.is_empty()
+            && state_urls.iter().any(|u| u == &self.rpc.execution_rpc_url)
+        {
+            crate::warn!(
+                "EXECUTION_RPC matches a state-read endpoint — multicall will burn premium execution quota; use a dedicated STATE_RPC_URL / POLYGON_RPC_URLS entry"
             );
         }
         if self.lf_interval_ms < 2_500 && !self.pipeline.stream_enabled {
@@ -738,8 +748,8 @@ impl AppConfig {
             "live mode requires PRIVATE_KEY or PRIVATE_KEY_FILE"
         );
         ensure!(
-            self.state_rpc_url().is_some(),
-            "live mode requires STATE_RPC_URL or POLYGON_RPC_URL"
+            !self.state_read_urls().is_empty(),
+            "live mode requires STATE_RPC_URL or POLYGON_RPC_URL(S)"
         );
         ensure!(
             !self.rpc.execution_rpc_url.is_empty() || self.rpc.private_rpc_url.is_some(),
@@ -762,19 +772,28 @@ impl AppConfig {
         self.execution.mode.eq_ignore_ascii_case("dry-run")
     }
 
+    /// Ordered state-read endpoints used for multicall pool refresh (matches [`RpcPool`]).
+    #[must_use]
+    pub fn state_read_urls(&self) -> Vec<String> {
+        let mut urls = Vec::with_capacity(1 + self.rpc.polygon_rpc_urls.len());
+        if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty()) {
+            urls.push(url.to_string());
+        }
+        for url in &self.rpc.polygon_rpc_urls {
+            if !url.is_empty() && !urls.iter().any(|u| u == url) {
+                urls.push(url.clone());
+            }
+        }
+        urls
+    }
+
     #[must_use]
     pub fn state_rpc_url(&self) -> Option<&str> {
         self.rpc
             .state_rpc_url
             .as_deref()
+            .filter(|u| !u.is_empty())
             .or_else(|| self.rpc.polygon_rpc_urls.first().map(String::as_str))
-            .or({
-                if self.rpc.execution_rpc_url.is_empty() {
-                    None
-                } else {
-                    Some(self.rpc.execution_rpc_url.as_str())
-                }
-            })
     }
 }
 
@@ -821,6 +840,46 @@ mod tests {
     }
 
     #[test]
+    fn state_read_urls_orders_primary_then_failover() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://state.example".into());
+        config.rpc.polygon_rpc_urls =
+            vec!["https://poly-a.example".into(), "https://state.example".into()];
+        assert_eq!(
+            config.state_read_urls(),
+            vec![
+                "https://state.example".to_string(),
+                "https://poly-a.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn state_rpc_url_does_not_fall_back_to_execution_rpc() {
+        let mut config = AppConfig::default();
+        config.rpc.execution_rpc_url = "https://exec.example".into();
+        assert!(config.state_read_urls().is_empty());
+        assert!(config.state_rpc_url().is_none());
+    }
+
+    #[test]
+    fn live_validation_requires_state_read_urls_not_execution_only() {
+        let mut config = AppConfig::default();
+        config.execution.mode = "live".into();
+        config.execution.executor_address = Some(Address::repeat_byte(0x11));
+        config.execution.private_key = Some(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78627d".into(),
+        );
+        config.rpc.execution_rpc_url = "https://exec.example".into();
+        config.rpc.private_rpc_url = Some("https://private.example".into());
+        let wallet = WalletSecrets::load(&mut config).expect("test wallet");
+        let err = config
+            .validate(&wallet)
+            .expect_err("execution-only live config should fail");
+        assert!(err.to_string().contains("STATE_RPC_URL"));
+    }
+
+    #[test]
     fn normalize_dedupes_rpc_urls_and_clamps_prefetch() {
         let mut config = AppConfig::default();
         config.rpc.polygon_rpc_urls = vec![
@@ -836,6 +895,9 @@ mod tests {
         assert_eq!(config.rpc.polygon_rpc_urls.len(), 2);
         assert_eq!(config.pipeline.hf_prefetch_count, 100);
         assert_eq!(config.pipeline.hf_score_cap, 100);
+        config.pipeline.hf_max_dispatch = 200;
+        config.normalize();
+        assert_eq!(config.pipeline.hf_max_dispatch, 100);
     }
 
     #[test]
@@ -895,6 +957,31 @@ mod tests {
                 .merge(env_provider())
                 .extract_lossy()?;
             assert_eq!(config.lf_interval_ms, 42);
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn env_polygon_rpc_urls_override_toml_list() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "config.toml",
+                "[rpc]\npolygon_rpc_urls = [\"https://toml.example\"]\n",
+            )?;
+            jail.set_env("POLYGON_RPC_URLS", "https://env-a.example,https://env-b.example");
+            let mut config: AppConfig = AppConfig::figment().extract_lossy()?;
+            apply_conditional_env_overrides(&mut config)
+                .expect("conditional env overrides should succeed");
+            config.normalize();
+            assert_eq!(
+                config.state_read_urls(),
+                vec![
+                    "https://env-a.example".to_string(),
+                    "https://env-b.example".to_string(),
+                ]
+            );
             Ok(())
         });
     }

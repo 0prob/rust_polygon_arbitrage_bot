@@ -73,6 +73,7 @@ pub fn simulate_v3_swap(
         || state.sqrt_price_x96 < MIN_SQRT_RATIO
         || state.sqrt_price_x96 >= MAX_SQRT_RATIO
         || state.liquidity == 0
+        || state.liquidity > i128::MAX as u128
         || fee_pips >= FEE_PIPS_SCALE
     {
         return V3SwapResult {

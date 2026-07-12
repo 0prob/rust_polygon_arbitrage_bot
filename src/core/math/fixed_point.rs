@@ -79,4 +79,14 @@ mod tests {
         let ratio = ONE - ONE / U256::from(100u64);
         assert!(edge_log_weight_from_ratio(ratio) > 0.0);
     }
+
+    #[test]
+    fn pow_down_live_weighted_pool_regression() {
+        // Regression: ln() compared reduced input to exponent thresholds instead of
+        // exp factors, yielding pow_down=0 and phantom Balancer weighted quotes.
+        let base = U256::from(845_837_069_060_167_155u64);
+        let exponent = U256::from(1_000_300_030_003_000_300u64);
+        let out = pow_down(base, exponent);
+        assert!(!out.is_zero(), "pow_down returned zero for live-pool inputs");
+    }
 }
