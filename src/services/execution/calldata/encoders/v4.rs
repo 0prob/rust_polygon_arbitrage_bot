@@ -115,3 +115,53 @@ fn v4_static_fields(arena: &StateArena, hop: &CalldataHop) -> (u32, i32, Address
         _ => (hop.edge.fee_bps.saturating_mul(100), 60, hooks),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex, V4PoolState};
+    use std::sync::Arc;
+
+    #[test]
+    fn pool_key_uses_exact_state_fee_before_rounded_edge_fee() {
+        let mut arena = StateArena::default();
+        let pool_index = arena.register_pool(
+            Address::with_last_byte(1),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                tick: 0,
+                liquidity: 1_000_000,
+                fee: U256::from(450u64),
+                tick_spacing: 9,
+                ticks: Arc::from([] as [crate::core::types::V3Tick; 0]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            })),
+        );
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                fee_bps: 4,
+                zero_for_one: true,
+                protocol: ProtocolType::UniswapV4,
+            },
+            pool_address: Address::with_last_byte(1),
+            token_in: Address::with_last_byte(2),
+            token_out: Address::with_last_byte(3),
+            amount_in: U256::from(1_000u64),
+            amount_out: U256::from(999u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: Some(Address::ZERO),
+        };
+
+        assert_eq!(v4_static_fields(&arena, &hop), (450, 9, Address::ZERO));
+    }
+}

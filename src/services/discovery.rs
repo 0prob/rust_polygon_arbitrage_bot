@@ -275,6 +275,11 @@ fn parse_pool_meta_impl(
     if !has_supported_token_shape(proto, &tokens) {
         return None;
     }
+    if proto == ProtocolType::UniswapV4
+        && (fee.is_none_or(|value| !(0..0x800000).contains(&value)) || tick_spacing.is_none())
+    {
+        return None;
+    }
     let fee_bps = fee_to_bps(protocol, fee.map(|f| f as u32));
     let mut hooks = hooks_raw.and_then(|h| h.parse().ok());
     let pool_type = if proto == ProtocolType::BalancerV2 {
@@ -406,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_uniswap_v4_without_pool_id() {
+    fn uniswap_v4_requires_execution_pool_key_fields() {
         let pool_id = "0x1111111111111111111111111111111111111111111111111111111111111111";
         assert!(
             parse_pool_meta_row(
@@ -426,7 +431,7 @@ mod tests {
             )
             .is_some()
         );
-        let pool = parse_pool_meta_row(
+        assert!(parse_pool_meta_row(
             pool_id,
             "UNISWAP_V4",
             &[
@@ -441,8 +446,25 @@ mod tests {
             Some(1),
             None,
         )
-        .expect("v4 pool id from bytes32 key");
-        assert!(pool.tick_spacing.is_none());
+        .is_none());
+        assert!(
+            parse_pool_meta_row(
+                pool_id,
+                "UNISWAP_V4",
+                &[
+                    "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270".to_string(),
+                    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174".to_string(),
+                ],
+                None,
+                Some(60),
+                None,
+                Some("0x0000000000000000000000000000000000000000"),
+                None,
+                Some(1),
+                None,
+            )
+            .is_none()
+        );
         assert!(
             parse_pool_meta_row(
                 "0x0000000000000000000000000000000000000001",

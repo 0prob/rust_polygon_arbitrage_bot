@@ -49,11 +49,11 @@ fn default_no_tick_step(tick_spacing: i32) -> i32 {
 
 #[must_use]
 pub fn resolve_v3_fee_pips(pool_fee: U256, edge_fee_bps: Option<u32>) -> U256 {
-    if let Some(bps) = edge_fee_bps.filter(|bps| *bps > 0 && *bps < 10_000) {
-        return U256::from(bps) * U256::from(100); // bps -> pips (1e4 -> 1e6)
-    }
     if !pool_fee.is_zero() {
         return pool_fee;
+    }
+    if let Some(bps) = edge_fee_bps.filter(|bps| *bps < 10_000) {
+        return U256::from(bps) * U256::from(100); // bps -> pips (1e4 -> 1e6)
     }
     U256::from(DEFAULT_V3_FEE_PIPS)
 }
@@ -233,9 +233,15 @@ mod tests {
     }
 
     #[test]
-    fn edge_fee_bps_override_converts_to_pips() {
+    fn exact_pool_fee_precedes_rounded_edge_fee() {
         let fee = resolve_v3_fee_pips(U256::from(5_000u32), Some(25));
-        assert_eq!(fee, U256::from(2_500u32));
+        assert_eq!(fee, U256::from(5_000u32));
+    }
+
+    #[test]
+    fn explicit_zero_edge_fee_remains_zero() {
+        let fee = resolve_v3_fee_pips(U256::ZERO, Some(0));
+        assert_eq!(fee, U256::ZERO);
     }
 
     #[test]

@@ -67,6 +67,7 @@ struct ProbeRankPartial {
     near_net: Vec<(U256, FoundCycle)>,
     seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
     skip: SkipCounters,
+    flash_diag: Option<String>,
 }
 
 impl ProbeRankPartial {
@@ -76,6 +77,9 @@ impl ProbeRankPartial {
         self.near_net.extend(other.near_net);
         self.seeds.extend(other.seeds);
         self.skip.merge(other.skip);
+        if self.flash_diag.is_none() {
+            self.flash_diag = other.flash_diag;
+        }
         self
     }
 }
@@ -333,6 +337,12 @@ fn rank_one_cycle_probe(
     }
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
         out.skip.flash = 1;
+        if out.flash_diag.is_none() {
+            out.flash_diag = Some(format!(
+                "fp={fp:#x} hops={} mixed_balancer_no_aave",
+                cycle.edges.len(),
+            ));
+        }
         return out;
     }
     let start_decimals =
@@ -356,6 +366,16 @@ fn rank_one_cycle_probe(
         probe_amount,
     ) else {
         out.skip.flash_source = 1;
+        if out.flash_diag.is_none() {
+            let start_addr = arena
+                .token_address(cycle.start_token)
+                .map(|a| format!("{a}"))
+                .unwrap_or_else(|| "?".into());
+            out.flash_diag = Some(format!(
+                "fp={fp:#x} hops={} flash_source_reject start={start_addr} probe_amt={probe_amount}",
+                cycle.edges.len(),
+            ));
+        }
         return out;
     };
 
@@ -541,8 +561,12 @@ pub fn rank_cycles_by_probe_net(
     probe_seeds.retain(|fingerprint, _| seen.contains(fingerprint));
 
     if kept.is_empty() && !scanned.is_empty() {
-        crate::debug!(
-            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len}",
+        let sample = partial
+            .flash_diag
+            .as_deref()
+            .unwrap_or("none");
+        crate::info!(
+            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
             skip.rate,
             skip.flash,

@@ -156,33 +156,31 @@ impl PgClient {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let url = url_str.to_string();
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                if *shutdown.borrow() {
-                    break;
-                }
-                match Self::run_notify_listener(&url, &notify_flag, &mut shutdown).await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        crate::warn!(
-                            "pg LISTEN disconnected ({e:#}); reconnecting in {}s",
-                            backoff.as_secs()
-                        );
-                        tokio::select! {
-                            _ = shutdown.changed() => {
-                                if *shutdown.borrow() {
-                                    break;
-                                }
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            match Self::run_notify_listener(&url, &notify_flag, &mut shutdown).await {
+                Ok(()) => break,
+                Err(e) => {
+                    crate::warn!(
+                        "pg LISTEN disconnected ({e:#}); reconnecting in {}s",
+                        backoff.as_secs()
+                    );
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                break;
                             }
-                            _ = tokio::time::sleep(backoff) => {}
                         }
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                        _ = tokio::time::sleep(backoff) => {}
                     }
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
             }
-            crate::info!("pg LISTEN listener shut down");
-        });
+        }
+        crate::info!("pg LISTEN listener shut down");
         Ok(())
     }
 
@@ -191,17 +189,46 @@ impl PgClient {
         notify_flag: &AtomicBool,
         shutdown: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let (client, mut connection) = tokio_postgres::connect(url_str, NoTls)
+        let (user, password, host, port, dbname) =
+            parse_pg_url(url_str).context("invalid postgres LISTEN connection URL")?;
+        let mut config = tokio_postgres::Config::new();
+        config.host(&host);
+        config.port(port);
+        config.dbname(&dbname);
+        config.user(&user);
+        if !password.is_empty() {
+            config.password(&password);
+        }
+        config.connect_timeout(PG_CONNECT_TIMEOUT);
+        let (client, mut connection) = config
+            .connect(NoTls)
             .await
             .context("pg LISTEN connect failed")?;
 
-        client
-            .batch_execute(&format!("LISTEN {NOTIFY_CHANNEL}"))
-            .await
-            .context("pg LISTEN pool_meta_channel failed")?;
+        let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
+        let listen_sql = format!("LISTEN {NOTIFY_CHANNEL}");
+        let subscribe = client.batch_execute(&listen_sql);
+        tokio::pin!(subscribe);
+        loop {
+            tokio::select! {
+                result = &mut subscribe => {
+                    result.context("pg LISTEN pool_meta_channel failed")?;
+                    break;
+                }
+                message = messages.next() => match message {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => anyhow::bail!("pg LISTEN connection closed during subscribe"),
+                },
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         crate::info!("pg LISTEN subscribed to {NOTIFY_CHANNEL}");
 
-        let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {

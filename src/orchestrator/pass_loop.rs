@@ -253,7 +253,7 @@ pub async fn run_pass_loop(
     let mut hs_restart_backoff = Duration::from_secs(2);
 
     let lf_shutdown = shutdown.clone();
-    let lf_handle = spawn_lf_background(lf_ctx, ctx.config.lf_interval_ms, lf_shutdown);
+    let mut lf_handle = spawn_lf_background(lf_ctx, ctx.config.lf_interval_ms, lf_shutdown);
 
     let stream_feed = spawn_pool_log_feed(
         &ctx.config,
@@ -417,11 +417,13 @@ pub async fn run_pass_loop(
         let operator = ctx.wallet.operator_address(executor);
         ctx.execution.shutdown_resync(&provider, operator).await;
     }
-    if tokio::time::timeout(Duration::from_secs(5), lf_handle)
+    if tokio::time::timeout(Duration::from_secs(5), &mut lf_handle)
         .await
         .is_err()
     {
-        crate::warn!("lf background task did not exit within 5s of shutdown");
+        lf_handle.abort();
+        let _ = lf_handle.await;
+        crate::warn!("lf background task aborted after 5s shutdown timeout");
     }
     #[cfg(feature = "tui")]
     if let Some(handle) = snapshot_handle {

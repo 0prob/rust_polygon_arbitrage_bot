@@ -39,7 +39,7 @@ fn probe_beats_gas_floor(
     gas_price: U256,
 ) -> bool {
     if rate < crate::core::constants::MIN_TOKEN_TO_MATIC_RATE {
-        return true;
+        return false;
     }
     let scale = crate::util::ten_pow_u256_cached(decimals);
     let profit_matic = sim.profit.saturating_mul(rate) / scale;
@@ -83,6 +83,9 @@ fn prefilter_verdict_for_cycle(
     ctx: Option<&ProbeContext<'_>>,
 ) -> PrefilterVerdict {
     if !is_fully_simulable_route(&cycle.edges) {
+        return PrefilterVerdict::Reject;
+    }
+    if !cycle_spot_negative(cycle) {
         return PrefilterVerdict::Reject;
     }
     let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
@@ -194,13 +197,13 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
 /// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
 /// iterator chain directly without an intermediate `.collect()`.
 pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
-    use crate::core::types::CycleEdges;
-    let mut best: FxHashMap<CycleEdges, FoundCycle> = FxHashMap::default();
+    let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
     for cycle in cycles {
-        match best.entry(cycle.edges.clone()) {
+        let key = cycle_key(&cycle.edges);
+        match best.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if cycle.score < e.get().score {
-                    e.insert(cycle);
+                if e.get().edges == cycle.edges && cycle.score < e.get().score {
+                    *e.get_mut() = cycle;
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {

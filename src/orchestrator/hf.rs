@@ -93,6 +93,18 @@ fn should_log_hf_summary() -> bool {
     true
 }
 
+fn near_miss_verify_provider(
+    rpc: &RpcPool,
+    execution_mode: &str,
+) -> anyhow::Result<alloy::providers::DynProvider> {
+    if execution_mode.eq_ignore_ascii_case("dry-run") {
+        rpc.connect_state()
+            .or_else(|_| rpc.connect_simulation())
+    } else {
+        rpc.connect_simulation()
+    }
+}
+
 fn should_log_best_eval() -> bool {
     let now = now_ms();
     let last = HF_BEST_EVAL_LOG_AT.load(Ordering::Relaxed);
@@ -388,8 +400,31 @@ pub async fn run_hf_tick(
         );
     }
     if !flash_token_list.is_empty() {
-        Arc::clone(&ctx.execution.flash_liquidity)
-            .spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_token_list);
+        let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
+        flash_cache.track_hot_tokens(&flash_token_list);
+        let stale: Vec<Address> = flash_token_list
+            .iter()
+            .copied()
+            .filter(|addr| !flash_cache.has_fresh_entry(*addr))
+            .collect();
+        if !stale.is_empty() {
+            let flash_budget = std::time::Duration::from_millis(750);
+            match tokio::time::timeout(
+                flash_budget,
+                flash_cache.refresh_with_fallback(&ctx.rpc, &stale),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => crate::debug!("hf flash prefetch failed: {e:#}"),
+                Err(_) => crate::debug!(
+                    "hf flash prefetch timed out after {}ms (stale={})",
+                    flash_budget.as_millis(),
+                    stale.len()
+                ),
+            }
+        }
+        flash_cache.spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_token_list);
     }
 
     let flash_policy = ctx.config.flash_policy;
@@ -559,7 +594,8 @@ pub async fn run_hf_tick(
             );
             if route_is_balancer_only(&near_miss.cycle)
                 && let Some(executor) = ctx.config.execution.executor_address
-                && let Ok(sim_provider) = ctx.rpc.connect_simulation()
+                && let Ok(sim_provider) =
+                    near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
             {
                 probe_near_miss_balancer(
                     &ctx.execution,
@@ -579,7 +615,8 @@ pub async fn run_hf_tick(
             log_best_eval_diagnostic(diag);
             if let Some(ref probe) = best_gross_probe
                 && let Some(executor) = ctx.config.execution.executor_address
-                && let Ok(sim_provider) = ctx.rpc.connect_simulation()
+                && let Ok(sim_provider) =
+                    near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
             {
                 probe_near_miss_balancer(
                     &ctx.execution,

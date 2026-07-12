@@ -306,10 +306,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         ctx.cache.len()
     );
     let decimals = ctx.refresh.token_decimals_map();
+    let arena_sync_started = crate::util::now_ms();
     let pool_metas = Arc::new(
         ctx.refresh
             .sync_routable_arena(&mut arena, Some(decimals.as_ref())),
     );
+    let arena_sync_ms = crate::util::now_ms().saturating_sub(arena_sync_started);
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 
@@ -332,8 +334,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // ponytail: skip enrich_all_token_to_matic_rates — prior_rates from last tick
     // is sufficient for resolvable set computation. Cycle-token enrichment below
     // provides fresh rates for profit evaluation, saving one oracle RPC pass.
+    let cpu_started = crate::util::now_ms();
     let cpu = run_lf_cpu_async(cpu_work).await;
     let cpu = cpu?;
+    let cpu_ms = crate::util::now_ms().saturating_sub(cpu_started);
     if *shutdown.borrow() {
         return Ok(());
     }
@@ -370,6 +374,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         }
     }
 
+    let ticks_started = crate::util::now_ms();
     if let Some(ref provider) = state_provider {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
         let v4_tick_targets = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
@@ -396,7 +401,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         )
         .await;
     }
+    let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);
 
+    let finalize_started = crate::util::now_ms();
     let mut capped = Arc::try_unwrap(cycles_arc).unwrap_or_else(|arc| (*arc).clone());
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
@@ -407,6 +414,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // ponytail: rescore reorders by score and would undo enumeration-time protocol
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
     capped = finalize_enumerated_cycles(capped, max_paths);
+    let finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
 
     let rates_started = crate::util::now_ms();
     let rates = if let Some(ref provider) = state_provider {
@@ -458,10 +466,14 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         resolvable_count
     );
     crate::info!(
-        "lf latency: total_ms={} discovery_ms={} refresh_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
+        "lf latency: total_ms={} discovery_ms={} refresh_ms={} arena_sync_ms={} cpu_ms={} ticks_ms={} finalize_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
         crate::util::now_ms().saturating_sub(lf_started),
         discovery_ms,
         refresh_ms,
+        arena_sync_ms,
+        cpu_ms,
+        ticks_ms,
+        finalize_ms,
         cycle_and_rates_ms,
         rates_ms,
         refreshed_pools,

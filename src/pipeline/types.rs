@@ -67,7 +67,7 @@ pub struct RoutingGraph {
     /// Reverse index: pool_index.0 → list of (adjacency_node_index, edge_index_in_list)
     pub pool_edge_positions: Vec<Vec<(usize, usize)>>,
     /// Cached cycle-capable coverage from Tarjan bridge search.
-    /// Only recomputed when graph topology changes (not on rescore).
+    /// Refreshed when thinning removes edges or on first build, not on weight-only rescoring.
     pub coverage: Option<std::sync::Arc<crate::pipeline::cycle_finder::CycleCapableCoverage>>,
 }
 

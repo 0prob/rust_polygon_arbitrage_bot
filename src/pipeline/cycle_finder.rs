@@ -9,7 +9,7 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
-use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_packed_route_calls};
+use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
@@ -31,7 +31,7 @@ pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
 
 type PoolMetaIndex<'a> = Vec<Option<&'a PoolMeta>>;
 
-fn index_pool_metas(pool_metas: &[PoolMeta]) -> PoolMetaIndex<'_> {
+pub(crate) fn index_pool_metas(pool_metas: &[PoolMeta]) -> PoolMetaIndex<'_> {
     let mut index = vec![None; pool_metas
         .iter()
         .map(|meta| meta.pool_index.0 as usize)
@@ -243,10 +243,13 @@ pub(crate) fn prioritize_cycle_start_tokens_from_out_degrees(
     scored.into_iter().map(|(t, _)| t).collect()
 }
 
-struct ActiveGraph {
+/// DFS enumeration view of a routing graph (live edges + pruning bounds).
+pub struct ActiveGraph {
     /// Live edges only — DFS never walks dead rescored legs.
     adjacency: Vec<Vec<GraphEdge>>,
     start_tokens: Vec<TokenIndex>,
+    /// True when hub Enter legs outnumber Direct legs (hybrid BF budget shrink).
+    pub hub_heavy: bool,
     /// Best live edge leaving each token (used for the next hop in the bound).
     /// Only valid for token indices where adjacency has live edges;
     /// for dead tokens the caller falls through to global_min.
@@ -259,7 +262,18 @@ struct ActiveGraph {
     global_max_live_edge_ratio: U256,
 }
 
-fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
+struct NodePrep {
+    live: Vec<GraphEdge>,
+    protos: u8,
+    min_outgoing: Option<f64>,
+    max_outgoing_ratio: U256,
+    enter_legs: u16,
+    direct_legs: u16,
+}
+
+/// Build the live-edge DFS view and hub/direct stats (single graph scan).
+#[must_use]
+pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     let coverage = graph
         .coverage
         .as_ref()
@@ -267,60 +281,99 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         .unwrap_or_else(|| std::sync::Arc::new(cycle_capable_coverage(graph)));
     let token_count = graph.token_count as usize;
     let node_count = graph.adjacency.len();
+
+    let per_node: Vec<NodePrep> = (0..node_count)
+        .into_par_iter()
+        .map(|index| {
+            let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
+            if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
+                return NodePrep {
+                    live: Vec::new(),
+                    protos: 0,
+                    min_outgoing: None,
+                    max_outgoing_ratio: ONE,
+                    enter_legs: 0,
+                    direct_legs: 0,
+                };
+            }
+            let mut live: Vec<GraphEdge> = Vec::with_capacity(edges.len());
+            let mut protos: u8 = 0;
+            let mut proto_bits = 0u16;
+            let mut min_outgoing: Option<f64> = None;
+            let mut max_outgoing_ratio = ONE;
+            let mut enter_legs = 0u16;
+            let mut direct_legs = 0u16;
+            for ge in edges {
+                if !is_live_graph_edge(ge) {
+                    continue;
+                }
+                if index < token_count {
+                    match ge.phase {
+                        GraphHopPhase::EnterPool => enter_legs = enter_legs.saturating_add(1),
+                        GraphHopPhase::Direct => direct_legs = direct_legs.saturating_add(1),
+                        GraphHopPhase::ExitPool => {}
+                    }
+                    let bit = 1u16 << (ge.edge.protocol as u8);
+                    if proto_bits & bit == 0 {
+                        protos += 1;
+                        proto_bits |= bit;
+                    }
+                    if ge.phase == GraphHopPhase::Direct {
+                        let w = ge.log_weight;
+                        match min_outgoing {
+                            Some(ref mut best) if w < *best => *best = w,
+                            None => min_outgoing = Some(w),
+                            _ => {}
+                        }
+                        if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio {
+                            max_outgoing_ratio = ge.ratio;
+                        }
+                    }
+                }
+                live.push(*ge);
+            }
+            NodePrep {
+                live,
+                protos,
+                min_outgoing,
+                max_outgoing_ratio,
+                enter_legs,
+                direct_legs,
+            }
+        })
+        .collect();
+
+    let mut hub_enter = 0usize;
+    let mut hub_direct = 0usize;
     let mut compact = Vec::with_capacity(node_count);
-    // min_outgoing lazily populated: only tokens with live edges get entries.
-    // Use a sparse representation: None for dead/unreachable tokens.
     let mut min_outgoing: Vec<Option<f64>> = vec![None; token_count];
     let mut max_outgoing_ratio: Vec<U256> = vec![ONE; token_count];
     let mut global_min = f64::INFINITY;
     let mut global_max_ratio = ONE;
-    // ponytail: single pass for live edges + diversity scoring (was double iteration).
     let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
 
-    for index in 0..node_count {
-        let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
-        if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
-            compact.push(Vec::new());
-            continue;
-        }
-        let mut live: Vec<GraphEdge> = Vec::with_capacity(edges.len());
-        let mut protos: u8 = 0;
-        let mut proto_bits = 0u16; // bitmask: ProtocolType has ≤9 variants
-        for ge in edges {
-            if !is_live_graph_edge(ge) {
-                continue;
-            }
-            if index < token_count {
-                let bit = 1u16 << (ge.edge.protocol as u8);
-                if proto_bits & bit == 0 {
-                    protos += 1;
-                    proto_bits |= bit;
-                }
-                if ge.phase == GraphHopPhase::Direct {
-                    let w = ge.log_weight;
-                    match min_outgoing[index] {
-                        Some(ref mut best) if w < *best => *best = w,
-                        None => min_outgoing[index] = Some(w),
-                        _ => {}
-                    }
-                    if w < global_min {
-                        global_min = w;
-                    }
-                    if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio[index] {
-                        max_outgoing_ratio[index] = ge.ratio;
-                    }
-                    if ge.ratio > global_max_ratio {
-                        global_max_ratio = ge.ratio;
-                    }
+    for (index, node) in per_node.into_iter().enumerate() {
+        let len = node.live.len();
+        if index < token_count {
+            hub_enter += node.enter_legs as usize;
+            hub_direct += node.direct_legs as usize;
+            if let Some(w) = node.min_outgoing {
+                min_outgoing[index] = Some(w);
+                if w < global_min {
+                    global_min = w;
                 }
             }
-            live.push(*ge);
+            if node.max_outgoing_ratio > max_outgoing_ratio[index] {
+                max_outgoing_ratio[index] = node.max_outgoing_ratio;
+            }
+            if node.max_outgoing_ratio > global_max_ratio {
+                global_max_ratio = node.max_outgoing_ratio;
+            }
+            if len > 0 {
+                scored_div.push((TokenIndex(index as u32), node.protos as usize, len));
+            }
         }
-        let len = live.len();
-        compact.push(live);
-        if index < token_count && len > 0 {
-            scored_div.push((TokenIndex(index as u32), protos as usize, len));
-        }
+        compact.push(node.live);
     }
 
     scored_div.sort_by(|a, b| {
@@ -343,6 +396,7 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     ActiveGraph {
         adjacency: compact,
         start_tokens,
+        hub_heavy: hub_enter > hub_direct,
         min_outgoing_weight: min_outgoing_dense,
         global_min_live_edge_weight: if global_min == f64::INFINITY {
             0.0
@@ -352,6 +406,11 @@ fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         max_outgoing_ratio,
         global_max_live_edge_ratio: global_max_ratio,
     }
+}
+
+#[inline]
+fn route_hop_budget_exceeded(hop_call_sum: u16) -> bool {
+    hop_call_sum as usize > MAX_ROUTE_CALLS
 }
 
 #[inline]
@@ -514,6 +573,7 @@ fn collect_cycles_dfs_single_start(
         curr_node: u32,
         pending: Option<PendingHubSwap>,
         path: &mut Vec<Edge>,
+        path_hop_calls: u16,
         used_pools: &mut rustc_hash::FxHashSet<u32>,
         used_tokens: &mut [bool],
         hops: u32,
@@ -580,11 +640,11 @@ fn collect_cycles_dfs_single_start(
                 ) {
                     continue;
                 }
-                path.push(edge);
-                if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS {
-                    path.pop();
+                let hop_calls = estimate_hop_calls(edge.protocol) as u16;
+                if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
                     continue;
                 }
+                path.push(edge);
                 dfs(
                     graph,
                     arena,
@@ -594,6 +654,7 @@ fn collect_cycles_dfs_single_start(
                     token_out.0,
                     None,
                     path,
+                    path_hop_calls.saturating_add(hop_calls),
                     used_pools,
                     used_tokens,
                     hops + 1,
@@ -614,7 +675,7 @@ fn collect_cycles_dfs_single_start(
 
         let curr = TokenIndex(curr_node);
         if hops >= 2 && curr == start {
-            if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS
+            if route_hop_budget_exceeded(path_hop_calls)
                 || product_ratio <= ONE
                 || product_ratio < min_profitable_cycle_ratio(hops)
             {
@@ -678,6 +739,7 @@ fn collect_cycles_dfs_single_start(
                         ge.target_node,
                         Some(pending),
                         path,
+                        path_hop_calls,
                         used_pools,
                         used_tokens,
                         hops,
@@ -712,12 +774,12 @@ fn collect_cycles_dfs_single_start(
                         pool_unmark(used_pools, pool_id);
                         continue;
                     }
-                    path.push(ge.edge);
-                    if estimate_packed_route_calls(path) > MAX_ROUTE_CALLS {
-                        path.pop();
+                    let hop_calls = estimate_hop_calls(ge.edge.protocol) as u16;
+                    if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
                         pool_unmark(used_pools, pool_id);
                         continue;
                     }
+                    path.push(ge.edge);
                     dfs(
                         graph,
                         arena,
@@ -727,6 +789,7 @@ fn collect_cycles_dfs_single_start(
                         ge.target_node,
                         None,
                         path,
+                        path_hop_calls.saturating_add(hop_calls),
                         used_pools,
                         used_tokens,
                         hops + 1,
@@ -777,6 +840,7 @@ fn collect_cycles_dfs_single_start(
                     ge.target_node,
                     Some(pending),
                     &mut path,
+                    0,
                     &mut used_pools,
                     &mut used_tokens,
                     0,
@@ -806,13 +870,12 @@ fn collect_cycles_dfs_single_start(
                 ) {
                     continue;
                 }
-                pool_mark(&mut used_pools, pool_id);
-                path.push(ge.edge);
-                if estimate_packed_route_calls(&path) > MAX_ROUTE_CALLS {
-                    path.pop();
-                    pool_unmark(&mut used_pools, pool_id);
+                let hop_calls = estimate_hop_calls(ge.edge.protocol) as u16;
+                if route_hop_budget_exceeded(hop_calls) {
                     continue;
                 }
+                pool_mark(&mut used_pools, pool_id);
+                path.push(ge.edge);
                 dfs(
                     graph,
                     arena,
@@ -822,6 +885,7 @@ fn collect_cycles_dfs_single_start(
                     ge.target_node,
                     None,
                     &mut path,
+                    hop_calls,
                     &mut used_pools,
                     &mut used_tokens,
                     1,
@@ -851,12 +915,12 @@ fn collect_cycles_dfs_parallel(
     prep: &ActiveGraph,
     hop_limit: u32,
     max_cycles: usize,
+    budget: &std::sync::Arc<SharedDeadlineGuard>,
 ) -> Vec<FoundCycle> {
     let start_tokens = &prep.start_tokens;
-    if start_tokens.is_empty() || max_cycles == 0 {
+    if start_tokens.is_empty() || max_cycles == 0 || budget.tick() {
         return Vec::new();
     }
-    let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
     let per_shard = max_cycles.div_ceil(start_tokens.len()).max(1);
     let mut shard_caps = vec![per_shard; start_tokens.len()];
     let mut shard_cycles: Vec<Vec<FoundCycle>> = start_tokens
@@ -937,9 +1001,10 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 
     use crate::pipeline::types::compare_cycle_score;
 
-    let mut best: rustc_hash::FxHashMap<CycleEdges, FoundCycle> = rustc_hash::FxHashMap::default();
+    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
     for cycle in shard_cycles.iter().flat_map(|s| s.iter()) {
-        match best.entry(cycle.edges.clone()) {
+        let key = cycle_key(&cycle.edges);
+        match best.entry(key) {
             Entry::Occupied(mut e) => {
                 if cycle.score < e.get().score {
                     *e.get_mut() = cycle.clone();
@@ -956,6 +1021,39 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 }
 
 #[must_use]
+pub fn find_cycles_multi_pass_with_prep(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    pool_metas: &PoolMetaIndex<'_>,
+    prep: &ActiveGraph,
+    passes: &[CycleSearchPass],
+) -> Vec<FoundCycle> {
+    if passes.is_empty() || prep.start_tokens.is_empty() {
+        return Vec::new();
+    }
+    // One deadline for all hop passes — each pass used to allocate a full budget
+    // sequentially (~2s wall time for the default two-pass schedule).
+    let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
+    let mut all = Vec::new();
+    for pass in passes {
+        if budget.tick() {
+            break;
+        }
+        let mut shard = collect_cycles_dfs_parallel(
+            graph,
+            arena,
+            &pool_metas,
+            &prep,
+            pass.max_hops,
+            pass.max_cycles.min(MAX_CYCLES_PER_PASS),
+            &budget,
+        );
+        all.append(&mut shard);
+    }
+    dedupe_cycles_by_edges(all)
+}
+
+#[must_use]
 pub fn find_cycles_multi_pass(
     graph: &RoutingGraph,
     arena: &StateArena,
@@ -965,25 +1063,9 @@ pub fn find_cycles_multi_pass(
     if passes.is_empty() {
         return Vec::new();
     }
-
     let prep = prepare_active_graph(graph);
     let pool_metas = index_pool_metas(pool_metas);
-    if prep.start_tokens.is_empty() {
-        return Vec::new();
-    }
-    let mut all = Vec::new();
-    for pass in passes {
-        let mut shard = collect_cycles_dfs_parallel(
-            graph,
-            arena,
-            &pool_metas,
-            &prep,
-            pass.max_hops,
-            pass.max_cycles.min(MAX_CYCLES_PER_PASS),
-        );
-        all.append(&mut shard);
-    }
-    dedupe_cycles_by_edges(all)
+    find_cycles_multi_pass_with_prep(graph, arena, &pool_metas, &prep, passes)
 }
 
 /// Returns the most frequently used protocol in the cycle (primary protocol for diversity).
@@ -1250,7 +1332,9 @@ mod tests {
         let metas = index_pool_metas(&[]);
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![a];
-        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 10);
+        let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
+        let cycles =
+            collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 10, &budget);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].hop_count, 2);
         assert!(cycles[0].score < 0.0);
@@ -1358,7 +1442,9 @@ mod tests {
         let metas = index_pool_metas(&[]);
         let mut prep = prepare_active_graph(&graph);
         prep.start_tokens = vec![dead, hub];
-        let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4);
+        let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
+        let cycles =
+            collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4, &budget);
         assert_eq!(cycles.len(), 3);
     }
 }

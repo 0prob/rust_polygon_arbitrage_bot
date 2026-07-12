@@ -383,9 +383,11 @@ fn is_prunable_direct_edge(ge: &GraphEdge) -> bool {
         && (ge.ratio.is_zero() || ge.log_weight >= DEAD_EDGE_LOG_WEIGHT)
 }
 
-fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
+/// Returns true when parallel thinning removed at least one edge.
+fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) -> bool {
     use std::cmp::Reverse;
 
+    let before_len = adj.len();
     let drained = std::mem::take(adj);
     let (mut direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
         .into_iter()
@@ -394,12 +396,12 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
     if max_per_pair == 0 {
         direct.append(&mut hub_legs);
         *adj = direct;
-        return;
+        return before_len != adj.len();
     }
     if direct.len() <= max_per_pair {
         direct.append(&mut hub_legs);
         *adj = direct;
-        return;
+        return before_len != adj.len();
     }
 
     direct.sort_by(|a, b| {
@@ -436,16 +438,15 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) {
     direct.truncate(out_len);
     direct.append(&mut hub_legs);
     *adj = direct;
+    before_len != adj.len()
 }
 
 /// Drop dead/unprofitable direct edges, re-thin parallel routes, and refresh coverage.
-fn compact_token_adjacency(
-    graph: &mut RoutingGraph,
-    token_slots: Option<&[usize]>,
-    touched_pools: Option<&rustc_hash::FxHashSet<usize>>,
-) {
+fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize]>) {
     let token_count = graph.token_count as usize;
     let touch_all = token_slots.is_none();
+    let mut topology_changed = graph.coverage.is_none();
+    let mut reindex_pools = rustc_hash::FxHashSet::default();
     for adj_idx in 0..token_count {
         if !touch_all
             && !token_slots
@@ -454,21 +455,29 @@ fn compact_token_adjacency(
             continue;
         }
         if let Some(adj) = graph.adjacency.get_mut(adj_idx) {
-            thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR);
+            if thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR) {
+                topology_changed = true;
+            }
             sort_adjacency_edges(adj);
+            for ge in adj.iter() {
+                reindex_pools.insert(ge.edge.pool_index.0 as usize);
+            }
         }
     }
     for adj in graph.adjacency.iter_mut().skip(token_count) {
         sort_adjacency_edges(adj);
+        for ge in adj.iter() {
+            reindex_pools.insert(ge.edge.pool_index.0 as usize);
+        }
     }
-    if let Some(pools) = touched_pools {
-        rebuild_pool_edge_positions_for_pools(graph, pools);
-    } else {
-        rebuild_pool_edge_positions_full(graph);
+    if !reindex_pools.is_empty() {
+        rebuild_pool_edge_positions_for_pools(graph, &reindex_pools);
     }
-    graph.coverage = Some(std::sync::Arc::new(
-        crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
-    ));
+    if topology_changed {
+        graph.coverage = Some(std::sync::Arc::new(
+            crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
+        ));
+    }
 }
 
 fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &PoolMeta) -> bool {
@@ -571,7 +580,7 @@ pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
 /// Recompute edge log-weights from current pool states without rebuilding adjacency.
 pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
     rescore_adjacency(arena, &mut graph.adjacency);
-    compact_token_adjacency(graph, None, None);
+    compact_token_adjacency(graph, None);
 }
 
 /// Rescore only dirty pools when the touch set is small; otherwise rescore all edges.
@@ -634,7 +643,7 @@ pub fn rescore_pools_in_place(
         }
         rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
     } else {
-        compact_token_adjacency(graph, Some(&compact_slots), Some(&touched_pools));
+        compact_token_adjacency(graph, Some(&compact_slots));
     }
     touched
 }
@@ -1203,6 +1212,40 @@ mod tests {
             .map(|ge| ge.edge.pool_index.0)
             .collect();
         assert_eq!(live_pools, vec![live_pool.0]);
+    }
+
+    #[test]
+    fn weight_only_rescore_reuses_cycle_coverage() {
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([60u8; 20]));
+        let b = arena.register_token(Address::from([61u8; 20]));
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let pool = arena.register_pool(
+            Address::from([62u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded + U256::from(100u64),
+                reserve1: funded + U256::from(200u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let metas = [pool_meta_from_pair(pool, ProtocolType::UniswapV2, a, b, 30)];
+        let mut graph = build_graph(&arena, &metas);
+        let coverage_ptr = std::sync::Arc::as_ptr(graph.coverage.as_ref().expect("coverage"));
+        arena.register_pool(
+            Address::from([62u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded + U256::from(110u64),
+                reserve1: funded + U256::from(190u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        rescore_pools_in_place(&arena, &mut graph, &[pool]);
+        let coverage_after = graph.coverage.as_ref().expect("coverage");
+        assert_eq!(std::sync::Arc::as_ptr(coverage_after), coverage_ptr);
     }
 
     #[test]

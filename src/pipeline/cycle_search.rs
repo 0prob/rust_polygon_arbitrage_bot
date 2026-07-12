@@ -5,26 +5,15 @@ use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
 use crate::pipeline::cycle_filter::{
     ProbeContext, dedupe_cycles_by_edges, prefilter_cycles_by_atomic_sim_with_context,
 };
-use crate::pipeline::cycle_finder::find_cycles_multi_pass;
+use std::sync::Arc;
+
+use crate::pipeline::cycle_finder::{
+    find_cycles_multi_pass, find_cycles_multi_pass_with_prep, index_pool_metas,
+    prepare_active_graph,
+};
 use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
 use crate::pipeline::weighted_graph::build_weighted_adjacency;
 use rayon::join;
-
-fn graph_hub_heavy(graph: &RoutingGraph) -> bool {
-    let token_slots = graph.token_count as usize;
-    let mut enter = 0usize;
-    let mut direct = 0usize;
-    for adj in graph.adjacency.iter().take(token_slots) {
-        for ge in adj {
-            match ge.phase {
-                crate::pipeline::types::GraphHopPhase::EnterPool => enter += 1,
-                crate::pipeline::types::GraphHopPhase::Direct => direct += 1,
-                crate::pipeline::types::GraphHopPhase::ExitPool => {}
-            }
-        }
-    }
-    enter > direct
-}
 
 fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
     if total == 0 {
@@ -98,7 +87,7 @@ pub fn find_cycles_for_mode(
     finalize_cycles(arena, cycles, passes, atomic_prefilter, probe_ctx)
 }
 
-/// Parallel DFS + Johnson hub search + Bellman-Ford, merged and atomically prefiltered.
+/// Parallel DFS + Bellman-Ford, merged and atomically prefiltered.
 #[must_use]
 pub fn find_cycles_hybrid_multi_pass(
     arena: &StateArena,
@@ -112,7 +101,8 @@ pub fn find_cycles_hybrid_multi_pass(
         return Vec::new();
     }
 
-    let hub_heavy = graph_hub_heavy(graph);
+    let prep = Arc::new(prepare_active_graph(graph));
+    let hub_heavy = prep.hub_heavy;
     let dfs_budget: Vec<_> = passes
         .iter()
         .map(|p| {
@@ -133,11 +123,27 @@ pub fn find_cycles_hybrid_multi_pass(
             }
         })
         .collect();
-    let base_adj = build_weighted_adjacency(graph);
+    let bf_enabled = bf_budget.iter().any(|p| p.max_cycles > 0);
+    let pool_index = index_pool_metas(pool_metas);
+    let prep_dfs = Arc::clone(&prep);
 
     let (mut dfs_cycles, mut bf_cycles) = join(
-        || find_cycles_multi_pass(graph, arena, pool_metas, &dfs_budget),
-        || find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &bf_budget),
+        || {
+            find_cycles_multi_pass_with_prep(
+                graph,
+                arena,
+                &pool_index,
+                prep_dfs.as_ref(),
+                &dfs_budget,
+            )
+        },
+        || {
+            if !bf_enabled {
+                return Vec::new();
+            }
+            let base_adj = build_weighted_adjacency(graph);
+            find_cycles_bellman_ford_multi_pass_with_adj(&base_adj, &bf_budget)
+        },
     );
 
     dfs_cycles.append(&mut bf_cycles);
