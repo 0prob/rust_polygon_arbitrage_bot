@@ -785,10 +785,12 @@ pub fn pool_meta_from_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
     use crate::core::types::{BalancerPoolKind, BalancerPoolState, PoolState, V2PoolState};
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
+
+    const MIN_HOP_TOKEN_BALANCE: U256 =
+        U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn direct_ge(pool: u32, tin: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
         GraphEdge {
@@ -915,7 +917,7 @@ mod tests {
         let d = arena.register_token(Address::from([13u8; 20]));
         let e = arena.register_token(Address::from([14u8; 20]));
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let pool = arena.register_pool(
             Address::from([15u8; 20]),
             Arc::new(PoolState::Balancer(BalancerPoolState {
@@ -1018,7 +1020,7 @@ mod tests {
         let b = arena.register_token(Address::from([11u8; 20]));
         let c = arena.register_token(Address::from([12u8; 20]));
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let routable_pool = arena.register_pool(
             Address::from([13u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -1056,7 +1058,7 @@ mod tests {
         let a = arena.register_token(Address::from([20u8; 20]));
         let b = arena.register_token(Address::from([21u8; 20]));
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let pool = arena.register_pool(
             Address::from([22u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -1119,7 +1121,7 @@ mod tests {
     #[test]
     fn pool_state_graph_eligible_requires_routable_pair() {
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let one_sided = PoolState::V2(V2PoolState {
             reserve0: funded,
             reserve1: dust,
@@ -1156,7 +1158,7 @@ mod tests {
         let hub = arena.register_token(Address::from([50u8; 20]));
         let leaf = arena.register_token(Address::from([51u8; 20]));
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let live_pool = arena.register_pool(
             Address::from([52u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {

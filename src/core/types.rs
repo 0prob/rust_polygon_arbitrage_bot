@@ -252,9 +252,14 @@ impl PoolState {
                 if token_idx < quote_idx {
                     s.base_states
                         .get(token_idx)
-                        .is_some_and(|base| base.reserve >= MIN_HOP_TOKEN_BALANCE)
+                        .is_some_and(|base| {
+                            base.reserve >= (base.base_dec / U256::from(1_000u64)).max(U256::ONE)
+                        })
                 } else if token_idx == quote_idx {
-                    s.quote_reserve >= MIN_HOP_TOKEN_BALANCE
+                    s.base_states.first().is_some_and(|base| {
+                        s.quote_reserve
+                            >= (base.quote_dec / U256::from(1_000u64)).max(U256::ONE)
+                    })
                 } else {
                     false
                 }
@@ -431,12 +436,14 @@ mod hop_routing_tests {
     use super::*;
     use alloy::primitives::Address;
 
+    const FUNDED_TEST_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
+
     fn funded() -> U256 {
-        MIN_HOP_TOKEN_BALANCE
+        FUNDED_TEST_BALANCE
     }
 
     fn dust() -> U256 {
-        MIN_HOP_TOKEN_BALANCE - U256::from(1u64)
+        U256::ZERO
     }
 
     #[test]
@@ -455,6 +462,19 @@ mod hop_routing_tests {
     }
 
     #[test]
+    fn v2_accepts_nonzero_six_decimal_reserves() {
+        let state = PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(2_000_000u64),
+            fee: U256::from(30u8),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        });
+
+        assert!(state.is_tradable());
+    }
+
+    #[test]
     fn woofi_skips_underfunded_base_legs() {
         let state = PoolState::Woofi(WoofiPoolState {
             tokens: vec![Address::ZERO; 3],
@@ -465,8 +485,8 @@ mod hop_routing_tests {
                     spread: U256::ZERO,
                     coeff: U256::ZERO,
                     reserve: funded(),
-                    base_dec: U256::from(1u8),
-                    quote_dec: U256::from(1u8),
+                    base_dec: funded() * U256::from(1_000u64),
+                    quote_dec: funded() * U256::from(1_000u64),
                     price_dec: U256::from(1u8),
                     fee_rate: U256::ZERO,
                     max_gamma: U256::ZERO,
@@ -477,8 +497,8 @@ mod hop_routing_tests {
                     spread: U256::ZERO,
                     coeff: U256::ZERO,
                     reserve: dust(),
-                    base_dec: U256::from(1u8),
-                    quote_dec: U256::from(1u8),
+                    base_dec: funded() * U256::from(1_000u64),
+                    quote_dec: funded() * U256::from(1_000u64),
                     price_dec: U256::from(1u8),
                     fee_rate: U256::ZERO,
                     max_gamma: U256::ZERO,
@@ -491,6 +511,34 @@ mod hop_routing_tests {
         assert!(state.hop_pair_routable(0, 2));
         assert!(!state.hop_pair_routable(1, 2));
         assert!(!state.hop_pair_routable(1, 0));
+    }
+
+    #[test]
+    fn woofi_six_decimal_quote_reserve_is_tradable() {
+        // Given: a funded base and a six-decimal quote reserve above one token.
+        let state = PoolState::Woofi(WoofiPoolState {
+            tokens: vec![Address::ZERO; 2],
+            quote_reserve: U256::from(98_047_508_855u64),
+            base_states: vec![WoofiBaseTokenState {
+                price: U256::from(1u8),
+                spread: U256::ZERO,
+                coeff: U256::ZERO,
+                reserve: U256::from(10u128.pow(18)),
+                base_dec: U256::from(10u128.pow(18)),
+                quote_dec: U256::from(10u64.pow(6)),
+                price_dec: U256::from(10u128.pow(8)),
+                fee_rate: U256::ZERO,
+                max_gamma: U256::ZERO,
+                max_notional_swap: U256::ZERO,
+            }],
+            fee: U256::ZERO,
+        });
+
+        // When: protocol-aware funding checks are applied.
+        let tradable = state.is_tradable();
+
+        // Then: raw 1e15 units must not reject a healthy six-decimal reserve.
+        assert!(tradable);
     }
 
     #[test]

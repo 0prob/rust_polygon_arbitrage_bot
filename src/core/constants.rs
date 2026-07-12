@@ -7,8 +7,9 @@ pub const HOP_CAP_USIZE: usize = HOP_CAP as usize;
 /// Maximum tokens per pool metadata row (Curve/Balancer upper bound in this bot).
 pub const MAX_POOL_TOKENS: usize = 8;
 
-/// Minimum raw token balance for a hop to be routable (dust guard).
-pub const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]); // 1e15
+/// Structural nonzero-liquidity floor. Decimal- and price-aware economic floors
+/// are applied before simulation and execution.
+pub const MIN_HOP_TOKEN_BALANCE: U256 = U256::ONE;
 
 pub const FEE_DENOMINATOR: U256 = U256::from_limbs([1000, 0, 0, 0]);
 pub const BPS_SCALE: U256 = U256::from_limbs([10_000, 0, 0, 0]);
@@ -43,7 +44,7 @@ pub const POLYGON_HUB_TOKENS: [Address; 20] = [
     address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
     address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"),
     address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"),
-    address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd5"),
+    address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6"),
     address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"),
     address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
     address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),

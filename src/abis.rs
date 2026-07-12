@@ -307,11 +307,7 @@ sol! {
             uint64 coeff,
             bool woFeasible
         );
-        function decimalInfo(address base) external view returns (
-            uint8 baseDec,
-            uint8 quoteDec,
-            uint8 priceDec
-        );
+        function decimals(address base) external view returns (uint8);
     }
 
     #[sol(rpc)]

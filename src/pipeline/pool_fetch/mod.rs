@@ -8,10 +8,12 @@ use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 
-use crate::abis::{IBalancerPool, IWoofiPool, IWooracle};
+use crate::abis::{IBalancerPool, IERC20Metadata, IWoofiPool, IWooracle};
 use crate::core::types::{PoolState, ProtocolType, WoofiBaseTokenState, WoofiPoolState};
 use crate::infra::pool_meta_cache::PoolMetaCache;
-use crate::pipeline::abi_cache::{BALANCER_POOL_ID, WOOFI_QUOTE_TOKEN, WOOFI_WOORACLE};
+use crate::pipeline::abi_cache::{
+    BALANCER_POOL_ID, ERC20_DECIMALS, WOOFI_QUOTE_TOKEN, WOOFI_WOORACLE,
+};
 use crate::pipeline::multicall::{
     MulticallItem, encode_call, execute_multicall_at_chunked, plan_batch_call_budget,
 };
@@ -130,6 +132,10 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             target: meta.address,
             data: encode_call(&IWoofiPool::tokenInfosCall { base: meta.quote }),
         });
+        phase2.push(MulticallItem {
+            target: meta.quote,
+            data: ERC20_DECIMALS.clone(),
+        });
         for token in &meta.tokens {
             if *token == meta.quote {
                 continue;
@@ -143,8 +149,12 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
                 data: encode_call(&IWooracle::stateCall { base: *token }),
             });
             phase2.push(MulticallItem {
+                target: *token,
+                data: ERC20_DECIMALS.clone(),
+            });
+            phase2.push(MulticallItem {
                 target: meta.wooracle,
-                data: encode_call(&IWooracle::decimalInfoCall { base: *token }),
+                data: encode_call(&IWooracle::decimalsCall { base: *token }),
             });
         }
         spans.push((meta_idx, start, phase2.len()));
@@ -181,11 +191,23 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             quote_reserve = U256::from(info.reserve);
         }
         cursor += 1;
+        let quote_dec = phase2_results
+            .get(cursor)
+            .and_then(|r| r.as_ref())
+            .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok());
+        cursor += 1;
         for token_addr in meta.tokens.iter().filter(|t| **t != meta.quote) {
             let base = phase2_results.get(cursor).and_then(|r| r.as_ref());
             let oracle = phase2_results.get(cursor + 1).and_then(|r| r.as_ref());
-            let decimals = phase2_results.get(cursor + 2).and_then(|r| r.as_ref());
-            cursor += 3;
+            let base_dec = phase2_results
+                .get(cursor + 2)
+                .and_then(|r| r.as_ref())
+                .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok());
+            let price_dec = phase2_results
+                .get(cursor + 3)
+                .and_then(|r| r.as_ref())
+                .and_then(|bytes| IWooracle::decimalsCall::abi_decode_returns(bytes).ok());
+            cursor += 4;
             let Some(info_bytes) = base else { continue };
             let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(info_bytes) else {
                 continue;
@@ -200,9 +222,11 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             if !oracle_state.woFeasible {
                 continue;
             }
-            let (base_dec, quote_dec, price_dec) = decimals
-                .and_then(|b| IWooracle::decimalInfoCall::abi_decode_returns(b).ok())
-                .map_or((18u8, 18u8, 18u8), |d| (d.baseDec, d.quoteDec, d.priceDec));
+            let (Some(base_dec), Some(quote_dec), Some(price_dec)) =
+                (base_dec, quote_dec, price_dec)
+            else {
+                continue;
+            };
             base_states.push(WoofiBaseTokenState {
                 price: U256::from(oracle_state.price),
                 spread: U256::from(oracle_state.spread),

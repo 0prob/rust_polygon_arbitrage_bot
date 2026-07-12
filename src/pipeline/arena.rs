@@ -319,9 +319,11 @@ impl StateArena {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
-    use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
     use crate::core::types::{V2PoolState, WoofiBaseTokenState, WoofiPoolState};
     use alloy::primitives::U256;
+
+    const MIN_HOP_TOKEN_BALANCE: U256 =
+        U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn v2_state() -> Arc<PoolState> {
         Arc::new(PoolState::V2(V2PoolState {
@@ -519,7 +521,7 @@ mod tests {
         let a = Address::with_last_byte(22);
         let b = Address::with_last_byte(23);
         let funded = MIN_HOP_TOKEN_BALANCE;
-        let dust = MIN_HOP_TOKEN_BALANCE - U256::from(1u64);
+        let dust = U256::ZERO;
         let cache = StateCache::default();
         cache.insert(
             pool_address,

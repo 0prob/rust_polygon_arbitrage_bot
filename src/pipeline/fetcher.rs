@@ -51,7 +51,6 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
     if targets.is_empty() {
         return (0, false);
     }
-
     // Group targets by protocol so we can parallelize fetch across protocol families.
     // V2 gets its own group (dominant count), the rest are batched together.
     let mut v2_targets: Vec<&DiscoveredPool> = Vec::new();

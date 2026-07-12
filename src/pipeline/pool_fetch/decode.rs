@@ -260,7 +260,7 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
 fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
     pool_type.is_some_and(|t| {
         let b = t.as_bytes();
-        b.windows(7).any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
+        b.windows(9).any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
             || b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
     })
 }
@@ -275,8 +275,11 @@ fn decode_curve_stored_rates(
         .get(rates_idx)
         .and_then(|b| b.as_ref())
         .and_then(|b| ICurvePool::stored_ratesCall::abi_decode_returns(b).ok())
-        .map(|r| r.iter().map(|&x| U256::from(x)).collect::<Vec<_>>())?;
-    if decoded.len() == n_fetched && !decoded.iter().any(U256::is_zero) {
+        .map(|r| r.iter().map(|&x| U256::from(x)).collect::<Vec<_>>());
+    if let Some(decoded) = decoded
+        && decoded.len() == n_fetched
+        && !decoded.iter().any(U256::is_zero)
+    {
         return Some(decoded);
     }
     if curve_pool_requires_stored_rates(plan.pool.pool_type.as_deref()) {
@@ -648,5 +651,32 @@ mod tests {
             Some(Bytes::copy_from_slice(&abi_word(0))),
         ];
         assert!(decode_plan(&plan, &results).is_none());
+    }
+
+    #[test]
+    fn legacy_curve_pool_without_stored_rates_uses_unit_rates() {
+        let mut plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![Address::ZERO, Address::with_last_byte(1)],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("stable".to_string()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: Vec::new(),
+        };
+        let missing = vec![None];
+
+        assert_eq!(
+            decode_curve_stored_rates(&plan, &missing, 2, 0),
+            Some(vec![ONE, ONE])
+        );
+
+        plan.pool.pool_type = Some("stable_ng".to_string());
+        assert_eq!(decode_curve_stored_rates(&plan, &missing, 2, 0), None);
     }
 }
