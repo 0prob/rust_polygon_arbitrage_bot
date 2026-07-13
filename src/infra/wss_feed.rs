@@ -259,11 +259,13 @@ fn wss_url_candidates(config: &AppConfig) -> Vec<String> {
 
 fn ordered_wss_urls(urls: &[String], sticky: Option<&str>) -> Vec<String> {
     let mut ordered = Vec::with_capacity(urls.len());
+    let mut seen = rustc_hash::FxHashSet::default();
     if let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s)) {
         ordered.push(url.to_string());
+        seen.insert(url);
     }
     for url in urls {
-        if !ordered.iter().any(|u| u == url) {
+        if seen.insert(url.as_str()) {
             ordered.push(url.clone());
         }
     }

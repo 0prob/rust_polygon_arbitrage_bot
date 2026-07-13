@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -6,6 +6,7 @@ use std::time::Instant;
 use alloy::primitives::{Address, U256};
 use alloy::sol_types::SolCall;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use rustc_hash::FxHashMap;
 
 use crate::config::AppConfig;
 use crate::core::types::FlashLoanSource;
@@ -282,7 +283,7 @@ fn build_graph_snapshot(
             .or_default() += 1;
     }
 
-    let mut token_counts: HashMap<u32, usize> = HashMap::new();
+    let mut token_counts: FxHashMap<u32, usize> = FxHashMap::default();
     for cycle in snap.cycles.iter().take(48) {
         *token_counts.entry(cycle.start_token.0).or_default() += 1;
         for edge in &cycle.edges {
@@ -291,7 +292,11 @@ fn build_graph_snapshot(
         }
     }
     let mut out_degrees: Vec<(u32, usize)> = token_counts.into_iter().collect();
-    out_degrees.sort_by_key(|b| std::cmp::Reverse(b.1));
+    out_degrees.sort_unstable_by(|(left_token, left_degree), (right_token, right_degree)| {
+        right_degree
+            .cmp(left_degree)
+            .then_with(|| left_token.cmp(right_token))
+    });
 
     let hubs: Vec<GraphHubRow> = out_degrees
         .into_iter()

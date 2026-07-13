@@ -65,7 +65,7 @@ cd ../sol && ./script/deploy_mainnet.sh
 # Set EXECUTOR_ADDRESS in .env to the logged address
 ```
 
-Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The shipped `config.toml` lowers `min_profit_matic_wei` to 0.01 MATIC, tunes HF parameters (score cap 150, prefetch 50, max dispatch 4, prefetch budget 2500ms), and sets `enumeration_max_paths = 650`.
+Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The checked-in `config.toml` currently sets `min_profit_matic_wei = 0.01 MATIC`, `lf_interval_ms = 4000`, `hf_interval_ms = 200`, `max_multicall_calls = 200`, `routing.max_hops = 4`, `routing.enumeration_max_paths = 650`, `routing.ternary_search_iterations = 18`, `pipeline.stream_enabled = true`, `pipeline.lf_hot_batch = 600`, `pipeline.lf_full_sweep_interval = 60`, `pipeline.cycle_refind_interval = 8`, `pipeline.hf_sim_cap = 120`, `pipeline.hf_score_cap = 150`, `pipeline.hf_prefetch_count = 50`, `pipeline.hf_prefetch_budget_ms = 2500`, and `pipeline.hf_max_dispatch = 4`.
 
 ## Run
 
@@ -81,22 +81,34 @@ TUI dashboard (live pipeline):
 cargo run --bin tui --release
 ```
 
-Useful env vars:
+Current active env values in this checkout:
 
 ```bash
-RPBOT_LOG=info                          # log level filter (error|warn|info|debug|trace)
-RPBOT_LOG_DIR=/tmp/bot                  # component JSONL log directory
-EXECUTION_MODE=dry-run                  # default-safe mode
-ROUTING_CYCLE_FINDER=hybrid             # hybrid | dfs | johnson | bellman-ford
-BLOXROUTE_AUTH_HEADER=your_bloxroute_auth   # private mempool via bloXroute BDN
-PRIVATE_RPC_URL=https://...                  # MEV-protected submission endpoint
-REQUIRE_PRIVATE_SUBMIT=false            # force submissions through PRIVATE_RPC_URL
-FLASH_LOAN_SOURCE=auto                  # auto | balancer | aave | aave_v3
-STREAM_ENABLED=true                     # WSS log stream for hot pool partial cache
-WSS_URL=wss://...                       # WebSocket pool log feed endpoint
-QUICKSWAP_V2_ENABLED=true             # include QuickSwap V2 pools (off unless set to true)
-UNISWAP_V2_ENABLED=true                 # include Uniswap V2 pools (off unless set to true)
+RPBOT_LOG=info
+EXECUTION_MODE=live
+DISCOVERY_INTERVAL_MS=5000
+LF_INTERVAL_MS=4000
+LF_BOOTSTRAP_BATCH=5000
+STREAM_ENABLED=true
+REQUIRE_PRIVATE_SUBMIT=true
+FLASH_LOAN_SOURCE=auto
+QUICKSWAP_V2_ENABLED=false
+UNISWAP_V2_ENABLED=false
+MAX_MULTICALL_CALLS=200
+RPC_BATCH_PACE_MS=8
 ```
+
+The checked-in `.env` currently points at:
+
+- `PG_URL=postgres://postgres:testing@localhost:5433/envio-dev`
+- `EXECUTION_RPC` on Alchemy
+- `STATE_RPC_URL` / `POLYGON_RPC_URLS` on dRPC + Chainstack + Ankr + PublicNode
+- `POLYGON_WSS_URLS` on dRPC + Alchemy + Chainstack
+- `ENVIO_API_TOKEN` enabled
+- `EXECUTION_MODE=live`
+- `REQUIRE_PRIVATE_SUBMIT=true`
+- `PRIVATE_RPC_URL=https://api.blxrbdn.com`
+- `BLOXROUTE_AUTH_HEADER=...`
 
 Continuous runner and log dashboard (after `cargo build --release`):
 

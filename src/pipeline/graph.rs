@@ -456,7 +456,7 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
         }
     }
     if !reindex_pools.is_empty() {
-        rebuild_pool_edge_positions_for_pools(graph, &reindex_pools);
+        rebuild_pool_edge_positions_for_pools(graph, reindex_pools);
     }
     if topology_changed {
         graph.coverage = Some(std::sync::Arc::new(
@@ -591,9 +591,9 @@ pub fn rescore_pools_in_place(
     if pools.is_empty() {
         return 0;
     }
-    let mut touched_pools = rustc_hash::FxHashSet::default();
+    let mut touched_pools: Vec<usize> = Vec::with_capacity(pools.len());
     let mut touched = 0usize;
-    let mut affected_adjacencies = rustc_hash::FxHashSet::default();
+    let mut affected_adjacencies: Vec<usize> = Vec::with_capacity(pools.len().saturating_mul(2));
 
     for pool in pools {
         let pool_idx = pool.0 as usize;
@@ -608,25 +608,27 @@ pub fn rescore_pools_in_place(
                 continue;
             };
             touched += rescore_graph_edge(arena, ge);
-            affected_adjacencies.insert(adj_idx);
+            affected_adjacencies.push(adj_idx);
         }
-        touched_pools.insert(pool_idx);
+        touched_pools.push(pool_idx);
     }
+    touched_pools.sort_unstable();
+    touched_pools.dedup();
+    affected_adjacencies.sort_unstable();
+    affected_adjacencies.dedup();
     let token_count = graph.token_count as usize;
-    let mut compact_slots: Vec<usize> = affected_adjacencies
+    let compact_slots: Vec<usize> = affected_adjacencies
         .iter()
         .copied()
         .filter(|idx| *idx < token_count)
         .collect();
-    compact_slots.sort_unstable();
-    compact_slots.dedup();
     if compact_slots.is_empty() {
         for adj_idx in &affected_adjacencies {
             if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
                 sort_adjacency_edges(adj);
             }
         }
-        rebuild_pool_edge_positions_for_pools(graph, &touched_pools);
+        rebuild_pool_edge_positions_for_pools(graph, touched_pools);
     } else {
         compact_token_adjacency(graph, Some(&compact_slots));
     }
@@ -634,11 +636,19 @@ pub fn rescore_pools_in_place(
 }
 
 fn rescore_adjacency(arena: &StateArena, adjacency: &mut [Vec<GraphEdge>]) {
-    adjacency.par_iter_mut().for_each(|adj| {
-        for ge in adj.iter_mut() {
-            rescore_graph_edge(arena, ge);
+    if crate::util::should_use_rayon(adjacency.len()) {
+        adjacency.par_iter_mut().for_each(|adj| {
+            for ge in adj.iter_mut() {
+                rescore_graph_edge(arena, ge);
+            }
+        });
+    } else {
+        for adj in adjacency.iter_mut() {
+            for ge in adj.iter_mut() {
+                rescore_graph_edge(arena, ge);
+            }
         }
-    });
+    }
 }
 
 fn sort_adjacency_edges(adj: &mut [GraphEdge]) {
@@ -647,36 +657,41 @@ fn sort_adjacency_edges(adj: &mut [GraphEdge]) {
 
 fn rebuild_pool_edge_positions_for_pools(
     graph: &mut RoutingGraph,
-    pools: &rustc_hash::FxHashSet<usize>,
+    pools: impl IntoIterator<Item = usize>,
 ) {
+    let mut pools: Vec<usize> = pools.into_iter().collect();
     if pools.is_empty() {
         return;
     }
+    pools.sort_unstable();
+    pools.dedup();
     let max_pool = graph
         .pool_edge_positions
         .len()
-        .max(pools.iter().copied().max().map_or(0, |idx| idx + 1));
+        .max(pools.last().copied().map_or(0, |idx| idx + 1));
     if graph.pool_edge_positions.len() < max_pool {
         graph.pool_edge_positions.resize(max_pool, Vec::new());
     }
-    let mut adj_to_scan = rustc_hash::FxHashSet::default();
-    for pool_idx in pools {
-        if let Some(slot) = graph.pool_edge_positions.get(*pool_idx) {
+    let mut adj_to_scan: Vec<usize> = Vec::new();
+    for &pool_idx in &pools {
+        if let Some(slot) = graph.pool_edge_positions.get(pool_idx) {
             for &(adj_idx, _) in slot {
-                adj_to_scan.insert(adj_idx);
+                adj_to_scan.push(adj_idx);
             }
         }
-        if let Some(slot) = graph.pool_edge_positions.get_mut(*pool_idx) {
+        if let Some(slot) = graph.pool_edge_positions.get_mut(pool_idx) {
             slot.clear();
         }
     }
+    adj_to_scan.sort_unstable();
+    adj_to_scan.dedup();
     for adj_idx in adj_to_scan {
         let Some(adj) = graph.adjacency.get(adj_idx) else {
             continue;
         };
         for (pos, ge) in adj.iter().enumerate() {
             let pool_idx = ge.edge.pool_index.0 as usize;
-            if pools.contains(&pool_idx) {
+            if pools.binary_search(&pool_idx).is_ok() {
                 graph.pool_edge_positions[pool_idx].push((adj_idx, pos));
             }
         }

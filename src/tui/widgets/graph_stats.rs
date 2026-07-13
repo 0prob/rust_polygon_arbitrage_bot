@@ -19,9 +19,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(36),
-            Constraint::Percentage(32),
-            Constraint::Percentage(32),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
         .split(area);
 
@@ -77,6 +78,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_panel(
         frame,
         chunks[2],
+        "Hubs",
+        snapshot
+            .graph
+            .hubs
+            .iter()
+            .map(|row| {
+                theme::label_value(
+                    row.token.clone(),
+                    format!("{} hits", row.out_degree),
+                    crate::tui::app::Severity::Info,
+                )
+            })
+            .collect(),
+    );
+
+    render_panel(
+        frame,
+        chunks[3],
         "Recent",
         snapshot
             .graph

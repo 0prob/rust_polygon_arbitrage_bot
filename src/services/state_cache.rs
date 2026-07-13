@@ -198,7 +198,7 @@ impl StateCache {
     pub fn tradable_by_discovery_index(
         &self,
         address_index: &FxHashMap<Address, usize>,
-    ) -> Vec<(Address, Arc<PoolState>)> {
+    ) -> Vec<(usize, Address, Arc<PoolState>)> {
         let guard = self.inner.read();
         let mut out: Vec<(usize, Address, Arc<PoolState>)> = guard
             .iter()
@@ -212,9 +212,7 @@ impl StateCache {
             })
             .collect();
         out.sort_unstable_by_key(|(idx, _, _)| *idx);
-        out.into_iter()
-            .map(|(_, address, state)| (address, state))
-            .collect()
+        out
     }
 
     /// Read a coherent set of unexpired pool states and the generation that
@@ -496,6 +494,41 @@ mod tests {
             }),
         );
         assert_eq!(cache.count_tradable_in_discovery(&index), 1);
+    }
+
+    #[test]
+    fn tradable_by_discovery_index_returns_sorted_indices() {
+        let cache = StateCache::default();
+        let a = Address::with_last_byte(1);
+        let b = Address::with_last_byte(2);
+        let c = Address::with_last_byte(3);
+        for address in [b, a, c] {
+            cache.insert(
+                address,
+                PoolState::V2(crate::core::types::V2PoolState {
+                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
+                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                        + alloy::primitives::U256::from(1u64),
+                    fee: alloy::primitives::U256::from(997u64),
+                    fee_denominator: alloy::primitives::U256::from(1_000u64),
+                    block_timestamp_last: 1,
+                }),
+            );
+        }
+
+        let mut index = FxHashMap::default();
+        index.insert(a, 2);
+        index.insert(b, 0);
+        index.insert(c, 1);
+
+        let tradable = cache.tradable_by_discovery_index(&index);
+        assert_eq!(tradable.len(), 3);
+        assert_eq!(tradable[0].0, 0);
+        assert_eq!(tradable[1].0, 1);
+        assert_eq!(tradable[2].0, 2);
+        assert_eq!(tradable[0].1, b);
+        assert_eq!(tradable[1].1, c);
+        assert_eq!(tradable[2].1, a);
     }
 
     #[test]

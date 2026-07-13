@@ -132,6 +132,7 @@ impl RuntimeContext {
             stream_addresses: self.stream_addresses.clone(),
             partial_cache: Arc::clone(&self.partial_cache),
             price_oracle: Arc::clone(&self.price_oracle),
+            gas_oracle: Arc::clone(&self.gas_oracle),
             rpc: Arc::clone(&self.rpc),
             graph_cache: Arc::clone(&self.graph_cache),
             arena: Arc::clone(&self.arena),

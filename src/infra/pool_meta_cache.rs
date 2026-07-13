@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy::primitives::{Address, FixedBytes};
@@ -95,19 +96,24 @@ impl PoolMetaCache {
         tokio::task::spawn_blocking(move || {
             loop {
                 let target_revision = revision.load(Ordering::Acquire);
-                let cloned = {
-                    let data = inner.read();
-                    (*data).clone()
-                };
-                let Ok(raw) = serde_json::to_vec(&cloned) else {
+                let seq = write_seq.fetch_add(1, Ordering::Relaxed);
+                let tmp = path.with_extension(format!("json.{seq}.tmp"));
+                let Ok(file) = std::fs::File::create(&tmp) else {
                     running.store(false, Ordering::Release);
                     return;
                 };
-                let seq = write_seq.fetch_add(1, Ordering::Relaxed);
-                let tmp = path.with_extension(format!("json.{seq}.tmp"));
-                let wrote = std::fs::write(&tmp, &raw).is_ok();
-                if wrote {
-                    let _ = std::fs::rename(&tmp, &*path);
+                let mut writer = BufWriter::new(file);
+                let serialized = {
+                    let data = inner.read();
+                    serde_json::to_writer(&mut writer, &*data)
+                };
+                if serialized.is_err() || writer.flush().is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    running.store(false, Ordering::Release);
+                    return;
+                }
+                if std::fs::rename(&tmp, &*path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
                 }
                 if revision.load(Ordering::Acquire) == target_revision {
                     running.store(false, Ordering::Release);

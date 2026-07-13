@@ -121,7 +121,7 @@ struct BestEvalDiag {
     sim_gas: u32,
     gross: U256,
     net_matic: U256,
-    gas_matic: U256,
+    gas_cost_wei: U256,
     slippage: U256,
     flash_fee: U256,
     reject: Option<String>,
@@ -130,14 +130,14 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} input={} sim_gas={} gross={} net_matic={} gas_matic={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} input={} sim_gas={} gross={} net_matic={} gas_cost_wei={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
         diag.input,
         diag.sim_gas,
         diag.gross,
         diag.net_matic,
-        diag.gas_matic,
+        diag.gas_cost_wei,
         diag.slippage,
         diag.flash_fee,
         reason,
@@ -282,6 +282,13 @@ pub async fn run_hf_tick(
         &token_to_matic_rates,
         rescore_cap,
     );
+    if should_log_hf_summary() || stream_triggered {
+        crate::debug!(
+            "hf candidates: snap_cycles={snap_cycle_count} selected={} hot_pools={} quarantine_skipped={quarantine_skipped} rate_skipped={rate_skipped} score_cap={rescore_cap} sim_cap={sim_cap}",
+            cycles.len(),
+            hot_pools_set.len()
+        );
+    }
     if cycles.is_empty() {
         if should_log_hf_summary() {
             crate::info!(
@@ -300,7 +307,7 @@ pub async fn run_hf_tick(
             hot_pools_set.insert(addr);
         }
     }
-    let mut hot_pools: Arc<Vec<_>> = Arc::new(hot_pools_set.into_iter().collect());
+    let mut hot_pools: Arc<[Address]> = hot_pools_set.into_iter().collect::<Vec<_>>().into();
 
     let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
         crate::warn!("hf tick skipped: gas oracle has no fee snapshot yet");
@@ -364,7 +371,7 @@ pub async fn run_hf_tick(
             rescore_cap,
         );
         cycles = selected.0;
-        hot_pools = Arc::new(selected.1.into_iter().collect());
+        hot_pools = selected.1.into_iter().collect::<Vec<_>>().into();
         quarantine_skipped = selected.2;
         rate_skipped = selected.3;
         if cycles.is_empty() {
@@ -497,7 +504,7 @@ pub async fn run_hf_tick(
                 sim_gas: result.sim.total_gas,
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
-                gas_matic: assessment.revert_penalty,
+                gas_cost_wei: assessment.revert_penalty,
                 slippage: assessment.slippage_deduction,
                 flash_fee: assessment.flash_loan_fee,
                 reject: assessment.reject_reason.clone(),
@@ -735,7 +742,7 @@ fn log_near_miss_diagnostic(
     let roi_bps = (assessment.roi * f64::from(BPS_SCALE)).round() as u64;
     let reason = assessment.reject_reason.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf near-miss: fp={} hops={} score={:.4} route={} input={} gross={} net_matic={} safety_floor={} gap={} min_profit={} roi_bps={} gas_matic={} slippage={} flash_fee={} reject={}",
+        "hf near-miss: fp={} hops={} score={:.4} route={} input={} gross={} net_matic={} safety_floor={} gap={} min_profit={} roi_bps={} gas_cost_wei={} slippage={} flash_fee={} reject={}",
         result.route_fingerprint,
         result.cycle.hop_count,
         result.cycle.score,

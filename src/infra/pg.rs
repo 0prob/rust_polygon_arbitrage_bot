@@ -16,11 +16,24 @@ use crate::services::pipeline_survival::{ParseStats, record_pg_row};
 use alloy::primitives::Address;
 
 const POOL_META_COLUMNS: &str = r#"id, address, protocol::text, tokens, fee, "tickSpacing", "poolId", hooks, "poolType", "createdBlock""#;
+const POOL_META_VALIDITY_SQL: &str = r#"
+        protocol IS NOT NULL
+        AND cardinality(tokens) >= 2
+        AND (
+            protocol <> 'UNISWAP_V4'
+            OR (fee IS NOT NULL AND "tickSpacing" IS NOT NULL AND "poolId" IS NOT NULL AND hooks IS NOT NULL)
+        )
+        AND (
+            protocol <> 'BALANCER_V2'
+            OR cardinality(tokens) >= 2
+        )
+    "#;
 
 static POOL_META_KEYSET_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"SELECT {POOL_META_COLUMNS} FROM "PoolMeta"
         WHERE ("createdBlock", id) > ($1, $2)
+        AND {POOL_META_VALIDITY_SQL}
         ORDER BY "createdBlock", id
         LIMIT $3"#
     )
@@ -33,10 +46,12 @@ static POOL_META_INCREMENTAL_SQL: LazyLock<String> = LazyLock::new(|| {
             SELECT {POOL_META_COLUMNS}, NULL::integer AS "updatedAtBlock", "createdBlock" AS "sortBlock"
             FROM "PoolMeta"
             WHERE "createdBlock" > $1
+            AND {POOL_META_VALIDITY_SQL}
             UNION ALL
             SELECT {POOL_META_COLUMNS}, "updatedAtBlock", "updatedAtBlock" AS "sortBlock"
             FROM "PoolMeta"
             WHERE "updatedAtBlock" > $2 AND "createdBlock" <= $3
+            AND {POOL_META_VALIDITY_SQL}
         ) AS combined
         ORDER BY "sortBlock" ASC
         LIMIT $4
@@ -540,6 +555,8 @@ mod tests {
             "keyset sql missing quoted createdBlock: {page}"
         );
         assert!(page.contains(r#"("createdBlock", id) >"#));
+        assert!(page.contains("cardinality(tokens) >= 2"));
+        assert!(page.contains("protocol <> 'UNISWAP_V4'"));
         assert!(!page.contains("OFFSET"));
 
         let incremental = POOL_META_INCREMENTAL_SQL.as_str();
@@ -547,6 +564,7 @@ mod tests {
             incremental.contains(r#""createdBlock", "updatedAtBlock""#),
             "incremental sql missing quoted columns: {incremental}"
         );
+        assert!(incremental.contains("cardinality(tokens) >= 2"));
         assert!(incremental.contains(r#"ORDER BY "sortBlock" ASC"#));
         assert!(incremental.contains("LIMIT $4"));
     }

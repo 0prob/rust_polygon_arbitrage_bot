@@ -183,10 +183,9 @@ pub fn collect_negative_cycles_from_source(
                 continue;
             }
             let key = cycle_key(&cycle_edges);
-            if found_keys.contains(&key) {
+            if !found_keys.insert(key) {
                 continue;
             }
-            found_keys.insert(key);
 
             let hop_count = cycle_edges.len() as u32;
             log_weight += hop_penalty(hop_count);

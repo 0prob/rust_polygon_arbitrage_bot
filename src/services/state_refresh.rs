@@ -9,7 +9,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::BlockId;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::config::AppConfig;
 use crate::core::constants::POLYGON_CHAIN_ID;
@@ -18,7 +18,9 @@ use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
 use crate::pipeline::fetcher::fetch_missing_pool_states;
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
-use crate::services::discovery::{DiscoveredPool, TokenMeta, is_routable_pool};
+use crate::services::discovery::{
+    DiscoveredPool, TokenMeta, is_routable_pool, unknown_tokens_from_pools,
+};
 use crate::services::pipeline_survival::{ParseStats, log_index_parse_stats};
 use crate::services::state_cache::StateCache;
 use crate::util::now_ms;
@@ -58,6 +60,7 @@ pub struct StateRefreshService {
     pool_meta_cache: Arc<PoolMetaCache>,
     discovery_state: parking_lot::RwLock<DiscoveryState>,
     discovery_count: AtomicU64,
+    discovery_skipped_ticks: AtomicU64,
     indexer_lag_blocks: AtomicU64,
     indexer_stale: AtomicBool,
     last_indexer_block: AtomicU64,
@@ -90,6 +93,7 @@ impl StateRefreshService {
             pool_meta_cache,
             discovery_state: parking_lot::RwLock::new(DiscoveryState::default()),
             discovery_count: AtomicU64::new(0),
+            discovery_skipped_ticks: AtomicU64::new(0),
             indexer_lag_blocks: AtomicU64::new(0),
             indexer_stale: AtomicBool::new(false),
             last_indexer_block: AtomicU64::new(0),
@@ -265,18 +269,30 @@ impl StateRefreshService {
             let notify_pending = self.pg_notify_pending.swap(false, Ordering::AcqRel);
 
             if !is_bootstrap && !notify_pending && elapsed < self.config.discovery_interval_ms {
+                let skipped = self.discovery_skipped_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                if skipped <= 2 || skipped.is_multiple_of(60) {
+                    crate::debug!(
+                        "discovery skipped: elapsed_ms={elapsed} interval_ms={} notify_pending={notify_pending}",
+                        self.config.discovery_interval_ms
+                    );
+                }
                 return Ok(0);
             }
             (cursor, is_bootstrap)
         };
 
+        let tick_started = now_ms();
+        let pg_started = now_ms();
         let mut result = if is_bootstrap {
             crate::info!("starting postgres pool bootstrap");
             self.discover_bootstrap().await?
         } else {
             self.discover_incremental(&cursor).await?
         };
+        let pg_ms = now_ms().saturating_sub(pg_started);
+        let batch_pools = result.pools.len();
 
+        let balancer_started = now_ms();
         if let Some(endpoint) = self.config.pipeline.balancer_backend_url.as_deref() {
             let needs_ids = result.pools.iter().any(|p| {
                 p.protocol == crate::core::types::ProtocolType::BalancerV2 && p.pool_id.is_none()
@@ -293,10 +309,18 @@ impl StateRefreshService {
                 }
             }
         }
+        let balancer_ms = now_ms().saturating_sub(balancer_started);
 
         self.discovery_state.write().last_discovery_ms = now_ms();
         self.discovery_count.fetch_add(1, Ordering::Relaxed);
 
+        let decimals_started = now_ms();
+        if !result.pools.is_empty() {
+            self.enrich_token_decimals_from_pools(&result.pools).await;
+        }
+        let decimals_ms = now_ms().saturating_sub(decimals_started);
+
+        let merge_started = now_ms();
         let (added, updated) = {
             if result.pools.is_empty() && result.complete {
                 {
@@ -352,6 +376,16 @@ impl StateRefreshService {
             state.discovery_cursor = result.cursor.clone();
             (added, updated)
         };
+        let merge_ms = now_ms().saturating_sub(merge_started);
+
+        if added > 0 || updated > 0 || !result.complete || is_bootstrap {
+            crate::debug!(
+                "discovery timing: bootstrap={is_bootstrap} pg_ms={pg_ms} balancer_ms={balancer_ms} \
+                 merge_ms={merge_ms} decimals_ms={decimals_ms} batch_pools={batch_pools} added={added} updated={updated} \
+                 total_ms={}",
+                now_ms().saturating_sub(tick_started)
+            );
+        }
 
         if added > 0 || updated > 0 || !result.complete {
             let _total = self.discovered_pool_count();
@@ -367,7 +401,6 @@ impl StateRefreshService {
         if self.discovery_state.read().token_metas.is_empty() {
             self.refresh_token_metas().await;
         }
-        self.enrich_token_decimals_onchain().await;
         self.routable_pool_count_generation
             .store(0, Ordering::Release);
 
@@ -382,7 +415,7 @@ impl StateRefreshService {
         loop {
             let (page, next, has_more, page_stats) =
                 self.pg.fetch_pool_meta_page(&keyset, batch as u64).await?;
-            all_pools.extend(page);
+            all_pools.extend(page.into_iter().filter(is_routable_pool));
             merge_parse_stats(&mut parse_stats, &page_stats);
             if !has_more {
                 break;
@@ -421,7 +454,7 @@ impl StateRefreshService {
         loop {
             let (page, last_block, last_updated_block, has_more) =
                 self.pg.fetch_pool_meta_incremental(&work_cursor).await?;
-            pools.extend(page);
+            pools.extend(page.into_iter().filter(is_routable_pool));
             work_cursor = DiscoveryCursor {
                 last_block: last_block.max(work_cursor.last_block),
                 last_updated_block: last_updated_block
@@ -464,26 +497,10 @@ impl StateRefreshService {
         }
     }
 
-    async fn enrich_token_decimals_onchain(&self) {
+    async fn enrich_token_decimals_from_pools(&self, pools: &[DiscoveredPool]) {
         let missing = {
             let state = self.discovery_state.read();
-            if state.discovered.is_empty() {
-                return;
-            }
-            let known = state.token_decimals.as_ref();
-            let mut missing_set = FxHashSet::default();
-            'scan: for pool in state.discovered.iter() {
-                for addr in &pool.tokens {
-                    if known.contains_key(addr) {
-                        continue;
-                    }
-                    missing_set.insert(*addr);
-                    if missing_set.len() >= DECIMALS_ENRICH_BATCH {
-                        break 'scan;
-                    }
-                }
-            }
-            missing_set.into_iter().collect::<Vec<_>>()
+            unknown_tokens_from_pools(pools, state.token_decimals.as_ref(), DECIMALS_ENRICH_BATCH)
         };
 
         if missing.is_empty() {
@@ -528,8 +545,13 @@ impl StateRefreshService {
             for entry in &new_entries {
                 Arc::make_mut(&mut state.token_decimals).insert(entry.address, entry.decimals);
             }
-            Arc::make_mut(&mut state.token_metas).extend(new_entries);
-            crate::info!("enriched token decimals on-chain: {}", added);
+            let metas = Arc::make_mut(&mut state.token_metas);
+            for entry in new_entries {
+                if !metas.iter().any(|m| m.address == entry.address) {
+                    metas.push(entry);
+                }
+            }
+            crate::debug!("token decimals on-chain: enriched={added}");
         }
     }
 
@@ -635,31 +657,30 @@ impl StateRefreshService {
         if addresses.is_empty() || max_pools == 0 {
             return Ok(0);
         }
-        let all = self.discovered_pools();
-        // ponytail: sort+two-pointer avoids HashMap allocation. discovered_pools() returns
-        // a stable-ordered Arc<Vec>. Sorting addresses once + linear merge is faster than
-        // building a HashMap from all discovered pools (which can be 10k+ entries).
-        let mut addrs: Vec<Address> = addresses.to_vec();
-        addrs.sort_unstable();
-        let mut pool_refs: Vec<&DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
-        let mut ai = 0usize;
-        let mut pi = 0usize;
-        while ai < addrs.len() && pi < all.len() {
-            match addrs[ai].cmp(&all[pi].address) {
-                std::cmp::Ordering::Equal => {
-                    pool_refs.push(&all[pi]);
-                    ai += 1;
-                    pi += 1;
-                }
-                std::cmp::Ordering::Less => ai += 1,
-                std::cmp::Ordering::Greater => pi += 1,
+        let (addrs, selected_pools) = {
+            let state = self.discovery_state.read();
+            let address_index = &state.address_index;
+            // ponytail: sort+dedupe addresses once, then do direct discovery-index lookups.
+            // That keeps targeted refresh bounded by requested addresses instead of
+            // scanning the full discovery list on every call.
+            let addrs = dedupe_sorted_addresses(addresses);
+            let mut selected_pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
+            for addr in &addrs {
+                let Some(&idx) = address_index.get(addr) else {
+                    continue;
+                };
+                let Some(pool) = state.discovered.get(idx) else {
+                    continue;
+                };
+                selected_pools.push(pool.clone());
             }
-        }
-        if pool_refs.is_empty() {
+            (addrs, selected_pools)
+        };
+        if selected_pools.is_empty() {
             return Ok(0);
         }
-        self.refresh_pools_impl(&pool_refs, max_pools, addresses)
-            .await
+        let pool_refs: Vec<&DiscoveredPool> = selected_pools.iter().collect();
+        self.refresh_pools_impl(&pool_refs, max_pools, &addrs).await
     }
 
     async fn refresh_pools_impl(
@@ -689,16 +710,8 @@ impl StateRefreshService {
                     continue;
                 }
             };
+            let provider_for_hash = provider.clone();
             let pinned_block = provider.get_block_number().await.ok().or(cached_block);
-            let pinned_hash = match pinned_block {
-                Some(block) => provider
-                    .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|b| b.header.hash),
-                None => None,
-            };
             let (updated, attempted) = fetch_missing_pool_states(
                 provider,
                 Arc::clone(&self.cache),
@@ -716,6 +729,15 @@ impl StateRefreshService {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
                 }
+                let pinned_hash = match pinned_block {
+                    Some(block) => provider_for_hash
+                        .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|b| b.header.hash),
+                    None => None,
+                };
                 if let Some(hash) = pinned_hash {
                     *self.last_state_hash.write() = Some(hash);
                 }
@@ -770,6 +792,13 @@ fn refresh_batch_for(
     }
 }
 
+fn dedupe_sorted_addresses(addresses: &[Address]) -> Vec<Address> {
+    let mut addrs: Vec<Address> = addresses.to_vec();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
 fn rebuild_discovery_indexes(
     pools: &[DiscoveredPool],
 ) -> (FxHashMap<String, usize>, FxHashMap<Address, usize>) {
@@ -795,8 +824,9 @@ fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
 
 #[cfg(test)]
 mod tests {
-    use super::refresh_batch_for;
+    use super::{dedupe_sorted_addresses, refresh_batch_for};
     use crate::config::AppConfig;
+    use alloy::primitives::Address;
 
     #[test]
     fn keeps_bootstrap_batch_until_cache_is_warm() {
@@ -804,5 +834,13 @@ mod tests {
         assert_eq!(refresh_batch_for(2, 3_000, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 11_999, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 12_000, &config.pipeline), 500);
+    }
+
+    #[test]
+    fn dedupe_sorted_addresses_removes_duplicates() {
+        let a = Address::with_last_byte(1);
+        let b = Address::with_last_byte(2);
+        let deduped = dedupe_sorted_addresses(&[b, a, b, a, b]);
+        assert_eq!(deduped, vec![a, b]);
     }
 }

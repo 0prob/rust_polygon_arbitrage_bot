@@ -445,6 +445,11 @@ impl App {
         self.route_view_dirty = true;
     }
 
+    #[must_use]
+    pub fn route_view_is_dirty(&self) -> bool {
+        self.route_view_dirty
+    }
+
     pub fn select_next(&mut self) {
         let len = self.current_rows_len().max(1);
         self.selected_index = (self.selected_index + 1).min(len.saturating_sub(1));

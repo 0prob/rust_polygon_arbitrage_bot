@@ -411,21 +411,28 @@ pub fn optimize_cycle(
             sim_cache.push((*amount, *sim));
         }
     }
+    let mut brent_local_hits = 0u32;
+    let mut brent_route_hits = 0u32;
+    let mut brent_sim_calls = 0u32;
+    let mut brent_rejected = 0u32;
     let evaluate = |amount: U256| -> U256 {
         if amount < economic_floor {
             return U256::ZERO;
         }
         if let Some(sim) = lookup_sim_cache(&sim_cache, amount) {
+            brent_local_hits += 1;
             return net_profit_after_gas_from_sim(sim, amount, profit_ctx);
         }
         if let Some((cache, generation, route_fp)) = route_sim_cache
             && let Some(cached) = cache.get(generation, route_fp, amount)
         {
+            brent_route_hits += 1;
             if sim_cache.len() < BRENT_CACHE_SLOTS {
                 sim_cache.push((amount, cached));
             }
             return net_profit_after_gas_from_sim(&cached, amount, profit_ctx);
         }
+        brent_sim_calls += 1;
         match simulate_route_minimal(arena, edges, amount) {
             Some(mut sim) => {
                 if let Some(costing) = route_gas {
@@ -445,6 +452,7 @@ pub fn optimize_cycle(
                     })
                     .is_err()
                 {
+                    brent_rejected += 1;
                     return U256::ZERO;
                 }
                 let score = net_profit_after_gas_from_sim(&sim, amount, profit_ctx);
@@ -456,12 +464,21 @@ pub fn optimize_cycle(
                 }
                 score
             }
-            None => U256::ZERO,
+            None => {
+                brent_rejected += 1;
+                U256::ZERO
+            }
         }
     };
 
     let iterations = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
     let optimal = solve_brent_optimal(low, high, evaluate, iterations);
+    if brent_sim_calls > 4 {
+        crate::debug!(
+            "brent sim: hops={} iters={iterations} walk_sim={brent_sim_calls} local_hit={brent_local_hits} route_hit={brent_route_hits} rejected={brent_rejected}",
+            edges.len()
+        );
+    }
     if optimal < economic_floor {
         crate::trace!(
             "optimize_cycle: optimal={optimal} < economic_floor={economic_floor} low={low} high={high}"

@@ -54,31 +54,65 @@ pub struct PrivateSubmitProbe {
 /// Probe an RPC URL for private-transaction capabilities (no wallet required).
 pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
     let client = &*HTTP;
-    let chain_id_ok = match rpc_call::<Vec<String>>(client, url, "eth_chainId", vec![]).await {
-        Ok(v) => {
-            matches!(v.as_ref(), Some(JsonRpcResult::Hex(s)) if s.eq_ignore_ascii_case("0x89"))
-        }
+    let chain_id_ok = match client
+        .post(url)
+        .timeout(PROBE_TIMEOUT)
+        .json(&JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_chainId",
+            params: Vec::<String>::new(),
+        })
+        .send()
+        .await
+        .and_then(|resp| resp.error_for_status())
+    {
+        Ok(resp) => match resp.bytes().await {
+            Ok(bytes) => serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes)
+                .ok()
+                .and_then(|parsed| parsed.result)
+                .and_then(|v| match v {
+                    JsonRpcResult::Hex(s) => Some(s),
+                    _ => None,
+                })
+                .is_some_and(|s| s.eq_ignore_ascii_case("0x89")),
+            Err(_) => false,
+        },
         Err(_) => false,
     };
 
-    let (supports_private_rpc_method, private_method_error) = match rpc_call(
-        client,
-        url,
-        "eth_sendRawTransactionPrivate",
-        vec!["0x00".to_string()],
-    )
-    .await
+    let (supports_private_rpc_method, private_method_error) = match client
+        .post(url)
+        .timeout(PROBE_TIMEOUT)
+        .json(&JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_sendRawTransactionPrivate",
+            params: vec!["0x00".to_string()],
+        })
+        .send()
+        .await
+        .and_then(|resp| resp.error_for_status())
     {
-        Ok(_) => (true, None),
-        Err(e) => {
-            let msg = e.to_string();
-            // Distinguish "method exists but tx invalid" from "method missing".
-            let exists = msg.contains("invalid")
-                || msg.contains("rlp")
-                || msg.contains("transaction")
-                || msg.contains("not accepted");
-            (exists, Some(msg))
-        }
+        Ok(resp) => match resp.bytes().await {
+            Ok(bytes) => match serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes) {
+                Ok(parsed) => match parsed.error {
+                    Some(err) => {
+                        let msg = err.message.to_string();
+                        // Distinguish "method exists but tx invalid" from "method missing".
+                        let exists = msg.contains("invalid")
+                            || msg.contains("rlp")
+                            || msg.contains("transaction")
+                            || msg.contains("not accepted");
+                        (exists, Some(msg))
+                    }
+                    None => (true, None),
+                },
+                Err(e) => (false, Some(e.to_string())),
+            },
+            Err(e) => (false, Some(e.to_string())),
+        },
+        Err(e) => (false, Some(e.to_string())),
     };
 
     let recommended_mode = if supports_private_rpc_method {
@@ -109,7 +143,10 @@ pub async fn probe_bloxroute_auth(auth_header: &str) -> bool {
     if resp.status().as_u16() == 401 {
         return false;
     }
-    let Ok(parsed) = resp.json::<JsonRpcResponse>().await else {
+    let Ok(bytes) = resp.bytes().await else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes) else {
         return false;
     };
     // Auth OK when the gateway accepts the method and rejects only the dummy tx bytes.
@@ -254,7 +291,8 @@ pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Res
         .send()
         .await?
         .error_for_status()?;
-    let parsed: JsonRpcResponse = resp.json().await?;
+    let bytes = resp.bytes().await?;
+    let parsed: JsonRpcResponse<'_> = serde_json::from_slice(&bytes)?;
     if let Some(err) = parsed.error {
         anyhow::bail!("eth_sendRawTransactionPrivate: {}", err.message);
     }
@@ -357,33 +395,6 @@ pub async fn submit_signed_raw(raw: &[u8], cfg: &PrivateSubmitConfig) -> anyhow:
         }
     }
 }
-
-async fn rpc_call<P: serde::Serialize>(
-    client: &Client,
-    url: &str,
-    method: &str,
-    params: P,
-) -> anyhow::Result<Option<JsonRpcResult>> {
-    let body = JsonRpcRequest {
-        jsonrpc: "2.0",
-        id: 1,
-        method,
-        params,
-    };
-    let resp = client
-        .post(url)
-        .timeout(PROBE_TIMEOUT)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?;
-    let parsed: JsonRpcResponse = resp.json().await?;
-    if let Some(err) = parsed.error {
-        anyhow::bail!("{}", err.message);
-    }
-    Ok(parsed.result)
-}
-
 /// Fallback: standard provider send (public or private URL with normal JSON-RPC).
 pub async fn submit_via_provider<P: Provider<Ethereum>>(
     provider: &P,

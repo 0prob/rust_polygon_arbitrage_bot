@@ -154,7 +154,9 @@ pub fn min_profitable_cycle_ratio(hops: u32) -> U256 {
     if hops <= 2 {
         return ONE.saturating_add(U256::from(1u8));
     }
-    let drag_bps = u64::from(hops.saturating_mul(40));
+    // Base 20 bps + 38 bps per hop above 2 (executor + flash drag grows with depth).
+    let extra = hops.saturating_sub(2);
+    let drag_bps = 20u64 + u64::from(extra) * 38;
     ONE.saturating_add(ONE * U256::from(drag_bps) / U256::from(10_000u64))
 }
 
@@ -361,6 +363,10 @@ fn rescore_one_cycle(
     token_decimals: Option<&FxHashMap<Address, u8>>,
     flash_source: Option<FlashLoanSource>,
 ) {
+    let edge_hops = u32::try_from(cycle.edges.len()).unwrap_or(cycle.hop_count);
+    if edge_hops != cycle.hop_count {
+        cycle.hop_count = edge_hops;
+    }
     let start_decimals = token_decimals.map_or(18, |m| {
         crate::services::oracle::resolve_token_decimals_for_index(cycle.start_token, arena, m)
     });
@@ -493,6 +499,17 @@ mod tests {
         assert_eq!(six, U256::from(1_000u64));
         assert_eq!(eighteen, U256::from(10u128.pow(15)));
         assert!(six < eighteen);
+    }
+
+    #[test]
+    fn min_profitable_cycle_ratio_scales_with_hop_depth() {
+        let two = min_profitable_cycle_ratio(2);
+        let four = min_profitable_cycle_ratio(4);
+        let six = min_profitable_cycle_ratio(6);
+        assert!(two < four);
+        assert!(four < six);
+        // 4-hop: 20 + 2*38 = 96 bps over ONE
+        assert_eq!(four, ONE + ONE * U256::from(96u64) / U256::from(10_000u64));
     }
 
     #[test]

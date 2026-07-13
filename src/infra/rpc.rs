@@ -169,6 +169,13 @@ impl RpcPool {
 
     /// Probe state HTTP endpoints in parallel and reorder by latency (fastest first).
     pub async fn probe_and_rank_state_urls(&self) {
+        struct ProbeInflightGuard<'a>(&'a AtomicBool);
+        impl Drop for ProbeInflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         if self
             .state_probe_inflight
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -176,8 +183,8 @@ impl RpcPool {
         {
             return;
         }
+        let _guard = ProbeInflightGuard(&self.state_probe_inflight);
         self.probe_and_rank_state_urls_inner().await;
-        self.state_probe_inflight.store(false, Ordering::Release);
     }
 
     async fn probe_and_rank_state_urls_inner(&self) {

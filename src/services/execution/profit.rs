@@ -498,7 +498,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     };
 
     let net_profit_after_gas = net_before_gas.saturating_sub(gas_cost_in_tokens);
-    let native_gross_profit_wei = if rate_ok {
+    let gross_profit_matic_wei = if rate_ok {
         let Some(native_profit) = adjusted_gross.checked_mul(input.token_to_matic_rate) else {
             return rejected_arithmetic(input, "native profit conversion overflow");
         };
@@ -506,17 +506,10 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     } else {
         U256::ZERO
     };
-    let net_profit_after_gas_matic_wei = native_gross_profit_wei.saturating_sub(gas_cost_wei);
+    let net_profit_after_gas_matic_wei = gross_profit_matic_wei.saturating_sub(gas_cost_wei);
 
     let required_net_matic = safety_floor_matic_wei(revert_penalty, input.safety_multiplier_bps);
-    let estimated_matic = if rate_ok && !adjusted_gross.is_zero() {
-        adjusted_gross
-            .checked_mul(input.token_to_matic_rate)
-            .map(|v| v / scale)
-            .unwrap_or(U256::ZERO)
-    } else {
-        U256::ZERO
-    };
+    let estimated_matic = gross_profit_matic_wei;
     let priority_uplift = profit_priority_uplift_wei(
         estimated_matic,
         input.profit_priority_alpha_bps,

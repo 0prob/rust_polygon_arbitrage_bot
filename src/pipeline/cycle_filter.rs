@@ -123,20 +123,39 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
     ctx: Option<&ProbeContext<'_>>,
 ) -> Vec<FoundCycle> {
     let mut cycles = cycles;
+    let merged_in = cycles.len();
+    cycles.retain(|c| is_fully_simulable_route(&c.edges));
+    let simulable = cycles.len();
     if cycles.is_empty() {
+        if merged_in > 0 {
+            crate::debug!(
+                "cycle prefilter: merged={merged_in} simulable=0 keep=0 (all non-simulable)"
+            );
+        }
         return cycles;
     }
     cycles.sort_unstable_by(compare_cycle_score);
     let rescue_cap = graph_negative_rescue_cap(max_keep);
-    let sim_candidates = cycles.len().min(max_keep.saturating_add(rescue_cap));
-    let candidates: Vec<FoundCycle> = cycles.into_iter().take(sim_candidates).collect();
-    let verdicts: Vec<PrefilterVerdict> = candidates
-        .par_iter()
-        .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
-        .collect();
+    let sim_window = cycles.len().min(max_keep.saturating_add(rescue_cap));
+    let candidates: Vec<FoundCycle> = cycles.into_iter().take(sim_window).collect();
+    let verdicts: Vec<PrefilterVerdict> = if crate::util::should_use_rayon(candidates.len()) {
+        candidates
+            .par_iter()
+            .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
+            .collect()
+    };
 
     let mut missing_state_rescued = 0usize;
     let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
+    let mut verdict_keep = 0usize;
+    let mut verdict_rescue_kept = 0usize;
+    let mut verdict_reject = 0usize;
+    let mut verdict_rescue_dropped = 0usize;
     for (cycle, verdict) in candidates.into_iter().zip(verdicts) {
         let keep = match verdict {
             PrefilterVerdict::Keep => true,
@@ -150,6 +169,16 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
             }
             PrefilterVerdict::Reject => false,
         };
+        match verdict {
+            PrefilterVerdict::Keep => {
+                if keep {
+                    verdict_keep += 1;
+                }
+            }
+            PrefilterVerdict::Rescue if keep => verdict_rescue_kept += 1,
+            PrefilterVerdict::Rescue => verdict_rescue_dropped += 1,
+            PrefilterVerdict::Reject => verdict_reject += 1,
+        }
         if keep {
             survivors.push(cycle);
             if survivors.len() >= max_keep {
@@ -157,6 +186,12 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
             }
         }
     }
+    crate::debug!(
+        "cycle prefilter: merged={merged_in} simulable={simulable} sim_window={sim_window} \
+         profit_keep={verdict_keep} rescue={verdict_rescue_kept} rescue_drop={verdict_rescue_dropped} \
+         reject={verdict_reject} out={}",
+        survivors.len()
+    );
     survivors
 }
 
@@ -197,7 +232,10 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
 /// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
 /// iterator chain directly without an intermediate `.collect()`.
 pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
+    let cycles = cycles.into_iter();
+    let (lower, upper) = cycles.size_hint();
     let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
+    best.reserve(upper.unwrap_or(lower));
     for cycle in cycles {
         let key = cycle_key(&cycle.edges);
         match best.entry(key) {

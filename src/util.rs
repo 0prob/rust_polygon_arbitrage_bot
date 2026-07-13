@@ -113,6 +113,18 @@ pub fn lf_worker_threads() -> usize {
     total.saturating_sub(hf_worker_threads()).max(1)
 }
 
+#[inline]
+#[must_use]
+pub fn rayon_parallel_min_work() -> usize {
+    rayon_worker_threads().saturating_mul(2).max(4)
+}
+
+#[inline]
+#[must_use]
+pub fn should_use_rayon(len: usize) -> bool {
+    len >= rayon_parallel_min_work()
+}
+
 fn build_named_cpu_pool(
     prefix: &str,
     threads: usize,

@@ -230,8 +230,7 @@ impl StateArena {
         let inner = Arc::make_mut(&mut self.inner);
         let expected_tokens = tradable
             .iter()
-            .filter_map(|(address, _)| address_index.get(address))
-            .map(|&idx| pools.get(idx).map_or(2, |pool| pool.tokens.len()))
+            .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
             .sum::<usize>()
             .max(1);
         inner.tokens.reserve(expected_tokens);
@@ -242,10 +241,7 @@ impl StateArena {
         inner.address_to_token.reserve(expected_tokens);
 
         let mut metas = Vec::with_capacity(tradable.len().max(1));
-        for (address, state) in tradable {
-            let Some(&idx) = address_index.get(&address) else {
-                continue;
-            };
+        for (idx, _address, state) in tradable {
             let Some(pool) = pools.get(idx) else {
                 continue;
             };

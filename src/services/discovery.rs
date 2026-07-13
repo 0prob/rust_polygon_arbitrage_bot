@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, FixedBytes, keccak256};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::core::protocol::{
     fee_to_bps, is_fetchable_protocol, is_known_protocol_label, normalize_balancer_pool_type,
@@ -70,7 +70,9 @@ fn quickswap_v2_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("QUICKSWAP_V2_ENABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+        std::env::var("QUICKSWAP_V2_ENABLED")
+            .ok()
+            .is_none_or(|v| v.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -85,7 +87,9 @@ fn uniswap_v2_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("UNISWAP_V2_ENABLED").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+        std::env::var("UNISWAP_V2_ENABLED")
+            .ok()
+            .is_none_or(|v| v.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -369,6 +373,30 @@ pub fn discovered_pool_by_address(pools: &[DiscoveredPool]) -> FxHashMap<Address
     out
 }
 
+/// Token addresses from `pools` that are not in `known`, capped for one multicall batch.
+#[must_use]
+pub fn unknown_tokens_from_pools(
+    pools: &[DiscoveredPool],
+    known: &FxHashMap<Address, u8>,
+    limit: usize,
+) -> Vec<Address> {
+    if limit == 0 || pools.is_empty() {
+        return Vec::new();
+    }
+    let mut missing = FxHashSet::default();
+    'outer: for pool in pools {
+        for addr in &pool.tokens {
+            if !known.contains_key(addr) {
+                missing.insert(*addr);
+                if missing.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    missing.into_iter().collect()
+}
+
 /// Log protocol distribution of discovered pools for routing health.
 pub fn log_protocol_distribution(pools: &[DiscoveredPool]) {
     use std::collections::BTreeMap;
@@ -391,6 +419,46 @@ pub fn log_protocol_distribution(pools: &[DiscoveredPool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_protocol_toggles_default_on_when_env_missing() {
+        assert!(quickswap_v2_enabled());
+        assert!(uniswap_v2_enabled());
+    }
+
+    #[test]
+    fn unknown_tokens_from_pools_respects_known_and_limit() {
+        let token_a: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .expect("addr");
+        let token_b: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .expect("addr");
+        let token_c: Address = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .expect("addr");
+        let pool = DiscoveredPool {
+            pool_key: "0x00000000000000000000000000000000000000aa".to_string(),
+            address: "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .expect("addr"),
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "UNISWAP_V2".to_string(),
+            tokens: vec![token_a, token_b, token_c],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        };
+        let mut known = FxHashMap::default();
+        known.insert(token_a, 18);
+        let missing = unknown_tokens_from_pools(&[pool], &known, 1);
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&token_b) || missing.contains(&token_c));
+    }
 
     #[test]
     fn admits_hookless_uniswap_v4_pools() {

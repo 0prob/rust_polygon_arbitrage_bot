@@ -160,9 +160,9 @@ impl HyperSyncService {
 fn quantity_to_u64(q: &Quantity) -> u64 {
     let bytes = q.as_ref();
     let start = bytes.len().saturating_sub(8);
-    bytes[start..]
-        .iter()
-        .fold(0u64, |acc, &b| acc.wrapping_shl(8) | u64::from(b))
+    let mut out = [0u8; 8];
+    out[8 - (bytes.len() - start)..].copy_from_slice(&bytes[start..]);
+    u64::from_be_bytes(out)
 }
 
 /// Returns `Some(service)` when `ENVIO_API_TOKEN` is set; otherwise `None`.

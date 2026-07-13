@@ -15,6 +15,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::types::MinimalSimResult;
 use alloy::primitives::U256;
+use rustc_hash::FxHashMap;
 
 /// Per-hop gas estimate for route ranking (matches simulation constants).
 #[must_use]
@@ -60,13 +61,39 @@ struct HopResult {
     gas: u32,
 }
 
+/// Per-hop shallow caps for CL routes only; other protocols use `U256::MAX`.
 #[inline]
-fn route_spot_probes(arena: &StateArena, edges: &[Edge]) -> [U256; HOP_CAP_USIZE] {
+fn route_shallow_caps_with(
+    edges: &[Edge],
+    mut probe_for_token: impl FnMut(crate::core::types::TokenIndex) -> U256,
+) -> [U256; HOP_CAP_USIZE] {
     let mut caps = [U256::MAX; HOP_CAP_USIZE];
+    let mut token_caps: FxHashMap<crate::core::types::TokenIndex, U256> = FxHashMap::default();
     for (i, edge) in edges.iter().enumerate() {
-        caps[i] = spot_probe_for_token(arena, edge.token_in);
+        if matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            caps[i] = *token_caps
+                .entry(edge.token_in)
+                .or_insert_with(|| probe_for_token(edge.token_in));
+        }
     }
     caps
+}
+
+fn route_shallow_caps(arena: &StateArena, edges: &[Edge]) -> [U256; HOP_CAP_USIZE] {
+    route_shallow_caps_with(edges, |token| spot_probe_for_token(arena, token))
+}
+
+#[inline]
+fn route_has_cl_hop(edges: &[Edge]) -> bool {
+    edges.iter().any(|edge| {
+        matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        )
+    })
 }
 
 fn simulate_hop(
@@ -230,16 +257,50 @@ pub enum HopFidelityReject {
     V2ReserveExhausted(usize),
 }
 
-fn cl_hop_shallow_at_amount(state: &PoolState, edge: &Edge, amount_in: U256) -> bool {
-    // ponytail: reuse cl_hop_tickless instead of duplicating the match
+/// Counters from `route_hop_fidelity_reject_profiled` (CL depth sims are the expensive path).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HopFidelityProfile {
+    pub hops_checked: u32,
+    pub cl_depth_sims: u32,
+}
+
+/// Drift metrics from a resim compare (populated even when the gate passes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResimFidelityProfile {
+    pub profit_drift_bps: u64,
+    pub max_hop_drift_bps: u64,
+}
+
+fn cl_hop_shallow_at_amount(
+    state: &PoolState,
+    edge: &Edge,
+    hop_probe: U256,
+    amount_in: U256,
+    profile: Option<&mut HopFidelityProfile>,
+) -> bool {
     if cl_hop_tickless(state) {
         return true;
+    }
+    if amount_in <= hop_probe {
+        return false;
+    }
+    if let Some(p) = profile {
+        p.cl_depth_sims = p.cl_depth_sims.saturating_add(1);
     }
     match state {
         PoolState::V3(s) | PoolState::V4(s) => {
             simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps)).shallow
         }
         _ => false,
+    }
+}
+
+#[inline]
+fn u256_to_bps_u64(v: U256) -> u64 {
+    if v > U256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        v.as_limbs()[0]
     }
 }
 
@@ -259,26 +320,38 @@ fn hop_amount_within_drift(baseline: U256, refreshed: U256, max_drift_bps: u64) 
     drift_bps <= U256::from(max_drift_bps)
 }
 
-/// Per-hop CL fidelity: each V3/V4 hop is checked at its simulated input, not route start.
+/// Per-hop CL fidelity: each V3/V4 hop uses its own decimal-aware spot probe.
 #[must_use]
-pub fn route_hop_fidelity_ok(
-    arena: &StateArena,
-    edges: &[Edge],
-    hop_amounts: &[U256],
-    spot_probe: U256,
-) -> bool {
-    route_hop_fidelity_reject(arena, edges, hop_amounts, spot_probe).is_none()
+pub fn route_hop_fidelity_ok(arena: &StateArena, edges: &[Edge], hop_amounts: &[U256]) -> bool {
+    route_hop_fidelity_reject(arena, edges, hop_amounts).is_none()
 }
 
-/// First hop that fails tick-depth, tradability, or reserve-depth checks above `spot_probe`, if any.
+/// First hop that fails tick-depth, tradability, or reserve-depth checks, if any.
 #[must_use]
 pub fn route_hop_fidelity_reject(
     arena: &StateArena,
     edges: &[Edge],
     hop_amounts: &[U256],
-    spot_probe: U256,
 ) -> Option<HopFidelityReject> {
+    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None)
+}
+
+#[must_use]
+pub fn route_hop_fidelity_reject_profiled(
+    arena: &StateArena,
+    edges: &[Edge],
+    hop_amounts: &[U256],
+    mut profile: Option<&mut HopFidelityProfile>,
+) -> Option<HopFidelityReject> {
+    let hop_probes = if route_has_cl_hop(edges) {
+        route_shallow_caps(arena, edges)
+    } else {
+        [U256::MAX; HOP_CAP_USIZE]
+    };
     for (i, edge) in edges.iter().enumerate() {
+        if let Some(p) = profile.as_deref_mut() {
+            p.hops_checked = p.hops_checked.saturating_add(1);
+        }
         let amount_in = hop_amounts.get(i).copied().unwrap_or(U256::ZERO);
         let Some(state) = arena.pool_state(edge.pool_index) else {
             return Some(HopFidelityReject::MissingPool(i));
@@ -293,9 +366,6 @@ pub fn route_hop_fidelity_reject(
                 } else {
                     (s.reserve1, s.reserve0)
                 };
-                // If trade input >= reserve_in, the swap would drain >50% of the pool.
-                // The pool lacks sufficient depth for this trade — reject before
-                // the simulation produces an unrealistic (phantom) profit.
                 if amount_in >= reserve_in {
                     return Some(HopFidelityReject::V2ReserveExhausted(i));
                 }
@@ -309,7 +379,14 @@ pub fn route_hop_fidelity_reject(
             (
                 PoolState::V3(_) | PoolState::V4(_),
                 ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
-            ) if amount_in > spot_probe && cl_hop_shallow_at_amount(state, edge, amount_in) => {
+            ) if cl_hop_shallow_at_amount(
+                state,
+                edge,
+                hop_probes[i],
+                amount_in,
+                profile.as_deref_mut(),
+            ) =>
+            {
                 return Some(HopFidelityReject::ShallowCl(i));
             }
             _ => {}
@@ -332,6 +409,16 @@ pub fn route_resim_fidelity_reject(
     baseline: &RouteSimulationResult,
     refreshed: &RouteSimulationResult,
 ) -> Option<&'static str> {
+    let mut profile = ResimFidelityProfile::default();
+    route_resim_fidelity_reject_profiled(baseline, refreshed, &mut profile)
+}
+
+#[must_use]
+pub fn route_resim_fidelity_reject_profiled(
+    baseline: &RouteSimulationResult,
+    refreshed: &RouteSimulationResult,
+    profile: &mut ResimFidelityProfile,
+) -> Option<&'static str> {
     if refreshed.profit.is_zero() {
         return Some("resim unprofitable");
     }
@@ -339,6 +426,13 @@ pub fn route_resim_fidelity_reject(
         return Some("hop count mismatch");
     }
     if !baseline.profit.is_zero() {
+        if refreshed.profit >= baseline.profit {
+            profile.profit_drift_bps = 0;
+        } else {
+            let lost = baseline.profit - refreshed.profit;
+            let bps = lost * U256::from(10_000u64) / baseline.profit;
+            profile.profit_drift_bps = u256_to_bps_u64(bps);
+        }
         let min_profit = baseline.profit * U256::from(10_000u64 - RESIM_PROFIT_DRIFT_BPS)
             / U256::from(10_000u64);
         if refreshed.profit < min_profit {
@@ -348,6 +442,11 @@ pub fn route_resim_fidelity_reject(
     for i in 0..baseline.hop_amounts.len() {
         let b = baseline.hop_amounts[i];
         let r = refreshed.hop_amounts[i];
+        if b != r && !b.is_zero() {
+            let (lo, hi) = if b >= r { (r, b) } else { (b, r) };
+            let drift = u256_to_bps_u64((hi - lo) * U256::from(10_000u64) / lo);
+            profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(drift);
+        }
         if !hop_amount_within_drift(b, r, RESIM_HOP_DRIFT_BPS) {
             return Some("hop amount drift");
         }
@@ -364,13 +463,8 @@ fn walk_route_hops(
 ) -> Option<(U256, u32)> {
     let mut current = amount_in;
     let mut total_gas = 0u32;
-    let shallow_caps = if edges.iter().any(|edge| {
-        matches!(
-            edge.protocol,
-            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
-        )
-    }) {
-        route_spot_probes(arena, edges)
+    let shallow_caps = if route_has_cl_hop(edges) {
+        route_shallow_caps(arena, edges)
     } else {
         [U256::MAX; HOP_CAP_USIZE]
     };
@@ -403,6 +497,22 @@ pub fn simulate_route_minimal(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
+    if edges.is_empty() {
+        return None;
+    }
+    if amount_in.is_zero() {
+        let hop_gas = route_hop_gas_budget(edges);
+        let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+            hop_gas,
+            edges.len(),
+            edges.len() as u32,
+        );
+        return Some(MinimalSimResult {
+            profit: U256::ZERO,
+            amount_out: U256::ZERO,
+            total_gas,
+        });
+    }
     let (amount_out, _) = walk_route_hops(arena, edges, amount_in, None)?;
     let profit = amount_out.saturating_sub(amount_in);
     let hop_count = edges.len();
@@ -427,6 +537,26 @@ pub fn simulate_route_detailed(
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
+    if hop_count == 0 {
+        return None;
+    }
+    if amount_in.is_zero() {
+        let hop_gas = route_hop_gas_budget(edges);
+        let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+            hop_gas,
+            hop_count,
+            hop_count as u32,
+        );
+        return Some(RouteSimulationResult {
+            amount_in: U256::ZERO,
+            amount_out: U256::ZERO,
+            profit: U256::ZERO,
+            profitable: false,
+            hop_amounts: hop_amounts_zeroed(hop_count),
+            total_gas,
+            hop_count: hop_count as u32,
+        });
+    }
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
     let (amount_out, _) = walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
     let profit = amount_out.saturating_sub(amount_in);
@@ -456,6 +586,39 @@ mod tests {
     #[test]
     fn test_estimate_hop_gas_v2() {
         assert!(estimate_hop_gas(ProtocolType::UniswapV2) > 0);
+    }
+
+    #[test]
+    fn zero_amount_minimal_sim_skips_walk() {
+        use crate::core::types::V2PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let sim = simulate_route_minimal(&arena, &[edge], U256::ZERO).expect("zero sim");
+        assert!(sim.profit.is_zero());
+        assert!(sim.amount_out.is_zero());
     }
 
     #[test]
@@ -568,6 +731,78 @@ mod tests {
     }
 
     #[test]
+    fn shallow_caps_probe_each_token_once_per_route() {
+        use crate::core::types::{TokenIndex, V3PoolState};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let token_a = arena.register_token(Address::from([1u8; 20]));
+        let token_b = arena.register_token(Address::from([2u8; 20]));
+        let pool_0 = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(Vec::new()),
+            })),
+        );
+        let pool_1 = arena.register_pool(
+            Address::from([4u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(Vec::new()),
+            })),
+        );
+        let edges = [
+            Edge {
+                pool_index: pool_0,
+                token_in: token_a,
+                token_out: token_b,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: pool_1,
+                token_in: token_a,
+                token_out: token_b,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV4,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+        ];
+        let mut probes = 0u32;
+        let caps = route_shallow_caps_with(&edges, |token: TokenIndex| {
+            probes += 1;
+            if token == token_a {
+                U256::from(111u64)
+            } else {
+                U256::from(222u64)
+            }
+        });
+        assert_eq!(probes, 1);
+        assert_eq!(caps[0], U256::from(111u64));
+        assert_eq!(caps[1], U256::from(111u64));
+    }
+
+    #[test]
     fn cl_amount_cap_none_when_ticks_present() {
         use crate::core::types::{V3PoolState, V3Tick};
         use std::sync::Arc;
@@ -668,12 +903,12 @@ mod tests {
         let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
         let mut first_only = hop_amounts_zeroed(edges.len());
         first_only[0] = probe;
-        assert!(!route_hop_fidelity_ok(&arena, &edges, &first_only, probe));
+        assert!(!route_hop_fidelity_ok(&arena, &edges, &first_only));
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = probe;
         hop_amounts[1] = U256::from(10u128.pow(18));
         assert_eq!(
-            route_hop_fidelity_reject(&arena, &edges, &hop_amounts, probe),
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             Some(HopFidelityReject::ShallowCl(1))
         );
     }
@@ -714,12 +949,11 @@ mod tests {
             fee_bps: 30,
             zero_for_one: true,
         }];
-        let spot_probe = U256::ZERO;
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = U256::from(1u64);
 
         assert_eq!(
-            route_hop_fidelity_reject(&arena, &edges, &hop_amounts, spot_probe),
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             None
         );
     }
@@ -808,7 +1042,7 @@ mod tests {
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
         assert_eq!(
-            route_hop_fidelity_reject(&arena, &edges, &hop_amounts, U256::ZERO),
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             Some(HopFidelityReject::ShallowCl(0))
         );
     }

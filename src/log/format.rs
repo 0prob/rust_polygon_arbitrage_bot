@@ -121,39 +121,39 @@ impl<'a> FileEvent<'a> {
     }
 }
 
-pub(super) fn write_sink_error(error: &io::Error, palette: &Palette) -> io::Result<()> {
+pub(super) fn write_sink_error(
+    stdout: &mut impl Write,
+    error: &io::Error,
+    palette: &Palette,
+) -> io::Result<()> {
     if !STDOUT_ENABLED.load(Ordering::Relaxed) {
         return Ok(());
     }
-    write_terminal(
+    let line = render_terminal(
         "ERROR",
         "system",
         &format!("component log write failed: {error}"),
         &palette.error,
         &palette.reset,
-    )
+    );
+    stdout.write_all(line.as_bytes())
 }
 
-pub(super) fn write_stdout(event: &Event, component: &str, palette: &Palette) -> io::Result<()> {
+pub(super) fn write_stdout(
+    stdout: &mut impl Write,
+    event: &Event,
+    component: &str,
+    palette: &Palette,
+) -> io::Result<()> {
     let prefix = format!("{}{}", palette.bold, palette.level(event.level));
-    write_terminal(
+    let line = render_terminal(
         event.level,
         component,
         &event.message,
         &prefix,
         &palette.reset,
-    )
-}
-
-fn write_terminal(
-    level: &str,
-    component: &str,
-    message: &str,
-    color: &str,
-    reset: &str,
-) -> io::Result<()> {
-    let line = render_terminal(level, component, message, color, reset);
-    std::io::stdout().lock().write_all(line.as_bytes())
+    );
+    stdout.write_all(line.as_bytes())
 }
 
 pub(super) fn render_terminal(

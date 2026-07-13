@@ -8,7 +8,7 @@ use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
+use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
@@ -479,7 +479,8 @@ fn can_still_find_profitable_cycle(
     curr: TokenIndex,
     prep: &ActiveGraph,
 ) -> bool {
-    if product_ratio > ONE {
+    let hop_floor = hops.max(2);
+    if product_ratio > ONE && product_ratio >= min_profitable_cycle_ratio(hop_floor) {
         return true;
     }
     if !can_still_be_negative(
@@ -912,22 +913,41 @@ fn collect_cycles_dfs_parallel(
     }
     let per_shard = max_cycles.div_ceil(start_tokens.len()).max(1);
     let mut shard_caps = vec![per_shard; start_tokens.len()];
-    let mut shard_cycles: Vec<Vec<FoundCycle>> = start_tokens
-        .par_iter()
-        .zip(shard_caps.par_iter())
-        .map(|(start, cap)| {
-            collect_cycles_dfs_single_start(
-                graph,
-                arena,
-                pool_metas,
-                prep,
-                *start,
-                hop_limit,
-                *cap,
-                budget.as_ref(),
-            )
-        })
-        .collect();
+    let mut shard_cycles: Vec<Vec<FoundCycle>> = if crate::util::should_use_rayon(start_tokens.len()) {
+        start_tokens
+            .par_iter()
+            .zip(shard_caps.par_iter())
+            .map(|(start, cap)| {
+                collect_cycles_dfs_single_start(
+                    graph,
+                    arena,
+                    pool_metas,
+                    prep,
+                    *start,
+                    hop_limit,
+                    *cap,
+                    budget.as_ref(),
+                )
+            })
+            .collect()
+    } else {
+        start_tokens
+            .iter()
+            .zip(shard_caps.iter())
+            .map(|(start, cap)| {
+                collect_cycles_dfs_single_start(
+                    graph,
+                    arena,
+                    pool_metas,
+                    prep,
+                    *start,
+                    hop_limit,
+                    *cap,
+                    budget.as_ref(),
+                )
+            })
+            .collect()
+    };
 
     let mut merged = merge_shard_cycles(&shard_cycles);
 
@@ -949,25 +969,48 @@ fn collect_cycles_dfs_parallel(
             break;
         }
         let extra = (max_cycles - merged.len()).div_ceil(saturated.len());
-        let rerun: Vec<(usize, Vec<FoundCycle>)> = saturated
-            .par_iter()
-            .map(|&i| {
-                let cap = shard_caps[i].saturating_add(extra).min(max_cycles);
-                (
-                    i,
-                    collect_cycles_dfs_single_start(
-                        graph,
-                        arena,
-                        pool_metas,
-                        prep,
-                        start_tokens[i],
-                        hop_limit,
-                        cap,
-                        budget.as_ref(),
-                    ),
-                )
-            })
-            .collect();
+        let rerun: Vec<(usize, Vec<FoundCycle>)> = if crate::util::should_use_rayon(saturated.len())
+        {
+            saturated
+                .par_iter()
+                .map(|&i| {
+                    let cap = shard_caps[i].saturating_add(extra).min(max_cycles);
+                    (
+                        i,
+                        collect_cycles_dfs_single_start(
+                            graph,
+                            arena,
+                            pool_metas,
+                            prep,
+                            start_tokens[i],
+                            hop_limit,
+                            cap,
+                            budget.as_ref(),
+                        ),
+                    )
+                })
+                .collect()
+        } else {
+            saturated
+                .iter()
+                .map(|&i| {
+                    let cap = shard_caps[i].saturating_add(extra).min(max_cycles);
+                    (
+                        i,
+                        collect_cycles_dfs_single_start(
+                            graph,
+                            arena,
+                            pool_metas,
+                            prep,
+                            start_tokens[i],
+                            hop_limit,
+                            cap,
+                            budget.as_ref(),
+                        ),
+                    )
+                })
+                .collect()
+        };
         let previous_len = merged.len();
         for (i, cycles) in rerun {
             shard_caps[i] = shard_caps[i].saturating_add(extra).min(max_cycles);
@@ -990,7 +1033,9 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 
     use crate::pipeline::types::compare_cycle_score;
 
+    let total: usize = shard_cycles.iter().map(Vec::len).sum();
     let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
+    best.reserve(total);
     for cycle in shard_cycles.iter().flat_map(|s| s.iter()) {
         let key = cycle_key(&cycle.edges);
         match best.entry(key) {
@@ -1039,7 +1084,8 @@ pub fn find_cycles_multi_pass_with_prep(
         );
         all.append(&mut shard);
     }
-    dedupe_cycles_by_edges(all)
+    // Dedup happens once in `finalize_cycles` after hybrid DFS+BF merge.
+    all
 }
 
 #[must_use]

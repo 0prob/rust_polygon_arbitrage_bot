@@ -80,12 +80,22 @@ impl GraphCache {
         &self,
         routable_pool_count: usize,
         layout_fingerprint: u64,
-        _state_generation: u64,
+        state_generation: u64,
+        dirty_pool_count: usize,
+        arena_pool_count: usize,
     ) -> bool {
         if self.needs_connectivity_rebuild(routable_pool_count, layout_fingerprint) {
             return true;
         }
         if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
+            return true;
+        }
+        // Mirror graph rescoring: a majority-dirty tick can invalidate cached routes.
+        if state_generation != self.cached_state_generation
+            && dirty_pool_count > 0
+            && arena_pool_count > 0
+            && dirty_pool_count > arena_pool_count / 2
+        {
             return true;
         }
         // LF rescoring reflects pool-state deltas; full enumeration is periodic.
@@ -216,7 +226,7 @@ mod tests {
             0,
             0,
         );
-        assert!(cache.needs_cycle_refind(10, 0, 0));
+        assert!(cache.needs_cycle_refind(10, 0, 0, 0, 0));
     }
 
     #[test]
@@ -232,7 +242,7 @@ mod tests {
             800,
         );
         assert!(!cache.needs_connectivity_rebuild(1_050, 1));
-        assert!(!cache.needs_cycle_refind(1_050, 1, 6));
+        assert!(!cache.needs_cycle_refind(1_050, 1, 6, 0, 1_000));
     }
 
     #[test]
@@ -264,8 +274,24 @@ mod tests {
             5,
             800,
         );
-        assert!(!cache.needs_cycle_refind(1_000, 1, 5));
-        assert!(!cache.needs_cycle_refind(1_000, 1, 6));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
+    }
+
+    #[test]
+    fn majority_dirty_pools_force_cycle_refind() {
+        let mut cache = GraphCache::with_intervals(60, 8);
+        cache.advance_pass();
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            1_000,
+            1,
+            5,
+            800,
+        );
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
+        assert!(cache.needs_cycle_refind(1_000, 1, 6, 51, 100));
     }
 
     #[test]
@@ -282,9 +308,9 @@ mod tests {
             5,
             800,
         );
-        assert!(!cache.needs_cycle_refind(1_000, 1, 6));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
         cache.advance_pass();
-        assert!(cache.needs_cycle_refind(1_000, 1, 6));
+        assert!(cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
     }
 
     #[test]
@@ -300,7 +326,7 @@ mod tests {
             800,
         );
         assert!(cache.needs_connectivity_rebuild(1_100, 1));
-        assert!(cache.needs_cycle_refind(1_100, 1, 6));
+        assert!(cache.needs_cycle_refind(1_100, 1, 6, 0, 1_000));
     }
 
     #[test]
@@ -317,7 +343,7 @@ mod tests {
         );
         assert!(!cache.needs_connectivity_rebuild(10, 1));
         assert!(cache.needs_connectivity_rebuild(10, 2));
-        assert!(cache.needs_cycle_refind(10, 2, 0));
+        assert!(cache.needs_cycle_refind(10, 2, 0, 0, 10));
     }
 
     #[test]
@@ -334,7 +360,7 @@ mod tests {
         );
         assert!(!cache.needs_connectivity_rebuild(1_000, 11));
         assert!(cache.needs_connectivity_rebuild(1_000, 12));
-        assert!(cache.needs_cycle_refind(1_000, 12, 6));
+        assert!(cache.needs_cycle_refind(1_000, 12, 6, 0, 1_000));
     }
 
     #[test]
@@ -367,7 +393,7 @@ mod tests {
             7,
             800,
         );
-        assert!(!cache.needs_cycle_refind(1_000, 1, 7));
-        assert!(!cache.needs_cycle_refind(1_000, 1, 8));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 7, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 8, 0, 1_000));
     }
 }

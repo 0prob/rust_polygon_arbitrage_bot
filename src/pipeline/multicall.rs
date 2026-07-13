@@ -113,7 +113,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
 
     let mut attempt = 0u32;
     loop {
-        let mut call = contract.aggregate3(calls.clone());
+        let mut call = contract.aggregate3(std::mem::take(&mut calls));
         if let Some(number) = block_number {
             call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
         }
@@ -138,7 +138,9 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
                 if is_retryable_rpc_error(&e) && attempt < 4 {
                     retry_sleep(attempt).await;
                     attempt += 1;
-                    calls = build_calls(items);
+                    if calls.is_empty() {
+                        calls = build_calls(items);
+                    }
                     continue;
                 }
                 return Err(e);

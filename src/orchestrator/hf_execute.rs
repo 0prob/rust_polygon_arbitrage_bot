@@ -15,7 +15,7 @@ use crate::orchestrator::hf_eval::{
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
-use crate::pipeline::spot_price::spot_probe_for_token;
+
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
@@ -54,7 +54,9 @@ pub(crate) struct DispatchInputs<'a> {
 struct SkipCounts {
     quarantine: AtomicU32,
     cooldown: AtomicU32,
-    fidelity: AtomicU32,
+    resim_fail: AtomicU32,
+    resim_drift: AtomicU32,
+    hop_fidelity: AtomicU32,
     prepare: AtomicU32,
     build: AtomicU32,
 }
@@ -64,7 +66,9 @@ impl SkipCounts {
         match key {
             "quarantine" => self.quarantine.fetch_add(1, Ordering::Relaxed),
             "cooldown" => self.cooldown.fetch_add(1, Ordering::Relaxed),
-            "fidelity" => self.fidelity.fetch_add(1, Ordering::Relaxed),
+            "resim_fail" => self.resim_fail.fetch_add(1, Ordering::Relaxed),
+            "resim_drift" => self.resim_drift.fetch_add(1, Ordering::Relaxed),
+            "hop_fidelity" => self.hop_fidelity.fetch_add(1, Ordering::Relaxed),
             "prepare" => self.prepare.fetch_add(1, Ordering::Relaxed),
             "build" => self.build.fetch_add(1, Ordering::Relaxed),
             _ => 0,
@@ -74,12 +78,15 @@ impl SkipCounts {
     fn log_if_any(&self) {
         let quarantine = self.quarantine.load(Ordering::Relaxed);
         let cooldown = self.cooldown.load(Ordering::Relaxed);
-        let fidelity = self.fidelity.load(Ordering::Relaxed);
+        let resim_fail = self.resim_fail.load(Ordering::Relaxed);
+        let resim_drift = self.resim_drift.load(Ordering::Relaxed);
+        let hop_fidelity = self.hop_fidelity.load(Ordering::Relaxed);
         let prepare = self.prepare.load(Ordering::Relaxed);
         let build = self.build.load(Ordering::Relaxed);
+        let fidelity = resim_fail + resim_drift + hop_fidelity;
         if build > 0 || quarantine > 0 || cooldown > 0 || fidelity > 0 || prepare > 0 {
             crate::info!(
-                "dispatch summary: quarantine={quarantine}, cooldown={cooldown}, fidelity={fidelity}, prepare={prepare}, build={build}",
+                "dispatch summary: quarantine={quarantine}, cooldown={cooldown}, fidelity={fidelity} (resim_fail={resim_fail}, resim_drift={resim_drift}, hop={hop_fidelity}), prepare={prepare}, build={build}",
             );
         }
     }
@@ -366,26 +373,34 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         let amount_in = evaluated.sim.amount_in;
         let Some(refreshed) = simulate_route_detailed(arena, &evaluated.cycle.edges, amount_in)
         else {
-            skipped.record("fidelity");
+            skipped.record("resim_fail");
             crate::debug!("dispatch skip: fp={fp} resim failed after pool refresh");
             return;
         };
-        if let Some(reason) = local_sim::route_resim_fidelity_reject(&evaluated.sim, &refreshed) {
-            skipped.record("fidelity");
+        let mut resim_profile = local_sim::ResimFidelityProfile::default();
+        if let Some(reason) = local_sim::route_resim_fidelity_reject_profiled(
+            &evaluated.sim,
+            &refreshed,
+            &mut resim_profile,
+        ) {
+            skipped.record("resim_drift");
             crate::debug!(
-                "dispatch skip: fp={fp} resim fidelity gate failed: {reason} baseline_profit={} refreshed_profit={}",
+                "dispatch skip: fp={fp} resim gate failed: {reason} baseline_profit={} refreshed_profit={} profit_drift_bps={} max_hop_drift_bps={}",
                 evaluated.sim.profit,
                 refreshed.profit,
+                resim_profile.profit_drift_bps,
+                resim_profile.max_hop_drift_bps,
             );
             return;
         }
-        if let Some(reject) = local_sim::route_hop_fidelity_reject(
+        let mut hop_profile = local_sim::HopFidelityProfile::default();
+        if let Some(reject) = local_sim::route_hop_fidelity_reject_profiled(
             arena,
             &evaluated.cycle.edges,
             &refreshed.hop_amounts,
-            spot_probe_for_token(arena, evaluated.cycle.start_token),
+            Some(&mut hop_profile),
         ) {
-            skipped.record("fidelity");
+            skipped.record("hop_fidelity");
             let hop = match reject {
                 local_sim::HopFidelityReject::MissingPool(i)
                 | local_sim::HopFidelityReject::PoolLocked(i)
@@ -398,9 +413,19 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 .copied()
                 .unwrap_or(U256::ZERO);
             crate::debug!(
-                "dispatch skip: fp={fp} hop fidelity gate failed: {reject:?} hop={hop} amount={hop_amount}"
+                "dispatch skip: fp={fp} hop fidelity failed: {reject:?} hop={hop} amount={hop_amount} hops_checked={} cl_depth_sims={}",
+                hop_profile.hops_checked,
+                hop_profile.cl_depth_sims,
             );
             return;
+        }
+        if hop_profile.cl_depth_sims > 0 {
+            crate::debug!(
+                "dispatch resim ok: fp={fp} profit_drift_bps={} max_hop_drift_bps={} cl_depth_sims={}",
+                resim_profile.profit_drift_bps,
+                resim_profile.max_hop_drift_bps,
+                hop_profile.cl_depth_sims,
+            );
         }
         refreshed
     } else {
@@ -681,9 +706,13 @@ pub(crate) async fn refresh_and_resim_profitable(
     if profitable.is_empty() {
         return (profitable, false, cache.generation());
     }
+    let batch_started = crate::util::now_ms();
+    let in_count = profitable.len();
     let pools = collect_route_pool_addresses(arena, &profitable);
+    let pool_count = pools.len();
     let mut pools_refreshed = false;
     let mut state_generation = cache.generation();
+    let refresh_started = crate::util::now_ms();
     if !pools.is_empty()
         && refresh
             .refresh_pool_states_for(&pools, pools.len())
@@ -693,6 +722,7 @@ pub(crate) async fn refresh_and_resim_profitable(
         state_generation = arena.apply_hot_cache(cache, &pools);
         pools_refreshed = true;
     }
+    let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
     let route_gas = RouteGasLookup::for_fingerprints(
         reassess.gas_oracle.as_ref(),
         profitable.iter().map(|r| r.route_fingerprint),
@@ -700,12 +730,15 @@ pub(crate) async fn refresh_and_resim_profitable(
     let eval = reassess.as_eval_input(&route_gas);
     let flash = reassess.flash_liquidity.load();
     let flash_ttl = reassess.flash_liquidity.ttl();
-    let filtered = profitable
+    let mut resim_unprofitable = 0usize;
+    let mut reassess_reject = 0usize;
+    let filtered: Vec<HfEvalResult> = profitable
         .into_iter()
         .filter_map(|mut result| {
             let amount = result.opt.optimal_input;
             let sim = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
             if sim.profit.is_zero() {
+                resim_unprofitable += 1;
                 return None;
             }
             result.sim = sim;
@@ -719,12 +752,18 @@ pub(crate) async fn refresh_and_resim_profitable(
             )?;
             let assessment = reassess_hf_eval_result(&result, &eval, flash_source)?;
             if !assessment.should_execute {
+                reassess_reject += 1;
                 return None;
             }
             result.assessment = assessment;
             Some(result)
         })
         .collect();
+    crate::debug!(
+        "resim batch: in={in_count} out={} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={}",
+        filtered.len(),
+        crate::util::now_ms().saturating_sub(batch_started)
+    );
     (filtered, pools_refreshed, state_generation)
 }
 

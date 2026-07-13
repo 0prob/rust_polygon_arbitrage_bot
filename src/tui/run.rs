@@ -74,8 +74,10 @@ pub async fn run_tui(
                 if app.should_quit {
                     break;
                 }
-                if immediate_draw {
+                if immediate_draw && app.route_view_is_dirty() {
                     app.rebuild_route_view();
+                }
+                if immediate_draw {
                     draw_frame_blocking(&mut terminal, &app)?;
                     needs_redraw = false;
                 }
@@ -90,7 +92,9 @@ pub async fn run_tui(
             }
             _ = redraw.tick(), if !app.should_quit => {
                 if needs_redraw {
-                    app.rebuild_route_view();
+                    if app.route_view_is_dirty() {
+                        app.rebuild_route_view();
+                    }
                     draw_frame_blocking(&mut terminal, &app)?;
                     needs_redraw = false;
                 }

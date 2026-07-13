@@ -20,6 +20,7 @@ pub struct RouteSimCacheStats {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub inserts: AtomicU64,
+    pub evictions: AtomicU64,
 }
 
 impl RouteSimCacheStats {
@@ -73,11 +74,19 @@ impl RouteSimCache {
 
     pub fn insert(&self, generation: u64, route_fp: u64, amount: U256, sim: MinimalSimResult) {
         if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+            let before = self.entries.len();
             self.clear_stale(generation);
+            let cleared = before.saturating_sub(self.entries.len());
+            if cleared > 0 {
+                self.stats
+                    .evictions
+                    .fetch_add(cleared as u64, Ordering::Relaxed);
+            }
             if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY
                 && let Some(victim) = self.entries.iter().next().map(|entry| *entry.key())
             {
                 self.entries.remove(&victim);
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.entries.insert(
@@ -89,5 +98,21 @@ impl RouteSimCache {
             sim,
         );
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Debug snapshot when the cache has seen traffic this tick.
+    pub fn debug_log_if_active(&self, label: &str) {
+        let hits = self.stats.hits.load(Ordering::Relaxed);
+        let misses = self.stats.misses.load(Ordering::Relaxed);
+        if hits.saturating_add(misses) == 0 {
+            return;
+        }
+        crate::debug!(
+            "route_sim_cache {label}: hit_rate_bps={} hits={hits} misses={misses} inserts={} evictions={} entries={}",
+            self.stats.hit_rate_bps(),
+            self.stats.inserts.load(Ordering::Relaxed),
+            self.stats.evictions.load(Ordering::Relaxed),
+            self.entries.len()
+        );
     }
 }

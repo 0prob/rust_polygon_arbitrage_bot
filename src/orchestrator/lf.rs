@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use anyhow::Context;
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -13,6 +14,7 @@ use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
+use crate::pipeline::cycle_filter::ProbeContext;
 use crate::pipeline::cycle_search::find_cycles_for_mode;
 use crate::pipeline::graph_cache::GraphCache;
 use crate::pipeline::spot_price::{
@@ -22,11 +24,13 @@ use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
 use crate::pipeline::types::CycleSearchPass;
+use crate::services::execution::GasOracle;
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
-    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
-    merge_token_rates, resolvable_token_set,
+    arena_tokens_without_decimal_hints, enrich_token_to_matic_rates,
+    enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable, merge_token_rates,
+    resolvable_token_set,
 };
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet, select_stream_targets};
 use crate::services::pipeline_survival::PipelineSurvival;
@@ -43,6 +47,10 @@ struct LfCpuWork {
     max_paths: usize,
     max_hops: u32,
     cycle_finder: crate::config::CycleFinderMode,
+    /// Prior-tick MATIC rates — enough for economic probe sizing at enumeration.
+    prior_rates: Arc<FxHashMap<TokenIndex, U256>>,
+    token_decimals: Arc<FxHashMap<Address, u8>>,
+    gas_price_wei: Option<U256>,
 }
 
 struct LfCpuResult {
@@ -55,7 +63,9 @@ struct LfCpuResult {
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
     let max_hops = max_hops.clamp(2, HOP_CAP);
     let mut passes: SmallVec<[CycleSearchPass; 2]> = SmallVec::new();
-    if max_hops <= 3 {
+    if max_hops <= 4 {
+        // One pass through the configured hop cap — avoids spending half the shared
+        // DFS deadline on a 3-only tranche when max_hops is 4 (common on Polygon).
         passes.push(CycleSearchPass {
             max_hops,
             max_cycles: max_paths,
@@ -203,12 +213,29 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
 
     let need_cycle_refind = {
         let gc = work.graph_cache.lock();
-        needs_rebuild || gc.needs_cycle_refind(routable_count, layout_fp, work.state_generation)
+        needs_rebuild
+            || gc.needs_cycle_refind(
+                routable_count,
+                layout_fp,
+                work.state_generation,
+                work.dirty_pools.len(),
+                work.arena.pool_count(),
+            )
     };
     let mut enumeration_ms = 0u64;
     let cycles = if need_cycle_refind {
-        crate::debug!("lf cycle refind: pass={}", work.lf_pass);
+        crate::debug!(
+            "lf cycle refind: pass={} dirty_pools={} state_gen={}",
+            work.lf_pass,
+            work.dirty_pools.len(),
+            work.state_generation
+        );
         let passes = cycle_search_passes(work.max_hops, work.max_paths);
+        let probe_ctx = ProbeContext {
+            token_to_matic_rates: Some(work.prior_rates.as_ref()),
+            token_decimals: Some(work.token_decimals.as_ref()),
+            gas_price_wei: work.gas_price_wei,
+        };
         let enum_started = crate::util::now_ms();
         let result = find_cycles_for_mode(
             work.cycle_finder,
@@ -217,10 +244,31 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             work.pool_metas.as_ref(),
             passes.as_slice(),
             true,
-            None,
+            Some(&probe_ctx),
         );
+        if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
+            let mut hop_hist = [0u32; HOP_CAP as usize + 1];
+            for c in &result {
+                let h = c.hop_count.min(HOP_CAP) as usize;
+                hop_hist[h] = hop_hist[h].saturating_add(1);
+            }
+            crate::debug!(
+                "cycle search hops: max_hops={} passes={} pre_diversity={} by_hop={hop_hist:?}",
+                work.max_hops,
+                passes.len(),
+                result.len()
+            );
+        }
         enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
-        let cycles = Arc::new(finalize_enumerated_cycles(result, work.max_paths));
+        let diversified = finalize_enumerated_cycles(result, work.max_paths);
+        if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
+            crate::debug!(
+                "cycle search diversity: cap={} post_diversity={}",
+                work.max_paths,
+                diversified.len()
+            );
+        }
+        let cycles = Arc::new(diversified);
         work.graph_cache.lock().store(
             Arc::clone(&graph),
             Some(Arc::clone(&cycles)),
@@ -232,7 +280,15 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         cycles
     } else {
         let gc = work.graph_cache.lock();
-        gc.cycles().unwrap_or_default()
+        let cached = gc.cycles().unwrap_or_default();
+        if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
+            crate::debug!(
+                "lf cycle cache: pass={} cycles={}",
+                work.lf_pass,
+                cached.len()
+            );
+        }
+        cached
     };
 
     LfCpuResult {
@@ -259,6 +315,7 @@ pub struct LfContext {
     pub stream_addresses: StreamAddressSet,
     pub partial_cache: Arc<PartialPoolCache>,
     pub price_oracle: Arc<PriceOracle>,
+    pub gas_oracle: Arc<GasOracle>,
     pub rpc: Arc<RpcPool>,
     pub graph_cache: Arc<Mutex<GraphCache>>,
     pub arena: Arc<parking_lot::Mutex<StateArena>>,
@@ -312,6 +369,16 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .sync_routable_arena(&mut arena, Some(decimals.as_ref())),
     );
     let arena_sync_ms = crate::util::now_ms().saturating_sub(arena_sync_started);
+    if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
+        let hints_missing = arena_tokens_without_decimal_hints(&arena, decimals.as_ref());
+        crate::debug!(
+            "token arena: tokens={} decimals_map={} missing_hints={} pool_metas={}",
+            arena.token_count(),
+            decimals.len(),
+            hints_missing,
+            pool_metas.len()
+        );
+    }
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 
@@ -320,6 +387,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let state_provider = ctx.rpc.connect_state().ok();
     let state_generation = ctx.cache.generation();
     let dirty_pools = ctx.cache.take_dirty_pool_indices(arena.address_to_pool());
+    let gas_price_wei = ctx.gas_oracle.conservative_gas_price();
+    if gas_price_wei.is_none() && lf_pass <= 2 {
+        crate::debug!("lf cycle prefilter: gas oracle not warm yet (no gas floor at enumeration)");
+    }
     let cpu_work = LfCpuWork {
         graph_cache: Arc::clone(&ctx.graph_cache),
         arena: arena.clone(),
@@ -330,6 +401,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         max_paths,
         max_hops,
         cycle_finder: ctx.config.routing.cycle_finder,
+        prior_rates: Arc::clone(&prior_rates),
+        token_decimals: Arc::clone(&decimals),
+        gas_price_wei,
     };
     // ponytail: skip enrich_all_token_to_matic_rates — prior_rates from last tick
     // is sufficient for resolvable set computation. Cycle-token enrichment below
@@ -351,7 +425,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let cycle_search_ms = cpu.enumeration_ms;
 
     // ponytail: collect unique cycle tokens without intermediate HashSet→Vec copy
-    let mut cycle_tokens: Vec<TokenIndex> = Vec::new();
+    let mut cycle_tokens: Vec<TokenIndex> =
+        Vec::with_capacity(cycles_arc.len().saturating_mul(4).max(16));
     let mut cycle_tokens_set = rustc_hash::FxHashSet::default();
     for c in cycles_arc.iter() {
         if cycle_tokens_set.insert(c.start_token) {
@@ -417,29 +492,29 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
 
     let rates_started = crate::util::now_ms();
-    let rates = if let Some(ref provider) = state_provider {
-        merge_token_rates(
-            &prior_rates,
-            enrich_token_to_matic_rates(
-                &ctx.price_oracle,
-                &arena,
-                cycle_tokens.iter().copied(),
-                Some(provider),
-            )
-            .await,
+    let (fresh_rates, rate_stats) = if let Some(ref provider) = state_provider {
+        enrich_token_to_matic_rates(
+            &ctx.price_oracle,
+            &arena,
+            cycle_tokens.iter().copied(),
+            Some(provider),
         )
+        .await
     } else {
-        merge_token_rates(
-            &prior_rates,
-            enrich_token_to_matic_rates_offline(
-                &ctx.price_oracle,
-                &arena,
-                cycle_tokens.iter().copied(),
-            )
-            .await,
-        )
+        enrich_token_to_matic_rates_offline(&ctx.price_oracle, &arena, cycle_tokens.iter().copied())
+            .await
     };
-    let cycle_and_rates_ms = crate::util::now_ms().saturating_sub(refresh_started);
+    let rates = merge_token_rates(&prior_rates, fresh_rates);
+    if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
+        crate::debug!(
+            "token rates: cycle_tokens={} prior_rates={} merged_rates={} {:?}",
+            cycle_tokens.len(),
+            prior_rates.len(),
+            rates.len(),
+            rate_stats
+        );
+    }
+    let cycle_and_rates_ms = crate::util::now_ms().saturating_sub(cpu_started);
     let rates_ms = crate::util::now_ms().saturating_sub(rates_started);
 
     let hot: Vec<Address> = {
@@ -448,7 +523,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .flat_map(|c| c.edges.iter())
             .filter_map(|e| arena.pool_address(e.pool_index))
             .collect();
-        set.into_iter().collect()
+        let mut hot = Vec::with_capacity(set.len());
+        hot.extend(set);
+        hot
     };
 
     let _cycle_count = capped.len();
@@ -586,8 +663,8 @@ mod tests {
     use crate::core::constants::HOP_CAP;
 
     #[test]
-    fn short_hop_search_does_not_schedule_duplicate_pass() {
-        for max_hops in [2, 3] {
+    fn short_hop_search_uses_single_pass_through_configured_cap() {
+        for max_hops in [2, 3, 4] {
             let passes = cycle_search_passes(max_hops, 5_000);
             assert_eq!(passes.len(), 1);
             assert_eq!(passes[0].max_hops, max_hops);
