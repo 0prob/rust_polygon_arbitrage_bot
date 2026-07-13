@@ -15,16 +15,13 @@ async fn main() -> anyhow::Result<()> {
     let hook = bridge.hook();
     let snapshot_tx = bridge.snapshot_sender();
 
-    let ctx = match bootstrap(Some(hook), Some(snapshot_tx)).await {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            rpbot::error!("bootstrap failed: {error:#}");
-            rpbot::log::shutdown();
-            return Err(error);
-        }
-    };
-
-    let result = run_tui(ctx, bridge, rx, snapshot_rx).await;
+    let result = run_tui(
+        bridge,
+        rx,
+        snapshot_rx,
+        bootstrap(Some(hook), Some(snapshot_tx)),
+    )
+    .await;
     rpbot::log::shutdown();
     result
 }

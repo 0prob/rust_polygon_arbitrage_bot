@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -5,7 +6,7 @@ use alloy::primitives::U256;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::time::{Duration, MissedTickBehavior, Sleep, interval};
 
 use alloy::providers::Provider;
 
@@ -69,12 +70,26 @@ impl RuntimeContext {
         ));
         let stream_addresses = StreamAddressSet::new();
         let snapshots = Arc::new(SnapshotStore::new());
-        let refresh = Arc::new(StateRefreshService::new(
-            config.clone(),
-            cache.clone(),
-            rpc.clone(),
-        )?);
-        let execution = Arc::new(ExecutionService::from_config(&config));
+        let (refresh, execution) = std::thread::scope(|scope| -> anyhow::Result<_> {
+            let config_refresh = Arc::clone(&config);
+            let cache_refresh = Arc::clone(&cache);
+            let rpc_refresh = Arc::clone(&rpc);
+            let config_exec = Arc::clone(&config);
+            let refresh_handle = scope.spawn(move || {
+                StateRefreshService::new(config_refresh, cache_refresh, rpc_refresh)
+            });
+            let exec_handle =
+                scope.spawn(move || ExecutionService::from_config(&config_exec));
+            let refresh = refresh_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("state refresh init thread panicked"))??;
+            let execution = exec_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("execution init thread panicked"))?;
+            Ok((refresh, execution))
+        })?;
+        let refresh = Arc::new(refresh);
+        let execution = Arc::new(execution);
         let gas_oracle = Arc::new(GasOracle::default());
         let price_oracle = Arc::new(PriceOracle::new(
             rpc.http().clone(),
@@ -166,101 +181,23 @@ pub async fn run_pass_loop(
     ctx: Arc<RuntimeContext>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let loop_started = crate::util::now_ms();
     info!("pass loop started");
 
-    warm_matic_usd_oracle(&ctx).await;
-    spawn_matic_usd_oracle_background(
-        Arc::clone(&ctx.price_oracle),
-        Arc::clone(&ctx.rpc),
-        ctx.config.oracle.cache_ttl_ms,
-        shutdown.clone(),
-    );
-
-    ctx.rpc
-        .spawn_periodic_probe(shutdown.clone(), std::time::Duration::from_secs(600));
-    // Rank RPC endpoints in the background; LF owns initial PG bootstrap via
-    // maybe_discover on its first tick so HF/WSS can start without blocking.
-    {
-        let rpc = Arc::clone(&ctx.rpc);
-        tokio::spawn(async move {
-            rpc.probe_and_rank_state_urls().await;
-        });
-    }
-
-    let daily_loss_guard = spawn_daily_loss_guard(&ctx, &shutdown);
-
-    // Spawn PostgreSQL LISTEN/NOTIFY consumer — triggers early discovery on pool changes.
-    {
-        let notify_flag = ctx.refresh.notify_flag();
-        let pg_url = ctx.config.pg_url.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = PgClient::spawn_notify_listener(&pg_url, notify_flag, shutdown).await {
-                crate::warn!("pg LISTEN/NOTIFY not available — polling only: {e:#}");
-            }
-        });
-    }
-
-    let rpc = Arc::clone(&ctx.rpc);
-    tokio::spawn(async move {
-        if let Ok(p) = rpc.connect_state()
-            && let Err(e) =
-                crate::services::execution::flash_liquidity::fetch_and_cache_aave_flash_loan_fee_bps(
-                    &p,
-                )
-                .await
-        {
-            crate::warn!("aave flash loan fee fetch failed: {e}");
-        }
-    });
+    let sidecar_started = crate::util::now_ms();
+    let sidecars = spawn_pass_loop_sidecars(&ctx, &shutdown);
+    let sidecar_ms = crate::util::now_ms().saturating_sub(sidecar_started);
 
     let lf_ctx = Arc::new(ctx.lf_context());
     let hf_ctx = Arc::new(ctx.hf_context(shutdown.clone()));
 
-    let mut hf_timer = interval(Duration::from_millis(ctx.config.hf_interval_ms.max(1)));
-    hf_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let hf_inflight = Arc::new(Semaphore::new(1));
-    let hf_pending = Arc::new(AtomicBool::new(false));
-    let hf_stream_pending = Arc::new(AtomicBool::new(false));
-    let hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>> = Arc::new(ParkingMutex::new(None)); // ponytail: simple shared handle tracking
-
-    if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
-        let probe_url = url.to_string();
-        tokio::spawn(async move {
-            let _probe =
-                crate::services::execution::private_submit::probe_submit_endpoint(&probe_url).await;
-            if let Some(auth) = std::env::var("BLOXROUTE_AUTH_HEADER")
-                .ok()
-                .filter(|s| !s.is_empty())
-            {
-                let _ =
-                    crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
-            }
-        });
-    }
-
-    Arc::clone(&ctx.execution.flash_liquidity)
-        .start_background(Arc::clone(&ctx.rpc), shutdown.clone());
-    spawn_gas_oracle_background(
-        Arc::clone(&ctx.gas_oracle),
-        Arc::clone(&ctx.rpc),
-        shutdown.clone(),
-    );
-
-    #[cfg(feature = "tui")]
-    let snapshot_handle = ctx.ui_snapshot_tx.clone().map(|tx| {
-        spawn_snapshot_publisher(
-            Arc::clone(&ctx),
-            tx,
-            std::time::Instant::now(),
-            shutdown.clone(),
-        )
-    });
+    let mut hf_scheduler = HfScheduler::new(hf_ctx, ctx.config.hf_interval_ms.max(1));
 
     let mut height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
     let mut hs_reconnect_log_at = 0u64;
     let mut hs_height_fallback_at = 0u64;
     let mut hs_restart_backoff = Duration::from_secs(2);
+    let mut hs_reconnect_sleep: Option<Pin<Box<Sleep>>> = None;
 
     let lf_shutdown = shutdown.clone();
     let mut lf_handle = spawn_lf_background(lf_ctx, ctx.config.lf_interval_ms, lf_shutdown);
@@ -277,10 +214,15 @@ pub async fn run_pass_loop(
     } else {
         None
     };
-    let stream_hf_min_interval = Duration::from_millis(ctx.config.hf_interval_ms.max(1));
-    let mut last_stream_hf_at = std::time::Instant::now()
-        .checked_sub(stream_hf_min_interval)
-        .unwrap_or_else(std::time::Instant::now);
+
+    info!(
+        "pass loop ready (sidecars={sidecar_ms}ms, lf={}ms, hf={}ms, stream={}, hypersync={}, startup={}ms)",
+        ctx.config.lf_interval_ms,
+        ctx.config.hf_interval_ms,
+        ctx.config.pipeline.stream_enabled,
+        ctx.hypersync.is_some(),
+        crate::util::now_ms().saturating_sub(loop_started),
+    );
 
     loop {
         tokio::select! {
@@ -289,15 +231,8 @@ pub async fn run_pass_loop(
                     break;
                 }
             }
-            _ = hf_timer.tick() => {
-                schedule_hf_tick(
-                    Arc::clone(&hf_ctx),
-                    Arc::clone(&hf_inflight),
-                    Arc::clone(&hf_task),
-                    Arc::clone(&hf_pending),
-                    Arc::clone(&hf_stream_pending),
-                    false,
-                );
+            _ = hf_scheduler.timer.tick() => {
+                hf_scheduler.schedule(false);
             }
             event = async {
                 match height_rx.as_mut() {
@@ -312,14 +247,7 @@ pub async fn run_pass_loop(
                         if let Some(hs) = ctx.hypersync.as_ref() {
                             hs.record_height(height);
                         }
-                        schedule_hf_tick(
-                            Arc::clone(&hf_ctx),
-                            Arc::clone(&hf_inflight),
-                            Arc::clone(&hf_task),
-                            Arc::clone(&hf_pending),
-                            Arc::clone(&hf_stream_pending),
-                            false,
-                        );
+                        hf_scheduler.schedule(false);
                     }
                     Some(HeightStreamEvent::Reconnecting { delay, error_msg }) => {
                         let now = crate::util::now_ms();
@@ -358,12 +286,23 @@ pub async fn run_pass_loop(
                             "hypersync height stream closed, restarting in {}ms",
                             hs_restart_backoff.as_millis()
                         );
-                        tokio::time::sleep(hs_restart_backoff).await;
+                        height_rx = None;
+                        hs_reconnect_sleep =
+                            Some(Box::pin(tokio::time::sleep(hs_restart_backoff)));
                         hs_restart_backoff =
                             (hs_restart_backoff * 2).min(Duration::from_secs(30));
-                        height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
                     }
                 }
+            }
+            _ = async {
+                match hs_reconnect_sleep.as_mut() {
+                    Some(sleep) => sleep.as_mut().await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if hs_reconnect_sleep.is_some() => {
+                hs_reconnect_sleep = None;
+                height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
+                hs_restart_backoff = Duration::from_secs(2);
             }
             result = async {
                 match stream_rx.as_mut() {
@@ -373,17 +312,8 @@ pub async fn run_pass_loop(
             }, if stream_rx.is_some() => {
                 match result {
                     Ok(()) => {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_stream_hf_at) >= stream_hf_min_interval {
-                            last_stream_hf_at = now;
-                            schedule_hf_tick(
-                                Arc::clone(&hf_ctx),
-                                Arc::clone(&hf_inflight),
-                                Arc::clone(&hf_task),
-                                Arc::clone(&hf_pending),
-                                Arc::clone(&hf_stream_pending),
-                                true,
-                            );
+                        if hf_scheduler.try_schedule_stream_triggered() {
+                            crate::debug!("stream pool update triggered hf tick");
                         }
                     }
                     Err(_) => {
@@ -407,10 +337,10 @@ pub async fn run_pass_loop(
     if let Some(handle) = stream_feed {
         handle.abort();
     }
-    if let Some(handle) = daily_loss_guard {
+    if let Some(handle) = sidecars.daily_loss_guard {
         handle.abort();
     }
-    let hf_join = hf_task.lock().take();
+    let hf_join = hf_scheduler.task.lock().take();
     const TASK_SHUTDOWN: Duration = Duration::from_secs(10);
     if let Some(mut handle) = hf_join
         && tokio::time::timeout(TASK_SHUTDOWN, &mut handle)
@@ -437,7 +367,7 @@ pub async fn run_pass_loop(
         crate::warn!("lf background task aborted after {TASK_SHUTDOWN:?} shutdown timeout");
     }
     #[cfg(feature = "tui")]
-    if let Some(handle) = snapshot_handle {
+    if let Some(handle) = sidecars.snapshot_handle {
         handle.abort();
         if tokio::time::timeout(Duration::from_secs(2), handle)
             .await
@@ -447,6 +377,168 @@ pub async fn run_pass_loop(
         }
     }
     Ok(())
+}
+
+struct PassLoopSidecars {
+    daily_loss_guard: Option<JoinHandle<()>>,
+    #[cfg(feature = "tui")]
+    snapshot_handle: Option<JoinHandle<()>>,
+}
+
+struct HfScheduler {
+    hf_ctx: Arc<HfContext>,
+    inflight: Arc<Semaphore>,
+    pending: Arc<AtomicBool>,
+    stream_pending: Arc<AtomicBool>,
+    task: Arc<ParkingMutex<Option<JoinHandle<()>>>>,
+    timer: tokio::time::Interval,
+    stream_min_interval: Duration,
+    last_stream_hf_at: std::time::Instant,
+}
+
+impl HfScheduler {
+    fn new(hf_ctx: Arc<HfContext>, hf_interval_ms: u64) -> Self {
+        let mut timer = interval(Duration::from_millis(hf_interval_ms));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let stream_min_interval = Duration::from_millis(hf_interval_ms);
+        let last_stream_hf_at = std::time::Instant::now()
+            .checked_sub(stream_min_interval)
+            .unwrap_or_else(std::time::Instant::now);
+        Self {
+            hf_ctx,
+            inflight: Arc::new(Semaphore::new(1)),
+            pending: Arc::new(AtomicBool::new(false)),
+            stream_pending: Arc::new(AtomicBool::new(false)),
+            task: Arc::new(ParkingMutex::new(None)),
+            timer,
+            stream_min_interval,
+            last_stream_hf_at,
+        }
+    }
+
+    fn schedule(&self, stream_triggered: bool) {
+        schedule_hf_tick(
+            Arc::clone(&self.hf_ctx),
+            Arc::clone(&self.inflight),
+            &self.task,
+            Arc::clone(&self.pending),
+            Arc::clone(&self.stream_pending),
+            stream_triggered,
+        );
+    }
+
+    fn try_schedule_stream_triggered(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_stream_hf_at) < self.stream_min_interval {
+            return false;
+        }
+        self.last_stream_hf_at = now;
+        self.schedule(true);
+        true
+    }
+}
+
+fn spawn_pass_loop_sidecars(
+    ctx: &Arc<RuntimeContext>,
+    shutdown: &watch::Receiver<bool>,
+) -> PassLoopSidecars {
+    {
+        let warm_ctx = Arc::clone(ctx);
+        tokio::spawn(async move {
+            const WARM_TIMEOUT: Duration = Duration::from_secs(8);
+            if tokio::time::timeout(WARM_TIMEOUT, warm_matic_usd_oracle(&warm_ctx))
+                .await
+                .is_err()
+            {
+                crate::warn!(
+                    "matic/usd warmup timed out after {WARM_TIMEOUT:?} — HF may skip until oracle responds"
+                );
+            }
+        });
+    }
+    spawn_matic_usd_oracle_background(
+        Arc::clone(&ctx.price_oracle),
+        Arc::clone(&ctx.rpc),
+        ctx.config.oracle.cache_ttl_ms,
+        shutdown.clone(),
+    );
+
+    ctx.rpc
+        .spawn_periodic_probe(shutdown.clone(), Duration::from_secs(600));
+
+    {
+        let rpc = Arc::clone(&ctx.rpc);
+        tokio::spawn(async move {
+            rpc.probe_and_rank_state_urls().await;
+        });
+    }
+
+    let daily_loss_guard = spawn_daily_loss_guard(ctx, shutdown);
+
+    {
+        let notify_flag = ctx.refresh.notify_flag();
+        let pg_url = ctx.config.pg_url.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = PgClient::spawn_notify_listener(&pg_url, notify_flag, shutdown).await {
+                crate::warn!("pg LISTEN/NOTIFY not available — polling only: {e:#}");
+            }
+        });
+    }
+
+    {
+        let rpc = Arc::clone(&ctx.rpc);
+        tokio::spawn(async move {
+            if let Ok(p) = rpc.connect_state()
+                && let Err(e) =
+                    crate::services::execution::flash_liquidity::fetch_and_cache_aave_flash_loan_fee_bps(
+                        &p,
+                    )
+                    .await
+            {
+                crate::warn!("aave flash loan fee fetch failed: {e}");
+            }
+        });
+    }
+
+    if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
+        let probe_url = url.to_string();
+        tokio::spawn(async move {
+            let _probe =
+                crate::services::execution::private_submit::probe_submit_endpoint(&probe_url).await;
+            if let Some(auth) = std::env::var("BLOXROUTE_AUTH_HEADER")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                let _ =
+                    crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
+            }
+        });
+    }
+
+    Arc::clone(&ctx.execution.flash_liquidity)
+        .start_background(Arc::clone(&ctx.rpc), shutdown.clone());
+    spawn_gas_oracle_background(
+        Arc::clone(&ctx.gas_oracle),
+        Arc::clone(&ctx.rpc),
+        shutdown.clone(),
+    );
+
+    #[cfg(feature = "tui")]
+    let snapshot_handle = ctx.ui_snapshot_tx.clone().map(|tx| {
+        spawn_snapshot_publisher(
+            Arc::clone(ctx),
+            tx,
+            std::time::Instant::now(),
+            shutdown.clone(),
+        )
+    });
+
+    PassLoopSidecars {
+        daily_loss_guard,
+        #[cfg(feature = "tui")]
+        snapshot_handle,
+    }
 }
 
 /// ponytail: global lock on daily loss check. Per-circuit refinement if needed.
@@ -576,7 +668,7 @@ fn spawn_gas_oracle_background(
 fn schedule_hf_tick(
     hf_ctx: Arc<HfContext>,
     hf_inflight: Arc<Semaphore>,
-    hf_task: Arc<ParkingMutex<Option<JoinHandle<()>>>>,
+    hf_task: &Arc<ParkingMutex<Option<JoinHandle<()>>>>,
     hf_pending: Arc<AtomicBool>,
     hf_stream_pending: Arc<AtomicBool>,
     stream_triggered: bool,
@@ -595,11 +687,30 @@ fn schedule_hf_tick(
     hf_pending.store(false, Ordering::Release);
     let stream_triggered = next_hf_stream_trigger(stream_triggered, &hf_stream_pending);
     let hf_ctx_run = Arc::clone(&hf_ctx);
-    let hf_task_store = Arc::clone(&hf_task);
+    let hf_task_store = Arc::clone(hf_task);
     let hf_pending_task = Arc::clone(&hf_pending);
     let hf_stream_pending_task = Arc::clone(&hf_stream_pending);
-    *hf_task_store.lock() = Some(tokio::spawn(async move {
-        let _permit = permit;
+    let hf_inflight_reschedule = Arc::clone(&hf_inflight);
+    let hf_task_for_tick = Arc::clone(&hf_task_store);
+    let handle = tokio::spawn(async move {
+        let stream_triggered = stream_triggered;
+        {
+            let _permit = permit;
+            if clear_hf_pending_on_shutdown(
+                &hf_ctx_run.shutdown,
+                &hf_pending_task,
+                &hf_stream_pending_task,
+            ) {
+                return;
+            }
+            if stream_triggered {
+                let _ = hf_ctx_run.partial_cache.trigger().take_stream_triggered();
+            }
+            if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
+                crate::warn!("hf tick failed: {e:#}");
+            }
+        }
+
         if clear_hf_pending_on_shutdown(
             &hf_ctx_run.shutdown,
             &hf_pending_task,
@@ -607,13 +718,20 @@ fn schedule_hf_tick(
         ) {
             return;
         }
-        if stream_triggered {
-            let _ = hf_ctx_run.partial_cache.trigger().take_stream_triggered();
+        let pending_timer = hf_pending_task.swap(false, Ordering::AcqRel);
+        let pending_stream = take_pending_hf_stream(&hf_stream_pending_task);
+        if should_reschedule_hf_after_tick(pending_timer, pending_stream) {
+            schedule_hf_tick(
+                hf_ctx_run,
+                hf_inflight_reschedule,
+                &hf_task_for_tick,
+                hf_pending_task,
+                hf_stream_pending_task,
+                pending_stream,
+            );
         }
-        if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
-            crate::warn!("hf tick failed: {e:#}");
-        }
-    }));
+    });
+    *hf_task_store.lock() = Some(handle);
 }
 
 fn clear_hf_pending_on_shutdown(
@@ -636,6 +754,11 @@ fn next_hf_stream_trigger(stream_triggered: bool, hf_stream_pending: &AtomicBool
 
 fn take_pending_hf_stream(hf_stream_pending: &AtomicBool) -> bool {
     hf_stream_pending.swap(false, Ordering::AcqRel)
+}
+
+#[inline]
+fn should_reschedule_hf_after_tick(pending_timer: bool, pending_stream: bool) -> bool {
+    pending_timer || pending_stream
 }
 
 fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {
@@ -667,7 +790,10 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_hf_pending_on_shutdown, next_hf_stream_trigger, take_pending_hf_stream};
+    use super::{
+        clear_hf_pending_on_shutdown, next_hf_stream_trigger, should_reschedule_hf_after_tick,
+        take_pending_hf_stream,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::watch;
 
@@ -685,6 +811,13 @@ mod tests {
 
         assert!(next_hf_stream_trigger(false, &pending));
         assert!(!pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deferred_hf_rerun_when_pending_after_tick() {
+        assert!(should_reschedule_hf_after_tick(true, false));
+        assert!(should_reschedule_hf_after_tick(false, true));
+        assert!(!should_reschedule_hf_after_tick(false, false));
     }
 
     #[test]

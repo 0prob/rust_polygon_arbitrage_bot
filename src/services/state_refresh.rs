@@ -111,6 +111,20 @@ impl StateRefreshService {
         Arc::clone(&self.pg_notify_pending)
     }
 
+    pub async fn probe_pool_meta_count(&self) -> anyhow::Result<u64> {
+        self.pg.probe_pool_meta_count().await
+    }
+
+    /// Logs postgres row count asynchronously (reuses the discovery connection pool).
+    pub fn spawn_connectivity_probe(self: Arc<Self>) {
+        tokio::spawn(async move {
+            match self.probe_pool_meta_count().await {
+                Ok(count) => crate::info!("postgres connected pool_meta_rows={count}"),
+                Err(e) => crate::warn!("postgres probe failed: {e}"),
+            }
+        });
+    }
+
     pub fn hot_addresses(&self) -> Arc<Vec<Address>> {
         Arc::clone(&self.discovery_state.read().hot_addresses)
     }

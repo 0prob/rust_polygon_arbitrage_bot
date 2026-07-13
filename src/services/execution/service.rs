@@ -295,30 +295,41 @@ impl ExecutionService {
             return FxHashMap::default();
         };
         let mut stats = FxHashMap::default();
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { continue };
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let Ok(fp) = parts[0].parse::<u64>() else {
-                continue;
-            };
-            let entry: &mut RouteStats = stats.entry(fp).or_default();
-            match parts[1] {
-                "s" => entry.successes += 1,
-                "f" => {
-                    entry.failures += 1;
-                    match parts.get(2).copied() {
-                        Some("DryRun") => entry.dry_run_failures += 1,
-                        Some("Submit") => entry.submit_failures += 1,
-                        Some("Timeout") => entry.receipt_timeouts += 1,
-                        Some("Revert") => entry.reverts += 1,
-                        Some("RealizedLoss") => entry.realized_losses += 1,
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let mut parts = line.split_whitespace();
+                    let Some(fp_str) = parts.next() else {
+                        continue;
+                    };
+                    let Ok(fp) = fp_str.parse::<u64>() else {
+                        continue;
+                    };
+                    let Some(tag) = parts.next() else {
+                        continue;
+                    };
+                    let entry: &mut RouteStats = stats.entry(fp).or_default();
+                    match tag {
+                        "s" => entry.successes += 1,
+                        "f" => {
+                            entry.failures += 1;
+                            match parts.next() {
+                                Some("DryRun") => entry.dry_run_failures += 1,
+                                Some("Submit") => entry.submit_failures += 1,
+                                Some("Timeout") => entry.receipt_timeouts += 1,
+                                Some("Revert") => entry.reverts += 1,
+                                Some("RealizedLoss") => entry.realized_losses += 1,
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
-                _ => {}
+                Err(_) => break,
             }
         }
         stats

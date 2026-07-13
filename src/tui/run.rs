@@ -1,7 +1,9 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::{mpsc, mpsc::Receiver, watch};
 
 use crate::orchestrator::{RuntimeContext, run_pass_loop};
@@ -16,17 +18,34 @@ use super::update::apply_event;
 /// Caps terminal writes while keeping metric charts visibly responsive.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 
-pub async fn run_tui(
-    ctx: Arc<RuntimeContext>,
+pub async fn run_tui<F>(
     bridge: TuiBridge,
     mut rx: Receiver<UiEvent>,
     mut snapshot_rx: watch::Receiver<Option<Arc<super::app::DashboardSnapshot>>>,
-) -> anyhow::Result<()> {
+    bootstrap: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<Arc<RuntimeContext>>>,
+{
     let mut terminal = TerminalGuard::enter().context("failed to initialize terminal")?;
+    draw_boot_blocking(&mut terminal, "Loading configuration…")?;
+
+    let ctx = match bootstrap.await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            terminal.restore().ok();
+            return Err(error);
+        }
+    };
+
+    draw_boot_blocking(&mut terminal, "Starting pipeline…")?;
+
     let mut app = App::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let pass_handle = tokio::spawn(run_pass_loop(Arc::clone(&ctx), shutdown_rx));
+    // Let pass_loop (and the TUI snapshot publisher) start before the first blocking draw.
+    tokio::task::yield_now().await;
 
     let tx = bridge.sender();
     let input_thread = spawn_input_thread(tx.clone()).context("spawn input thread")?;
@@ -123,4 +142,18 @@ fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
 
 fn draw_frame_blocking(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
     tokio::task::block_in_place(|| draw_frame(terminal, app))
+}
+
+fn draw_boot_blocking(terminal: &mut TerminalGuard, message: &str) -> anyhow::Result<()> {
+    tokio::task::block_in_place(|| {
+        terminal
+            .terminal()
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(message).block(Block::bordered().title(" rpbot ")),
+                    frame.area(),
+                );
+            })?;
+        Ok(())
+    })
 }

@@ -4,8 +4,8 @@ use anyhow::Context;
 
 use crate::config::{AppConfig, WalletSecrets};
 use crate::infra::hypersync::{HyperSyncService, try_from_env};
-use crate::infra::pg::PgClient;
 use crate::orchestrator::{RuntimeContext, SharedUiHook};
+use crate::services::state_refresh::StateRefreshService;
 
 /// Load config + wallet, validate, and log startup summary.
 pub fn load_config_and_wallet() -> anyhow::Result<(AppConfig, WalletSecrets)> {
@@ -72,21 +72,9 @@ pub fn log_startup(config: &AppConfig) {
     config.warn_suboptimal();
 }
 
-/// Non-blocking postgres probe; does not delay runtime startup.
-pub fn spawn_pg_probe(pg_url: String) {
-    tokio::spawn(async move {
-        let pg = match PgClient::new(pg_url) {
-            Ok(c) => c,
-            Err(e) => {
-                crate::warn!("postgres connection failed: {e}");
-                return;
-            }
-        };
-        match pg.probe_pool_meta_count().await {
-            Ok(count) => crate::info!("postgres connected pool_meta_rows={count}"),
-            Err(e) => crate::warn!("postgres probe failed: {e}"),
-        }
-    });
+/// Non-blocking postgres probe using the discovery pool (avoids a second `PgClient` at startup).
+pub fn spawn_pg_probe(refresh: Arc<StateRefreshService>) {
+    StateRefreshService::spawn_connectivity_probe(refresh);
 }
 
 /// Non-blocking connectivity probe; does not delay runtime startup.
@@ -110,6 +98,41 @@ pub fn build_runtime(
     RuntimeContext::new(config, wallet, hypersync).context("failed to initialize runtime context")
 }
 
+struct BlockingBootstrap {
+    runtime: RuntimeContext,
+    hypersync_built: bool,
+    envio_token_present: bool,
+    config_ms: u64,
+    runtime_ms: u64,
+}
+
+/// Config load, startup logs, hypersync client build, and runtime init on a blocking thread.
+fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
+    let config_started = crate::util::now_ms();
+    let (config, wallet) = load_config_and_wallet()?;
+    let config_ms = crate::util::now_ms().saturating_sub(config_started);
+
+    log_startup(&config);
+
+    let envio_token_present = std::env::var("ENVIO_API_TOKEN")
+        .ok()
+        .is_some_and(|t| !t.trim().is_empty());
+    let hypersync = try_from_env(&config.rpc);
+    let hypersync_built = hypersync.is_some();
+
+    let runtime_started = crate::util::now_ms();
+    let runtime = build_runtime(config, wallet, hypersync)?;
+    let runtime_ms = crate::util::now_ms().saturating_sub(runtime_started);
+
+    Ok(BlockingBootstrap {
+        runtime,
+        hypersync_built,
+        envio_token_present,
+        config_ms,
+        runtime_ms,
+    })
+}
+
 /// Common bootstrap for both the rpbot and tui binaries.
 /// Logs startup summary (including hypersync status), builds the runtime context (optionally
 /// installing a UI hook for TUI), and spawns the non-blocking pg + hypersync connectivity probes
@@ -123,25 +146,20 @@ async fn bootstrap_inner(
         tokio::sync::watch::Sender<Option<Arc<crate::tui::app::DashboardSnapshot>>>,
     >,
 ) -> anyhow::Result<Arc<RuntimeContext>> {
-    let (config, wallet) = tokio::task::spawn_blocking(load_config_and_wallet)
+    let bootstrap_started = crate::util::now_ms();
+    let block = tokio::task::spawn_blocking(run_blocking_bootstrap)
         .await
-        .context("config load task panicked")??;
+        .context("bootstrap task panicked")??;
 
-    log_startup(&config);
-
-    let pg_url = config.pg_url.clone();
-    let token_present = std::env::var("ENVIO_API_TOKEN")
-        .ok()
-        .is_some_and(|t| !t.trim().is_empty());
-    let hypersync = try_from_env(&config.rpc);
-    match (&hypersync, token_present) {
-        (None, true) => {
+    match (block.hypersync_built, block.envio_token_present) {
+        (false, true) => {
             crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled")
         }
-        (None, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
+        (false, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
         _ => {}
     }
-    let mut runtime = build_runtime(config, wallet, hypersync)?;
+
+    let mut runtime = block.runtime;
     if let Some(hook) = ui_hook {
         runtime = runtime.with_ui_hook(hook);
     }
@@ -151,7 +169,15 @@ async fn bootstrap_inner(
     }
     let ctx = Arc::new(runtime);
 
-    spawn_pg_probe(pg_url);
+    let total_ms = crate::util::now_ms().saturating_sub(bootstrap_started);
+    crate::info!(
+        "bootstrap timing: config={}ms runtime_build={}ms total={}ms",
+        block.config_ms,
+        block.runtime_ms,
+        total_ms
+    );
+
+    spawn_pg_probe(Arc::clone(&ctx.refresh));
     spawn_hypersync_probe(ctx.hypersync.clone());
 
     Ok(ctx)
@@ -175,6 +201,16 @@ pub async fn bootstrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Smoke timing for local profiling (`cargo test bootstrap_runtime_build_smoke -- --ignored`).
+    #[test]
+    #[ignore = "requires project .env / config.toml"]
+    fn bootstrap_runtime_build_smoke() {
+        let block = run_blocking_bootstrap().expect("blocking bootstrap");
+        assert!(block.config_ms < 60_000);
+        assert!(block.runtime_ms < 60_000);
+        assert!(block.runtime.config.pg_url.len() > 0);
+    }
 
     #[test]
     fn pg_host_label_strips_credentials_and_scheme() {
