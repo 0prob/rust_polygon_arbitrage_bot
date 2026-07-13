@@ -61,7 +61,7 @@ pub fn build_packed_route_payload(
     }
     let packed_calls = pack_executor_calls(calls)?;
     let route_hash = compute_route_hash(&packed_calls);
-    let mut payload = Vec::with_capacity(0xe0 + packed_calls.len());
+    let mut payload = Vec::with_capacity(0xc0 + packed_calls.len());
     payload.extend_from_slice(&[0u8; 12]);
     payload.extend_from_slice(flash_token.as_slice());
     payload.extend_from_slice(&flash_amount.to_be_bytes::<32>());

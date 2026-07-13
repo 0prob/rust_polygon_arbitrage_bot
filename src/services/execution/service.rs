@@ -659,19 +659,7 @@ impl ExecutionService {
                 // was set from modeled net at build time — reassess without re-fees.
                 (realized, candidate.amount_in, 0, FlashLoanSource::Direct)
             } else if realized_profit.is_some() {
-                // Some Polygon RPC eth_call paths return 0 despite a successful swap sim;
-                // fall back to build-time gross (vault queryBatchSwap for Direct routes).
-                crate::debug!(
-                    "dry-run realized_profit=0: fp={}, using candidate gross={}",
-                    candidate.route_fingerprint,
-                    candidate.gross_profit,
-                );
-                (
-                    candidate.gross_profit,
-                    candidate.amount_in,
-                    candidate.slippage_bps,
-                    candidate.flash_loan_source,
-                )
+                return None;
             } else {
                 (
                     candidate.gross_profit,
@@ -778,7 +766,7 @@ impl ExecutionService {
             return outcome;
         }
 
-        let simulation_block = match sim_provider.get_block_number().await {
+        let chain_head = match sim_provider.get_block_number().await {
             Ok(block) => block,
             Err(e) => {
                 return ExecutionOutcome::SubmitFailed {
@@ -786,6 +774,18 @@ impl ExecutionService {
                 };
             }
         };
+        // Pin eth_call to the LF/HF state block so simulation matches routed pool state.
+        let simulation_block = if candidate.state_block > 0 {
+            candidate.state_block.min(chain_head)
+        } else {
+            chain_head
+        };
+        if simulation_block != chain_head {
+            crate::debug!(
+                "dry-run pinned: fp={}, block={simulation_block} (head={chain_head})",
+                fp,
+            );
+        }
 
         if let Some(expiry) = self.quarantine.read().get(&fp)
             && now < *expiry
@@ -829,9 +829,11 @@ impl ExecutionService {
             return outcome;
         }
 
-        let dry = dry_run_candidate(sim_provider, candidate, operator).await;
+        let dry =
+            dry_run_candidate(sim_provider, candidate, operator, Some(simulation_block)).await;
 
-        if !dry.success || !dry.semantic_success || dry.realized_profit.is_none() {
+        let realized_profit = dry.realized_profit.filter(|p| !p.is_zero());
+        if !dry.success || !dry.semantic_success || realized_profit.is_none() {
             let sim_fidelity_miss = matches!(
                 dry.decoded_revert,
                 Some(DecodedRevert::InsufficientProfit {
@@ -980,7 +982,7 @@ impl ExecutionService {
             profit_gas,
             reassess_gas_price,
             learned_floor,
-            dry.realized_profit,
+            realized_profit,
             config.execution.profit_priority_fee_alpha_bps,
         );
         let dry_pass = reassess.as_ref().is_some_and(|a| a.should_execute);
@@ -1308,8 +1310,16 @@ impl ExecutionService {
             let gas_cost = receipt
                 .effective_gas_price
                 .and_then(|price| U256::from(receipt.gas_used).checked_mul(U256::from(price)))
+                .or_else(|| {
+                    gas_oracle
+                        .conservative_gas_price()
+                        .and_then(|price| U256::from(receipt.gas_used).checked_mul(price))
+                })
                 .unwrap_or_else(|| {
-                    crate::warn!("no effective_gas_price in revert receipt fp={fp}");
+                    crate::warn!(
+                        "revert receipt missing gas price attribution fp={fp} gas_used={}",
+                        receipt.gas_used
+                    );
                     U256::ZERO
                 });
             self.record_realized(U256::ZERO, gas_cost);
@@ -1395,6 +1405,7 @@ impl ExecutionService {
                 self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
             }
         } else {
+            self.record_realized(U256::ZERO, gas_cost);
             self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
         }
         if parsed_profit.is_none() {
@@ -1547,6 +1558,43 @@ mod safety_tests {
             token_profit_to_matic_wei(U256::from(1_000_000u64), U256::ZERO, 6),
             None
         );
+    }
+
+    #[test]
+    fn realized_profit_zero_fails_reassess() {
+        let candidate = CandidateExecution {
+            route_fingerprint: 8,
+            calldata: Default::default(),
+            target_address: Address::repeat_byte(8),
+            value: U256::ZERO,
+            profit_token: Address::repeat_byte(9),
+            expected_profit_matic_wei: U256::from(1u64),
+            gas_limit: None,
+            simulated_gas: 100,
+            route_hash: Default::default(),
+            gross_profit: U256::from(1_000u64),
+            amount_in: U256::from(1_000u64),
+            token_decimals: 18,
+            token_to_matic_rate: U256::from(1_000_000_000_000_000_000u128),
+            slippage_bps: 250,
+            flash_loan_source: FlashLoanSource::AaveV3,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            hop_count: 2,
+            safety_multiplier_bps: 10_000,
+            state_generation: 1,
+            state_block: 1,
+            state_hash: None,
+        };
+        assert!(ExecutionService::reassess_assessment(
+            &candidate,
+            100,
+            U256::from(1u8),
+            U256::ZERO,
+            Some(U256::ZERO),
+            0,
+        )
+        .is_none());
     }
 
     #[test]

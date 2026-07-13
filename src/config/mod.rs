@@ -225,7 +225,7 @@ fn default_min_profit_matic_wei() -> String {
     "100000000000000000".to_string()
 }
 fn default_slippage_bps() -> u64 {
-    50
+    0
 }
 fn default_flash_loan_source() -> String {
     "auto".to_string()
@@ -825,6 +825,11 @@ mod tests {
     fn default_config_has_discovery_bootstrap_batch() {
         let config = AppConfig::default();
         assert_eq!(config.discovery_bootstrap_batch, 20_000);
+    }
+
+    #[test]
+    fn default_config_uses_no_static_slippage_allowance() {
+        assert_eq!(AppConfig::default().execution.slippage_bps, 0);
     }
 
     #[test]

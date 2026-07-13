@@ -73,6 +73,7 @@ impl PoolLogFeed {
         let mut addr_rx = self.addresses.watch();
         let mut current_addrs = addr_rx.borrow().clone();
         let mut backoff_ms = BASE_RECONNECT_DELAY_MS;
+        let mut last_no_endpoint_warn_at = 0u64;
 
         loop {
             if *self.shutdown.borrow() {
@@ -107,7 +108,13 @@ impl PoolLogFeed {
                             }
                         }
                     }
-                    None => warn!("no WSS endpoint available — retrying"),
+                    None => {
+                        let now = now_ms();
+                        if now.saturating_sub(last_no_endpoint_warn_at) >= 30_000 {
+                            warn!("no WSS endpoint available — retrying");
+                            last_no_endpoint_warn_at = now;
+                        }
+                    }
                 }
                 current_addrs.clone_from(&addr_rx.borrow());
             }

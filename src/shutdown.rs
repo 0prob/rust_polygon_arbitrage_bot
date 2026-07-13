@@ -7,7 +7,7 @@ use tokio::signal;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub const PASS_LOOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PASS_LOOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait for Ctrl+C or (on Unix) SIGTERM.
 pub async fn wait_for_os_shutdown() {

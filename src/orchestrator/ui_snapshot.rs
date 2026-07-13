@@ -66,7 +66,7 @@ pub fn spawn_snapshot_publisher(
             let refresh_portfolio = last_portfolio_refresh.elapsed() >= PORTFOLIO_REFRESH_INTERVAL;
 
             match tokio::time::timeout(
-                Duration::from_secs(8),
+                Duration::from_secs(12),
                 build_ui_snapshot(
                     Arc::clone(&ctx),
                     started_at,
@@ -168,14 +168,20 @@ async fn build_ui_snapshot(
     };
 
     if let Some(task) = oracle_task {
-        let refreshed = task.await.context("oracle refresh task failed")?;
-        if refreshed > 0.0 {
-            matic_usd = refreshed;
+        match tokio::time::timeout(Duration::from_secs(6), task).await {
+            Ok(Ok(refreshed)) if refreshed > 0.0 => matic_usd = refreshed,
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => crate::debug!("snapshot oracle refresh failed: {e:#}"),
+            Err(_) => crate::debug!("snapshot oracle refresh timed out"),
         }
     }
 
     if let Some(task) = portfolio_task {
-        portfolio_rows = task.await.context("portfolio refresh task failed")?;
+        match tokio::time::timeout(Duration::from_secs(6), task).await {
+            Ok(Ok(rows)) => portfolio_rows = rows,
+            Ok(Err(e)) => crate::debug!("snapshot portfolio refresh failed: {e:#}"),
+            Err(_) => crate::debug!("snapshot portfolio refresh timed out"),
+        }
     }
 
     let gas_gwei = ctx

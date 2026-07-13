@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 
-use crate::core::constants::MIN_ECONOMIC_VALUE_MATIC_WEI;
 use crate::core::math::dodo::estimate_dodo_hop_capacity;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
@@ -273,8 +272,7 @@ fn get_dynamic_search_bounds(
     }
 
     if !start_rate.is_zero() {
-        let start_scale = ten_pow_u256_cached(start_decimals);
-        let min_economic = (U256::from(MIN_ECONOMIC_VALUE_MATIC_WEI) * start_scale) / start_rate;
+        let min_economic = min_economic_amount_in(start_decimals, start_rate);
         if min_economic <= max_search_low && low < min_economic {
             low = min_economic;
         }

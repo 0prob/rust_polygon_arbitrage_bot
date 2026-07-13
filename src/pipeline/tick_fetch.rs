@@ -162,6 +162,10 @@ pub async fn enrich_v3_ticks<
         let Ok(results) =
             crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
         else {
+            crate::warn!(
+                "v3 tick lens multicall failed ({} pools); trying algebra fallback",
+                pool_addresses.len()
+            );
             return enrich_algebra_ticks(
                 provider,
                 arena,
@@ -251,6 +255,7 @@ pub async fn enrich_v4_ticks<
     }
 
     let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
+        crate::warn!("v4 tick bitmap multicall failed ({} pools)", targets.len());
         return 0;
     };
 
@@ -286,6 +291,7 @@ pub async fn enrich_v4_ticks<
     }
 
     let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
+        crate::warn!("v4 tick state multicall failed ({} tick reads)", tick_calls.len());
         return 0;
     };
 
@@ -355,6 +361,7 @@ async fn enrich_algebra_ticks<
         return 0;
     }
     let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
+        crate::warn!("algebra tick bitmap multicall failed ({} pools)", targets.len());
         return 0;
     };
     let mut tick_calls = Vec::new();
@@ -387,6 +394,7 @@ async fn enrich_algebra_ticks<
         }
     }
     let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
+        crate::warn!("algebra tick state multicall failed ({} tick reads)", tick_calls.len());
         return 0;
     };
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =

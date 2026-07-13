@@ -1,6 +1,7 @@
-use std::path::PathBuf;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy::primitives::{Address, FixedBytes};
 use parking_lot::RwLock;
@@ -14,6 +15,9 @@ struct PoolMetaData {
     #[serde(default)]
     woofi_meta: FxHashMap<Address, WoofiMetaEntry>,
 }
+
+/// Coalesce burst hydration writes (Woofi/Balancer sweeps) before hitting disk.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WoofiMetaEntry {
@@ -96,6 +100,10 @@ impl PoolMetaCache {
         tokio::task::spawn_blocking(move || {
             loop {
                 let target_revision = revision.load(Ordering::Acquire);
+                std::thread::sleep(PERSIST_DEBOUNCE);
+                if revision.load(Ordering::Acquire) != target_revision {
+                    continue;
+                }
                 let seq = write_seq.fetch_add(1, Ordering::Relaxed);
                 let tmp = path.with_extension(format!("json.{seq}.tmp"));
                 let Ok(file) = std::fs::File::create(&tmp) else {

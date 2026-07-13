@@ -38,7 +38,8 @@ use crate::services::execution::profit::{
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
-    has_reliable_matic_rate, resolve_token_decimals_for_index, resolve_token_to_matic_rate,
+    cycle_tokens_have_known_decimals, has_reliable_matic_rate, resolve_token_decimals_for_index,
+    resolve_token_to_matic_rate,
 };
 
 #[derive(Default)]
@@ -220,7 +221,9 @@ fn cycle_simulatable(
     token_decimals: &FxHashMap<Address, u8>,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) -> bool {
-    if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+    if !cycle_tokens_have_known_decimals(cycle, arena, token_decimals)
+        || !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates)
+    {
         return false;
     }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
@@ -237,6 +240,9 @@ fn cycle_flash_evaluable(
     token_decimals: &FxHashMap<Address, u8>,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) -> bool {
+    if !cycle_tokens_have_known_decimals(cycle, arena, token_decimals) {
+        return false;
+    }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let economic = min_economic_amount_in(decimals, rate);
@@ -320,7 +326,7 @@ fn rank_one_cycle_probe(
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
     token_decimals: &FxHashMap<Address, u8>,
     gas_price: U256,
-    base_slippage: u64,
+    slippage_bps: u64,
     flash_policy: FlashLoanPolicy,
     gas_oracle: &GasOracle,
     route_gas: &RouteGasLookup,
@@ -334,6 +340,10 @@ fn rank_one_cycle_probe(
     let fp = hash_cycle_edges(&cycle.edges);
     if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
         out.skip.rate = 1;
+        return out;
+    }
+    if !cycle_tokens_have_known_decimals(&cycle, arena, token_decimals) {
+        out.skip.probe = 1;
         return out;
     }
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
@@ -374,13 +384,17 @@ fn rank_one_cycle_probe(
         return out;
     };
 
+    let depth_bps =
+        depth_impact_slippage_bps_with_base(arena, &cycle.edges, probe_amount, Some(&probe));
+    let effective_slip = effective_slippage_bps(slippage_bps, depth_bps);
+
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         arena,
         token_to_matic_rates,
         token_decimals,
         gas_price,
-        base_slippage,
+        effective_slip,
         flash_source,
         safety_multiplier_bps,
     );
@@ -448,7 +462,6 @@ pub fn rank_cycles_by_probe_net(
     let probe_stop_at = probe_rank_window(max_keep, cycles.len());
     let mut scanned = cycles;
     scanned.truncate(probe_stop_at);
-    let base_slippage = effective_slippage_bps(slippage_bps, 0);
     let flash_ttl = flash_liquidity.ttl();
     let flash = flash_liquidity.load();
     let partial = if crate::util::should_use_rayon(scanned.len()) {
@@ -461,7 +474,7 @@ pub fn rank_cycles_by_probe_net(
                     token_to_matic_rates,
                     token_decimals,
                     gas_price,
-                    base_slippage,
+                    slippage_bps,
                     flash_policy,
                     gas_oracle,
                     route_gas,
@@ -482,7 +495,7 @@ pub fn rank_cycles_by_probe_net(
                     token_to_matic_rates,
                     token_decimals,
                     gas_price,
-                    base_slippage,
+                    slippage_bps,
                     flash_policy,
                     gas_oracle,
                     route_gas,
@@ -579,7 +592,7 @@ pub fn rank_cycles_by_probe_net(
 
     if kept.is_empty() && !scanned.is_empty() {
         let sample = partial.flash_diag.as_deref().unwrap_or("none");
-        crate::info!(
+        crate::debug!(
             "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
             skip.rate,
@@ -740,7 +753,9 @@ pub async fn rescore_rank_and_evaluate_async(
             let probe_kept = cycles.len();
             (eval_results, Arc::clone(&input.arena), probe_kept)
         });
-        let _ = tx.send(result);
+        if tx.send(result).is_err() {
+            crate::debug!("hf eval result channel closed before send");
+        }
     });
     rx.await.context("hf eval task failed")
 }
@@ -861,6 +876,10 @@ fn evaluate_one(
     let fp = hash_cycle_edges(&cycle.edges);
     if input.execution.is_route_quarantined(fp) {
         inc(&stats.quarantine);
+        return None;
+    }
+    if !cycle_tokens_have_known_decimals(cycle, input.arena, input.token_decimals) {
+        inc(&stats.opt_none);
         return None;
     }
     let flash = input.flash_liquidity.load();

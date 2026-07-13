@@ -508,6 +508,10 @@ impl StateRefreshService {
         }
 
         let Ok(provider) = self.rpc.connect_state() else {
+            crate::warn!(
+                "token decimals enrich skipped: state RPC unavailable (missing={})",
+                missing.len()
+            );
             return;
         };
 
@@ -523,19 +527,25 @@ impl StateRefreshService {
             .collect();
 
         let Ok(results) = execute_multicall(&provider, &batch).await else {
+            crate::warn!(
+                "token decimals enrich multicall failed (missing={})",
+                missing.len()
+            );
             return;
         };
 
         let mut new_entries: Vec<TokenMeta> = Vec::with_capacity(results.len());
         for (addr, result) in missing.iter().zip(results) {
-            let dec = result
+            let Some(decimals) = result
                 .as_ref()
                 .and_then(|b| IERC20Metadata::decimalsCall::abi_decode_returns(b).ok())
-                .filter(|&d| d <= 30)
-                .unwrap_or(18);
+                .filter(|&d| d <= crate::core::constants::MAX_SUPPORTED_TOKEN_DECIMALS)
+            else {
+                continue;
+            };
             new_entries.push(TokenMeta {
                 address: *addr,
-                decimals: dec,
+                decimals,
             });
         }
 

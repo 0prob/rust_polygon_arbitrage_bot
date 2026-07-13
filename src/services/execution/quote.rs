@@ -14,13 +14,12 @@ pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<
 
 #[must_use]
 pub fn resolve_v3_fee_pips_for_hop(arena: &StateArena, hop: &CalldataHop) -> u32 {
-    let fee_u256 = match arena.pool_state(hop.edge.pool_index) {
-        Some(PoolState::V3(s) | PoolState::V4(s)) => {
-            resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
-        }
-        _ => resolve_v3_fee_pips(U256::ZERO, Some(hop.edge.fee_bps)),
-    };
-    fee_u256.min(U256::from(0xffffffu32)).to::<u32>()
+    match arena.pool_state(hop.edge.pool_index) {
+        Some(PoolState::V3(s) | PoolState::V4(s)) => resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
+            .min(U256::from(0xffffffu32))
+            .to::<u32>(),
+        _ => hop.edge.fee_bps.min(0xffffff),
+    }
 }
 
 #[must_use]
@@ -50,6 +49,9 @@ pub fn derive_tight_v3_price_limit(
     } else {
         simulate_v3_swap(state, amount_in, zero_for_one, Some(edge_fee_bps))
     };
+    if sim.shallow {
+        anyhow::bail!("v3 price limit: incomplete tick coverage");
+    }
     if sim.sqrt_price_x96_after < MIN_SQRT_RATIO || sim.sqrt_price_x96_after >= MAX_SQRT_RATIO {
         anyhow::bail!("v3 price limit: invalid sqrt after swap");
     }
@@ -70,4 +72,38 @@ pub fn derive_tight_v3_price_limit(
     } else {
         (sim.sqrt_price_x96_after * (denom + slip)) / denom
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn price_limit_rejects_a_shallow_quote() {
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(Vec::new()),
+        };
+
+        assert!(
+            derive_tight_v3_price_limit(
+                &state,
+                U256::from(100u64),
+                U256::from(1u64),
+                true,
+                30,
+                0,
+                None,
+            )
+            .is_err()
+        );
+    }
 }

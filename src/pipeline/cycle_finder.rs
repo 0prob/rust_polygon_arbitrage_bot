@@ -522,9 +522,12 @@ fn hub_exit_legs(
         };
         return crate::pipeline::graph::funded_token_indices(state, meta);
     }
+    let Some(idx) = graph.virtual_hub_index(hub_node) else {
+        return smallvec::SmallVec::new();
+    };
     graph
-        .virtual_hub_index(hub_node)
-        .and_then(|idx| graph.virtual_hubs.get(idx))
+        .virtual_hubs
+        .get(idx)
         .map(|hub| hub.exit_legs.clone())
         .unwrap_or_default()
 }
@@ -615,9 +618,6 @@ fn collect_cycles_dfs_single_start(
                 else {
                     continue;
                 };
-                if ratio < ONE {
-                    continue;
-                }
                 let next_log_w = log_w + edge_log_w;
                 let next_ratio = mul_ratio_saturating(product_ratio, ratio);
                 if !can_still_find_profitable_cycle(
@@ -744,7 +744,7 @@ fn collect_cycles_dfs_single_start(
                     );
                 }
                 GraphHopPhase::Direct => {
-                    if ge.ratio.is_zero() || ge.ratio < ONE {
+                    if ge.ratio.is_zero() {
                         continue;
                     }
                     let pool_id = ge.edge.pool_index.0;
@@ -845,7 +845,7 @@ fn collect_cycles_dfs_single_start(
                 );
             }
             GraphHopPhase::Direct => {
-                if ge.ratio.is_zero() || ge.ratio < ONE {
+                if ge.ratio.is_zero() {
                     continue;
                 }
                 let pool_id = ge.edge.pool_index.0;
@@ -913,41 +913,42 @@ fn collect_cycles_dfs_parallel(
     }
     let per_shard = max_cycles.div_ceil(start_tokens.len()).max(1);
     let mut shard_caps = vec![per_shard; start_tokens.len()];
-    let mut shard_cycles: Vec<Vec<FoundCycle>> = if crate::util::should_use_rayon(start_tokens.len()) {
-        start_tokens
-            .par_iter()
-            .zip(shard_caps.par_iter())
-            .map(|(start, cap)| {
-                collect_cycles_dfs_single_start(
-                    graph,
-                    arena,
-                    pool_metas,
-                    prep,
-                    *start,
-                    hop_limit,
-                    *cap,
-                    budget.as_ref(),
-                )
-            })
-            .collect()
-    } else {
-        start_tokens
-            .iter()
-            .zip(shard_caps.iter())
-            .map(|(start, cap)| {
-                collect_cycles_dfs_single_start(
-                    graph,
-                    arena,
-                    pool_metas,
-                    prep,
-                    *start,
-                    hop_limit,
-                    *cap,
-                    budget.as_ref(),
-                )
-            })
-            .collect()
-    };
+    let mut shard_cycles: Vec<Vec<FoundCycle>> =
+        if crate::util::should_use_rayon(start_tokens.len()) {
+            start_tokens
+                .par_iter()
+                .zip(shard_caps.par_iter())
+                .map(|(start, cap)| {
+                    collect_cycles_dfs_single_start(
+                        graph,
+                        arena,
+                        pool_metas,
+                        prep,
+                        *start,
+                        hop_limit,
+                        *cap,
+                        budget.as_ref(),
+                    )
+                })
+                .collect()
+        } else {
+            start_tokens
+                .iter()
+                .zip(shard_caps.iter())
+                .map(|(start, cap)| {
+                    collect_cycles_dfs_single_start(
+                        graph,
+                        arena,
+                        pool_metas,
+                        prep,
+                        *start,
+                        hop_limit,
+                        *cap,
+                        budget.as_ref(),
+                    )
+                })
+                .collect()
+        };
 
     let mut merged = merge_shard_cycles(&shard_cycles);
 

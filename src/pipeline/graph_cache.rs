@@ -174,7 +174,7 @@ impl GraphCache {
             );
         }
         let g = Arc::clone(self.graph.as_ref()?);
-        let cyc = self.cycles.as_ref().cloned();
+        let cyc = self.cycles.clone();
         self.store(
             Arc::clone(&g),
             cyc,

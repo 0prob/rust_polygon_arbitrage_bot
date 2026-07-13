@@ -29,7 +29,8 @@ pub fn encode_v4_hop(
         .ok_or_else(|| anyhow::anyhow!("missing pool state for v4 hop"))?;
     let v3 = to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not v4 state"))?;
 
-    let quoted_out = quote_hop_for_execution(arena, hop).unwrap_or(hop.amount_out);
+    let quoted_out = quote_hop_for_execution(arena, hop)
+        .ok_or_else(|| anyhow::anyhow!("v4 execution quote unavailable"))?;
     let sqrt_limit = derive_tight_v3_price_limit(
         &v3,
         hop.amount_in,

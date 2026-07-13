@@ -172,6 +172,8 @@ impl StateCache {
         (entry.updated_at.elapsed() <= self.ttl).then(|| Arc::clone(&entry.state))
     }
 
+    /// Deep-clones pool state — prefer [`Self::get_arc`] on hot paths (HF/WSS).
+    #[cold]
     pub fn get(&self, address: &Address) -> Option<PoolState> {
         self.lookup_pool_state(address)
             .map(|state| (*state).clone())
@@ -226,14 +228,15 @@ impl StateCache {
         // Load generation while the read lock is still held so no concurrent
         // writer can advance it between reading states and loading generation.
         let generation = self.generation.load(Ordering::Acquire);
-        let states = addresses
-            .iter()
-            .filter_map(|address| {
-                let entry = guard.get(address)?;
-                (entry.updated_at.elapsed() <= self.ttl)
-                    .then(|| (*address, Arc::clone(&entry.state)))
-            })
-            .collect();
+        let mut states = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let Some(entry) = guard.get(address) else {
+                continue;
+            };
+            if entry.updated_at.elapsed() <= self.ttl {
+                states.push((*address, Arc::clone(&entry.state)));
+            }
+        }
         (states, generation)
     }
 

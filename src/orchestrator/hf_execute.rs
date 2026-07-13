@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::core::constants::AAVE_V3_POOL;
-use crate::core::types::FlashLoanSource;
 use crate::core::types::FoundCycle;
+use crate::core::types::{FlashLoanSource, PoolState};
 use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::{
     HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
@@ -25,7 +25,7 @@ use crate::services::execution::flash_liquidity::{
 };
 use crate::services::execution::gas_oracle::RouteGasLookup;
 
-use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
+use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::execution::balancer_verify::{
     BatchQueryOutcome, balancer_batch_within_max_in_ratio, batch_profit_covers_min,
     query_balancer_batch_profit,
@@ -33,11 +33,10 @@ use crate::services::execution::balancer_verify::{
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
 use crate::services::execution::{
-    CandidateBuildConfig, PrepareDispatchInput, build_execution_candidate, prepare_evaluated_route,
+    CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
+    prepare_evaluated_route,
 };
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
-
-const DISPATCH_CONCURRENCY: usize = 3;
 
 pub(crate) struct DispatchInputs<'a> {
     pub(crate) pool_metas: &'a [crate::pipeline::types::PoolMeta],
@@ -198,7 +197,12 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let base_slippage_bps = ctx.config.execution.slippage_bps;
     let min_profit_roi_bps = ctx.config.execution.min_profit_roi_bps;
     let max_flash_loan_usd = ctx.config.execution.max_flash_loan_usd;
-    let matic_usd = matic_usd_for_flash_cap(ctx.price_oracle.cached_matic_usd().unwrap_or(0.0));
+    let Some(matic_usd) =
+        ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await
+    else {
+        crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
+        return;
+    };
     let deadline_secs = ctx.config.execution.deadline_secs;
 
     let profitable: Vec<_> = profitable
@@ -231,26 +235,41 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
     let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
     let mut dispatch_state_generation = state_generation;
-    let pools_refreshed = if skip_dispatch_refresh || dispatch_pools.is_empty() {
-        false
-    } else if let Err(e) = ctx
-        .refresh
-        .refresh_pool_states_for(&dispatch_pools, dispatch_pools.len())
-        .await
-    {
-        crate::debug!("dispatch pool refresh failed: {e:#}");
+    let refresh_required = !skip_dispatch_refresh && !dispatch_pools.is_empty();
+    let pools_refreshed = if !refresh_required {
         false
     } else {
-        dispatch_state_generation = arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
-        enrich_dispatch_cl_ticks(
-            sim_provider,
-            arena,
-            &dispatch_cycles,
-            pool_metas,
-            ctx.config.oracle.tick_word_range,
-        )
-        .await;
-        true
+        match ctx
+            .refresh
+            .refresh_pool_states_for(&dispatch_pools, dispatch_pools.len())
+            .await
+        {
+            Ok(updated) if updated > 0 => {
+                dispatch_state_generation = arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
+                let tick_block = ctx.refresh.last_state_block();
+                enrich_dispatch_cl_ticks(
+                    sim_provider,
+                    arena,
+                    &dispatch_cycles,
+                    pool_metas,
+                    ctx.config.oracle.tick_word_range,
+                    (tick_block > 0).then_some(tick_block),
+                )
+                .await;
+                true
+            }
+            Ok(_) => {
+                crate::warn!(
+                    "dispatch aborted: route pool refresh updated 0/{} pools",
+                    dispatch_pools.len()
+                );
+                return;
+            }
+            Err(e) => {
+                crate::warn!("dispatch aborted: route pool refresh failed ({e:#})");
+                return;
+            }
+        }
     };
 
     if flash_stale && !flash_tokens.is_empty() {
@@ -272,47 +291,46 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let shutdown = ctx.shutdown.clone();
     let arena_ref: &StateArena = &*arena;
 
-    stream::iter(profitable)
-        .map(|evaluated| {
-            let sim_provider = sim_provider.clone();
-            let shutdown = shutdown.clone();
-            let skipped = Arc::clone(&skipped);
-            async move {
-                if *shutdown.borrow() {
-                    return;
-                }
-                dispatch_one_candidate(
-                    ctx,
-                    arena_ref,
-                    evaluated,
-                    &sim_provider,
-                    operator,
-                    executor,
-                    min_profit_matic,
-                    pool_metas_by_pool,
-                    token_to_matic_rates,
-                    token_decimals,
-                    dispatch_state_generation,
-                    state_block,
-                    state_hash,
-                    pools_refreshed,
-                    flash_policy,
-                    gas_price,
-                    brent_iters,
-                    base_slippage_bps,
-                    min_profit_roi_bps,
-                    max_flash_loan_usd,
-                    matic_usd,
-                    deadline_secs,
-                    &skipped,
-                )
-                .await;
-            }
-        })
-        .for_each_concurrent(DISPATCH_CONCURRENCY, |dispatch| async move {
-            dispatch.await;
-        })
-        .await;
+    for evaluated in profitable {
+        if *shutdown.borrow() {
+            break;
+        }
+        let Some(outcome) = dispatch_one_candidate(
+            ctx,
+            arena_ref,
+            evaluated,
+            sim_provider,
+            operator,
+            executor,
+            min_profit_matic,
+            pool_metas_by_pool,
+            token_to_matic_rates,
+            token_decimals,
+            dispatch_state_generation,
+            state_block,
+            state_hash,
+            pools_refreshed,
+            flash_policy,
+            gas_price,
+            brent_iters,
+            base_slippage_bps,
+            min_profit_roi_bps,
+            max_flash_loan_usd,
+            matic_usd,
+            deadline_secs,
+            &skipped,
+        )
+        .await
+        else {
+            continue;
+        };
+        if matches!(
+            outcome,
+            ExecutionOutcome::SkippedCircuitBreaker | ExecutionOutcome::SkippedShutdown
+        ) {
+            break;
+        }
+    }
 
     skipped.log_if_any();
 }
@@ -345,28 +363,31 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     matic_usd: f64,
     deadline_secs: u64,
     skipped: &Arc<SkipCounts>,
-) {
+) -> Option<ExecutionOutcome> {
     let fp = evaluated.route_fingerprint;
     let balancer_batch_verified = evaluated.balancer_batch_verified;
     if ctx.execution.is_route_quarantined(fp) {
         skipped.record("quarantine");
-        return;
+        return None;
     }
     if ctx.execution.is_route_on_cooldown(fp, &ctx.config) {
         skipped.record("cooldown");
-        return;
+        return None;
     }
 
     let Some(start_token_addr) = arena.token_address(evaluated.cycle.start_token) else {
         skipped.record("prepare");
-        return;
+        return None;
     };
-    let resolved_token_decimals = token_decimals.get(&start_token_addr).copied().unwrap_or(18);
+    let Some(resolved_token_decimals) = token_decimals.get(&start_token_addr).copied() else {
+        skipped.record("prepare");
+        return None;
+    };
     let Some(token_to_matic_rate) =
         resolve_token_to_matic_rate_or_bootstrap(evaluated.cycle.start_token, token_to_matic_rates)
     else {
         skipped.record("prepare");
-        return;
+        return None;
     };
 
     let sim = if pools_refreshed {
@@ -375,7 +396,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         else {
             skipped.record("resim_fail");
             crate::debug!("dispatch skip: fp={fp} resim failed after pool refresh");
-            return;
+            return None;
         };
         let mut resim_profile = local_sim::ResimFidelityProfile::default();
         if let Some(reason) = local_sim::route_resim_fidelity_reject_profiled(
@@ -391,7 +412,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 resim_profile.profit_drift_bps,
                 resim_profile.max_hop_drift_bps,
             );
-            return;
+            return None;
         }
         let mut hop_profile = local_sim::HopFidelityProfile::default();
         if let Some(reject) = local_sim::route_hop_fidelity_reject_profiled(
@@ -417,7 +438,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 hop_profile.hops_checked,
                 hop_profile.cl_depth_sims,
             );
-            return;
+            return None;
         }
         if hop_profile.cl_depth_sims > 0 {
             crate::debug!(
@@ -463,18 +484,14 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         gas_oracle: &ctx.gas_oracle,
         search_low,
         risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
-        existing_assessment: if pools_refreshed {
-            None
-        } else {
-            evaluated.assessment.clone()
-        },
+        existing_assessment: None,
         log_skips: log_prepare_skip,
     }) else {
         skipped.record("prepare");
         if log_prepare_skip {
             ctx.execution.record_prepare_skip(fp);
         }
-        return;
+        return None;
     };
 
     if prepared.flash_source == FlashLoanSource::AaveV3
@@ -493,7 +510,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 "dispatch skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
             );
         }
-        return;
+        return None;
     }
 
     if prepared.flash_source == FlashLoanSource::Direct
@@ -507,13 +524,13 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             pool_metas_by_pool,
         ) else {
             skipped.record("prepare");
-            return;
+            return None;
         };
         if !balancer_batch_within_max_in_ratio(arena, &hops) {
             skipped.record("prepare");
             ctx.execution.quarantine_batch_query_failure(fp);
             crate::debug!("prepare skip: fp={fp} queryBatchSwap would exceed MAX_IN_RATIO");
-            return;
+            return None;
         }
         // ponytail: dry-run must queryBatchSwap too — local Balancer sim overstates profit
         // and executeArbDirect reverts with opaque ExternalCallFailed without this gate.
@@ -539,7 +556,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                         prepared.evaluated.result.profit,
                     );
                 }
-                return;
+                return None;
             }
             BatchQueryOutcome::NonPositiveDelta(delta) => {
                 skipped.record("prepare");
@@ -555,7 +572,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                         prepared.evaluated.result.profit,
                     );
                 }
-                return;
+                return None;
             }
             BatchQueryOutcome::RpcError(reason) => {
                 skipped.record("prepare");
@@ -565,7 +582,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 } else {
                     crate::debug!("dispatch skip: fp={fp} queryBatchSwap RPC error: {reason}");
                 }
-                return;
+                return None;
             }
             other => {
                 skipped.record("prepare");
@@ -583,7 +600,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 } else {
                     crate::debug!("dispatch skip: fp={fp} queryBatchSwap {reason}");
                 }
-                return;
+                return None;
             }
         }
     }
@@ -614,7 +631,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             Err(e) => {
                 crate::warn!("dispatch build failed: fp={fp}: {e:#}");
                 skipped.record("build");
-                return;
+                return None;
             }
         };
 
@@ -623,7 +640,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         .is_route_hash_quarantined(&candidate.route_hash)
     {
         skipped.record("quarantine");
-        return;
+        return None;
     }
 
     if ctx
@@ -639,7 +656,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         );
     }
 
-    let _ = ctx
+    let outcome = ctx
         .execution
         .process_candidate(
             sim_provider,
@@ -658,6 +675,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             None,
         )
         .await;
+    Some(outcome)
 }
 
 async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static>(
@@ -666,6 +684,7 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     cycles: &[&FoundCycle],
     pool_metas: &[crate::pipeline::types::PoolMeta],
     word_range: i16,
+    block_number: Option<u64>,
 ) {
     if cycles.is_empty() {
         return;
@@ -675,6 +694,7 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     if tick_pools.is_empty() && v4_targets.is_empty() {
         return;
     }
+    clear_dispatch_cl_ticks(arena, &tick_pools, &v4_targets);
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
     let v3_loaded = enrich_v3_ticks(
@@ -684,15 +704,38 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
         word_range,
         &algebra_pools,
         &algebra_integral_pools,
-        None,
+        block_number,
     )
     .await;
-    let v4_loaded = enrich_v4_ticks(provider, arena, &v4_targets, word_range, None).await;
+    let v4_loaded = enrich_v4_ticks(provider, arena, &v4_targets, word_range, block_number).await;
     crate::debug!(
         "dispatch tick enrich: v3_pools={} v3_loaded={v3_loaded} v4_targets={} v4_loaded={v4_loaded}",
         tick_pools.len(),
         v4_targets.len(),
     );
+}
+
+fn clear_dispatch_cl_ticks(
+    arena: &mut StateArena,
+    v3_pools: &[alloy::primitives::Address],
+    v4_targets: &[(
+        crate::core::types::PoolIndex,
+        alloy::primitives::FixedBytes<32>,
+    )],
+) {
+    for pool in v3_pools {
+        let Some(&index) = arena.address_to_pool().get(pool) else {
+            continue;
+        };
+        if let Some(PoolState::V3(state)) = arena.pool_state_mut(index) {
+            state.ticks = Arc::from([]);
+        }
+    }
+    for &(index, _) in v4_targets {
+        if let Some(PoolState::V4(state)) = arena.pool_state_mut(index) {
+            state.ticks = Arc::from([]);
+        }
+    }
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
@@ -713,14 +756,25 @@ pub(crate) async fn refresh_and_resim_profitable(
     let mut pools_refreshed = false;
     let mut state_generation = cache.generation();
     let refresh_started = crate::util::now_ms();
-    if !pools.is_empty()
-        && refresh
-            .refresh_pool_states_for(&pools, pools.len())
-            .await
-            .is_ok()
-    {
-        state_generation = arena.apply_hot_cache(cache, &pools);
-        pools_refreshed = true;
+    if !pools.is_empty() {
+        match refresh.refresh_pool_states_for(&pools, pools.len()).await {
+            Ok(updated) if updated > 0 => {
+                state_generation = arena.apply_hot_cache(cache, &pools);
+                pools_refreshed = true;
+            }
+            Ok(_) => {
+                crate::warn!(
+                    "resim aborted: route pool refresh updated 0/{pool_count} pools — dropping {in_count} candidates"
+                );
+                return (Vec::new(), false, state_generation);
+            }
+            Err(e) => {
+                crate::warn!(
+                    "resim aborted: route pool refresh failed ({e:#}) — dropping {in_count} candidates"
+                );
+                return (Vec::new(), false, state_generation);
+            }
+        }
     }
     let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
     let route_gas = RouteGasLookup::for_fingerprints(
@@ -735,13 +789,42 @@ pub(crate) async fn refresh_and_resim_profitable(
     let filtered: Vec<HfEvalResult> = profitable
         .into_iter()
         .filter_map(|mut result| {
+            let baseline = result.sim;
             let amount = result.opt.optimal_input;
-            let sim = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
-            if sim.profit.is_zero() {
+            let refreshed = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
+            if refreshed.profit.is_zero() {
                 resim_unprofitable += 1;
                 return None;
             }
-            result.sim = sim;
+            let mut resim_profile = local_sim::ResimFidelityProfile::default();
+            if let Some(reason) = local_sim::route_resim_fidelity_reject_profiled(
+                &baseline,
+                &refreshed,
+                &mut resim_profile,
+            ) {
+                reassess_reject += 1;
+                crate::debug!(
+                    "resim fidelity drop: fp={} reason={reason} profit_drift_bps={}",
+                    result.route_fingerprint,
+                    resim_profile.profit_drift_bps,
+                );
+                return None;
+            }
+            let mut hop_profile = local_sim::HopFidelityProfile::default();
+            if let Some(reject) = local_sim::route_hop_fidelity_reject_profiled(
+                arena,
+                &result.cycle.edges,
+                &refreshed.hop_amounts,
+                Some(&mut hop_profile),
+            ) {
+                reassess_reject += 1;
+                crate::debug!(
+                    "resim hop fidelity drop: fp={} reject={reject:?}",
+                    result.route_fingerprint,
+                );
+                return None;
+            }
+            result.sim = refreshed;
             let flash_source = resolve_flash_source_for_cycle(
                 &result.cycle,
                 arena,
@@ -1066,4 +1149,41 @@ fn collect_route_pool_addresses(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{V3PoolState, V3Tick};
+
+    #[test]
+    fn clear_dispatch_cl_ticks_removes_stale_v3_ticks() {
+        let address = alloy::primitives::Address::from([1u8; 20]);
+        let mut arena = StateArena::default();
+        let pool = arena.register_pool(
+            address,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1_000_000,
+                    liquidity_net: 1_000_000,
+                }]),
+            })),
+        );
+
+        clear_dispatch_cl_ticks(&mut arena, &[address], &[]);
+
+        let Some(PoolState::V3(state)) = arena.pool_state(pool) else {
+            panic!("registered pool must retain V3 state");
+        };
+        assert!(state.ticks.is_empty());
+    }
 }

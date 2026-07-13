@@ -214,6 +214,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
     let need_cycle_refind = {
         let gc = work.graph_cache.lock();
         needs_rebuild
+            || gc.cycles().is_none()
             || gc.needs_cycle_refind(
                 routable_count,
                 layout_fp,
@@ -645,6 +646,7 @@ pub fn spawn_lf_background(
                 }
                 _ = timer.tick() => {
                     let Ok(guard) = lf_ctx.tick_lock.try_lock() else {
+                        crate::debug!("lf tick skipped: previous pass still running");
                         continue;
                     };
                     if let Err(e) = run_lf_tick(&lf_ctx, &shutdown).await {

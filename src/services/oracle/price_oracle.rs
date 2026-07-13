@@ -172,6 +172,8 @@ pub struct PriceOracle {
     cache_ttl: Duration,
     /// Monotonic clock of the last successful rate-build across all tokens.
     pub rates_updated_at: parking_lot::RwLock<Option<Instant>>,
+    /// Coalesce concurrent MATIC/USD refreshes (HF ticks at 200ms can stampede).
+    matic_refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl PriceOracle {
@@ -187,6 +189,7 @@ impl PriceOracle {
             custom_chainlink: parking_lot::RwLock::new(FxHashMap::default()),
             cache_ttl: Duration::from_millis(cache_ttl_ms),
             rates_updated_at: parking_lot::RwLock::new(None),
+            matic_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -242,8 +245,7 @@ impl PriceOracle {
             self.store_matic_usd(usd);
             return usd;
         }
-        if let Some(stale) = self.matic_usd.read().as_ref().map(|e| e.value) {
-            crate::warn!("oracle using stale MATIC/USD — Chainlink and Pyth unavailable");
+        if let Some(stale) = self.touch_stale_matic_usd("Chainlink and Pyth unavailable") {
             return stale;
         }
         crate::warn!(
@@ -266,12 +268,45 @@ impl PriceOracle {
             self.store_matic_usd(usd);
             return usd;
         }
-        if let Some(stale) = self.matic_usd.read().as_ref().map(|e| e.value) {
-            crate::warn!("oracle using stale MATIC/USD — Pyth unavailable");
+        if let Some(stale) = self.touch_stale_matic_usd("Pyth unavailable") {
             return stale;
         }
         crate::warn!("oracle has no MATIC/USD price — Pyth unavailable, no cached value");
         DEFAULT_MATIC_USD
+    }
+
+    /// Refresh MATIC/USD for flash-cap sizing (fresh cache, singleflight, then feeds).
+    pub async fn ensure_matic_usd_for_flash_cap<P: Provider<Ethereum>>(
+        &self,
+        state_provider: Option<&P>,
+    ) -> Option<f64> {
+        use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
+
+        if let Some(usd) = matic_usd_for_flash_cap(self.cached_matic_usd().unwrap_or(0.0)) {
+            return Some(usd);
+        }
+        let _guard = self.matic_refresh.lock().await;
+        if let Some(usd) = matic_usd_for_flash_cap(self.cached_matic_usd().unwrap_or(0.0)) {
+            return Some(usd);
+        }
+        let usd = match state_provider {
+            Some(p) => self.get_matic_usd(Some(p)).await,
+            None => self.get_matic_usd_offline().await,
+        };
+        matic_usd_for_flash_cap(usd)
+    }
+
+    fn touch_stale_matic_usd(&self, reason: &str) -> Option<f64> {
+        let stale = self.matic_usd.read().as_ref().map(|e| e.value)?;
+        if !(stale.is_finite() && stale > 0.0) {
+            return None;
+        }
+        crate::warn!("oracle using stale MATIC/USD — {reason}");
+        self.matic_usd.write().replace(PriceEntry {
+            value: stale,
+            updated_at: Instant::now(),
+        });
+        Some(stale)
     }
 
     pub async fn prefetch_token_usd_offline(&self, tokens: &[Address]) {

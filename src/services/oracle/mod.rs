@@ -14,20 +14,57 @@ use alloy::primitives::U256;
 use alloy::providers::Provider;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::core::constants::{POLYGON_HUB_TOKENS, WMATIC};
-use crate::core::types::{PoolTokenAddrs, TokenIndex};
+use crate::core::constants::{MAX_SUPPORTED_TOKEN_DECIMALS, POLYGON_HUB_TOKENS, WMATIC};
+use crate::core::types::{FoundCycle, PoolTokenAddrs, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::services::discovery::TokenMeta;
 
 use self::price_oracle::{PriceOracle, token_usd_to_matic_rate_per_unit};
 
+/// MATIC/USD for flash borrow caps — see [`PriceOracle::ensure_matic_usd_for_flash_cap`].
+pub async fn ensure_matic_usd_for_flash_cap<P>(
+    oracle: &PriceOracle,
+    state_provider: Option<&P>,
+) -> Option<f64>
+where
+    P: Provider<Ethereum>,
+{
+    oracle
+        .ensure_matic_usd_for_flash_cap(state_provider)
+        .await
+}
+
 #[must_use]
 pub fn token_decimals_map(metas: &[TokenMeta]) -> FxHashMap<Address, u8> {
     let mut out = FxHashMap::with_capacity_and_hasher(metas.len(), FxBuildHasher);
     for meta in metas {
-        out.insert(meta.address, meta.decimals);
+        if meta.decimals <= MAX_SUPPORTED_TOKEN_DECIMALS {
+            out.insert(meta.address, meta.decimals);
+        }
     }
     out
+}
+
+/// Execution paths require explicit, bounded decimal metadata for every route token.
+#[must_use]
+pub fn cycle_tokens_have_known_decimals(
+    cycle: &FoundCycle,
+    arena: &StateArena,
+    hints: &FxHashMap<Address, u8>,
+) -> bool {
+    !cycle.edges.is_empty()
+        && arena
+            .token_address(cycle.start_token)
+            .and_then(|address| hints.get(&address))
+            .is_some_and(|decimals| *decimals <= MAX_SUPPORTED_TOKEN_DECIMALS)
+        && cycle.edges.iter().all(|edge| {
+            [edge.token_in, edge.token_out].into_iter().all(|token| {
+                arena
+                    .token_address(token)
+                    .and_then(|address| hints.get(&address))
+                    .is_some_and(|decimals| *decimals <= MAX_SUPPORTED_TOKEN_DECIMALS)
+            })
+        })
 }
 
 #[must_use]
@@ -304,7 +341,7 @@ fn build_token_to_matic_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+    use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::arena::StateArena;
     use crate::pipeline::types::PoolMeta;
 
@@ -322,6 +359,48 @@ mod tests {
         let mut hints = FxHashMap::default();
         hints.insert(a, 18);
         assert_eq!(arena_tokens_without_decimal_hints(&arena, &hints), 1);
+    }
+
+    #[test]
+    fn execution_cycles_require_known_bounded_decimals_for_every_token() {
+        let mut arena = StateArena::default();
+        let a = Address::with_last_byte(1);
+        let b = Address::with_last_byte(2);
+        let c = Address::with_last_byte(3);
+        let a_idx = arena.register_token(a);
+        let b_idx = arena.register_token(b);
+        let c_idx = arena.register_token(c);
+        let edge = |token_in, token_out| Edge {
+            pool_index: PoolIndex(0),
+            token_in,
+            token_out,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let cycle = FoundCycle {
+            start_token: a_idx,
+            edges: CycleEdges::from(vec![
+                edge(a_idx, b_idx),
+                edge(b_idx, c_idx),
+                edge(c_idx, a_idx),
+            ]),
+            hop_count: 3,
+            log_weight: 0.0,
+            cumulative_fee_bps: 90,
+            score: 0.0,
+            cycle_ratio: U256::ONE,
+        };
+        let mut hints = FxHashMap::default();
+        hints.insert(a, 0);
+        hints.insert(b, 6);
+        assert!(!cycle_tokens_have_known_decimals(&cycle, &arena, &hints));
+        hints.insert(c, 18);
+        assert!(cycle_tokens_have_known_decimals(&cycle, &arena, &hints));
+        hints.insert(c, 31);
+        assert!(!cycle_tokens_have_known_decimals(&cycle, &arena, &hints));
     }
 
     #[test]

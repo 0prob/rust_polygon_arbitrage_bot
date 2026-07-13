@@ -1,14 +1,15 @@
 use alloy::primitives::U256;
 
 use crate::core::constants::{
-    BPS_SCALE, MAX_SANE_PROFIT_MATIC_WEI, MAX_SANE_PROFIT_RATIO_BPS, MIN_ECONOMIC_VALUE_MATIC_WEI,
-    MIN_TOKEN_TO_MATIC_RATE,
+    BPS_SCALE, MAX_SANE_PROFIT_MATIC_WEI, MAX_SANE_PROFIT_RATIO_BPS, MAX_SUPPORTED_TOKEN_DECIMALS,
+    MIN_ECONOMIC_VALUE_MATIC_WEI, MIN_TOKEN_TO_MATIC_RATE,
 };
 use crate::core::math::fixed_point::ONE;
 use crate::util::ten_pow_u256_cached as ten_pow_u256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimSanityReject {
+    UnsupportedTokenDecimals,
     AmountBelowEconomicFloor,
     InsaneProfitRatio,
     InsaneProfitMatic,
@@ -27,6 +28,9 @@ pub struct SimSanityInput {
 /// Smallest borrow size that represents meaningful notional (~0.001 token or ~1 MATIC).
 #[must_use]
 pub fn min_economic_amount_in(token_decimals: u8, token_to_matic_rate: U256) -> U256 {
+    if token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
+        return U256::MAX;
+    }
     let scale = ten_pow_u256(token_decimals);
     let dust_floor = scale / U256::from(1000u64);
     let absolute_floor = U256::from(1000u64);
@@ -34,21 +38,19 @@ pub fn min_economic_amount_in(token_decimals: u8, token_to_matic_rate: U256) -> 
         return dust_floor.max(absolute_floor);
     }
     let matic_floor = U256::from(MIN_ECONOMIC_VALUE_MATIC_WEI);
-    let economic = (matic_floor * scale) / token_to_matic_rate;
+    let Some(economic) = matic_floor.checked_mul(scale) else {
+        return U256::MAX;
+    };
+    let economic = economic / token_to_matic_rate;
     economic.max(dust_floor).max(absolute_floor)
 }
 
-/// MATIC/USD for flash-cap sizing when the oracle cache is cold.
-pub const FLASH_CAP_MATIC_USD_FALLBACK: f64 = 0.75;
-
+/// Live MATIC/USD for flash-cap sizing. Returns `None` when oracle is cold — callers
+/// must not invent a USD price (avoids oversizing borrows vs `max_flash_loan_usd`).
 #[inline]
 #[must_use]
-pub fn matic_usd_for_flash_cap(matic_usd: f64) -> f64 {
-    if matic_usd > 0.0 {
-        matic_usd
-    } else {
-        FLASH_CAP_MATIC_USD_FALLBACK
-    }
+pub fn matic_usd_for_flash_cap(matic_usd: f64) -> Option<f64> {
+    (matic_usd.is_finite() && matic_usd > 0.0).then_some(matic_usd)
 }
 
 /// USD notional cap → MATIC wei (`max_flash_loan_usd` is denominated in US dollars).
@@ -57,7 +59,7 @@ pub fn max_flash_loan_matic_wei_from_usd(usd_cap: u64, matic_usd: f64) -> Option
     if usd_cap == 0 {
         return None;
     }
-    let matic_usd = matic_usd_for_flash_cap(matic_usd);
+    let matic_usd = matic_usd_for_flash_cap(matic_usd)?;
     let matic_usd_micros = (matic_usd * 1_000_000.0).round();
     if !matic_usd_micros.is_finite() || matic_usd_micros <= 0.0 {
         return None;
@@ -77,7 +79,7 @@ pub fn max_flash_borrow_wei(
     token_to_matic_rate: U256,
     matic_usd: f64,
 ) -> Option<U256> {
-    if token_to_matic_rate.is_zero() {
+    if token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS || token_to_matic_rate.is_zero() {
         return None;
     }
     let max_matic_wei = max_flash_loan_matic_wei_from_usd(max_flash_loan_usd, matic_usd)?;
@@ -90,10 +92,19 @@ pub fn max_flash_borrow_wei(
 /// Fast rejects for Brent inner-loop evaluation (skips floor/pin checks).
 #[inline]
 pub fn check_sim_sanity_fast(input: SimSanityInput) -> Result<(), SimSanityReject> {
+    if input.token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
+        return Err(SimSanityReject::UnsupportedTokenDecimals);
+    }
     if input.amount_in.is_zero() {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
     }
-    let max_sane_profit = input.amount_in * U256::from(MAX_SANE_PROFIT_RATIO_BPS) / BPS_SCALE;
+    let Some(max_sane_profit) = input
+        .amount_in
+        .checked_mul(U256::from(MAX_SANE_PROFIT_RATIO_BPS))
+        .map(|value| value / BPS_SCALE)
+    else {
+        return Err(SimSanityReject::InsaneProfitRatio);
+    };
     if input.gross_profit > max_sane_profit {
         return Err(SimSanityReject::InsaneProfitRatio);
     }
@@ -101,6 +112,9 @@ pub fn check_sim_sanity_fast(input: SimSanityInput) -> Result<(), SimSanityRejec
 }
 
 pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
+    if input.token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
+        return Err(SimSanityReject::UnsupportedTokenDecimals);
+    }
     if input.amount_in.is_zero() {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
     }
@@ -112,7 +126,13 @@ pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
     }
 
-    let max_sane_profit = input.amount_in * U256::from(MAX_SANE_PROFIT_RATIO_BPS) / BPS_SCALE;
+    let Some(max_sane_profit) = input
+        .amount_in
+        .checked_mul(U256::from(MAX_SANE_PROFIT_RATIO_BPS))
+        .map(|value| value / BPS_SCALE)
+    else {
+        return Err(SimSanityReject::InsaneProfitRatio);
+    };
     if input.gross_profit > max_sane_profit {
         return Err(SimSanityReject::InsaneProfitRatio);
     }
@@ -179,6 +199,37 @@ mod tests {
                 token_to_matic_rate: rate,
             })
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn unsupported_decimals_fail_closed_without_overflow() {
+        let rate = U256::from(10u128.pow(18));
+        assert_eq!(min_economic_amount_in(77, rate), U256::MAX);
+        assert_eq!(max_flash_borrow_wei(50_000, 77, rate, 1.0), None);
+        assert_eq!(
+            check_sim_sanity_fast(SimSanityInput {
+                amount_in: U256::ONE,
+                gross_profit: U256::ZERO,
+                search_low: U256::ONE,
+                token_decimals: 77,
+                token_to_matic_rate: rate,
+            }),
+            Err(SimSanityReject::UnsupportedTokenDecimals)
+        );
+    }
+
+    #[test]
+    fn overflowing_profit_ratio_bound_fails_closed() {
+        assert_eq!(
+            check_sim_sanity_fast(SimSanityInput {
+                amount_in: U256::MAX,
+                gross_profit: U256::ZERO,
+                search_low: U256::ONE,
+                token_decimals: 18,
+                token_to_matic_rate: U256::ONE,
+            }),
+            Err(SimSanityReject::InsaneProfitRatio)
         );
     }
 

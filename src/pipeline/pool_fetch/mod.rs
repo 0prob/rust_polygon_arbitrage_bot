@@ -74,7 +74,13 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     let phase1_results = if phase1.is_empty() {
         Vec::new()
     } else {
-        match execute_multicall_at_chunked(provider.clone(), &phase1, block_number, max_chunk).await
+        match execute_multicall_at_chunked(
+            provider.clone(),
+            Arc::from(phase1),
+            block_number,
+            max_chunk,
+        )
+        .await
         {
             Ok(r) => r,
             Err(error) => {
@@ -163,7 +169,7 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
 
     let phase2_results = match execute_multicall_at_chunked(
         provider.clone(),
-        &phase2,
+        Arc::from(phase2),
         block_number,
         max_chunk,
     )
@@ -304,7 +310,7 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
 
     let Ok(results) = execute_multicall_at_chunked(
         provider.clone(),
-        &items,
+        Arc::from(items),
         block_number,
         crate::pipeline::multicall::MULTICALL_CHUNK,
     )
@@ -360,10 +366,13 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     updated
 }
 
+/// Concurrent plan-batch RPCs (bounded) — complements per-chunk multicall parallelism.
+const MAX_PARALLEL_PLAN_BATCHES: usize = 2;
+
 async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
-    provider: &P,
-    batches: &[Vec<PoolFetchPlan>],
-    cache: &StateCache,
+    provider: P,
+    batches: Vec<Vec<PoolFetchPlan>>,
+    cache: Arc<StateCache>,
     block_number: Option<u64>,
     chunk_size: usize,
     batch_pace_ms: u64,
@@ -371,14 +380,42 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     if batches.is_empty() {
         return 0;
     }
+    if batches.len() == 1 {
+        return execute_plan_batch(
+            &provider,
+            &batches[0],
+            cache.as_ref(),
+            block_number,
+            chunk_size,
+        )
+        .await;
+    }
 
-    let pace_batches = batch_pace_ms > 0 && batches.len() > 1;
+    let pace_batches = batch_pace_ms > 0;
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
-    let mut updated = 0usize;
-    for (i, batch) in batches.iter().enumerate() {
-        updated += execute_plan_batch(provider, batch, cache, block_number, chunk_size).await;
-        if pace_batches && i + 1 < batches.len() {
+    let sem = Arc::new(tokio::sync::Semaphore::new(
+        MAX_PARALLEL_PLAN_BATCHES.min(batches.len()),
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, batch) in batches.into_iter().enumerate() {
+        if pace_batches && i > 0 {
             tokio::time::sleep(pacing).await;
+        }
+        let provider = provider.clone();
+        let cache = Arc::clone(&cache);
+        let sem = Arc::clone(&sem);
+        tasks.spawn(async move {
+            let Ok(_permit) = sem.acquire().await else {
+                crate::warn!("plan batch skipped: fetch semaphore closed");
+                return 0usize;
+            };
+            execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
+        });
+    }
+    let mut updated = 0usize;
+    while let Some(res) = tasks.join_next().await {
+        if let Ok(n) = res {
+            updated += n;
         }
     }
     updated
@@ -454,9 +491,9 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
             meta_cache,
         ),
         run_plan_batches(
-            &provider,
-            &batches,
-            cache.as_ref(),
+            provider,
+            batches,
+            Arc::clone(&cache),
             block_number,
             chunk_size,
             batch_pace_ms,
@@ -482,9 +519,10 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         spans.push((plan, start, items.len()));
     }
 
+    let item_count = items.len();
     let results = match execute_multicall_at_chunked(
         provider.clone(),
-        &items,
+        Arc::from(items),
         block_number,
         chunk_size,
     )
@@ -493,10 +531,7 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         Ok(r) => r,
         Err(e) => {
             let _ = e;
-            crate::warn!(
-                "multicall batch failed ({} items): provider rejected batch",
-                items.len()
-            );
+            crate::warn!("multicall batch failed ({item_count} items): provider rejected batch",);
             return 0;
         }
     };
@@ -507,7 +542,7 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
             crate::warn!(
                 "multicall batch returned {} results for {} requested items",
                 results.len(),
-                items.len()
+                item_count
             );
             return updated;
         };

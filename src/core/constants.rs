@@ -70,8 +70,12 @@ pub fn is_polygon_hub_token(addr: Address) -> bool {
 /// Fee precision for per-gas-amount fee computation (1e6).
 pub const FEE_PIPS_SCALE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
 
-/// Oracle rate precision (MATIC wei per token smallest unit, 1e18 scaled).
+/// Oracle rate precision: MATIC wei per whole token unit.
+/// Convert base-unit amounts by dividing by `10^token_decimals`.
 pub const RATE_PRECISION: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+/// Largest ERC-20 precision accepted for execution metadata.
+/// The on-chain enrichment path shares this bound; higher values are rejected rather than scaled.
+pub const MAX_SUPPORTED_TOKEN_DECIMALS: u8 = 30;
 /// Reject opportunities when the token/MATIC rate rounds to zero or is untrustworthy.
 pub const MIN_TOKEN_TO_MATIC_RATE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
 /// Minimum borrow size expressed as ~0.1 MATIC of notional (wei, 18 decimals).

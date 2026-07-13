@@ -62,4 +62,29 @@ mod tests {
         }];
         assert!(pack_executor_calls(&calls).is_err());
     }
+
+    #[test]
+    fn packed_calls_use_unpadded_data_length_layout() {
+        let call = ExecutorCall {
+            target: alloy::primitives::Address::from([0x11; 20]),
+            value: alloy::primitives::U256::from(7u8),
+            data: vec![0xaa, 0xbb, 0xcc].into(),
+        };
+        let packed = pack_executor_calls(&[call]).expect("call should pack");
+        assert_eq!(packed.len(), 32 + 32 + 32 + 32 + 3);
+        assert_eq!(
+            &packed[0..32],
+            &alloy::primitives::U256::ONE.to_be_bytes::<32>()
+        );
+        assert_eq!(&packed[32 + 12..32 + 32], &[0x11; 20]);
+        assert_eq!(
+            &packed[64..96],
+            &alloy::primitives::U256::from(7u8).to_be_bytes::<32>()
+        );
+        assert_eq!(
+            &packed[96..128],
+            &alloy::primitives::U256::from(3u8).to_be_bytes::<32>()
+        );
+        assert_eq!(&packed[128..], &[0xaa, 0xbb, 0xcc]);
+    }
 }

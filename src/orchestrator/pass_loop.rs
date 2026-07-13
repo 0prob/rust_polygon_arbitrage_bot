@@ -25,6 +25,7 @@ use crate::pipeline::graph_cache::GraphCache;
 use crate::services::execution::ExecutionService;
 use crate::services::execution::GasOracle;
 use crate::services::hf_snapshot::SnapshotStore;
+use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet};
 use crate::services::state_cache::StateCache;
@@ -166,6 +167,14 @@ pub async fn run_pass_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     info!("pass loop started");
+
+    warm_matic_usd_oracle(&ctx).await;
+    spawn_matic_usd_oracle_background(
+        Arc::clone(&ctx.price_oracle),
+        Arc::clone(&ctx.rpc),
+        ctx.config.oracle.cache_ttl_ms,
+        shutdown.clone(),
+    );
 
     ctx.rpc
         .spawn_periodic_probe(shutdown.clone(), std::time::Duration::from_secs(600));
@@ -402,14 +411,15 @@ pub async fn run_pass_loop(
         handle.abort();
     }
     let hf_join = hf_task.lock().take();
+    const TASK_SHUTDOWN: Duration = Duration::from_secs(10);
     if let Some(mut handle) = hf_join
-        && tokio::time::timeout(Duration::from_secs(5), &mut handle)
+        && tokio::time::timeout(TASK_SHUTDOWN, &mut handle)
             .await
             .is_err()
     {
         handle.abort();
         let _ = handle.await;
-        crate::warn!("hf task aborted after 5s shutdown timeout");
+        crate::warn!("hf task aborted after {TASK_SHUTDOWN:?} shutdown timeout");
     }
     if let (Some(executor), Ok(provider)) = (
         ctx.config.execution.executor_address,
@@ -418,13 +428,13 @@ pub async fn run_pass_loop(
         let operator = ctx.wallet.operator_address(executor);
         ctx.execution.shutdown_resync(&provider, operator).await;
     }
-    if tokio::time::timeout(Duration::from_secs(5), &mut lf_handle)
+    if tokio::time::timeout(TASK_SHUTDOWN, &mut lf_handle)
         .await
         .is_err()
     {
         lf_handle.abort();
         let _ = lf_handle.await;
-        crate::warn!("lf background task aborted after 5s shutdown timeout");
+        crate::warn!("lf background task aborted after {TASK_SHUTDOWN:?} shutdown timeout");
     }
     #[cfg(feature = "tui")]
     if let Some(handle) = snapshot_handle {
@@ -493,6 +503,43 @@ fn spawn_daily_loss_guard(
     }))
 }
 
+async fn warm_matic_usd_oracle(ctx: &RuntimeContext) {
+    let provider = ctx.rpc.connect_state().ok();
+    let provider_ref = provider.as_ref();
+    match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, provider_ref).await {
+        Some(usd) => crate::info!("matic/usd oracle ready for HF (usd={usd:.4})"),
+        None => crate::warn!(
+            "matic/usd oracle unavailable at startup — HF eval may skip until Pyth/Chainlink responds"
+        ),
+    }
+}
+
+fn spawn_matic_usd_oracle_background(
+    price_oracle: Arc<PriceOracle>,
+    rpc: Arc<RpcPool>,
+    cache_ttl_ms: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let period_ms = (cache_ttl_ms / 2).clamp(2_000, 8_000);
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(period_ms));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
+            let provider = rpc.connect_state().ok();
+            let provider_ref = provider.as_ref();
+            let _ = ensure_matic_usd_for_flash_cap(&price_oracle, provider_ref).await;
+        }
+    });
+}
+
 /// Start fee polling once state RPC is reachable (retries if startup connect fails).
 fn spawn_gas_oracle_background(
     gas_oracle: Arc<GasOracle>,
@@ -534,8 +581,10 @@ fn schedule_hf_tick(
     hf_stream_pending: Arc<AtomicBool>,
     stream_triggered: bool,
 ) {
+    if clear_hf_pending_on_shutdown(&hf_ctx.shutdown, &hf_pending, &hf_stream_pending) {
+        return;
+    }
     let hf_inflight_acquire = Arc::clone(&hf_inflight);
-    let hf_inflight_coalesce = Arc::clone(&hf_inflight);
     let Ok(permit) = hf_inflight_acquire.try_acquire_owned() else {
         hf_pending.store(true, Ordering::Release);
         if stream_triggered {
@@ -543,36 +592,46 @@ fn schedule_hf_tick(
         }
         return;
     };
+    hf_pending.store(false, Ordering::Release);
+    let stream_triggered = next_hf_stream_trigger(stream_triggered, &hf_stream_pending);
     let hf_ctx_run = Arc::clone(&hf_ctx);
     let hf_task_store = Arc::clone(&hf_task);
-    let hf_task_coalesce = Arc::clone(&hf_task);
-    let hf_pending_coalesce = Arc::clone(&hf_pending);
-    let hf_stream_pending_coalesce = Arc::clone(&hf_stream_pending);
+    let hf_pending_task = Arc::clone(&hf_pending);
+    let hf_stream_pending_task = Arc::clone(&hf_stream_pending);
     *hf_task_store.lock() = Some(tokio::spawn(async move {
         let _permit = permit;
+        if clear_hf_pending_on_shutdown(
+            &hf_ctx_run.shutdown,
+            &hf_pending_task,
+            &hf_stream_pending_task,
+        ) {
+            return;
+        }
         if stream_triggered {
             let _ = hf_ctx_run.partial_cache.trigger().take_stream_triggered();
         }
         if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
             crate::warn!("hf tick failed: {e:#}");
         }
-        drop(_permit);
-        if take_pending_hf_tick(&hf_pending_coalesce) {
-            let coalesced_stream = take_pending_hf_stream(&hf_stream_pending_coalesce);
-            schedule_hf_tick(
-                hf_ctx_run,
-                hf_inflight_coalesce,
-                hf_task_coalesce,
-                hf_pending_coalesce,
-                hf_stream_pending_coalesce,
-                coalesced_stream,
-            );
-        }
     }));
 }
 
-fn take_pending_hf_tick(hf_pending: &AtomicBool) -> bool {
-    hf_pending.swap(false, Ordering::AcqRel)
+fn clear_hf_pending_on_shutdown(
+    shutdown: &watch::Receiver<bool>,
+    hf_pending: &AtomicBool,
+    hf_stream_pending: &AtomicBool,
+) -> bool {
+    if !*shutdown.borrow() {
+        return false;
+    }
+    hf_pending.store(false, Ordering::Release);
+    hf_stream_pending.store(false, Ordering::Release);
+    true
+}
+
+fn next_hf_stream_trigger(stream_triggered: bool, hf_stream_pending: &AtomicBool) -> bool {
+    let pending_stream = take_pending_hf_stream(hf_stream_pending);
+    stream_triggered || pending_stream
 }
 
 fn take_pending_hf_stream(hf_stream_pending: &AtomicBool) -> bool {
@@ -608,16 +667,9 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
 
 #[cfg(test)]
 mod tests {
-    use super::{take_pending_hf_stream, take_pending_hf_tick};
+    use super::{clear_hf_pending_on_shutdown, next_hf_stream_trigger, take_pending_hf_stream};
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[test]
-    fn pending_hf_tick_is_consumed_once() {
-        let pending = AtomicBool::new(true);
-        assert!(take_pending_hf_tick(&pending));
-        assert!(!pending.load(Ordering::Acquire));
-        assert!(!take_pending_hf_tick(&pending));
-    }
+    use tokio::sync::watch;
 
     #[test]
     fn pending_hf_stream_is_consumed_once() {
@@ -625,5 +677,29 @@ mod tests {
         assert!(take_pending_hf_stream(&pending));
         assert!(!pending.load(Ordering::Acquire));
         assert!(!take_pending_hf_stream(&pending));
+    }
+
+    #[test]
+    fn pending_stream_trigger_is_consumed_by_the_next_scheduler_tick() {
+        let pending = AtomicBool::new(true);
+
+        assert!(next_hf_stream_trigger(false, &pending));
+        assert!(!pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_clears_pending_hf_before_task_work() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let pending = AtomicBool::new(true);
+        let stream_pending = AtomicBool::new(true);
+        let _ = shutdown_tx.send(true);
+
+        assert!(clear_hf_pending_on_shutdown(
+            &shutdown_rx,
+            &pending,
+            &stream_pending,
+        ));
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(!stream_pending.load(Ordering::Acquire));
     }
 }

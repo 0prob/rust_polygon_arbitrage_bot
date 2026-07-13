@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::hex;
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, U256};
@@ -86,6 +87,10 @@ fn try_decode_revert(
     decode_revert(&bytes)
 }
 
+fn block_id(simulation_block: Option<u64>) -> Option<BlockId> {
+    simulation_block.map(|block| BlockId::Number(BlockNumberOrTag::Number(block)))
+}
+
 fn is_gas_limit_rpc_error(msg: &str) -> bool {
     msg.contains("gas uint64 overflow")
         || msg.contains("exceeds block gas limit")
@@ -118,9 +123,14 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
     provider: &P,
     candidate: &CandidateExecution,
     from: Address,
+    simulation_block: Option<u64>,
 ) -> DryRunResult {
     let tx = build_tx(candidate, from);
-    match timeout(RPC_TIMEOUT, provider.estimate_gas(tx)).await {
+    let mut estimate = provider.estimate_gas(tx);
+    if let Some(block) = block_id(simulation_block) {
+        estimate = estimate.block(block);
+    }
+    match timeout(RPC_TIMEOUT, estimate).await {
         Ok(Ok(gas)) => DryRunResult {
             semantic_success: true,
             success: true,
@@ -147,9 +157,14 @@ pub async fn estimate_candidate_gas<P: Provider<Ethereum>>(
     provider: &P,
     candidate: &CandidateExecution,
     from: Address,
+    simulation_block: Option<u64>,
 ) -> Option<u64> {
     let tx = build_tx(candidate, from);
-    match timeout(RPC_TIMEOUT, provider.estimate_gas(tx)).await {
+    let mut estimate = provider.estimate_gas(tx);
+    if let Some(block) = block_id(simulation_block) {
+        estimate = estimate.block(block);
+    }
+    match timeout(RPC_TIMEOUT, estimate).await {
         Ok(Ok(gas)) => Some(gas),
         Ok(Err(_err)) => None,
         Err(_) => None,
@@ -160,13 +175,18 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
     provider: &P,
     candidate: &CandidateExecution,
     from: Address,
+    simulation_block: Option<u64>,
 ) -> DryRunResult {
     // Never constrain simulation or estimation with the local gas heuristic.
     // Flash-loan callbacks can exceed it; the measured estimate is buffered
     // later when the real transaction is built.
     let tx = build_tx(candidate, from);
+    let mut call = provider.call(tx);
+    if let Some(block) = block_id(simulation_block) {
+        call = call.block(block);
+    }
 
-    let realized_profit = match timeout(RPC_TIMEOUT, provider.call(tx)).await {
+    let realized_profit = match timeout(RPC_TIMEOUT, call).await {
         Ok(Ok(output)) => decode_realized_profit(&output),
         Ok(Err(err)) => {
             let raw = err.to_string();
@@ -176,7 +196,13 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                     candidate.route_fingerprint,
                     candidate.hop_count,
                 );
-                return dry_run_after_call_gas_overflow(provider, candidate, from).await;
+                return dry_run_after_call_gas_overflow(
+                    provider,
+                    candidate,
+                    from,
+                    simulation_block,
+                )
+                .await;
             }
             let decoded = try_decode_revert(&raw);
             let reason = decoded
@@ -219,7 +245,11 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
     };
 
     let tx = build_tx(candidate, from);
-    match timeout(RPC_TIMEOUT, provider.estimate_gas(tx)).await {
+    let mut estimate = provider.estimate_gas(tx);
+    if let Some(block) = block_id(simulation_block) {
+        estimate = estimate.block(block);
+    }
+    match timeout(RPC_TIMEOUT, estimate).await {
         Ok(Ok(gas)) => DryRunResult {
             semantic_success: true,
             success: true,

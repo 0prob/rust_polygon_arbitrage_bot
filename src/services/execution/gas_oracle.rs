@@ -185,8 +185,9 @@ impl GasOracle {
         self.loaded_snapshot().map(compute_conservative_gas_price)
     }
 
-    pub fn conservative_gas_price_required(&self) -> U256 {
-        self.conservative_gas_price().unwrap_or(U256::ZERO)
+    /// Prefer [`Self::conservative_gas_price`]; never substitute zero gas price.
+    pub fn conservative_gas_price_required(&self) -> Option<U256> {
+        self.conservative_gas_price()
     }
 
     #[cfg(test)]
@@ -206,7 +207,7 @@ impl GasOracle {
             .map(U256::from)
             .ok_or_else(|| anyhow::anyhow!("block header missing base_fee_per_gas"))?;
 
-        let priority_fee = match provider.get_max_priority_fee_per_gas().await {
+        let mut priority_fee = match provider.get_max_priority_fee_per_gas().await {
             Ok(v) => U256::from(v),
             Err(_e) => self
                 .snapshot
@@ -214,6 +215,9 @@ impl GasOracle {
                 .as_deref()
                 .map_or(U256::ZERO, |snap| snap.priority_fee),
         };
+        if priority_fee.is_zero() {
+            priority_fee = U256::from(25_000_000_000u64);
+        }
 
         self.snapshot.store(Some(Arc::new(FeeSnapshot {
             base_fee,
@@ -229,7 +233,9 @@ impl GasOracle {
     ) {
         let poll = self.poll_interval;
         tokio::spawn(async move {
-            let _ = self.refresh_once(&provider).await;
+            if let Err(e) = self.refresh_once(&provider).await {
+                crate::debug!("gas oracle initial refresh failed: {e:#}");
+            }
             let mut ticker = tokio::time::interval(poll);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
@@ -240,7 +246,9 @@ impl GasOracle {
                         }
                     }
                     _ = ticker.tick() => {
-                        let _ = self.refresh_once(&provider).await;
+                        if let Err(e) = self.refresh_once(&provider).await {
+                            crate::debug!("gas oracle refresh failed: {e:#}");
+                        }
                     }
                 }
             }

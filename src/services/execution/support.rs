@@ -367,7 +367,8 @@ pub fn depth_impact_slippage_bps_with_base(
         return 0;
     }
     let Some(probe) = simulate_route_minimal(arena, edges, probe_in) else {
-        return 0;
+        // Probe failure means unknown depth impact — do not report 0 slippage.
+        return 10_000;
     };
 
     marginal_shortfall_bps(base_out, amount_in, probe.amount_out, probe_in)

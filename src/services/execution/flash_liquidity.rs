@@ -813,7 +813,10 @@ fn plan_auto(amount_in: U256, liquidity: TokenFlashLiquidity, allow_balancer: bo
             cap: U256::ZERO,
         };
     }
-    let source = if allow_balancer && liquidity.balancer >= liquidity.aave {
+    let source = if allow_balancer
+        && !liquidity.balancer.is_zero()
+        && liquidity.balancer >= liquidity.aave
+    {
         FlashLoanSource::Balancer
     } else if liquidity.aave_listed && liquidity.aave >= liquidity.dodo {
         FlashLoanSource::AaveV3
@@ -1565,6 +1568,24 @@ mod tests {
             false,
         );
         assert_eq!(plan.action, FlashPlanAction::Reject);
+    }
+
+    #[test]
+    fn plan_auto_selects_dodo_when_balancer_and_aave_are_empty() {
+        let plan = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1_000u64),
+            TokenFlashLiquidity {
+                balancer: U256::ZERO,
+                aave: U256::ZERO,
+                aave_listed: false,
+                dodo: U256::from(2_000u64),
+            },
+            false,
+            false,
+        );
+        assert_eq!(plan.source, FlashLoanSource::Dodo);
+        assert_eq!(plan.action, FlashPlanAction::Direct);
     }
 
     #[test]

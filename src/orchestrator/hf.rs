@@ -20,7 +20,7 @@ use crate::orchestrator::hf_execute::{
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
+use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -66,6 +66,8 @@ const HF_BEST_EVAL_INTERVAL_MS: u64 = 60_000;
 const HF_EVAL_BUDGET: Duration = Duration::from_secs(30);
 static HF_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_BEST_EVAL_LOG_AT: AtomicU64 = AtomicU64::new(0);
+static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
+const HF_ORACLE_SKIP_INTERVAL_MS: u64 = 30_000;
 
 /// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
 fn cycle_with_reliable_start(
@@ -81,6 +83,16 @@ fn cycle_with_reliable_start(
         }
     }
     None
+}
+
+fn warn_hf_oracle_skip(message: &str) {
+    let now = now_ms();
+    let last = HF_ORACLE_SKIP_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HF_ORACLE_SKIP_INTERVAL_MS {
+        return;
+    }
+    HF_ORACLE_SKIP_LOG_AT.store(now, Ordering::Relaxed);
+    crate::warn!("{message}");
 }
 
 fn should_log_hf_summary() -> bool {
@@ -220,7 +232,8 @@ fn select_cycles_for_rescore(
     candidates.truncate(rescore_cap);
 
     let mut cycles = Vec::with_capacity(candidates.len());
-    let mut hot_pools = FxHashSet::default();
+    let mut hot_pools =
+        FxHashSet::with_capacity_and_hasher(candidates.len().saturating_mul(3), Default::default());
     for (cycle, _) in candidates {
         for edge in &cycle.edges {
             if let Some(addr) = arena.pool_address(edge.pool_index) {
@@ -349,9 +362,23 @@ pub async fn run_hf_tick(
     }
 
     if stream_triggered && pipeline.stream_enabled {
-        let _ = ctx
+        let flushed = ctx
             .partial_cache
             .flush_to_state_cache(&ctx.cache, hot_pools.as_ref());
+        let pending = ctx
+            .partial_cache
+            .dirty_addresses()
+            .into_iter()
+            .filter(|a| hot_pools.iter().any(|h| h == a))
+            .count();
+        if pending > 0 {
+            crate::warn!(
+                "stream flush incomplete: flushed={flushed} hot_dirty_pending={pending} — HF eval may use stale StateCache"
+            );
+            prefetch_ok = false;
+        } else if flushed > 0 {
+            prefetch_ok = true;
+        }
     }
 
     let latest_generation = ctx.snapshots.generation();
@@ -434,7 +461,34 @@ pub async fn run_hf_tick(
     }
 
     let flash_policy = ctx.config.flash_policy;
-    let matic_usd = matic_usd_for_flash_cap(ctx.price_oracle.cached_matic_usd().unwrap_or(0.0));
+    let state_provider = ctx.rpc.connect_state().ok();
+    let state_provider_ref = state_provider.as_ref();
+    let matic_usd = match timeout(
+        Duration::from_millis(800),
+        ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
+    )
+    .await
+    {
+        Ok(Some(usd)) => usd,
+        Ok(None) => {
+            warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle unavailable for flash loan cap");
+            return Ok(HfTickResult {
+                cycles_considered: cycles.len(),
+                profitable_count: 0,
+                best_profit: U256::ZERO,
+                elapsed_ms: now_ms().saturating_sub(start),
+            });
+        }
+        Err(_) => {
+            warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
+            return Ok(HfTickResult {
+                cycles_considered: cycles.len(),
+                profitable_count: 0,
+                best_profit: U256::ZERO,
+                elapsed_ms: now_ms().saturating_sub(start),
+            });
+        }
+    };
 
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
@@ -527,39 +581,54 @@ pub async fn run_hf_tick(
 
     let mut skip_dispatch_refresh = prefetch_ok;
     let mut dispatch_state_generation = evaluation_state_generation;
-    if !profitable.is_empty()
-        && let Some(executor) = ctx.config.execution.executor_address
-        && let Ok(sim_provider) = ctx.rpc.connect_simulation()
-    {
-        let (resimmed, resim_refreshed, resim_generation) = refresh_and_resim_profitable(
-            &ctx.refresh,
-            &ctx.cache,
-            Arc::make_mut(&mut eval_arena),
-            profitable,
-            reassess_ctx.as_ref(),
-        )
-        .await;
-        profitable = resimmed;
-        skip_dispatch_refresh = prefetch_ok || resim_refreshed;
-        if resim_refreshed {
-            dispatch_state_generation = resim_generation;
+    if !profitable.is_empty() && ctx.config.execution.executor_address.is_some() {
+        let sim_provider = match ctx.rpc.connect_simulation() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                crate::warn!(
+                    "dropping {} profitable routes: simulation RPC unavailable for pre-dispatch resim ({e:#})",
+                    profitable.len()
+                );
+                profitable.clear();
+                None
+            }
+        };
+        if let Some(sim_provider) = sim_provider {
+            let executor = ctx
+                .config
+                .execution
+                .executor_address
+                .expect("checked above");
+            let (resimmed, resim_refreshed, resim_generation) = refresh_and_resim_profitable(
+                &ctx.refresh,
+                &ctx.cache,
+                Arc::make_mut(&mut eval_arena),
+                profitable,
+                reassess_ctx.as_ref(),
+            )
+            .await;
+            profitable = resimmed;
+            skip_dispatch_refresh = prefetch_ok || resim_refreshed;
+            if resim_refreshed {
+                dispatch_state_generation = resim_generation;
+            }
+            profitable = filter_balancer_onchain_verified(
+                Arc::clone(&ctx.execution),
+                eval_arena.as_ref(),
+                profitable,
+                &sim_provider,
+                executor,
+                pool_metas_for_dispatch.as_ref(),
+                ctx.config.execution.slippage_bps,
+                Arc::clone(&reassess_ctx),
+            )
+            .await;
+            best_profit_matic = profitable
+                .iter()
+                .map(|r| r.assessment.net_profit_after_gas_matic_wei)
+                .max()
+                .unwrap_or(U256::ZERO);
         }
-        profitable = filter_balancer_onchain_verified(
-            Arc::clone(&ctx.execution),
-            eval_arena.as_ref(),
-            profitable,
-            &sim_provider,
-            executor,
-            pool_metas_for_dispatch.as_ref(),
-            ctx.config.execution.slippage_bps,
-            Arc::clone(&reassess_ctx),
-        )
-        .await;
-        best_profit_matic = profitable
-            .iter()
-            .map(|r| r.assessment.net_profit_after_gas_matic_wei)
-            .max()
-            .unwrap_or(U256::ZERO);
     }
 
     profitable.sort_unstable_by(|a, b| {

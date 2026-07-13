@@ -14,6 +14,7 @@ use super::rpc_errors::{SubmitAction, classify_submit_error, extract_tx_hash_fro
 /// ponytail: 15% fee bump on resubmit. Standard EIP-1559 bump.
 pub const FEE_BUMP_BPS: u64 = 1500;
 const MAX_SUBMIT_ATTEMPTS: u32 = 3;
+pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([30_000_000_000, 0, 0, 0]);
 /// ponytail: cap profit-derived priority fee boost at 200 gwei.
 /// 100 gwei was too conservative during Polygon MEV competition.
 use crate::services::execution::profit::profit_priority_uplift_wei;
@@ -35,9 +36,10 @@ pub fn bump_fees(fees: SubmitFees, bump_bps: u64) -> SubmitFees {
 
 pub fn resolve_submit_fees(gas_oracle: &GasOracle) -> Option<SubmitFees> {
     let snap = gas_oracle.loaded_snapshot()?;
+    let priority_fee = snap.priority_fee.max(MIN_PRIORITY_FEE_PER_GAS);
     Some(SubmitFees {
-        max_fee_per_gas: compute_conservative_gas_price(snap),
-        max_priority_fee_per_gas: snap.priority_fee,
+        max_fee_per_gas: compute_conservative_gas_price(snap).max(snap.base_fee + priority_fee),
+        max_priority_fee_per_gas: priority_fee,
     })
 }
 
@@ -50,7 +52,7 @@ pub fn resolve_submit_fees_with_profit(
 ) -> Option<SubmitFees> {
     let snap = gas_oracle.loaded_snapshot()?;
     let max_fee_per_gas = compute_conservative_gas_price(snap);
-    let priority_fee = snap.priority_fee;
+    let priority_fee = snap.priority_fee.max(MIN_PRIORITY_FEE_PER_GAS);
     let mut fees = SubmitFees {
         max_fee_per_gas,
         max_priority_fee_per_gas: priority_fee,

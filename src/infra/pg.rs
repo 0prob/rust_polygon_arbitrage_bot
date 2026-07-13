@@ -497,13 +497,20 @@ fn parse_token_meta_rows(rows: &[Row]) -> Vec<TokenMeta> {
         let Ok(address) = id.parse::<Address>() else {
             continue;
         };
-        let dec = decimals.unwrap_or(18).clamp(0, 77) as u8;
+        let Some(dec) = valid_token_decimals(decimals) else {
+            continue;
+        };
         metas.push(TokenMeta {
             address,
             decimals: dec,
         });
     }
     metas
+}
+
+fn valid_token_decimals(decimals: Option<i32>) -> Option<u8> {
+    let decimals = u8::try_from(decimals?).ok()?;
+    (decimals <= crate::core::constants::MAX_SUPPORTED_TOKEN_DECIMALS).then_some(decimals)
 }
 
 fn parse_pg_row(row: &Row) -> Option<DiscoveredPool> {
@@ -545,6 +552,17 @@ mod tests {
             .block_on(client.fetch_pool_meta_incremental(&DiscoveryCursor::default()))
             .expect_err("incremental fetch should fail without bootstrap");
         assert!(err.to_string().contains("not bootstrapped"));
+    }
+
+    #[test]
+    fn token_decimal_metadata_rejects_unknown_and_unsupported_values() {
+        assert_eq!(valid_token_decimals(None), None);
+        assert_eq!(valid_token_decimals(Some(-1)), None);
+        assert_eq!(valid_token_decimals(Some(31)), None);
+        assert_eq!(valid_token_decimals(Some(77)), None);
+        assert_eq!(valid_token_decimals(Some(0)), Some(0));
+        assert_eq!(valid_token_decimals(Some(6)), Some(6));
+        assert_eq!(valid_token_decimals(Some(18)), Some(18));
     }
 
     #[test]

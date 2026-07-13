@@ -13,7 +13,8 @@ pub fn compute_min_out(
     slippage_bps: u64,
     label: &str,
 ) -> anyhow::Result<U256> {
-    let quoted = quote_hop_for_execution(arena, hop).unwrap_or(hop.amount_out);
+    let quoted = quote_hop_for_execution(arena, hop)
+        .ok_or_else(|| anyhow::anyhow!("{label} hop execution quote unavailable"))?;
     slippage_adjusted(quoted, slippage_bps)
         .ok_or_else(|| anyhow::anyhow!("{label} hop min out is zero"))
 }

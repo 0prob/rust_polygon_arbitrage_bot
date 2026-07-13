@@ -156,7 +156,13 @@ pub async fn execute_multicall<P: Provider<Ethereum> + Clone + Send + 'static>(
     if items.len() <= MULTICALL_CHUNK {
         execute_multicall_chunk(provider, items, None).await
     } else {
-        execute_multicall_at_chunked(provider.clone(), items, None, MULTICALL_CHUNK).await
+        execute_multicall_at_chunked(
+            provider.clone(),
+            Arc::from(items.to_vec()),
+            None,
+            MULTICALL_CHUNK,
+        )
+        .await
     }
 }
 
@@ -170,7 +176,13 @@ pub async fn execute_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static
     if items.len() <= MULTICALL_CHUNK {
         execute_multicall_chunk(provider, items, block_number).await
     } else {
-        execute_multicall_at_chunked(provider.clone(), items, block_number, MULTICALL_CHUNK).await
+        execute_multicall_at_chunked(
+            provider.clone(),
+            Arc::from(items.to_vec()),
+            block_number,
+            MULTICALL_CHUNK,
+        )
+        .await
     }
 }
 
@@ -179,7 +191,7 @@ pub async fn execute_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static
 /// large state refreshes / pool fetches. Requires P: Clone (cheap for alloy providers).
 pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: P,
-    items: &[MulticallItem],
+    items: Arc<[MulticallItem]>,
     block_number: Option<u64>,
     max_chunk: usize,
 ) -> anyhow::Result<Vec<Option<Bytes>>> {
@@ -188,10 +200,8 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
     }
     let max_chunk = max_chunk.max(1);
     if items.len() <= max_chunk {
-        return execute_multicall_chunk(&provider, items, block_number).await;
+        return execute_multicall_chunk(&provider, &items, block_number).await;
     }
-
-    let items = Arc::new(items.to_vec());
     let num_chunks = items.len().div_ceil(max_chunk);
     let sem = Arc::new(tokio::sync::Semaphore::new(
         MAX_CONCURRENT_CHUNKS.min(num_chunks).max(1),
