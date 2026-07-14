@@ -227,18 +227,25 @@ impl StateArena {
     ) -> Vec<crate::pipeline::types::PoolMeta> {
         let tradable = cache.tradable_by_discovery_index(address_index);
 
-        let inner = Arc::make_mut(&mut self.inner);
-        let expected_tokens = tradable
-            .iter()
-            .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
-            .sum::<usize>()
-            .max(1);
-        inner.tokens.reserve(expected_tokens);
-        inner.token_decimals.reserve(expected_tokens);
-        inner.pools.reserve(tradable.len());
-        inner.pool_addresses.reserve(tradable.len());
-        inner.address_to_pool.reserve(tradable.len());
-        inner.address_to_token.reserve(expected_tokens);
+        let reusable = self.inner.pools.len() == tradable.len()
+            && tradable
+                .iter()
+                .all(|(_, address, _)| self.inner.address_to_pool.contains_key(address));
+        if !reusable {
+            *Arc::make_mut(&mut self.inner) = ArenaInner::default();
+            let inner = Arc::make_mut(&mut self.inner);
+            let expected_tokens = tradable
+                .iter()
+                .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
+                .sum::<usize>()
+                .max(1);
+            inner.tokens.reserve(expected_tokens);
+            inner.token_decimals.reserve(expected_tokens);
+            inner.pools.reserve(tradable.len());
+            inner.pool_addresses.reserve(tradable.len());
+            inner.address_to_pool.reserve(tradable.len());
+            inner.address_to_token.reserve(expected_tokens);
+        }
 
         let mut metas = Vec::with_capacity(tradable.len().max(1));
         for (idx, _address, state) in tradable {

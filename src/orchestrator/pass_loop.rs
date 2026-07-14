@@ -78,8 +78,7 @@ impl RuntimeContext {
             let refresh_handle = scope.spawn(move || {
                 StateRefreshService::new(config_refresh, cache_refresh, rpc_refresh)
             });
-            let exec_handle =
-                scope.spawn(move || ExecutionService::from_config(&config_exec));
+            let exec_handle = scope.spawn(move || ExecutionService::from_config(&config_exec));
             let refresh = refresh_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("state refresh init thread panicked"))??;

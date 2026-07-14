@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
 use alloy::primitives::Address;
@@ -7,7 +7,7 @@ use alloy::primitives::U256;
 use anyhow::{Context, ensure};
 use figment::{
     Figment,
-    providers::{Env, Format, Serialized, Toml},
+    providers::{Env, Serialized},
 };
 use serde::{Deserialize, Serialize};
 
@@ -460,7 +460,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("discovery_bootstrap_batch") => "discovery_bootstrap_batch",
         k if k.eq_ignore_ascii_case("max_multicall_calls") => "max_multicall_calls",
         k if k.eq_ignore_ascii_case("execution_mode") => "execution.mode",
-        k if k.eq_ignore_ascii_case("min_profit_matic_wei") => "execution.min_profit_matic_wei",
+
         k if k.eq_ignore_ascii_case("slippage_bps") => "execution.slippage_bps",
         k if k.eq_ignore_ascii_case("flash_loan_source") => "execution.flash_loan_source",
         k if k.eq_ignore_ascii_case("receipt_timeout_ms") => "execution.receipt_timeout_ms",
@@ -474,14 +474,12 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("profit_safety_multiplier_bps") => {
             "execution.profit_safety_multiplier_bps"
         }
-        k if k.eq_ignore_ascii_case("min_operator_matic_wei") => "execution.min_operator_matic_wei",
+
         k if k.eq_ignore_ascii_case("max_global_consecutive_failures") => {
             "execution.max_global_consecutive_failures"
         }
         k if k.eq_ignore_ascii_case("min_profit_roi_bps") => "execution.min_profit_roi_bps",
-        k if k.eq_ignore_ascii_case("max_daily_loss_matic_wei") => {
-            "execution.max_daily_loss_matic_wei"
-        }
+
         k if k.eq_ignore_ascii_case("route_stats_path") => "execution.route_stats_path",
         k if k.eq_ignore_ascii_case("lf_bootstrap_batch") => "pipeline.lf_bootstrap_batch",
         k if k.eq_ignore_ascii_case("lf_hot_batch") => "pipeline.lf_hot_batch",
@@ -510,6 +508,8 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("oracle_pyth_hermes_url") => "oracle.pyth_hermes_url",
         k if k.eq_ignore_ascii_case("tick_word_range") => "oracle.tick_word_range",
         k if k.eq_ignore_ascii_case("oracle_cache_ttl_ms") => "oracle.cache_ttl_ms",
+        k if k.eq_ignore_ascii_case("oracle_pyth_feeds") => "oracle.pyth_feeds",
+        k if k.eq_ignore_ascii_case("oracle_chainlink_feeds") => "oracle.chainlink_feeds",
         k if k.eq_ignore_ascii_case("rpc_batch_pace_ms") => "rpc.batch_pace_ms",
         k if k.eq_ignore_ascii_case("request_timeout_ms") => "rpc.request_timeout_ms",
         k if k.eq_ignore_ascii_case("rpc_request_timeout_ms") => "rpc.request_timeout_ms",
@@ -562,6 +562,15 @@ fn apply_conditional_env_overrides(config: &mut AppConfig) -> anyhow::Result<()>
     if let Some(key) = env_var("PRIVATE_KEY") {
         config.execution.private_key = Some(key);
     }
+    if let Some(wei) = env_var("MIN_PROFIT_MATIC_WEI") {
+        config.execution.min_profit_matic_wei = wei;
+    }
+    if let Some(wei) = env_var("MIN_OPERATOR_MATIC_WEI") {
+        config.execution.min_operator_matic_wei = wei;
+    }
+    if let Some(wei) = env_var("MAX_DAILY_LOSS_MATIC_WEI") {
+        config.execution.max_daily_loss_matic_wei = wei;
+    }
     if let Some(urls) = env_var("POLYGON_RPC_URLS") {
         config.rpc.polygon_rpc_urls = split_rpc_urls(&urls);
     } else if let Some(url) = env_var("POLYGON_RPC_URL") {
@@ -571,18 +580,10 @@ fn apply_conditional_env_overrides(config: &mut AppConfig) -> anyhow::Result<()>
 }
 
 impl AppConfig {
-    /// Figment provider chain: defaults → TOML → env (later sources win on conflict).
+    /// Figment provider chain: code defaults → environment (from process env / `.env` via [`load_dotenv`]).
     #[must_use]
     pub fn figment() -> Figment {
-        let mut figment = Figment::from(Serialized::defaults(AppConfig::default()));
-        if let Ok(path) = std::env::var("CONFIG_PATH") {
-            if !path.trim().is_empty() {
-                figment = figment.merge(Toml::file(path));
-            }
-        } else if Path::new("config.toml").exists() {
-            figment = figment.merge(Toml::file("config.toml"));
-        }
-        figment.merge(env_provider())
+        Figment::from(Serialized::defaults(AppConfig::default())).merge(env_provider())
     }
 
     pub fn load() -> anyhow::Result<Self> {
@@ -609,7 +610,7 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Coalesce duplicates and clamp values that commonly fight each other across TOML/env.
+    /// Coalesce duplicates and clamp values that commonly fight each other across env sources.
     pub fn normalize(&mut self) {
         dedupe_preserve_order(&mut self.rpc.polygon_rpc_urls);
         dedupe_preserve_order(&mut self.rpc.polygon_wss_urls);
@@ -935,17 +936,14 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
-    fn figment_partial_rpc_toml_keeps_batch_pace_default() {
+    fn figment_env_overrides_rpc_and_pipeline() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
-            jail.create_file(
-                "config.toml",
-                "[rpc]\nrequest_timeout_ms = 10000\n[pipeline]\nstream_enabled = true\n",
-            )?;
+            jail.set_env("RPC_REQUEST_TIMEOUT_MS", 10_000);
+            jail.set_env("STREAM_ENABLED", "true");
             let config: AppConfig = AppConfig::figment().extract_lossy()?;
-            // batch_pace must not fall back to serde plain-default of 0
             assert_eq!(config.rpc.batch_pace_ms, 5);
-            assert_eq!(config.rpc.request_timeout_ms, 10000);
+            assert_eq!(config.rpc.request_timeout_ms, 10_000);
             assert!(config.pipeline.stream_enabled);
             Ok(())
         });
@@ -953,15 +951,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
-    fn figment_env_overrides_toml() {
+    fn figment_env_overrides_defaults() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
-            jail.create_file("config.toml", "lf_interval_ms = 999\n")?;
             jail.set_env("LF_INTERVAL_MS", 42);
-            let config: AppConfig = Figment::from(Serialized::defaults(AppConfig::default()))
-                .merge(Toml::file("config.toml"))
-                .merge(env_provider())
-                .extract_lossy()?;
+            let config: AppConfig = AppConfig::figment().extract_lossy()?;
             assert_eq!(config.lf_interval_ms, 42);
             Ok(())
         });
@@ -969,13 +963,9 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
-    fn env_polygon_rpc_urls_override_toml_list() {
+    fn env_polygon_rpc_urls_from_env_list() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
-            jail.create_file(
-                "config.toml",
-                "[rpc]\npolygon_rpc_urls = [\"https://toml.example\"]\n",
-            )?;
             jail.set_env(
                 "POLYGON_RPC_URLS",
                 "https://env-a.example,https://env-b.example",
@@ -1014,53 +1004,20 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
-    fn figment_rejects_invalid_toml_type() {
+    fn load_respects_dotenv_and_defaults() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
-            jail.create_file("bad.toml", "lf_interval_ms = \"not-a-number\"\n")?;
-            let err: figment::Result<AppConfig> = AppConfig::figment()
-                .merge(Toml::file("bad.toml"))
-                .extract_lossy();
-            assert!(err.is_err());
-            Ok(())
-        });
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn load_respects_config_toml_and_defaults() {
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            // prevent reading real .env which may set live mode + secrets
-            jail.set_env("DOTENV_PATH", "/non/existent/.env.for.test");
-            // Create a config.toml inside the isolated jail fs (real one is not visible in jail)
             jail.create_file(
-                "myconfig.toml",
-                "[execution]\nprofit_safety_multiplier_bps = 25000\nmin_profit_matic_wei = \"100000000000000000\"\n[pipeline]\nstream_enabled = true\n",
+                ".env",
+                "PROFIT_SAFETY_MULTIPLIER_BPS=25000\nMIN_PROFIT_MATIC_WEI=100000000000000000\nSTREAM_ENABLED=true\nEXECUTION_MODE=dry-run\n",
             )?;
-            jail.set_env("CONFIG_PATH", "myconfig.toml");
-            jail.set_env("EXECUTION_MODE", "dry-run");
+            jail.set_env("DOTENV_PATH", ".env");
             let config =
                 AppConfig::load().map_err(|e| figment::Error::from(format!("load: {e}")))?;
             assert!(config.pipeline.stream_enabled);
             assert_eq!(config.execution.profit_safety_multiplier_bps, 25000);
             assert_eq!(config.rpc.batch_pace_ms, 5);
             assert_eq!(config.execution.mode, "dry-run");
-            Ok(())
-        });
-    }
-
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn load_fails_closed_for_invalid_config_path() {
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            jail.set_env("DOTENV_PATH", "/non/existent/.env.for.test");
-            jail.create_file("invalid.toml", "this is not toml\n")
-                .expect("create invalid config fixture");
-            jail.set_env("CONFIG_PATH", "invalid.toml");
-            let result = AppConfig::load();
-            assert!(result.is_err());
             Ok(())
         });
     }

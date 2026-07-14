@@ -29,9 +29,7 @@ pub async fn ensure_matic_usd_for_flash_cap<P>(
 where
     P: Provider<Ethereum>,
 {
-    oracle
-        .ensure_matic_usd_for_flash_cap(state_provider)
-        .await
+    oracle.ensure_matic_usd_for_flash_cap(state_provider).await
 }
 
 #[must_use]

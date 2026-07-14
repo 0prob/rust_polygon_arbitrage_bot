@@ -259,6 +259,11 @@ pub fn resolve_lazy_swap_edge(
     if !state.hop_pair_routable(pending.token_in_idx as usize, token_out_idx as usize) {
         return None;
     }
+    let zero_for_one = if pending.protocol == ProtocolType::UniswapV4 {
+        arena.token_address(pending.token_in)? < arena.token_address(token_out)?
+    } else {
+        multi_zero_for_one(pending.token_in_idx, token_out_idx)
+    };
     let edge = Edge {
         pool_index: pending.pool_index,
         token_in: pending.token_in,
@@ -267,7 +272,7 @@ pub fn resolve_lazy_swap_edge(
         token_out_idx,
         protocol: pending.protocol,
         fee_bps: pending.fee_bps,
-        zero_for_one: multi_zero_for_one(pending.token_in_idx, token_out_idx),
+        zero_for_one,
     };
     let ratio = compute_edge_ratio(arena, &edge);
     if ratio.is_zero() {
@@ -524,6 +529,17 @@ pub fn count_eligible_pools_missing_from_graph(
             pool_has_admissible_edges(arena, meta) && !graph.pool_has_live_edges(meta.pool_index)
         })
         .count()
+}
+
+#[must_use]
+pub fn has_missing_eligible_pools(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    graph: &RoutingGraph,
+) -> bool {
+    pools.iter().any(|meta| {
+        pool_has_admissible_edges(arena, meta) && !graph.pool_has_live_edges(meta.pool_index)
+    })
 }
 
 /// Attach pools that became tradable since the last connectivity build.
@@ -959,6 +975,27 @@ mod tests {
             let ge = &graph.adjacency[adj_idx][edge_pos];
             assert_eq!(ge.edge.pool_index, pool);
         }
+    }
+
+    #[test]
+    fn cached_graph_has_no_missing_eligible_pools() {
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([1u8; 20]));
+        let b = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: MIN_HOP_TOKEN_BALANCE,
+                reserve1: MIN_HOP_TOKEN_BALANCE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let metas = [pool_meta_from_pair(pool, ProtocolType::UniswapV2, a, b, 30)];
+        let graph = build_graph(&arena, &metas);
+
+        assert!(!has_missing_eligible_pools(&arena, &metas, &graph));
     }
 
     #[test]

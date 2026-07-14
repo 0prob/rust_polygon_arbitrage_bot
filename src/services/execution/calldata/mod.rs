@@ -15,7 +15,9 @@ use crate::abis::ExecutorCall;
 use crate::core::types::{Edge, FlashLoanSource, PoolIndex, PoolState, ProtocolType};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
+use crate::services::execution::profit::slippage_adjusted;
 
+use crate::services::execution::quote::quote_hop_for_execution;
 use encoders::encode_hop_for_protocol;
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,7 @@ pub fn encode_route(
     {
         return encoders::balancer::encode_balancer_batch_route(hops, executor, config.deadline);
     }
+    let hops = conservative_execution_hops(arena, hops, config.slippage_bps)?;
     let mut calls = Vec::with_capacity(hops.len().saturating_mul(2));
     for (i, hop) in hops.iter().enumerate() {
         calls.extend(encode_hop_for_protocol(
@@ -102,6 +105,29 @@ pub fn encode_route(
         )?);
     }
     Ok(calls)
+}
+
+fn conservative_execution_hops(
+    arena: &StateArena,
+    hops: &[CalldataHop],
+    slippage_bps: u64,
+) -> anyhow::Result<Vec<CalldataHop>> {
+    let mut amount_in = hops
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("route requires at least one hop"))?
+        .amount_in;
+    let mut out = Vec::with_capacity(hops.len());
+    for hop in hops {
+        let mut hop = hop.clone();
+        hop.amount_in = amount_in;
+        let quoted_out = quote_hop_for_execution(arena, &hop)
+            .ok_or_else(|| anyhow::anyhow!("execution quote unavailable"))?;
+        hop.amount_out = slippage_adjusted(quoted_out, slippage_bps)
+            .ok_or_else(|| anyhow::anyhow!("execution hop min out is zero"))?;
+        amount_in = hop.amount_out;
+        out.push(hop);
+    }
+    Ok(out)
 }
 
 #[must_use]
@@ -138,7 +164,12 @@ pub fn build_calldata_hops(
     hop_amounts: &[U256],
     pool_metas_by_pool: &FxHashMap<PoolIndex, &PoolMeta>,
 ) -> Option<Vec<CalldataHop>> {
-    if hop_amounts.len() != edges.len() + 1 {
+    if edges.is_empty()
+        || hop_amounts.len() != edges.len() + 1
+        || edges
+            .windows(2)
+            .any(|pair| pair[0].token_out != pair[1].token_in)
+    {
         return None;
     }
     let mut hops = Vec::with_capacity(edges.len());
@@ -152,6 +183,9 @@ pub fn build_calldata_hops(
         if !crate::services::discovery::is_plausible_contract_address(token_in)
             || !crate::services::discovery::is_plausible_contract_address(token_out)
         {
+            return None;
+        }
+        if edge.protocol == ProtocolType::UniswapV4 && edge.zero_for_one != (token_in < token_out) {
             return None;
         }
         let meta = pool_metas_by_pool.get(&edge.pool_index).copied();
@@ -253,4 +287,97 @@ pub fn build_arb_calldata(
         route_hash,
         calls,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use alloy::primitives::Address;
+
+    use super::*;
+    use crate::core::types::{TokenIndex, V2PoolState};
+
+    fn v2_state() -> Arc<PoolState> {
+        Arc::new(PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(1_000_000u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 1,
+        }))
+    }
+
+    fn v2_hop(pool: PoolIndex, token_in: TokenIndex, token_out: TokenIndex) -> CalldataHop {
+        CalldataHop {
+            edge: Edge {
+                pool_index: pool,
+                token_in,
+                token_out,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            pool_address: Address::ZERO,
+            token_in: Address::ZERO,
+            token_out: Address::ZERO,
+            amount_in: U256::ZERO,
+            amount_out: U256::ZERO,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        }
+    }
+
+    #[test]
+    fn downstream_hop_uses_predecessor_min_out() {
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let t2 = arena.register_token(Address::from([3u8; 20]));
+        let first_pool = arena.register_pool(Address::from([4u8; 20]), v2_state());
+        let second_pool = arena.register_pool(Address::from([5u8; 20]), v2_state());
+        let mut first = v2_hop(first_pool, t0, t1);
+        first.amount_in = U256::from(1_000u64);
+        let second = v2_hop(second_pool, t1, t2);
+
+        let normalized = conservative_execution_hops(&arena, &[first.clone(), second], 100)
+            .expect("route should quote");
+        let quoted = quote_hop_for_execution(&arena, &first).expect("first quote");
+
+        assert!(normalized[0].amount_out < quoted);
+        assert_eq!(normalized[1].amount_in, normalized[0].amount_out);
+    }
+
+    #[test]
+    fn v4_hop_with_noncanonical_direction_is_rejected() {
+        let mut arena = StateArena::default();
+        let high = arena.register_token(Address::from([2u8; 20]));
+        let low = arena.register_token(Address::from([1u8; 20]));
+        let pool = arena.register_pool(Address::from([3u8; 20]), v2_state());
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: high,
+            token_out: low,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV4,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+
+        assert!(
+            build_calldata_hops(
+                &arena,
+                &edges,
+                &[U256::from(1u8), U256::from(1u8)],
+                &FxHashMap::default(),
+            )
+            .is_none()
+        );
+    }
 }

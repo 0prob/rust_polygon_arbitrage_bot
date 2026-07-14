@@ -65,7 +65,7 @@ cd ../sol && ./script/deploy_mainnet.sh
 # Set EXECUTOR_ADDRESS in .env to the logged address
 ```
 
-Config precedence: code defaults → `config.toml` (or `CONFIG_PATH`) → environment variables (later wins). The checked-in `config.toml` currently sets `min_profit_matic_wei = 0.01 MATIC`, `lf_interval_ms = 4000`, `hf_interval_ms = 200`, `max_multicall_calls = 200`, `routing.max_hops = 4`, `routing.enumeration_max_paths = 650`, `routing.ternary_search_iterations = 18`, `pipeline.stream_enabled = true`, `pipeline.lf_hot_batch = 600`, `pipeline.lf_full_sweep_interval = 60`, `pipeline.cycle_refind_interval = 8`, `pipeline.hf_sim_cap = 120`, `pipeline.hf_score_cap = 150`, `pipeline.hf_prefetch_count = 50`, `pipeline.hf_prefetch_budget_ms = 2500`, and `pipeline.hf_max_dispatch = 4`.
+Config precedence: code defaults → `.env` (or `DOTENV_PATH`) → variables already set in the process environment. Tuned LF/HF/routing/RPC values live in `.env.example`; copy to `.env` and adjust for your RPC tier.
 
 ## Run
 

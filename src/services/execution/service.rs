@@ -1160,7 +1160,7 @@ impl ExecutionService {
             }
         };
 
-        let nonce = match nonce_mgr.next_nonce() {
+        let mut nonce = match nonce_mgr.next_nonce() {
             Ok(n) => n,
             Err(e) => {
                 let outcome = ExecutionOutcome::SubmitFailed {
@@ -1180,7 +1180,7 @@ impl ExecutionService {
             &submit_provider,
             &nonce_mgr,
             candidate,
-            nonce,
+            &mut nonce,
             fees,
             final_gas,
             private_cfg.as_ref(),
@@ -1597,15 +1597,17 @@ mod safety_tests {
             state_block: 1,
             state_hash: None,
         };
-        assert!(ExecutionService::reassess_assessment(
-            &candidate,
-            100,
-            U256::from(1u8),
-            U256::ZERO,
-            Some(U256::ZERO),
-            0,
-        )
-        .is_none());
+        assert!(
+            ExecutionService::reassess_assessment(
+                &candidate,
+                100,
+                U256::from(1u8),
+                U256::ZERO,
+                Some(U256::ZERO),
+                0,
+            )
+            .is_none()
+        );
     }
 
     #[test]

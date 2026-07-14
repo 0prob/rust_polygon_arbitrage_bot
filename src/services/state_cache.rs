@@ -14,8 +14,6 @@ use crate::services::discovery::DiscoveredPool;
 const DEFAULT_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_INVALID_RETRY_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_STALE_TRADABLE_TTL: Duration = Duration::from_secs(300);
-const EVICT_INTERVAL: u64 = 64;
-const EVICT_INTERVAL_MASK: u64 = EVICT_INTERVAL.wrapping_sub(1);
 
 #[derive(Debug, Clone)]
 struct CachedEntry {
@@ -30,7 +28,6 @@ pub struct StateCache {
     ttl: Duration,
     invalid_retry_ttl: Duration,
     stale_tradable_ttl: Duration,
-    eviction_counter: AtomicU64,
     generation: AtomicU64,
     /// Pools touched since last graph partial-rescore drain.
     dirty: ParkingMutex<FxHashSet<Address>>,
@@ -51,7 +48,6 @@ impl StateCache {
             ttl,
             invalid_retry_ttl: DEFAULT_INVALID_RETRY_TTL,
             stale_tradable_ttl: DEFAULT_STALE_TRADABLE_TTL,
-            eviction_counter: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             dirty: ParkingMutex::new(FxHashSet::default()),
         }
@@ -308,10 +304,6 @@ impl StateCache {
     pub fn insert(&self, address: Address, state: PoolState) {
         let mut guard = self.inner.write();
         if guard.len() >= self.max_entries && !guard.contains_key(&address) {
-            let count = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
-            if count & EVICT_INTERVAL_MASK == 0 {
-                guard.retain(|_, v| v.updated_at.elapsed() <= self.ttl);
-            }
             if guard.len() >= self.max_entries
                 && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
             {

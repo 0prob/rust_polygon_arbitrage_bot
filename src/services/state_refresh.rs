@@ -60,6 +60,7 @@ pub struct StateRefreshService {
     pool_meta_cache: Arc<PoolMetaCache>,
     discovery_state: parking_lot::RwLock<DiscoveryState>,
     discovery_count: AtomicU64,
+    token_metadata_loaded: AtomicBool,
     discovery_skipped_ticks: AtomicU64,
     indexer_lag_blocks: AtomicU64,
     indexer_stale: AtomicBool,
@@ -93,6 +94,7 @@ impl StateRefreshService {
             pool_meta_cache,
             discovery_state: parking_lot::RwLock::new(DiscoveryState::default()),
             discovery_count: AtomicU64::new(0),
+            token_metadata_loaded: AtomicBool::new(false),
             discovery_skipped_ticks: AtomicU64::new(0),
             indexer_lag_blocks: AtomicU64::new(0),
             indexer_stale: AtomicBool::new(false),
@@ -328,6 +330,10 @@ impl StateRefreshService {
         self.discovery_state.write().last_discovery_ms = now_ms();
         self.discovery_count.fetch_add(1, Ordering::Relaxed);
 
+        if !self.token_metadata_loaded.load(Ordering::Acquire) {
+            self.refresh_token_metas().await;
+        }
+
         let decimals_started = now_ms();
         if !result.pools.is_empty() {
             self.enrich_token_decimals_from_pools(&result.pools).await;
@@ -354,7 +360,7 @@ impl StateRefreshService {
                         result.cursor.last_block
                     );
                 }
-                if self.discovery_state.read().token_metas.is_empty() {
+                if !self.token_metadata_loaded.load(Ordering::Acquire) {
                     self.refresh_token_metas().await;
                 }
                 return Ok(0);
@@ -412,7 +418,7 @@ impl StateRefreshService {
             );
         }
 
-        if self.discovery_state.read().token_metas.is_empty() {
+        if !self.token_metadata_loaded.load(Ordering::Acquire) {
             self.refresh_token_metas().await;
         }
         self.routable_pool_count_generation
@@ -505,6 +511,7 @@ impl StateRefreshService {
             Ok(metas) => {
                 let _count = metas.len();
                 self.set_token_metas(metas);
+                self.token_metadata_loaded.store(true, Ordering::Release);
                 crate::info!("token metadata refreshed: {_count}");
             }
             Err(_e) => crate::warn!("token metadata refresh failed: {_e:?}"),
@@ -668,8 +675,7 @@ impl StateRefreshService {
             hot.len(),
             max_pools
         );
-        let pool_refs: Vec<&DiscoveredPool> = pools.iter().collect();
-        self.refresh_pools_impl(&pool_refs, max_pools, hot.as_ref())
+        self.refresh_pools_impl(pools.as_ref(), max_pools, hot.as_ref())
             .await
     }
 
@@ -703,13 +709,13 @@ impl StateRefreshService {
         if selected_pools.is_empty() {
             return Ok(0);
         }
-        let pool_refs: Vec<&DiscoveredPool> = selected_pools.iter().collect();
-        self.refresh_pools_impl(&pool_refs, max_pools, &addrs).await
+        self.refresh_pools_impl(&selected_pools, max_pools, &addrs)
+            .await
     }
 
     async fn refresh_pools_impl(
         &self,
-        pools: &[&DiscoveredPool],
+        pools: &[DiscoveredPool],
         max_pools: usize,
         hot: &[Address],
     ) -> anyhow::Result<usize> {

@@ -40,6 +40,7 @@ impl RouteSimCacheStats {
 #[derive(Debug, Default)]
 pub struct RouteSimCache {
     entries: DashMap<RouteSimKey, MinimalSimResult, FxBuildHasher>,
+    pruned_generation: AtomicU64,
     pub stats: RouteSimCacheStats,
 }
 
@@ -48,13 +49,19 @@ impl RouteSimCache {
     pub fn new() -> Self {
         Self {
             entries: DashMap::with_capacity_and_hasher(ROUTE_SIM_CACHE_CAPACITY, FxBuildHasher),
+            pruned_generation: AtomicU64::new(u64::MAX),
             stats: RouteSimCacheStats::default(),
         }
     }
 
     pub fn clear_stale(&self, current_generation: u64) {
+        if self.pruned_generation.load(Ordering::Acquire) == current_generation {
+            return;
+        }
         self.entries
             .retain(|key, _| key.generation == current_generation);
+        self.pruned_generation
+            .store(current_generation, Ordering::Release);
     }
 
     #[must_use]
@@ -114,5 +121,33 @@ impl RouteSimCache {
             self.stats.evictions.load(Ordering::Relaxed),
             self.entries.len()
         );
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_stale_keeps_current_generation_entries() {
+        let cache = RouteSimCache::new();
+        cache.insert(
+            7,
+            11,
+            U256::from(1u8),
+            MinimalSimResult {
+                profit: U256::ZERO,
+                amount_out: U256::ZERO,
+                total_gas: 0,
+            },
+        );
+        cache.clear_stale(7);
+
+        assert_eq!(cache.entry_count(), 1);
     }
 }

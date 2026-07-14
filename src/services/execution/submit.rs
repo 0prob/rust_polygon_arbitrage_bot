@@ -142,7 +142,7 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
     provider: &P,
     nonce_mgr: &NonceManager,
     candidate: &CandidateExecution,
-    mut nonce: u64,
+    nonce: &mut u64,
     mut fees: SubmitFees,
     gas_limit: u64,
     private: Option<&PrivateSubmitConfig>,
@@ -154,7 +154,7 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
         let tx = build_transaction_request_with_calldata(
             candidate,
             calldata.clone(),
-            nonce,
+            *nonce,
             &fees,
             gas_limit,
         )?;
@@ -166,9 +166,9 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
                 }
                 match classify_submit_error(&e) {
                     SubmitAction::ResyncAndRetry => {
-                        nonce_mgr.release(nonce);
+                        nonce_mgr.release(*nonce);
                         nonce_mgr.resync(provider).await?;
-                        nonce = nonce_mgr.next_nonce()?;
+                        *nonce = nonce_mgr.next_nonce()?;
                     }
                     SubmitAction::BumpFeesAndRetry => {
                         fees = bump_fees(fees, FEE_BUMP_BPS);

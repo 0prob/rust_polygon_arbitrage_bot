@@ -121,7 +121,6 @@ pub fn log(level: &'static str, module: &'static str, mut message: String) {
 fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
     let palette = Palette::detect();
     let mut files = LogFiles::new(run_dir);
-    let mut stdout = std::io::BufWriter::with_capacity(16 * 1024, std::io::stdout().lock());
     let flush_interval = std::time::Duration::from_millis(250);
     let mut next_flush = std::time::Instant::now() + flush_interval;
     loop {
@@ -131,9 +130,8 @@ fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
             Ok(command) => command,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(error) = files.flush() {
-                    let _ = format::write_sink_error(&mut stdout, &error, &palette);
+                    with_stdout(|stdout| format::write_sink_error(stdout, &error, &palette));
                 }
-                let _ = stdout.flush();
                 next_flush = std::time::Instant::now() + flush_interval;
                 continue;
             }
@@ -142,11 +140,9 @@ fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
         match command {
             Command::Event(event) => {
                 let component = component_for_module(event.module);
-                if STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = format::write_stdout(&mut stdout, &event, component, &palette);
-                }
+                with_stdout(|stdout| format::write_stdout(stdout, &event, component, &palette));
                 if let Err(error) = files.write(&event, component) {
-                    let _ = format::write_sink_error(&mut stdout, &error, &palette);
+                    with_stdout(|stdout| format::write_sink_error(stdout, &error, &palette));
                 }
                 let dropped = DROPPED_EVENTS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 if dropped > 0 {
@@ -156,28 +152,36 @@ fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
                         module: "rpbot::log",
                         message: format!("log queue saturated; dropped_events={dropped}"),
                     };
-                    if STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = format::write_stdout(&mut stdout, &warning, "system", &palette);
-                    }
+                    with_stdout(|stdout| {
+                        format::write_stdout(stdout, &warning, "system", &palette)
+                    });
                     let _ = files.write(&warning, "system");
                 }
                 if std::time::Instant::now() >= next_flush {
                     if let Err(error) = files.flush() {
-                        let _ = format::write_sink_error(&mut stdout, &error, &palette);
+                        with_stdout(|stdout| format::write_sink_error(stdout, &error, &palette));
                     }
-                    let _ = stdout.flush();
                     next_flush = std::time::Instant::now() + flush_interval;
                 }
             }
             Command::Shutdown => {
                 if let Err(error) = files.flush() {
-                    let _ = format::write_sink_error(&mut stdout, &error, &palette);
+                    with_stdout(|stdout| format::write_sink_error(stdout, &error, &palette));
                 }
-                let _ = stdout.flush();
                 return;
             }
         }
     }
+}
+
+fn with_stdout(write: impl FnOnce(&mut io::BufWriter<io::StdoutLock<'_>>) -> io::Result<()>) {
+    if !STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let stdout = io::stdout();
+    let mut stdout = io::BufWriter::with_capacity(16 * 1024, stdout.lock());
+    let _ = write(&mut stdout);
+    let _ = stdout.flush();
 }
 
 fn prepare_run_dir(root: &Path) -> io::Result<PathBuf> {

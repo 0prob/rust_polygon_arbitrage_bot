@@ -498,7 +498,12 @@ pub fn simulate_route_minimal(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
-    if edges.is_empty() || edges.len() > HOP_CAP_USIZE {
+    if edges.is_empty()
+        || edges.len() > HOP_CAP_USIZE
+        || edges
+            .windows(2)
+            .any(|pair| pair[0].token_out != pair[1].token_in)
+    {
         return None;
     }
     if amount_in.is_zero() {
@@ -538,7 +543,12 @@ pub fn simulate_route_detailed(
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
-    if hop_count == 0 || hop_count > HOP_CAP_USIZE {
+    if hop_count == 0
+        || hop_count > HOP_CAP_USIZE
+        || edges
+            .windows(2)
+            .any(|pair| pair[0].token_out != pair[1].token_in)
+    {
         return None;
     }
     if amount_in.is_zero() {
@@ -638,6 +648,51 @@ mod tests {
         let sim = simulate_route_minimal(&arena, &[edge], U256::ZERO).expect("zero sim");
         assert!(sim.profit.is_zero());
         assert!(sim.amount_out.is_zero());
+    }
+
+    #[test]
+    fn disconnected_hops_fail_closed_even_for_zero_amount() {
+        use crate::core::types::V2PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let t2 = arena.register_token(Address::from([3u8; 20]));
+        let state = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(1_000_000u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 1,
+        }));
+        let first_pool = arena.register_pool(Address::from([4u8; 20]), Arc::clone(&state));
+        let second_pool = arena.register_pool(Address::from([5u8; 20]), state);
+        let edges = [
+            Edge {
+                pool_index: first_pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: second_pool,
+                token_in: t2,
+                token_out: t0,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+        ];
+
+        assert!(simulate_route_minimal(&arena, &edges, U256::ZERO).is_none());
+        assert!(simulate_route_detailed(&arena, &edges, U256::from(100u64)).is_none());
     }
 
     #[test]

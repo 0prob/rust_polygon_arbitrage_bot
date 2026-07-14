@@ -25,7 +25,6 @@ use crate::services::execution::flash_liquidity::{
 };
 use crate::services::execution::gas_oracle::RouteGasLookup;
 
-use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::execution::balancer_verify::{
     BatchQueryOutcome, balancer_batch_within_max_in_ratio, batch_profit_covers_min,
     query_balancer_batch_profit,
@@ -36,6 +35,7 @@ use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
     prepare_evaluated_route,
 };
+use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
 
 pub(crate) struct DispatchInputs<'a> {
@@ -235,6 +235,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
     let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
     let mut dispatch_state_generation = state_generation;
+    let mut dispatch_state_block = state_block;
+    let mut dispatch_state_hash = state_hash;
     let refresh_required = !skip_dispatch_refresh && !dispatch_pools.is_empty();
     let pools_refreshed = if !refresh_required {
         false
@@ -247,6 +249,12 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             Ok(updated) if updated > 0 => {
                 dispatch_state_generation = arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
                 let tick_block = ctx.refresh.last_state_block();
+                if tick_block == 0 {
+                    crate::warn!("dispatch aborted: refreshed route state has no pinned block");
+                    return;
+                }
+                dispatch_state_block = tick_block;
+                dispatch_state_hash = ctx.refresh.last_state_hash();
                 enrich_dispatch_cl_ticks(
                     sim_provider,
                     arena,
@@ -307,8 +315,8 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             token_to_matic_rates,
             token_decimals,
             dispatch_state_generation,
-            state_block,
-            state_hash,
+            dispatch_state_block,
+            dispatch_state_hash,
             pools_refreshed,
             flash_policy,
             gas_price,

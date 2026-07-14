@@ -20,7 +20,6 @@ use crate::orchestrator::hf_execute::{
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -29,6 +28,7 @@ use crate::services::execution::{
     ExecutionService, GasOracle, hash_cycle_edges, rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
+use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::partial_cache::PartialPoolCache;
@@ -129,11 +129,17 @@ fn should_log_best_eval() -> bool {
 struct BestEvalDiag {
     fp: u64,
     hops: u32,
+    route: String,
     input: U256,
-    sim_gas: u32,
+    raw_sim_gas: u32,
+    assessed_gas: u32,
+    gas_basis: &'static str,
+    sim_scale_bps: u64,
+    gas_price_gwei: f64,
     gross: U256,
     net_matic: U256,
     gas_cost_wei: U256,
+    slippage_bps: u64,
     slippage: U256,
     flash_fee: U256,
     reject: Option<String>,
@@ -142,14 +148,20 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} input={} sim_gas={} gross={} net_matic={} gas_cost_wei={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} slippage_bps={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
+        diag.route,
         diag.input,
-        diag.sim_gas,
+        diag.raw_sim_gas,
+        diag.assessed_gas,
+        diag.gas_basis,
+        diag.sim_scale_bps,
+        diag.gas_price_gwei,
         diag.gross,
         diag.net_matic,
         diag.gas_cost_wei,
+        diag.slippage_bps,
         diag.slippage,
         diag.flash_fee,
         reason,
@@ -463,30 +475,42 @@ pub async fn run_hf_tick(
     let flash_policy = ctx.config.flash_policy;
     let state_provider = ctx.rpc.connect_state().ok();
     let state_provider_ref = state_provider.as_ref();
-    let matic_usd = match timeout(
-        Duration::from_millis(800),
-        ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
-    )
-    .await
-    {
-        Ok(Some(usd)) => usd,
-        Ok(None) => {
-            warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle unavailable for flash loan cap");
-            return Ok(HfTickResult {
-                cycles_considered: cycles.len(),
-                profitable_count: 0,
-                best_profit: U256::ZERO,
-                elapsed_ms: now_ms().saturating_sub(start),
-            });
-        }
-        Err(_) => {
-            warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
-            return Ok(HfTickResult {
-                cycles_considered: cycles.len(),
-                profitable_count: 0,
-                best_profit: U256::ZERO,
-                elapsed_ms: now_ms().saturating_sub(start),
-            });
+    let matic_usd = if let Some(usd) = ctx.price_oracle.cached_matic_usd() {
+        usd
+    } else if let Some((usd, age)) = ctx.price_oracle.last_known_matic_usd() {
+        warn_hf_oracle_skip(&format!(
+            "hf eval using stale MATIC/USD while refresh runs (age_ms={})",
+            age.as_millis()
+        ));
+        usd
+    } else {
+        match timeout(
+            Duration::from_millis(800),
+            ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
+        )
+        .await
+        {
+            Ok(Some(usd)) => usd,
+            Ok(None) => {
+                warn_hf_oracle_skip(
+                    "hf eval skipped: MATIC/USD oracle unavailable for flash loan cap",
+                );
+                return Ok(HfTickResult {
+                    cycles_considered: cycles.len(),
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                });
+            }
+            Err(_) => {
+                warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
+                return Ok(HfTickResult {
+                    cycles_considered: cycles.len(),
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                });
+            }
         }
     };
 
@@ -540,6 +564,8 @@ pub async fn run_hf_tick(
     let mut best_near_miss: Option<HfEvalResult> = None;
     let mut best_gross_diag: Option<BestEvalDiag> = None;
     let mut best_gross_probe: Option<HfEvalResult> = None;
+    let mut zero_net_rejects = 0usize;
+    let mut positive_net_rejects = 0usize;
 
     for result in eval_results {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
@@ -551,14 +577,32 @@ pub async fn run_hf_tick(
             .as_ref()
             .is_none_or(|best| assessment.gross_profit > best.gross);
         if gross_dominated && !assessment.gross_profit.is_zero() {
+            let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
                 hops: result.cycle.hop_count,
+                route: near_miss_route_summary(
+                    eval_arena.as_ref(),
+                    &result.cycle,
+                    pool_metas_for_dispatch.as_ref(),
+                ),
                 input: result.sim.amount_in,
-                sim_gas: result.sim.total_gas,
+                raw_sim_gas: result.sim.total_gas,
+                assessed_gas: observed_gas.unwrap_or_else(|| {
+                    ctx.gas_oracle
+                        .route_gas_or_heuristic(result.route_fingerprint, result.sim.total_gas)
+                }),
+                gas_basis: if observed_gas.is_some() {
+                    "observed_route"
+                } else {
+                    "scaled_heuristic"
+                },
+                sim_scale_bps: ctx.gas_oracle.sim_scale_bps(),
+                gas_price_gwei: crate::util::u256_to_f64(gas_price) / 1e9,
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
                 gas_cost_wei: assessment.revert_penalty,
+                slippage_bps: result.effective_slippage_bps,
                 slippage: assessment.slippage_deduction,
                 flash_fee: assessment.flash_loan_fee,
                 reject: assessment.reject_reason.clone(),
@@ -569,18 +613,25 @@ pub async fn run_hf_tick(
         }
         if assessment.should_execute {
             profitable.push(result);
-        } else if matic > U256::ZERO {
-            let dominated = best_near_miss
-                .as_ref()
-                .is_none_or(|best| matic > best.assessment.net_profit_after_gas_matic_wei);
-            if dominated {
-                best_near_miss = Some(result);
+        } else {
+            if matic.is_zero() {
+                zero_net_rejects += 1;
+            } else {
+                positive_net_rejects += 1;
+                let dominated = best_near_miss
+                    .as_ref()
+                    .is_none_or(|best| matic > best.assessment.net_profit_after_gas_matic_wei);
+                if dominated {
+                    best_near_miss = Some(result);
+                }
             }
         }
     }
 
     let mut skip_dispatch_refresh = prefetch_ok;
     let mut dispatch_state_generation = evaluation_state_generation;
+    let mut dispatch_state_block = snap.state_block;
+    let mut dispatch_state_hash = snap.state_hash;
     if !profitable.is_empty() && ctx.config.execution.executor_address.is_some() {
         let sim_provider = match ctx.rpc.connect_simulation() {
             Ok(p) => Some(p),
@@ -611,6 +662,12 @@ pub async fn run_hf_tick(
             skip_dispatch_refresh = prefetch_ok || resim_refreshed;
             if resim_refreshed {
                 dispatch_state_generation = resim_generation;
+                dispatch_state_block = ctx.refresh.last_state_block();
+                dispatch_state_hash = ctx.refresh.last_state_hash();
+                if dispatch_state_block == 0 {
+                    crate::warn!("dropping refreshed routes: state refresh has no pinned block");
+                    profitable.clear();
+                }
             }
             profitable = filter_balancer_onchain_verified(
                 Arc::clone(&ctx.execution),
@@ -645,10 +702,16 @@ pub async fn run_hf_tick(
     let elapsed_ms = now_ms().saturating_sub(start);
 
     if cycles_considered > 0 {
-        if profitable_count > 0 || should_log_hf_summary() {
+        let log_summary = profitable_count > 0 || should_log_hf_summary();
+        if log_summary {
             crate::info!(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
             );
+            if profitable_count == 0 && eval_count > 0 {
+                crate::info!(
+                    "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
+                );
+            }
         }
         if eval_count == 0 {
             crate::debug!(
@@ -714,8 +777,8 @@ pub async fn run_hf_tick(
                 token_to_matic_rates: dispatch_token_to_matic_rates.as_ref(),
                 token_decimals: dispatch_token_decimals.as_ref(),
                 state_generation: dispatch_state_generation,
-                state_block: snap.state_block,
-                state_hash: snap.state_hash,
+                state_block: dispatch_state_block,
+                state_hash: dispatch_state_hash,
                 skip_dispatch_refresh,
             },
         )

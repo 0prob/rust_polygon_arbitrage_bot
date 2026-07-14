@@ -10,6 +10,9 @@ async fn main() -> anyhow::Result<()> {
     rpbot::config::load_dotenv();
     rpbot::log::init()?;
     rpbot::log::set_stdout_enabled(false);
+    if let Some(dir) = rpbot::log::run_dir() {
+        eprintln!("rpbot tui: logging to {}", dir.display());
+    }
 
     let (bridge, rx, snapshot_rx) = TuiBridge::channel();
     let hook = bridge.hook();

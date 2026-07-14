@@ -47,7 +47,8 @@ struct SkipCounters {
     rate: u32,
     flash: u32,
     flash_source: u32,
-    probe: u32,
+    missing_decimals: u32,
+    minimal_sim: u32,
     net: u32,
 }
 
@@ -56,8 +57,13 @@ impl SkipCounters {
         self.rate += other.rate;
         self.flash += other.flash;
         self.flash_source += other.flash_source;
-        self.probe += other.probe;
+        self.missing_decimals += other.missing_decimals;
+        self.minimal_sim += other.minimal_sim;
         self.net += other.net;
+    }
+
+    fn probe(&self) -> u32 {
+        self.missing_decimals + self.minimal_sim
     }
 }
 
@@ -343,7 +349,7 @@ fn rank_one_cycle_probe(
         return out;
     }
     if !cycle_tokens_have_known_decimals(&cycle, arena, token_decimals) {
-        out.skip.probe = 1;
+        out.skip.missing_decimals = 1;
         return out;
     }
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
@@ -363,7 +369,7 @@ fn rank_one_cycle_probe(
         if cycle.score < 0.0 {
             out.rescue.push((fp, cycle.into_owned()));
         } else {
-            out.skip.probe = 1;
+            out.skip.minimal_sim = 1;
         }
         return out;
     };
@@ -579,11 +585,13 @@ pub fn rank_cycles_by_probe_net(
         }
         if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} skip_net={} near_net={near_net_count} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
-                skip.probe,
+                skip.probe(),
+                skip.missing_decimals,
+                skip.minimal_sim,
                 skip.net,
             );
         }
@@ -593,23 +601,27 @@ pub fn rank_cycles_by_probe_net(
     if kept.is_empty() && !scanned.is_empty() {
         let sample = partial.flash_diag.as_deref().unwrap_or("none");
         crate::debug!(
-            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} rescue={rescue_len} sample={sample}",
+            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
             skip.rate,
             skip.flash,
             skip.flash_source,
-            skip.probe,
+            skip.probe(),
+            skip.missing_decimals,
+            skip.minimal_sim,
             skip.net,
         );
     } else if kept.len() * 4 < scanned.len() {
         crate::debug!(
-            "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} skip_net={} near_net={}",
+            "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={}",
             kept.len(),
             scanned.len(),
             skip.rate,
             skip.flash,
             skip.flash_source,
-            skip.probe,
+            skip.probe(),
+            skip.missing_decimals,
+            skip.minimal_sim,
             skip.net,
             near_net_count,
         );
@@ -1230,5 +1242,33 @@ mod tests {
         assert_eq!(kept.len(), 4);
         assert_eq!(kept[0].1.start_token, TokenIndex(1));
         assert_eq!(kept[1].1.start_token, TokenIndex(2));
+    }
+
+    #[test]
+    fn probe_skip_counters_keep_missing_decimals_distinct_from_simulation_rejects() {
+        let mut aggregate = SkipCounters::default();
+        aggregate.merge(SkipCounters {
+            missing_decimals: 2,
+            minimal_sim: 3,
+            ..SkipCounters::default()
+        });
+
+        assert_eq!(aggregate.missing_decimals, 2);
+        assert_eq!(aggregate.minimal_sim, 3);
+        assert_eq!(aggregate.probe(), 5);
+    }
+
+    #[test]
+    fn probe_skip_counter_merge_does_not_double_count_reduced_partials() {
+        let mut reduced = SkipCounters::default();
+        reduced.merge(SkipCounters {
+            missing_decimals: 2,
+            ..SkipCounters::default()
+        });
+
+        let mut aggregate = SkipCounters::default();
+        aggregate.merge(reduced);
+
+        assert_eq!(aggregate.probe(), 2);
     }
 }

@@ -213,6 +213,13 @@ impl PriceOracle {
             .map(|entry| entry.value)
     }
 
+    pub fn last_known_matic_usd(&self) -> Option<(f64, Duration)> {
+        self.matic_usd.read().as_ref().and_then(|entry| {
+            crate::pipeline::sim_sanity::matic_usd_for_flash_cap(entry.value)
+                .map(|usd| (usd, entry.updated_at.elapsed()))
+        })
+    }
+
     pub async fn get_matic_usd<P: Provider<Ethereum>>(&self, provider: Option<&P>) -> f64 {
         {
             let cache = self.matic_usd.read();
@@ -917,5 +924,10 @@ mod tests {
             updated_at: Instant::now() - Duration::from_millis(1),
         });
         assert!(oracle.cached_matic_usd().is_none());
+        assert!(
+            oracle
+                .last_known_matic_usd()
+                .is_some_and(|(usd, age)| usd == 1.0 && age >= Duration::from_millis(1))
+        );
     }
 }

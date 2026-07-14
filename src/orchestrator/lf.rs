@@ -58,6 +58,7 @@ struct LfCpuResult {
     cycles: Arc<Vec<crate::core::types::FoundCycle>>,
     /// Cycle enumeration only (0 when graph cache reused).
     enumeration_ms: u64,
+    enumerated_cycles: usize,
 }
 
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
@@ -102,7 +103,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         )
     };
 
-    let graph = if needs_rebuild {
+    let mut graph = if needs_rebuild {
         if connectivity_stale {
             let gc = work.graph_cache.lock();
             crate::debug!(
@@ -188,14 +189,19 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         }
     };
 
-    let mut graph = graph;
-    let missing_graph_pools = {
+    let missing_graph_pools = if crate::pipeline::graph::has_missing_eligible_pools(
+        &work.arena,
+        work.pool_metas.as_ref(),
+        graph.as_ref(),
+    ) {
         let g = Arc::make_mut(&mut graph);
         crate::pipeline::graph::attach_missing_eligible_pools(
             &work.arena,
             g,
             work.pool_metas.as_ref(),
         )
+    } else {
+        0
     };
     if missing_graph_pools > 0 {
         crate::info!(
@@ -224,7 +230,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             )
     };
     let mut enumeration_ms = 0u64;
-    let cycles = if need_cycle_refind {
+    let (cycles, enumerated_cycles) = if need_cycle_refind {
         crate::debug!(
             "lf cycle refind: pass={} dirty_pools={} state_gen={}",
             work.lf_pass,
@@ -261,6 +267,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             );
         }
         enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
+        let enumerated_cycles = result.len();
         let diversified = finalize_enumerated_cycles(result, work.max_paths);
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
@@ -278,7 +285,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             work.state_generation,
             eligible_count,
         );
-        cycles
+        (cycles, enumerated_cycles)
     } else {
         let gc = work.graph_cache.lock();
         let cached = gc.cycles().unwrap_or_default();
@@ -289,13 +296,15 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
                 cached.len()
             );
         }
-        cached
+        let enumerated_cycles = cached.len();
+        (cached, enumerated_cycles)
     };
 
     LfCpuResult {
         graph,
         cycles,
         enumeration_ms,
+        enumerated_cycles,
     }
 }
 
@@ -357,7 +366,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         crate::services::discovery::log_protocol_distribution(&pools);
     }
 
-    let mut arena = StateArena::default();
+    let mut arena = ctx.arena.lock().clone();
     crate::debug!(
         "lf sync: discovered={}, cache_size={}",
         pools.len(),
@@ -424,6 +433,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let cycles_arc = cpu.cycles;
     let routing_graph = cpu.graph;
     let cycle_search_ms = cpu.enumeration_ms;
+    let enumerated_cycles = cpu.enumerated_cycles;
 
     // ponytail: collect unique cycle tokens without intermediate HashSet→Vec copy
     let mut cycle_tokens: Vec<TokenIndex> =
@@ -535,8 +545,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     let graph_pool_count = routing_graph.active_pool_count();
     crate::info!(
-        "lf tick: cycles={}, cycle_search_ms={}, arena_pools={}, graph_pools={}, discovered={}, resolvable_tokens={}",
+        "lf tick: cycles={}, enumerated_cycles={}, cycle_search_ms={}, arena_pools={}, graph_pools={}, discovered={}, resolvable_tokens={}",
         _cycle_count,
+        enumerated_cycles,
         cycle_search_ms,
         _pool_count,
         graph_pool_count,

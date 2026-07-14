@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::{mpsc, mpsc::Receiver, watch};
 
 use crate::orchestrator::{RuntimeContext, run_pass_loop};
@@ -27,18 +26,18 @@ pub async fn run_tui<F>(
 where
     F: Future<Output = anyhow::Result<Arc<RuntimeContext>>> + Send + 'static,
 {
-    // Overlap config/runtime init with terminal setup (bootstrap uses spawn_blocking internally).
-    let bootstrap_task = tokio::spawn(async move { bootstrap.await });
-    let mut terminal = TerminalGuard::enter().context("failed to initialize terminal")?;
-    draw_boot_blocking(&mut terminal, "Loading configuration…")?;
+    // Bootstrap before taking the TTY: parallel terminal draw + spawn_blocking historically
+    // stalled on "Loading configuration…" (SIGTTOU / blocking-pool contention). Logs go to
+    // RPBot run dir while this runs (`RPBOT_LOG=debug` for phase timings).
+    crate::info!("tui: loading configuration");
+    let boot_started = std::time::Instant::now();
+    let ctx = bootstrap.await?;
+    crate::info!(
+        "tui: configuration ready in {}ms",
+        boot_started.elapsed().as_millis()
+    );
 
-    let ctx = match bootstrap_task.await.context("bootstrap task join failed")? {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            terminal.restore().ok();
-            return Err(error);
-        }
-    };
+    let mut terminal = TerminalGuard::enter().context("failed to initialize terminal")?;
 
     let mut app = App::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -142,18 +141,4 @@ fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
 
 fn draw_frame_blocking(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
     tokio::task::block_in_place(|| draw_frame(terminal, app))
-}
-
-fn draw_boot_blocking(terminal: &mut TerminalGuard, message: &str) -> anyhow::Result<()> {
-    tokio::task::block_in_place(|| {
-        terminal
-            .terminal()
-            .draw(|frame| {
-                frame.render_widget(
-                    Paragraph::new(message).block(Block::bordered().title(" rpbot ")),
-                    frame.area(),
-                );
-            })?;
-        Ok(())
-    })
 }

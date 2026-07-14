@@ -15,9 +15,11 @@ pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<
 #[must_use]
 pub fn resolve_v3_fee_pips_for_hop(arena: &StateArena, hop: &CalldataHop) -> u32 {
     match arena.pool_state(hop.edge.pool_index) {
-        Some(PoolState::V3(s) | PoolState::V4(s)) => resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
-            .min(U256::from(0xffffffu32))
-            .to::<u32>(),
+        Some(PoolState::V3(s) | PoolState::V4(s)) => {
+            resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
+                .min(U256::from(0xffffffu32))
+                .to::<u32>()
+        }
         _ => hop.edge.fee_bps.min(0xffffff),
     }
 }

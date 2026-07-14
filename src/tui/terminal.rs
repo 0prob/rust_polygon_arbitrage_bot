@@ -9,6 +9,7 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn enter() -> anyhow::Result<Self> {
+        ignore_job_control_tty_stops();
         Ok(Self {
             terminal: ratatui::try_init().context("failed to initialize ratatui terminal")?,
             restored: false,
@@ -33,3 +34,16 @@ impl Drop for TerminalGuard {
         let _ = self.restore();
     }
 }
+
+/// Prevent SIGTTIN/SIGTTOU from freezing the process when the TTY is not foreground
+/// (e.g. job control, some multiplexer/wrapper setups).
+#[cfg(unix)]
+fn ignore_job_control_tty_stops() {
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(unix))]
+fn ignore_job_control_tty_stops() {}

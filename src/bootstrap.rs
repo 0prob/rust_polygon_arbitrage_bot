@@ -109,8 +109,10 @@ struct BlockingBootstrap {
 /// Config load, startup logs, hypersync client build, and runtime init on a blocking thread.
 fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
     let config_started = crate::util::now_ms();
+    crate::debug!("bootstrap: loading config and wallet");
     let (config, wallet) = load_config_and_wallet()?;
     let config_ms = crate::util::now_ms().saturating_sub(config_started);
+    crate::debug!("bootstrap: config loaded in {config_ms}ms");
 
     log_startup(&config);
 
@@ -121,8 +123,10 @@ fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
     let hypersync_built = hypersync.is_some();
 
     let runtime_started = crate::util::now_ms();
+    crate::debug!("bootstrap: building runtime context");
     let runtime = build_runtime(config, wallet, hypersync)?;
     let runtime_ms = crate::util::now_ms().saturating_sub(runtime_started);
+    crate::debug!("bootstrap: runtime built in {runtime_ms}ms");
 
     Ok(BlockingBootstrap {
         runtime,
@@ -138,7 +142,7 @@ fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
 /// installing a UI hook for TUI), and spawns the non-blocking pg + hypersync connectivity probes
 /// (their results log asynchronously).
 ///
-/// The config/wallet load (which may do filesystem reads for .env / PRIVATE_KEY_FILE / config.toml)
+/// The config/wallet load (which may do filesystem reads for `.env` / `PRIVATE_KEY_FILE`)
 /// is performed via `spawn_blocking` so it does not occupy an async worker thread.
 async fn bootstrap_inner(
     ui_hook: Option<SharedUiHook>,
@@ -204,12 +208,12 @@ mod tests {
 
     /// Smoke timing for local profiling (`cargo test bootstrap_runtime_build_smoke -- --ignored`).
     #[test]
-    #[ignore = "requires project .env / config.toml"]
+    #[ignore = "requires project .env"]
     fn bootstrap_runtime_build_smoke() {
         let block = run_blocking_bootstrap().expect("blocking bootstrap");
         assert!(block.config_ms < 60_000);
         assert!(block.runtime_ms < 60_000);
-        assert!(block.runtime.config.pg_url.len() > 0);
+        assert!(!block.runtime.config.pg_url.is_empty());
     }
 
     #[test]

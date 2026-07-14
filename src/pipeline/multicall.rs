@@ -5,7 +5,9 @@ use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use crate::abis::IMulticall3;
 use crate::core::constants::MULTICALL3;
@@ -15,6 +17,14 @@ pub const MULTICALL_CHUNK: usize = 200;
 /// Max concurrent chunk RPCs for batched multicalls. Parallelizes IO for large
 /// refreshes (e.g. 1000+ pools) while a semaphore prevents thundering herd.
 pub const MAX_CONCURRENT_CHUNKS: usize = 8;
+
+static GLOBAL_MULTICALL_ADMISSION: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_CHUNKS));
+
+#[cfg(test)]
+fn global_multicall_available_permits() -> usize {
+    GLOBAL_MULTICALL_ADMISSION.available_permits()
+}
 
 /// Plan-batch call budget sized so `execute_multicall_at_chunked` can fan out
 /// across [`MAX_CONCURRENT_CHUNKS`] RPC chunks instead of serializing one chunk.
@@ -117,6 +127,10 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
         if let Some(number) = block_number {
             call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
         }
+        let _permit = GLOBAL_MULTICALL_ADMISSION
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("global multicall admission closed"))?;
         match call.call().await {
             Ok(results) => {
                 return Ok(results
@@ -244,7 +258,15 @@ pub fn encode_call<C: SolCall>(call: &C) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{MULTICALL_CHUNK, is_retryable_rpc_error, plan_batch_call_budget};
+    use super::{
+        MULTICALL_CHUNK, global_multicall_available_permits, is_retryable_rpc_error,
+        plan_batch_call_budget,
+    };
+
+    #[test]
+    fn global_multicall_admission_matches_chunk_limit() {
+        assert_eq!(global_multicall_available_permits(), 8);
+    }
 
     #[test]
     fn retries_transient_rpc_responses_only() {
