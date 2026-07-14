@@ -506,7 +506,17 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     } else {
         U256::ZERO
     };
-    let net_profit_after_gas_matic_wei = gross_profit_matic_wei.saturating_sub(gas_cost_wei);
+    let flash_fee_matic_wei = if rate_ok {
+        let Some(native_fee) = flash_loan_fee.checked_mul(input.token_to_matic_rate) else {
+            return rejected_arithmetic(input, "flash fee MATIC conversion overflow");
+        };
+        native_fee / scale
+    } else {
+        U256::ZERO
+    };
+    let net_profit_after_gas_matic_wei = gross_profit_matic_wei
+        .saturating_sub(flash_fee_matic_wei)
+        .saturating_sub(gas_cost_wei);
 
     let required_net_matic = safety_floor_matic_wei(revert_penalty, input.safety_multiplier_bps);
     let estimated_matic = gross_profit_matic_wei;
@@ -548,6 +558,8 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         None
     } else if !rate_ok {
         Some("token/MATIC rate too low or unavailable".into())
+    } else if net_after_priority.is_zero() || net_profit_after_gas.is_zero() {
+        Some("non-positive net profit after gas".into())
     } else if !meets_safety_ratio {
         Some(format!(
             "net profit {net_after_priority} MATIC wei below safety floor {required_net_matic} (incl priority uplift {priority_uplift})"

@@ -671,7 +671,8 @@ pub fn balancer_route_flash_feasible(
         return true;
     }
     if !cycle_flash_cache_warm(cycle, arena, flash, ttl) {
-        return false;
+        // HF flash prefetch may still be in flight during probe rank; eval re-checks with warm data.
+        return true;
     }
     cycle_has_aave_listed_token(cycle, arena, flash, ttl)
 }

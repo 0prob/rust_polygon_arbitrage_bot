@@ -774,16 +774,24 @@ impl AppConfig {
     }
 
     /// Ordered state-read endpoints used for multicall pool refresh (matches [`RpcPool`]).
+    /// Never includes [`RpcConfig::execution_rpc_url`] so execution quota is not spent on multicall.
     #[must_use]
     pub fn state_read_urls(&self) -> Vec<String> {
+        let exec = self.rpc.execution_rpc_url.trim();
         let mut urls = Vec::with_capacity(1 + self.rpc.polygon_rpc_urls.len());
         if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty()) {
-            urls.push(url.to_string());
+            if exec.is_empty() || url != exec {
+                urls.push(url.to_string());
+            }
         }
         for url in &self.rpc.polygon_rpc_urls {
-            if !url.is_empty() && !urls.iter().any(|u| u == url) {
-                urls.push(url.clone());
+            if url.is_empty() || urls.iter().any(|u| u == url) {
+                continue;
             }
+            if !exec.is_empty() && url.as_str() == exec {
+                continue;
+            }
+            urls.push(url.clone());
         }
         urls
     }
@@ -868,6 +876,24 @@ mod tests {
         config.rpc.execution_rpc_url = "https://exec.example".into();
         assert!(config.state_read_urls().is_empty());
         assert!(config.state_rpc_url().is_none());
+    }
+
+    #[test]
+    fn state_read_urls_skip_execution_rpc_duplicates() {
+        let mut config = AppConfig::default();
+        config.rpc.execution_rpc_url = "https://shared.drpc".into();
+        config.rpc.state_rpc_url = Some("https://state.example".into());
+        config.rpc.polygon_rpc_urls = vec![
+            "https://shared.drpc".into(),
+            "https://poly.example".into(),
+        ];
+        assert_eq!(
+            config.state_read_urls(),
+            vec![
+                "https://state.example".to_string(),
+                "https://poly.example".to_string(),
+            ]
+        );
     }
 
     #[test]

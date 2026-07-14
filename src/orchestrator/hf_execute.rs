@@ -1,5 +1,5 @@
 use alloy::network::Ethereum;
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use futures_util::{StreamExt, stream};
 use rustc_hash::FxHashMap;
@@ -37,6 +37,49 @@ use crate::services::execution::{
 };
 use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
+use crate::services::state_refresh::PoolRefreshResult;
+
+enum RoutePoolRefreshAbort {
+    NotIndexed { pool_count: usize },
+    Rpc(anyhow::Error),
+}
+
+async fn refresh_route_pools_into_arena(
+    refresh: &crate::services::state_refresh::StateRefreshService,
+    cache: &crate::services::state_cache::StateCache,
+    arena: &mut StateArena,
+    pools: &[Address],
+) -> Result<(bool, u64), RoutePoolRefreshAbort> {
+    if pools.is_empty() {
+        return Ok((false, cache.generation()));
+    }
+    let pool_count = pools.len();
+    let result = refresh
+        .refresh_pool_states_for(pools, pool_count)
+        .await
+        .map_err(RoutePoolRefreshAbort::Rpc)?;
+    if !result.can_use_cached_state() {
+        return Err(RoutePoolRefreshAbort::NotIndexed { pool_count });
+    }
+    let generation = arena.apply_hot_cache(cache, pools);
+    let fetched = result.updated > 0;
+    if !fetched {
+        log_route_refresh_cache_only(result, pool_count);
+    }
+    Ok((fetched, generation))
+}
+
+fn log_route_refresh_cache_only(result: PoolRefreshResult, pool_count: usize) {
+    if result.attempted {
+        crate::debug!(
+            "route pool refresh: 0/{pool_count} updated after fetch — using cached state"
+        );
+    } else {
+        crate::debug!(
+            "route pool refresh: {pool_count} pools already fresh — using cached state"
+        );
+    }
+}
 
 pub(crate) struct DispatchInputs<'a> {
     pub(crate) pool_metas: &'a [crate::pipeline::types::PoolMeta],
@@ -241,39 +284,45 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let pools_refreshed = if !refresh_required {
         false
     } else {
-        match ctx
-            .refresh
-            .refresh_pool_states_for(&dispatch_pools, dispatch_pools.len())
-            .await
+        match refresh_route_pools_into_arena(
+            &ctx.refresh,
+            &ctx.cache,
+            arena,
+            &dispatch_pools,
+        )
+        .await
         {
-            Ok(updated) if updated > 0 => {
-                dispatch_state_generation = arena.apply_hot_cache(&ctx.cache, &dispatch_pools);
-                let tick_block = ctx.refresh.last_state_block();
-                if tick_block == 0 {
-                    crate::warn!("dispatch aborted: refreshed route state has no pinned block");
-                    return;
+            Ok((fetched, generation)) => {
+                dispatch_state_generation = generation;
+                if fetched {
+                    let tick_block = ctx.refresh.last_state_block();
+                    if tick_block == 0 {
+                        crate::warn!("dispatch aborted: refreshed route state has no pinned block");
+                        return;
+                    }
+                    dispatch_state_block = tick_block;
+                    dispatch_state_hash = ctx.refresh.last_state_hash();
+                    enrich_dispatch_cl_ticks(
+                        sim_provider,
+                        arena,
+                        &dispatch_cycles,
+                        pool_metas,
+                        ctx.config.oracle.tick_word_range,
+                        (tick_block > 0).then_some(tick_block),
+                    )
+                    .await;
+                    true
+                } else {
+                    false
                 }
-                dispatch_state_block = tick_block;
-                dispatch_state_hash = ctx.refresh.last_state_hash();
-                enrich_dispatch_cl_ticks(
-                    sim_provider,
-                    arena,
-                    &dispatch_cycles,
-                    pool_metas,
-                    ctx.config.oracle.tick_word_range,
-                    (tick_block > 0).then_some(tick_block),
-                )
-                .await;
-                true
             }
-            Ok(_) => {
+            Err(RoutePoolRefreshAbort::NotIndexed { pool_count }) => {
                 crate::warn!(
-                    "dispatch aborted: route pool refresh updated 0/{} pools",
-                    dispatch_pools.len()
+                    "dispatch aborted: route pools not in discovery index ({pool_count} addresses)"
                 );
                 return;
             }
-            Err(e) => {
+            Err(RoutePoolRefreshAbort::Rpc(e)) => {
                 crate::warn!("dispatch aborted: route pool refresh failed ({e:#})");
                 return;
             }
@@ -765,18 +814,18 @@ pub(crate) async fn refresh_and_resim_profitable(
     let mut state_generation = cache.generation();
     let refresh_started = crate::util::now_ms();
     if !pools.is_empty() {
-        match refresh.refresh_pool_states_for(&pools, pools.len()).await {
-            Ok(updated) if updated > 0 => {
-                state_generation = arena.apply_hot_cache(cache, &pools);
-                pools_refreshed = true;
+        match refresh_route_pools_into_arena(refresh, cache, arena, &pools).await {
+            Ok((fetched, generation)) => {
+                state_generation = generation;
+                pools_refreshed = fetched;
             }
-            Ok(_) => {
+            Err(RoutePoolRefreshAbort::NotIndexed { .. }) => {
                 crate::warn!(
-                    "resim aborted: route pool refresh updated 0/{pool_count} pools — dropping {in_count} candidates"
+                    "resim aborted: route pools not in discovery index ({pool_count} pools) — dropping {in_count} candidates"
                 );
                 return (Vec::new(), false, state_generation);
             }
-            Err(e) => {
+            Err(RoutePoolRefreshAbort::Rpc(e)) => {
                 crate::warn!(
                     "resim aborted: route pool refresh failed ({e:#}) — dropping {in_count} candidates"
                 );
@@ -850,11 +899,17 @@ pub(crate) async fn refresh_and_resim_profitable(
             Some(result)
         })
         .collect();
-    crate::debug!(
-        "resim batch: in={in_count} out={} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={}",
-        filtered.len(),
-        crate::util::now_ms().saturating_sub(batch_started)
-    );
+    let out_count = filtered.len();
+    let total_ms = crate::util::now_ms().saturating_sub(batch_started);
+    if in_count > 0 && out_count < in_count {
+        crate::info!(
+            "resim batch: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={total_ms}"
+        );
+    } else {
+        crate::debug!(
+            "resim batch: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={total_ms}"
+        );
+    }
     (filtered, pools_refreshed, state_generation)
 }
 

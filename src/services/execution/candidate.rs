@@ -43,6 +43,8 @@ pub struct CandidateExecution {
     pub state_generation: u64,
     pub state_block: u64,
     pub state_hash: Option<alloy::primitives::B256>,
+    /// Human-readable hop trace for dry-run / submit failure logs.
+    pub route_trace: String,
 }
 
 pub struct CandidateBuildConfig {
@@ -229,6 +231,19 @@ pub fn build_execution_candidate(
         start_token
     };
 
+    let route_trace = hops
+        .iter()
+        .map(|h| {
+            let label = h
+                .protocol_label
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{:?}", h.edge.protocol));
+            format!("{label}@{:#x}", h.pool_address)
+        })
+        .collect::<Vec<_>>()
+        .join("->");
+
     let built = build_arb_calldata(
         config.executor_address,
         flash_token,
@@ -263,6 +278,7 @@ pub fn build_execution_candidate(
         state_generation: config.state_generation,
         state_block: config.state_block,
         state_hash: config.state_hash,
+        route_trace,
     })
 }
 

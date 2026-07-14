@@ -250,14 +250,29 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
         estimate = estimate.block(block);
     }
     match timeout(RPC_TIMEOUT, estimate).await {
-        Ok(Ok(gas)) => DryRunResult {
-            semantic_success: true,
-            success: true,
-            gas_used: Some(gas),
-            realized_profit,
-            error: None,
-            decoded_revert: None,
-        },
+        Ok(Ok(gas)) => {
+            if realized_profit.is_none() {
+                return DryRunResult {
+                    semantic_success: false,
+                    success: false,
+                    gas_used: Some(gas),
+                    realized_profit: None,
+                    error: Some(
+                        "eth_call succeeded but returned no decodable realized profit (wrong entrypoint or empty return)"
+                            .into(),
+                    ),
+                    decoded_revert: None,
+                };
+            }
+            DryRunResult {
+                semantic_success: true,
+                success: true,
+                gas_used: Some(gas),
+                realized_profit,
+                error: None,
+                decoded_revert: None,
+            }
+        }
         Ok(Err(err)) => {
             // eth_call already succeeded; some RPCs return gas-limit errors on
             // estimate_gas even when the callback is otherwise valid.
@@ -325,6 +340,7 @@ mod tests {
             state_generation: 1,
             state_block: 1,
             state_hash: None,
+            route_trace: String::new(),
         };
 
         let tx = build_tx(&candidate, Address::repeat_byte(3));

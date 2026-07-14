@@ -510,6 +510,42 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
     block_number: Option<u64>,
     chunk_size: usize,
 ) -> usize {
+    if plans.is_empty() {
+        return 0;
+    }
+    let mut work: Vec<(usize, usize)> = vec![(0, plans.len())];
+    let mut updated = 0usize;
+    while let Some((start, end)) = work.pop() {
+        if start >= end {
+            continue;
+        }
+        let slice = &plans[start..end];
+        match execute_plan_batch_inner(provider, slice, cache, block_number, chunk_size).await {
+            Ok(n) => updated += n,
+            Err(()) if slice.len() > 1 => {
+                let mid = start + slice.len() / 2;
+                work.push((mid, end));
+                work.push((start, mid));
+            }
+            Err(()) => {
+                crate::warn!(
+                    "multicall batch failed for pool {} ({} calls)",
+                    slice[0].pool.address,
+                    slice[0].calls.len()
+                );
+            }
+        }
+    }
+    updated
+}
+
+async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    plans: &[PoolFetchPlan],
+    cache: &StateCache,
+    block_number: Option<u64>,
+    chunk_size: usize,
+) -> Result<usize, ()> {
     let total_calls: usize = plans.iter().map(|p| p.calls.len()).sum();
     let mut items = Vec::with_capacity(total_calls);
     let mut spans: Vec<(&PoolFetchPlan, usize, usize)> = Vec::with_capacity(plans.len());
@@ -531,8 +567,11 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         Ok(r) => r,
         Err(e) => {
             let _ = e;
-            crate::warn!("multicall batch failed ({item_count} items): provider rejected batch",);
-            return 0;
+            crate::warn!(
+                "multicall batch failed ({item_count} items, {} pools): provider rejected batch",
+                plans.len()
+            );
+            return Err(());
         }
     };
 
@@ -544,7 +583,7 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
                 results.len(),
                 item_count
             );
-            return updated;
+            return Ok(updated);
         };
         if let Some(state) = decode_plan(plan, slice) {
             cache.insert(plan.pool.address, state);
@@ -553,5 +592,5 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
             cache.insert(plan.pool.address, PoolState::Invalid);
         }
     }
-    updated
+    Ok(updated)
 }

@@ -348,7 +348,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let _ = ctx.refresh.maybe_discover().await?;
     let discovery_ms = crate::util::now_ms().saturating_sub(discovery_started);
     let refresh_started = crate::util::now_ms();
-    let refreshed_pools = ctx.refresh.refresh_pool_states(refresh_batch).await?;
+    let refresh_result = ctx.refresh.refresh_pool_states(refresh_batch).await?;
+    let refreshed_pools = refresh_result.updated;
     let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
     ctx.refresh.prune_dead_pools_if_due(lf_pass);
 

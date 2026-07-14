@@ -29,6 +29,25 @@ use crate::util::now_ms;
 /// fetch classifications as invalid / never-fetched.
 const MAX_INVALID_FETCHES: u32 = 30;
 
+/// Outcome of a targeted or batch pool-state refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolRefreshResult {
+    /// Pools whose on-chain state was written into the cache this call.
+    pub updated: usize,
+    /// A fetch was attempted (stale/missing targets existed) but `updated` may still be 0.
+    pub attempted: bool,
+    /// Requested pools that resolved in the discovery index.
+    pub matched: usize,
+}
+
+impl PoolRefreshResult {
+    /// Route pools are present in discovery; cached arena state may still be used when `updated` is 0.
+    #[must_use]
+    pub fn can_use_cached_state(&self) -> bool {
+        self.matched > 0
+    }
+}
+
 /// Minimum interval between indexer lag checks.
 const INDEXER_HEALTH_CHECK_INTERVAL_MS: u64 = 5_000;
 
@@ -666,7 +685,7 @@ impl StateRefreshService {
         )
     }
 
-    pub async fn refresh_pool_states(&self, max_pools: usize) -> anyhow::Result<usize> {
+    pub async fn refresh_pool_states(&self, max_pools: usize) -> anyhow::Result<PoolRefreshResult> {
         let pools = self.discovered_pools();
         let hot = self.hot_addresses();
         crate::debug!(
@@ -683,9 +702,9 @@ impl StateRefreshService {
         &self,
         addresses: &[Address],
         max_pools: usize,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<PoolRefreshResult> {
         if addresses.is_empty() || max_pools == 0 {
-            return Ok(0);
+            return Ok(PoolRefreshResult::default());
         }
         let (addrs, selected_pools) = {
             let state = self.discovery_state.read();
@@ -707,7 +726,7 @@ impl StateRefreshService {
             (addrs, selected_pools)
         };
         if selected_pools.is_empty() {
-            return Ok(0);
+            return Ok(PoolRefreshResult::default());
         }
         self.refresh_pools_impl(&selected_pools, max_pools, &addrs)
             .await
@@ -718,11 +737,15 @@ impl StateRefreshService {
         pools: &[DiscoveredPool],
         max_pools: usize,
         hot: &[Address],
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<PoolRefreshResult> {
+        let matched = pools.len();
         let candidates = self.rpc.state_url_candidates();
         if candidates.is_empty() {
             crate::warn!("no state RPC configured — skipping pool state refresh");
-            return Ok(0);
+            return Ok(PoolRefreshResult {
+                matched,
+                ..PoolRefreshResult::default()
+            });
         }
 
         let cached_block = {
@@ -731,6 +754,7 @@ impl StateRefreshService {
         };
 
         let mut total_updated = 0usize;
+        let mut fetch_attempted = false;
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,
@@ -755,6 +779,7 @@ impl StateRefreshService {
             )
             .await;
             total_updated = updated;
+            fetch_attempted |= attempted;
             if updated > 0 {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
@@ -788,7 +813,11 @@ impl StateRefreshService {
                 );
             }
         }
-        Ok(total_updated)
+        Ok(PoolRefreshResult {
+            updated: total_updated,
+            attempted: fetch_attempted,
+            matched,
+        })
     }
 
     pub fn bootstrap_parse_stats(&self) -> Option<ParseStats> {

@@ -13,7 +13,7 @@ use crate::pipeline::sim_sanity::{
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
-use crate::services::execution::profit::{ProfitEvalContext, net_profit_after_gas_from_sim};
+use crate::services::execution::profit::{ProfitEvalContext, net_profit_matic_from_sim};
 
 /// Resolve simulated hop gas the same way probe ranking does before Brent scoring.
 #[derive(Debug, Clone, Copy)]
@@ -419,7 +419,7 @@ pub fn optimize_cycle(
         }
         if let Some(sim) = lookup_sim_cache(&sim_cache, amount) {
             brent_local_hits += 1;
-            return net_profit_after_gas_from_sim(sim, amount, profit_ctx);
+            return net_profit_matic_from_sim(sim, amount, profit_ctx);
         }
         if let Some((cache, generation, route_fp)) = route_sim_cache
             && let Some(cached) = cache.get(generation, route_fp, amount)
@@ -428,7 +428,7 @@ pub fn optimize_cycle(
             if sim_cache.len() < BRENT_CACHE_SLOTS {
                 sim_cache.push((amount, cached));
             }
-            return net_profit_after_gas_from_sim(&cached, amount, profit_ctx);
+            return net_profit_matic_from_sim(&cached, amount, profit_ctx);
         }
         brent_sim_calls += 1;
         match simulate_route_minimal(arena, edges, amount) {
@@ -453,7 +453,7 @@ pub fn optimize_cycle(
                     brent_rejected += 1;
                     return U256::ZERO;
                 }
-                let score = net_profit_after_gas_from_sim(&sim, amount, profit_ctx);
+                let score = net_profit_matic_from_sim(&sim, amount, profit_ctx);
                 if let Some((cache, generation, route_fp)) = route_sim_cache {
                     cache.insert(generation, route_fp, amount, sim);
                 }

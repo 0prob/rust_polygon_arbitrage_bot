@@ -68,6 +68,8 @@ static HF_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_BEST_EVAL_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
 const HF_ORACLE_SKIP_INTERVAL_MS: u64 = 30_000;
+/// MATIC/USD refresh can hold singleflight longer than cache TTL; HF may use slightly stale price.
+const HF_MATIC_STALE_WARN_MS: u64 = 45_000;
 
 /// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
 fn cycle_with_reliable_start(
@@ -478,10 +480,12 @@ pub async fn run_hf_tick(
     let matic_usd = if let Some(usd) = ctx.price_oracle.cached_matic_usd() {
         usd
     } else if let Some((usd, age)) = ctx.price_oracle.last_known_matic_usd() {
-        warn_hf_oracle_skip(&format!(
-            "hf eval using stale MATIC/USD while refresh runs (age_ms={})",
-            age.as_millis()
-        ));
+        if age.as_millis() > HF_MATIC_STALE_WARN_MS as u128 {
+            warn_hf_oracle_skip(&format!(
+                "hf eval using stale MATIC/USD while refresh runs (age_ms={})",
+                age.as_millis()
+            ));
+        }
         usd
     } else {
         match timeout(
@@ -630,7 +634,11 @@ pub async fn run_hf_tick(
 
     let mut skip_dispatch_refresh = prefetch_ok;
     let mut dispatch_state_generation = evaluation_state_generation;
-    let mut dispatch_state_block = snap.state_block;
+    let mut dispatch_state_block = if snap.state_block > 0 {
+        snap.state_block
+    } else {
+        ctx.refresh.last_state_block()
+    };
     let mut dispatch_state_hash = snap.state_hash;
     if !profitable.is_empty() && ctx.config.execution.executor_address.is_some() {
         let sim_provider = match ctx.rpc.connect_simulation() {

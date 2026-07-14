@@ -786,15 +786,21 @@ impl ExecutionService {
             }
         };
         // Pin eth_call to the LF/HF state block so simulation matches routed pool state.
-        let simulation_block = if candidate.state_block > 0 {
-            candidate.state_block.min(chain_head)
+        let provenance_block = candidate.state_block.max(expected_state_block);
+        let simulation_block = if provenance_block > 0 {
+            provenance_block.min(chain_head)
         } else {
             chain_head
         };
-        if simulation_block != chain_head {
-            crate::debug!(
-                "dry-run pinned: fp={}, block={simulation_block} (head={chain_head})",
-                fp,
+        if provenance_block == 0 {
+            crate::warn!(
+                "dry-run unpinned: fp={fp} route={} (head={chain_head})",
+                candidate.route_trace,
+            );
+        } else if simulation_block != chain_head {
+            crate::info!(
+                "dry-run pinned: fp={fp} block={simulation_block} (head={chain_head}) route={}",
+                candidate.route_trace,
             );
         }
 
@@ -868,9 +874,11 @@ impl ExecutionService {
                 self.quarantine_route_hash(candidate.route_hash, now);
             }
             crate::info!(
-                "dry-run failed: fp={}, route_hash={}, reason={}{}",
+                "dry-run failed: fp={}, route_hash={}, flash={:?}, route={}, reason={}{}",
                 fp,
                 candidate.route_hash,
+                candidate.flash_loan_source,
+                candidate.route_trace,
                 dry.error.as_deref().unwrap_or("unknown"),
                 if sim_fidelity_miss {
                     " (sim fidelity miss — soft cooldown)"
@@ -1596,6 +1604,7 @@ mod safety_tests {
             state_generation: 1,
             state_block: 1,
             state_hash: None,
+            route_trace: String::new(),
         };
         assert!(
             ExecutionService::reassess_assessment(
@@ -1635,6 +1644,7 @@ mod safety_tests {
             state_generation: 1,
             state_block: 1,
             state_hash: None,
+            route_trace: String::new(),
         };
 
         let assessment = ExecutionService::reassess_assessment(
@@ -1677,6 +1687,7 @@ mod safety_tests {
             state_generation: 1,
             state_block: 1,
             state_hash: None,
+            route_trace: String::new(),
         };
         let gas_price = U256::from(314_608_528_420u64);
         let realized = U256::from(300_000_000_000_000_000u128);
@@ -1755,6 +1766,7 @@ mod safety_tests {
             state_generation: cache.generation(),
             state_block: 0,
             state_hash: None,
+            route_trace: String::new(),
         };
 
         assert!(ExecutionService::candidate_matches_state_generation(
