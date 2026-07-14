@@ -25,20 +25,20 @@ pub async fn run_tui<F>(
     bootstrap: F,
 ) -> anyhow::Result<()>
 where
-    F: Future<Output = anyhow::Result<Arc<RuntimeContext>>>,
+    F: Future<Output = anyhow::Result<Arc<RuntimeContext>>> + Send + 'static,
 {
+    // Overlap config/runtime init with terminal setup (bootstrap uses spawn_blocking internally).
+    let bootstrap_task = tokio::spawn(async move { bootstrap.await });
     let mut terminal = TerminalGuard::enter().context("failed to initialize terminal")?;
     draw_boot_blocking(&mut terminal, "Loading configuration…")?;
 
-    let ctx = match bootstrap.await {
+    let ctx = match bootstrap_task.await.context("bootstrap task join failed")? {
         Ok(ctx) => ctx,
         Err(error) => {
             terminal.restore().ok();
             return Err(error);
         }
     };
-
-    draw_boot_blocking(&mut terminal, "Starting pipeline…")?;
 
     let mut app = App::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

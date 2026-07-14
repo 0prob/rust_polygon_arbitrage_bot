@@ -38,12 +38,10 @@ pub fn spawn_snapshot_publisher(
 
         let mut ticker = tokio::time::interval(SNAPSHOT_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_oracle_refresh = Instant::now()
-            .checked_sub(ORACLE_REFRESH_INTERVAL)
-            .unwrap_or_else(Instant::now);
-        let mut last_portfolio_refresh = Instant::now()
-            .checked_sub(PORTFOLIO_REFRESH_INTERVAL)
-            .unwrap_or_else(Instant::now);
+        // Defer RPC oracle/portfolio until after the first paint — forcing both on tick 0
+        // blocked dashboard updates for up to ~12s at startup.
+        let mut last_oracle_refresh = Instant::now();
+        let mut last_portfolio_refresh = Instant::now();
         let mut portfolio_rows = Vec::new();
         let mut route_cache = RouteBuildCache {
             generation: 0,
