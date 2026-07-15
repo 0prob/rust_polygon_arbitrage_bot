@@ -47,6 +47,7 @@ where
     tokio::task::yield_now().await;
 
     let tx = bridge.sender();
+    let metrics_bridge = bridge.clone();
     let input_thread = spawn_input_thread(tx.clone()).context("spawn input thread")?;
 
     let (os_shutdown_tx, mut os_shutdown_rx) = mpsc::channel(1);
@@ -87,6 +88,10 @@ where
                     if app.should_quit {
                         break;
                     }
+                    needs_redraw = true;
+                }
+                for event in metrics_bridge.drain_coalesced_metrics() {
+                    apply_event(&mut app, event);
                     needs_redraw = true;
                 }
                 if app.should_quit {

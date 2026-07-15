@@ -90,6 +90,8 @@ pub(crate) struct DispatchInputs<'a> {
     pub(crate) state_block: u64,
     pub(crate) state_hash: Option<B256>,
     pub(crate) skip_dispatch_refresh: bool,
+    /// HF tick flash-cap USD price; skips redundant oracle RPC on dispatch when set.
+    pub(crate) matic_usd: Option<f64>,
 }
 
 #[derive(Default)]
@@ -200,6 +202,7 @@ pub(crate) async fn dispatch_profitable_candidates(
         inputs.state_block,
         inputs.state_hash,
         inputs.skip_dispatch_refresh,
+        inputs.matic_usd,
     )
     .await;
 
@@ -226,6 +229,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     state_block: u64,
     state_hash: Option<B256>,
     skip_dispatch_refresh: bool,
+    matic_usd_hint: Option<f64>,
 ) {
     if ctx.execution.global_is_quarantined() {
         crate::warn!("dispatch skipped: execution circuit breaker active");
@@ -240,11 +244,18 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let base_slippage_bps = ctx.config.execution.slippage_bps;
     let min_profit_roi_bps = ctx.config.execution.min_profit_roi_bps;
     let max_flash_loan_usd = ctx.config.execution.max_flash_loan_usd;
-    let Some(matic_usd) =
-        ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await
-    else {
-        crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
-        return;
+    let matic_usd = match matic_usd_hint
+        .and_then(crate::pipeline::sim_sanity::matic_usd_for_flash_cap)
+    {
+        Some(usd) => usd,
+        None => match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await
+        {
+            Some(usd) => usd,
+            None => {
+                crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
+                return;
+            }
+        },
     };
     let deadline_secs = ctx.config.execution.deadline_secs;
 
@@ -271,10 +282,6 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     for route in &profitable {
         collect_flash_tokens_for_cycle(arena, &route.cycle, &mut flash_seen, &mut flash_tokens);
     }
-    let flash_stale = flash_tokens
-        .iter()
-        .any(|token| !ctx.execution.flash_liquidity.has_fresh_entry(*token));
-
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
     let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
     let mut dispatch_state_generation = state_generation;
@@ -329,24 +336,18 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
     };
 
-    if flash_stale && !flash_tokens.is_empty() {
-        match ctx
-            .execution
-            .flash_liquidity
-            .refresh_with_fallback(ctx.rpc.as_ref(), &flash_tokens)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if crate::services::execution::rpc_errors::is_rpc_rate_limited(&e) => {
-                crate::debug!("dispatch flash refresh rate-limited, using stale cache");
-            }
-            Err(e) => crate::warn!("flash liquidity refresh failed: {e:#}"),
-        }
+    // HF tick already prefetches stale flash tokens (750ms budget); avoid a second blocking refresh here.
+    if !flash_tokens.is_empty() {
+        ctx.execution.flash_liquidity.spawn_refresh_if_stale(
+            Arc::clone(&ctx.rpc),
+            &flash_tokens,
+        );
     }
 
     let skipped = Arc::new(SkipCounts::default());
     let shutdown = ctx.shutdown.clone();
     let arena_ref: &StateArena = &*arena;
+    let chain_head_hint = sim_provider.get_block_number().await.ok();
 
     for evaluated in profitable {
         if *shutdown.borrow() {
@@ -376,6 +377,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             matic_usd,
             deadline_secs,
             &skipped,
+            chain_head_hint,
         )
         .await
         else {
@@ -420,6 +422,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     matic_usd: f64,
     deadline_secs: u64,
     skipped: &Arc<SkipCounts>,
+    chain_head_hint: Option<u64>,
 ) -> Option<ExecutionOutcome> {
     let fp = evaluated.route_fingerprint;
     let balancer_batch_verified = evaluated.balancer_batch_verified;
@@ -535,6 +538,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         slippage_bps,
         max_flash_loan_usd,
         matic_usd,
+        matic_usd_chainlink: ctx.price_oracle.fresh_matic_usd_chainlink_raw(),
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         route_fingerprint: fp,
@@ -551,23 +555,29 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         return None;
     };
 
-    if prepared.flash_source == FlashLoanSource::AaveV3
-        && !aave_flash_reserve_viable(sim_provider, AAVE_V3_POOL, start_token_addr).await
-    {
-        skipped.record("prepare");
-        ctx.execution
-            .flash_liquidity
-            .mark_aave_inactive(start_token_addr);
-        if log_prepare_skip {
-            crate::info!(
-                "prepare skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
-            );
-        } else {
-            crate::debug!(
-                "dispatch skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
-            );
+    if prepared.flash_source == FlashLoanSource::AaveV3 {
+        let cached = ctx.execution.flash_liquidity.snapshot(start_token_addr);
+        let cache_fresh = ctx.execution.flash_liquidity.has_fresh_entry(start_token_addr);
+        let cache_viable =
+            cache_fresh && cached.aave_listed && !cached.aave.is_zero();
+        if !cache_viable
+            && !aave_flash_reserve_viable(sim_provider, AAVE_V3_POOL, start_token_addr).await
+        {
+            skipped.record("prepare");
+            ctx.execution
+                .flash_liquidity
+                .mark_aave_inactive(start_token_addr);
+            if log_prepare_skip {
+                crate::info!(
+                    "prepare skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
+                );
+            } else {
+                crate::debug!(
+                    "dispatch skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
+                );
+            }
+            return None;
         }
-        return None;
     }
 
     if prepared.flash_source == FlashLoanSource::Direct
@@ -591,7 +601,16 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
         // ponytail: dry-run must queryBatchSwap too — local Balancer sim overstates profit
         // and executeArbDirect reverts with opaque ExternalCallFailed without this gate.
-        match query_balancer_batch_profit(sim_provider, executor, &hops, start_token_addr).await {
+        let query_block = (state_block > 0).then_some(state_block);
+        match query_balancer_batch_profit(
+            sim_provider,
+            executor,
+            &hops,
+            start_token_addr,
+            query_block,
+        )
+        .await
+        {
             BatchQueryOutcome::Profit(on_chain_profit)
                 if batch_profit_covers_min(
                     on_chain_profit,
@@ -724,12 +743,13 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             operator,
             &ctx.gas_oracle,
             &ctx.cache,
-            ctx.refresh.last_state_block(),
-            ctx.refresh.last_state_hash(),
+            state_block,
+            state_hash,
             ctx.hypersync.as_deref(),
             Some(&ctx.ui_hook),
             Some(&ctx.shutdown),
             None,
+            chain_head_hint,
         )
         .await;
     Some(outcome)
@@ -935,6 +955,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
     pool_metas: &[crate::pipeline::types::PoolMeta],
     slippage_bps: u64,
     reassess: Arc<HfEvalInputOwned>,
+    state_block: u64,
 ) -> Vec<HfEvalResult> {
     let pool_metas_by_pool: FxHashMap<
         crate::core::types::PoolIndex,
@@ -945,8 +966,18 @@ pub(crate) async fn filter_balancer_onchain_verified<
         .into_iter()
         .partition(|result| route_is_balancer_only(&result.cycle));
 
-    let mut jobs = Vec::with_capacity(balancer_only.len());
+    let mut already_verified = Vec::new();
+    let mut need_onchain_verify = Vec::with_capacity(balancer_only.len());
     for result in balancer_only {
+        if result.balancer_batch_verified {
+            already_verified.push(result);
+        } else {
+            need_onchain_verify.push(result);
+        }
+    }
+
+    let mut jobs = Vec::with_capacity(need_onchain_verify.len());
+    for result in need_onchain_verify {
         let fp = result.route_fingerprint;
         let Some(start_token) = arena.token_address(result.cycle.start_token) else {
             execution.quarantine_batch_query_failure(fp);
@@ -1003,6 +1034,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
                     executor,
                     &eval,
                     &route_gas,
+                    state_block,
                 )
                 .await
             }
@@ -1014,6 +1046,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
 
     let mut verified = passthrough;
     verified.extend(verified_balancer);
+    verified.extend(already_verified);
     verified
 }
 
@@ -1024,6 +1057,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     executor: alloy::primitives::Address,
     eval: &HfEvalInput<'_>,
     _route_gas: &RouteGasLookup,
+    state_block: u64,
 ) -> Option<HfEvalResult> {
     let BalancerVerifyJob {
         result,
@@ -1032,7 +1066,9 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
         slippage,
     } = job;
     let fp = result.route_fingerprint;
-    let outcome = query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await;
+    let query_block = (state_block > 0).then_some(state_block);
+    let outcome =
+        query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await;
     let accept = match &outcome {
         BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
             *on_chain_profit,
@@ -1103,6 +1139,7 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
     pool_metas: &[crate::pipeline::types::PoolMeta],
     sim_provider: &P,
     executor: alloy::primitives::Address,
+    state_block: u64,
 ) {
     if !route_is_balancer_only(&result.cycle) {
         return;
@@ -1128,7 +1165,9 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         return;
     };
     let modeled = result.sim.profit;
-    match query_balancer_batch_profit(sim_provider, executor, &hops, start_token).await {
+    let query_block = (state_block > 0).then_some(state_block);
+    match query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await
+    {
         BatchQueryOutcome::Profit(on_chain) => {
             crate::info!(
                 "hf near-miss-verify: fp={fp} modeled={modeled} on_chain={on_chain} net_matic={}",

@@ -106,6 +106,7 @@ pub struct HfEvalInput<'a> {
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
     pub matic_usd: f64,
+    pub matic_usd_chainlink: Option<alloy::primitives::I256>,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: &'a FlashLiquidityCache,
@@ -128,6 +129,7 @@ pub struct HfEvalInputOwned {
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
     pub matic_usd: f64,
+    pub matic_usd_chainlink: Option<alloy::primitives::I256>,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
@@ -151,6 +153,7 @@ impl HfEvalInputOwned {
             flash_policy: self.flash_policy,
             max_flash_loan_usd: self.max_flash_loan_usd,
             matic_usd: self.matic_usd,
+            matic_usd_chainlink: self.matic_usd_chainlink,
             safety_multiplier_bps: self.safety_multiplier_bps,
             profit_priority_alpha_bps: self.profit_priority_alpha_bps,
             flash_liquidity: self.flash_liquidity.as_ref(),
@@ -797,7 +800,13 @@ fn probe_fallback_amounts(
         // Skip spot probe if it exceeds the flash loan cap for this token.
         if candidate == spot
             && let Some(cap) =
-                max_flash_borrow_wei(input.max_flash_loan_usd, dec, rate, input.matic_usd)
+                max_flash_borrow_wei(
+                    input.max_flash_loan_usd,
+                    dec,
+                    rate,
+                    input.matic_usd,
+                    input.matic_usd_chainlink,
+                )
             && spot > cap
         {
             continue;
@@ -953,6 +962,7 @@ fn evaluate_one(
         input.token_decimals,
         Some(input.max_flash_loan_usd),
         input.matic_usd,
+        input.matic_usd_chainlink,
         Some(input.brent_iters),
         None,
         &profit_ctx,
@@ -1047,6 +1057,7 @@ fn evaluate_one(
                 input.token_decimals,
                 Some(input.max_flash_loan_usd),
                 input.matic_usd,
+                input.matic_usd_chainlink,
                 Some(input.brent_iters),
                 None,
                 &depth_ctx,
@@ -1173,6 +1184,7 @@ fn validate_optimized_sim(
         token_decimals,
         token_to_matic_rate,
         input.matic_usd,
+        input.matic_usd_chainlink,
     )
     .is_none_or(|cap| sim.amount_in <= cap);
 

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, I256, U256};
 use alloy::providers::Provider;
@@ -16,7 +17,15 @@ use crate::services::execution::calldata::encoders::balancer::build_balancer_bat
 use crate::services::execution::profit::on_chain_min_profit_for_route;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// `queryBatchSwap` is a static vault view; cap avoids RPC default gas overflow on heavy batches.
+const BALANCER_QUERY_BATCH_GAS: u64 = 2_000_000;
 const BALANCER_GIVEN_IN: u8 = 0;
+
+fn query_block_id(block_number: Option<u64>) -> Option<BlockId> {
+    block_number
+        .filter(|&b| b > 0)
+        .map(|block| BlockId::Number(BlockNumberOrTag::Number(block)))
+}
 
 /// Net vault delta for the profit token: negative means the vault sends tokens (profit).
 fn profit_from_vault_delta(delta: I256) -> Option<U256> {
@@ -57,6 +66,7 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     executor: Address,
     hops: &[CalldataHop],
     profit_token: Address,
+    block_number: Option<u64>,
 ) -> BatchQueryOutcome {
     let Some(req) = build_balancer_batch_swap_request(hops, executor).ok() else {
         return BatchQueryOutcome::BuildFailed;
@@ -72,8 +82,13 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     };
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(BALANCER_VAULT)
-        .input(call.abi_encode().into());
-    let output = match timeout(QUERY_TIMEOUT, provider.call(tx)).await {
+        .input(call.abi_encode().into())
+        .gas_limit(BALANCER_QUERY_BATCH_GAS);
+    let mut eth_call = provider.call(tx);
+    if let Some(block) = query_block_id(block_number) {
+        eth_call = eth_call.block(block);
+    }
+    let output = match timeout(QUERY_TIMEOUT, eth_call).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => return BatchQueryOutcome::RpcError(format!("{e:#}")),
         Err(_) => return BatchQueryOutcome::Timeout,

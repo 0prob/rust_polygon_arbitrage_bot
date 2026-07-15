@@ -239,9 +239,11 @@ impl PartialPoolCache {
             dirty.clear();
             return;
         }
-        let keep: FxHashSet<Address> = keep.iter().copied().collect();
-        self.pools.retain(|addr, _| keep.contains(addr));
-        dirty.retain(|addr| keep.contains(addr));
+        let mut keep_set =
+            FxHashSet::with_capacity_and_hasher(keep.len(), rustc_hash::FxBuildHasher);
+        keep_set.extend(keep.iter().copied());
+        self.pools.retain(|addr, _| keep_set.contains(addr));
+        dirty.retain(|addr| keep_set.contains(addr));
     }
 
     /// Merge slim snapshots into the shared `StateCache` for pools that already have full state.

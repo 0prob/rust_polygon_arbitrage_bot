@@ -17,7 +17,7 @@ use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::profit::{AssessProfitInput, assess_profit};
 use crate::services::hf_snapshot::HfSnapshot;
 use crate::services::oracle::price_oracle::PriceOracle;
-use crate::services::oracle::resolve_token_to_matic_rate;
+use crate::services::oracle::{known_token_decimals, resolve_token_to_matic_rate};
 use crate::services::state_refresh::StateRefreshService;
 use crate::util::{ten_pow_u256_cached as ten_pow_u256, truncate_str, u256_to_f64};
 
@@ -688,8 +688,11 @@ pub async fn build_portfolio_rows(
                         crate::abis::IERC20Metadata::balanceOfCall::abi_decode_returns(&b).ok()
                     })
                     .map_or(U256::ZERO, U256::from);
-                let decimals = snapshot.token_decimals.get(token).copied().unwrap_or(18);
-                let unit_usd = oracle.token_usd(token);
+                let Some(decimals) = known_token_decimals(*token, snapshot.token_decimals.as_ref())
+                else {
+                    continue;
+                };
+                let unit_usd = oracle.token_usd_fresh(token).or_else(|| oracle.token_usd(token));
                 let balance_units = u256_to_f64(balance) / u256_to_f64(ten_pow_u256(decimals));
                 let usd = unit_usd.map(|price| price * balance_units);
                 rows.push(PortfolioRow {

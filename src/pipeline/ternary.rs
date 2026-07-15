@@ -222,6 +222,7 @@ fn get_dynamic_search_bounds(
     start_decimals: u8,
     max_flash_loan_usd: u64,
     matic_usd: f64,
+    matic_usd_chainlink: Option<alloy::primitives::I256>,
     liquidity_cap: Option<U256>,
 ) -> (U256, U256) {
     let mut min_capacity = U256::MAX;
@@ -276,9 +277,13 @@ fn get_dynamic_search_bounds(
         if min_economic <= max_search_low && low < min_economic {
             low = min_economic;
         }
-        if let Some(max_wei) =
-            max_flash_borrow_wei(max_flash_loan_usd, start_decimals, start_rate, matic_usd)
-            && high > max_wei
+        if let Some(max_wei) = max_flash_borrow_wei(
+            max_flash_loan_usd,
+            start_decimals,
+            start_rate,
+            matic_usd,
+            matic_usd_chainlink,
+        ) && high > max_wei
         {
             high = max_wei;
         }
@@ -332,6 +337,7 @@ pub fn optimize_cycle(
     token_decimals: &FxHashMap<Address, u8>,
     max_flash_loan_usd: Option<u64>,
     matic_usd: f64,
+    matic_usd_chainlink: Option<alloy::primitives::I256>,
     max_iterations: Option<u32>,
     liquidity_cap: Option<U256>,
     profit_ctx: &ProfitEvalContext,
@@ -353,6 +359,7 @@ pub fn optimize_cycle(
         start_decimals,
         max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
         matic_usd,
+        matic_usd_chainlink,
         liquidity_cap,
     );
     if high < economic_floor {
@@ -363,6 +370,7 @@ pub fn optimize_cycle(
                 start_decimals,
                 start_rate,
                 matic_usd,
+                matic_usd_chainlink,
             )
             && high > max_wei
         {
@@ -406,7 +414,15 @@ pub fn optimize_cycle(
             if sim_cache.len() >= BRENT_CACHE_SLOTS {
                 break;
             }
-            sim_cache.push((*amount, *sim));
+            let mut seeded = *sim;
+            if let Some(costing) = route_gas {
+                seeded.total_gas = costing.lookup.route_gas_or_heuristic(
+                    costing.oracle,
+                    costing.fingerprint,
+                    seeded.total_gas,
+                );
+            }
+            sim_cache.push((*amount, seeded));
         }
     }
     let mut brent_local_hits = 0u32;
@@ -485,6 +501,11 @@ pub fn optimize_cycle(
     }
     let mut sim = lookup_sim_cache(&sim_cache, optimal)
         .copied()
+        .or_else(|| {
+            route_sim_cache.and_then(|(cache, generation, route_fp)| {
+                cache.get(generation, route_fp, optimal)
+            })
+        })
         .or_else(|| simulate_route_minimal(arena, edges, optimal))?;
     if let Some(costing) = route_gas {
         sim.total_gas = costing.lookup.route_gas_or_heuristic(

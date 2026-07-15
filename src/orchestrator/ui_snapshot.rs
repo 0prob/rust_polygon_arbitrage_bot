@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 #[cfg(feature = "tui")]
 use crate::orchestrator::RuntimeContext;
+use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 #[cfg(feature = "tui")]
 use crate::tui::bridge::publish_snapshot;
 #[cfg(feature = "tui")]
@@ -111,7 +112,11 @@ async fn build_ui_snapshot(
 )> {
     let snap = ctx.snapshots.read();
 
-    let mut matic_usd = ctx.price_oracle.cached_matic_usd().unwrap_or(0.0);
+    let mut matic_usd = ctx
+        .price_oracle
+        .resolve_matic_usd_cached()
+        .and_then(matic_usd_for_flash_cap)
+        .unwrap_or(0.0);
     let route_tokens = if refresh_oracle || matic_usd <= 0.0 || refresh_portfolio {
         unique_route_tokens(&snap)
     } else {
@@ -124,21 +129,21 @@ async fn build_ui_snapshot(
         Some(tokio::spawn(async move {
             let provider = ctx.rpc.connect_state().ok();
             let provider_ref = provider.as_ref();
-            let refreshed = if let Some(provider) = provider_ref {
-                ctx.price_oracle.get_matic_usd(Some(provider)).await
-            } else {
-                ctx.price_oracle.get_matic_usd_offline().await
-            };
+            let mut prefetch_addrs = route_tokens;
+            prefetch_addrs.extend(crate::core::constants::POLYGON_HUB_TOKENS);
+            prefetch_addrs.sort_unstable();
+            prefetch_addrs.dedup();
             if let Some(provider) = provider_ref {
                 ctx.price_oracle
-                    .prefetch_token_usd(&route_tokens, Some(provider))
+                    .prefetch_token_usd(&prefetch_addrs, Some(provider))
                     .await;
+                ctx.price_oracle.get_matic_usd(Some(provider)).await
             } else {
                 ctx.price_oracle
-                    .prefetch_token_usd_offline(&route_tokens)
+                    .prefetch_token_usd_offline(&prefetch_addrs)
                     .await;
+                ctx.price_oracle.get_matic_usd_offline().await
             }
-            refreshed
         }))
     } else {
         None
@@ -167,7 +172,11 @@ async fn build_ui_snapshot(
 
     if let Some(task) = oracle_task {
         match tokio::time::timeout(Duration::from_secs(6), task).await {
-            Ok(Ok(refreshed)) if refreshed > 0.0 => matic_usd = refreshed,
+            Ok(Ok(refreshed)) => {
+                if let Some(usd) = matic_usd_for_flash_cap(refreshed) {
+                    matic_usd = usd;
+                }
+            }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => crate::debug!("snapshot oracle refresh failed: {e:#}"),
             Err(_) => crate::debug!("snapshot oracle refresh timed out"),
@@ -283,34 +292,42 @@ fn hot_pool_addresses(snap: &crate::services::hf_snapshot::HfSnapshot) -> Vec<Ad
 
 #[cfg(feature = "tui")]
 fn unique_route_tokens(snap: &crate::services::hf_snapshot::HfSnapshot) -> Vec<Address> {
+    use crate::core::constants::POLYGON_HUB_TOKENS;
+
     const TOKEN_LIMIT: usize = 24;
     let mut seen = FxHashSet::default();
     let mut ordered = Vec::with_capacity(TOKEN_LIMIT);
-    let mut push = |addr: Address| -> bool {
+    let mut at_limit = || ordered.len() >= TOKEN_LIMIT;
+    let mut push = |addr: Address| {
         if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
             ordered.push(addr);
         }
-        ordered.len() >= TOKEN_LIMIT
     };
 
-    'cycles: for cycle in snap.cycles.iter().take(24) {
-        if let Some(addr) = snap.arena.token_address(cycle.start_token)
-            && push(addr)
-        {
-            break 'cycles;
+    for cycle in snap.cycles.iter().take(24) {
+        if at_limit() {
+            break;
+        }
+        if let Some(addr) = snap.arena.token_address(cycle.start_token) {
+            push(addr);
         }
         for edge in &cycle.edges {
-            if let Some(addr) = snap.arena.token_address(edge.token_in)
-                && push(addr)
-            {
-                break 'cycles;
+            if at_limit() {
+                break;
             }
-            if let Some(addr) = snap.arena.token_address(edge.token_out)
-                && push(addr)
-            {
-                break 'cycles;
+            if let Some(addr) = snap.arena.token_address(edge.token_in) {
+                push(addr);
+            }
+            if let Some(addr) = snap.arena.token_address(edge.token_out) {
+                push(addr);
             }
         }
+    }
+    for hub in POLYGON_HUB_TOKENS {
+        if at_limit() {
+            break;
+        }
+        push(hub);
     }
     ordered
 }

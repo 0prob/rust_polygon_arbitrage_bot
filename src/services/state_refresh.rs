@@ -616,7 +616,7 @@ impl StateRefreshService {
         let invalid_set: rustc_hash::FxHashSet<Address> = {
             let state = self.discovery_state.read();
             self.cache
-                .pools_past_invalid_retry(state.discovered.as_ref())
+                .pools_past_invalid_retry_indexed(&state.address_index)
                 .into_iter()
                 .collect()
         };
@@ -630,7 +630,7 @@ impl StateRefreshService {
 
         for addr in &invalid_set {
             let entry = state.invalid_fetch_count.entry(*addr).or_insert(0);
-            *entry += 1;
+            *entry = entry.saturating_add(1);
             if *entry >= MAX_INVALID_FETCHES {
                 to_remove.push(*addr);
             }
@@ -641,7 +641,8 @@ impl StateRefreshService {
         }
 
         let before = state.discovered.len();
-        let retain_filter: rustc_hash::FxHashSet<Address> = to_remove.iter().copied().collect();
+        let retain_filter: rustc_hash::FxHashSet<Address> =
+            rustc_hash::FxHashSet::from_iter(to_remove.iter().copied());
         Arc::make_mut(&mut state.discovered).retain(|p| !retain_filter.contains(&p.address));
         let (key_index, address_index) = rebuild_discovery_indexes(state.discovered.as_ref());
         state.pool_key_index = key_index;

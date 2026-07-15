@@ -109,12 +109,27 @@ pub fn log(level: &'static str, module: &'static str, mut message: String) {
         module,
         message,
     };
-    if let Err(error) = logger.sender.try_send(Command::Event(event)) {
-        match error {
-            TrySendError::Full(_) | TrySendError::Disconnected(_) => {
-                DROPPED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match logger.sender.try_send(Command::Event(event)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(Command::Event(event))) => {
+            if log_level_rank(event.level) <= LEVEL_DEBUG {
+                return;
             }
+            DROPPED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        Err(TrySendError::Full(Command::Shutdown)) => {}
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+fn log_level_rank(level: &'static str) -> u8 {
+    match level {
+        "ERROR" => LEVEL_ERROR,
+        "WARN" => LEVEL_WARN,
+        "INFO" => LEVEL_INFO,
+        "DEBUG" => LEVEL_DEBUG,
+        "TRACE" => LEVEL_TRACE,
+        _ => LEVEL_INFO,
     }
 }
 

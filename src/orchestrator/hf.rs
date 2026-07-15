@@ -20,6 +20,7 @@ use crate::orchestrator::hf_execute::{
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
+use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -477,18 +478,22 @@ pub async fn run_hf_tick(
     let flash_policy = ctx.config.flash_policy;
     let state_provider = ctx.rpc.connect_state().ok();
     let state_provider_ref = state_provider.as_ref();
-    let matic_usd = if let Some(usd) = ctx.price_oracle.cached_matic_usd() {
-        usd
-    } else if let Some((usd, age)) = ctx.price_oracle.last_known_matic_usd() {
-        if age.as_millis() > HF_MATIC_STALE_WARN_MS as u128 {
-            warn_hf_oracle_skip(&format!(
-                "hf eval using stale MATIC/USD while refresh runs (age_ms={})",
-                age.as_millis()
-            ));
-        }
-        usd
-    } else {
-        match timeout(
+    let matic_usd = match ctx
+        .price_oracle
+        .resolve_matic_usd_cached()
+        .and_then(matic_usd_for_flash_cap)
+        .or_else(|| {
+            let (raw, age) = ctx.price_oracle.last_known_matic_usd()?;
+            if age.as_millis() > HF_MATIC_STALE_WARN_MS as u128 {
+                warn_hf_oracle_skip(&format!(
+                    "hf eval using stale MATIC/USD while refresh runs (age_ms={})",
+                    age.as_millis()
+                ));
+            }
+            matic_usd_for_flash_cap(raw)
+        }) {
+        Some(usd) => usd,
+        None => match timeout(
             Duration::from_millis(800),
             ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
         )
@@ -515,9 +520,10 @@ pub async fn run_hf_tick(
                     elapsed_ms: now_ms().saturating_sub(start),
                 });
             }
-        }
+        },
     };
 
+    let matic_usd_chainlink = ctx.price_oracle.fresh_matic_usd_chainlink_raw();
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
     let reassess_ctx = Arc::new(HfEvalInputOwned {
@@ -534,6 +540,7 @@ pub async fn run_hf_tick(
         flash_policy,
         max_flash_loan_usd: ctx.config.execution.max_flash_loan_usd,
         matic_usd,
+        matic_usd_chainlink,
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         flash_liquidity: Arc::clone(&ctx.execution.flash_liquidity),
@@ -605,7 +612,7 @@ pub async fn run_hf_tick(
                 gas_price_gwei: crate::util::u256_to_f64(gas_price) / 1e9,
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
-                gas_cost_wei: assessment.revert_penalty,
+                gas_cost_wei: assessment.gas_cost_wei,
                 slippage_bps: result.effective_slippage_bps,
                 slippage: assessment.slippage_deduction,
                 flash_fee: assessment.flash_loan_fee,
@@ -686,6 +693,7 @@ pub async fn run_hf_tick(
                 pool_metas_for_dispatch.as_ref(),
                 ctx.config.execution.slippage_bps,
                 Arc::clone(&reassess_ctx),
+                dispatch_state_block,
             )
             .await;
             best_profit_matic = profitable
@@ -748,6 +756,7 @@ pub async fn run_hf_tick(
                     pool_metas_for_dispatch.as_ref(),
                     &sim_provider,
                     executor,
+                    dispatch_state_block,
                 )
                 .await;
             }
@@ -769,6 +778,7 @@ pub async fn run_hf_tick(
                     pool_metas_for_dispatch.as_ref(),
                     &sim_provider,
                     executor,
+                    dispatch_state_block,
                 )
                 .await;
             }
@@ -788,6 +798,7 @@ pub async fn run_hf_tick(
                 state_block: dispatch_state_block,
                 state_hash: dispatch_state_hash,
                 skip_dispatch_refresh,
+                matic_usd: matic_usd_for_flash_cap(matic_usd),
             },
         )
         .await;
@@ -875,7 +886,7 @@ fn log_near_miss_diagnostic(
         return;
     }
     let safety_floor = crate::services::execution::profit::safety_floor_matic_wei(
-        assessment.revert_penalty,
+        assessment.gas_cost_wei,
         safety_bps,
     );
     let gap = safety_floor.saturating_sub(net_matic);
@@ -894,7 +905,7 @@ fn log_near_miss_diagnostic(
         gap,
         min_profit_matic,
         roi_bps,
-        assessment.revert_penalty,
+        assessment.gas_cost_wei,
         assessment.slippage_deduction,
         assessment.flash_loan_fee,
         reason,

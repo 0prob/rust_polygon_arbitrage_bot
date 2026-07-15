@@ -88,6 +88,9 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
     items: &[MulticallItem],
     block_number: Option<u64>,
 ) -> anyhow::Result<Vec<Option<Bytes>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut pending: Vec<(usize, usize)> = vec![(0, items.len())];
     let mut out = vec![None; items.len()];
     while let Some((start, end)) = pending.pop() {
@@ -98,6 +101,7 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                     out[start + i] = result;
                 }
             }
+            Err(e) if is_rate_limited_rpc_error(&e) => return Err(e),
             Err(_e) if slice.len() > 1 => {
                 let mid = start + slice.len() / 2;
                 pending.push((mid, end));
@@ -123,14 +127,14 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
 
     let mut attempt = 0u32;
     loop {
-        let mut call = contract.aggregate3(std::mem::take(&mut calls));
-        if let Some(number) = block_number {
-            call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
-        }
         let _permit = GLOBAL_MULTICALL_ADMISSION
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("global multicall admission closed"))?;
+        let mut call = contract.aggregate3(std::mem::take(&mut calls));
+        if let Some(number) = block_number {
+            call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
+        }
         match call.call().await {
             Ok(results) => {
                 return Ok(results
@@ -146,6 +150,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
             }
             Err(e) => {
                 let e: anyhow::Error = e.into();
+                drop(_permit);
                 if is_rate_limited_rpc_error(&e) {
                     return Err(e);
                 }
@@ -167,6 +172,9 @@ pub async fn execute_multicall<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: &P,
     items: &[MulticallItem],
 ) -> anyhow::Result<Vec<Option<Bytes>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
     if items.len() <= MULTICALL_CHUNK {
         execute_multicall_chunk(provider, items, None).await
     } else {
@@ -187,6 +195,9 @@ pub async fn execute_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static
     items: &[MulticallItem],
     block_number: Option<u64>,
 ) -> anyhow::Result<Vec<Option<Bytes>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
     if items.len() <= MULTICALL_CHUNK {
         execute_multicall_chunk(provider, items, block_number).await
     } else {
@@ -243,6 +254,12 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
         let (idx, chunk_res) = res.context("chunk task panicked")?;
         let chunk_res = chunk_res.context("chunk multicall failed")?;
         indexed.push((idx, chunk_res));
+    }
+    if indexed.len() != num_chunks {
+        anyhow::bail!(
+            "multicall chunked join incomplete: expected {num_chunks} chunks, got {}",
+            indexed.len()
+        );
     }
     indexed.sort_unstable_by_key(|&(i, _)| i);
     let mut out = Vec::with_capacity(items.len());
@@ -305,6 +322,13 @@ mod tests {
         let chunk = MULTICALL_CHUNK;
         let chunk_count = items_len.div_ceil(chunk);
         assert_eq!(chunk_count, 3);
+    }
+
+    #[test]
+    fn rate_limited_errors_are_not_bisected() {
+        let err = anyhow::anyhow!("429 Too Many Requests");
+        assert!(super::is_rate_limited_rpc_error(&err));
+        assert!(!is_retryable_rpc_error(&err));
     }
 
     #[test]

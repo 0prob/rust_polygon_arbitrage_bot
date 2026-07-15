@@ -12,6 +12,19 @@ use crate::services::execution::candidate::CandidateExecution;
 use crate::services::execution::revert_decoder::decode_revert;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Polygon block gas ceiling for `eth_call` / `estimate_gas`.
+const MAX_ETH_CALL_GAS: u64 = 30_000_000;
+const MIN_ETH_CALL_GAS: u64 = 500_000;
+/// Match `GAS_FALLBACK_MIN_SCALE_BPS` in support.rs — flash callbacks often need >1× sim seed.
+const ETH_CALL_SIM_SCALE_BPS: u64 = 20_000;
+
+#[must_use]
+fn eth_call_gas_limit(simulated_gas: u32) -> u64 {
+    let scaled = u128::from(simulated_gas).saturating_mul(u128::from(ETH_CALL_SIM_SCALE_BPS)) / 10_000;
+    let gas = u64::try_from(scaled).unwrap_or(MAX_ETH_CALL_GAS);
+    gas.clamp(MIN_ETH_CALL_GAS, MAX_ETH_CALL_GAS)
+        .max(u64::from(simulated_gas))
+}
 
 #[derive(Debug, Clone)]
 pub struct DryRunResult {
@@ -38,12 +51,19 @@ fn decode_realized_profit(output: &[u8]) -> Option<U256> {
     None
 }
 
-fn build_tx(candidate: &CandidateExecution, from: Address) -> TransactionRequest {
-    let tx = TransactionRequest::default()
+fn build_tx(
+    candidate: &CandidateExecution,
+    from: Address,
+    gas_limit: Option<u64>,
+) -> TransactionRequest {
+    let mut tx = TransactionRequest::default()
         .to(candidate.target_address)
         .input(candidate.calldata.clone().into())
         .value(candidate.value)
         .from(from);
+    if let Some(gas) = gas_limit {
+        tx = tx.gas_limit(gas);
+    }
 
     if candidate.calldata.len() >= 4 {
         let _sel = &candidate.calldata[..4];
@@ -119,36 +139,104 @@ fn gas_overflow_estimate_fallback(realized_profit: U256) -> DryRunResult {
     }
 }
 
+async fn eth_call_at_block<P: Provider<Ethereum>>(
+    provider: &P,
+    candidate: &CandidateExecution,
+    from: Address,
+    gas_limit: Option<u64>,
+    simulation_block: Option<u64>,
+) -> Result<alloy::primitives::Bytes, String> {
+    let tx = build_tx(candidate, from, gas_limit);
+    let mut call = provider.call(tx);
+    if let Some(block) = block_id(simulation_block) {
+        call = call.block(block);
+    }
+    match timeout(RPC_TIMEOUT, call).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("eth_call timed out".into()),
+    }
+}
+
 async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
     provider: &P,
     candidate: &CandidateExecution,
     from: Address,
     simulation_block: Option<u64>,
 ) -> DryRunResult {
-    let tx = build_tx(candidate, from);
+    let estimate_cap = eth_call_gas_limit(candidate.simulated_gas);
+    let tx = build_tx(candidate, from, Some(estimate_cap));
     let mut estimate = provider.estimate_gas(tx);
     if let Some(block) = block_id(simulation_block) {
         estimate = estimate.block(block);
     }
-    match timeout(RPC_TIMEOUT, estimate).await {
-        Ok(Ok(gas)) => DryRunResult {
-            semantic_success: true,
-            success: true,
-            gas_used: Some(gas),
-            realized_profit: None,
-            error: None,
-            decoded_revert: None,
-        },
-        Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => gas_overflow_dry_run_failure(),
-        Ok(Err(err)) => DryRunResult {
-            semantic_success: false,
-            success: false,
-            gas_used: None,
-            realized_profit: None,
-            error: Some(err.to_string()),
-            decoded_revert: None,
-        },
-        Err(_) => gas_overflow_dry_run_failure(),
+    let gas = match timeout(RPC_TIMEOUT, estimate).await {
+        Ok(Ok(gas)) => gas.min(MAX_ETH_CALL_GAS),
+        Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => {
+            return gas_overflow_dry_run_failure();
+        }
+        Ok(Err(err)) => {
+            return DryRunResult {
+                semantic_success: false,
+                success: false,
+                gas_used: None,
+                realized_profit: None,
+                error: Some(err.to_string()),
+                decoded_revert: None,
+            };
+        }
+        Err(_) => return gas_overflow_dry_run_failure(),
+    };
+    let call_gas = gas.saturating_mul(11_000) / 10_000;
+    match eth_call_at_block(
+        provider,
+        candidate,
+        from,
+        Some(call_gas.min(MAX_ETH_CALL_GAS)),
+        simulation_block,
+    )
+    .await
+    {
+        Ok(output) => {
+            let realized_profit = decode_realized_profit(&output);
+            if realized_profit.filter(|p| !p.is_zero()).is_none() {
+                return DryRunResult {
+                    semantic_success: false,
+                    success: false,
+                    gas_used: Some(gas),
+                    realized_profit: None,
+                    error: Some(
+                        "eth_call after gas estimate succeeded but returned no decodable realized profit"
+                            .into(),
+                    ),
+                    decoded_revert: None,
+                };
+            }
+            DryRunResult {
+                semantic_success: true,
+                success: true,
+                gas_used: Some(gas),
+                realized_profit,
+                error: None,
+                decoded_revert: None,
+            }
+        }
+        Err(raw) if is_gas_limit_rpc_error(&raw) => gas_overflow_dry_run_failure(),
+        Err(raw) => {
+            let decoded = try_decode_revert(&raw);
+            let reason = decoded
+                .as_ref()
+                .map(|r| r.to_string())
+                .unwrap_or(raw);
+            DryRunResult {
+                semantic_success: false,
+                success: false,
+                gas_used: None,
+                realized_profit: None,
+                error: Some(reason),
+                decoded_revert: decoded,
+            }
+        }
     }
 }
 
@@ -159,13 +247,13 @@ pub async fn estimate_candidate_gas<P: Provider<Ethereum>>(
     from: Address,
     simulation_block: Option<u64>,
 ) -> Option<u64> {
-    let tx = build_tx(candidate, from);
+    let tx = build_tx(candidate, from, None);
     let mut estimate = provider.estimate_gas(tx);
     if let Some(block) = block_id(simulation_block) {
         estimate = estimate.block(block);
     }
     match timeout(RPC_TIMEOUT, estimate).await {
-        Ok(Ok(gas)) => Some(gas),
+        Ok(Ok(gas)) => Some(gas.min(MAX_ETH_CALL_GAS)),
         Ok(Err(_err)) => None,
         Err(_) => None,
     }
@@ -177,19 +265,21 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
     from: Address,
     simulation_block: Option<u64>,
 ) -> DryRunResult {
-    // Never constrain simulation or estimation with the local gas heuristic.
-    // Flash-loan callbacks can exceed it; the measured estimate is buffered
-    // later when the real transaction is built.
-    let tx = build_tx(candidate, from);
-    let mut call = provider.call(tx);
-    if let Some(block) = block_id(simulation_block) {
-        call = call.block(block);
-    }
-
-    let realized_profit = match timeout(RPC_TIMEOUT, call).await {
-        Ok(Ok(output)) => decode_realized_profit(&output),
-        Ok(Err(err)) => {
-            let raw = err.to_string();
+    // Do not use candidate.gas_limit for simulation; eth_call gets a scaled cap
+    // from simulated_gas. estimate_gas stays unconstrained; submit buffering is later.
+    let call_gas = eth_call_gas_limit(candidate.simulated_gas);
+    let realized_profit = match eth_call_at_block(
+        provider,
+        candidate,
+        from,
+        Some(call_gas),
+        simulation_block,
+    )
+    .await
+    {
+        Ok(output) => decode_realized_profit(&output),
+        Err(err) => {
+            let raw = err;
             if is_gas_limit_rpc_error(&raw) {
                 crate::debug!(
                     "dry-run eth_call gas overflow: fp={}, hops={}, trying estimate/sim_gas fallback",
@@ -232,25 +322,37 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 decoded_revert: decoded,
             };
         }
-        Err(_) => {
-            return DryRunResult {
-                semantic_success: false,
-                success: false,
-                gas_used: None,
-                realized_profit: None,
-                error: Some("eth_call timed out".into()),
-                decoded_revert: None,
-            };
-        }
     };
 
-    let tx = build_tx(candidate, from);
-    let mut estimate = provider.estimate_gas(tx);
-    if let Some(block) = block_id(simulation_block) {
-        estimate = estimate.block(block);
+    let estimate_gas_cap = eth_call_gas_limit(candidate.simulated_gas);
+    let gas_from_estimate = async {
+        let tx = build_tx(candidate, from, Some(estimate_gas_cap));
+        let mut estimate = provider.estimate_gas(tx);
+        if let Some(block) = block_id(simulation_block) {
+            estimate = estimate.block(block);
+        }
+        match timeout(RPC_TIMEOUT, estimate).await {
+            Ok(Ok(gas)) => Ok(gas.min(MAX_ETH_CALL_GAS)),
+            Ok(Err(err)) if is_gas_limit_rpc_error(&err.to_string()) => {
+                let tx = build_tx(candidate, from, None);
+                let mut retry = provider.estimate_gas(tx);
+                if let Some(block) = block_id(simulation_block) {
+                    retry = retry.block(block);
+                }
+                match timeout(RPC_TIMEOUT, retry).await {
+                    Ok(Ok(gas)) => Ok(gas.min(MAX_ETH_CALL_GAS)),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("estimate_gas timed out".into()),
+                }
+            }
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("estimate_gas timed out".into()),
+        }
     }
-    match timeout(RPC_TIMEOUT, estimate).await {
-        Ok(Ok(gas)) => {
+    .await;
+
+    match gas_from_estimate {
+        Ok(gas) => {
             if realized_profit.is_none() {
                 return DryRunResult {
                     semantic_success: false,
@@ -273,14 +375,16 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 decoded_revert: None,
             }
         }
-        Ok(Err(err)) => {
-            // eth_call already succeeded; some RPCs return gas-limit errors on
-            // estimate_gas even when the callback is otherwise valid.
-            let msg = err.to_string();
+        Err(msg) => {
             if is_gas_limit_rpc_error(&msg) {
                 return realized_profit
                     .map(gas_overflow_estimate_fallback)
                     .unwrap_or_else(gas_overflow_dry_run_failure);
+            }
+            if let Some(profit) = realized_profit {
+                if msg == "estimate_gas timed out" {
+                    return gas_overflow_estimate_fallback(profit);
+                }
             }
             DryRunResult {
                 semantic_success: false,
@@ -289,20 +393,6 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                 realized_profit: None,
                 error: Some(msg),
                 decoded_revert: None,
-            }
-        }
-        Err(_) => {
-            if let Some(profit) = realized_profit {
-                gas_overflow_estimate_fallback(profit)
-            } else {
-                DryRunResult {
-                    semantic_success: false,
-                    success: false,
-                    gas_used: None,
-                    realized_profit: None,
-                    error: Some("estimate_gas timed out".into()),
-                    decoded_revert: None,
-                }
             }
         }
     }
@@ -343,8 +433,14 @@ mod tests {
             route_trace: String::new(),
         };
 
-        let tx = build_tx(&candidate, Address::repeat_byte(3));
+        let tx = build_tx(&candidate, Address::repeat_byte(3), None);
         assert_eq!(tx.gas, None);
+    }
+
+    #[test]
+    fn eth_call_gas_limit_scales_sim_seed() {
+        assert_eq!(eth_call_gas_limit(827_500), 1_655_000);
+        assert_eq!(eth_call_gas_limit(100), MIN_ETH_CALL_GAS);
     }
 
     #[test]

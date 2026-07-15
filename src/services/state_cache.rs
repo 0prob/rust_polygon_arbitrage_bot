@@ -138,6 +138,21 @@ impl StateCache {
         (cached, tradable)
     }
 
+    fn pool_past_invalid_retry_entry(
+        &self,
+        address: Address,
+        entry: &CachedEntry,
+    ) -> Option<Address> {
+        if entry.state.is_tradable() {
+            return None;
+        }
+        let elapsed = entry.updated_at.elapsed();
+        if elapsed > self.ttl {
+            return None;
+        }
+        (elapsed > self.invalid_retry_ttl).then_some(address)
+    }
+
     /// Pools eligible for dead-pool pruning (invalid past retry TTL, one read lock).
     pub fn pools_past_invalid_retry(&self, pools: &[DiscoveredPool]) -> Vec<Address> {
         let guard = self.inner.read();
@@ -145,10 +160,27 @@ impl StateCache {
             .iter()
             .filter_map(|pool| {
                 let entry = guard.get(&pool.address)?;
-                if entry.updated_at.elapsed() > self.ttl || entry.state.is_tradable() {
+                self.pool_past_invalid_retry_entry(pool.address, entry)
+            })
+            .collect()
+    }
+
+    /// Scan cache only — O(cache) instead of O(discovery) for LF dead-pool prune.
+    pub fn pools_past_invalid_retry_indexed(
+        &self,
+        address_index: &FxHashMap<Address, usize>,
+    ) -> Vec<Address> {
+        if address_index.is_empty() {
+            return Vec::new();
+        }
+        let guard = self.inner.read();
+        guard
+            .iter()
+            .filter_map(|(address, entry)| {
+                if !address_index.contains_key(address) {
                     return None;
                 }
-                (entry.updated_at.elapsed() > self.invalid_retry_ttl).then_some(pool.address)
+                self.pool_past_invalid_retry_entry(*address, entry)
             })
             .collect()
     }
@@ -593,6 +625,38 @@ mod tests {
         let dirty = cache.take_dirty_pool_indices(&map);
         assert_eq!(dirty, vec![PoolIndex(3)]);
         assert!(cache.take_dirty_pool_indices(&map).is_empty());
+    }
+
+    #[test]
+    fn pools_past_invalid_retry_indexed_matches_discovery_scan() {
+        use rustc_hash::FxHashMap;
+
+        let cache = StateCache::default().with_ttls(Duration::from_millis(1), Duration::ZERO);
+        let address = Address::with_last_byte(42);
+        cache.insert(address, PoolState::Invalid);
+        std::thread::sleep(Duration::from_millis(5));
+
+        let pool = DiscoveredPool {
+            address,
+            pool_key: "k".to_string(),
+            protocol: crate::core::types::ProtocolType::UniswapV2,
+            protocol_label: "v2".to_string(),
+            tokens: vec![],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 0,
+        };
+        let mut index = FxHashMap::default();
+        index.insert(address, 0usize);
+
+        let via_discovery = cache.pools_past_invalid_retry(&[pool]);
+        let via_index = cache.pools_past_invalid_retry_indexed(&index);
+        assert_eq!(via_discovery, via_index);
+        assert_eq!(via_index, vec![address]);
     }
 
     #[test]

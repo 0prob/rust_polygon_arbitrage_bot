@@ -1,4 +1,4 @@
-use alloy::primitives::U256;
+use alloy::primitives::{I256, U256};
 
 use crate::core::constants::{
     BPS_SCALE, MAX_SANE_PROFIT_MATIC_WEI, MAX_SANE_PROFIT_RATIO_BPS, MAX_SUPPORTED_TOKEN_DECIMALS,
@@ -53,6 +53,24 @@ pub fn matic_usd_for_flash_cap(matic_usd: f64) -> Option<f64> {
     (matic_usd.is_finite() && matic_usd > 0.0).then_some(matic_usd)
 }
 
+/// USD notional cap → MATIC wei from a Chainlink MATIC/USD answer (8 decimals).
+#[must_use]
+pub fn max_flash_loan_matic_wei_from_usd_chainlink_8(usd_cap: u64, matic_usd_answer: I256) -> Option<U256> {
+    if usd_cap == 0 {
+        return None;
+    }
+    let Ok(matic) = i128::try_from(matic_usd_answer) else {
+        return None;
+    };
+    if matic <= 0 {
+        return None;
+    }
+    let numer = U256::from(usd_cap)
+        .checked_mul(ONE)?
+        .checked_mul(U256::from(100_000_000u64))?;
+    Some(numer / U256::from(matic as u128))
+}
+
 /// USD notional cap → MATIC wei (`max_flash_loan_usd` is denominated in US dollars).
 #[must_use]
 pub fn max_flash_loan_matic_wei_from_usd(usd_cap: u64, matic_usd: f64) -> Option<U256> {
@@ -78,11 +96,15 @@ pub fn max_flash_borrow_wei(
     token_decimals: u8,
     token_to_matic_rate: U256,
     matic_usd: f64,
+    matic_usd_chainlink: Option<I256>,
 ) -> Option<U256> {
     if token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS || token_to_matic_rate.is_zero() {
         return None;
     }
-    let max_matic_wei = max_flash_loan_matic_wei_from_usd(max_flash_loan_usd, matic_usd)?;
+    let max_matic_wei = match matic_usd_chainlink {
+        Some(raw) => max_flash_loan_matic_wei_from_usd_chainlink_8(max_flash_loan_usd, raw)?,
+        None => max_flash_loan_matic_wei_from_usd(max_flash_loan_usd, matic_usd)?,
+    };
     let scale = ten_pow_u256(token_decimals);
     max_matic_wei
         .checked_mul(scale)?
@@ -206,7 +228,7 @@ mod tests {
     fn unsupported_decimals_fail_closed_without_overflow() {
         let rate = U256::from(10u128.pow(18));
         assert_eq!(min_economic_amount_in(77, rate), U256::MAX);
-        assert_eq!(max_flash_borrow_wei(50_000, 77, rate, 1.0), None);
+        assert_eq!(max_flash_borrow_wei(50_000, 77, rate, 1.0, None), None);
         assert_eq!(
             check_sim_sanity_fast(SimSanityInput {
                 amount_in: U256::ONE,
@@ -298,16 +320,34 @@ mod tests {
 
     #[test]
     fn max_flash_borrow_scales_with_rate() {
-        let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0).expect("cap");
+        let cap =
+            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0, None).expect("cap");
         assert_eq!(cap, U256::from(50_000u64) * ONE);
-        let low_rate_cap =
-            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(15)), 1.0).expect("cap");
+        let low_rate_cap = max_flash_borrow_wei(
+            50_000,
+            18,
+            U256::from(10u128.pow(15)),
+            1.0,
+            None,
+        )
+        .expect("cap");
         assert!(low_rate_cap > cap);
     }
 
     #[test]
     fn max_flash_borrow_uses_usd_not_matic_units() {
-        let cap = max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 0.5).expect("cap");
+        let cap =
+            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 0.5, None).expect("cap");
         assert_eq!(cap, U256::from(100_000u64) * ONE);
+    }
+
+    #[test]
+    fn max_flash_borrow_chainlink_8_matches_float_usd() {
+        use alloy::primitives::I256;
+        let rate = U256::from(10u128.pow(18));
+        let matic_raw = I256::from(U256::from(50_000_000u64));
+        let float_cap = max_flash_borrow_wei(50_000, 18, rate, 0.5, None).expect("float");
+        let chain_cap = max_flash_borrow_wei(50_000, 18, rate, 0.0, Some(matic_raw)).expect("cl");
+        assert_eq!(float_cap, chain_cap);
     }
 }

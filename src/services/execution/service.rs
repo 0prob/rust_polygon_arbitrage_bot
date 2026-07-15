@@ -706,6 +706,7 @@ impl ExecutionService {
         ui_hook: Option<&SharedUiHook>,
         shutdown: Option<&watch::Receiver<bool>>,
         _metrics: Option<&()>,
+        chain_head_hint: Option<u64>,
     ) -> ExecutionOutcome {
         let fp = candidate.route_fingerprint;
         if shutdown.is_some_and(|rx| *rx.borrow()) {
@@ -777,13 +778,16 @@ impl ExecutionService {
             return outcome;
         }
 
-        let chain_head = match sim_provider.get_block_number().await {
-            Ok(block) => block,
-            Err(e) => {
-                return ExecutionOutcome::SubmitFailed {
-                    reason: format!("cannot establish simulation block: {e}"),
-                };
-            }
+        let chain_head = match chain_head_hint {
+            Some(head) => head,
+            None => match sim_provider.get_block_number().await {
+                Ok(block) => block,
+                Err(e) => {
+                    return ExecutionOutcome::SubmitFailed {
+                        reason: format!("cannot establish simulation block: {e}"),
+                    };
+                }
+            },
         };
         // Pin eth_call to the LF/HF state block so simulation matches routed pool state.
         let provenance_block = candidate.state_block.max(expected_state_block);
@@ -890,8 +894,10 @@ impl ExecutionService {
                 reason: dry.error.unwrap_or_else(|| {
                     if !dry.semantic_success {
                         "dry-run did not produce a decodable realized profit".into()
+                    } else if dry.realized_profit.is_none() {
+                        "dry-run succeeded but returned no non-zero realized profit".into()
                     } else {
-                        "unknown".into()
+                        "dry-run failed without RPC error detail".into()
                     }
                 }),
             };
@@ -935,14 +941,17 @@ impl ExecutionService {
                     .unwrap_or_else(|| "none".into()),
             );
         }
-        gas_oracle.record_sim_observed(candidate.simulated_gas, gas_used);
-        if gas_used > 0 {
-            gas_oracle.record_route_gas(
-                candidate.route_fingerprint,
-                u32::try_from(gas_used).unwrap_or(u32::MAX),
-            );
-        }
         let gas_fallback = dry.gas_used.is_none();
+        // Only RPC-measured gas may calibrate the oracle; scaled heuristics are not observations.
+        if !gas_fallback {
+            gas_oracle.record_sim_observed(candidate.simulated_gas, gas_used);
+            if gas_used > 0 {
+                gas_oracle.record_route_gas(
+                    candidate.route_fingerprint,
+                    u32::try_from(gas_used).unwrap_or(u32::MAX),
+                );
+            }
+        }
         let final_gas = match if gas_fallback {
             pick_live_gas_limit_with_buffer(
                 candidate.simulated_gas,

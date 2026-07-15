@@ -14,12 +14,16 @@ use alloy::primitives::U256;
 use alloy::providers::Provider;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::core::constants::{MAX_SUPPORTED_TOKEN_DECIMALS, POLYGON_HUB_TOKENS, WMATIC};
+use crate::core::constants::{
+    MAX_SUPPORTED_TOKEN_DECIMALS, MIN_TOKEN_TO_MATIC_RATE, POLYGON_HUB_TOKENS, RATE_PRECISION,
+    WMATIC,
+};
 use crate::core::types::{FoundCycle, PoolTokenAddrs, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::services::discovery::TokenMeta;
 
 use self::price_oracle::{PriceOracle, token_usd_to_matic_rate_per_unit};
+use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 
 /// MATIC/USD for flash borrow caps — see [`PriceOracle::ensure_matic_usd_for_flash_cap`].
 pub async fn ensure_matic_usd_for_flash_cap<P>(
@@ -27,7 +31,7 @@ pub async fn ensure_matic_usd_for_flash_cap<P>(
     state_provider: Option<&P>,
 ) -> Option<f64>
 where
-    P: Provider<Ethereum>,
+    P: Provider<Ethereum> + Clone + Send + 'static,
 {
     oracle.ensure_matic_usd_for_flash_cap(state_provider).await
 }
@@ -97,14 +101,29 @@ pub fn resolve_token_decimals_for_index(
     arena: &StateArena,
     hints: &FxHashMap<Address, u8>,
 ) -> u8 {
-    let idx = token.0 as usize;
-    if idx < arena.token_count() as usize {
-        return arena.token_decimals(token);
+    if let Some(addr) = arena.token_address(token) {
+        if let Some(&dec) = hints.get(&addr) {
+            return dec;
+        }
+        let idx = token.0 as usize;
+        if idx < arena.token_count() as usize {
+            let dec = arena.token_decimals(token);
+            if dec <= MAX_SUPPORTED_TOKEN_DECIMALS {
+                return dec;
+            }
+        }
+        return resolve_token_decimals(addr, hints);
     }
-    // Tests / partial arenas without sync still resolve through the address map.
-    arena
-        .token_address(token)
-        .map_or(18, |addr| resolve_token_decimals(addr, hints))
+    18
+}
+
+/// Explicit decimals from discovery/on-chain enrichment only (no 18-decimal guess).
+#[must_use]
+pub fn known_token_decimals(token: Address, hints: &FxHashMap<Address, u8>) -> Option<u8> {
+    hints
+        .get(&token)
+        .copied()
+        .filter(|d| *d <= MAX_SUPPORTED_TOKEN_DECIMALS)
 }
 
 /// Builds the set of token addresses whose MATIC rate is at or above the dust floor.
@@ -212,11 +231,12 @@ where
     let tokens = dedupe_token_indices(tokens);
     let addrs = prefetch_addrs_for_rates(arena, &tokens);
     oracle.prefetch_token_usd(&addrs, provider).await;
-    let matic_usd = match oracle.cached_matic_usd() {
+    let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
         Some(usd) => usd,
         None if provider.is_some() => oracle.get_matic_usd(provider).await,
         None => oracle.get_matic_usd_offline().await,
     };
+    let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
     build_token_to_matic_rates(oracle, arena, &tokens, matic_usd)
 }
 
@@ -232,7 +252,11 @@ where
     let tokens = dedupe_token_indices(tokens);
     let addrs = prefetch_addrs_for_rates(arena, &tokens);
     oracle.prefetch_token_usd_offline(&addrs).await;
-    let matic_usd = oracle.get_matic_usd_offline().await;
+    let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
+        Some(usd) => usd,
+        None => oracle.get_matic_usd_offline().await,
+    };
+    let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
     build_token_to_matic_rates(oracle, arena, &tokens, matic_usd)
 }
 
@@ -264,6 +288,51 @@ fn prefetch_addrs_for_rates(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Ad
     addrs
 }
 
+/// Wrapped native is 1:1 with MATIC for routing when USD feeds exist (integer or float).
+fn insert_missing_wmatic_self_rates(
+    oracle: &PriceOracle,
+    arena: &StateArena,
+    matic_usd: f64,
+    out: &mut FxHashMap<TokenIndex, U256>,
+) {
+    let wmatic = WMATIC;
+    let rate_one = RATE_PRECISION;
+    for i in 0..arena.token_count() {
+        let idx = TokenIndex(i);
+        if out.contains_key(&idx) {
+            continue;
+        }
+        let Some(addr) = arena.token_address(idx) else {
+            continue;
+        };
+        if addr != wmatic {
+            continue;
+        }
+        let rate = oracle
+            .token_matic_rate_per_unit_integer(&wmatic)
+            .or_else(|| {
+                if matic_usd > 0.0 {
+                    oracle
+                        .fresh_token_usd(&wmatic)
+                        .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
+                } else {
+                    None
+                }
+            })
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE)
+            .unwrap_or_else(|| {
+                if matic_usd > 0.0 {
+                    rate_one
+                } else {
+                    U256::ZERO
+                }
+            });
+        if rate >= MIN_TOKEN_TO_MATIC_RATE {
+            out.insert(idx, rate);
+        }
+    }
+}
+
 fn build_token_to_matic_rates(
     oracle: &PriceOracle,
     arena: &StateArena,
@@ -276,30 +345,33 @@ fn build_token_to_matic_rates(
         requested: tokens.len(),
         ..RateEnrichStats::default()
     };
+    let mut addrs: Vec<Address> = Vec::with_capacity(tokens.len());
+    for idx in tokens {
+        if let Some(addr) = arena.token_address(*idx) {
+            addrs.push(addr);
+        }
+    }
+    let integer_by_addr = oracle.integer_matic_rates_batch(&addrs);
     let mut out = FxHashMap::with_capacity_and_hasher(tokens.len(), FxBuildHasher);
     for idx in tokens {
         let Some(addr) = arena.token_address(*idx) else {
             stats.unresolved += 1;
             continue;
         };
-        let chainlink = if addr == wmatic {
-            oracle.token_matic_rate_per_unit_integer(&wmatic)
-        } else {
-            oracle.token_matic_rate_per_unit_integer(&addr)
-        };
-        let rate = chainlink
+        let integer = integer_by_addr.get(&addr).copied();
+        let rate = integer
             .or_else(|| {
                 if matic_usd > 0.0 {
                     oracle
-                        .token_usd(&addr)
+                        .fresh_token_usd(&addr)
                         .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
                 } else {
                     None
                 }
             })
-            .filter(|r| *r >= crate::core::constants::MIN_TOKEN_TO_MATIC_RATE);
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
         if let Some(rate) = rate {
-            if chainlink.is_some() || addr == wmatic {
+            if integer.is_some() {
                 stats.chainlink += 1;
             } else {
                 stats.pyth_or_float += 1;
@@ -310,6 +382,7 @@ fn build_token_to_matic_rates(
             stats.unresolved += 1;
         }
     }
+    insert_missing_wmatic_self_rates(oracle, arena, matic_usd, &mut out);
     // ponytail: fallback when no oracle feeds — mark WMATIC as self-resolving
     // so that WMATIC-paired pools become routable. Without this, zero oracle
     // feeds = zero resolvable tokens = zero cycles.
@@ -402,6 +475,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_token_decimals_prefers_hints_over_arena_default() {
+        let mut arena = StateArena::default();
+        let token = Address::with_last_byte(7);
+        let idx = arena.register_token(token);
+        let mut hints = FxHashMap::default();
+        hints.insert(token, 6);
+        assert_eq!(resolve_token_decimals_for_index(idx, &arena, &hints), 6);
+    }
+
+    #[test]
+    fn known_token_decimals_rejects_unbounded_metadata() {
+        let mut hints = FxHashMap::default();
+        let token = Address::with_last_byte(8);
+        hints.insert(token, 31);
+        assert!(known_token_decimals(token, &hints).is_none());
+        hints.insert(token, 6);
+        assert_eq!(known_token_decimals(token, &hints), Some(6));
+    }
+
+    #[test]
     fn dedupe_token_indices_drops_duplicates() {
         let v = dedupe_token_indices([TokenIndex(1), TokenIndex(1), TokenIndex(2), TokenIndex(2)]);
         assert_eq!(v.len(), 2);
@@ -443,6 +536,22 @@ mod tests {
         assert!(addrs.contains(&usdc));
         assert!(addrs.contains(&POLYGON_HUB_TOKENS[0]));
         assert!(addrs.len() >= POLYGON_HUB_TOKENS.len());
+    }
+
+    #[test]
+    fn insert_missing_wmatic_self_rates_when_matic_usd_known() {
+        use super::price_oracle::PriceOracle;
+
+        let mut arena = StateArena::default();
+        let wmatic_idx = arena.register_token(WMATIC);
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            10_000,
+        );
+        let mut out = FxHashMap::default();
+        insert_missing_wmatic_self_rates(&oracle, &arena, 0.5, &mut out);
+        assert_eq!(out.get(&wmatic_idx).copied(), Some(RATE_PRECISION));
     }
 
     #[test]

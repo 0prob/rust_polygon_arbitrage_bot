@@ -40,6 +40,33 @@ pub fn route_hop_gas_budget(edges: &[Edge]) -> u32 {
     edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum()
 }
 
+/// Route gas for ranking: static hop budget vs walked hop gas (V3 tick crosses), whichever is higher.
+#[must_use]
+fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
+    let hop_count = edges.len();
+    if hop_count == 0 {
+        return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
+    }
+    let hop_budget = route_hop_gas_budget(edges);
+    let static_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
+        hop_budget,
+        hop_count,
+        hop_count as u32,
+    );
+    if walked_hop_gas == 0 || crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+        return static_gas;
+    }
+    let dynamic = crate::services::execution::gas::estimate_route_gas_from_hops(
+        walked_hop_gas,
+        hop_count,
+    )
+    .saturating_add(crate::services::execution::gas::estimate_route_storage_gas(
+        hop_count,
+        hop_count as u32,
+    ));
+    static_gas.max(dynamic)
+}
+
 /// Conservative gas units for a full route (overhead + per-hop + tick premium + storage reads).
 #[must_use]
 pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
@@ -493,41 +520,33 @@ fn walk_route_hops(
     Some((current, total_gas))
 }
 
+#[inline]
+fn route_edges_simulatable(edges: &[Edge]) -> bool {
+    !edges.is_empty()
+        && edges.len() <= HOP_CAP_USIZE
+        && edges
+            .windows(2)
+            .all(|pair| pair[0].token_out == pair[1].token_in)
+}
+
 pub fn simulate_route_minimal(
     arena: &StateArena,
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
-    if edges.is_empty()
-        || edges.len() > HOP_CAP_USIZE
-        || edges
-            .windows(2)
-            .any(|pair| pair[0].token_out != pair[1].token_in)
-    {
+    if !route_edges_simulatable(edges) {
         return None;
     }
     if amount_in.is_zero() {
-        let hop_gas = route_hop_gas_budget(edges);
-        let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-            hop_gas,
-            edges.len(),
-            edges.len() as u32,
-        );
         return Some(MinimalSimResult {
             profit: U256::ZERO,
             amount_out: U256::ZERO,
-            total_gas,
+            total_gas: finalize_route_total_gas(edges, 0),
         });
     }
-    let (amount_out, _) = walk_route_hops(arena, edges, amount_in, None)?;
+    let (amount_out, walked_gas) = walk_route_hops(arena, edges, amount_in, None)?;
     let profit = amount_out.saturating_sub(amount_in);
-    let hop_count = edges.len();
-    let hop_gas = route_hop_gas_budget(edges);
-    let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-        hop_gas,
-        hop_count,
-        hop_count as u32,
-    );
+    let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(MinimalSimResult {
         profit,
         amount_out,
@@ -543,40 +562,25 @@ pub fn simulate_route_detailed(
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
-    if hop_count == 0
-        || hop_count > HOP_CAP_USIZE
-        || edges
-            .windows(2)
-            .any(|pair| pair[0].token_out != pair[1].token_in)
-    {
+    if !route_edges_simulatable(edges) {
         return None;
     }
     if amount_in.is_zero() {
-        let hop_gas = route_hop_gas_budget(edges);
-        let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-            hop_gas,
-            hop_count,
-            hop_count as u32,
-        );
         return Some(RouteSimulationResult {
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
             profit: U256::ZERO,
             profitable: false,
             hop_amounts: hop_amounts_zeroed(hop_count),
-            total_gas,
+            total_gas: finalize_route_total_gas(edges, 0),
             hop_count: hop_count as u32,
         });
     }
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    let (amount_out, _) = walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
+    let (amount_out, walked_gas) =
+        walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
     let profit = amount_out.saturating_sub(amount_in);
-    let hop_gas = route_hop_gas_budget(edges);
-    let total_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
-        hop_gas,
-        hop_count,
-        hop_count as u32,
-    );
+    let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(RouteSimulationResult {
         amount_in,
         amount_out,

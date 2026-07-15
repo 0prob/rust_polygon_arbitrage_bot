@@ -38,6 +38,8 @@ use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
+/// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
+const MAX_HOT_FLASH_TOKENS: usize = 384;
 
 pub async fn fetch_and_cache_aave_flash_loan_fee_bps<P: Provider<Ethereum>>(
     provider: &P,
@@ -197,6 +199,12 @@ impl FlashLiquidityCache {
         for token in tokens {
             hot.insert(*token);
         }
+        if hot.len() > MAX_HOT_FLASH_TOKENS {
+            hot.clear();
+            for token in tokens {
+                hot.insert(*token);
+            }
+        }
     }
 
     fn hot_token_list(&self) -> Vec<Address> {
@@ -286,7 +294,11 @@ impl FlashLiquidityCache {
                         if tokens.is_empty() {
                             continue;
                         }
-                        if let Err(e) = self.refresh_with_fallback(&rpc, &tokens).await {
+                        let stale = self.stale_tokens(&tokens);
+                        if stale.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = self.refresh_with_fallback(&rpc, &stale).await {
                             crate::debug!("background flash liquidity refresh failed: {e:#}");
                         }
                     }
@@ -478,7 +490,8 @@ impl FlashLiquidityCache {
                         balancer,
                         aave,
                         aave_listed,
-                        dodo: U256::MAX,
+                        // DODO borrow size is route-local (see `flash_liquidity_for_cycle`).
+                        dodo: U256::ZERO,
                     },
                     fetched_at: now,
                 },
@@ -634,13 +647,15 @@ pub fn cycle_has_aave_listed_token(
         .any(|liquidity| liquidity.aave_listed && !liquidity.aave.is_zero())
 }
 
-fn cycle_flash_cache_warm(
+/// Every hop borrow candidate must have fresh flash liquidity before we fail-close mixed routes.
+fn cycle_flash_tokens_all_fresh(
     cycle: &FoundCycle,
     arena: &StateArena,
     flash: &FlashLiquiditySnapshot,
     ttl: Duration,
 ) -> bool {
     let mut seen = rustc_hash::FxHashSet::default();
+    let mut checked = 0u32;
     for edge in &cycle.edges {
         let token = edge.token_in;
         if !seen.insert(token) {
@@ -649,11 +664,12 @@ fn cycle_flash_cache_warm(
         let Some(addr) = arena.token_address(token) else {
             continue;
         };
-        if flash.has_fresh(addr, ttl) {
-            return true;
+        checked += 1;
+        if !flash.has_fresh(addr, ttl) {
+            return false;
         }
     }
-    false
+    checked > 0
 }
 
 /// Mixed Balancer routes need an Aave-listed token for flash borrow. Pure Balancer routes
@@ -670,8 +686,8 @@ pub fn balancer_route_flash_feasible(
     if route_is_balancer_only(cycle) {
         return true;
     }
-    if !cycle_flash_cache_warm(cycle, arena, flash, ttl) {
-        // HF flash prefetch may still be in flight during probe rank; eval re-checks with warm data.
+    if !cycle_flash_tokens_all_fresh(cycle, arena, flash, ttl) {
+        // HF flash prefetch may still be in flight; partial cache must not false-reject.
         return true;
     }
     cycle_has_aave_listed_token(cycle, arena, flash, ttl)
@@ -970,6 +986,7 @@ pub struct PrepareDispatchInput<'a> {
     pub slippage_bps: u64,
     pub max_flash_loan_usd: u64,
     pub matic_usd: f64,
+    pub matic_usd_chainlink: Option<alloy::primitives::I256>,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
     pub route_fingerprint: u64,
@@ -1038,6 +1055,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         token_decimals,
         token_to_matic_rate,
         input.matic_usd,
+        input.matic_usd_chainlink,
     );
     if plan.action != FlashPlanAction::Reject
         && let Some(cap) = flash_borrow_cap
@@ -1169,6 +1187,7 @@ fn reoptimize_capped(
         input.token_decimals,
         Some(input.max_flash_loan_usd),
         input.matic_usd,
+        input.matic_usd_chainlink,
         Some(input.brent_iters),
         Some(cap),
         &profit_ctx,
@@ -1243,6 +1262,7 @@ fn dispatch_sim_passes_sanity(
         token_decimals,
         token_to_matic_rate,
         input.matic_usd,
+        input.matic_usd_chainlink,
     ) && result.amount_in > cap
     {
         return false;

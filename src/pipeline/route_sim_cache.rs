@@ -55,13 +55,15 @@ impl RouteSimCache {
     }
 
     pub fn clear_stale(&self, current_generation: u64) {
-        if self.pruned_generation.load(Ordering::Acquire) == current_generation {
-            return;
-        }
+        let before = self.entries.len();
         self.entries
             .retain(|key, _| key.generation == current_generation);
-        self.pruned_generation
-            .store(current_generation, Ordering::Release);
+        if before != self.entries.len()
+            || self.pruned_generation.load(Ordering::Acquire) != current_generation
+        {
+            self.pruned_generation
+                .store(current_generation, Ordering::Release);
+        }
     }
 
     #[must_use]
@@ -148,6 +150,23 @@ mod tests {
         );
         cache.clear_stale(7);
 
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn clear_stale_prunes_old_generation_even_when_marker_matches() {
+        let cache = RouteSimCache::new();
+        let sim = MinimalSimResult {
+            profit: U256::ONE,
+            amount_out: U256::ONE,
+            total_gas: 1,
+        };
+        cache.insert(1, 10, U256::from(100u64), sim);
+        cache.insert(2, 10, U256::from(100u64), sim);
+        cache.clear_stale(2);
+        assert!(cache.get(1, 10, U256::from(100u64)).is_none());
+        assert!(cache.get(2, 10, U256::from(100u64)).is_some());
+        cache.clear_stale(2);
         assert_eq!(cache.entry_count(), 1);
     }
 }

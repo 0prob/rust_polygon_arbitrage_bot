@@ -37,7 +37,15 @@ pub(super) fn prune_run_directories(root: &Path, keep: usize) -> io::Result<()> 
                 .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
         })
         .collect::<Vec<_>>();
-    runs.sort_by_key(std::fs::DirEntry::file_name);
+    runs.sort_by(|a, b| {
+        let key = |entry: &std::fs::DirEntry| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        };
+        key(a).cmp(&key(b))
+    });
     let remove_count = runs.len().saturating_sub(keep);
     for entry in runs.into_iter().take(remove_count) {
         std::fs::remove_dir_all(entry.path())?;

@@ -18,6 +18,7 @@ use crate::pipeline::multicall::{
     MulticallItem, encode_call, execute_multicall_at_chunked, plan_batch_call_budget,
 };
 use crate::services::discovery::DiscoveredPool;
+use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::services::state_cache::StateCache;
 
 use decode::decode_plan;
@@ -391,16 +392,31 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         .await;
     }
 
-    let pace_batches = batch_pace_ms > 0;
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
+    // Stagger spawns do not pace in-flight RPC when batches run in parallel — serialize when pacing is on.
+    if batch_pace_ms > 0 {
+        let mut updated = 0usize;
+        for (i, batch) in batches.into_iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(pacing).await;
+            }
+            updated += execute_plan_batch(
+                &provider,
+                &batch,
+                cache.as_ref(),
+                block_number,
+                chunk_size,
+            )
+            .await;
+        }
+        return updated;
+    }
+
     let sem = Arc::new(tokio::sync::Semaphore::new(
         MAX_PARALLEL_PLAN_BATCHES.min(batches.len()),
     ));
     let mut tasks = tokio::task::JoinSet::new();
-    for (i, batch) in batches.into_iter().enumerate() {
-        if pace_batches && i > 0 {
-            tokio::time::sleep(pacing).await;
-        }
+    for batch in batches {
         let provider = provider.clone();
         let cache = Arc::clone(&cache);
         let sem = Arc::clone(&sem);
@@ -414,8 +430,9 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
     let mut updated = 0usize;
     while let Some(res) = tasks.join_next().await {
-        if let Ok(n) = res {
-            updated += n;
+        match res {
+            Ok(n) => updated += n,
+            Err(e) => crate::warn!("plan batch task failed: {e:#}"),
         }
     }
     updated
@@ -522,12 +539,19 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         let slice = &plans[start..end];
         match execute_plan_batch_inner(provider, slice, cache, block_number, chunk_size).await {
             Ok(n) => updated += n,
-            Err(()) if slice.len() > 1 => {
+            Err(e) if is_rpc_rate_limited(&e) => {
+                crate::warn!(
+                    "plan batch abort: rate limited (updated={updated}, remaining_pools={})",
+                    end.saturating_sub(start)
+                );
+                break;
+            }
+            Err(_e) if slice.len() > 1 => {
                 let mid = start + slice.len() / 2;
                 work.push((mid, end));
                 work.push((start, mid));
             }
-            Err(()) => {
+            Err(_e) => {
                 crate::warn!(
                     "multicall batch failed for pool {} ({} calls)",
                     slice[0].pool.address,
@@ -545,7 +569,7 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
     cache: &StateCache,
     block_number: Option<u64>,
     chunk_size: usize,
-) -> Result<usize, ()> {
+) -> anyhow::Result<usize> {
     let total_calls: usize = plans.iter().map(|p| p.calls.len()).sum();
     let mut items = Vec::with_capacity(total_calls);
     let mut spans: Vec<(&PoolFetchPlan, usize, usize)> = Vec::with_capacity(plans.len());
@@ -556,24 +580,19 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
     }
 
     let item_count = items.len();
-    let results = match execute_multicall_at_chunked(
+    let results = execute_multicall_at_chunked(
         provider.clone(),
         Arc::from(items),
         block_number,
         chunk_size,
     )
     .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = e;
-            crate::warn!(
-                "multicall batch failed ({item_count} items, {} pools): provider rejected batch",
-                plans.len()
-            );
-            return Err(());
-        }
-    };
+    .inspect_err(|e| {
+        crate::warn!(
+            "multicall batch failed ({item_count} items, {} pools): {e:#}",
+            plans.len()
+        );
+    })?;
 
     let mut updated = 0usize;
     for (plan, start, end) in spans {
