@@ -45,11 +45,18 @@ pub fn sign_extend_tick24(tick_word: U256) -> i32 {
     }
 }
 
-/// Hot-path scale lookup — avoids `pow` for the dominant 18-decimal case.
+static TEN_POW_BY_DECIMALS: LazyLock<[U256; 31]> =
+    LazyLock::new(|| std::array::from_fn(|d| ten_pow_u256(d as u8)));
+
+/// Hot-path scale lookup — table for 0..=30 (MAX_SUPPORTED_TOKEN_DECIMALS).
 #[inline]
 #[must_use]
 pub fn ten_pow_u256_cached(decimals: u8) -> U256 {
-    ten_pow_u256(decimals)
+    if decimals <= 30 {
+        TEN_POW_BY_DECIMALS[decimals as usize]
+    } else {
+        ten_pow_u256(decimals)
+    }
 }
 
 static RAYON_GLOBAL_INIT: Once = Once::new();

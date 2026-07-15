@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::FoundCycle;
-use crate::core::types::{FlashLoanSource, PoolState};
+use crate::core::types::FlashLoanSource;
 use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::{
     HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
@@ -480,6 +480,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &evaluated.cycle.edges,
             &refreshed.hop_amounts,
             Some(&mut hop_profile),
+            true,
         ) {
             skipped.record("hop_fidelity");
             let hop = match reject {
@@ -771,7 +772,8 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     if tick_pools.is_empty() && v4_targets.is_empty() {
         return;
     }
-    clear_dispatch_cl_ticks(arena, &tick_pools, &v4_targets);
+    crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
+    crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
     let v3_loaded = enrich_v3_ticks(
@@ -790,29 +792,6 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
         tick_pools.len(),
         v4_targets.len(),
     );
-}
-
-fn clear_dispatch_cl_ticks(
-    arena: &mut StateArena,
-    v3_pools: &[alloy::primitives::Address],
-    v4_targets: &[(
-        crate::core::types::PoolIndex,
-        alloy::primitives::FixedBytes<32>,
-    )],
-) {
-    for pool in v3_pools {
-        let Some(&index) = arena.address_to_pool().get(pool) else {
-            continue;
-        };
-        if let Some(PoolState::V3(state)) = arena.pool_state_mut(index) {
-            state.ticks = Arc::from([]);
-        }
-    }
-    for &(index, _) in v4_targets {
-        if let Some(PoolState::V4(state)) = arena.pool_state_mut(index) {
-            state.ticks = Arc::from([]);
-        }
-    }
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
@@ -893,6 +872,7 @@ pub(crate) async fn refresh_and_resim_profitable(
                 &result.cycle.edges,
                 &refreshed.hop_amounts,
                 Some(&mut hop_profile),
+                true,
             ) {
                 reassess_reject += 1;
                 crate::debug!(
@@ -1256,7 +1236,7 @@ fn collect_route_pool_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{V3PoolState, V3Tick};
+    use crate::core::types::{PoolState, V3PoolState, V3Tick};
 
     #[test]
     fn clear_dispatch_cl_ticks_removes_stale_v3_ticks() {
@@ -1281,7 +1261,7 @@ mod tests {
             })),
         );
 
-        clear_dispatch_cl_ticks(&mut arena, &[address], &[]);
+        crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &[address]);
 
         let Some(PoolState::V3(state)) = arena.pool_state(pool) else {
             panic!("registered pool must retain V3 state");

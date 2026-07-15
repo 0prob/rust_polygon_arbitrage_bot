@@ -7,10 +7,63 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 use crate::core::v4_storage::{
     compute_v4_tick_bitmap_slot, compute_v4_tick_info_slot, decode_v4_tick_liquidity,
 };
+use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 
 const MAX_TICK_POOLS: usize = 512;
+/// Cap per-pass extsload tick-info reads (dense bitmaps can fan out quickly).
+const MAX_V4_TICK_INFO_READS: usize = 2_048;
+
+/// Drop stale tick bitmap before re-enriching (slot0/liquidity may have moved).
+pub fn clear_v3_pool_ticks(arena: &mut StateArena, pool_addresses: &[Address]) {
+    for pool in pool_addresses {
+        let Some(&index) = arena.address_to_pool().get(pool) else {
+            continue;
+        };
+        if let Some(crate::core::types::PoolState::V3(state)) = arena.pool_state_mut(index) {
+            state.ticks = Arc::from([]);
+        }
+    }
+}
+
+pub fn clear_v4_pool_ticks(
+    arena: &mut StateArena,
+    targets: &[(PoolIndex, FixedBytes<32>)],
+) {
+    for &(index, _) in targets {
+        if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(index) {
+            state.ticks = Arc::from([]);
+        }
+    }
+}
+
+/// Compressed tick index (`floor(tick / spacing)`) matching Uniswap V3 tick bitmap math.
+#[inline]
+#[must_use]
+pub fn compress_cl_tick(tick: i32, spacing: i32) -> i32 {
+    tick.div_euclid(spacing.max(1))
+}
+
+#[inline]
+#[must_use]
+pub fn cl_tick_bitmap_center_word(tick: i32, spacing: i32) -> i32 {
+    compress_cl_tick(tick, spacing) >> 8
+}
+
+#[inline]
+fn cl_tick_from_bitmap_bit(word: i32, bit: u16, spacing: i32) -> Option<i32> {
+    let compressed = word
+        .saturating_mul(256)
+        .saturating_add(i32::from(bit));
+    let tick = compressed.saturating_mul(spacing.max(1));
+    (MIN_TICK..=MAX_TICK).contains(&tick).then_some(tick)
+}
+
+fn finalize_cl_ticks(ticks: &mut Vec<V3Tick>) {
+    ticks.sort_unstable_by_key(|t| t.tick);
+    ticks.dedup_by(|a, b| a.tick == b.tick);
+}
 
 /// Collect (algebra, algebra_integral) pool address sets from metas for tick enrichment.
 /// Integral pools are also algebra (use special tick path) but require different decode ABI.
@@ -133,7 +186,7 @@ pub async fn enrich_v3_ticks<
             Some(crate::core::types::PoolState::V3(s)) => (s.tick, s.tick_spacing),
             _ => continue,
         };
-        let center_word = (tick / spacing.max(1)) >> 8;
+        let center_word = cl_tick_bitmap_center_word(tick, spacing);
         let word_min = center_word - word_range as i32;
         let word_max = center_word + word_range as i32;
         let start = items.len();
@@ -183,8 +236,12 @@ pub async fn enrich_v3_ticks<
                     ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
                 {
                     for pt in populated {
+                        let tick = pt.tick.as_i32();
+                        if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+                            continue;
+                        }
                         ticks.push(V3Tick {
-                            tick: pt.tick.as_i32(),
+                            tick,
                             liquidity_gross: pt.liquidityGross,
                             liquidity_net: pt.liquidityNet,
                         });
@@ -194,7 +251,7 @@ pub async fn enrich_v3_ticks<
             if ticks.is_empty() {
                 continue;
             }
-            ticks.sort_unstable();
+            finalize_cl_ticks(&mut ticks);
             if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(idx) {
                 s.ticks = Arc::from(ticks);
                 updated += 1;
@@ -237,7 +294,7 @@ pub async fn enrich_v4_ticks<
             continue;
         };
         let spacing = s.tick_spacing.max(1);
-        let center_word = (s.tick / spacing) >> 8;
+        let center_word = cl_tick_bitmap_center_word(s.tick, spacing);
         let word_min = center_word - word_range as i32;
         let word_max = center_word + word_range as i32;
         let start = bitmap_calls.len();
@@ -261,7 +318,7 @@ pub async fn enrich_v4_ticks<
 
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
-    for (idx, pool_id, spacing, word_min, start, end) in spans {
+    'pools: for (idx, pool_id, spacing, word_min, start, end) in spans {
         for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
             let Some(bytes) = bytes else {
                 continue;
@@ -270,18 +327,22 @@ pub async fn enrich_v4_ticks<
                 continue;
             };
             for bit in 0..256u16 {
+                if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                    break 'pools;
+                }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
                     continue;
                 }
-                let compressed = (word_min + offset as i32) * 256 + i32::from(bit);
-                let tick = compressed.saturating_mul(spacing);
-                let clamped = tick.clamp(-8_388_608, 8_388_607);
-                let slot = compute_v4_tick_info_slot(&pool_id, clamped);
+                let word = word_min + offset as i32;
+                let Some(tick) = cl_tick_from_bitmap_bit(word, bit, spacing) else {
+                    continue;
+                };
+                let slot = compute_v4_tick_info_slot(&pool_id, tick);
                 tick_calls.push(MulticallItem {
                     target: manager,
                     data: encode_extsload(slot),
                 });
-                tick_owners.push((idx, clamped));
+                tick_owners.push((idx, tick));
             }
         }
     }
@@ -319,7 +380,7 @@ pub async fn enrich_v4_ticks<
 
     let mut updated = 0;
     for (idx, mut ticks) in grouped {
-        ticks.sort_unstable();
+        finalize_cl_ticks(&mut ticks);
         if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(idx) {
             state.ticks = Arc::from(ticks);
             updated += 1;
@@ -385,17 +446,18 @@ async fn enrich_algebra_ticks<
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
                     continue;
                 }
-                let compressed = (word_min + offset as i32) * 256 + i32::from(bit);
-                let tick = compressed.saturating_mul(spacing);
-                let clamped: i32 = tick.clamp(-8_388_608, 8_388_607);
-                let Ok(tick_i24) = clamped.try_into() else {
+                let word = word_min + offset as i32;
+                let Some(tick) = cl_tick_from_bitmap_bit(word, bit, spacing) else {
+                    continue;
+                };
+                let Ok(tick_i24) = tick.try_into() else {
                     continue;
                 };
                 tick_calls.push(MulticallItem {
                     target: pool,
                     data: encode_call(&IAlgebraPool::ticksCall { tick: tick_i24 }),
                 });
-                tick_owners.push((pool, idx, clamped));
+                tick_owners.push((pool, idx, tick));
             }
         }
     }
@@ -444,11 +506,55 @@ async fn enrich_algebra_ticks<
     }
     let mut updated = 0;
     for (idx, mut ticks) in grouped {
-        ticks.sort_unstable();
+        finalize_cl_ticks(&mut ticks);
         if let Some(crate::core::types::PoolState::V3(state)) = arena.pool_state_mut(idx) {
             state.ticks = Arc::from(ticks);
             updated += 1;
         }
     }
     updated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compress_cl_tick_matches_uniswap_floor_division_for_negatives() {
+        assert_eq!(compress_cl_tick(61, 60), 1);
+        assert_eq!(compress_cl_tick(-61, 60), -2);
+        assert_eq!(compress_cl_tick(-120, 60), -2);
+        assert_eq!(compress_cl_tick(0, 60), 0);
+    }
+
+    #[test]
+    fn bitmap_bit_reconstructs_spacing_aligned_tick() {
+        assert_eq!(cl_tick_from_bitmap_bit(0, 1, 60), Some(60));
+        assert_eq!(cl_tick_from_bitmap_bit(-1, 0, 60), Some(-256 * 60));
+    }
+
+    #[test]
+    fn finalize_cl_ticks_dedups_duplicate_indices() {
+        let mut ticks = vec![
+            V3Tick {
+                tick: 60,
+                liquidity_gross: 1,
+                liquidity_net: 1,
+            },
+            V3Tick {
+                tick: 60,
+                liquidity_gross: 2,
+                liquidity_net: 2,
+            },
+            V3Tick {
+                tick: -60,
+                liquidity_gross: 3,
+                liquidity_net: 3,
+            },
+        ];
+        finalize_cl_ticks(&mut ticks);
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[0].tick, -60);
+        assert_eq!(ticks[1].tick, 60);
+    }
 }

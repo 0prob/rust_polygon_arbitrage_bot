@@ -185,7 +185,11 @@ pub fn build_calldata_hops(
         {
             return None;
         }
-        if edge.protocol == ProtocolType::UniswapV4 && edge.zero_for_one != (token_in < token_out) {
+        if matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) && edge.zero_for_one != (token_in < token_out)
+        {
             return None;
         }
         let meta = pool_metas_by_pool.get(&edge.pool_index).copied();

@@ -8,7 +8,8 @@ use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_minimal;
 use crate::pipeline::sim_sanity::min_economic_amount_in;
-use crate::pipeline::types::compare_cycle_score;
+use crate::pipeline::spot_price::spot_probe_for_decimals;
+use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
 
 #[must_use]
 pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
@@ -21,7 +22,11 @@ pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
 
 #[inline]
 fn cycle_spot_negative(cycle: &FoundCycle) -> bool {
-    cycle.cycle_ratio > ONE || (cycle.cycle_ratio.is_zero() && cycle.score < 0.0)
+    if cycle.cycle_ratio > ONE {
+        return true;
+    }
+    // Pre-rescore / cache paths may only have graph f64 score.
+    cycle.cycle_ratio.is_zero() && cycle.score < 0.0
 }
 
 /// Token metadata for per-cycle probe sizing during atomic prefilter.
@@ -52,15 +57,17 @@ fn probe_context_for_cycle(
     cycle: &FoundCycle,
     ctx: Option<&ProbeContext<'_>>,
 ) -> (U256, U256, u8) {
-    let mut decimals = arena.token_decimals(cycle.start_token);
     let mut rate = U256::ZERO;
+    let decimals = if let Some(c) = ctx.and_then(|c| c.token_decimals) {
+        crate::services::oracle::resolve_token_decimals_for_index(
+            cycle.start_token,
+            arena,
+            c,
+        )
+    } else {
+        arena.token_decimals(cycle.start_token)
+    };
     if let Some(c) = ctx {
-        if let Some(token_address) = arena.token_address(cycle.start_token)
-            && let Some(dec_map) = c.token_decimals
-            && let Some(&dec) = dec_map.get(&token_address)
-        {
-            decimals = dec;
-        }
         if let Some(rate_map) = c.token_to_matic_rates
             && let Some(&r) = rate_map.get(&cycle.start_token)
         {
@@ -89,7 +96,13 @@ fn prefilter_verdict_for_cycle(
         return PrefilterVerdict::Reject;
     }
     let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
-    let probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
+    let mut probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
+    if probe.as_ref().is_none_or(|s| s.profit.is_zero()) {
+        let spot = spot_probe_for_decimals(decimals);
+        if spot != probe_amount && !spot.is_zero() {
+            probe = simulate_route_minimal(arena, &cycle.edges, spot);
+        }
+    }
     match &probe {
         Some(sim) if sim.profit > U256::ZERO => {
             if let Some(c) = ctx {
@@ -240,7 +253,7 @@ pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> V
         let key = cycle_key(&cycle.edges);
         match best.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if e.get().edges == cycle.edges && cycle.score < e.get().score {
+                if cycle_prefers_candidate(&cycle, e.get()) {
                     *e.get_mut() = cycle;
                 }
             }
@@ -341,6 +354,18 @@ mod tests {
         let kept = dedupe_cycles_by_edges(vec![cycle(-0.1, false), cycle(-0.2, false)]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].score, -0.2);
+    }
+
+    #[test]
+    fn dedupe_prefers_higher_cycle_ratio_when_scores_tie() {
+        let mut better = cycle(-0.1, false);
+        better.cycle_ratio = ONE + ONE / U256::from(50u64);
+        let expected_ratio = better.cycle_ratio;
+        let mut worse = cycle(-0.1, false);
+        worse.cycle_ratio = ONE + ONE / U256::from(100u64);
+        let kept = dedupe_cycles_by_edges(vec![worse, better]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].cycle_ratio, expected_ratio);
     }
 
     #[test]

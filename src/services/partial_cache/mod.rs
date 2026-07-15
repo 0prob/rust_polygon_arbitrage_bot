@@ -33,8 +33,24 @@ pub struct SlimPoolState {
 impl SlimPoolState {
     #[must_use]
     pub fn from_v3(sqrt_price_x96: U256, liquidity: u128, tick: i32, now_ms: u64) -> Self {
+        Self::from_cl(ProtocolType::UniswapV3, sqrt_price_x96, liquidity, tick, now_ms)
+    }
+
+    #[must_use]
+    pub fn from_v4(sqrt_price_x96: U256, liquidity: u128, tick: i32, now_ms: u64) -> Self {
+        Self::from_cl(ProtocolType::UniswapV4, sqrt_price_x96, liquidity, tick, now_ms)
+    }
+
+    #[must_use]
+    fn from_cl(
+        protocol: ProtocolType,
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+        now_ms: u64,
+    ) -> Self {
         Self {
-            protocol: ProtocolType::UniswapV3,
+            protocol,
             sqrt_price_x96,
             liquidity,
             tick,
@@ -165,6 +181,12 @@ impl PartialPoolCache {
                 self.seed(
                     address,
                     SlimPoolState::from_v3(v3.sqrt_price_x96, v3.liquidity, v3.tick, now_ms),
+                );
+            }
+            PoolState::V4(v4) => {
+                self.seed(
+                    address,
+                    SlimPoolState::from_v4(v4.sqrt_price_x96, v4.liquidity, v4.tick, now_ms),
                 );
             }
             _ => {}
@@ -300,10 +322,19 @@ fn apply_slim_to_pool_state(state: &mut PoolState, slim: &SlimPoolState) {
             v2.reserve0 = slim.reserve0;
             v2.reserve1 = slim.reserve1;
         }
-        (PoolState::V3(v3), ProtocolType::UniswapV3) => {
+        (PoolState::V3(v3), ProtocolType::UniswapV3)
+            if slim.protocol == ProtocolType::UniswapV3 =>
+        {
             v3.sqrt_price_x96 = slim.sqrt_price_x96;
             v3.liquidity = slim.liquidity;
             v3.tick = slim.tick;
+        }
+        (PoolState::V4(v4), ProtocolType::UniswapV4)
+            if slim.protocol == ProtocolType::UniswapV4 =>
+        {
+            v4.sqrt_price_x96 = slim.sqrt_price_x96;
+            v4.liquidity = slim.liquidity;
+            v4.tick = slim.tick;
         }
         _ => {}
     }

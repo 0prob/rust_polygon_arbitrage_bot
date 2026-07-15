@@ -1,5 +1,5 @@
 use crate::core::constants::BPS_SCALE;
-use crate::core::math::fixed_point::{ONE, ONE_U512};
+use crate::core::math::fixed_point::{ONE, ONE_U512, edge_log_weight_from_ratio};
 use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
 use crate::core::types::{
@@ -38,6 +38,35 @@ pub fn spot_probe_for_token(arena: &StateArena, token: TokenIndex) -> U256 {
     spot_probe_for_decimals(arena.token_decimals(token))
 }
 
+/// Economic floor then decimal-aware spot probe (deduped) for route ranking / TUI sim.
+pub fn for_each_rank_probe_amount(
+    decimals: u8,
+    rate: U256,
+    mut visit: impl FnMut(U256),
+) {
+    let economic = min_economic_amount_in(decimals, rate);
+    if !economic.is_zero() {
+        visit(economic);
+    }
+    let spot = spot_probe_for_decimals(decimals);
+    if !spot.is_zero() && spot != economic {
+        visit(spot);
+    }
+}
+
+#[inline]
+fn cl_edge_ratio_from_state(
+    state: &ConcentratedLiquidityPoolState,
+    edge: &Edge,
+    probe: U256,
+) -> U256 {
+    if cl_has_ticks(state) {
+        cl_edge_ratio_u256(state, edge, probe).unwrap_or(U256::ZERO)
+    } else {
+        cl_spot_u256(state, edge).unwrap_or(U256::ZERO)
+    }
+}
+
 /// Multiply two fixed-point ratios (`ONE` = 1e18). Returns `None` on U256 overflow.
 #[inline]
 #[must_use]
@@ -71,18 +100,48 @@ fn simulated_edge_ratio(out: U256, probe: U256) -> Option<U256> {
     if out.is_zero() || probe.is_zero() {
         return None;
     }
-    out.checked_mul(ONE)?.checked_div(probe)
+    let num = U512::from(out).checked_mul(U512::from(ONE))?;
+    u512_to_u256_checked(num / U512::from(probe))
+}
+
+/// Chained fixed-point edge ratio product for a closed route (`ONE` = no net change).
+#[must_use]
+pub fn cycle_product_ratio(arena: &StateArena, edges: &[Edge]) -> U256 {
+    let mut product = ONE;
+    for edge in edges {
+        let ratio = compute_edge_ratio(arena, edge);
+        if ratio.is_zero() {
+            return U256::ZERO;
+        }
+        product = mul_ratio_saturating(product, ratio);
+    }
+    product
 }
 
 /// V2 edge ratio via constant-product simulation at `probe` (fee-inclusive).
 #[inline]
+fn v2_marginal_probe(probe: U256, reserve_in: U256) -> Option<U256> {
+    if reserve_in <= U256::ONE {
+        return None;
+    }
+    let cap = reserve_in - U256::ONE;
+    let amount = probe.min(cap);
+    (!amount.is_zero()).then_some(amount)
+}
+
 fn v2_edge_ratio_u256(
     state: &crate::core::types::V2PoolState,
     edge: &Edge,
     probe: U256,
 ) -> Option<U256> {
-    let out = simulate_v2_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
-    simulated_edge_ratio(out, probe)
+    let reserve_in = if edge.zero_for_one {
+        state.reserve0
+    } else {
+        state.reserve1
+    };
+    let amount = v2_marginal_probe(probe, reserve_in)?;
+    let out = simulate_v2_swap(state, amount, edge.zero_for_one, Some(edge.fee_bps));
+    simulated_edge_ratio(out, amount)
 }
 
 #[inline]
@@ -101,6 +160,9 @@ fn cl_edge_ratio_u256(
         return cl_spot_u256(state, edge);
     }
     let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
+    if r.shallow {
+        return None;
+    }
     simulated_edge_ratio(r.amount_out, probe)
 }
 
@@ -175,7 +237,7 @@ pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
 
 #[derive(Debug, Clone, Default)]
 pub struct SpotTable {
-    values: rustc_hash::FxHashMap<u64, f64>,
+    ratios: rustc_hash::FxHashMap<u64, U256>,
 }
 
 impl SpotTable {
@@ -192,14 +254,14 @@ impl SpotTable {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            values: rustc_hash::FxHashMap::with_capacity_and_hasher(
+            ratios: rustc_hash::FxHashMap::with_capacity_and_hasher(
                 capacity,
                 rustc_hash::FxBuildHasher,
             ),
         }
     }
 
-    /// Pre-fill spot prices from graph edge ratios (avoids re-simulating at rescore time).
+    /// Pre-fill marginal ratios from graph build (avoids re-simulating at rescore time).
     pub fn populate_from_graph(&mut self, graph: &RoutingGraph) {
         use crate::pipeline::types::GraphHopPhase;
         for adj in &graph.adjacency {
@@ -207,37 +269,44 @@ impl SpotTable {
                 if ge.phase != GraphHopPhase::Direct || ge.ratio.is_zero() {
                     continue;
                 }
-                let spot = u256_to_f64(ge.ratio) / ONE_F64;
-                self.set(&ge.edge, spot);
+                self.set_ratio(&ge.edge, ge.ratio);
             }
         }
     }
 
     #[must_use]
+    pub fn get_ratio(&self, edge: &Edge) -> Option<U256> {
+        self.ratios.get(&Self::key(edge)).copied()
+    }
+
+    pub fn set_ratio(&mut self, edge: &Edge, ratio: U256) {
+        if !ratio.is_zero() {
+            self.ratios.insert(Self::key(edge), ratio);
+        }
+    }
+
+    /// Marginal spot (output per input token) derived from the cached fixed-point ratio.
+    #[must_use]
     pub fn get(&self, edge: &Edge) -> f64 {
-        self.values.get(&Self::key(edge)).copied().unwrap_or(0.0)
+        self.get_ratio(edge)
+            .filter(|r| !r.is_zero())
+            .map(|r| u256_to_f64(r) / ONE_F64)
+            .unwrap_or(0.0)
     }
 
     #[must_use]
     pub fn get_opt(&self, edge: &Edge) -> Option<f64> {
-        self.values.get(&Self::key(edge)).copied()
+        let spot = self.get(edge);
+        (spot > 0.0).then_some(spot)
     }
 
-    pub fn set(&mut self, edge: &Edge, spot: f64) {
-        self.values.insert(Self::key(edge), spot);
-    }
-}
-
-#[inline]
-fn v2_marginal_spot(state: &crate::core::types::V2PoolState, edge: &Edge, probe: U256) -> f64 {
-    spot_ratio_to_f64(v2_edge_ratio_u256(state, edge, probe))
-}
-
-#[inline]
-fn cl_marginal_spot(state: &ConcentratedLiquidityPoolState, edge: &Edge) -> f64 {
-    match cl_spot_u256(state, edge) {
-        Some(ratio) if !ratio.is_zero() => u256_to_f64(ratio) / ONE_F64,
-        _ => 0.0,
+    pub fn get_or_compute_ratio(&mut self, arena: &StateArena, edge: &Edge) -> U256 {
+        if let Some(r) = self.get_ratio(edge) {
+            return r;
+        }
+        let r = compute_edge_ratio(arena, edge);
+        self.set_ratio(edge, r);
+        r
     }
 }
 
@@ -249,50 +318,12 @@ pub fn edge_log_weight_from_spot(spot_price: f64, fee_bps: u32) -> f64 {
     -spot_price.ln()
 }
 
+/// Marginal output/input ratio at `probe` (fee-inclusive where applicable).
 #[must_use]
-pub fn compute_spot_price(arena: &StateArena, edge: &Edge) -> f64 {
-    let ratio = compute_edge_ratio(arena, edge);
-    if ratio.is_zero() {
-        0.0
-    } else {
-        u256_to_f64(ratio) / ONE_F64
-    }
-}
-
-#[must_use]
-pub fn spot_price_from_state(state: &PoolState, edge: &Edge, token_in_decimals: u8) -> f64 {
-    let probe = spot_probe_for_decimals(token_in_decimals);
-    let shallow_cap = probe;
-    match (state, edge.protocol) {
-        (PoolState::V2(s), ProtocolType::UniswapV2) => v2_marginal_spot(s, edge, probe),
-        (PoolState::V3(s), ProtocolType::UniswapV3)
-        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            if cl_has_ticks(s) {
-                spot_ratio_to_f64(cl_edge_ratio_u256(s, edge, probe))
-            } else {
-                cl_marginal_spot(s, edge)
-            }
-        }
-        _ => {
-            let out = match simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap) {
-                Some(v) if !v.is_zero() => v,
-                _ => return 0.0,
-            };
-            let p = u256_to_f64(probe);
-            if p <= 0.0 { 0.0 } else { u256_to_f64(out) / p }
-        }
-    }
-}
-
-#[must_use]
-pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
-    let Some(state) = arena.pool_state(edge.pool_index) else {
-        return U256::ZERO;
-    };
-    if !state.is_tradable() {
+pub fn edge_ratio_from_state(state: &PoolState, edge: &Edge, probe: U256) -> U256 {
+    if probe.is_zero() || !state.is_tradable() {
         return U256::ZERO;
     }
-    let probe = spot_probe_for_token(arena, edge.token_in);
     let shallow_cap = probe;
     match (state, edge.protocol) {
         (PoolState::V2(s), ProtocolType::UniswapV2) => {
@@ -300,7 +331,7 @@ pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
         }
         (PoolState::V3(s), ProtocolType::UniswapV3)
         | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            cl_edge_ratio_u256(s, edge, probe).unwrap_or(U256::ZERO)
+            cl_edge_ratio_from_state(s, edge, probe)
         }
         _ => {
             let out = simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap)
@@ -308,6 +339,26 @@ pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
             simulated_edge_ratio(out, probe).unwrap_or(U256::ZERO)
         }
     }
+}
+
+#[must_use]
+pub fn compute_spot_price(arena: &StateArena, edge: &Edge) -> f64 {
+    spot_ratio_to_f64(Some(compute_edge_ratio(arena, edge)))
+}
+
+#[must_use]
+pub fn spot_price_from_state(state: &PoolState, edge: &Edge, token_in_decimals: u8) -> f64 {
+    let probe = spot_probe_for_decimals(token_in_decimals);
+    spot_ratio_to_f64(Some(edge_ratio_from_state(state, edge, probe)))
+}
+
+#[must_use]
+pub fn compute_edge_ratio(arena: &StateArena, edge: &Edge) -> U256 {
+    let Some(state) = arena.pool_state(edge.pool_index) else {
+        return U256::ZERO;
+    };
+    let probe = spot_probe_for_token(arena, edge.token_in);
+    edge_ratio_from_state(state, edge, probe)
 }
 
 #[must_use]
@@ -372,43 +423,34 @@ fn rescore_one_cycle(
     });
     let mut log_weight = 0.0;
     let mut cum_fee = 0u32;
-    let mut missing_spot = 0u32;
+    let mut product_ratio = ONE;
+    let mut dead = false;
     for edge in &cycle.edges {
         cum_fee = cum_fee.saturating_add(clamp_fee_bps(edge.fee_bps));
         let Some(state) = arena.pool_state(edge.pool_index) else {
-            log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+            dead = true;
             break;
         };
         if !state.hop_pair_routable(edge.token_in_idx as usize, edge.token_out_idx as usize) {
-            log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+            dead = true;
             break;
         }
-        let tin_decimals = match token_decimals {
-            Some(m) => {
-                crate::services::oracle::resolve_token_decimals_for_index(edge.token_in, arena, m)
-            }
-            None => arena.token_decimals(edge.token_in),
-        };
-        let spot = match table.get_opt(edge) {
-            Some(v) => v,
-            None => {
-                let val = spot_price_from_state(state, edge, tin_decimals);
-                table.set(edge, val);
-                val
-            }
-        };
-        if spot <= 0.0 {
-            missing_spot += 1;
-            log_weight += compute_edge_log_weight(edge.fee_bps);
-        } else {
-            log_weight += edge_log_weight_from_spot(spot, edge.fee_bps);
+        let ratio = table.get_or_compute_ratio(arena, edge);
+        if ratio.is_zero() {
+            dead = true;
+            break;
         }
+        product_ratio = mul_ratio_saturating(product_ratio, ratio);
+        let mut hop_log = edge_log_weight_from_ratio(ratio);
+        if !hop_log.is_finite() {
+            hop_log = compute_edge_log_weight(edge.fee_bps);
+        }
+        log_weight += hop_log;
     }
-    let missing_penalty = if missing_spot > 0 {
-        (missing_spot.min(5) * 2) as f64
-    } else {
-        0.0
-    };
+    if dead {
+        log_weight = crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+        product_ratio = U256::ZERO;
+    }
     let gas_penalty = gas_price_wei.filter(|p| !p.is_zero()).map_or(0.0, |price| {
         gas_log_penalty_for_cycle(
             &cycle.edges,
@@ -419,10 +461,11 @@ fn rescore_one_cycle(
             flash_source,
         )
     });
-    log_weight += hop_penalty(cycle.hop_count) + missing_penalty + gas_penalty;
+    log_weight += hop_penalty(cycle.hop_count) + gas_penalty;
     cycle.log_weight = log_weight;
     cycle.score = log_weight;
     cycle.cumulative_fee_bps = cum_fee;
+    cycle.cycle_ratio = product_ratio;
 }
 
 pub fn rescore_cycles_with_table_and_gas(
@@ -493,6 +536,163 @@ mod tests {
     }
 
     #[test]
+    fn tickless_cl_edge_ratio_uses_sqrt_spot_not_shallow_probe_sim() {
+        use crate::core::types::V3PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from([]),
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let ratio = compute_edge_ratio(&arena, &edge);
+        assert!(ratio > U256::ZERO);
+        assert_eq!(ratio, cl_edge_ratio_from_state(
+            match arena.pool_state(pool).expect("pool") {
+                PoolState::V3(s) => s,
+                _ => panic!("expected v3"),
+            },
+            &edge,
+            spot_probe_for_token(&arena, t0),
+        ));
+    }
+
+    #[test]
+    fn spot_table_populate_from_graph_round_trips_ratio() {
+        use crate::pipeline::types::{GraphEdge, GraphHopPhase, RoutingGraph};
+
+        let edge = edge_with_indices(0, 0, 1, true);
+        let ratio = ONE + ONE / U256::from(50u64);
+        let mut graph = RoutingGraph::default();
+        graph.push_edge_at(
+            0,
+            GraphEdge {
+                edge,
+                phase: GraphHopPhase::Direct,
+                target_node: 1,
+                log_weight: -0.01,
+                ratio,
+            },
+        );
+        let mut table = SpotTable::new(1);
+        table.populate_from_graph(&graph);
+        assert_eq!(table.get_ratio(&edge), Some(ratio));
+    }
+
+    #[test]
+    fn v2_edge_ratio_none_when_reserve_too_shallow_for_marginal_probe() {
+        use crate::core::types::V2PoolState;
+
+        let state = PoolState::V2(V2PoolState {
+            reserve0: U256::ONE,
+            reserve1: U256::from(2_000u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        });
+        let edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let v2 = match &state {
+            PoolState::V2(s) => s,
+            _ => panic!("v2"),
+        };
+        assert!(super::v2_edge_ratio_u256(v2, &edge, U256::from(1_000u64)).is_none());
+    }
+
+    #[test]
+    fn v2_edge_ratio_caps_probe_below_reserve_in() {
+        use crate::core::types::V2PoolState;
+
+        let state = PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000u64),
+            reserve1: U256::from(2_000u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        });
+        let edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let v2 = match &state {
+            PoolState::V2(s) => s,
+            _ => panic!("v2"),
+        };
+        let ratio = super::v2_edge_ratio_u256(v2, &edge, U256::from(10u128.pow(18))).expect("ratio");
+        assert!(!ratio.is_zero());
+    }
+
+    #[test]
+    fn edge_ratio_from_state_matches_compute_edge_ratio() {
+        use crate::core::types::V2PoolState;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(5_000_000u64) * U256::from(1_000_000u64),
+                reserve1: U256::from(5_000_000u64) * U256::from(1_000_000_000_000_000_000u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let state = arena.pool_state(pool).expect("pool");
+        let probe = spot_probe_for_token(&arena, t0);
+        let from_state = edge_ratio_from_state(state, &edge, probe);
+        assert_eq!(from_state, compute_edge_ratio(&arena, &edge));
+        assert!(!from_state.is_zero());
+    }
+
+    #[test]
     fn spot_probe_scales_with_decimals() {
         let six = spot_probe_for_decimals(6);
         let eighteen = spot_probe_for_decimals(18);
@@ -513,6 +713,90 @@ mod tests {
     }
 
     #[test]
+    fn simulated_edge_ratio_scales_large_outputs_without_u256_mul_overflow() {
+        let out = U256::from(1u128 << 100);
+        let probe = U256::from(10u128.pow(15));
+        let ratio = super::simulated_edge_ratio(out, probe).expect("ratio");
+        assert!(ratio > ONE);
+    }
+
+    #[test]
+    fn cycle_product_ratio_is_one_for_identity_edge() {
+        use crate::core::types::V2PoolState;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64) * U256::from(10u128.pow(18)),
+                reserve1: U256::from(1_000_000u64) * U256::from(10u128.pow(18)),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let single = cycle_product_ratio(&arena, &[edge]);
+        let r = compute_edge_ratio(&arena, &edge);
+        assert_eq!(single, r);
+        assert!(!single.is_zero());
+    }
+
+    #[test]
+    fn rescore_refreshes_cycle_ratio_from_live_edge_ratios() {
+        use crate::core::types::{CycleEdges, V2PoolState};
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([4u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(2_000_000u64) * U256::from(10u128.pow(18)),
+                reserve1: U256::from(1_000_000u64) * U256::from(10u128.pow(18)),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let mut cycle = FoundCycle {
+            start_token: t0,
+            edges: CycleEdges::from_slice(&[edge]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        };
+        let mut table = SpotTable::new(1);
+        rescore_one_cycle(&arena, &mut table, &mut cycle, None, None, None, None);
+        let expected = cycle_product_ratio(&arena, &cycle.edges);
+        assert_eq!(cycle.cycle_ratio, expected);
+        assert!(!cycle.cycle_ratio.is_zero());
+    }
+
+    #[test]
     fn mul_ratio_detects_overflow() {
         let huge = U256::MAX / U256::from(2u64);
         assert!(mul_ratio(huge, U256::MAX).is_none());
@@ -524,10 +808,10 @@ mod tests {
         let mut table = SpotTable::new(1);
         let ab = edge_with_indices(0, 0, 1, true);
         let ac = edge_with_indices(0, 0, 2, true);
-        table.set(&ab, 1.5);
-        table.set(&ac, 2.5);
-        assert_eq!(table.get(&ab), 1.5);
-        assert_eq!(table.get(&ac), 2.5);
+        table.set_ratio(&ab, ONE + ONE / U256::from(2u64));
+        table.set_ratio(&ac, ONE + ONE / U256::from(4u64));
+        assert!((table.get(&ab) - 1.5).abs() < 1e-9);
+        assert!((table.get(&ac) - 1.25).abs() < 1e-9);
     }
 
     #[test]
@@ -535,9 +819,9 @@ mod tests {
         let mut table = SpotTable::new(1);
         let forward = edge_with_indices(0, 0, 1, true);
         let reverse = edge_with_indices(0, 1, 0, false);
-        table.set(&forward, 3.0);
-        table.set(&reverse, 4.0);
-        assert_eq!(table.get(&forward), 3.0);
-        assert_eq!(table.get(&reverse), 4.0);
+        table.set_ratio(&forward, ONE * U256::from(3u64));
+        table.set_ratio(&reverse, ONE * U256::from(4u64));
+        assert!((table.get(&forward) - 3.0).abs() < 1e-9);
+        assert!((table.get(&reverse) - 4.0).abs() < 1e-9);
     }
 }

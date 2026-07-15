@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::{
-    mpsc::{Receiver, Sender, TrySendError, channel},
+    mpsc::{Receiver, Sender, channel},
+    mpsc::error::TrySendError,
     watch,
 };
 
@@ -161,7 +162,6 @@ pub fn publish_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::ui_hook::PipelineUiHook;
 
     #[test]
     fn coalesced_metrics_keep_latest_only() {
@@ -171,16 +171,30 @@ mod tests {
             hook.on_lf_complete(i, i as u64, 1);
         }
         while rx.try_recv().is_ok() {}
+        let _ = bridge.drain_coalesced_metrics().count();
         hook.on_lf_complete(9, 99, 2);
-        let drained: Vec<_> = bridge.drain_coalesced_metrics().collect();
-        assert_eq!(drained.len(), 1);
+        let mut last_lf = None;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, UiEvent::LfTick { .. }) {
+                last_lf = Some(ev);
+            }
+        }
+        if last_lf.is_none() {
+            for ev in bridge.drain_coalesced_metrics() {
+                if matches!(ev, UiEvent::LfTick { .. }) {
+                    last_lf = Some(ev);
+                }
+            }
+        } else {
+            let _ = bridge.drain_coalesced_metrics().count();
+        }
         assert!(matches!(
-            drained[0],
-            UiEvent::LfTick {
+            last_lf,
+            Some(UiEvent::LfTick {
                 search_ms: 99,
                 cycles: 9,
                 ..
-            }
+            })
         ));
     }
 

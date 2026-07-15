@@ -10,6 +10,7 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::AppConfig;
 use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS};
+use crate::core::math::fixed_point::ONE;
 use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
@@ -465,6 +466,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     if let Some(ref provider) = state_provider {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
         let v4_tick_targets = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
+        crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools);
+        crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_targets);
         let state_block = ctx.refresh.last_state_block();
         let pinned_block = (state_block > 0).then_some(state_block);
         let (algebra_pools, algebra_integral_pools) =
@@ -497,7 +500,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
     // Prune any that became unroutable due to dirty state updates (prevents
     // polluting HF candidate pool with now-dead cycles kept from graph cache).
-    capped.retain(|c| c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT);
+    capped.retain(|c| {
+        c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT
+            && (c.cycle_ratio.is_zero() || c.cycle_ratio > ONE)
+    });
     // ponytail: rescore reorders by score and would undo enumeration-time protocol
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
     capped = finalize_enumerated_cycles(capped, max_paths);

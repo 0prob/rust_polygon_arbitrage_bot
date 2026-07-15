@@ -23,12 +23,15 @@ pub struct V3SwapResult {
     pub shallow: bool,
 }
 
-/// Binary search pre-sorted V3 ticks (ticks are stored sorted by tick value).
+/// Next initialized tick at or below/above `current_tick` (ticks sorted by `tick` asc).
 fn next_initialized_tick_with_net(
     ticks: &[V3Tick],
     current_tick: i32,
     zero_for_one: bool,
 ) -> Option<(i32, i128)> {
+    if ticks.is_empty() {
+        return None;
+    }
     let i = ticks.partition_point(|t| t.tick <= current_tick);
     if zero_for_one {
         (i > 0).then(|| {
@@ -70,6 +73,7 @@ pub fn simulate_v3_swap(
     let fee_pips = resolve_v3_fee_pips(state.fee, edge_fee_bps);
 
     if amount_in.is_zero()
+        || !state.unlocked
         || state.sqrt_price_x96 < MIN_SQRT_RATIO
         || state.sqrt_price_x96 >= MAX_SQRT_RATIO
         || state.liquidity == 0
@@ -113,7 +117,11 @@ pub fn simulate_v3_swap(
             break;
         }
 
-        let tick_search = if zero_for_one { tick - 1 } else { tick };
+        let tick_search = if zero_for_one {
+            tick.saturating_sub(1)
+        } else {
+            tick
+        };
         let mut next_tick = next_initialized_tick_with_net(ticks, tick_search, zero_for_one);
 
         if next_tick.is_none() && has_ticks {
@@ -242,6 +250,24 @@ mod tests {
     fn explicit_zero_edge_fee_remains_zero() {
         let fee = resolve_v3_fee_pips(U256::ZERO, Some(0));
         assert_eq!(fee, U256::ZERO);
+    }
+
+    #[test]
+    fn locked_pool_returns_zero_output() {
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: false,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(Vec::new()),
+        };
+        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30));
+        assert!(r.amount_out.is_zero());
+        assert!(!r.shallow);
     }
 
     #[test]

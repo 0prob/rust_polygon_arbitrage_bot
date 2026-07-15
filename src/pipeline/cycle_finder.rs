@@ -414,9 +414,11 @@ fn can_still_be_negative(
     min_outgoing: &[f64],
     global_min: f64,
 ) -> bool {
+    // DFS stores hop_penalty in score only at cycle close; reserve worst-case depth penalty.
+    let close_penalty = hop_penalty(hop_cap.max(2));
     let remaining = hop_cap.saturating_sub(hops);
     if remaining == 0 {
-        return log_weight <= LOG_WEIGHT_PRUNE_THRESHOLD;
+        return log_weight + close_penalty <= LOG_WEIGHT_PRUNE_THRESHOLD;
     }
     let first = min_outgoing
         .get(curr.0 as usize)
@@ -429,7 +431,7 @@ fn can_still_be_negative(
         1 => 0.0,
         _ => f64::from(remaining - 1) * global_min,
     };
-    log_weight + first + tail <= LOG_WEIGHT_PRUNE_THRESHOLD
+    log_weight + first + tail + close_penalty <= LOG_WEIGHT_PRUNE_THRESHOLD
 }
 
 #[inline]
@@ -1032,7 +1034,7 @@ fn collect_cycles_dfs_parallel(
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
     use std::collections::hash_map::Entry;
 
-    use crate::pipeline::types::compare_cycle_score;
+    use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
 
     let total: usize = shard_cycles.iter().map(Vec::len).sum();
     let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
@@ -1041,7 +1043,7 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
         let key = cycle_key(&cycle.edges);
         match best.entry(key) {
             Entry::Occupied(mut e) => {
-                if cycle.score < e.get().score {
+                if cycle_prefers_candidate(cycle, e.get()) {
                     *e.get_mut() = cycle.clone();
                 }
             }

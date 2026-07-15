@@ -127,7 +127,7 @@ fn simulate_hop(
     state: &PoolState,
     edge: &Edge,
     amount_in: U256,
-    _shallow_cap: U256,
+    shallow_cap: U256,
 ) -> Option<HopResult> {
     if amount_in.is_zero() {
         return Some(HopResult {
@@ -135,9 +135,19 @@ fn simulate_hop(
             gas: 0,
         });
     }
+    if matches!(
+        edge.protocol,
+        ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+    ) && cl_hop_exceeds_shallow_cap(amount_in, shallow_cap)
+    {
+        return None;
+    }
 
     match (state, edge.protocol) {
         (PoolState::V2(s), ProtocolType::UniswapV2) => {
+            if amount_in >= v2_reserve_in(s, edge.zero_for_one) {
+                return None;
+            }
             let out = simulate_v2_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps));
             Some(HopResult {
                 amount_out: out,
@@ -246,6 +256,20 @@ fn cl_hop_tickless(state: &PoolState) -> bool {
     )
 }
 
+#[inline]
+fn cl_hop_exceeds_shallow_cap(amount_in: U256, shallow_cap: U256) -> bool {
+    shallow_cap < U256::MAX && amount_in > shallow_cap
+}
+
+#[inline]
+fn v2_reserve_in(state: &crate::core::types::V2PoolState, zero_for_one: bool) -> U256 {
+    if zero_for_one {
+        state.reserve0
+    } else {
+        state.reserve1
+    }
+}
+
 /// Max trade size with faithful CL simulation. `None` = full tick coverage.
 /// `Some(0)` = at least one CL hop lacks tick coverage and must not be quoted.
 #[must_use]
@@ -297,12 +321,15 @@ pub struct ResimFidelityProfile {
 fn cl_hop_shallow_at_amount(
     state: &PoolState,
     edge: &Edge,
-    _hop_probe: U256,
+    hop_probe: U256,
     amount_in: U256,
     profile: Option<&mut HopFidelityProfile>,
 ) -> bool {
     if cl_hop_tickless(state) {
         return false;
+    }
+    if cl_hop_exceeds_shallow_cap(amount_in, hop_probe) {
+        return true;
     }
     if let Some(p) = profile {
         p.cl_depth_sims = p.cl_depth_sims.saturating_add(1);
@@ -346,6 +373,16 @@ pub fn route_hop_fidelity_ok(arena: &StateArena, edges: &[Edge], hop_amounts: &[
     route_hop_fidelity_reject(arena, edges, hop_amounts).is_none()
 }
 
+/// Fidelity after `simulate_route_detailed` / `walk_route_hops` on the same arena (skips redundant CL depth sims).
+#[must_use]
+pub fn route_hop_fidelity_ok_after_walk(
+    arena: &StateArena,
+    edges: &[Edge],
+    hop_amounts: &[U256],
+) -> bool {
+    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, true).is_none()
+}
+
 /// First hop that fails tick-depth, tradability, or reserve-depth checks, if any.
 #[must_use]
 pub fn route_hop_fidelity_reject(
@@ -353,7 +390,7 @@ pub fn route_hop_fidelity_reject(
     edges: &[Edge],
     hop_amounts: &[U256],
 ) -> Option<HopFidelityReject> {
-    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None)
+    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, false)
 }
 
 #[must_use]
@@ -362,6 +399,7 @@ pub fn route_hop_fidelity_reject_profiled(
     edges: &[Edge],
     hop_amounts: &[U256],
     mut profile: Option<&mut HopFidelityProfile>,
+    cl_depth_already_verified: bool,
 ) -> Option<HopFidelityReject> {
     let hop_probes = if route_has_cl_hop(edges) {
         route_shallow_caps(arena, edges)
@@ -399,13 +437,22 @@ pub fn route_hop_fidelity_reject_profiled(
             (
                 PoolState::V3(_) | PoolState::V4(_),
                 ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
-            ) if cl_hop_shallow_at_amount(
-                state,
-                edge,
-                hop_probes[i],
-                amount_in,
-                profile.as_deref_mut(),
-            ) =>
+            ) if !cl_depth_already_verified
+                && cl_hop_shallow_at_amount(
+                    state,
+                    edge,
+                    hop_probes[i],
+                    amount_in,
+                    profile.as_deref_mut(),
+                ) =>
+            {
+                return Some(HopFidelityReject::ShallowCl(i));
+            }
+            (
+                PoolState::V3(_) | PoolState::V4(_),
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
+            ) if cl_depth_already_verified
+                && cl_hop_exceeds_shallow_cap(amount_in, hop_probes[i]) =>
             {
                 return Some(HopFidelityReject::ShallowCl(i));
             }
@@ -810,6 +857,66 @@ mod tests {
         let expected = estimate_route_gas_from_hops_evm(hop_gas, 2, 2);
         assert_eq!(estimate_route_gas(&edges), expected);
         assert!(expected > hop_gas);
+    }
+
+    #[test]
+    fn v2_hop_fails_closed_when_amount_exhausts_reserve_in() {
+        use crate::core::types::V2PoolState;
+
+        let state = PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(2_000_000u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 0,
+        });
+        let edge = Edge {
+            pool_index: crate::core::types::PoolIndex(0),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        assert!(simulate_hop_amount_out(&state, &edge, U256::from(999_999u64)).is_some());
+        assert!(simulate_hop_amount_out(&state, &edge, U256::from(1_000_000u64)).is_none());
+    }
+
+    #[test]
+    fn cl_hop_rejects_amount_above_explicit_shallow_cap() {
+        use crate::core::types::{V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let state = PoolState::V3(V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 10_000_000_000_000u128,
+            tick: 0,
+            fee: U256::from(3000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(vec![V3Tick {
+                tick: -60,
+                liquidity_gross: 10_000_000_000_000,
+                liquidity_net: 10_000_000_000_000,
+            }]),
+        });
+        let edge = Edge {
+            pool_index: crate::core::types::PoolIndex(0),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let cap = U256::from(1_000u64);
+        assert!(simulate_hop_amount_out_with_cap(&state, &edge, cap, cap).is_some());
+        assert!(simulate_hop_amount_out_with_cap(&state, &edge, cap + U256::ONE, cap).is_none());
     }
 
     #[test]

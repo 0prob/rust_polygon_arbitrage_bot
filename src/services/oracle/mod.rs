@@ -47,6 +47,18 @@ pub fn token_decimals_map(metas: &[TokenMeta]) -> FxHashMap<Address, u8> {
     out
 }
 
+/// Explicit decimals from discovery/on-chain map only (no arena 18-default).
+#[must_use]
+pub fn explicit_decimals_for_index(
+    token: TokenIndex,
+    arena: &StateArena,
+    hints: &FxHashMap<Address, u8>,
+) -> Option<u8> {
+    arena
+        .token_address(token)
+        .and_then(|addr| known_token_decimals(addr, hints))
+}
+
 /// Execution paths require explicit, bounded decimal metadata for every route token.
 #[must_use]
 pub fn cycle_tokens_have_known_decimals(
@@ -54,19 +66,17 @@ pub fn cycle_tokens_have_known_decimals(
     arena: &StateArena,
     hints: &FxHashMap<Address, u8>,
 ) -> bool {
-    !cycle.edges.is_empty()
-        && arena
-            .token_address(cycle.start_token)
-            .and_then(|address| hints.get(&address))
-            .is_some_and(|decimals| *decimals <= MAX_SUPPORTED_TOKEN_DECIMALS)
-        && cycle.edges.iter().all(|edge| {
-            [edge.token_in, edge.token_out].into_iter().all(|token| {
-                arena
-                    .token_address(token)
-                    .and_then(|address| hints.get(&address))
-                    .is_some_and(|decimals| *decimals <= MAX_SUPPORTED_TOKEN_DECIMALS)
-            })
+    if cycle.edges.is_empty() {
+        return false;
+    }
+    if explicit_decimals_for_index(cycle.start_token, arena, hints).is_none() {
+        return false;
+    }
+    cycle.edges.iter().all(|edge| {
+        [edge.token_in, edge.token_out].into_iter().all(|token| {
+            explicit_decimals_for_index(token, arena, hints).is_some()
         })
+    })
 }
 
 #[must_use]
@@ -101,20 +111,12 @@ pub fn resolve_token_decimals_for_index(
     arena: &StateArena,
     hints: &FxHashMap<Address, u8>,
 ) -> u8 {
-    if let Some(addr) = arena.token_address(token) {
-        if let Some(&dec) = hints.get(&addr) {
-            return dec;
-        }
-        let idx = token.0 as usize;
-        if idx < arena.token_count() as usize {
-            let dec = arena.token_decimals(token);
-            if dec <= MAX_SUPPORTED_TOKEN_DECIMALS {
-                return dec;
-            }
-        }
-        return resolve_token_decimals(addr, hints);
-    }
-    18
+    explicit_decimals_for_index(token, arena, hints).unwrap_or_else(|| {
+        arena
+            .token_address(token)
+            .map(|addr| resolve_token_decimals(addr, hints))
+            .unwrap_or(18)
+    })
 }
 
 /// Explicit decimals from discovery/on-chain enrichment only (no 18-decimal guess).

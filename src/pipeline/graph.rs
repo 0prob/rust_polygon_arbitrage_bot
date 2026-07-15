@@ -28,6 +28,34 @@ fn pair_zero_for_one(token_in_idx: u8) -> bool {
     token_in_idx == 0
 }
 
+/// Uniswap V3/V4: `zeroForOne` iff `token_in` is the lower pool address (on-chain token0).
+#[inline]
+fn cl_zero_for_one_from_addresses(
+    arena: &StateArena,
+    token_in: TokenIndex,
+    token_out: TokenIndex,
+) -> Option<bool> {
+    match (
+        arena.token_address(token_in),
+        arena.token_address(token_out),
+    ) {
+        (Some(a_in), Some(a_out)) => Some(a_in < a_out),
+        _ => None,
+    }
+}
+
+/// V2/V3/V4: `zeroForOne` / reserve0-in iff `token_in` is the lower pool address.
+#[inline]
+fn apply_cl_zero_for_one(arena: &StateArena, edge: &mut Edge) {
+    if matches!(
+        edge.protocol,
+        ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+    ) && let Some(zfo) = cl_zero_for_one_from_addresses(arena, edge.token_in, edge.token_out)
+    {
+        edge.zero_for_one = zfo;
+    }
+}
+
 #[inline]
 fn multi_zero_for_one(token_in_idx: u8, token_out_idx: u8) -> bool {
     token_in_idx < token_out_idx
@@ -259,10 +287,11 @@ pub fn resolve_lazy_swap_edge(
     if !state.hop_pair_routable(pending.token_in_idx as usize, token_out_idx as usize) {
         return None;
     }
-    let zero_for_one = if pending.protocol == ProtocolType::UniswapV4 {
-        arena.token_address(pending.token_in)? < arena.token_address(token_out)?
-    } else {
-        multi_zero_for_one(pending.token_in_idx, token_out_idx)
+    let zero_for_one = match pending.protocol {
+        ProtocolType::UniswapV3 | ProtocolType::UniswapV4 => {
+            cl_zero_for_one_from_addresses(arena, pending.token_in, token_out)?
+        }
+        _ => multi_zero_for_one(pending.token_in_idx, token_out_idx),
     };
     let edge = Edge {
         pool_index: pending.pool_index,
@@ -294,22 +323,28 @@ pub fn count_graph_eligible_pools(arena: &StateArena, pools: &[PoolMeta]) -> usi
         .count()
 }
 
-fn direct_pair_has_marginal_spot(state: &PoolState, protocol: ProtocolType, fee_bps: u32) -> bool {
-    for (tin, tout, zfo) in [(0u8, 1u8, true), (1u8, 0u8, false)] {
-        if !state.hop_pair_routable(tin as usize, tout as usize) {
+fn direct_pair_has_marginal_spot(
+    state: &PoolState,
+    protocol: ProtocolType,
+    fee_bps: u32,
+    input_decimals: (u8, u8),
+) -> bool {
+    let (dec0, dec1) = input_decimals;
+    for (t_in_idx, t_out_idx, zfo, tin_dec) in [(0u8, 1u8, true, dec0), (1u8, 0u8, false, dec1)] {
+        if !state.hop_pair_routable(t_in_idx as usize, t_out_idx as usize) {
             continue;
         }
         let edge = Edge {
             pool_index: PoolIndex(0),
-            token_in: TokenIndex(u32::from(tin)),
-            token_out: TokenIndex(u32::from(tout)),
-            token_in_idx: tin,
-            token_out_idx: tout,
+            token_in: TokenIndex(u32::from(t_in_idx)),
+            token_out: TokenIndex(u32::from(t_out_idx)),
+            token_in_idx: t_in_idx,
+            token_out_idx: t_out_idx,
             protocol,
             fee_bps,
             zero_for_one: zfo,
         };
-        if spot_price_from_state(state, &edge, 18) > 0.0 {
+        if spot_price_from_state(state, &edge, tin_dec) > 0.0 {
             return true;
         }
     }
@@ -319,19 +354,25 @@ fn direct_pair_has_marginal_spot(state: &PoolState, protocol: ProtocolType, fee_
 /// Tradable pool would emit at least one routable graph edge (arena sync gate).
 #[must_use]
 pub fn pool_state_graph_eligible(
+    arena: Option<&StateArena>,
     state: &PoolState,
     protocol: ProtocolType,
     token_count: usize,
     bpt_index: Option<usize>,
     fee_bps: u32,
+    pair_input_decimals: Option<(u8, u8)>,
 ) -> bool {
     if !state.is_tradable() || token_count < 2 {
         return false;
     }
     let hub_spoke = protocol == ProtocolType::UniswapV4 || token_count > 2;
     if token_count == 2 && !hub_spoke {
-        return direct_pair_has_marginal_spot(state, protocol, fee_bps);
+        let Some(decimals) = pair_input_decimals else {
+            return false;
+        };
+        return direct_pair_has_marginal_spot(state, protocol, fee_bps, decimals);
     }
+    let _ = arena;
     let mut funded = SmallVec::<[u8; 8]>::new();
     for i in 0..token_count {
         if bpt_index == Some(i) {
@@ -367,7 +408,21 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
         PoolState::Balancer(b) => b.bpt_index,
         _ => None,
     });
-    pool_state_graph_eligible(state, meta.protocol, token_count, bpt_index, meta.fee_bps)
+    let pair_input_decimals = meta.tokens.first().zip(meta.tokens.get(1)).map(|(&t0, &t1)| {
+        (
+            arena.token_decimals(t0),
+            arena.token_decimals(t1),
+        )
+    });
+    pool_state_graph_eligible(
+        Some(arena),
+        state,
+        meta.protocol,
+        token_count,
+        bpt_index,
+        meta.fee_bps,
+        pair_input_decimals,
+    )
 }
 
 #[inline]
@@ -487,7 +542,7 @@ fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &Poo
     if uses_hub_spoke(meta) {
         attach_hub_spoke_pool(graph, meta, state);
     } else if meta.tokens.len() == 2 {
-        for edge in edges_for_pair(
+        for mut edge in edges_for_pair(
             meta.pool_index,
             meta.protocol,
             meta.tokens[0],
@@ -495,6 +550,7 @@ fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &Poo
             meta.fee_bps,
             Some(state),
         ) {
+            apply_cl_zero_for_one(arena, &mut edge);
             graph.push_edge_at(
                 edge.token_in.0,
                 GraphEdge {
@@ -830,6 +886,76 @@ mod tests {
     }
 
     #[test]
+    fn v2_zero_for_one_follows_on_chain_token_order_not_meta_index() {
+        let mut arena = StateArena::default();
+        let low = arena.register_token(Address::from([1u8; 20]));
+        let high = arena.register_token(Address::from([2u8; 20]));
+        let mut sell_low = Edge {
+            pool_index: PoolIndex(0),
+            token_in: low,
+            token_out: high,
+            token_in_idx: 1,
+            token_out_idx: 0,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: false,
+        };
+        apply_cl_zero_for_one(&arena, &mut sell_low);
+        assert!(sell_low.zero_for_one);
+    }
+
+    #[test]
+    fn v3_zero_for_one_follows_on_chain_token_order_not_meta_index() {
+        let mut arena = StateArena::default();
+        let low = arena.register_token(Address::from([1u8; 20]));
+        let high = arena.register_token(Address::from([2u8; 20]));
+        let mut sell_low = Edge {
+            pool_index: PoolIndex(0),
+            token_in: low,
+            token_out: high,
+            token_in_idx: 1,
+            token_out_idx: 0,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let mut sell_high = Edge {
+            pool_index: PoolIndex(0),
+            token_in: high,
+            token_out: low,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        apply_cl_zero_for_one(&arena, &mut sell_low);
+        apply_cl_zero_for_one(&arena, &mut sell_high);
+        assert!(sell_low.zero_for_one);
+        assert!(!sell_high.zero_for_one);
+    }
+
+    #[test]
+    fn v4_lazy_swap_zero_for_one_matches_currency_order() {
+        let mut arena = StateArena::default();
+        let low = arena.register_token(Address::from([1u8; 20]));
+        let high = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(Address::from([3u8; 20]), v4_pool_state());
+        let pending = PendingHubSwap {
+            pool_index: pool,
+            token_in: high,
+            token_in_idx: 0,
+            protocol: ProtocolType::UniswapV4,
+            fee_bps: 30,
+        };
+        let (edge, log_w, ratio) =
+            resolve_lazy_swap_edge(&arena, pending, low, 1).expect("lazy v4 swap");
+        assert!(!edge.zero_for_one);
+        assert!(log_w.is_finite());
+        assert!(!ratio.is_zero());
+    }
+
+    #[test]
     fn hub_spoke_balancer_uses_linear_edge_count() {
         let mut arena = StateArena::default();
         let tokens: Vec<TokenIndex> = (0u8..8)
@@ -1142,11 +1268,13 @@ mod tests {
             block_timestamp_last: 0,
         });
         assert!(!pool_state_graph_eligible(
+            None,
             &one_sided,
             ProtocolType::UniswapV2,
             2,
             None,
             30,
+            Some((18, 18)),
         ));
         let two_sided = PoolState::V2(V2PoolState {
             reserve0: funded,
@@ -1156,11 +1284,13 @@ mod tests {
             block_timestamp_last: 0,
         });
         assert!(pool_state_graph_eligible(
+            None,
             &two_sided,
             ProtocolType::UniswapV2,
             2,
             None,
             30,
+            Some((18, 18)),
         ));
     }
 

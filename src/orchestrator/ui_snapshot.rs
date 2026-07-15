@@ -177,7 +177,6 @@ async fn build_ui_snapshot(
                     matic_usd = usd;
                 }
             }
-            Ok(Ok(_)) => {}
             Ok(Err(e)) => crate::debug!("snapshot oracle refresh failed: {e:#}"),
             Err(_) => crate::debug!("snapshot oracle refresh timed out"),
         }
@@ -196,10 +195,12 @@ async fn build_ui_snapshot(
         .snapshot()
         .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
 
+    let hot_pools = hot_pool_addresses(&snap);
+    let mut display_arena = snap.arena.clone();
+    display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
+
     if snap.generation != route_cache.generation || route_cache.gas_gwei != gas_gwei {
-        let hot_pools = hot_pool_addresses(&snap);
-        let mut arena = snap.arena.clone();
-        arena.apply_hot_cache(&ctx.cache, &hot_pools);
+        let arena = display_arena.clone();
         let snap_arc = Arc::clone(&snap);
         let slippage_bps = ctx.config.execution.slippage_bps;
         let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
@@ -217,7 +218,6 @@ async fn build_ui_snapshot(
         .await
         .context("route cache build task failed")?;
     }
-    let input_arena = crate::pipeline::arena::StateArena::default();
 
     let hypersync_height = ctx.hypersync.as_ref().and_then(|hs| hs.latest_height());
 
@@ -243,7 +243,7 @@ async fn build_ui_snapshot(
     let runtime_input = RuntimeSnapshotInput {
         started_at,
         snapshot: Arc::clone(&snap),
-        arena: input_arena,
+        arena: display_arena,
         config: Arc::clone(&ctx.config),
         refresh: Arc::clone(&ctx.refresh),
         execution_trades,
@@ -297,37 +297,39 @@ fn unique_route_tokens(snap: &crate::services::hf_snapshot::HfSnapshot) -> Vec<A
     const TOKEN_LIMIT: usize = 24;
     let mut seen = FxHashSet::default();
     let mut ordered = Vec::with_capacity(TOKEN_LIMIT);
-    let mut at_limit = || ordered.len() >= TOKEN_LIMIT;
-    let mut push = |addr: Address| {
-        if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
-            ordered.push(addr);
-        }
-    };
 
     for cycle in snap.cycles.iter().take(24) {
-        if at_limit() {
+        if ordered.len() >= TOKEN_LIMIT {
             break;
         }
         if let Some(addr) = snap.arena.token_address(cycle.start_token) {
-            push(addr);
+            if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
+                ordered.push(addr);
+            }
         }
         for edge in &cycle.edges {
-            if at_limit() {
+            if ordered.len() >= TOKEN_LIMIT {
                 break;
             }
             if let Some(addr) = snap.arena.token_address(edge.token_in) {
-                push(addr);
+                if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
+                    ordered.push(addr);
+                }
             }
             if let Some(addr) = snap.arena.token_address(edge.token_out) {
-                push(addr);
+                if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
+                    ordered.push(addr);
+                }
             }
         }
     }
     for hub in POLYGON_HUB_TOKENS {
-        if at_limit() {
+        if ordered.len() >= TOKEN_LIMIT {
             break;
         }
-        push(hub);
+        if seen.insert(hub) && ordered.len() < TOKEN_LIMIT {
+            ordered.push(hub);
+        }
     }
     ordered
 }

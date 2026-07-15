@@ -13,11 +13,15 @@ use crate::core::types::FlashLoanSource;
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType};
 use crate::pipeline::local_sim::{estimate_route_gas, simulate_route_minimal};
 use crate::pipeline::sim_sanity::min_economic_amount_in;
+use crate::pipeline::spot_price::for_each_rank_probe_amount;
+use crate::pipeline::types::MinimalSimResult;
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::profit::{AssessProfitInput, assess_profit};
 use crate::services::hf_snapshot::HfSnapshot;
 use crate::services::oracle::price_oracle::PriceOracle;
-use crate::services::oracle::{known_token_decimals, resolve_token_to_matic_rate};
+use crate::services::oracle::{
+    known_token_decimals, resolve_token_decimals_for_index, resolve_token_to_matic_rate,
+};
 use crate::services::state_refresh::StateRefreshService;
 use crate::util::{ten_pow_u256_cached as ten_pow_u256, truncate_str, u256_to_f64};
 
@@ -368,6 +372,28 @@ fn build_graph_snapshot(
     }
 }
 
+/// Best minimal sim at economic floor or decimal-aware spot probe (matches HF rank probes).
+fn best_route_probe_sim(
+    arena: &crate::pipeline::arena::StateArena,
+    edges: &[crate::core::types::Edge],
+    decimals: u8,
+    rate: U256,
+) -> Option<(U256, MinimalSimResult)> {
+    let mut best: Option<(U256, MinimalSimResult)> = None;
+    for_each_rank_probe_amount(decimals, rate, |amount| {
+        let Some(sim) = simulate_route_minimal(arena, edges, amount) else {
+            return;
+        };
+        if sim.profit.is_zero() {
+            return;
+        }
+        if best.as_ref().is_none_or(|(_, b)| sim.profit > b.profit) {
+            best = Some((amount, sim));
+        }
+    });
+    best
+}
+
 fn build_search_blob(route: &str, route_detail: &str, protocols: &str, fingerprint: u64) -> String {
     format!(
         "{} {} {} {:x}",
@@ -403,17 +429,23 @@ fn build_routes(
         }
         let rate =
             resolve_token_to_matic_rate(cycle.start_token, snapshot.token_to_matic_rates.as_ref());
-        let decimals = arena.token_decimals(cycle.start_token);
-        let amount_in = min_economic_amount_in(decimals, rate);
-        let sim = simulate_route_minimal(arena, &cycle.edges, amount_in);
-        let simulation_available = sim.is_some();
-        let (amount_out_token, gross_profit_token, gas_estimate) = match sim {
-            Some(ref sim) => (sim.amount_out, sim.profit, sim.total_gas),
+        let decimals = resolve_token_decimals_for_index(
+            cycle.start_token,
+            arena,
+            snapshot.token_decimals.as_ref(),
+        );
+        let probe = best_route_probe_sim(arena, &cycle.edges, decimals, rate);
+        let simulation_available = probe.is_some();
+        let amount_in = probe
+            .map(|(amount, _)| amount)
+            .unwrap_or_else(|| min_economic_amount_in(decimals, rate));
+        let (amount_out_token, gross_profit_token, gas_estimate) = match probe {
+            Some((_, sim)) => (sim.amount_out, sim.profit, sim.total_gas),
             None => (U256::ZERO, U256::ZERO, estimate_route_gas(&cycle.edges)),
         };
         let amount_in_matic = rate_to_matic(amount_in, rate, decimals);
         let profit_matic = rate_to_matic(gross_profit_token, rate, decimals);
-        let net_profit_matic = if let (Some(sim), Some(gwei)) = (sim.as_ref(), gas_gwei) {
+        let net_profit_matic = if let (Some((_, sim)), Some(gwei)) = (probe, gas_gwei) {
             let gas_price = U256::from((gwei * 1e9).max(0.0) as u128);
             let assessment = assess_profit(&AssessProfitInput {
                 gross_profit: sim.profit,
@@ -452,7 +484,7 @@ fn build_routes(
         let fingerprint = route_fingerprint(&cycle.edges);
         let search_blob = build_search_blob(&route, &detail, &protocols, fingerprint);
         let risk_score = risk_score
-            .saturating_add(if sim.is_none() { 20 } else { 0 })
+            .saturating_add(if probe.is_none() { 20 } else { 0 })
             .min(100);
         out.push(RouteSummary {
             fingerprint,

@@ -18,7 +18,7 @@ use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch, max_flash_borrow_wei,
     min_economic_amount_in,
 };
-use crate::pipeline::spot_price::spot_probe_for_decimals;
+use crate::pipeline::spot_price::for_each_rank_probe_amount;
 use crate::pipeline::ternary::{RouteGasCosting, optimize_cycle};
 use crate::pipeline::types::OptimizationResult;
 use crate::pipeline::types::{MinimalSimResult, compare_cycle_score};
@@ -193,14 +193,13 @@ fn minimal_rank_probe(
     rate: U256,
     rank_amount_as_search_low: bool,
 ) -> Option<(U256, MinimalSimResult)> {
-    let economic = min_economic_amount_in(start_decimals, rate);
-    let spot_probe = spot_probe_for_decimals(start_decimals);
-    for amount in [economic, spot_probe] {
+    let mut best: Option<(U256, MinimalSimResult)> = None;
+    for_each_rank_probe_amount(start_decimals, rate, |amount| {
         let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
-            continue;
+            return;
         };
         if sim.profit.is_zero() {
-            continue;
+            return;
         }
         let search_low = if rank_amount_as_search_low {
             amount
@@ -214,12 +213,15 @@ fn minimal_rank_probe(
             token_decimals: start_decimals,
             token_to_matic_rate: rate,
         })
-        .is_ok()
+        .is_err()
         {
-            return Some((amount, sim));
+            return;
         }
-    }
-    None
+        if best.as_ref().is_none_or(|(_, b)| sim.profit > b.profit) {
+            best = Some((amount, sim));
+        }
+    });
+    best
 }
 
 /// Routes that cannot minimal-sim at probe or spot size waste Brent work.
@@ -841,7 +843,11 @@ fn probe_fallback_opt(
             pzp += 1;
             continue;
         }
-        if !local_sim::route_hop_fidelity_ok(input.arena, &cycle.edges, &sim.hop_amounts) {
+        if !local_sim::route_hop_fidelity_ok_after_walk(
+            input.arena,
+            &cycle.edges,
+            &sim.hop_amounts,
+        ) {
             pf += 1;
             continue;
         }
@@ -1189,7 +1195,11 @@ fn validate_optimized_sim(
     .is_none_or(|cap| sim.amount_in <= cap);
 
     sim.amount_in == optimal_input
-        && local_sim::route_hop_fidelity_ok(input.arena, &cycle.edges, &sim.hop_amounts)
+        && local_sim::route_hop_fidelity_ok_after_walk(
+            input.arena,
+            &cycle.edges,
+            &sim.hop_amounts,
+        )
         && !sim.profit.is_zero()
         && within_flash_cap
         && check_sim_sanity_for_dispatch(SimSanityInput {

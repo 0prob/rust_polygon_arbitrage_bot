@@ -49,7 +49,10 @@ pub fn resolve_v2_fee_with_edge(state: &V2PoolState, edge_fee_bps: Option<u32>) 
         let num = U256::from(10_000u64 - u64::from(bps));
         return (num, U256::from(10_000u64));
     }
-    if !state.fee.is_zero() && !state.fee_denominator.is_zero() {
+    if !state.fee.is_zero()
+        && !state.fee_denominator.is_zero()
+        && state.fee < state.fee_denominator
+    {
         return (state.fee, state.fee_denominator);
     }
     (DEFAULT_FEE_NUMERATOR, FEE_DENOMINATOR)

@@ -261,12 +261,25 @@ impl StateArena {
                 PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
                 _ => pool.tokens.len(),
             };
+            let pair_input_decimals =
+                pool.tokens
+                    .first()
+                    .zip(pool.tokens.get(1))
+                    .and_then(|(a0, a1)| match decimal_hints {
+                        Some(h) => Some((
+                            crate::services::oracle::known_token_decimals(*a0, h)?,
+                            crate::services::oracle::known_token_decimals(*a1, h)?,
+                        )),
+                        None => Some((18, 18)),
+                    });
             if !crate::pipeline::graph::pool_state_graph_eligible(
+                Some(self),
                 state.as_ref(),
                 pool.protocol,
                 token_count,
                 bpt_hint,
                 pool.fee_bps,
+                pair_input_decimals,
             ) {
                 continue;
             }
@@ -602,6 +615,50 @@ mod tests {
         let weth_idx = metas[0].tokens[1];
         assert_eq!(arena.token_decimals(usdc_idx), 6);
         assert_eq!(arena.token_decimals(weth_idx), 18);
+    }
+
+    #[test]
+    fn sync_skips_two_token_pool_when_decimal_hints_incomplete() {
+        use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
+        use crate::core::types::V2PoolState;
+
+        let usdc = Address::from([1u8; 20]);
+        let weth = Address::from([2u8; 20]);
+        let pool_address = Address::from([3u8; 20]);
+        let cache = StateCache::default();
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: MIN_HOP_TOKEN_BALANCE,
+                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        let discovered = [DiscoveredPool {
+            pool_key: pool_address.to_string(),
+            address: pool_address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "UNI-V2".into(),
+            tokens: vec![usdc, weth],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let hints: FxHashMap<_, _> = [(usdc, 6u8)].into_iter().collect();
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect();
+        let mut arena = StateArena::default();
+        let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, Some(&hints));
+        assert!(metas.is_empty(), "missing weth decimals must not admit pool");
     }
 
     #[test]

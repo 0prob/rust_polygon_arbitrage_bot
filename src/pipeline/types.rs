@@ -198,6 +198,13 @@ pub fn pool_meta_at(pool_metas: &[PoolMeta], index: PoolIndex) -> Option<&PoolMe
     pool_metas.iter().find(|meta| meta.pool_index == index)
 }
 
+/// True when `candidate` ranks strictly ahead of `incumbent` (lower is better for `score`).
+#[inline]
+#[must_use]
+pub fn cycle_prefers_candidate(candidate: &FoundCycle, incumbent: &FoundCycle) -> bool {
+    compare_cycle_score(candidate, incumbent) == std::cmp::Ordering::Less
+}
+
 #[must_use]
 pub fn compare_cycle_score(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering {
     // Primary key: U256 cycle_ratio (exact fixed-point). Higher ratio = more profitable at margin.

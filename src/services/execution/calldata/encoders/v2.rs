@@ -20,6 +20,9 @@ pub fn encode_v2_hop(
     slippage_bps: u64,
     use_transfer_all: bool,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
+    if hop.edge.zero_for_one != (hop.token_in < hop.token_out) {
+        anyhow::bail!("v2 zero_for_one must match sorted token0 (token_in < token_out)");
+    }
     let min_out = compute_min_out(arena, hop, slippage_bps, "v2")?;
 
     let mut calls = Vec::with_capacity(2);

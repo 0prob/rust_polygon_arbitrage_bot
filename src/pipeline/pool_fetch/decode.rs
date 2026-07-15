@@ -79,14 +79,23 @@ fn decode_v2(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
     if r0.is_zero() || r1.is_zero() {
         return None;
     }
-    let fee_bps = U256::from(plan.pool.fee_bps);
+    let (fee, fee_denominator) = v2_stored_fee_from_bps(plan.pool.fee_bps);
     Some(PoolState::V2(V2PoolState {
         reserve0: r0,
         reserve1: r1,
-        fee: fee_bps,
-        fee_denominator: U256::from(10_000u64),
+        fee,
+        fee_denominator,
         block_timestamp_last: block_ts,
     }))
+}
+
+#[inline]
+fn v2_stored_fee_from_bps(fee_bps: u32) -> (U256, U256) {
+    let bps = fee_bps.min(9_999);
+    (
+        U256::from(10_000u64 - u64::from(bps)),
+        U256::from(10_000u64),
+    )
 }
 
 fn decode_v3_head(
@@ -532,6 +541,24 @@ mod tests {
         assert_eq!(r0, U256::from(1_000u64));
         assert_eq!(r1, U256::from(2_000u64));
         assert_eq!(ts, 42);
+    }
+
+    #[test]
+    fn v2_stored_fee_from_bps_matches_edge_fee_resolution() {
+        let (fee, den) = v2_stored_fee_from_bps(30);
+        assert_eq!(fee, U256::from(9970u64));
+        assert_eq!(den, U256::from(10_000u64));
+        let state = V2PoolState {
+            reserve0: U256::from(1u64),
+            reserve1: U256::from(1u64),
+            fee,
+            fee_denominator: den,
+            block_timestamp_last: 0,
+        };
+        let (num, denom) =
+            crate::core::math::uniswap_v2::resolve_v2_fee_with_edge(&state, None);
+        assert_eq!(num, U256::from(9970u64));
+        assert_eq!(denom, U256::from(10_000u64));
     }
 
     #[test]

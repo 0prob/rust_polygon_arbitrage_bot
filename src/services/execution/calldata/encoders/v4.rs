@@ -23,6 +23,9 @@ pub fn encode_v4_hop(
     if hooks != Address::ZERO {
         anyhow::bail!("v4 hook pools are not supported");
     }
+    if hop.edge.zero_for_one != (hop.token_in < hop.token_out) {
+        anyhow::bail!("v4 zero_for_one must match sorted currency0 (token_in < token_out)");
+    }
 
     let pool_state = arena
         .pool_state(hop.edge.pool_index)
