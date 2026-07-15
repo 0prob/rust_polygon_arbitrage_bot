@@ -490,12 +490,10 @@ fn spawn_pass_loop_sidecars(
         tokio::spawn(async move {
             if let Ok(p) = rpc.connect_state()
                 && let Err(e) =
-                    crate::services::execution::flash_liquidity::fetch_and_cache_aave_flash_loan_fee_bps(
-                        &p,
-                    )
-                    .await
+                    crate::services::execution::aave::fetch_and_cache_aave_flash_loan_fee_bps(&p)
+                        .await
             {
-                crate::warn!("aave flash loan fee fetch failed: {e}");
+                crate::warn!("aave: startup flash_fee fetch failed: {e}");
             }
         });
     }

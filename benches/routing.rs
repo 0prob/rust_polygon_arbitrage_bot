@@ -205,6 +205,7 @@ fn bench_cycle_search(c: &mut Criterion) {
                 false,
                 None,
             )
+            .cycles
         });
     });
 }

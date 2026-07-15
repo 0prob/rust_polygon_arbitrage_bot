@@ -77,24 +77,57 @@ fn probe_context_for_cycle(
     (min_economic_amount_in(decimals, rate), rate, decimals)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PrefilterDiagnostics {
+    pub merged_in: usize,
+    pub pruned_non_simulable: usize,
+    pub pruned_spot_flat: usize,
+    pub pruned_executor_budget: usize,
+    pub simulable: usize,
+    pub sim_window: usize,
+    pub profit_keep: usize,
+    pub gas_rescue: usize,
+    pub spot_rescue: usize,
+    pub rescue_cap_drop: usize,
+    pub out: usize,
+}
+
+impl PrefilterDiagnostics {
+    pub fn log_summary(&self) {
+        if self.merged_in == 0 {
+            return;
+        }
+        crate::info!(
+            "cycle prefilter: in={} pruned_sim={} pruned_spot={} pruned_executor={} simulable={} window={} \
+             keep={} gas_rescue={} spot_rescue={} rescue_cap_drop={} out={}",
+            self.merged_in,
+            self.pruned_non_simulable,
+            self.pruned_spot_flat,
+            self.pruned_executor_budget,
+            self.simulable,
+            self.sim_window,
+            self.profit_keep,
+            self.gas_rescue,
+            self.spot_rescue,
+            self.rescue_cap_drop,
+            self.out,
+        );
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrefilterVerdict {
     Keep,
-    Rescue,
-    Reject,
+    RescueGas,
+    RescueSpot,
 }
 
-fn prefilter_verdict_for_cycle(
+/// Atomic sim verdict — caller must already require simulable + spot-negative routes.
+fn atomic_sim_verdict_for_cycle(
     arena: &StateArena,
     cycle: &FoundCycle,
     ctx: Option<&ProbeContext<'_>>,
 ) -> PrefilterVerdict {
-    if !is_fully_simulable_route(&cycle.edges) {
-        return PrefilterVerdict::Reject;
-    }
-    if !cycle_spot_negative(cycle) {
-        return PrefilterVerdict::Reject;
-    }
     let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
     let mut probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
     if probe.as_ref().is_none_or(|s| s.profit.is_zero()) {
@@ -109,11 +142,9 @@ fn prefilter_verdict_for_cycle(
                 if let Some(gas_price) = c.gas_price_wei {
                     if probe_beats_gas_floor(sim, rate, decimals, gas_price) {
                         PrefilterVerdict::Keep
-                    } else if cycle_spot_negative(cycle) {
-                        // Dust probe profit may not cover gas; Brent can find size.
-                        PrefilterVerdict::Rescue
                     } else {
-                        PrefilterVerdict::Reject
+                        // Dust probe profit may not cover gas; Brent can find size.
+                        PrefilterVerdict::RescueGas
                     }
                 } else {
                     PrefilterVerdict::Keep
@@ -122,10 +153,8 @@ fn prefilter_verdict_for_cycle(
                 PrefilterVerdict::Keep
             }
         }
-        // Simulable at probe size but zero profit, or sim failed: rescue when the
-        // graph still shows a spot-negative cycle (cycle_ratio / score).
-        Some(_) | None if cycle_spot_negative(cycle) => PrefilterVerdict::Rescue,
-        Some(_) | None => PrefilterVerdict::Reject,
+        // Simulable at probe size but zero profit, or sim failed: Brent rescue when spot-negative.
+        Some(_) | None => PrefilterVerdict::RescueSpot,
     }
 }
 
@@ -134,64 +163,92 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
     cycles: Vec<FoundCycle>,
     max_keep: usize,
     ctx: Option<&ProbeContext<'_>>,
-) -> Vec<FoundCycle> {
-    let mut cycles = cycles;
+) -> (Vec<FoundCycle>, PrefilterDiagnostics) {
+    prefilter_cycles_by_atomic_sim_with_context_and_diag(arena, cycles, max_keep, ctx)
+}
+
+pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
+    arena: &StateArena,
+    cycles: Vec<FoundCycle>,
+    max_keep: usize,
+    ctx: Option<&ProbeContext<'_>>,
+) -> (Vec<FoundCycle>, PrefilterDiagnostics) {
     let merged_in = cycles.len();
-    cycles.retain(|c| is_fully_simulable_route(&c.edges));
-    let simulable = cycles.len();
-    if cycles.is_empty() {
-        if merged_in > 0 {
-            crate::debug!(
-                "cycle prefilter: merged={merged_in} simulable=0 keep=0 (all non-simulable)"
-            );
-        }
-        return cycles;
+    let mut diag = PrefilterDiagnostics {
+        merged_in,
+        ..PrefilterDiagnostics::default()
+    };
+    if max_keep == 0 || merged_in == 0 {
+        return (Vec::new(), diag);
     }
-    cycles.sort_unstable_by(compare_cycle_score);
+
+    let mut simulable: Vec<FoundCycle> = Vec::with_capacity(merged_in);
+    for c in cycles {
+        if !is_fully_simulable_route(&c.edges) {
+            diag.pruned_non_simulable += 1;
+            continue;
+        }
+        if !cycle_spot_negative(&c) {
+            diag.pruned_spot_flat += 1;
+            continue;
+        }
+        if !crate::pipeline::route_calls::route_fits_executor(&c.edges) {
+            diag.pruned_executor_budget += 1;
+            continue;
+        }
+        simulable.push(c);
+    }
+    diag.simulable = simulable.len();
+    if simulable.is_empty() {
+        return (Vec::new(), diag);
+    }
+
+    simulable.sort_unstable_by(compare_cycle_score);
     let rescue_cap = graph_negative_rescue_cap(max_keep);
-    let sim_window = cycles.len().min(max_keep.saturating_add(rescue_cap));
-    let candidates: Vec<FoundCycle> = cycles.into_iter().take(sim_window).collect();
+    let sim_window = simulable.len().min(max_keep.saturating_add(rescue_cap));
+    diag.sim_window = sim_window;
+    let candidates: Vec<FoundCycle> = simulable.into_iter().take(sim_window).collect();
     let verdicts: Vec<PrefilterVerdict> = if crate::util::should_use_rayon(candidates.len()) {
         candidates
             .par_iter()
-            .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
+            .map(|cycle| atomic_sim_verdict_for_cycle(arena, cycle, ctx))
             .collect()
     } else {
         candidates
             .iter()
-            .map(|cycle| prefilter_verdict_for_cycle(arena, cycle, ctx))
+            .map(|cycle| atomic_sim_verdict_for_cycle(arena, cycle, ctx))
             .collect()
     };
 
-    let mut missing_state_rescued = 0usize;
+    let mut rescue_used = 0usize;
     let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
-    let mut verdict_keep = 0usize;
-    let mut verdict_rescue_kept = 0usize;
-    let mut verdict_reject = 0usize;
-    let mut verdict_rescue_dropped = 0usize;
     for (cycle, verdict) in candidates.into_iter().zip(verdicts) {
         let keep = match verdict {
-            PrefilterVerdict::Keep => true,
-            PrefilterVerdict::Rescue => {
-                if missing_state_rescued >= rescue_cap {
+            PrefilterVerdict::Keep => {
+                diag.profit_keep += 1;
+                true
+            }
+            PrefilterVerdict::RescueGas => {
+                if rescue_used >= rescue_cap {
+                    diag.rescue_cap_drop += 1;
                     false
                 } else {
-                    missing_state_rescued += 1;
+                    rescue_used += 1;
+                    diag.gas_rescue += 1;
                     true
                 }
             }
-            PrefilterVerdict::Reject => false,
-        };
-        match verdict {
-            PrefilterVerdict::Keep => {
-                if keep {
-                    verdict_keep += 1;
+            PrefilterVerdict::RescueSpot => {
+                if rescue_used >= rescue_cap {
+                    diag.rescue_cap_drop += 1;
+                    false
+                } else {
+                    rescue_used += 1;
+                    diag.spot_rescue += 1;
+                    true
                 }
             }
-            PrefilterVerdict::Rescue if keep => verdict_rescue_kept += 1,
-            PrefilterVerdict::Rescue => verdict_rescue_dropped += 1,
-            PrefilterVerdict::Reject => verdict_reject += 1,
-        }
+        };
         if keep {
             survivors.push(cycle);
             if survivors.len() >= max_keep {
@@ -199,13 +256,8 @@ pub fn prefilter_cycles_by_atomic_sim_with_context(
             }
         }
     }
-    crate::debug!(
-        "cycle prefilter: merged={merged_in} simulable={simulable} sim_window={sim_window} \
-         profit_keep={verdict_keep} rescue={verdict_rescue_kept} rescue_drop={verdict_rescue_dropped} \
-         reject={verdict_reject} out={}",
-        survivors.len()
-    );
-    survivors
+    diag.out = survivors.len();
+    (survivors, diag)
 }
 
 #[inline]
@@ -392,6 +444,22 @@ mod tests {
     }
 
     #[test]
+    fn prefilter_prunes_spot_flat_before_sim() {
+        let mut flat = cycle(-0.1, false);
+        flat.cycle_ratio = ONE;
+        flat.score = 0.1;
+        let (_, diag) =
+            prefilter_cycles_by_atomic_sim_with_context_and_diag(
+                &crate::pipeline::arena::StateArena::default(),
+                vec![flat],
+                8,
+                None,
+            );
+        assert_eq!(diag.pruned_spot_flat, 1);
+        assert_eq!(diag.sim_window, 0);
+    }
+
+    #[test]
     fn rescue_cap_scales_with_enumeration_budget() {
         assert_eq!(graph_negative_rescue_cap(650), 162);
         assert_eq!(graph_negative_rescue_cap(32), 32);
@@ -465,7 +533,7 @@ mod tests {
             "dust probe should not show profit for marginal 2-hop cycle"
         );
 
-        let kept = prefilter_cycles_by_atomic_sim_with_context(
+        let (kept, diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
             &arena,
             vec![graph_negative.clone()],
             8,
@@ -473,5 +541,9 @@ mod tests {
         );
         assert_eq!(kept.len(), 1, "spot-negative cycle should be rescued");
         assert_eq!(kept[0].cycle_ratio, graph_negative.cycle_ratio);
+        assert!(
+            diag.spot_rescue >= 1 || diag.gas_rescue >= 1,
+            "rescued cycle should be counted: {diag:?}"
+        );
     }
 }

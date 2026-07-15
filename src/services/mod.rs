@@ -2,6 +2,7 @@ pub mod balancer_backend;
 pub mod discovery;
 pub mod execution;
 pub mod hf_snapshot;
+pub mod index_diag;
 pub mod oracle;
 pub mod partial_cache;
 pub mod pipeline_survival;

@@ -267,6 +267,7 @@ pub async fn run_hf_tick(
     if ctx.refresh.is_indexer_stale() && ctx.config.pipeline.indexer_pause_on_lag {
         ctx.refresh.maybe_refresh_indexer_health().await;
         if ctx.refresh.is_indexer_stale() {
+            crate::services::index_diag::record_indexer_stale_gate();
             crate::warn!("hf tick skipped: indexer lag exceeds threshold");
             return Ok(HfTickResult {
                 cycles_considered: 0,
@@ -311,10 +312,10 @@ pub async fn run_hf_tick(
         rescore_cap,
     );
     if should_log_hf_summary() || stream_triggered {
-        crate::debug!(
-            "hf candidates: snap_cycles={snap_cycle_count} selected={} hot_pools={} quarantine_skipped={quarantine_skipped} rate_skipped={rate_skipped} score_cap={rescore_cap} sim_cap={sim_cap}",
+        crate::info!(
+            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} hot_pools={} rescore_cap={rescore_cap}",
             cycles.len(),
-            hot_pools_set.len()
+            hot_pools_set.len(),
         );
     }
     if cycles.is_empty() {
@@ -457,18 +458,27 @@ pub async fn run_hf_tick(
             .collect();
         if !stale.is_empty() {
             let flash_budget = std::time::Duration::from_millis(750);
+            let stale_n = stale.len();
+            let fresh_n = flash_token_list.len().saturating_sub(stale_n);
             match tokio::time::timeout(
                 flash_budget,
                 flash_cache.refresh_with_fallback(&ctx.rpc, &stale),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => crate::debug!("hf flash prefetch failed: {e:#}"),
-                Err(_) => crate::debug!(
-                    "hf flash prefetch timed out after {}ms (stale={})",
+                Ok(Ok(generation)) => {
+                    crate::info!(
+                        "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation}"
+                    );
+                }
+                Ok(Err(e)) => {
+                    crate::info!(
+                        "flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}"
+                    );
+                }
+                Err(_) => crate::info!(
+                    "flash loan: hf_prefetch timeout_ms={} stale={stale_n} fresh={fresh_n}",
                     flash_budget.as_millis(),
-                    stale.len()
                 ),
             }
         }

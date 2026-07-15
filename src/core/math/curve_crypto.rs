@@ -269,25 +269,36 @@ pub fn curve_crypto_newton_y(
     }
 }
 
-#[inline]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveCryptoReject {
+    ZeroAmount,
+    InvalidIndices,
+    MissingGamma,
+    NewtonD,
+    NewtonY,
+    ZeroOut,
+}
+
 #[must_use]
-pub fn get_curve_crypto_amount_out(
+pub fn try_curve_crypto_amount_out(
     state: &CurvePoolState,
     amount_in: U256,
     token_in_idx: usize,
     token_out_idx: usize,
-) -> U256 {
-    if amount_in.is_zero()
-        || token_in_idx >= state.n_coins as usize
+) -> Result<U256, CurveCryptoReject> {
+    if amount_in.is_zero() {
+        return Err(CurveCryptoReject::ZeroAmount);
+    }
+    if token_in_idx >= state.n_coins as usize
         || token_out_idx >= state.n_coins as usize
         || token_in_idx == token_out_idx
     {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::InvalidIndices);
     }
     let gamma = state.gamma.unwrap_or(U256::ZERO);
     let a = state.a;
     if gamma.is_zero() || a.is_zero() {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::MissingGamma);
     }
     let n = U256::from(state.n_coins);
     let ann = a * n * A_MULTIPLIER;
@@ -307,33 +318,46 @@ pub fn get_curve_crypto_amount_out(
             .map(|(b, r)| (*b * *r) / ONE),
     );
     if token_in_idx >= xp.len() || token_out_idx >= xp.len() {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::InvalidIndices);
     }
     xp[token_in_idx] += (amount_in * rates[token_in_idx]) / ONE;
     let d_result = curve_crypto_newton_d(ann, gamma, &xp);
     if !d_result.converged {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::NewtonD);
     }
     let y_result = curve_crypto_newton_y(ann, gamma, &xp, d_result.value, token_out_idx);
     if !y_result.converged {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::NewtonY);
     }
     let dy = xp[token_out_idx].saturating_sub(y_result.value);
     let fee = state.fee;
     let fee_denom = POW_10_10;
     let out_rate = rates[token_out_idx];
     if out_rate.is_zero() {
-        return U256::ZERO;
+        return Err(CurveCryptoReject::ZeroOut);
     }
     let out = (dy * ONE) / out_rate;
     let fee_amount = (out * fee) / fee_denom;
     let out_after_fee = out.saturating_sub(fee_amount);
-    // Apply output buffer to guard against state drift between simulation and execution.
-    // Same proportion as the stable Curve buffer (0.001% of output).
-    out_after_fee.saturating_sub(
+    let buffered = out_after_fee.saturating_sub(
         (out_after_fee * crate::core::math::curve::CURVE_OUTPUT_BUFFER)
             / crate::core::math::curve::CURVE_FEE_DENOMINATOR,
-    )
+    );
+    if buffered.is_zero() {
+        return Err(CurveCryptoReject::ZeroOut);
+    }
+    Ok(buffered)
+}
+
+#[inline]
+#[must_use]
+pub fn get_curve_crypto_amount_out(
+    state: &CurvePoolState,
+    amount_in: U256,
+    token_in_idx: usize,
+    token_out_idx: usize,
+) -> U256 {
+    try_curve_crypto_amount_out(state, amount_in, token_in_idx, token_out_idx).unwrap_or(U256::ZERO)
 }
 
 #[cfg(test)]

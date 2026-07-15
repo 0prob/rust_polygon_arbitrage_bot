@@ -37,6 +37,36 @@ pub struct DryRunResult {
     pub decoded_revert: Option<crate::services::execution::revert_decoder::DecodedRevert>,
 }
 
+impl DryRunResult {
+    /// User-facing / log reason when dispatch treats the dry-run as failed.
+    #[must_use]
+    pub fn failure_reason(&self) -> String {
+        if let Some(ref e) = self.error {
+            return e.clone();
+        }
+        if let Some(ref d) = self.decoded_revert {
+            return d.to_string();
+        }
+        if self.realized_profit.is_some_and(|p| p.is_zero()) {
+            return "eth_call succeeded but on-chain realized profit is zero".into();
+        }
+        if !self.semantic_success {
+            return "dry-run did not produce a decodable realized profit".into();
+        }
+        if self.realized_profit.is_none() {
+            return "dry-run succeeded but returned no non-zero realized profit".into();
+        }
+        if !self.success {
+            return "dry-run failed without RPC error detail".into();
+        }
+        "dry-run failed without RPC error detail".into()
+    }
+}
+
+fn is_acceptable_realized_profit(profit: Option<U256>) -> bool {
+    profit.is_some_and(|p| !p.is_zero())
+}
+
 fn decode_realized_profit(output: &[u8]) -> Option<U256> {
     if output.is_empty() {
         return None;
@@ -185,7 +215,16 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
                 decoded_revert: None,
             };
         }
-        Err(_) => return gas_overflow_dry_run_failure(),
+        Err(_) => {
+            return DryRunResult {
+                semantic_success: false,
+                success: false,
+                gas_used: None,
+                realized_profit: None,
+                error: Some("estimate_gas timed out after eth_call gas overflow".into()),
+                decoded_revert: None,
+            };
+        }
     };
     let call_gas = gas.saturating_mul(11_000) / 10_000;
     match eth_call_at_block(
@@ -353,16 +392,19 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
 
     match gas_from_estimate {
         Ok(gas) => {
-            if realized_profit.is_none() {
+            if !is_acceptable_realized_profit(realized_profit) {
+                let error = if realized_profit.is_some() {
+                    "eth_call succeeded but on-chain realized profit is zero".into()
+                } else {
+                    "eth_call succeeded but returned no decodable realized profit (wrong entrypoint or empty return)"
+                        .into()
+                };
                 return DryRunResult {
                     semantic_success: false,
                     success: false,
                     gas_used: Some(gas),
-                    realized_profit: None,
-                    error: Some(
-                        "eth_call succeeded but returned no decodable realized profit (wrong entrypoint or empty return)"
-                            .into(),
-                    ),
+                    realized_profit,
+                    error: Some(error),
                     decoded_revert: None,
                 };
             }
@@ -378,6 +420,7 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
         Err(msg) => {
             if is_gas_limit_rpc_error(&msg) {
                 return realized_profit
+                    .filter(|p| !p.is_zero())
                     .map(gas_overflow_estimate_fallback)
                     .unwrap_or_else(gas_overflow_dry_run_failure);
             }
@@ -454,6 +497,35 @@ mod tests {
     fn gas_overflow_error_is_recognized() {
         let msg = "server returned an error response: error code -32000: gas uint64 overflow";
         assert!(msg.contains("gas uint64 overflow"));
+    }
+
+    #[test]
+    fn failure_reason_prefers_rpc_error_then_zero_profit() {
+        let with_rpc = DryRunResult {
+            semantic_success: false,
+            success: false,
+            gas_used: None,
+            realized_profit: None,
+            error: Some("execution reverted: InsufficientProfit".into()),
+            decoded_revert: None,
+        };
+        assert_eq!(
+            with_rpc.failure_reason(),
+            "execution reverted: InsufficientProfit"
+        );
+
+        let zero_profit = DryRunResult {
+            semantic_success: true,
+            success: true,
+            gas_used: Some(200_000),
+            realized_profit: Some(U256::ZERO),
+            error: None,
+            decoded_revert: None,
+        };
+        assert_eq!(
+            zero_profit.failure_reason(),
+            "eth_call succeeded but on-chain realized profit is zero"
+        );
     }
 
     #[test]

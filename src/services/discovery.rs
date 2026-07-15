@@ -5,6 +5,7 @@ use crate::core::protocol::{
     fee_to_bps, is_fetchable_protocol, is_known_protocol_label, normalize_balancer_pool_type,
     resolve_protocol_from_pg,
 };
+use crate::services::index_diag::{IndexParseReject, IndexRoutableSkip, record_index_parse_reject};
 use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
 use crate::pipeline::types::PoolMeta;
 
@@ -99,14 +100,38 @@ fn is_uniswap_v2_label(label: &str) -> bool {
 }
 
 #[must_use]
+pub fn routable_skip_reason(pool: &DiscoveredPool) -> Option<IndexRoutableSkip> {
+    if !is_fetchable_protocol(pool.protocol) {
+        return Some(IndexRoutableSkip::NotFetchable);
+    }
+    if !has_supported_token_shape(pool.protocol, &pool.tokens) {
+        return Some(IndexRoutableSkip::BadShape);
+    }
+    if !is_supported_v4_pool(pool.protocol, pool.hooks) {
+        return Some(IndexRoutableSkip::V4Hooks);
+    }
+    if !quickswap_v2_enabled() && is_quickswap_v2_label(&pool.protocol_label) {
+        return Some(IndexRoutableSkip::QuickswapV2Disabled);
+    }
+    if !uniswap_v2_enabled() && is_uniswap_v2_label(&pool.protocol_label) {
+        return Some(IndexRoutableSkip::UniswapV2Disabled);
+    }
+    None
+}
+
+#[must_use]
 pub fn is_routable_pool(pool: &DiscoveredPool) -> bool {
-    is_fetchable_protocol(pool.protocol)
-        && has_supported_token_shape(pool.protocol, &pool.tokens)
-        && is_supported_v4_pool(pool.protocol, pool.hooks)
-        // ponytail: env toggle for quickswap v2 pools
-        && (quickswap_v2_enabled() || !is_quickswap_v2_label(&pool.protocol_label))
-        // ponytail: env toggle for uniswap v2 pools
-        && (uniswap_v2_enabled() || !is_uniswap_v2_label(&pool.protocol_label))
+    routable_skip_reason(pool).is_none()
+}
+
+/// Keep parsed pools that pass the routable gate; record skips for index funnel logs.
+#[must_use]
+pub fn retain_routable_pool(pool: DiscoveredPool) -> Option<DiscoveredPool> {
+    if let Some(reason) = routable_skip_reason(&pool) {
+        crate::services::index_diag::record_index_routable_skip(reason);
+        return None;
+    }
+    Some(pool)
 }
 
 fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool {
@@ -238,9 +263,14 @@ pub fn parse_pool_meta_row(
     created_block: Option<i64>,
     address_raw: Option<&str>,
 ) -> Option<DiscoveredPool> {
+    crate::services::index_diag::record_index_parse_attempt();
     let mut parsed = Vec::with_capacity(tokens.len());
     for token in tokens {
-        parsed.push(token.parse().ok()?);
+        let Ok(addr) = token.parse() else {
+            record_index_parse_reject(IndexParseReject::BadToken);
+            return None;
+        };
+        parsed.push(addr);
     }
     parse_pool_meta_impl(
         id,
@@ -269,19 +299,33 @@ fn parse_pool_meta_impl(
     created_block: Option<i64>,
     address_raw: Option<&str>,
 ) -> Option<DiscoveredPool> {
-    let (pool_key, address, pool_id) = resolve_pool_identity(id, pool_id_raw, address_raw)?;
+    let Some((pool_key, address, pool_id)) = resolve_pool_identity(id, pool_id_raw, address_raw)
+    else {
+        record_index_parse_reject(IndexParseReject::BadIdentity);
+        return None;
+    };
 
-    if tokens.len() < 2 || !is_known_protocol_label(protocol) {
+    if tokens.len() < 2 {
+        record_index_parse_reject(IndexParseReject::BadShape);
+        return None;
+    }
+    if !is_known_protocol_label(protocol) {
+        record_index_parse_reject(IndexParseReject::UnknownProtocol);
         return None;
     }
 
-    let proto = resolve_protocol_from_pg(protocol, pool_type_raw)?;
+    let Some(proto) = resolve_protocol_from_pg(protocol, pool_type_raw) else {
+        record_index_parse_reject(IndexParseReject::UnresolvedProtocol);
+        return None;
+    };
     if !has_supported_token_shape(proto, &tokens) {
+        record_index_parse_reject(IndexParseReject::BadShape);
         return None;
     }
     if proto == ProtocolType::UniswapV4
         && (fee.is_none_or(|value| !(0..0x800000).contains(&value)) || tick_spacing.is_none())
     {
+        record_index_parse_reject(IndexParseReject::V4Fields);
         return None;
     }
     let fee_bps = fee_to_bps(protocol, fee.map(|f| f as u32));
@@ -292,6 +336,7 @@ fn parse_pool_meta_impl(
         // weighted fallback. Gyro and other specialized pools require
         // different invariants that are not implemented here.
         if pool_type_raw.is_some() && normalized.is_none() {
+            record_index_parse_reject(IndexParseReject::BalancerPoolType);
             return None;
         }
         normalized
@@ -301,13 +346,19 @@ fn parse_pool_meta_impl(
 
     if proto == ProtocolType::UniswapV4 {
         let pool_id = pool_id.or_else(|| resolve_v4_pool_id_from_key(&pool_key));
-        pool_id?;
+        if pool_id.is_none() {
+            record_index_parse_reject(IndexParseReject::V4Fields);
+            return None;
+        }
+        let pool_id = pool_id.or_else(|| resolve_v4_pool_id_from_key(&pool_key));
         if hooks.is_none() {
             hooks = Some(Address::ZERO);
         }
         if !is_supported_v4_pool(proto, hooks) {
+            record_index_parse_reject(IndexParseReject::V4Hooks);
             return None;
         }
+        crate::services::index_diag::record_index_parse_ok();
         return Some(DiscoveredPool {
             pool_key,
             address,
@@ -324,6 +375,7 @@ fn parse_pool_meta_impl(
         });
     }
 
+    crate::services::index_diag::record_index_parse_ok();
     Some(DiscoveredPool {
         pool_key,
         address,

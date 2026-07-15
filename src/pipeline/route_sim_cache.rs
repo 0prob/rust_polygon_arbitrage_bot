@@ -109,15 +109,15 @@ impl RouteSimCache {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Debug snapshot when the cache has seen traffic this tick.
+    /// Snapshot when the cache has seen traffic this tick.
     pub fn debug_log_if_active(&self, label: &str) {
         let hits = self.stats.hits.load(Ordering::Relaxed);
         let misses = self.stats.misses.load(Ordering::Relaxed);
         if hits.saturating_add(misses) == 0 {
             return;
         }
-        crate::debug!(
-            "route_sim_cache {label}: hit_rate_bps={} hits={hits} misses={misses} inserts={} evictions={} entries={}",
+        crate::info!(
+            "route sim cache {label}: hit_rate_bps={} hits={hits} misses={misses} inserts={} evictions={} entries={}",
             self.stats.hit_rate_bps(),
             self.stats.inserts.load(Ordering::Relaxed),
             self.stats.evictions.load(Ordering::Relaxed),

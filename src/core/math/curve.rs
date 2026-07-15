@@ -125,6 +125,69 @@ fn to_xp(balances: &[U256], rates: &[U256]) -> Option<CurveXp> {
     Some(xp)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveStableReject {
+    ZeroAmount,
+    InvalidIndices,
+    FeeTooHigh,
+    Xp,
+    DInvariant,
+    Y,
+    ZeroOut,
+}
+
+#[must_use]
+pub fn try_curve_stable_amount_out(
+    state: &CurvePoolState,
+    amount_in: U256,
+    token_in_idx: usize,
+    token_out_idx: usize,
+) -> Result<U256, CurveStableReject> {
+    if amount_in.is_zero() {
+        return Err(CurveStableReject::ZeroAmount);
+    }
+    if state.a.is_zero()
+        || token_in_idx == token_out_idx
+        || token_in_idx >= state.balances.len()
+        || token_out_idx >= state.balances.len()
+    {
+        return Err(CurveStableReject::InvalidIndices);
+    }
+    if state.fee >= CURVE_FEE_DENOMINATOR {
+        return Err(CurveStableReject::FeeTooHigh);
+    }
+    let Some(xp) = to_xp(&state.balances, &state.rates) else {
+        return Err(CurveStableReject::Xp);
+    };
+    let d = state
+        .d
+        .filter(|d| !d.is_zero())
+        .or_else(|| get_d(&xp, state.a))
+        .filter(|d| !d.is_zero())
+        .ok_or(CurveStableReject::DInvariant)?;
+    let in_rate = state.rates.get(token_in_idx).copied().unwrap_or(ONE);
+    let x = xp[token_in_idx] + (amount_in * in_rate) / ONE;
+    let Some(y) = get_y(x, token_in_idx, token_out_idx, &xp, state.a, d) else {
+        return Err(CurveStableReject::Y);
+    };
+    let dy = xp[token_out_idx].saturating_sub(y).saturating_sub(ONE_U256);
+    if dy.is_zero() {
+        return Err(CurveStableReject::ZeroOut);
+    }
+    let fee_amount = (dy * state.fee) / CURVE_FEE_DENOMINATOR;
+    let dy_after_fee = dy.saturating_sub(fee_amount);
+    let dy_buffered =
+        dy_after_fee.saturating_sub((dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR);
+    if dy_buffered.is_zero() {
+        return Err(CurveStableReject::ZeroOut);
+    }
+    let out_rate = state.rates.get(token_out_idx).copied().unwrap_or(ONE);
+    if out_rate.is_zero() {
+        return Err(CurveStableReject::ZeroOut);
+    }
+    Ok((dy_buffered * ONE) / out_rate)
+}
+
 #[inline]
 #[must_use]
 pub fn get_curve_stable_amount_out(
@@ -133,54 +196,7 @@ pub fn get_curve_stable_amount_out(
     token_in_idx: usize,
     token_out_idx: usize,
 ) -> U256 {
-    if amount_in.is_zero()
-        || state.a.is_zero()
-        || token_in_idx == token_out_idx
-        || token_in_idx >= state.balances.len()
-        || token_out_idx >= state.balances.len()
-    {
-        return U256::ZERO;
-    }
-
-    if state.fee >= CURVE_FEE_DENOMINATOR {
-        return U256::ZERO;
-    }
-
-    let Some(xp) = to_xp(&state.balances, &state.rates) else {
-        return U256::ZERO;
-    };
-
-    let d = match get_d(&xp, state.a) {
-        Some(v) if !v.is_zero() => v,
-        _ => return U256::ZERO,
-    };
-
-    let in_rate = state.rates.get(token_in_idx).copied().unwrap_or(ONE);
-    let x = xp[token_in_idx] + (amount_in * in_rate) / ONE;
-    let Some(y) = get_y(x, token_in_idx, token_out_idx, &xp, state.a, d) else {
-        return U256::ZERO;
-    };
-
-    let dy = xp[token_out_idx].saturating_sub(y).saturating_sub(ONE_U256);
-    if dy.is_zero() {
-        return U256::ZERO;
-    }
-
-    let fee_amount = (dy * state.fee) / CURVE_FEE_DENOMINATOR;
-    let dy_after_fee = dy.saturating_sub(fee_amount);
-    // Apply output buffer to guard against state drift between simulation and execution.
-    let dy_buffered =
-        dy_after_fee.saturating_sub((dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR);
-    if dy_buffered.is_zero() {
-        return U256::ZERO;
-    }
-
-    let out_rate = state.rates.get(token_out_idx).copied().unwrap_or(ONE);
-    if out_rate.is_zero() {
-        return U256::ZERO;
-    }
-
-    (dy_buffered * ONE) / out_rate
+    try_curve_stable_amount_out(state, amount_in, token_in_idx, token_out_idx).unwrap_or(U256::ZERO)
 }
 
 #[cfg(test)]

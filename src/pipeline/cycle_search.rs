@@ -7,7 +7,8 @@ use crate::core::types::FoundCycle;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
 use crate::pipeline::cycle_filter::{
-    ProbeContext, dedupe_cycles_by_edges, prefilter_cycles_by_atomic_sim_with_context,
+    PrefilterDiagnostics, ProbeContext, dedupe_cycles_by_edges,
+    prefilter_cycles_by_atomic_sim_with_context_and_diag,
 };
 use crate::pipeline::cycle_finder::{
     find_cycles_multi_pass, find_cycles_multi_pass_with_prep, index_pool_metas,
@@ -30,24 +31,71 @@ fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CycleSearchDiagnostics {
+    pub mode: CycleFinderMode,
+    pub raw_collected: usize,
+    pub post_dedupe: usize,
+    pub post_prefilter: usize,
+    pub dfs_raw: usize,
+    pub bf_raw: usize,
+    pub hub_heavy: bool,
+    pub start_tokens: usize,
+    pub enumerate_ms: u64,
+    pub finalize_ms: u64,
+    pub prefilter: PrefilterDiagnostics,
+}
+
+impl CycleSearchDiagnostics {
+    pub fn log_summary(&self) {
+        crate::info!(
+            "cycle search: mode={:?} raw={} dedupe={} prefilter={} dfs={} bf={} hub_heavy={} starts={} enum_ms={} finalize_ms={}",
+            self.mode,
+            self.raw_collected,
+            self.post_dedupe,
+            self.post_prefilter,
+            self.dfs_raw,
+            self.bf_raw,
+            self.hub_heavy,
+            self.start_tokens,
+            self.enumerate_ms,
+            self.finalize_ms,
+        );
+        self.prefilter.log_summary();
+    }
+}
+
+pub struct CycleSearchOutcome {
+    pub cycles: Vec<FoundCycle>,
+    pub diag: CycleSearchDiagnostics,
+}
+
 fn finalize_cycles(
     arena: &StateArena,
     cycles: Vec<FoundCycle>,
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
+    diag: &mut CycleSearchDiagnostics,
 ) -> Vec<FoundCycle> {
+    diag.raw_collected = cycles.len();
     let merged = dedupe_cycles_by_edges(cycles);
+    diag.post_dedupe = merged.len();
     let max_keep = passes.iter().map(|p| p.max_cycles).max().unwrap_or(0);
-    if atomic_prefilter {
-        prefilter_cycles_by_atomic_sim_with_context(arena, merged, max_keep, probe_ctx)
+    let out = if atomic_prefilter {
+        let (out, prefilter_diag) =
+            prefilter_cycles_by_atomic_sim_with_context_and_diag(arena, merged, max_keep, probe_ctx);
+        diag.prefilter = prefilter_diag;
+        out
     } else {
         let mut out = merged;
         if out.len() > max_keep {
             out.truncate(max_keep);
         }
         out
-    }
+    };
+    diag.post_prefilter = out.len();
+    out
 }
 
 /// Dispatch cycle search by configured finder mode.
@@ -60,12 +108,24 @@ pub fn find_cycles_for_mode(
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
-) -> Vec<FoundCycle> {
+) -> CycleSearchOutcome {
     if passes.is_empty() {
-        return Vec::new();
+        return CycleSearchOutcome {
+            cycles: Vec::new(),
+            diag: CycleSearchDiagnostics {
+                mode,
+                ..CycleSearchDiagnostics::default()
+            },
+        };
     }
 
-    let cycles = match mode {
+    let enum_started = crate::util::now_ms();
+    let mut diag = CycleSearchDiagnostics {
+        mode,
+        ..CycleSearchDiagnostics::default()
+    };
+
+    match mode {
         CycleFinderMode::Hybrid => {
             return find_cycles_hybrid_multi_pass(
                 arena,
@@ -74,35 +134,65 @@ pub fn find_cycles_for_mode(
                 passes,
                 atomic_prefilter,
                 probe_ctx,
+                enum_started,
+                &mut diag,
             );
         }
-        CycleFinderMode::Dfs => find_cycles_multi_pass(graph, arena, pool_metas, passes),
-        // Johnson reweighting assumes the absence of negative cycles, but this
-        // router deliberately searches for them. Fall back to the weighted
-        // Bellman-Ford path instead of applying an invalid transform.
+        CycleFinderMode::Dfs => {
+            let raw = find_cycles_multi_pass(graph, arena, pool_metas, passes);
+            diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
+            let finalize_started = crate::util::now_ms();
+            let cycles = finalize_cycles(
+                arena,
+                raw,
+                passes,
+                atomic_prefilter,
+                probe_ctx,
+                &mut diag,
+            );
+            diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
+            CycleSearchOutcome { cycles, diag }
+        }
         CycleFinderMode::Johnson | CycleFinderMode::BellmanFord => {
             let adj = build_weighted_adjacency(graph);
-            find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes)
+            let raw = find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes);
+            diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
+            let finalize_started = crate::util::now_ms();
+            let cycles = finalize_cycles(
+                arena,
+                raw,
+                passes,
+                atomic_prefilter,
+                probe_ctx,
+                &mut diag,
+            );
+            diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
+            CycleSearchOutcome { cycles, diag }
         }
-    };
-    finalize_cycles(arena, cycles, passes, atomic_prefilter, probe_ctx)
+    }
 }
 
 /// Parallel DFS + Bellman-Ford, merged and atomically prefiltered.
-#[must_use]
-pub fn find_cycles_hybrid_multi_pass(
+fn find_cycles_hybrid_multi_pass(
     arena: &StateArena,
     graph: &RoutingGraph,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     passes: &[CycleSearchPass],
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
-) -> Vec<FoundCycle> {
+    enum_started: u64,
+    diag: &mut CycleSearchDiagnostics,
+) -> CycleSearchOutcome {
     if passes.is_empty() {
-        return Vec::new();
+        return CycleSearchOutcome {
+            cycles: Vec::new(),
+            diag: diag.clone(),
+        };
     }
 
     let prep = Arc::new(prepare_active_graph(graph));
+    diag.hub_heavy = prep.hub_heavy;
+    diag.start_tokens = prep.start_token_count();
     let hub_heavy = prep.hub_heavy;
     let dfs_budget: Vec<_> = passes
         .iter()
@@ -147,9 +237,25 @@ pub fn find_cycles_hybrid_multi_pass(
         },
     );
 
+    diag.dfs_raw = dfs_cycles.len();
+    diag.bf_raw = bf_cycles.len();
     dfs_cycles.append(&mut bf_cycles);
 
-    finalize_cycles(arena, dfs_cycles, passes, atomic_prefilter, probe_ctx)
+    diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
+    let finalize_started = crate::util::now_ms();
+    let cycles = finalize_cycles(
+        arena,
+        dfs_cycles,
+        passes,
+        atomic_prefilter,
+        probe_ctx,
+        diag,
+    );
+    diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
+    CycleSearchOutcome {
+        cycles,
+        diag: diag.clone(),
+    }
 }
 
 #[cfg(test)]

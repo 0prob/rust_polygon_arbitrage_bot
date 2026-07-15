@@ -305,7 +305,7 @@ impl PgClient {
     pub async fn fetch_pool_meta_incremental(
         &self,
         cursor: &DiscoveryCursor,
-    ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64, bool)> {
+    ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64, bool, ParseStats)> {
         ensure!(
             cursor.last_block > 0,
             "pool discovery not bootstrapped — use keyset bootstrap first"
@@ -332,9 +332,9 @@ impl PgClient {
         )
         .await?;
         let has_more = rows.len() == POOL_META_INCREMENTAL_LIMIT as usize;
-        let (pools, max_created, max_updated) =
+        let (pools, max_created, max_updated, stats) =
             parse_incremental_rows(&rows, initial_created, initial_updated);
-        Ok((pools, max_created, max_updated, has_more))
+        Ok((pools, max_created, max_updated, has_more, stats))
     }
 
     pub async fn fetch_all_token_metas(&self) -> anyhow::Result<Vec<TokenMeta>> {
@@ -452,10 +452,11 @@ fn parse_incremental_rows(
     rows: &[Row],
     initial_created: u64,
     initial_updated: u64,
-) -> (Vec<DiscoveredPool>, u64, u64) {
+) -> (Vec<DiscoveredPool>, u64, u64, ParseStats) {
     let mut pools = Vec::with_capacity(rows.len());
     let mut max_created = initial_created;
     let mut max_updated = initial_updated;
+    let mut stats = ParseStats::default();
     for row in rows {
         let created = block_from_row(row, "createdBlock");
         if created > max_created {
@@ -467,11 +468,20 @@ fn parse_incremental_rows(
                 max_updated = updated;
             }
         }
+        let protocol: String = row.try_get("protocol").unwrap_or_default();
         if let Some(pool) = parse_pg_row(row) {
+            record_pg_row(&mut stats, &protocol, true);
             pools.push(pool);
+        } else {
+            record_pg_row(&mut stats, &protocol, false);
         }
     }
-    (pools, max_created, max_updated.max(max_created))
+    (
+        pools,
+        max_created,
+        max_updated.max(max_created),
+        stats,
+    )
 }
 
 fn is_transient_pg_error(error: &anyhow::Error) -> bool {

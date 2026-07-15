@@ -220,13 +220,16 @@ pub fn record_pg_row(stats: &mut ParseStats, protocol: &str, parsed: bool) {
 pub fn log_index_parse_stats(stats: &ParseStats) {
     let parsed: usize = stats.parsed.values().sum();
     let rejected: usize = stats.rejected.values().sum();
+    if parsed == 0 && rejected == 0 {
+        return;
+    }
     crate::info!(
         "index parse: parsed={parsed} rejected={rejected} across {} protocols",
         stats.parsed.len().max(stats.rejected.len())
     );
     for (label, count) in &stats.rejected {
         if *count > 0 {
-            crate::debug!("index rejected: protocol={label} count={count}");
+            crate::info!("index parse reject by protocol: {label}={count}");
         }
     }
 }

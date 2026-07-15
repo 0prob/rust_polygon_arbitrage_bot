@@ -1,5 +1,6 @@
 mod support;
 
+pub mod aave;
 pub mod balancer_verify;
 pub mod calldata;
 pub mod candidate;
@@ -43,15 +44,28 @@ pub mod impact_slippage {
 }
 pub mod nonce;
 
+pub use aave::{
+    aave_flash_reserve_status_live, aave_reserve_flash_eligible, fetch_and_cache_aave_flash_loan_fee_bps,
+    log_aave_gate_summary, record_aave_mark_inactive, record_aave_prepare_skip_inactive,
+    refresh_aave_flash_fee_with_fallback, AaveRefreshStats, AaveReserveStatus,
+};
+pub use balancer_verify::{
+    balancer_batch_within_max_in_ratio, batch_profit_covers_min, evaluate_batch_query,
+    log_balancer_batch_filter_summary, log_balancer_prepare_gate_summary,
+    query_balancer_batch_profit, record_balancer_batch_reject, record_balancer_filter_accept,
+    record_balancer_filter_window, record_balancer_prepare_skip, BalancerBatchReject,
+    BatchQueryOutcome, BatchQueryVerdict,
+};
 pub use candidate::{
     CandidateBuildConfig, CandidateExecution, build_execution_candidate, evaluated_from_sim,
     hash_cycle_edges,
 };
 pub use flash_liquidity::{
-    FlashLiquidityCache, FlashLiquiditySnapshot, PrepareDispatchInput, PreparedDispatch,
-    balancer_route_flash_feasible, collect_flash_tokens_for_cycle, cycle_has_aave_listed_token,
-    prefer_aave_flash_start, prepare_evaluated_route, resolve_flash_source_for_cycle,
-    rotate_cycle_to_start,
+    CycleFlashContext, FlashLiquidityCache, FlashLiquiditySnapshot, FlashLoanDiagnostics,
+    FlashRejectReason, PrepareDispatchInput, PreparedDispatch, balancer_route_flash_feasible,
+    build_cycle_flash_context, collect_flash_tokens_for_cycle, cycle_has_aave_listed_token,
+    flash_reject_reason, prefer_aave_flash_start, prepare_evaluated_route,
+    resolve_flash_source_for_cycle, resolve_flash_source_with_context, rotate_cycle_to_start,
 };
 pub use flash_policy::{FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy};
 pub use gas::{FeeSnapshot, compute_conservative_gas_price};

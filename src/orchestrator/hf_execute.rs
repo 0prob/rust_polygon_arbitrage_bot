@@ -20,14 +20,19 @@ use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
 use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
+use crate::services::execution::aave::{
+    aave_flash_reserve_status_live, record_aave_prepare_skip_inactive, AaveReserveStatus,
+};
 use crate::services::execution::flash_liquidity::{
-    aave_flash_reserve_viable, collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
+    collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
 };
 use crate::services::execution::gas_oracle::RouteGasLookup;
 
 use crate::services::execution::balancer_verify::{
-    BatchQueryOutcome, balancer_batch_within_max_in_ratio, batch_profit_covers_min,
-    query_balancer_batch_profit,
+    evaluate_batch_query, log_balancer_batch_filter_summary, log_balancer_prepare_gate_summary,
+    query_balancer_batch_profit, record_balancer_batch_reject, record_balancer_filter_accept,
+    record_balancer_filter_window, record_balancer_prepare_skip, BalancerBatchReject,
+    BatchQueryOutcome, BatchQueryVerdict,
 };
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
@@ -101,7 +106,10 @@ struct SkipCounts {
     resim_fail: AtomicU32,
     resim_drift: AtomicU32,
     hop_fidelity: AtomicU32,
-    prepare: AtomicU32,
+    prepare_meta: AtomicU32,
+    prepare_plan: AtomicU32,
+    prepare_aave: AtomicU32,
+    prepare_balancer: AtomicU32,
     build: AtomicU32,
 }
 
@@ -113,26 +121,48 @@ impl SkipCounts {
             "resim_fail" => self.resim_fail.fetch_add(1, Ordering::Relaxed),
             "resim_drift" => self.resim_drift.fetch_add(1, Ordering::Relaxed),
             "hop_fidelity" => self.hop_fidelity.fetch_add(1, Ordering::Relaxed),
-            "prepare" => self.prepare.fetch_add(1, Ordering::Relaxed),
+            "prepare_meta" => self.prepare_meta.fetch_add(1, Ordering::Relaxed),
+            "prepare_plan" => self.prepare_plan.fetch_add(1, Ordering::Relaxed),
+            "prepare_aave" => self.prepare_aave.fetch_add(1, Ordering::Relaxed),
+            "prepare_balancer" => self.prepare_balancer.fetch_add(1, Ordering::Relaxed),
             "build" => self.build.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
 
-    fn log_if_any(&self) {
+    fn log_dispatch_gates(&self, candidates: u32, pools_refreshed: bool) {
+        if candidates == 0 {
+            return;
+        }
         let quarantine = self.quarantine.load(Ordering::Relaxed);
         let cooldown = self.cooldown.load(Ordering::Relaxed);
         let resim_fail = self.resim_fail.load(Ordering::Relaxed);
         let resim_drift = self.resim_drift.load(Ordering::Relaxed);
         let hop_fidelity = self.hop_fidelity.load(Ordering::Relaxed);
-        let prepare = self.prepare.load(Ordering::Relaxed);
+        let prepare_meta = self.prepare_meta.load(Ordering::Relaxed);
+        let prepare_plan = self.prepare_plan.load(Ordering::Relaxed);
+        let prepare_aave = self.prepare_aave.load(Ordering::Relaxed);
+        let prepare_balancer = self.prepare_balancer.load(Ordering::Relaxed);
         let build = self.build.load(Ordering::Relaxed);
-        let fidelity = resim_fail + resim_drift + hop_fidelity;
-        if build > 0 || quarantine > 0 || cooldown > 0 || fidelity > 0 || prepare > 0 {
-            crate::info!(
-                "dispatch summary: quarantine={quarantine}, cooldown={cooldown}, fidelity={fidelity} (resim_fail={resim_fail}, resim_drift={resim_drift}, hop={hop_fidelity}), prepare={prepare}, build={build}",
-            );
+        let skipped = quarantine
+            + cooldown
+            + resim_fail
+            + resim_drift
+            + hop_fidelity
+            + prepare_meta
+            + prepare_plan
+            + prepare_aave
+            + prepare_balancer
+            + build;
+        if skipped == 0 && build == 0 {
+            return;
         }
+        crate::info!(
+            "dispatch gate: candidates={candidates} pools_refreshed={pools_refreshed} skipped={skipped} \
+             quarantine={quarantine} cooldown={cooldown} resim_fail={resim_fail} resim_drift={resim_drift} \
+             hop_fidelity={hop_fidelity} prepare_meta={prepare_meta} prepare_plan={prepare_plan} \
+             prepare_aave={prepare_aave} prepare_balancer={prepare_balancer} build_fail={build}",
+        );
     }
 }
 
@@ -345,6 +375,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
 
     let skipped = Arc::new(SkipCounts::default());
+    let dispatch_candidates = u32::try_from(profitable.len()).unwrap_or(u32::MAX);
     let shutdown = ctx.shutdown.clone();
     let arena_ref: &StateArena = &*arena;
     let chain_head_hint = sim_provider.get_block_number().await.ok();
@@ -391,7 +422,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
     }
 
-    skipped.log_if_any();
+    skipped.log_dispatch_gates(dispatch_candidates, pools_refreshed);
+    crate::services::execution::aave::log_aave_gate_summary(dispatch_candidates);
+    log_balancer_prepare_gate_summary(dispatch_candidates);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -436,19 +469,22 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
 
     let Some(start_token_addr) = arena.token_address(evaluated.cycle.start_token) else {
-        skipped.record("prepare");
+        skipped.record("prepare_meta");
         return None;
     };
     let Some(resolved_token_decimals) = token_decimals.get(&start_token_addr).copied() else {
-        skipped.record("prepare");
+        skipped.record("prepare_meta");
         return None;
     };
     let Some(token_to_matic_rate) =
         resolve_token_to_matic_rate_or_bootstrap(evaluated.cycle.start_token, token_to_matic_rates)
     else {
-        skipped.record("prepare");
+        skipped.record("prepare_meta");
         return None;
     };
+
+    let hop_fidelity_caps =
+        local_sim::precompute_route_shallow_caps(arena, &evaluated.cycle.edges);
 
     let sim = if pools_refreshed {
         let amount_in = evaluated.sim.amount_in;
@@ -465,8 +501,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &mut resim_profile,
         ) {
             skipped.record("resim_drift");
-            crate::debug!(
-                "dispatch skip: fp={fp} resim gate failed: {reason} baseline_profit={} refreshed_profit={} profit_drift_bps={} max_hop_drift_bps={}",
+            crate::info!(
+                "dispatch gate resim: fp={fp} reason={reason} baseline_profit={} refreshed_profit={} profit_drift_bps={} max_hop_drift_bps={}",
                 evaluated.sim.profit,
                 refreshed.profit,
                 resim_profile.profit_drift_bps,
@@ -481,6 +517,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &refreshed.hop_amounts,
             Some(&mut hop_profile),
             true,
+            hop_fidelity_caps.as_ref(),
         ) {
             skipped.record("hop_fidelity");
             let hop = match reject {
@@ -549,7 +586,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         existing_assessment: None,
         log_skips: log_prepare_skip,
     }) else {
-        skipped.record("prepare");
+        skipped.record("prepare_plan");
         if log_prepare_skip {
             ctx.execution.record_prepare_skip(fp);
         }
@@ -557,27 +594,34 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     };
 
     if prepared.flash_source == FlashLoanSource::AaveV3 {
-        let cached = ctx.execution.flash_liquidity.snapshot(start_token_addr);
-        let cache_fresh = ctx.execution.flash_liquidity.has_fresh_entry(start_token_addr);
-        let cache_viable =
-            cache_fresh && cached.aave_listed && !cached.aave.is_zero();
-        if !cache_viable
-            && !aave_flash_reserve_viable(sim_provider, AAVE_V3_POOL, start_token_addr).await
-        {
-            skipped.record("prepare");
-            ctx.execution
-                .flash_liquidity
-                .mark_aave_inactive(start_token_addr);
-            if log_prepare_skip {
-                crate::info!(
-                    "prepare skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
-                );
-            } else {
-                crate::debug!(
-                    "dispatch skip: fp={fp} Aave reserve inactive for flash borrow token {start_token_addr}"
-                );
+        let cache_viable = ctx
+            .execution
+            .flash_liquidity
+            .aave_viable_for_dispatch(start_token_addr);
+        if !cache_viable {
+            let status = aave_flash_reserve_status_live(
+                sim_provider,
+                AAVE_V3_POOL,
+                start_token_addr,
+            )
+            .await;
+            if status != AaveReserveStatus::Viable {
+                skipped.record("prepare_aave");
+                record_aave_prepare_skip_inactive();
+                ctx.execution
+                    .flash_liquidity
+                    .mark_aave_inactive(start_token_addr);
+                if log_prepare_skip {
+                    crate::info!(
+                        "aave: prepare_skip fp={fp} token={start_token_addr} status={status:?}"
+                    );
+                } else {
+                    crate::debug!(
+                        "aave: dispatch_skip fp={fp} token={start_token_addr} status={status:?}"
+                    );
+                }
+                return None;
             }
-            return None;
         }
     }
 
@@ -591,91 +635,56 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &prepared.evaluated.result.hop_amounts,
             pool_metas_by_pool,
         ) else {
-            skipped.record("prepare");
+            skipped.record("prepare_balancer");
+            record_balancer_prepare_skip();
+            record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
             return None;
         };
-        if !balancer_batch_within_max_in_ratio(arena, &hops) {
-            skipped.record("prepare");
+        if !crate::services::execution::balancer_verify::balancer_batch_within_max_in_ratio(
+            arena, &hops,
+        ) {
+            skipped.record("prepare_balancer");
+            record_balancer_prepare_skip();
+            record_balancer_batch_reject(BalancerBatchReject::MaxInRatio);
             ctx.execution.quarantine_batch_query_failure(fp);
-            crate::debug!("prepare skip: fp={fp} queryBatchSwap would exceed MAX_IN_RATIO");
+            if log_prepare_skip {
+                crate::info!("balancer: prepare_skip fp={fp} reason=max_in_ratio");
+            } else {
+                crate::debug!("balancer: dispatch_skip fp={fp} reason=max_in_ratio");
+            }
             return None;
         }
-        // ponytail: dry-run must queryBatchSwap too — local Balancer sim overstates profit
-        // and executeArbDirect reverts with opaque ExternalCallFailed without this gate.
         let query_block = (state_block > 0).then_some(state_block);
-        match query_balancer_batch_profit(
+        let outcome = query_balancer_batch_profit(
             sim_provider,
             executor,
             &hops,
             start_token_addr,
             query_block,
         )
-        .await
-        {
-            BatchQueryOutcome::Profit(on_chain_profit)
-                if batch_profit_covers_min(
-                    on_chain_profit,
-                    prepared.evaluated.result.amount_in,
-                    slippage_bps,
-                    prepared.evaluated.cycle.hop_count,
-                ) => {}
-            BatchQueryOutcome::Profit(on_chain_profit) => {
-                skipped.record("prepare");
+        .await;
+        match evaluate_batch_query(
+            outcome,
+            prepared.evaluated.result.amount_in,
+            slippage_bps,
+            prepared.evaluated.cycle.hop_count,
+        ) {
+            BatchQueryVerdict::Accepted(_) => {}
+            BatchQueryVerdict::Rejected(reason) => {
+                skipped.record("prepare_balancer");
+                record_balancer_prepare_skip();
+                record_balancer_batch_reject(reason);
                 ctx.execution.quarantine_batch_query_failure(fp);
                 if log_prepare_skip {
                     crate::info!(
-                        "prepare skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                        "balancer: prepare_skip fp={fp} reason={reason:?} modeled={}",
                         prepared.evaluated.result.profit,
                     );
                 } else {
                     crate::debug!(
-                        "dispatch skip: fp={fp} queryBatchSwap profit {on_chain_profit} below min floor (modeled={})",
+                        "balancer: dispatch_skip fp={fp} reason={reason:?} modeled={}",
                         prepared.evaluated.result.profit,
                     );
-                }
-                return None;
-            }
-            BatchQueryOutcome::NonPositiveDelta(delta) => {
-                skipped.record("prepare");
-                ctx.execution.quarantine_batch_query_failure(fp);
-                if log_prepare_skip {
-                    crate::info!(
-                        "prepare skip: fp={fp} queryBatchSwap non-positive delta {delta} (modeled={})",
-                        prepared.evaluated.result.profit,
-                    );
-                } else {
-                    crate::debug!(
-                        "dispatch skip: fp={fp} queryBatchSwap non-positive delta {delta} (modeled={})",
-                        prepared.evaluated.result.profit,
-                    );
-                }
-                return None;
-            }
-            BatchQueryOutcome::RpcError(reason) => {
-                skipped.record("prepare");
-                ctx.execution.quarantine_batch_query_failure(fp);
-                if log_prepare_skip {
-                    crate::info!("prepare skip: fp={fp} queryBatchSwap RPC error: {reason}");
-                } else {
-                    crate::debug!("dispatch skip: fp={fp} queryBatchSwap RPC error: {reason}");
-                }
-                return None;
-            }
-            other => {
-                skipped.record("prepare");
-                ctx.execution.quarantine_batch_query_failure(fp);
-                let reason = match other {
-                    BatchQueryOutcome::Timeout => "timeout",
-                    BatchQueryOutcome::BuildFailed => "build failed",
-                    BatchQueryOutcome::DecodeFailed => "decode failed",
-                    BatchQueryOutcome::Profit(_)
-                    | BatchQueryOutcome::NonPositiveDelta(_)
-                    | BatchQueryOutcome::RpcError(_) => unreachable!(),
-                };
-                if log_prepare_skip {
-                    crate::info!("prepare skip: fp={fp} queryBatchSwap {reason}");
-                } else {
-                    crate::debug!("dispatch skip: fp={fp} queryBatchSwap {reason}");
                 }
                 return None;
             }
@@ -841,12 +850,16 @@ pub(crate) async fn refresh_and_resim_profitable(
     let flash = reassess.flash_liquidity.load();
     let flash_ttl = reassess.flash_liquidity.ttl();
     let mut resim_unprofitable = 0usize;
+    let mut resim_profit_drift = 0usize;
+    let mut resim_hop_fidelity = 0usize;
     let mut reassess_reject = 0usize;
     let filtered: Vec<HfEvalResult> = profitable
         .into_iter()
         .filter_map(|mut result| {
             let baseline = result.sim;
             let amount = result.opt.optimal_input;
+            let hop_caps =
+                local_sim::precompute_route_shallow_caps(arena, &result.cycle.edges);
             let refreshed = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
             if refreshed.profit.is_zero() {
                 resim_unprofitable += 1;
@@ -858,9 +871,9 @@ pub(crate) async fn refresh_and_resim_profitable(
                 &refreshed,
                 &mut resim_profile,
             ) {
-                reassess_reject += 1;
+                resim_profit_drift += 1;
                 crate::debug!(
-                    "resim fidelity drop: fp={} reason={reason} profit_drift_bps={}",
+                    "resim gate profit: fp={} reason={reason} profit_drift_bps={}",
                     result.route_fingerprint,
                     resim_profile.profit_drift_bps,
                 );
@@ -873,11 +886,13 @@ pub(crate) async fn refresh_and_resim_profitable(
                 &refreshed.hop_amounts,
                 Some(&mut hop_profile),
                 true,
+                hop_caps.as_ref(),
             ) {
-                reassess_reject += 1;
+                resim_hop_fidelity += 1;
                 crate::debug!(
-                    "resim hop fidelity drop: fp={} reject={reject:?}",
+                    "resim gate hop: fp={} reject={reject:?} cl_depth_sims={}",
                     result.route_fingerprint,
+                    hop_profile.cl_depth_sims,
                 );
                 return None;
             }
@@ -903,11 +918,12 @@ pub(crate) async fn refresh_and_resim_profitable(
     let total_ms = crate::util::now_ms().saturating_sub(batch_started);
     if in_count > 0 && out_count < in_count {
         crate::info!(
-            "resim batch: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={total_ms}"
+            "resim gate: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} \
+             unprofitable={resim_unprofitable} profit_drift={resim_profit_drift} hop_fidelity={resim_hop_fidelity} reassess={reassess_reject} total_ms={total_ms}"
         );
-    } else {
+    } else if in_count > 0 {
         crate::debug!(
-            "resim batch: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} unprofitable={resim_unprofitable} reassess_reject={reassess_reject} total_ms={total_ms}"
+            "resim gate: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} total_ms={total_ms}"
         );
     }
     (filtered, pools_refreshed, state_generation)
@@ -946,6 +962,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
         .into_iter()
         .partition(|result| route_is_balancer_only(&result.cycle));
 
+    let passthrough_n = u32::try_from(passthrough.len()).unwrap_or(u32::MAX);
     let mut already_verified = Vec::new();
     let mut need_onchain_verify = Vec::with_capacity(balancer_only.len());
     for result in balancer_only {
@@ -955,13 +972,15 @@ pub(crate) async fn filter_balancer_onchain_verified<
             need_onchain_verify.push(result);
         }
     }
+    let skip_verified_n = u32::try_from(already_verified.len()).unwrap_or(u32::MAX);
 
     let mut jobs = Vec::with_capacity(need_onchain_verify.len());
     for result in need_onchain_verify {
         let fp = result.route_fingerprint;
         let Some(start_token) = arena.token_address(result.cycle.start_token) else {
             execution.quarantine_batch_query_failure(fp);
-            crate::debug!("hf batch-filter: fp={fp} reject=missing_start_token");
+            record_balancer_batch_reject(BalancerBatchReject::MissingStartToken);
+            crate::debug!("balancer: batch_filter fp={fp} reject=missing_start_token");
             continue;
         };
         let Some(hops) = build_calldata_hops(
@@ -971,17 +990,21 @@ pub(crate) async fn filter_balancer_onchain_verified<
             &pool_metas_by_pool,
         ) else {
             execution.quarantine_batch_query_failure(fp);
+            record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
             crate::debug!(
-                "hf batch-filter: fp={fp} reject=calldata_build_failed modeled={} net_matic={}",
+                "balancer: batch_filter fp={fp} reject=calldata_build modeled={} net_matic={}",
                 result.sim.profit,
                 result.assessment.net_profit_after_gas_matic_wei,
             );
             continue;
         };
-        if !balancer_batch_within_max_in_ratio(arena, &hops) {
+        if !crate::services::execution::balancer_verify::balancer_batch_within_max_in_ratio(
+            arena, &hops,
+        ) {
             execution.quarantine_batch_query_failure(fp);
+            record_balancer_batch_reject(BalancerBatchReject::MaxInRatio);
             crate::debug!(
-                "hf batch-filter: fp={fp} reject=max_in_ratio modeled={} net_matic={}",
+                "balancer: batch_filter fp={fp} reject=max_in_ratio modeled={} net_matic={}",
                 result.sim.profit,
                 result.assessment.net_profit_after_gas_matic_wei,
             );
@@ -995,6 +1018,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
         });
     }
 
+    let jobs_n = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
     let route_gas = RouteGasLookup::for_fingerprints(
         reassess.gas_oracle.as_ref(),
         jobs.iter().map(|job| job.result.route_fingerprint),
@@ -1024,6 +1048,9 @@ pub(crate) async fn filter_balancer_onchain_verified<
         .collect::<Vec<_>>()
         .await;
 
+    record_balancer_filter_window(jobs_n, skip_verified_n, passthrough_n);
+    log_balancer_batch_filter_summary();
+
     let mut verified = passthrough;
     verified.extend(verified_balancer);
     verified.extend(already_verified);
@@ -1049,66 +1076,43 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     let query_block = (state_block > 0).then_some(state_block);
     let outcome =
         query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await;
-    let accept = match &outcome {
-        BatchQueryOutcome::Profit(on_chain_profit) => batch_profit_covers_min(
-            *on_chain_profit,
-            result.sim.amount_in,
-            slippage,
-            result.cycle.hop_count,
-        ),
-        _ => false,
-    };
-    if accept {
-        let mut accepted = result;
-        if let BatchQueryOutcome::Profit(on_chain_profit) = outcome {
+    match evaluate_batch_query(
+        outcome,
+        result.sim.amount_in,
+        slippage,
+        result.cycle.hop_count,
+    ) {
+        BatchQueryVerdict::Accepted(on_chain_profit) => {
+            let mut accepted = result;
             accepted.sim.profit = on_chain_profit;
             accepted.sim.amount_out = accepted.sim.amount_in.saturating_add(on_chain_profit);
             accepted.sim.profitable = true;
             let assessment = reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
             if !assessment.should_execute {
                 execution.quarantine_batch_query_failure(fp);
+                record_balancer_batch_reject(BalancerBatchReject::ReassessAfterOnChain);
                 crate::debug!(
-                    "hf batch-filter: fp={fp} reject=reassess_after_on_chain on_chain={on_chain_profit} net_matic={}",
+                    "balancer: batch_filter fp={fp} reject=reassess_after_on_chain on_chain={on_chain_profit} net_matic={}",
                     assessment.net_profit_after_gas_matic_wei,
                 );
                 return None;
             }
             accepted.assessment = assessment;
             accepted.balancer_batch_verified = true;
+            record_balancer_filter_accept();
+            return Some(accepted);
         }
-        return Some(accepted);
-    }
-    execution.quarantine_batch_query_failure(fp);
-    let modeled = result.sim.profit;
-    let net_matic = result.assessment.net_profit_after_gas_matic_wei;
-    match outcome {
-        BatchQueryOutcome::Profit(on_chain) => {
+        BatchQueryVerdict::Rejected(reason) => {
+            execution.quarantine_batch_query_failure(fp);
+            record_balancer_batch_reject(reason);
+            let modeled = result.sim.profit;
+            let net_matic = result.assessment.net_profit_after_gas_matic_wei;
             crate::debug!(
-                "hf batch-filter: fp={fp} reject=on_chain_profit_below_min on_chain={on_chain} modeled={modeled} net_matic={net_matic} slippage_bps={slippage}"
+                "balancer: batch_filter fp={fp} reject={reason:?} modeled={modeled} net_matic={net_matic} slippage_bps={slippage}",
             );
-        }
-        BatchQueryOutcome::NonPositiveDelta(delta) => {
-            crate::debug!(
-                "hf batch-filter: fp={fp} reject=non_positive_delta delta={delta} modeled={modeled} net_matic={net_matic}"
-            );
-        }
-        BatchQueryOutcome::RpcError(reason) => {
-            crate::debug!(
-                "hf batch-filter: fp={fp} reject=rpc_error reason={reason} modeled={modeled} net_matic={net_matic}"
-            );
-        }
-        BatchQueryOutcome::Timeout => {
-            crate::debug!(
-                "hf batch-filter: fp={fp} reject=timeout modeled={modeled} net_matic={net_matic}"
-            );
-        }
-        BatchQueryOutcome::BuildFailed | BatchQueryOutcome::DecodeFailed => {
-            crate::debug!(
-                "hf batch-filter: fp={fp} reject=batch_query_build_decode modeled={modeled} net_matic={net_matic}"
-            );
+            None
         }
     }
-    None
 }
 
 /// On-chain `queryBatchSwap` probe for balancer near-misses (sim vs vault delta).

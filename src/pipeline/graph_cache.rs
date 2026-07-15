@@ -164,13 +164,21 @@ impl GraphCache {
         routable_count: usize,
         eligible_count: usize,
     ) -> Option<Arc<crate::pipeline::types::RoutingGraph>> {
+        let mut rescore_report = crate::pipeline::graph::GraphRescoreReport::default();
         if let Some(g) = &mut self.graph {
             let gm = Arc::make_mut(g);
-            crate::pipeline::graph::rescore_dirty_pools_or_full(
+            rescore_report = crate::pipeline::graph::rescore_dirty_pools_or_full(
                 arena,
                 gm,
                 dirty_pools,
                 arena_pool_count,
+            );
+        }
+        if let Some(mode) = rescore_report.mode {
+            crate::info!(
+                "graph rescore: mode={mode:?} dirty_pools={} edges_touched={}",
+                rescore_report.dirty_pools,
+                rescore_report.edges_touched,
             );
         }
         let g = Arc::clone(self.graph.as_ref()?);

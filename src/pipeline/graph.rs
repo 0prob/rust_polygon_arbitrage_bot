@@ -568,8 +568,96 @@ fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &Poo
     graph.pool_has_live_edges(meta.pool_index)
 }
 
+fn refresh_graph_cycle_coverage(graph: &mut RoutingGraph) {
+    graph.coverage = Some(std::sync::Arc::new(
+        crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
+    ));
+}
+
 fn finalize_graph_topology(arena: &StateArena, graph: &mut RoutingGraph) {
     rescore_graph_in_place(arena, graph);
+    refresh_graph_cycle_coverage(graph);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphRescoreMode {
+    Full,
+    Partial,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphRescoreReport {
+    pub mode: Option<GraphRescoreMode>,
+    pub edges_touched: usize,
+    pub dirty_pools: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphTopologyStats {
+    pub token_slots: usize,
+    pub virtual_hubs: usize,
+    pub live_direct_edges: usize,
+    pub dead_direct_edges: usize,
+    pub hub_leg_edges: usize,
+    pub active_pools: usize,
+    pub cycle_capable_pools: usize,
+}
+
+impl GraphTopologyStats {
+    pub fn log_summary(&self, action: &str) {
+        crate::info!(
+            "graph {action}: tokens={} virtual_hubs={} live_direct={} dead_direct={} hub_legs={} active_pools={} cycle_capable={}",
+            self.token_slots,
+            self.virtual_hubs,
+            self.live_direct_edges,
+            self.dead_direct_edges,
+            self.hub_leg_edges,
+            self.active_pools,
+            self.cycle_capable_pools,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphAttachReport {
+    pub attached_pools: usize,
+}
+
+/// Single-pass adjacency scan for LF/HF diagnostics.
+#[must_use]
+pub fn topology_stats(graph: &RoutingGraph) -> GraphTopologyStats {
+    use crate::pipeline::cycle_finder::is_live_graph_edge;
+
+    let mut stats = GraphTopologyStats {
+        token_slots: graph.token_count as usize,
+        virtual_hubs: graph.virtual_hubs.len(),
+        ..GraphTopologyStats::default()
+    };
+    for (adj_idx, adj) in graph.adjacency.iter().enumerate() {
+        for ge in adj {
+            match ge.phase {
+                GraphHopPhase::Direct => {
+                    if is_live_graph_edge(ge) {
+                        stats.live_direct_edges += 1;
+                    } else {
+                        stats.dead_direct_edges += 1;
+                    }
+                }
+                GraphHopPhase::EnterPool | GraphHopPhase::ExitPool => {
+                    if adj_idx < stats.token_slots && is_live_graph_edge(ge) {
+                        stats.hub_leg_edges += 1;
+                    }
+                }
+            }
+        }
+    }
+    stats.active_pools = graph.active_pool_count();
+    stats.cycle_capable_pools = graph
+        .coverage
+        .as_ref()
+        .map(|c| c.pool_indices.len())
+        .unwrap_or(0);
+    stats
 }
 
 /// Eligible arena pools that have no live edges in the cached graph yet.
@@ -607,20 +695,24 @@ pub fn attach_missing_eligible_pools(
     arena: &StateArena,
     graph: &mut RoutingGraph,
     pools: &[PoolMeta],
-) -> usize {
-    let mut attached = 0usize;
+) -> GraphAttachReport {
+    let mut attached_pools: Vec<PoolIndex> = Vec::new();
     for meta in pools {
         if graph.pool_has_live_edges(meta.pool_index) {
             continue;
         }
         if attach_pool_to_graph(graph, arena, meta) {
-            attached += 1;
+            attached_pools.push(meta.pool_index);
         }
     }
-    if attached > 0 {
-        finalize_graph_topology(arena, graph);
+    if !attached_pools.is_empty() {
+        // Patch path: rescore only new edges — full-graph rescore was ~O(all edges) per attach.
+        let _ = rescore_pools_in_place(arena, graph, &attached_pools);
+        refresh_graph_cycle_coverage(graph);
     }
-    attached
+    GraphAttachReport {
+        attached_pools: attached_pools.len(),
+    }
 }
 
 pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
@@ -646,11 +738,28 @@ pub fn rescore_dirty_pools_or_full(
     graph: &mut RoutingGraph,
     dirty_pools: &[PoolIndex],
     arena_pool_count: usize,
-) {
-    if dirty_pools.is_empty() || dirty_pools.len() > arena_pool_count / 2 {
+) -> GraphRescoreReport {
+    if dirty_pools.is_empty() {
+        return GraphRescoreReport::default();
+    }
+    if dirty_pools.len() > arena_pool_count / 2 {
         rescore_graph_in_place(arena, graph);
+        GraphRescoreReport {
+            mode: Some(GraphRescoreMode::Full),
+            edges_touched: graph
+                .adjacency
+                .iter()
+                .map(|adj| adj.len())
+                .sum(),
+            dirty_pools: dirty_pools.len(),
+        }
     } else {
-        rescore_pools_in_place(arena, graph, dirty_pools);
+        let edges_touched = rescore_pools_in_place(arena, graph, dirty_pools);
+        GraphRescoreReport {
+            mode: Some(GraphRescoreMode::Partial),
+            edges_touched,
+            dirty_pools: dirty_pools.len(),
+        }
     }
 }
 
@@ -1496,7 +1605,8 @@ mod tests {
         assert!(graph.pool_has_live_edges(pool0));
         assert!(!graph.pool_has_live_edges(pool1));
 
-        let attached = attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]);
+        let attached =
+            attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]).attached_pools;
         assert_eq!(attached, 1);
         assert!(graph.pool_has_live_edges(pool1));
     }

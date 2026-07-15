@@ -8,7 +8,7 @@ use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::cycle_key;
+use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
@@ -252,6 +252,13 @@ pub struct ActiveGraph {
     max_outgoing_ratio: Vec<U256>,
     /// Graph-wide best live edge ratio.
     global_max_live_edge_ratio: U256,
+}
+
+impl ActiveGraph {
+    #[must_use]
+    pub fn start_token_count(&self) -> usize {
+        self.start_tokens.len()
+    }
 }
 
 struct NodePrep {
@@ -1072,6 +1079,10 @@ pub fn find_cycles_multi_pass_with_prep(
     // sequentially (~2s wall time for the default two-pass schedule).
     let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
     let mut all = Vec::new();
+    let pass_cap = passes.iter().map(|p| p.max_cycles).max().unwrap_or(0);
+    let collect_bound = pass_cap
+        .saturating_mul(3)
+        .min(MAX_CYCLES_PER_PASS.saturating_mul(passes.len().max(1)));
     for pass in passes {
         if budget.tick() {
             break;
@@ -1086,8 +1097,15 @@ pub fn find_cycles_multi_pass_with_prep(
             &budget,
         );
         all.append(&mut shard);
+        if all.len() > collect_bound {
+            all = dedupe_cycles_by_edges(all);
+            if all.len() > collect_bound {
+                all.sort_unstable_by(compare_cycle_score);
+                all.truncate(collect_bound);
+            }
+        }
     }
-    // Dedup happens once in `finalize_cycles` after hybrid DFS+BF merge.
+    // Final dedupe happens in `finalize_cycles` after hybrid DFS+BF merge.
     all
 }
 

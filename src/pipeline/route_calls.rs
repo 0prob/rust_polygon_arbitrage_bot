@@ -37,6 +37,31 @@ pub fn estimate_hop_calls(protocol: ProtocolType) -> usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteExecutorBudget {
+    pub hops: usize,
+    pub packed_calls: usize,
+    pub per_hop_calls: usize,
+    pub balancer_batch: bool,
+}
+
+#[must_use]
+pub fn route_executor_budget(edges: &[Edge]) -> RouteExecutorBudget {
+    RouteExecutorBudget {
+        hops: edges.len(),
+        packed_calls: estimate_packed_route_calls(edges),
+        per_hop_calls: estimate_route_calls(edges),
+        balancer_batch: balancer_direct_batch_eligible(edges),
+    }
+}
+
+/// Huff `ArbExecutor` rejects routes at or above 12 packed calls.
+#[inline]
+#[must_use]
+pub fn route_fits_executor(edges: &[Edge]) -> bool {
+    estimate_packed_route_calls(edges) <= MAX_ROUTE_CALLS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +98,17 @@ mod tests {
         let mut edges = vec![edge(ProtocolType::BalancerV2); 3];
         edges.push(edge(ProtocolType::UniswapV3));
         assert_eq!(estimate_packed_route_calls(&edges), 7);
+    }
+
+    #[test]
+    fn route_fits_executor_respects_packed_budget() {
+        let v4_heavy: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::UniswapV4), 7).collect();
+        assert!(!route_fits_executor(&v4_heavy));
+        let budget = route_executor_budget(&v4_heavy);
+        assert_eq!(budget.packed_calls, 14);
+        let batch: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::BalancerV2), 4).collect();
+        assert!(route_fits_executor(&batch));
+        assert!(route_executor_budget(&batch).balancer_batch);
     }
 
     #[test]

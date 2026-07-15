@@ -8,7 +8,7 @@ use alloy::primitives::Address;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
-use anyhow::Context;
+
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -28,6 +28,9 @@ use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
 use crate::pipeline::sim_sanity::{SimSanityInput, max_flash_borrow_wei};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
+use crate::services::execution::aave::{
+    AaveRefreshStats, AaveReserveStatus, reserve_status_from_config,
+};
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::profit::{
@@ -41,19 +44,7 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
 const MAX_HOT_FLASH_TOKENS: usize = 384;
 
-pub async fn fetch_and_cache_aave_flash_loan_fee_bps<P: Provider<Ethereum>>(
-    provider: &P,
-) -> anyhow::Result<u64> {
-    let pool = IAaveV3Pool::new(crate::core::constants::AAVE_V3_POOL, provider);
-    let fee = pool.FLASHLOAN_PREMIUM_TOTAL().call().await?;
-    let bps = u64::try_from(fee)
-        .with_context(|| format!("Aave flash loan fee {fee} does not fit u64"))?;
-    if bps == 0 {
-        anyhow::bail!("Aave FLASHLOAN_PREMIUM_TOTAL returned zero — on-chain data unreliable");
-    }
-    crate::services::execution::profit::set_aave_flash_loan_fee_bps(bps);
-    Ok(bps)
-}
+pub use crate::services::execution::aave::fetch_and_cache_aave_flash_loan_fee_bps;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashPlanAction {
@@ -79,6 +70,89 @@ pub struct TokenFlashLiquidity {
     pub aave_listed: bool,
     /// DODO V2 pool liquidity — max of all DODO pools for this token.
     pub dodo: U256,
+}
+
+/// Why a flash plan or dispatch alignment failed (HF funnel diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashRejectReason {
+    ZeroAmount,
+    ColdCache,
+    ZeroLiquidity,
+    AaveUnlisted,
+    MixedBalancerNoAave,
+    AlignDispatch,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlashLoanDiagnostics {
+    pub mixed_no_aave: u32,
+    pub reject_cold_cache: u32,
+    pub reject_zero_liquidity: u32,
+    pub reject_aave_unlisted: u32,
+    pub reject_zero_amount: u32,
+    pub reject_align: u32,
+    pub refresh_tokens: u32,
+    pub cache_generation: u64,
+}
+
+impl FlashLoanDiagnostics {
+    pub fn record_reject(&mut self, reason: FlashRejectReason) {
+        match reason {
+            FlashRejectReason::ZeroAmount => self.reject_zero_amount += 1,
+            FlashRejectReason::ColdCache => self.reject_cold_cache += 1,
+            FlashRejectReason::ZeroLiquidity => self.reject_zero_liquidity += 1,
+            FlashRejectReason::AaveUnlisted => self.reject_aave_unlisted += 1,
+            FlashRejectReason::MixedBalancerNoAave => self.mixed_no_aave += 1,
+            FlashRejectReason::AlignDispatch => self.reject_align += 1,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.mixed_no_aave += other.mixed_no_aave;
+        self.reject_cold_cache += other.reject_cold_cache;
+        self.reject_zero_liquidity += other.reject_zero_liquidity;
+        self.reject_aave_unlisted += other.reject_aave_unlisted;
+        self.reject_zero_amount += other.reject_zero_amount;
+        self.reject_align += other.reject_align;
+        self.refresh_tokens += other.refresh_tokens;
+        if other.cache_generation > self.cache_generation {
+            self.cache_generation = other.cache_generation;
+        }
+    }
+
+    pub fn log_summary(&self, label: &str) {
+        let rejects = self.reject_cold_cache
+            + self.reject_zero_liquidity
+            + self.reject_aave_unlisted
+            + self.reject_zero_amount
+            + self.reject_align
+            + self.mixed_no_aave;
+        if rejects == 0 && self.refresh_tokens == 0 {
+            return;
+        }
+        crate::info!(
+            "flash loan: {label} mixed_no_aave={} cold={} zero_liq={} aave_unlisted={} zero_amt={} align={} refresh_tokens={} gen={}",
+            self.mixed_no_aave,
+            self.reject_cold_cache,
+            self.reject_zero_liquidity,
+            self.reject_aave_unlisted,
+            self.reject_zero_amount,
+            self.reject_align,
+            self.refresh_tokens,
+            self.cache_generation,
+        );
+    }
+}
+
+/// Per-cycle flash borrow context — build once, resolve at multiple probe sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct CycleFlashContext {
+    pub liquidity: TokenFlashLiquidity,
+    pub forbid_balancer_flash: bool,
+    pub balancer_only: bool,
+    pub has_dodo: bool,
+    pub start_addr: Address,
+    pub start_fresh: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +303,16 @@ impl FlashLiquidityCache {
         snap.has_fresh(token, self.ttl)
     }
 
+    /// Fresh snapshot with listed Aave reserve and non-zero aToken liquidity — skips dispatch RPC.
+    #[must_use]
+    pub fn aave_viable_for_dispatch(&self, token: Address) -> bool {
+        if !self.has_fresh_entry(token) {
+            return false;
+        }
+        let snap = self.snapshot(token);
+        snap.aave_listed && !snap.aave.is_zero()
+    }
+
     /// Drop cached liquidity so the next refresh re-fetches (e.g. after ReserveInactive).
     pub fn invalidate(&self, token: Address) {
         self.invalidate_batch(std::slice::from_ref(&token));
@@ -250,7 +334,9 @@ impl FlashLiquidityCache {
 
     /// Pin Aave as inactive after on-chain `ReserveInactive` so HF eval stops routing through it.
     pub fn mark_aave_inactive(&self, token: Address) {
+        crate::services::execution::aave::record_aave_mark_inactive();
         self.aave_inactive_pins.lock().insert(token);
+        crate::info!("aave: mark_inactive token={token}");
         self.inner.rcu(|current| {
             let mut entries = current.entries.clone();
             let prior = entries.get(&token).map(|e| e.snapshot).unwrap_or_default();
@@ -290,6 +376,14 @@ impl FlashLiquidityCache {
                         }
                     }
                     _ = ticker.tick() => {
+                        if let Err(e) =
+                            crate::services::execution::aave::refresh_aave_flash_fee_with_fallback(
+                                &rpc,
+                            )
+                            .await
+                        {
+                            crate::debug!("background aave fee refresh failed: {e:#}");
+                        }
                         let tokens = self.hot_token_list();
                         if tokens.is_empty() {
                             continue;
@@ -436,19 +530,32 @@ impl FlashLiquidityCache {
         }
 
         let results = execute_multicall(provider, &items).await?;
+        let pinned_tokens: FxHashSet<Address> =
+            self.aave_inactive_pins.lock().iter().copied().collect();
+        let mut aave_stats = AaveRefreshStats::default();
         let reserves: Vec<Option<Address>> = (0..to_fetch.len())
             .map(|i| {
-                results
+                let token = to_fetch[i];
+                let pinned = pinned_tokens.contains(&token);
+                let decoded = results
                     .get(i * 2 + 1)
                     .and_then(|bytes| bytes.as_ref())
                     .and_then(|bytes| {
                         IAaveV3Pool::getReserveDataCall::abi_decode_returns(bytes).ok()
-                    })
-                    .filter(|reserve| {
-                        !reserve.aTokenAddress.is_zero()
-                            && aave_reserve_flash_eligible(reserve.configuration)
-                    })
-                    .map(|reserve| reserve.aTokenAddress)
+                    });
+                let has_a_token = decoded
+                    .as_ref()
+                    .is_some_and(|r| !r.aTokenAddress.is_zero());
+                let status = decoded
+                    .as_ref()
+                    .map(|r| reserve_status_from_config(r.configuration, has_a_token))
+                    .unwrap_or(AaveReserveStatus::NoAToken);
+                aave_stats.record(status, pinned);
+                if pinned || status != AaveReserveStatus::Viable {
+                    None
+                } else {
+                    decoded.map(|r| r.aTokenAddress)
+                }
             })
             .collect();
         let aave_items: Vec<MulticallItem> = to_fetch
@@ -497,7 +604,13 @@ impl FlashLiquidityCache {
                 },
             );
         }
+        let n = to_fetch.len();
+        let generation = self.generation();
         self.publish_updates(updates);
+        crate::info!(
+            "flash liquidity refresh: tokens={n} generation={generation}",
+        );
+        aave_stats.log_refresh_summary(n, self.generation());
         Ok(())
     }
 }
@@ -514,11 +627,9 @@ pub async fn aave_flash_reserve_viable<P: Provider<Ethereum>>(
     aave_pool: Address,
     token: Address,
 ) -> bool {
-    let pool = IAaveV3Pool::new(aave_pool, provider);
-    let Ok(reserve) = pool.getReserveData(token).call().await else {
-        return false;
-    };
-    !reserve.aTokenAddress.is_zero() && aave_reserve_flash_eligible(reserve.configuration)
+    crate::services::execution::aave::aave_flash_reserve_status_live(provider, aave_pool, token)
+        .await
+        == AaveReserveStatus::Viable
 }
 
 fn decode_balance(bytes: Option<&Option<alloy::primitives::Bytes>>) -> U256 {
@@ -526,27 +637,6 @@ fn decode_balance(bytes: Option<&Option<alloy::primitives::Bytes>>) -> U256 {
         .and_then(|b| b.as_ref())
         .and_then(|b| IERC20Metadata::balanceOfCall::abi_decode_returns(b).ok())
         .map_or(U256::ZERO, U256::from)
-}
-
-/// Aave V3 `ReserveConfigurationMap` bit positions (see Pool.sol / ReserveConfiguration.sol).
-const AAVE_CFG_ACTIVE_BIT: u32 = 56;
-const AAVE_CFG_FROZEN_BIT: u32 = 57;
-const AAVE_CFG_PAUSED_BIT: u32 = 60;
-const AAVE_CFG_FLASH_BIT: u32 = 63;
-
-#[inline]
-fn aave_cfg_bit_set(configuration: U256, bit: u32) -> bool {
-    (configuration >> bit) & U256::from(1) != U256::ZERO
-}
-
-/// Active, unfrozen, unpaused, flash-loan-enabled — else Aave reverts `ReserveInactive()` / `FLASHLOAN_DISABLED`.
-#[inline]
-#[must_use]
-pub fn aave_reserve_flash_eligible(configuration: U256) -> bool {
-    aave_cfg_bit_set(configuration, AAVE_CFG_ACTIVE_BIT)
-        && !aave_cfg_bit_set(configuration, AAVE_CFG_FROZEN_BIT)
-        && !aave_cfg_bit_set(configuration, AAVE_CFG_PAUSED_BIT)
-        && aave_cfg_bit_set(configuration, AAVE_CFG_FLASH_BIT)
 }
 
 /// True when the route swaps through the Balancer vault (not just pool flash liquidity).
@@ -875,23 +965,124 @@ fn plan_single(
     }
 }
 
-fn flash_liquidity_for_cycle(
+#[must_use]
+pub fn build_cycle_flash_context(
     cycle: &FoundCycle,
     arena: &StateArena,
     flash: &FlashLiquiditySnapshot,
     ttl: Duration,
-) -> Option<TokenFlashLiquidity> {
+) -> Option<CycleFlashContext> {
     let start_addr = arena.token_address(cycle.start_token)?;
     let snapshot = flash.token_liquidity(start_addr, ttl);
     let route_cap = route_balancer_flash_capacity(arena, cycle);
     let has_dodo = cycle_has_dodo_pool(arena, cycle);
-    Some(TokenFlashLiquidity {
-        balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
-        aave: snapshot.aave,
-        aave_listed: snapshot.aave_listed,
-        // Only offer DODO when the route actually swaps through a DODO pool.
-        dodo: if has_dodo { U256::MAX } else { U256::ZERO },
+    Some(CycleFlashContext {
+        liquidity: TokenFlashLiquidity {
+            balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
+            aave: snapshot.aave,
+            aave_listed: snapshot.aave_listed,
+            dodo: if has_dodo { U256::MAX } else { U256::ZERO },
+        },
+        forbid_balancer_flash: route_uses_balancer_vault_swap(cycle),
+        balancer_only: route_is_balancer_only(cycle),
+        has_dodo,
+        start_addr,
+        start_fresh: flash.has_fresh(start_addr, ttl),
     })
+}
+
+#[must_use]
+pub fn flash_reject_reason(
+    ctx: &CycleFlashContext,
+    policy: FlashLoanPolicy,
+    amount_in: U256,
+) -> Option<FlashRejectReason> {
+    if amount_in.is_zero() {
+        return Some(FlashRejectReason::ZeroAmount);
+    }
+    if ctx.balancer_only && ctx.forbid_balancer_flash {
+        return None;
+    }
+    let plan = plan_flash_loan(
+        policy,
+        amount_in,
+        ctx.liquidity,
+        ctx.forbid_balancer_flash,
+        ctx.balancer_only,
+    );
+    match plan.action {
+        FlashPlanAction::Reject => {
+            if !ctx.start_fresh {
+                return Some(FlashRejectReason::ColdCache);
+            }
+            if ctx.forbid_balancer_flash
+                && !ctx.balancer_only
+                && (!ctx.liquidity.aave_listed || ctx.liquidity.aave.is_zero())
+            {
+                return Some(FlashRejectReason::MixedBalancerNoAave);
+            }
+            if matches!(policy, FlashLoanPolicy::AaveOnly) && !ctx.liquidity.aave_listed {
+                return Some(FlashRejectReason::AaveUnlisted);
+            }
+            Some(FlashRejectReason::ZeroLiquidity)
+        }
+        _ => align_flash_source_for_dispatch(
+            plan.source,
+            &ctx.liquidity,
+            ctx.balancer_only,
+            ctx.has_dodo,
+        )
+        .is_none()
+        .then_some(FlashRejectReason::AlignDispatch),
+    }
+}
+
+/// Flash loan source at a concrete borrow size using a pre-built [`CycleFlashContext`].
+#[must_use]
+pub fn resolve_flash_source_with_context(
+    ctx: &CycleFlashContext,
+    policy: FlashLoanPolicy,
+    amount_in: U256,
+) -> Option<FlashLoanSource> {
+    if amount_in.is_zero() {
+        return None;
+    }
+    let plan = plan_flash_loan(
+        policy,
+        amount_in,
+        ctx.liquidity,
+        ctx.forbid_balancer_flash,
+        ctx.balancer_only,
+    );
+    match plan.action {
+        FlashPlanAction::Reject => {
+            if ctx.balancer_only && ctx.forbid_balancer_flash {
+                Some(FlashLoanSource::Direct)
+            } else if !ctx.start_fresh {
+                None
+            } else {
+                if ctx.start_fresh {
+                    crate::debug!(
+                        "flash source reject: token={} policy={policy:?} forbid_balancer={} balancer_only={} balancer={} aave={} aave_listed={} dodo={}",
+                        ctx.start_addr,
+                        ctx.forbid_balancer_flash,
+                        ctx.balancer_only,
+                        ctx.liquidity.balancer,
+                        ctx.liquidity.aave,
+                        ctx.liquidity.aave_listed,
+                        ctx.liquidity.dodo,
+                    );
+                }
+                None
+            }
+        }
+        _ => align_flash_source_for_dispatch(
+            plan.source,
+            &ctx.liquidity,
+            ctx.balancer_only,
+            ctx.has_dodo,
+        ),
+    }
 }
 
 /// Flash loan source for eval/ranking at a concrete borrow size (probe or optimal `amount_in`).
@@ -904,36 +1095,8 @@ pub fn resolve_flash_source_for_cycle(
     policy: FlashLoanPolicy,
     amount_in: U256,
 ) -> Option<FlashLoanSource> {
-    if amount_in.is_zero() {
-        return None;
-    }
-    let start_addr = arena.token_address(cycle.start_token)?;
-    let liquidity = flash_liquidity_for_cycle(cycle, arena, flash, ttl)?;
-    let forbid = route_uses_balancer_vault_swap(cycle);
-    let balancer_only = route_is_balancer_only(cycle);
-    let plan = plan_flash_loan(policy, amount_in, liquidity, forbid, balancer_only);
-    let has_dodo = cycle_has_dodo_pool(arena, cycle);
-    match plan.action {
-        FlashPlanAction::Reject => {
-            // ponytail: no optimistic Aave/Balancer fallback when cache is cold — caused
-            // AaveReserveInactive dry-runs after failed flash refresh (RPC rate limits).
-            if balancer_only && forbid {
-                Some(FlashLoanSource::Direct)
-            } else {
-                if flash.has_fresh(start_addr, ttl) {
-                    crate::debug!(
-                        "flash source reject: token={start_addr} policy={policy:?} forbid_balancer={forbid} balancer_only={balancer_only} balancer={} aave={} aave_listed={} dodo={}",
-                        liquidity.balancer,
-                        liquidity.aave,
-                        liquidity.aave_listed,
-                        liquidity.dodo,
-                    );
-                }
-                None
-            }
-        }
-        _ => align_flash_source_for_dispatch(plan.source, &liquidity, balancer_only, has_dodo),
-    }
+    let ctx = build_cycle_flash_context(cycle, arena, flash, ttl)?;
+    resolve_flash_source_with_context(&ctx, policy, amount_in)
 }
 
 /// Max start-token cash in Balancer pools along the route (vault ERC20 balanceOf is a poor
@@ -1033,13 +1196,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
     };
     let forbid_balancer_flash = route_uses_balancer_vault_swap(&input.evaluated.cycle);
     let balancer_only = route_is_balancer_only(&input.evaluated.cycle);
-    let plan = plan_flash_loan(
-        input.policy,
-        amount_in,
-        liquidity,
-        forbid_balancer_flash,
-        balancer_only,
-    );
+    let plan = plan_flash_loan(input.policy, amount_in, liquidity, forbid_balancer_flash, balancer_only);
 
     let token_decimals = resolve_token_decimals_for_index(
         input.evaluated.cycle.start_token,
@@ -1464,20 +1621,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn aave_reserve_flash_eligible_requires_active_and_flash_enabled() {
-        let active_flash =
-            U256::from(1u128 << AAVE_CFG_ACTIVE_BIT) | U256::from(1u128 << AAVE_CFG_FLASH_BIT);
-        assert!(aave_reserve_flash_eligible(active_flash));
-        assert!(!aave_reserve_flash_eligible(U256::ZERO));
-        assert!(!aave_reserve_flash_eligible(U256::from(
-            1u128 << AAVE_CFG_FLASH_BIT
-        )));
-        let frozen = active_flash | U256::from(1u128 << AAVE_CFG_FROZEN_BIT);
-        assert!(!aave_reserve_flash_eligible(frozen));
-        let paused = active_flash | U256::from(1u128 << AAVE_CFG_PAUSED_BIT);
-        assert!(!aave_reserve_flash_eligible(paused));
-    }
+
 
     #[test]
     fn flash_source_at_economic_probe_differs_from_unit_probe() {
@@ -1607,6 +1751,46 @@ mod tests {
         );
         assert_eq!(plan.source, FlashLoanSource::Dodo);
         assert_eq!(plan.action, FlashPlanAction::Direct);
+    }
+
+    #[test]
+    fn cycle_flash_context_reuses_liquidity_across_probe_sizes() {
+        let liquidity = TokenFlashLiquidity {
+            balancer: U256::from(500u64),
+            aave: U256::from(10_000u64),
+            aave_listed: true,
+            dodo: U256::ZERO,
+        };
+        let ctx = CycleFlashContext {
+            liquidity,
+            forbid_balancer_flash: false,
+            balancer_only: false,
+            has_dodo: false,
+            start_addr: Address::repeat_byte(0x01),
+            start_fresh: true,
+        };
+        let economic =
+            resolve_flash_source_with_context(&ctx, FlashLoanPolicy::Auto, U256::from(1_000u64));
+        let again =
+            resolve_flash_source_with_context(&ctx, FlashLoanPolicy::Auto, U256::from(1_000u64));
+        assert_eq!(economic, Some(FlashLoanSource::AaveV3));
+        assert_eq!(economic, again);
+    }
+
+    #[test]
+    fn flash_reject_reason_cold_cache_when_stale() {
+        let ctx = CycleFlashContext {
+            liquidity: TokenFlashLiquidity::default(),
+            forbid_balancer_flash: false,
+            balancer_only: false,
+            has_dodo: false,
+            start_addr: Address::repeat_byte(0x02),
+            start_fresh: false,
+        };
+        assert_eq!(
+            flash_reject_reason(&ctx, FlashLoanPolicy::Auto, U256::from(1_000u64)),
+            Some(FlashRejectReason::ColdCache)
+        );
     }
 
     #[test]

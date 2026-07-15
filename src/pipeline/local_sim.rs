@@ -3,7 +3,7 @@ use crate::core::constants::{
     GAS_V3_BASE, GAS_V4_BASE, GAS_WOOFI_HOP, HOP_CAP_USIZE,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
-use crate::core::math::curve::get_curve_stable_amount_out;
+use crate::pipeline::curve_sim::curve_hop_amount_out;
 use crate::core::math::dodo::get_dodo_amount_out;
 use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
@@ -165,25 +165,14 @@ fn simulate_hop(
                 gas: r.gas_estimate,
             })
         }
-        (PoolState::Curve(s), ProtocolType::CurveStable) => {
-            let out = get_curve_stable_amount_out(
+        (PoolState::Curve(s), ProtocolType::CurveStable | ProtocolType::CurveCrypto) => {
+            let out = curve_hop_amount_out(
                 s,
+                edge.protocol,
                 amount_in,
                 edge.token_in_idx as usize,
                 edge.token_out_idx as usize,
-            );
-            Some(HopResult {
-                amount_out: out,
-                gas: GAS_CURVE_HOP,
-            })
-        }
-        (PoolState::Curve(s), ProtocolType::CurveCrypto) => {
-            let out = crate::core::math::curve_crypto::get_curve_crypto_amount_out(
-                s,
-                amount_in,
-                edge.token_in_idx as usize,
-                edge.token_out_idx as usize,
-            );
+            )?;
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_CURVE_HOP,
@@ -380,7 +369,7 @@ pub fn route_hop_fidelity_ok_after_walk(
     edges: &[Edge],
     hop_amounts: &[U256],
 ) -> bool {
-    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, true).is_none()
+    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, true, None).is_none()
 }
 
 /// First hop that fails tick-depth, tradability, or reserve-depth checks, if any.
@@ -390,7 +379,7 @@ pub fn route_hop_fidelity_reject(
     edges: &[Edge],
     hop_amounts: &[U256],
 ) -> Option<HopFidelityReject> {
-    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, false)
+    route_hop_fidelity_reject_profiled(arena, edges, hop_amounts, None, false, None)
 }
 
 #[must_use]
@@ -400,8 +389,11 @@ pub fn route_hop_fidelity_reject_profiled(
     hop_amounts: &[U256],
     mut profile: Option<&mut HopFidelityProfile>,
     cl_depth_already_verified: bool,
+    precomputed_hop_probes: Option<&[U256; HOP_CAP_USIZE]>,
 ) -> Option<HopFidelityReject> {
-    let hop_probes = if route_has_cl_hop(edges) {
+    let hop_probes = if let Some(caps) = precomputed_hop_probes {
+        *caps
+    } else if route_has_cl_hop(edges) {
         route_shallow_caps(arena, edges)
     } else {
         [U256::MAX; HOP_CAP_USIZE]
@@ -527,18 +519,30 @@ pub fn route_resim_fidelity_reject_profiled(
 }
 
 #[must_use]
+/// Precomputed CL shallow caps for Brent — avoids rebuilding per `simulate_route_minimal` call.
+#[must_use]
+pub fn precompute_route_shallow_caps(
+    arena: &StateArena,
+    edges: &[Edge],
+) -> Option<[U256; HOP_CAP_USIZE]> {
+    route_has_cl_hop(edges).then(|| route_shallow_caps(arena, edges))
+}
+
 fn walk_route_hops(
     arena: &StateArena,
     edges: &[Edge],
     amount_in: U256,
     mut hop_amounts: Option<&mut [U256]>,
+    precomputed_shallow_caps: Option<&[U256; HOP_CAP_USIZE]>,
 ) -> Option<(U256, u32)> {
     if edges.len() > HOP_CAP_USIZE {
         return None;
     }
     let mut current = amount_in;
     let mut total_gas = 0u32;
-    let shallow_caps = if route_has_cl_hop(edges) {
+    let shallow_caps = if let Some(caps) = precomputed_shallow_caps {
+        *caps
+    } else if route_has_cl_hop(edges) {
         route_shallow_caps(arena, edges)
     } else {
         [U256::MAX; HOP_CAP_USIZE]
@@ -581,6 +585,16 @@ pub fn simulate_route_minimal(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimResult> {
+    simulate_route_minimal_with_caps(arena, edges, amount_in, None)
+}
+
+#[must_use]
+pub fn simulate_route_minimal_with_caps(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount_in: U256,
+    precomputed_shallow_caps: Option<&[U256; HOP_CAP_USIZE]>,
+) -> Option<MinimalSimResult> {
     if !route_edges_simulatable(edges) {
         return None;
     }
@@ -591,7 +605,8 @@ pub fn simulate_route_minimal(
             total_gas: finalize_route_total_gas(edges, 0),
         });
     }
-    let (amount_out, walked_gas) = walk_route_hops(arena, edges, amount_in, None)?;
+    let (amount_out, walked_gas) =
+        walk_route_hops(arena, edges, amount_in, None, precomputed_shallow_caps)?;
     let profit = amount_out.saturating_sub(amount_in);
     let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(MinimalSimResult {
@@ -624,8 +639,13 @@ pub fn simulate_route_detailed(
         });
     }
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    let (amount_out, walked_gas) =
-        walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts))?;
+    let (amount_out, walked_gas) = walk_route_hops(
+        arena,
+        edges,
+        amount_in,
+        Some(&mut hop_amounts),
+        None,
+    )?;
     let profit = amount_out.saturating_sub(amount_in);
     let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(RouteSimulationResult {

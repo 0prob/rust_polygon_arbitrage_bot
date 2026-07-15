@@ -104,7 +104,13 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         )
     };
 
+    let graph_action;
     let mut graph = if needs_rebuild {
+        graph_action = if connectivity_stale {
+            "rebuild_eligible_growth"
+        } else {
+            "rebuild"
+        };
         if connectivity_stale {
             let gc = work.graph_cache.lock();
             crate::debug!(
@@ -112,11 +118,18 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
                 gc.cached_eligible_pool_count()
             );
         }
+        let build_started = crate::util::now_ms();
         // Build outside lock to keep critical section short.
         let g = Arc::new(crate::pipeline::graph::build_graph(
             &work.arena,
             work.pool_metas.as_ref(),
         ));
+        let build_ms = crate::util::now_ms().saturating_sub(build_started);
+        let stats = crate::pipeline::graph::topology_stats(g.as_ref());
+        stats.log_summary(graph_action);
+        crate::info!(
+            "graph build: ms={build_ms} eligible={eligible_count} routable_metas={routable_count}",
+        );
         let mut gc = work.graph_cache.lock();
         gc.store(
             Arc::clone(&g),
@@ -128,6 +141,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         );
         g
     } else {
+        graph_action = "cache";
         let mut gc = work.graph_cache.lock();
         if gc.graph().is_none() {
             let gg = Arc::new(crate::pipeline::graph::build_graph(
@@ -201,10 +215,13 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             g,
             work.pool_metas.as_ref(),
         )
+        .attached_pools
     } else {
         0
     };
     if missing_graph_pools > 0 {
+        let stats = crate::pipeline::graph::topology_stats(graph.as_ref());
+        stats.log_summary("patch_attach");
         crate::info!(
             "lf graph patch: attached {missing_graph_pools} eligible pools missing from cached adjacency"
         );
@@ -245,7 +262,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             gas_price_wei: work.gas_price_wei,
         };
         let enum_started = crate::util::now_ms();
-        let result = find_cycles_for_mode(
+        let outcome = find_cycles_for_mode(
             work.cycle_finder,
             &work.arena,
             &graph,
@@ -254,6 +271,8 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             true,
             Some(&probe_ctx),
         );
+        outcome.diag.log_summary();
+        let result = outcome.cycles;
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             let mut hop_hist = [0u32; HOP_CAP as usize + 1];
             for c in &result {
@@ -300,6 +319,14 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         let enumerated_cycles = cached.len();
         (cached, enumerated_cycles)
     };
+
+    if graph_action == "cache"
+        && missing_graph_pools == 0
+        && (work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30))
+    {
+        crate::pipeline::graph::topology_stats(graph.as_ref())
+            .log_summary("cache_hit");
+    }
 
     LfCpuResult {
         graph,
@@ -587,6 +614,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             survival = survival.with_index_stats(&stats);
         }
         survival.log_summary(lf_pass);
+        crate::services::index_diag::log_index_summary();
     }
 
     let stream_targets = ctx.config.pipeline.stream_enabled.then(|| {

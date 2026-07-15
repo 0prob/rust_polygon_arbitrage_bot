@@ -19,7 +19,11 @@ use crate::infra::rpc::RpcPool;
 use crate::pipeline::fetcher::fetch_missing_pool_states;
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
-    DiscoveredPool, TokenMeta, is_routable_pool, unknown_tokens_from_pools,
+    DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
+};
+use crate::services::index_diag::{
+    log_index_summary, record_index_bootstrap_page, record_index_discovery_notify,
+    record_index_discovery_skipped_tick, record_index_incremental_rows,
 };
 use crate::services::pipeline_survival::{ParseStats, log_index_parse_stats};
 use crate::services::state_cache::StateCache;
@@ -302,9 +306,13 @@ impl StateRefreshService {
             // Check the LISTEN/NOTIFY flag: if a pool_meta_channel notification arrived
             // since last discovery, skip the interval gate and refresh immediately.
             let notify_pending = self.pg_notify_pending.swap(false, Ordering::AcqRel);
+            if notify_pending {
+                record_index_discovery_notify();
+            }
 
             if !is_bootstrap && !notify_pending && elapsed < self.config.discovery_interval_ms {
                 let skipped = self.discovery_skipped_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                record_index_discovery_skipped_tick();
                 if skipped <= 2 || skipped.is_multiple_of(60) {
                     crate::debug!(
                         "discovery skipped: elapsed_ms={elapsed} interval_ms={} notify_pending={notify_pending}",
@@ -435,6 +443,7 @@ impl StateRefreshService {
                 _cursor.last_updated_block,
                 result.complete,
             );
+            log_index_summary();
         }
 
         if !self.token_metadata_loaded.load(Ordering::Acquire) {
@@ -454,7 +463,8 @@ impl StateRefreshService {
         loop {
             let (page, next, has_more, page_stats) =
                 self.pg.fetch_pool_meta_page(&keyset, batch as u64).await?;
-            all_pools.extend(page.into_iter().filter(is_routable_pool));
+            record_index_bootstrap_page();
+            all_pools.extend(page.into_iter().filter_map(retain_routable_pool));
             merge_parse_stats(&mut parse_stats, &page_stats);
             if !has_more {
                 break;
@@ -467,6 +477,7 @@ impl StateRefreshService {
             );
         }
         log_index_parse_stats(&parse_stats);
+        log_index_summary();
         // SQL returns ORDER BY "createdBlock", id — last pool's block is max
         let max_block = keyset.created_block.max(0) as u64;
         crate::info!(
@@ -490,10 +501,17 @@ impl StateRefreshService {
     ) -> anyhow::Result<DiscoveryResult> {
         let mut work_cursor = cursor.clone();
         let mut pools = Vec::new();
+        let mut parse_stats = ParseStats::default();
         loop {
-            let (page, last_block, last_updated_block, has_more) =
+            let (page, last_block, last_updated_block, has_more, page_stats) =
                 self.pg.fetch_pool_meta_incremental(&work_cursor).await?;
-            pools.extend(page.into_iter().filter(is_routable_pool));
+            record_index_incremental_rows(
+                u32::try_from(page_stats.parsed.values().sum::<usize>()
+                    + page_stats.rejected.values().sum::<usize>())
+                    .unwrap_or(u32::MAX),
+            );
+            merge_parse_stats(&mut parse_stats, &page_stats);
+            pools.extend(page.into_iter().filter_map(retain_routable_pool));
             work_cursor = DiscoveryCursor {
                 last_block: last_block.max(work_cursor.last_block),
                 last_updated_block: last_updated_block
@@ -509,6 +527,10 @@ impl StateRefreshService {
                 work_cursor.last_block,
                 work_cursor.last_updated_block,
             );
+        }
+
+        if !pools.is_empty() || parse_stats.rejected.values().sum::<usize>() > 0 {
+            log_index_parse_stats(&parse_stats);
         }
 
         Ok(DiscoveryResult {

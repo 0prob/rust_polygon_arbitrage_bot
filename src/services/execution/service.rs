@@ -877,30 +877,21 @@ impl ExecutionService {
             ) {
                 self.quarantine_route_hash(candidate.route_hash, now);
             }
+            let reason = dry.failure_reason();
             crate::info!(
                 "dry-run failed: fp={}, route_hash={}, flash={:?}, route={}, reason={}{}",
                 fp,
                 candidate.route_hash,
                 candidate.flash_loan_source,
                 candidate.route_trace,
-                dry.error.as_deref().unwrap_or("unknown"),
+                reason,
                 if sim_fidelity_miss {
                     " (sim fidelity miss — soft cooldown)"
                 } else {
                     ""
                 }
             );
-            let outcome = ExecutionOutcome::DryRunFailed {
-                reason: dry.error.unwrap_or_else(|| {
-                    if !dry.semantic_success {
-                        "dry-run did not produce a decodable realized profit".into()
-                    } else if dry.realized_profit.is_none() {
-                        "dry-run succeeded but returned no non-zero realized profit".into()
-                    } else {
-                        "dry-run failed without RPC error detail".into()
-                    }
-                }),
-            };
+            let outcome = ExecutionOutcome::DryRunFailed { reason };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
             }

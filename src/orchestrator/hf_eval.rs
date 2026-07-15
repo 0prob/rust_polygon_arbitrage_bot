@@ -14,6 +14,7 @@ use crate::core::types::{
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
 use crate::pipeline::local_sim::{self, simulate_route_detailed, simulate_route_minimal};
+use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch, max_flash_borrow_wei,
     min_economic_amount_in,
@@ -24,8 +25,9 @@ use crate::pipeline::types::OptimizationResult;
 use crate::pipeline::types::{MinimalSimResult, compare_cycle_score};
 use crate::services::execution::candidate::hash_cycle_edges;
 use crate::services::execution::flash_liquidity::{
-    FlashLiquidityCache, balancer_route_flash_feasible, prefer_aave_flash_start,
-    resolve_flash_source_for_cycle,
+    FlashLiquidityCache, FlashLoanDiagnostics, balancer_route_flash_feasible,
+    build_cycle_flash_context, flash_reject_reason, prefer_aave_flash_start,
+    resolve_flash_source_for_cycle, resolve_flash_source_with_context,
 };
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -50,6 +52,7 @@ struct SkipCounters {
     missing_decimals: u32,
     minimal_sim: u32,
     net: u32,
+    executor_budget: u32,
 }
 
 impl SkipCounters {
@@ -60,6 +63,7 @@ impl SkipCounters {
         self.missing_decimals += other.missing_decimals;
         self.minimal_sim += other.minimal_sim;
         self.net += other.net;
+        self.executor_budget += other.executor_budget;
     }
 
     fn probe(&self) -> u32 {
@@ -75,6 +79,7 @@ struct ProbeRankPartial {
     seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
     skip: SkipCounters,
     flash_diag: Option<String>,
+    flash_loan: FlashLoanDiagnostics,
 }
 
 impl ProbeRankPartial {
@@ -87,6 +92,7 @@ impl ProbeRankPartial {
         if self.flash_diag.is_none() {
             self.flash_diag = other.flash_diag;
         }
+        self.flash_loan.merge(other.flash_loan);
         self
     }
 }
@@ -349,6 +355,10 @@ fn rank_one_cycle_probe(
     let mut out = ProbeRankPartial::default();
     let cycle = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl);
     let fp = hash_cycle_edges(&cycle.edges);
+    if !route_fits_executor(&cycle.edges) {
+        out.skip.executor_budget = 1;
+        return out;
+    }
     if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
         out.skip.rate = 1;
         return out;
@@ -359,6 +369,7 @@ fn rank_one_cycle_probe(
     }
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
         out.skip.flash = 1;
+        out.flash_loan.mixed_no_aave += 1;
         if out.flash_diag.is_none() {
             out.flash_diag = Some(format!(
                 "fp={fp:#x} hops={} mixed_balancer_no_aave",
@@ -367,6 +378,10 @@ fn rank_one_cycle_probe(
         }
         return out;
     }
+    let Some(flash_ctx) = build_cycle_flash_context(&cycle, arena, flash, flash_ttl) else {
+        out.skip.flash_source = 1;
+        return out;
+    };
     let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
     let Some((probe_amount, probe)) = try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
@@ -379,17 +394,17 @@ fn rank_one_cycle_probe(
         return out;
     };
     let Some(flash_source) =
-        resolve_flash_source_for_cycle(&cycle, arena, flash, flash_ttl, flash_policy, probe_amount)
+        resolve_flash_source_with_context(&flash_ctx, flash_policy, probe_amount)
     else {
         out.skip.flash_source = 1;
+        if let Some(reason) = flash_reject_reason(&flash_ctx, flash_policy, probe_amount) {
+            out.flash_loan.record_reject(reason);
+        }
         if out.flash_diag.is_none() {
-            let start_addr = arena
-                .token_address(cycle.start_token)
-                .map(|a| format!("{a}"))
-                .unwrap_or_else(|| "?".into());
             out.flash_diag = Some(format!(
-                "fp={fp:#x} hops={} flash_source_reject start={start_addr} probe_amt={probe_amount}",
+                "fp={fp:#x} hops={} flash_source_reject start={} probe_amt={probe_amount}",
                 cycle.edges.len(),
+                flash_ctx.start_addr,
             ));
         }
         return out;
@@ -518,11 +533,15 @@ pub fn rank_cycles_by_probe_net(
             })
             .fold(ProbeRankPartial::default(), ProbeRankPartial::merge)
     };
-    let profitable_ranked = partial.profitable;
-    let mut rescue = partial.rescue;
-    let mut probe_seeds = partial.seeds;
-    let skip = partial.skip;
-    let mut near_net = partial.near_net;
+    let ProbeRankPartial {
+        profitable: profitable_ranked,
+        mut rescue,
+        seeds: mut probe_seeds,
+        skip,
+        mut near_net,
+        flash_diag,
+        mut flash_loan,
+    } = partial;
     // Rescue holds spot-negative cycles that already failed `try_rank_probe_minimal`;
     // re-running full minimal sim here duplicated work. Flash feasibility is enough
     // before Brent / probe-fallback tries larger sizes.
@@ -604,7 +623,7 @@ pub fn rank_cycles_by_probe_net(
     probe_seeds.retain(|fingerprint, _| seen.contains(fingerprint));
 
     if kept.is_empty() && !scanned.is_empty() {
-        let sample = partial.flash_diag.as_deref().unwrap_or("none");
+        let sample = flash_diag.as_deref().unwrap_or("none");
         crate::debug!(
             "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
@@ -617,11 +636,12 @@ pub fn rank_cycles_by_probe_net(
             skip.net,
         );
     } else if kept.len() * 4 < scanned.len() {
-        crate::debug!(
-            "probe rank thin: kept={} scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={}",
+        crate::info!(
+            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={}",
             kept.len(),
             scanned.len(),
             skip.rate,
+            skip.executor_budget,
             skip.flash,
             skip.flash_source,
             skip.probe(),
@@ -631,6 +651,8 @@ pub fn rank_cycles_by_probe_net(
             near_net_count,
         );
     }
+    flash_loan.cache_generation = flash.generation();
+    flash_loan.log_summary("probe_rank");
 
     let kept_cycles = kept.into_iter().map(|(_, cycle)| cycle).collect();
     (kept_cycles, probe_seeds)
@@ -639,6 +661,7 @@ pub fn rank_cycles_by_probe_net(
 #[derive(Default)]
 struct EvalFailStats {
     quarantine: AtomicU32,
+    executor_budget: AtomicU32,
     flash: AtomicU32,
     flash_source: AtomicU32,
     opt_none: AtomicU32,
@@ -648,6 +671,28 @@ struct EvalFailStats {
     probe_zero_profit: AtomicU32,
     probe_fidelity: AtomicU32,
     probe_sanity: AtomicU32,
+}
+
+impl EvalFailStats {
+    fn log_assess_summary(&self, in_count: usize, out_count: usize) {
+        if in_count == 0 {
+            return;
+        }
+        crate::info!(
+            "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
+            load(&self.quarantine),
+            load(&self.executor_budget),
+            load(&self.flash),
+            load(&self.flash_source),
+            load(&self.opt_none),
+            load(&self.detailed_none),
+            load(&self.fallback_none),
+            load(&self.probe_sim_none),
+            load(&self.probe_zero_profit),
+            load(&self.probe_fidelity),
+            load(&self.probe_sanity),
+        );
+    }
 }
 
 fn inc(c: &AtomicU32) {
@@ -681,32 +726,11 @@ pub fn evaluate_cycles_parallel(
             .filter_map(|cycle| evaluate_one(cycle, input, probe_seeds, &stats))
             .collect()
     };
-    if in_count > 0 {
-        let out = results.len();
-        if out == 0 {
-            crate::debug!(
-                "hf assess failed: routes={in_count} quarantine={} flash={} flash_source={} opt_none={} detailed_none={} fallback_none={} probe(sim_none={} zero={} fidelity={} sanity={})",
-                load(&stats.quarantine),
-                load(&stats.flash),
-                load(&stats.flash_source),
-                load(&stats.opt_none),
-                load(&stats.detailed_none),
-                load(&stats.fallback_none),
-                load(&stats.probe_sim_none),
-                load(&stats.probe_zero_profit),
-                load(&stats.probe_fidelity),
-                load(&stats.probe_sanity),
-            );
-        } else if out < in_count {
-            crate::debug!(
-                "hf assess partial: ok={out}/{in_count} quarantine={} flash={} flash_source={} opt_none={} fallback_none={}",
-                load(&stats.quarantine),
-                load(&stats.flash),
-                load(&stats.flash_source),
-                load(&stats.opt_none),
-                load(&stats.fallback_none),
-            );
-        }
+    if in_count > 0 && (results.len() < in_count || results.is_empty()) {
+        stats.log_assess_summary(in_count, results.len());
+        crate::pipeline::curve_sim::log_curve_sim_summary();
+        crate::pipeline::brent_diag::log_brent_summary();
+        crate::pipeline::ternary_diag::log_ternary_summary();
     }
     results
 }
@@ -901,6 +925,10 @@ fn evaluate_one(
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
     let fp = hash_cycle_edges(&cycle.edges);
+    if !route_fits_executor(&cycle.edges) {
+        inc(&stats.executor_budget);
+        return None;
+    }
     if input.execution.is_route_quarantined(fp) {
         inc(&stats.quarantine);
         return None;
@@ -923,11 +951,12 @@ fn evaluate_one(
     let brent_probe_amount = probe_seed
         .map(|(amount, _)| amount)
         .unwrap_or_else(|| min_economic_amount_in(start_decimals, start_rate));
-    let Some(flash_source_brent) = resolve_flash_source_for_cycle(
-        cycle,
-        input.arena,
-        &flash,
-        flash_ttl,
+    let Some(flash_ctx) = build_cycle_flash_context(cycle, input.arena, &flash, flash_ttl) else {
+        inc(&stats.flash_source);
+        return None;
+    };
+    let Some(flash_source_brent) = resolve_flash_source_with_context(
+        &flash_ctx,
         input.flash_policy,
         brent_probe_amount,
     ) else {
@@ -1015,11 +1044,8 @@ fn evaluate_one(
         }
     };
 
-    let Some(flash_source) = resolve_flash_source_for_cycle(
-        cycle,
-        input.arena,
-        &flash,
-        flash_ttl,
+    let Some(flash_source) = resolve_flash_source_with_context(
+        &flash_ctx,
         input.flash_policy,
         opt.optimal_input,
     ) else {

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
@@ -44,6 +45,134 @@ pub enum BatchQueryOutcome {
     BuildFailed,
     DecodeFailed,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalancerBatchReject {
+    MissingStartToken,
+    CalldataBuildFailed,
+    MaxInRatio,
+    ProfitBelowMin,
+    NonPositiveDelta,
+    ReassessAfterOnChain,
+    RpcError,
+    Timeout,
+    BuildDecodeFailed,
+}
+
+static BAL_FILTER_IN: AtomicU32 = AtomicU32::new(0);
+static BAL_FILTER_ACCEPT: AtomicU32 = AtomicU32::new(0);
+static BAL_FILTER_SKIP_VERIFIED: AtomicU32 = AtomicU32::new(0);
+static BAL_FILTER_PASSTHROUGH: AtomicU32 = AtomicU32::new(0);
+static BAL_PREPARE_SKIP: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_MAX_IN: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_BUILD: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_PROFIT_FLOOR: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_NON_POS: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_REASSESS: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_RPC: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_TIMEOUT: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_DECODE: AtomicU32 = AtomicU32::new(0);
+
+pub fn record_balancer_batch_reject(reason: BalancerBatchReject) {
+    match reason {
+        BalancerBatchReject::MissingStartToken => {}
+        BalancerBatchReject::CalldataBuildFailed => {
+            BAL_REJECT_BUILD.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::MaxInRatio => {
+            BAL_REJECT_MAX_IN.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::ProfitBelowMin => {
+            BAL_REJECT_PROFIT_FLOOR.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::NonPositiveDelta => {
+            BAL_REJECT_NON_POS.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::ReassessAfterOnChain => {
+            BAL_REJECT_REASSESS.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::RpcError => {
+            BAL_REJECT_RPC.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::Timeout => {
+            BAL_REJECT_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::BuildDecodeFailed => {
+            BAL_REJECT_DECODE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn record_balancer_filter_accept() {
+    BAL_FILTER_ACCEPT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_balancer_prepare_skip() {
+    BAL_PREPARE_SKIP.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_balancer_filter_window(
+    query_jobs: u32,
+    skip_already_verified: u32,
+    passthrough_mixed: u32,
+) {
+    BAL_FILTER_IN.fetch_add(query_jobs, Ordering::Relaxed);
+    BAL_FILTER_SKIP_VERIFIED.fetch_add(skip_already_verified, Ordering::Relaxed);
+    BAL_FILTER_PASSTHROUGH.fetch_add(passthrough_mixed, Ordering::Relaxed);
+}
+
+pub fn log_balancer_batch_filter_summary() {
+    let jobs = BAL_FILTER_IN.load(Ordering::Relaxed);
+    let accept = BAL_FILTER_ACCEPT.load(Ordering::Relaxed);
+    let skip_verified = BAL_FILTER_SKIP_VERIFIED.load(Ordering::Relaxed);
+    let passthrough = BAL_FILTER_PASSTHROUGH.load(Ordering::Relaxed);
+    let rejects = BAL_REJECT_MAX_IN.load(Ordering::Relaxed)
+        + BAL_REJECT_BUILD.load(Ordering::Relaxed)
+        + BAL_REJECT_PROFIT_FLOOR.load(Ordering::Relaxed)
+        + BAL_REJECT_NON_POS.load(Ordering::Relaxed)
+        + BAL_REJECT_REASSESS.load(Ordering::Relaxed)
+        + BAL_REJECT_RPC.load(Ordering::Relaxed)
+        + BAL_REJECT_TIMEOUT.load(Ordering::Relaxed)
+        + BAL_REJECT_DECODE.load(Ordering::Relaxed);
+    if jobs == 0 && skip_verified == 0 && passthrough == 0 && rejects == 0 && accept == 0 {
+        return;
+    }
+    crate::info!(
+        "balancer: batch_filter jobs={jobs} accept={accept} skip_verified={skip_verified} passthrough={passthrough} \
+         reject_max_in={} reject_build={} reject_profit_floor={} reject_non_pos={} reject_reassess={} \
+         reject_rpc={} reject_timeout={} reject_decode={}",
+        BAL_REJECT_MAX_IN.load(Ordering::Relaxed),
+        BAL_REJECT_BUILD.load(Ordering::Relaxed),
+        BAL_REJECT_PROFIT_FLOOR.load(Ordering::Relaxed),
+        BAL_REJECT_NON_POS.load(Ordering::Relaxed),
+        BAL_REJECT_REASSESS.load(Ordering::Relaxed),
+        BAL_REJECT_RPC.load(Ordering::Relaxed),
+        BAL_REJECT_TIMEOUT.load(Ordering::Relaxed),
+        BAL_REJECT_DECODE.load(Ordering::Relaxed),
+    );
+}
+
+pub fn log_balancer_prepare_gate_summary(candidates: u32) {
+    if candidates == 0 {
+        return;
+    }
+    let prepare = BAL_PREPARE_SKIP.load(Ordering::Relaxed);
+    if prepare == 0 {
+        return;
+    }
+    crate::info!(
+        "balancer: prepare_gate candidates={candidates} prepare_skip={prepare} \
+         (max_in={} profit_floor={} non_pos={} rpc={} timeout={} decode={})",
+        BAL_REJECT_MAX_IN.load(Ordering::Relaxed),
+        BAL_REJECT_PROFIT_FLOOR.load(Ordering::Relaxed),
+        BAL_REJECT_NON_POS.load(Ordering::Relaxed),
+        BAL_REJECT_RPC.load(Ordering::Relaxed),
+        BAL_REJECT_TIMEOUT.load(Ordering::Relaxed),
+        BAL_REJECT_DECODE.load(Ordering::Relaxed),
+    );
+}
+
+
 
 /// True when every hop amount stays within the vault `MAX_IN_RATIO` (30%) limit.
 #[must_use]
@@ -105,6 +234,39 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchQueryVerdict {
+    Accepted(U256),
+    Rejected(BalancerBatchReject),
+}
+
+/// Evaluates vault batch profit and on-chain min-profit floor (HF filter + dispatch).
+#[must_use]
+pub fn evaluate_batch_query(
+    outcome: BatchQueryOutcome,
+    amount_in: U256,
+    slippage_bps: u64,
+    hop_count: u32,
+) -> BatchQueryVerdict {
+    match outcome {
+        BatchQueryOutcome::Profit(on_chain) => {
+            if batch_profit_covers_min(on_chain, amount_in, slippage_bps, hop_count) {
+                BatchQueryVerdict::Accepted(on_chain)
+            } else {
+                BatchQueryVerdict::Rejected(BalancerBatchReject::ProfitBelowMin)
+            }
+        }
+        BatchQueryOutcome::NonPositiveDelta(_) => {
+            BatchQueryVerdict::Rejected(BalancerBatchReject::NonPositiveDelta)
+        }
+        BatchQueryOutcome::RpcError(_) => BatchQueryVerdict::Rejected(BalancerBatchReject::RpcError),
+        BatchQueryOutcome::Timeout => BatchQueryVerdict::Rejected(BalancerBatchReject::Timeout),
+        BatchQueryOutcome::BuildFailed | BatchQueryOutcome::DecodeFailed => {
+            BatchQueryVerdict::Rejected(BalancerBatchReject::BuildDecodeFailed)
+        }
+    }
+}
+
 /// Reject Direct routes when vault `queryBatchSwap` profit cannot satisfy calldata `minProfit`.
 ///
 /// The floor must be derived from on-chain gross, not local sim — Balancer batch sim
@@ -160,6 +322,19 @@ mod tests {
             on_chain_min_profit_for_route(modeled, amount_in, 476, 2, FlashLoanSource::Direct)
                 .expect("modeled floor");
         assert!(on_chain < modeled_floor);
+    }
+
+    #[test]
+    fn evaluate_batch_query_accepts_when_floor_met() {
+        let on_chain = U256::from(111_906_298_841_187_462u128);
+        let amount_in = U256::from(7_978_784_081_956_178u128);
+        let verdict = evaluate_batch_query(
+            BatchQueryOutcome::Profit(on_chain),
+            amount_in,
+            476,
+            2,
+        );
+        assert!(matches!(verdict, BatchQueryVerdict::Accepted(_)));
     }
 
     #[test]

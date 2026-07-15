@@ -1,8 +1,10 @@
 pub mod abi_cache;
 pub mod arena;
 pub mod bellman_ford;
+pub mod brent_diag;
 pub mod cycle_filter;
 pub mod cycle_finder;
+pub mod curve_sim;
 pub mod cycle_search;
 pub mod deadline;
 pub mod fetcher;
@@ -17,6 +19,7 @@ pub mod route_sim_cache;
 pub mod sim_sanity;
 pub mod spot_price;
 pub mod ternary;
+pub mod ternary_diag;
 pub mod tick_fetch;
 pub mod types;
 pub mod weighted_graph;
