@@ -816,7 +816,7 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
 mod tests {
     use super::{
         clear_hf_pending_on_shutdown, next_hf_stream_trigger, should_reschedule_hf_after_tick,
-        take_pending_hf_stream,
+        submit_probe_url, take_pending_hf_stream,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::watch;
@@ -858,5 +858,13 @@ mod tests {
         ));
         assert!(!pending.load(Ordering::Acquire));
         assert!(!stream_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn submit_probe_skips_json_rpc_endpoint_when_bloxroute_auth_is_configured() {
+        assert_eq!(
+            submit_probe_url(Some("https://api.blxrbdn.com"), Some("https://rpc.example"), true),
+            None
+        );
     }
 }

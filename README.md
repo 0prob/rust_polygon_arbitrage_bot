@@ -1,3 +1,7 @@
+> [!CAUTION]
+> **CRITICAL WARNING: Work in Progress**
+> This bot is actively under development. Running this software with real capital carries a severe risk of **permanent loss of funds**. Use at your own risk.
+
 # rpbot
 
 Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex indexer, builds a multi-protocol routing graph, finds profitable cycles, simulates swaps locally, and executes via a Huff flash-loan executor contract.
