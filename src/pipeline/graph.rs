@@ -11,10 +11,7 @@ use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
-use crate::services::execution::flash_liquidity::{
-    FlashLiquiditySnapshot, token_eligible_for_flash_borrow_graph,
-    token_flash_borrow_proven_unviable,
-};
+use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
 use crate::services::oracle::has_reliable_matic_rate;
 use alloy::primitives::U256;
 use rayon::prelude::*;
@@ -23,7 +20,6 @@ use smallvec::SmallVec;
 /// Max parallel edges per `(token_in, token_out, protocol)` after rescoring.
 const MAX_PARALLEL_EDGES_PER_PAIR: usize = 2;
 
-/// Optional LF gate: drop pools with no priced, flash-viable token once oracle rates exist.
 #[derive(Clone)]
 pub struct GraphBuildGate {
     pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
@@ -357,6 +353,28 @@ pub fn count_graph_eligible_pools_with_gate(
         .count()
 }
 
+#[must_use]
+pub fn count_graph_eligible_unpriced_pools(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    gate: &GraphBuildGate,
+) -> usize {
+    if !gate.active() {
+        return 0;
+    }
+    pools
+        .iter()
+        .filter(|meta| {
+            let bpt_index = meta.bpt_index;
+            let has_priced_token = meta.tokens.iter().enumerate().any(|(i, &token)| {
+                bpt_index != Some(i)
+                    && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
+            });
+            !has_priced_token && pool_has_admissible_edges(arena, meta, Some(gate))
+        })
+        .count()
+}
+
 fn direct_pair_has_marginal_spot(
     state: &PoolState,
     protocol: ProtocolType,
@@ -428,37 +446,11 @@ pub fn pool_state_graph_eligible(
     false
 }
 
-fn pool_touches_flash_executable_token(
-    arena: &StateArena,
-    meta: &PoolMeta,
-    gate: &GraphBuildGate,
-) -> bool {
-    let bpt_index = meta.bpt_index;
-    for (i, &token) in meta.tokens.iter().enumerate() {
-        if bpt_index == Some(i) {
-            continue;
-        }
-        if !has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref()) {
-            continue;
-        }
-        let Some(addr) = arena.token_address(token) else {
-            continue;
-        };
-        if token_flash_borrow_proven_unviable(addr, gate.flash.as_ref(), gate.flash_ttl) {
-            continue;
-        }
-        if token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl) {
-            return true;
-        }
-    }
-    false
-}
-
 #[inline]
 fn pool_has_admissible_edges(
     arena: &StateArena,
     meta: &PoolMeta,
-    gate: Option<&GraphBuildGate>,
+    _gate: Option<&GraphBuildGate>,
 ) -> bool {
     let Some(state) = arena.pool_state(meta.pool_index) else {
         return false;
@@ -487,9 +479,6 @@ fn pool_has_admissible_edges(
         pair_input_decimals,
     ) {
         return false;
-    }
-    if let Some(gate) = gate.filter(|gate| gate.active()) {
-        return pool_touches_flash_executable_token(arena, meta, gate);
     }
     true
 }
@@ -1745,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_gate_keeps_hub_pool_and_drops_priced_non_hub_only_pair() {
+    fn graph_gate_keeps_non_flash_intermediate_pool_in_closed_cycle() {
         use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, WMATIC};
         use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
 
@@ -1774,8 +1763,19 @@ mod tests {
                 block_timestamp_last: 1,
             })),
         );
+        let close_pool = arena.register_pool(
+            Address::from([0x03u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
         let hub_meta = pool_meta_from_pair(hub_pool, ProtocolType::UniswapV2, hub, tail_a, 30);
         let tail_meta = pool_meta_from_pair(tail_pool, ProtocolType::UniswapV2, tail_a, tail_b, 30);
+        let close_meta = pool_meta_from_pair(close_pool, ProtocolType::UniswapV2, tail_b, hub, 30);
 
         let mut rates = FxHashMap::default();
         rates.insert(hub, MIN_TOKEN_TO_MATIC_RATE);
@@ -1788,8 +1788,48 @@ mod tests {
             flash_ttl: Duration::from_secs(60),
         };
 
-        let gated = build_graph_with_gate(&arena, &[hub_meta, tail_meta], Some(&gate));
+        let gated = build_graph_with_gate(&arena, &[hub_meta, tail_meta, close_meta], Some(&gate));
         assert!(gated.pool_has_live_edges(hub_pool));
-        assert!(!gated.pool_has_live_edges(tail_pool));
+        assert!(gated.pool_has_live_edges(tail_pool));
+        assert!(gated.pool_has_live_edges(close_pool));
+    }
+
+    #[test]
+    fn graph_gate_keeps_flash_eligible_unpriced_intermediate_pool() {
+        use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, WMATIC};
+        use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
+
+        let mut arena = StateArena::default();
+        let priced_start = arena.register_token(Address::from([0x11u8; 20]));
+        let intermediate = arena.register_token(WMATIC);
+        let unpriced = arena.register_token(Address::from([0x22u8; 20]));
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let pool = arena.register_pool(
+            Address::from([0x33u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let meta = pool_meta_from_pair(pool, ProtocolType::UniswapV2, intermediate, unpriced, 30);
+
+        let mut rates = FxHashMap::default();
+        rates.insert(priced_start, MIN_TOKEN_TO_MATIC_RATE);
+        let gate = GraphBuildGate {
+            token_to_matic_rates: Arc::new(rates),
+            flash: Arc::new(FlashLiquiditySnapshot::default()),
+            flash_ttl: Duration::from_secs(60),
+        };
+
+        let metas = [meta];
+        let gated = build_graph_with_gate(&arena, &metas, Some(&gate));
+        assert!(gated.pool_has_live_edges(pool));
+        assert_eq!(
+            count_graph_eligible_unpriced_pools(&arena, &metas, &gate),
+            1
+        );
     }
 }

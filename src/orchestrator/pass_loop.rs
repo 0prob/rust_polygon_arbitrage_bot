@@ -500,8 +500,16 @@ fn spawn_pass_loop_sidecars(
         });
     }
 
-    if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
+    let bloxroute_auth = std::env::var("BLOXROUTE_AUTH_HEADER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(url) = submit_probe_url(
+        ctx.rpc.private_url(),
+        ctx.rpc.execution_url(),
+        bloxroute_auth.is_some(),
+    ) {
         let probe_url = url.to_string();
+        let rpc = Arc::clone(&ctx.rpc);
         tokio::spawn(async move {
             let probe =
                 crate::services::execution::private_submit::probe_submit_endpoint(&probe_url).await;
@@ -512,19 +520,19 @@ fn spawn_pass_loop_sidecars(
                 probe.recommended_mode,
                 probe.private_method_error,
             );
-            if let Some(auth) = std::env::var("BLOXROUTE_AUTH_HEADER")
-                .ok()
-                .filter(|s| !s.is_empty())
-            {
-                let blox_ok =
-                    crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
-                if blox_ok {
-                    crate::info!("submit probe: bloXroute auth accepted");
-                } else {
-                    crate::warn!(
-                        "submit probe: bloXroute auth failed — live private submit may fail"
-                    );
-                }
+            rpc.record_private_submit_probe(probe);
+        });
+    }
+    if let Some(auth) = bloxroute_auth {
+        let rpc = Arc::clone(&ctx.rpc);
+        tokio::spawn(async move {
+            let blox_ok =
+                crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
+            rpc.record_bloxroute_auth_probe(blox_ok);
+            if blox_ok {
+                crate::info!("submit probe: bloXroute auth accepted");
+            } else {
+                crate::warn!("submit probe: bloXroute auth failed — live private submit may fail");
             }
         });
     }
@@ -656,37 +664,12 @@ fn spawn_matic_usd_oracle_background(
     });
 }
 
-/// Start fee polling once state RPC is reachable (retries if startup connect fails).
 fn spawn_gas_oracle_background(
     gas_oracle: Arc<GasOracle>,
     rpc: Arc<RpcPool>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
-        let retry = Duration::from_secs(5);
-        loop {
-            if *shutdown.borrow() {
-                return;
-            }
-            match rpc.connect_state() {
-                Ok(provider) => {
-                    gas_oracle.start_background(provider, shutdown);
-                    return;
-                }
-                Err(e) => {
-                    crate::warn!("gas oracle waiting for state RPC: {e:#}");
-                    tokio::select! {
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() {
-                                return;
-                            }
-                        }
-                        _ = tokio::time::sleep(retry) => {}
-                    }
-                }
-            }
-        }
-    });
+    gas_oracle.start_background(rpc, shutdown);
 }
 
 fn schedule_hf_tick(
@@ -780,6 +763,18 @@ fn take_pending_hf_stream(hf_stream_pending: &AtomicBool) -> bool {
     hf_stream_pending.swap(false, Ordering::AcqRel)
 }
 
+fn submit_probe_url<'a>(
+    private_url: Option<&'a str>,
+    execution_url: Option<&'a str>,
+    has_bloxroute_auth: bool,
+) -> Option<&'a str> {
+    if has_bloxroute_auth {
+        None
+    } else {
+        private_url.or(execution_url)
+    }
+}
+
 #[inline]
 fn should_reschedule_hf_after_tick(pending_timer: bool, pending_stream: bool) -> bool {
     pending_timer || pending_stream
@@ -863,7 +858,11 @@ mod tests {
     #[test]
     fn submit_probe_skips_json_rpc_endpoint_when_bloxroute_auth_is_configured() {
         assert_eq!(
-            submit_probe_url(Some("https://api.blxrbdn.com"), Some("https://rpc.example"), true),
+            submit_probe_url(
+                Some("https://api.blxrbdn.com"),
+                Some("https://rpc.example"),
+                true
+            ),
             None
         );
     }

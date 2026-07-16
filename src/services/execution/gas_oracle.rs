@@ -6,12 +6,14 @@ use std::time::Duration;
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::Ethereum;
 use alloy::primitives::U256;
-use alloy::providers::{DynProvider, Provider};
+use alloy::providers::Provider;
 use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
+
+use crate::infra::rpc::RpcPool;
 
 use super::gas::{FeeSnapshot, compute_conservative_gas_price, scaled_simulated_gas};
 
@@ -287,15 +289,52 @@ impl GasOracle {
         Ok(())
     }
 
+    async fn refresh_from_state_pool(&self, rpc: &RpcPool) -> anyhow::Result<()> {
+        let candidates = rpc.state_url_candidates();
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "no state RPC configured for gas oracle"
+        );
+        let mut last_error = None;
+
+        for (idx, url) in candidates.iter().enumerate() {
+            let provider = match rpc.connect_state_at(url) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    rpc.deprioritize_state_url(url);
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            match self.refresh_once(&provider).await {
+                Ok(()) => {
+                    if idx > 0 {
+                        crate::info!("gas oracle fallback refresh succeeded (url_index={idx})");
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    rpc.deprioritize_state_url(url);
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Err(anyhow::anyhow!("gas oracle exhausted state RPC candidates")),
+        }
+    }
+
     pub fn start_background(
         self: Arc<Self>,
-        provider: DynProvider,
+        rpc: Arc<RpcPool>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let poll = self.poll_interval;
         tokio::spawn(async move {
             static REFRESH_FAILS: AtomicU32 = AtomicU32::new(0);
-            if let Err(e) = self.refresh_once(&provider).await {
+            if let Err(e) = self.refresh_from_state_pool(&rpc).await {
                 let n = REFRESH_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
                 crate::warn!("gas oracle initial refresh failed ({n}): {e:#}");
             } else {
@@ -311,7 +350,7 @@ impl GasOracle {
                         }
                     }
                     _ = ticker.tick() => {
-                        if let Err(e) = self.refresh_once(&provider).await {
+                        if let Err(e) = self.refresh_from_state_pool(&rpc).await {
                             let n = REFRESH_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
                             if n == 1 || n.is_multiple_of(20) {
                                 crate::warn!(

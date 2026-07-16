@@ -481,17 +481,12 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     };
     let balancer_hydrate_ms = crate::util::now_ms().saturating_sub(hydrate_started);
 
-    let mut woofi_pools: Vec<&DiscoveredPool> = Vec::with_capacity(pools.len());
+    let mut woofi_pools: Vec<&DiscoveredPool> = Vec::new();
+    let mut protocol_work = rustc_hash::FxHashMap::default();
+    let mut plans = Vec::with_capacity(pools.len());
     for pool in pools {
         if pool.protocol == ProtocolType::Woofi {
             woofi_pools.push(*pool);
-        }
-    }
-
-    let mut protocol_work = rustc_hash::FxHashMap::default();
-    let mut plans = Vec::with_capacity(pools.len().saturating_sub(woofi_pools.len()));
-    for pool in pools {
-        if pool.protocol == ProtocolType::Woofi {
             continue;
         }
         let pool_id = balancer_pool_id(pool, &balancer_ids);
@@ -567,11 +562,10 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     let (plan_result, plan_ms) = plan_result;
     let plan_updated = plan_result.updated;
     crate::debug!(
-        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_rate_limited={} plan_ms={plan_ms}",
-        plan_result.rate_limited,
+        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={needs_balancer_hydrate} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_rate_limited={} plan_ms={plan_ms}",
         pools.len(),
         woofi_pools.len(),
-        needs_balancer_hydrate,
+        plan_result.rate_limited,
     );
 
     PoolFetchResult {

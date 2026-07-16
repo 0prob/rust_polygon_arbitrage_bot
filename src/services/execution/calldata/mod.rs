@@ -102,6 +102,7 @@ pub fn encode_route(
             arena,
             &config,
             i == 0,
+            flash_source,
         )?);
     }
     Ok(calls)

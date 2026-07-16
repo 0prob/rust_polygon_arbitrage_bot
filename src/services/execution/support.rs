@@ -95,7 +95,10 @@ pub(crate) fn ic(haystack: &str, needle: &str) -> bool {
 pub fn classify_submit_error(err: &impl std::fmt::Display) -> SubmitAction {
     let msg = err.to_string();
 
-    if ic(&msg, "nonce too low") || ic(&msg, "nonce has already been used") {
+    if ic(&msg, "nonce too low")
+        || ic(&msg, "nonce has already been used")
+        || ic(&msg, "nonce too high")
+    {
         return SubmitAction::ResyncAndRetry;
     }
     if ic(&msg, "already known") || ic(&msg, "already imported") {

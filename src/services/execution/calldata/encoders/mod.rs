@@ -16,6 +16,7 @@ use crate::pipeline::arena::StateArena;
 use crate::services::execution::profit::slippage_adjusted;
 
 use super::{CalldataHop, RouteEncodeConfig};
+use crate::core::types::FlashLoanSource;
 
 /// Dispatch to the protocol-specific encoder free function.
 pub fn encode_hop_for_protocol(
@@ -24,11 +25,14 @@ pub fn encode_hop_for_protocol(
     arena: &StateArena,
     config: &RouteEncodeConfig,
     is_first_hop: bool,
+    flash_source: FlashLoanSource,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     match hop.edge.protocol {
         ProtocolType::UniswapV2 => {
             if is_first_hop {
-                v2::encode_v2_hop(arena, hop, recipient, config.slippage_bps, false)
+                // After vault/Aave/DODO flash, sweep the credited balance (exact `amount_in` can drift).
+                let use_transfer_all = flash_source != FlashLoanSource::Direct;
+                v2::encode_v2_hop(arena, hop, recipient, config.slippage_bps, use_transfer_all)
             } else {
                 let mut h = hop.clone();
                 let slip = config.slippage_bps.saturating_add(100);

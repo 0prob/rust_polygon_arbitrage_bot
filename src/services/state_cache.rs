@@ -346,10 +346,12 @@ impl StateCache {
         let mut guard = self.inner.write();
         if guard.len() >= self.max_entries
             && !guard.contains_key(&address)
-            && guard.len() >= self.max_entries
             && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
         {
             guard.remove(&victim);
+            // Eviction drops cache state while the LF arena may still reference the pool
+            // until the next sync — mark dirty so partial graph rescore can react.
+            self.mark_dirty(victim);
         }
         let revision = self
             .generation
@@ -369,7 +371,7 @@ impl StateCache {
     pub fn remove(&self, address: &Address) -> bool {
         let removed = self.inner.write().remove(address).is_some();
         if removed {
-            self.generation.fetch_add(1, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::AcqRel);
             self.mark_dirty(*address);
         }
         removed
@@ -498,6 +500,22 @@ mod tests {
         // not invalid, because the global TTL check fires before the invalid check.
         assert!(invalid.is_empty());
         assert_eq!(stale, vec![&expired]);
+    }
+
+    #[test]
+    fn eviction_marks_victim_dirty_for_graph_rescore() {
+        let cache = StateCache::new(1, Duration::from_secs(600));
+        let victim = Address::with_last_byte(10);
+        let newcomer = Address::with_last_byte(11);
+        cache.insert(victim, PoolState::Invalid);
+        let mut map = FxHashMap::default();
+        map.insert(victim, PoolIndex(0));
+        map.insert(newcomer, PoolIndex(1));
+        assert!(cache.take_dirty_pool_indices(&map).contains(&PoolIndex(0)));
+        cache.insert(newcomer, PoolState::Invalid);
+        let dirty = cache.take_dirty_pool_indices(&map);
+        assert!(dirty.contains(&PoolIndex(0)));
+        assert!(dirty.contains(&PoolIndex(1)));
     }
 
     #[test]

@@ -225,11 +225,11 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
     let updated_other = other_fetch.updated;
     crate::debug!(
         "pool fetch branches: targets={} v2_targets={} other_targets={} v2_updated={updated_v2} v2_rate_limited={} other_updated={updated_other} other_rate_limited={} v2_ms={v2_ms} other_ms={other_ms} max_multicall_calls={max_multicall_calls} batch_pace_ms={batch_pace_ms} pinned_block={block_number:?}",
-        v2_fetch.rate_limited,
-        other_fetch.rate_limited,
         targets.len(),
         v2_targets.len(),
         other_targets.len(),
+        v2_fetch.rate_limited,
+        other_fetch.rate_limited,
     );
     FetchTargetsResult {
         updated: updated_v2.saturating_add(updated_other),

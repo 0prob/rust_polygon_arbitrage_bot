@@ -7,6 +7,7 @@ pub mod candidate;
 pub mod dryrun;
 pub mod flash_liquidity;
 pub mod gas_oracle;
+pub mod mempool;
 pub mod private_submit;
 pub mod profit;
 pub mod quote;

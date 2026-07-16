@@ -46,6 +46,15 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
 const MAX_HOT_FLASH_TOKENS: usize = 384;
 
+/// Clears [`FlashLiquidityCache::refresh_inflight`] on drop so only one multicall batch runs at a time.
+pub(crate) struct RefreshInflightGuard<'a>(&'a AtomicBool);
+
+impl Drop for RefreshInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub use crate::services::execution::aave::fetch_and_cache_aave_flash_loan_fee_bps;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,12 +284,30 @@ impl FlashLiquidityCache {
         for token in tokens {
             hot.insert(*token);
         }
+        if hot.len() <= MAX_HOT_FLASH_TOKENS {
+            return;
+        }
+        let current: FxHashSet<Address> = tokens.iter().copied().collect();
+        hot.retain(|t| current.contains(t));
         if hot.len() > MAX_HOT_FLASH_TOKENS {
             hot.clear();
-            for token in tokens {
+            for token in tokens.iter().take(MAX_HOT_FLASH_TOKENS) {
                 hot.insert(*token);
             }
         }
+    }
+
+    /// One in-flight flash liquidity multicall (HF prefetch, background tick, dispatch spawn).
+    #[must_use]
+    pub(crate) fn try_acquire_refresh_inflight(&self) -> Option<RefreshInflightGuard<'_>> {
+        if self
+            .refresh_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(RefreshInflightGuard(&self.refresh_inflight))
     }
 
     fn hot_token_list(&self) -> Vec<Address> {
@@ -394,6 +421,9 @@ impl FlashLiquidityCache {
                         if stale.is_empty() {
                             continue;
                         }
+                        let Some(_guard) = self.try_acquire_refresh_inflight() else {
+                            continue;
+                        };
                         if let Err(e) = self.refresh_with_fallback(&rpc, &stale).await {
                             crate::debug!("background flash liquidity refresh failed: {e:#}");
                         }
@@ -412,23 +442,15 @@ impl FlashLiquidityCache {
         if !tokens.iter().any(|token| !self.has_fresh_entry(*token)) {
             return;
         }
-        if self
-            .refresh_inflight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
+        if self.refresh_inflight.load(Ordering::Acquire) {
             return;
         }
         let cache = Arc::clone(self);
         let tokens = tokens.to_vec();
         tokio::spawn(async move {
-            struct InflightGuard<'a>(&'a AtomicBool);
-            impl Drop for InflightGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = InflightGuard(&cache.refresh_inflight);
+            let Some(_guard) = cache.try_acquire_refresh_inflight() else {
+                return;
+            };
             if let Err(e) = cache.refresh_with_fallback(&rpc, &tokens).await
                 && !is_rpc_rate_limited(&e)
             {
@@ -678,14 +700,20 @@ pub fn align_flash_source_for_dispatch(
     liquidity: &TokenFlashLiquidity,
     balancer_only: bool,
     has_dodo: bool,
+    route_uses_balancer_vault: bool,
 ) -> Option<FlashLoanSource> {
     let aave_viable = liquidity.aave_listed && !liquidity.aave.is_zero();
+    let mixed_balancer_route = route_uses_balancer_vault && !balancer_only;
     if !balancer_only && matches!(source, FlashLoanSource::Balancer | FlashLoanSource::Direct) {
         if aave_viable {
             return Some(FlashLoanSource::AaveV3);
         }
         if has_dodo {
             return Some(FlashLoanSource::Dodo);
+        }
+        // Vault flash is safe for pure V2/V3/… routes; mixed vault hops need Aave/DODO instead.
+        if !liquidity.balancer.is_zero() && !mixed_balancer_route {
+            return Some(FlashLoanSource::Balancer);
         }
         return None;
     }
@@ -1086,6 +1114,7 @@ pub fn flash_reject_reason(
             &ctx.liquidity,
             ctx.balancer_only,
             ctx.has_dodo,
+            ctx.forbid_balancer_flash,
         )
         .is_none()
         .then_some(FlashRejectReason::AlignDispatch),
@@ -1136,6 +1165,7 @@ pub fn resolve_flash_source_with_context(
             &ctx.liquidity,
             ctx.balancer_only,
             ctx.has_dodo,
+            ctx.forbid_balancer_flash,
         ),
     }
 }
@@ -1661,7 +1691,7 @@ mod tests {
             dodo: U256::MAX,
         };
         assert_eq!(
-            align_flash_source_for_dispatch(FlashLoanSource::Balancer, &liquidity, false, false,),
+            align_flash_source_for_dispatch(FlashLoanSource::Balancer, &liquidity, false, false, true),
             None
         );
     }
@@ -1817,6 +1847,10 @@ mod tests {
     }
 
     impl FlashLiquidityCache {
+        fn hot_tokens_for_test(&self) -> Vec<Address> {
+            self.hot_tokens.lock().iter().copied().collect()
+        }
+
         fn seed_token(&self, token: Address, liquidity: TokenFlashLiquidity) {
             let current = self.load();
             let mut next = current.entries.clone();
@@ -1833,6 +1867,43 @@ mod tests {
                 entries: next,
             }));
         }
+    }
+
+    #[test]
+    fn track_hot_tokens_overflow_retains_current_tick() {
+        let cache = FlashLiquidityCache::new();
+        let mut old = Vec::with_capacity(400);
+        for i in 0..400u32 {
+            let mut bytes = [0u8; 20];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            old.push(Address::from(bytes));
+        }
+        cache.track_hot_tokens(&old);
+        let new_batch: Vec<Address> = (0u8..6)
+            .map(|i| Address::from([0xfe, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .collect();
+        cache.track_hot_tokens(&new_batch);
+        let hot = cache.hot_tokens_for_test();
+        assert!(hot.len() <= MAX_HOT_FLASH_TOKENS);
+        for addr in &new_batch {
+            assert!(hot.contains(addr), "missing current-tick token {addr}");
+        }
+        let mut evicted = [0u8; 20];
+        evicted[..4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(
+            !hot.contains(&Address::from(evicted)),
+            "evicted token from prior tick should not remain"
+        );
+    }
+
+    #[test]
+    fn refresh_inflight_single_flight() {
+        let cache = FlashLiquidityCache::new();
+        let g1 = cache.try_acquire_refresh_inflight();
+        assert!(g1.is_some());
+        assert!(cache.try_acquire_refresh_inflight().is_none());
+        drop(g1);
+        assert!(cache.try_acquire_refresh_inflight().is_some());
     }
 
     #[test]

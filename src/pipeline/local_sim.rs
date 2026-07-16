@@ -236,6 +236,95 @@ pub fn simulate_hop_amount_out_with_cap(
     simulate_hop(state, edge, amount_in, shallow_cap).map(|h| h.amount_out)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimalSimFailure {
+    InvalidRoute,
+    MissingPool { hop: usize },
+    NonTradable { hop: usize },
+    ShallowCl { hop: usize },
+    V2ReserveExhausted { hop: usize },
+    Math { hop: usize },
+    UnsupportedState { hop: usize },
+    ZeroOutput { hop: usize },
+}
+
+#[must_use]
+pub fn minimal_sim_failure(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount_in: U256,
+) -> Option<MinimalSimFailure> {
+    if !route_edges_simulatable(edges) {
+        return Some(MinimalSimFailure::InvalidRoute);
+    }
+    if amount_in.is_zero() {
+        return None;
+    }
+    let shallow_caps = if route_has_cl_hop(edges) {
+        route_shallow_caps(arena, edges)
+    } else {
+        [U256::MAX; HOP_CAP_USIZE]
+    };
+    let mut current = amount_in;
+    for (hop, edge) in edges.iter().enumerate() {
+        let Some(state) = arena.pool_state(edge.pool_index) else {
+            return Some(MinimalSimFailure::MissingPool { hop });
+        };
+        if !state.is_tradable() {
+            return Some(MinimalSimFailure::NonTradable { hop });
+        }
+        if matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) && cl_hop_exceeds_shallow_cap(current, shallow_caps[hop])
+        {
+            return Some(MinimalSimFailure::ShallowCl { hop });
+        }
+        match (state, edge.protocol) {
+            (PoolState::V2(state), ProtocolType::UniswapV2)
+                if current >= v2_reserve_in(state, edge.zero_for_one) =>
+            {
+                return Some(MinimalSimFailure::V2ReserveExhausted { hop });
+            }
+            (PoolState::V3(state), ProtocolType::UniswapV3)
+            | (PoolState::V4(state), ProtocolType::UniswapV4)
+                if simulate_v3_swap(state, current, edge.zero_for_one, Some(edge.fee_bps))
+                    .shallow =>
+            {
+                return Some(MinimalSimFailure::ShallowCl { hop });
+            }
+            (PoolState::Curve(state), ProtocolType::CurveStable | ProtocolType::CurveCrypto)
+                if curve_hop_amount_out(
+                    state,
+                    edge.protocol,
+                    current,
+                    edge.token_in_idx as usize,
+                    edge.token_out_idx as usize,
+                )
+                .is_none() =>
+            {
+                return Some(MinimalSimFailure::Math { hop });
+            }
+            (PoolState::V2(_), ProtocolType::UniswapV2)
+            | (PoolState::V3(_), ProtocolType::UniswapV3)
+            | (PoolState::V4(_), ProtocolType::UniswapV4)
+            | (PoolState::Curve(_), ProtocolType::CurveStable | ProtocolType::CurveCrypto)
+            | (PoolState::Balancer(_), ProtocolType::BalancerV2)
+            | (PoolState::Dodo(_), ProtocolType::Dodo)
+            | (PoolState::Woofi(_), ProtocolType::Woofi) => {}
+            _ => return Some(MinimalSimFailure::UnsupportedState { hop }),
+        }
+        let Some(result) = simulate_hop(state, edge, current, shallow_caps[hop]) else {
+            return Some(MinimalSimFailure::Math { hop });
+        };
+        if result.amount_out.is_zero() {
+            return Some(MinimalSimFailure::ZeroOutput { hop });
+        }
+        current = result.amount_out;
+    }
+    None
+}
+
 fn cl_hop_tickless(state: &PoolState) -> bool {
     matches!(
         state,
@@ -255,6 +344,20 @@ fn v2_reserve_in(state: &crate::core::types::V2PoolState, zero_for_one: bool) ->
     } else {
         state.reserve1
     }
+}
+
+/// Max start-token input when the route has tickless CL hops (shallow sim only).
+/// `None` when the route has full tick coverage or no CL hops.
+#[must_use]
+pub fn tickless_cl_start_input_cap(
+    arena: &StateArena,
+    cycle_start: crate::core::types::TokenIndex,
+    edges: &[Edge],
+) -> Option<U256> {
+    if cl_amount_cap(arena, edges) != Some(U256::ZERO) {
+        return None;
+    }
+    Some(crate::pipeline::spot_price::spot_probe_for_token(arena, cycle_start))
 }
 
 /// Max trade size with faithful CL simulation. `None` = full tick coverage.
@@ -897,6 +1000,41 @@ mod tests {
     }
 
     #[test]
+    fn minimal_sim_diagnoses_v2_reserve_exhaustion() {
+        use crate::core::types::V2PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let token_in = arena.register_token(Address::from([11u8; 20]));
+        let token_out = arena.register_token(Address::from([12u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([13u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(2_000_000u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in,
+            token_out,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+
+        assert_eq!(
+            minimal_sim_failure(&arena, &[edge], U256::from(1_000_000u64)),
+            Some(MinimalSimFailure::V2ReserveExhausted { hop: 0 })
+        );
+    }
+
+    #[test]
     fn cl_hop_rejects_amount_above_explicit_shallow_cap() {
         use crate::core::types::{V3PoolState, V3Tick};
         use std::sync::Arc;
@@ -1235,8 +1373,13 @@ mod tests {
             zero_for_one: true,
         }];
         assert_eq!(cl_amount_cap(&arena, &edges), Some(U256::ZERO));
+        let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
+        assert_eq!(
+            tickless_cl_start_input_cap(&arena, t0, &edges),
+            Some(probe)
+        );
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
-        hop_amounts[0] = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
+        hop_amounts[0] = probe;
         assert_eq!(
             route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             Some(HopFidelityReject::ShallowCl(0))

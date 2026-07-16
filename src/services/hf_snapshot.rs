@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use alloy::primitives::B256;
@@ -53,6 +54,8 @@ impl Default for HfSnapshot {
 /// `Arc` for the whole HF tick (arc-swap "consistent snapshots" pattern).
 pub struct SnapshotStore {
     inner: ArcSwap<HfSnapshot>,
+    /// Monotonic publish counter — cheap HF staleness checks without loading the full snapshot.
+    published_generation: AtomicU64,
 }
 
 impl SnapshotStore {
@@ -60,6 +63,7 @@ impl SnapshotStore {
     pub fn new() -> Self {
         Self {
             inner: ArcSwap::from_pointee(HfSnapshot::default()),
+            published_generation: AtomicU64::new(0),
         }
     }
 
@@ -73,11 +77,17 @@ impl SnapshotStore {
     }
 
     pub fn generation(&self) -> u64 {
-        self.inner.load().generation
+        self.published_generation.load(Ordering::Acquire)
+    }
+
+    /// Latest merged token/MATIC rates from the published LF snapshot.
+    pub fn token_to_matic_rates(&self) -> Arc<FxHashMap<TokenIndex, U256>> {
+        Arc::clone(&self.read().token_to_matic_rates)
     }
 
     pub fn publish(&self, mut snapshot: HfSnapshot) {
-        snapshot.generation = self.inner.load().generation.saturating_add(1);
+        let generation = self.published_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        snapshot.generation = generation;
         self.inner.store(Arc::new(snapshot));
     }
 }
@@ -118,6 +128,15 @@ mod tests {
         let first = store.read();
         let second = store.read();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn generation_increments_atomically_across_publish() {
+        let store = SnapshotStore::new();
+        store.publish(HfSnapshot::default());
+        store.publish(HfSnapshot::default());
+        assert_eq!(store.generation(), 2);
+        assert_eq!(store.read().generation, 2);
     }
 
     #[test]

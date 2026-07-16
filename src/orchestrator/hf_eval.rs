@@ -13,14 +13,16 @@ use crate::core::types::{
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
-use crate::pipeline::local_sim::{self, simulate_route_detailed, simulate_route_minimal};
+use crate::pipeline::local_sim::{
+    self, MinimalSimFailure, simulate_route_detailed, simulate_route_minimal,
+};
 use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
-    FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch,
-    min_economic_amount_in,
+    FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_fast,
+    check_sim_sanity_for_dispatch, min_economic_amount_in,
 };
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
-use crate::pipeline::ternary::{RouteGasCosting, optimize_cycle};
+use crate::pipeline::ternary::{BRENT_SEED_CACHE_SLOTS, RouteGasCosting, optimize_cycle};
 use crate::pipeline::types::OptimizationResult;
 use crate::pipeline::types::{MinimalSimResult, compare_cycle_score};
 use crate::services::execution::candidate::hash_cycle_edges;
@@ -57,6 +59,8 @@ struct SkipCounters {
     executor_budget: u32,
 }
 
+static MINIMAL_SIM_DIAGNOSTICS: AtomicU32 = AtomicU32::new(0);
+
 impl SkipCounters {
     fn merge(&mut self, other: SkipCounters) {
         self.rate += other.rate;
@@ -76,6 +80,44 @@ impl SkipCounters {
 
     fn minimal_sim(&self) -> u32 {
         self.minimal_no_sim + self.minimal_zero_profit + self.minimal_sanity
+    }
+}
+
+#[derive(Default)]
+struct MinimalSimReasonCounts {
+    invalid_route: u32,
+    missing_pool: u32,
+    non_tradable: u32,
+    shallow_cl: u32,
+    v2_reserve_exhausted: u32,
+    math: u32,
+    unsupported_state: u32,
+    zero_output: u32,
+}
+
+impl MinimalSimReasonCounts {
+    fn merge(&mut self, other: Self) {
+        self.invalid_route += other.invalid_route;
+        self.missing_pool += other.missing_pool;
+        self.non_tradable += other.non_tradable;
+        self.shallow_cl += other.shallow_cl;
+        self.v2_reserve_exhausted += other.v2_reserve_exhausted;
+        self.math += other.math;
+        self.unsupported_state += other.unsupported_state;
+        self.zero_output += other.zero_output;
+    }
+
+    fn record(&mut self, reason: MinimalSimFailure) {
+        match reason {
+            MinimalSimFailure::InvalidRoute => self.invalid_route += 1,
+            MinimalSimFailure::MissingPool { .. } => self.missing_pool += 1,
+            MinimalSimFailure::NonTradable { .. } => self.non_tradable += 1,
+            MinimalSimFailure::ShallowCl { .. } => self.shallow_cl += 1,
+            MinimalSimFailure::V2ReserveExhausted { .. } => self.v2_reserve_exhausted += 1,
+            MinimalSimFailure::Math { .. } => self.math += 1,
+            MinimalSimFailure::UnsupportedState { .. } => self.unsupported_state += 1,
+            MinimalSimFailure::ZeroOutput { .. } => self.zero_output += 1,
+        }
     }
 }
 
@@ -103,6 +145,7 @@ struct ProbeRankPartial {
     near_net: Vec<(u64, U256, FoundCycle)>,
     seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
     skip: SkipCounters,
+    minimal_sim_reasons: MinimalSimReasonCounts,
     flash_diag: Option<String>,
     flash_loan: FlashLoanDiagnostics,
 }
@@ -114,6 +157,7 @@ impl ProbeRankPartial {
         self.near_net.extend(other.near_net);
         self.seeds.extend(other.seeds);
         self.skip.merge(other.skip);
+        self.minimal_sim_reasons.merge(other.minimal_sim_reasons);
         if self.flash_diag.is_none() {
             self.flash_diag = other.flash_diag;
         }
@@ -425,6 +469,36 @@ fn rank_one_cycle_probe(
     let (probe_amount, probe) = match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
         Ok(probe) => probe,
         Err(reject) => {
+            if matches!(reject, MinimalProbeReject::NoSimulation) {
+                let mut first_failure = None;
+                for_each_rank_probe_amount(start_decimals, rate, |amount| {
+                    if first_failure.is_none() {
+                        first_failure = local_sim::minimal_sim_failure(arena, &cycle.edges, amount);
+                    }
+                });
+                if let Some(reason) = first_failure {
+                    out.minimal_sim_reasons.record(reason);
+                }
+            }
+            if matches!(reject, MinimalProbeReject::NoSimulation)
+                && MINIMAL_SIM_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 3
+            {
+                let mut attempts = Vec::with_capacity(2);
+                for_each_rank_probe_amount(start_decimals, rate, |amount| {
+                    attempts.push((
+                        amount,
+                        local_sim::minimal_sim_failure(arena, &cycle.edges, amount),
+                    ));
+                });
+                let route: Vec<_> = cycle
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.pool_index, edge.protocol))
+                    .collect();
+                crate::info!(
+                    "hf minimal-sim reject: fp={fp:#x} route={route:?} attempts={attempts:?}"
+                );
+            }
             if cycle.score < 0.0 {
                 out.rescue.push((fp, cycle.into_owned()));
             } else {
@@ -578,6 +652,7 @@ pub fn rank_cycles_by_probe_net(
         mut rescue,
         seeds: mut probe_seeds,
         skip,
+        minimal_sim_reasons,
         mut near_net,
         flash_diag,
         mut flash_loan,
@@ -649,7 +724,7 @@ pub fn rank_cycles_by_probe_net(
         }
         if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} near_net={near_net_count} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
@@ -659,6 +734,14 @@ pub fn rank_cycles_by_probe_net(
                 skip.minimal_no_sim,
                 skip.minimal_zero_profit,
                 skip.minimal_sanity,
+                minimal_sim_reasons.invalid_route,
+                minimal_sim_reasons.missing_pool,
+                minimal_sim_reasons.non_tradable,
+                minimal_sim_reasons.shallow_cl,
+                minimal_sim_reasons.v2_reserve_exhausted,
+                minimal_sim_reasons.math,
+                minimal_sim_reasons.unsupported_state,
+                minimal_sim_reasons.zero_output,
                 skip.net,
             );
         }
@@ -683,7 +766,7 @@ pub fn rank_cycles_by_probe_net(
         );
     } else if kept.len() * 4 < scanned.len() {
         crate::info!(
-            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} near_net={}",
+            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={}",
             kept.len(),
             scanned.len(),
             skip.rate,
@@ -696,6 +779,14 @@ pub fn rank_cycles_by_probe_net(
             skip.minimal_no_sim,
             skip.minimal_zero_profit,
             skip.minimal_sanity,
+            minimal_sim_reasons.invalid_route,
+            minimal_sim_reasons.missing_pool,
+            minimal_sim_reasons.non_tradable,
+            minimal_sim_reasons.shallow_cl,
+            minimal_sim_reasons.v2_reserve_exhausted,
+            minimal_sim_reasons.math,
+            minimal_sim_reasons.unsupported_state,
+            minimal_sim_reasons.zero_output,
             skip.net,
             near_net_count,
         );
@@ -960,6 +1051,47 @@ fn probe_fallback_opt(
     best
 }
 
+/// Economic + spot probe sims for Brent warm-start (deduped, sanity-filtered).
+fn build_brent_probe_seeds(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    start_decimals: u8,
+    start_rate: U256,
+    probe_seed: Option<(U256, MinimalSimResult)>,
+) -> Vec<(U256, MinimalSimResult)> {
+    let mut seeds = Vec::with_capacity(2);
+    if let Some(pair) = probe_seed {
+        seeds.push(pair);
+    }
+    for_each_rank_probe_amount(start_decimals, start_rate, |amount| {
+        if seeds.len() >= BRENT_SEED_CACHE_SLOTS {
+            return;
+        }
+        if seeds.iter().any(|(a, _)| *a == amount) {
+            return;
+        }
+        let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
+            return;
+        };
+        if sim.profit.is_zero() {
+            return;
+        }
+        if check_sim_sanity_fast(SimSanityInput {
+            amount_in: amount,
+            gross_profit: sim.profit,
+            search_low: U256::ZERO,
+            token_decimals: start_decimals,
+            token_to_matic_rate: start_rate,
+        })
+        .is_err()
+        {
+            return;
+        }
+        seeds.push((amount, sim));
+    });
+    seeds
+}
+
 fn evaluate_one(
     cycle: &FoundCycle,
     input: &HfEvalInput<'_>,
@@ -1031,6 +1163,9 @@ fn evaluate_one(
         oracle: input.gas_oracle,
         fingerprint: fp,
     };
+    let brent_seeds =
+        build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
+    let brent_seed_slice = (!brent_seeds.is_empty()).then_some(brent_seeds.as_slice());
 
     let (mut opt, mut sim, probe_only) = match optimize_cycle(
         input.arena,
@@ -1043,7 +1178,7 @@ fn evaluate_one(
         Some(input.brent_iters),
         None,
         &profit_ctx,
-        probe_seed.as_ref().map(std::slice::from_ref),
+        brent_seed_slice,
         Some(route_gas_costing),
         route_state_revision
             .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),

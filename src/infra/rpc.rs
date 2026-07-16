@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::config::AppConfig;
 use crate::info;
 use crate::infra::http::{HttpClientOpts, build_static};
+use crate::services::execution::private_submit::PrivateSubmitProbe;
 use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
@@ -32,6 +33,8 @@ pub struct RpcPool {
     failed_executors: Arc<Mutex<FxHashSet<(String, Address)>>>,
     state_url_penalties: Arc<RwLock<FxHashMap<String, Instant>>>,
     state_probe_inflight: Arc<AtomicBool>,
+    private_submit_probe: Arc<RwLock<Option<PrivateSubmitProbe>>>,
+    bloxroute_auth_verified: Arc<RwLock<Option<bool>>>,
 }
 
 impl std::fmt::Debug for RpcPool {
@@ -85,6 +88,8 @@ impl RpcPool {
             failed_executors: Arc::new(Mutex::new(FxHashSet::default())),
             state_url_penalties: Arc::new(RwLock::new(FxHashMap::default())),
             state_probe_inflight: Arc::new(AtomicBool::new(false)),
+            private_submit_probe: Arc::new(RwLock::new(None)),
+            bloxroute_auth_verified: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -258,6 +263,24 @@ impl RpcPool {
     #[must_use]
     pub fn require_private_submit(&self) -> bool {
         self.require_private_submit
+    }
+
+    pub fn record_private_submit_probe(&self, probe: PrivateSubmitProbe) {
+        *self.private_submit_probe.write() = Some(probe);
+    }
+
+    #[must_use]
+    pub fn private_submit_probe(&self) -> Option<PrivateSubmitProbe> {
+        self.private_submit_probe.read().clone()
+    }
+
+    pub fn record_bloxroute_auth_probe(&self, verified: bool) {
+        *self.bloxroute_auth_verified.write() = Some(verified);
+    }
+
+    #[must_use]
+    pub fn bloxroute_auth_verified(&self) -> Option<bool> {
+        *self.bloxroute_auth_verified.read()
     }
 
     /// Shared connection pool for JSON-RPC and other HTTP (e.g. Pyth Hermes).

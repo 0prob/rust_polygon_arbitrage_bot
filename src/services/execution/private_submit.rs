@@ -458,6 +458,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_submit_mode_uses_verified_private_rpc_capability() {
+        let probe = PrivateSubmitProbe {
+            url: "https://private.example".into(),
+            chain_id_ok: true,
+            supports_private_rpc_method: true,
+            private_method_error: Some("invalid transaction".into()),
+            recommended_mode: PrivateSubmitMode::PolygonPrivateRpc,
+        };
+        assert_eq!(
+            resolve_submit_mode(Some("https://private.example"), None, Some(&probe)),
+            PrivateSubmitMode::PolygonPrivateRpc
+        );
+    }
+
+    #[test]
     fn private_submit_mode_requires_chain_id_for_signed_raw_paths() {
         assert!((private_submit_mode_requires_chain_id(PrivateSubmitMode::Bloxroute)));
         assert!(private_submit_mode_requires_chain_id(

@@ -50,6 +50,12 @@ impl PoolRefreshResult {
     pub fn can_use_cached_state(&self) -> bool {
         self.matched > 0
     }
+
+    /// HF tick may skip dispatch pool refresh when prefetch warmed cache or nothing was stale.
+    #[must_use]
+    pub fn prefetch_tick_succeeded(&self) -> bool {
+        !self.attempted || self.updated > 0
+    }
 }
 
 /// Minimum interval between indexer lag checks.
@@ -788,6 +794,7 @@ impl StateRefreshService {
         let mut hash_ms = 0u64;
         let mut rpc_attempts = 0usize;
         let mut last_pinned_block = None;
+        let address_index = self.discovery_state.read().address_index.clone();
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,
@@ -804,7 +811,6 @@ impl StateRefreshService {
             rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
-            let address_index = self.discovery_state.read().address_index.clone();
             let fetch_result = fetch_missing_pool_states_indexed(
                 provider,
                 Arc::clone(&self.cache),
@@ -954,6 +960,30 @@ mod tests {
         assert_eq!(refresh_batch_for(2, 3_000, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 11_999, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 12_000, &config.pipeline), 500);
+    }
+
+    #[test]
+    fn prefetch_tick_succeeded_when_nothing_stale_or_updates_applied() {
+        use super::PoolRefreshResult;
+
+        assert!(PoolRefreshResult {
+            attempted: false,
+            updated: 0,
+            matched: 12,
+        }
+        .prefetch_tick_succeeded());
+        assert!(PoolRefreshResult {
+            attempted: true,
+            updated: 3,
+            matched: 12,
+        }
+        .prefetch_tick_succeeded());
+        assert!(!PoolRefreshResult {
+            attempted: true,
+            updated: 0,
+            matched: 12,
+        }
+        .prefetch_tick_succeeded());
     }
 
     #[test]

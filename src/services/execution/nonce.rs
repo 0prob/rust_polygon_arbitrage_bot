@@ -32,10 +32,12 @@ impl NonceState {
         if let Some(min_in_flight) = self.min_in_flight {
             n = n.min(min_in_flight);
         }
-        while self.in_flight.contains(&n) || self.stale.contains(&n) {
+        loop {
+            if !self.in_flight.contains(&n) && !self.stale.contains(&n) {
+                return n;
+            }
             n += 1;
         }
-        n
     }
 
     fn insert_in_flight(&mut self, nonce: u64) {
@@ -160,6 +162,18 @@ impl NonceManager {
     pub async fn resync<P: Provider<Ethereum>>(&self, provider: &P) -> anyhow::Result<()> {
         self.initialize(provider).await
     }
+
+    /// Resync from pending nonce when local tracking has stale or in-flight reservations.
+    pub async fn resync_if_dirty<P: Provider<Ethereum>>(
+        &self,
+        provider: &P,
+    ) -> anyhow::Result<bool> {
+        if self.stale_count() == 0 && self.in_flight_count() == 0 {
+            return Ok(false);
+        }
+        self.resync(provider).await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +209,51 @@ mod tests {
         state.remove_in_flight(9);
         assert_eq!(state.min_in_flight, None);
         assert_eq!(state.next_available(), 9);
+    }
+
+    #[test]
+    fn release_makes_reserved_nonce_available_again() {
+        let mgr = NonceManager::new(Address::ZERO);
+        mgr.initialized.store(true, Ordering::Release);
+        mgr.state.lock().local_nonce = 7;
+
+        let nonce = mgr
+            .next_nonce()
+            .expect("initialized manager reserves nonce");
+        assert_eq!(nonce, 7);
+        assert_eq!(mgr.in_flight_count(), 1);
+
+        mgr.release(nonce);
+        assert_eq!(mgr.in_flight_count(), 0);
+        assert_eq!(mgr.next_nonce().expect("released nonce is reusable"), 7);
+    }
+
+    #[test]
+    fn stale_and_in_flight_counts_for_dirty_resync() {
+        let mgr = NonceManager::new(Address::ZERO);
+        mgr.initialized.store(true, Ordering::Release);
+        mgr.state.lock().local_nonce = 3;
+        let n = mgr.next_nonce().expect("reserve");
+        assert_eq!(n, 3);
+        assert_eq!(mgr.in_flight_count(), 1);
+        mgr.mark_stale(n);
+        assert_eq!(mgr.in_flight_count(), 0);
+        assert_eq!(mgr.stale_count(), 1);
+    }
+
+    #[test]
+    fn mark_stale_prevents_private_timeout_nonce_reuse() {
+        let mgr = NonceManager::new(Address::ZERO);
+        mgr.initialized.store(true, Ordering::Release);
+        mgr.state.lock().local_nonce = 7;
+
+        let nonce = mgr
+            .next_nonce()
+            .expect("initialized manager reserves nonce");
+        mgr.mark_stale(nonce);
+
+        assert_eq!(mgr.in_flight_count(), 0);
+        assert_eq!(mgr.stale_count(), 1);
+        assert_eq!(mgr.next_nonce().expect("stale nonce stays reserved"), 8);
     }
 }

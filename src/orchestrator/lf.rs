@@ -45,6 +45,7 @@ use crate::services::state_refresh::StateRefreshService;
 
 struct LfCpuWork {
     graph_cache: Arc<Mutex<GraphCache>>,
+    cache: Arc<StateCache>,
     arena: StateArena,
     pool_metas: Arc<Vec<crate::pipeline::types::PoolMeta>>,
     dirty_pools: Vec<PoolIndex>,
@@ -100,9 +101,41 @@ fn lf_graph_build_gate(work: &LfCpuWork) -> GraphBuildGate {
     }
 }
 
-fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
+/// Merge LF-tick dirty pools with any cache writes that landed while the CPU job was queued.
+fn merge_dirty_pool_indices(mut base: Vec<PoolIndex>, extra: Vec<PoolIndex>) -> Vec<PoolIndex> {
+    for idx in extra {
+        if !base.contains(&idx) {
+            base.push(idx);
+        }
+    }
+    base
+}
+
+/// Overlay cache-hot pool states onto the LF arena snapshot before graph rescoring.
+fn overlay_dirty_cache_states(work: &mut LfCpuWork) {
+    let fresh_dirty = work
+        .cache
+        .take_dirty_pool_indices(work.arena.address_to_pool());
+    work.dirty_pools = merge_dirty_pool_indices(std::mem::take(&mut work.dirty_pools), fresh_dirty);
+    if work.dirty_pools.is_empty() {
+        work.state_generation = work.cache.generation();
+        return;
+    }
+    let addrs: Vec<Address> = work
+        .dirty_pools
+        .iter()
+        .filter_map(|idx| work.arena.pool_address(*idx))
+        .collect();
+    if !addrs.is_empty() {
+        work.arena.apply_hot_cache(&work.cache, &addrs);
+    }
+    work.state_generation = work.cache.generation();
+}
+
+fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
+    overlay_dirty_cache_states(&mut work);
     let routable_count = work.pool_metas.len();
-    let graph_gate = lf_graph_build_gate(work);
+    let graph_gate = lf_graph_build_gate(&work);
     let gate_ref = graph_gate.active().then_some(&graph_gate);
     let layout_fp = work.arena.routing_layout_fingerprint();
     let eligible_count =
@@ -133,6 +166,13 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
             );
         }
         let build_started = crate::util::now_ms();
+        let unpriced_pools = gate_ref.map_or(0, |gate| {
+            crate::pipeline::graph::count_graph_eligible_unpriced_pools(
+                &work.arena,
+                work.pool_metas.as_ref(),
+                gate,
+            )
+        });
         // Build outside lock to keep critical section short.
         let g = Arc::new(build_graph_with_gate(
             &work.arena,
@@ -143,7 +183,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         let stats = crate::pipeline::graph::topology_stats(g.as_ref());
         stats.log_summary(graph_action);
         crate::info!(
-            "graph build: ms={build_ms} eligible={eligible_count} routable_metas={routable_count}",
+            "graph build: ms={build_ms} eligible={eligible_count} unpriced_pools={unpriced_pools} routable_metas={routable_count}",
         );
         let mut gc = work.graph_cache.lock();
         gc.store(
@@ -351,7 +391,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
 async fn run_lf_cpu_async(work: LfCpuWork) -> anyhow::Result<LfCpuResult> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     crate::util::lf_cpu_pool().spawn(move || {
-        let result = crate::util::run_lf_cpu(|| run_lf_cpu_work(&work));
+        let result = crate::util::run_lf_cpu(|| run_lf_cpu_work(work));
         let _ = tx.send(result);
     });
     rx.await.context("lf cpu worker dropped")
@@ -434,7 +474,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let max_paths = ctx.config.routing.enumeration_max_paths as usize;
     let max_hops = ctx.config.routing.max_hops;
 
-    let prior_rates = Arc::clone(&ctx.snapshots.read().token_to_matic_rates);
+    let prior_rates = ctx.snapshots.token_to_matic_rates();
 
     let state_provider = ctx.rpc.connect_state().ok();
     let state_generation = ctx.cache.generation();
@@ -445,6 +485,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
     let cpu_work = LfCpuWork {
         graph_cache: Arc::clone(&ctx.graph_cache),
+        cache: Arc::clone(&ctx.cache),
         arena: arena.clone(),
         pool_metas: Arc::clone(&pool_metas),
         dirty_pools,
@@ -617,6 +658,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         .await
     };
     let rates = merge_token_rates(&prior_rates, &cycle_tokens_set, fresh_rates);
+    let rates_built_at = std::time::Instant::now();
     retain_cycles_with_priced_start(&mut capped, rates.as_ref());
     if rates.len() > prior_rates.len() {
         let post_gate = GraphBuildGate {
@@ -695,8 +737,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     let _cycle_count = capped.len();
     let _pool_count = pool_metas.len();
-    let pools_snapshot = pools.clone();
-
     let graph_pool_count = routing_graph.active_pool_count();
     crate::info!(
         "lf tick: cycles={}, enumerated_cycles={}, cycle_search_ms={}, arena_pools={}, graph_pools={}, discovered={}, resolvable_tokens={}",
@@ -762,7 +802,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     *ctx.arena.lock() = arena.clone();
-    let snapshot_now = std::time::Instant::now();
     let graph_active_by_protocol = Arc::new(
         crate::services::pipeline_survival::graph_active_protocol_counts(
             pool_metas.as_ref(),
@@ -778,9 +817,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             token_decimals: decimals,
             pool_metas,
             arena,
-            discovered_pools: pools_snapshot,
+            discovered_pools: Arc::clone(&pools),
             graph_active_by_protocol,
-            rates_built_at: Some(snapshot_now),
+            rates_built_at: Some(rates_built_at),
             ..Default::default()
         });
     // Publish first so the TUI poller cannot pair fresh LF metrics with the

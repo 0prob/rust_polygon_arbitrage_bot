@@ -26,7 +26,8 @@ use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
 };
 use crate::services::execution::{
-    ExecutionService, GasOracle, hash_cycle_edges, rotate_cycle_to_start,
+    ExecutionService, GasOracle, compute_conservative_gas_price, hash_cycle_edges,
+    rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::ensure_matic_usd_for_flash_cap;
@@ -34,9 +35,10 @@ use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::partial_cache::PartialPoolCache;
 use crate::services::state_cache::StateCache;
-use crate::services::state_refresh::StateRefreshService;
+use crate::services::execution::flash_liquidity::FlashLiquidityCache;
+use crate::services::state_refresh::{PoolRefreshResult, StateRefreshService};
 use crate::util::now_ms;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub struct HfContext {
     pub config: Arc<AppConfig>,
@@ -72,6 +74,76 @@ static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
 const HF_ORACLE_SKIP_INTERVAL_MS: u64 = 30_000;
 /// MATIC/USD refresh can hold singleflight longer than cache TTL; HF may use slightly stale price.
 const HF_MATIC_STALE_WARN_MS: u64 = 45_000;
+const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 750;
+
+async fn hf_pool_prefetch(
+    refresh: &StateRefreshService,
+    hot_pools: &[Address],
+    prefetch_count: usize,
+) -> anyhow::Result<PoolRefreshResult> {
+    refresh
+        .refresh_pool_states_for(hot_pools, prefetch_count)
+        .await
+}
+
+async fn hf_flash_prefetch_stale(
+    flash_cache: &FlashLiquidityCache,
+    rpc: &RpcPool,
+    flash_token_list: &[Address],
+) {
+    if flash_token_list.is_empty() {
+        return;
+    }
+    flash_cache.track_hot_tokens(flash_token_list);
+    let stale: Vec<Address> = flash_token_list
+        .iter()
+        .copied()
+        .filter(|addr| !flash_cache.has_fresh_entry(*addr))
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let flash_budget = Duration::from_millis(HF_FLASH_PREFETCH_BUDGET_MS);
+    let stale_n = stale.len();
+    let fresh_n = flash_token_list.len().saturating_sub(stale_n);
+    let Some(_inflight) = flash_cache.try_acquire_refresh_inflight() else {
+        crate::debug!("flash loan: hf_prefetch skipped stale={stale_n} (refresh inflight)");
+        return;
+    };
+    match timeout(
+        flash_budget,
+        flash_cache.refresh_with_fallback(rpc, &stale),
+    )
+    .await
+    {
+        Ok(Ok(generation)) => {
+            crate::info!(
+                "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation}"
+            );
+        }
+        Ok(Err(e)) => {
+            crate::info!(
+                "flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}"
+            );
+        }
+        Err(_) => crate::info!(
+            "flash loan: hf_prefetch timeout_ms={} stale={stale_n} fresh={fresh_n}",
+            flash_budget.as_millis(),
+        ),
+    }
+}
+
+fn collect_hf_flash_token_list(
+    arena: &StateArena,
+    cycles: &[Arc<FoundCycle>],
+) -> (FxHashSet<Address>, Vec<Address>) {
+    let mut seen = FxHashSet::default();
+    let mut list = Vec::new();
+    for c in cycles {
+        collect_flash_tokens_for_cycle(arena, c.as_ref(), &mut seen, &mut list);
+    }
+    (seen, list)
+}
 
 #[derive(Default)]
 pub struct InactiveCycleRotation {
@@ -103,6 +175,89 @@ fn inactive_indices(offset: usize, inactive_len: usize, take: usize) -> Vec<usiz
     (0..take.min(inactive_len))
         .map(|index| (offset + index) % inactive_len)
         .collect()
+}
+
+fn hot_pools_arc_from_set(
+    mut hot_pools_set: FxHashSet<Address>,
+    partial_cache: &PartialPoolCache,
+    stream_triggered: bool,
+    stream_enabled: bool,
+) -> Arc<[Address]> {
+    if stream_triggered && stream_enabled {
+        for addr in partial_cache.dirty_addresses() {
+            hot_pools_set.insert(addr);
+        }
+    }
+    hot_pools_set.into_iter().collect::<Vec<_>>().into()
+}
+
+/// Re-read LF snapshot and rebuild HF cycle/pool selection when generation advanced.
+#[allow(clippy::too_many_arguments)]
+fn hf_reselect_from_snapshot(
+    ctx: &HfContext,
+    rescore_cap: usize,
+    selection_generation: u64,
+    snap_cycle_count: &mut usize,
+    token_to_matic_rates: &mut Arc<rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>>,
+    token_decimals: &mut Arc<FxHashMap<alloy::primitives::Address, u8>>,
+    pool_metas_for_dispatch: &mut Arc<Vec<PoolMeta>>,
+    arena_base: &mut StateArena,
+    snap_state_block: &mut u64,
+    snap_state_hash: &mut Option<alloy::primitives::B256>,
+    cycles: &mut Vec<Arc<FoundCycle>>,
+    quarantine_skipped: &mut usize,
+    rate_skipped: &mut usize,
+    inactive_len: &mut usize,
+    inactive_selected: &mut usize,
+    stream_triggered: bool,
+    stream_enabled: bool,
+) -> Result<(u64, Arc<[Address]>), HfTickResult> {
+    let snap = ctx.snapshots.read();
+    *token_to_matic_rates = Arc::clone(&snap.token_to_matic_rates);
+    *token_decimals = Arc::clone(&snap.token_decimals);
+    *pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
+    *arena_base = snap.arena.clone();
+    *snap_cycle_count = snap.cycles.len();
+    let new_generation = snap.generation;
+    *snap_state_block = snap.state_block;
+    *snap_state_hash = snap.state_hash;
+    let inactive_offset = ctx
+        .inactive_rotation
+        .lock()
+        .offset_for(new_generation, *snap_cycle_count);
+    let selected = select_cycles_for_rescore(
+        &snap.cycles,
+        arena_base,
+        &ctx.partial_cache,
+        &ctx.execution,
+        token_to_matic_rates,
+        rescore_cap,
+        inactive_offset,
+    );
+    drop(snap);
+    *cycles = selected.cycles;
+    *quarantine_skipped = selected.quarantine_skipped;
+    *rate_skipped = selected.rate_skipped;
+    *inactive_len = selected.inactive_len;
+    *inactive_selected = selected.inactive_selected;
+    if cycles.is_empty() {
+        return Err(HfTickResult {
+            cycles_considered: 0,
+            profitable_count: 0,
+            best_profit: U256::ZERO,
+            elapsed_ms: 0,
+        });
+    }
+    let _ = selection_generation;
+    Ok((
+        new_generation,
+        hot_pools_arc_from_set(
+            selected.hot_pools,
+            &ctx.partial_cache,
+            stream_triggered,
+            stream_enabled,
+        ),
+    ))
 }
 
 fn stream_pending_pools(partial_cache: &PartialPoolCache, hot_pools: &[Address]) -> Vec<Address> {
@@ -179,6 +334,9 @@ struct BestEvalDiag {
     assessed_gas: u32,
     gas_basis: &'static str,
     sim_scale_bps: u64,
+    gas_base_fee_wei: U256,
+    gas_priority_fee_wei: U256,
+    gas_snapshot_age_ms: Option<u64>,
     gas_price_gwei: f64,
     gross: U256,
     net_matic: U256,
@@ -192,7 +350,7 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} slippage_bps={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_base_fee_wei={} gas_priority_fee_wei={} gas_snapshot_age_ms={:?} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} slippage_bps={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
         diag.route,
@@ -201,6 +359,9 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
         diag.assessed_gas,
         diag.gas_basis,
         diag.sim_scale_bps,
+        diag.gas_base_fee_wei,
+        diag.gas_priority_fee_wei,
+        diag.gas_snapshot_age_ms,
         diag.gas_price_gwei,
         diag.gross,
         diag.net_matic,
@@ -349,7 +510,7 @@ pub async fn run_hf_tick(
     let rescore_cap = pipeline.hf_score_cap;
     let sim_cap = pipeline.hf_sim_cap;
 
-    let mut snap = ctx.snapshots.read();
+    let snap = ctx.snapshots.read();
     if snap.cycles.is_empty() {
         return Ok(HfTickResult {
             cycles_considered: 0,
@@ -365,12 +526,6 @@ pub async fn run_hf_tick(
     let mut pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
     let mut arena_base = snap.arena.clone();
     let mut snap_cycle_count = snap.cycles.len();
-    let mut cycles;
-    let mut hot_pools_set;
-    let mut quarantine_skipped;
-    let mut rate_skipped;
-    let mut inactive_len;
-    let mut inactive_selected;
     let mut selection_generation = snap_generation;
     let inactive_offset = ctx
         .inactive_rotation
@@ -385,15 +540,19 @@ pub async fn run_hf_tick(
         rescore_cap,
         inactive_offset,
     );
-    cycles = selection.cycles;
-    hot_pools_set = selection.hot_pools;
-    quarantine_skipped = selection.quarantine_skipped;
-    rate_skipped = selection.rate_skipped;
+    let mut cycles = selection.cycles;
+    let hot_pools_set = selection.hot_pools;
+    let mut quarantine_skipped = selection.quarantine_skipped;
+    let mut rate_skipped = selection.rate_skipped;
     let activity_candidates = selection.activity_candidates;
     let activity_selected = selection.activity_selected;
-    inactive_len = selection.inactive_len;
-    inactive_selected = selection.inactive_selected;
-    if should_log_hf_summary() || stream_triggered {
+    let mut inactive_len = selection.inactive_len;
+    let mut inactive_selected = selection.inactive_selected;
+    let mut snap_state_block = snap.state_block;
+    let mut snap_state_hash = snap.state_hash;
+    drop(snap);
+    let log_hf_summary = should_log_hf_summary() || stream_triggered;
+    if log_hf_summary {
         crate::info!(
             "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
             cycles.len(),
@@ -413,14 +572,14 @@ pub async fn run_hf_tick(
             elapsed_ms: now_ms().saturating_sub(start),
         });
     }
-    if stream_triggered && pipeline.stream_enabled {
-        for addr in ctx.partial_cache.dirty_addresses() {
-            hot_pools_set.insert(addr);
-        }
-    }
-    let mut hot_pools: Arc<[Address]> = hot_pools_set.into_iter().collect::<Vec<_>>().into();
+    let mut hot_pools = hot_pools_arc_from_set(
+        hot_pools_set,
+        &ctx.partial_cache,
+        stream_triggered,
+        pipeline.stream_enabled,
+    );
 
-    let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
+    let Some(gas_snapshot) = ctx.gas_oracle.loaded_snapshot() else {
         crate::warn!("hf tick skipped: gas oracle has no fee snapshot yet");
         return Ok(HfTickResult {
             cycles_considered: 0,
@@ -429,37 +588,55 @@ pub async fn run_hf_tick(
             elapsed_ms: now_ms().saturating_sub(start),
         });
     };
+    let gas_price = compute_conservative_gas_price(gas_snapshot);
+    let gas_snapshot_age_ms = ctx.gas_oracle.snapshot_age_ms();
 
-    let refresh = Arc::clone(&ctx.refresh);
+    if ctx.snapshots.generation() != selection_generation {
+        match hf_reselect_from_snapshot(
+            &ctx,
+            rescore_cap,
+            selection_generation,
+            &mut snap_cycle_count,
+            &mut token_to_matic_rates,
+            &mut token_decimals,
+            &mut pool_metas_for_dispatch,
+            &mut arena_base,
+            &mut snap_state_block,
+            &mut snap_state_hash,
+            &mut cycles,
+            &mut quarantine_skipped,
+            &mut rate_skipped,
+            &mut inactive_len,
+            &mut inactive_selected,
+            stream_triggered,
+            pipeline.stream_enabled,
+        ) {
+            Ok((new_gen, hot)) => {
+                selection_generation = new_gen;
+                hot_pools = hot;
+            }
+            Err(_) => {
+                if should_log_hf_summary() {
+                    crate::info!(
+                        "hf tick: 0 cycles after refresh (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped})"
+                    );
+                }
+                return Ok(HfTickResult {
+                    cycles_considered: 0,
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                });
+            }
+        }
+    }
+
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
     let skip_prefetch = stream_triggered && pipeline.stream_enabled;
     let mut prefetch_ok = skip_prefetch;
-    let prefetch = if skip_prefetch || hot_pools.is_empty() {
-        None
-    } else {
-        let prefetch_hot = Arc::clone(&hot_pools);
-        Some(tokio::spawn(async move {
-            refresh
-                .refresh_pool_states_for(prefetch_hot.as_ref(), prefetch_count)
-                .await
-        }))
-    };
-
+    let pool_prefetch_budget =
+        Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
     let pool_prefetch_started = now_ms();
-    if let Some(handle) = prefetch {
-        let prefetch_budget =
-            std::time::Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
-        match tokio::time::timeout(prefetch_budget, handle).await {
-            Ok(Ok(Ok(_))) => prefetch_ok = true,
-            Ok(Ok(Err(e))) => crate::debug!("hf prefetch failed: {e:#}"),
-            Ok(Err(e)) => crate::debug!("hf prefetch task failed: {e}"),
-            Err(_) => crate::debug!(
-                "hf prefetch timed out after {}ms",
-                prefetch_budget.as_millis()
-            ),
-        }
-    }
-    let mut pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
 
     if stream_triggered && pipeline.stream_enabled {
         let flushed = ctx
@@ -479,13 +656,13 @@ pub async fn run_hf_tick(
             )
             .await
             {
-                Ok(Ok(_)) => {
+                Ok(Ok(result)) => {
                     let recovered = ctx
                         .partial_cache
                         .flush_to_state_cache(&ctx.cache, &pending_pools);
                     let remaining = stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
                     if remaining.is_empty() {
-                        prefetch_ok = true;
+                        prefetch_ok = result.prefetch_tick_succeeded();
                         crate::info!(
                             "stream state recovery: refreshed={} flushed={recovered}",
                             pending_pools.len()
@@ -525,106 +702,101 @@ pub async fn run_hf_tick(
                     });
                 }
             }
-            pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
         } else if flushed > 0 {
             prefetch_ok = true;
         }
     }
 
-    let latest_generation = ctx.snapshots.generation();
-    if latest_generation != snap_generation {
-        snap = ctx.snapshots.read();
-        token_to_matic_rates = Arc::clone(&snap.token_to_matic_rates);
-        token_decimals = Arc::clone(&snap.token_decimals);
-        pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
-        arena_base = snap.arena.clone();
-        snap_cycle_count = snap.cycles.len();
-        selection_generation = snap.generation;
-        let inactive_offset = ctx
-            .inactive_rotation
-            .lock()
-            .offset_for(selection_generation, snap_cycle_count);
-        let selected = select_cycles_for_rescore(
-            &snap.cycles,
-            &arena_base,
-            &ctx.partial_cache,
-            &ctx.execution,
-            &token_to_matic_rates,
-            rescore_cap,
-            inactive_offset,
+    let flash_prefetch_started = now_ms();
+    let flash_token_list = collect_hf_flash_token_list(&arena_base, &cycles).1;
+    let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
+    let rpc = Arc::clone(&ctx.rpc);
+    let refresh = Arc::clone(&ctx.refresh);
+
+    if skip_prefetch || hot_pools.is_empty() {
+        hf_flash_prefetch_stale(flash_cache.as_ref(), rpc.as_ref(), &flash_token_list).await;
+        if !flash_token_list.is_empty() {
+            flash_cache.spawn_refresh_if_stale(rpc, &flash_token_list);
+        }
+    } else {
+        let hot = Arc::clone(&hot_pools);
+        let pool_fut = async {
+            timeout(
+                pool_prefetch_budget,
+                hf_pool_prefetch(refresh.as_ref(), hot.as_ref(), prefetch_count),
+            )
+            .await
+        };
+        let flash_fut = hf_flash_prefetch_stale(
+            flash_cache.as_ref(),
+            rpc.as_ref(),
+            &flash_token_list,
         );
-        cycles = selected.cycles;
-        hot_pools = selected.hot_pools.into_iter().collect::<Vec<_>>().into();
-        quarantine_skipped = selected.quarantine_skipped;
-        rate_skipped = selected.rate_skipped;
-        inactive_len = selected.inactive_len;
-        inactive_selected = selected.inactive_selected;
-        if cycles.is_empty() {
-            if should_log_hf_summary() {
-                crate::info!(
-                    "hf tick: 0 cycles after refresh (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped})"
-                );
+        let (pool_out, _) = tokio::join!(pool_fut, flash_fut);
+        match pool_out {
+            Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
+            Ok(Err(e)) => crate::debug!("hf prefetch failed: {e:#}"),
+            Err(_) => crate::debug!(
+                "hf prefetch timed out after {}ms",
+                pool_prefetch_budget.as_millis()
+            ),
+        }
+        if !flash_token_list.is_empty() {
+            flash_cache.spawn_refresh_if_stale(rpc, &flash_token_list);
+        }
+    }
+
+    let pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
+    let flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
+
+    if ctx.snapshots.generation() != selection_generation {
+        crate::debug!(
+            "hf snap: generation advanced during prefetch ({selection_generation} -> {})",
+            ctx.snapshots.generation()
+        );
+        match hf_reselect_from_snapshot(
+            &ctx,
+            rescore_cap,
+            selection_generation,
+            &mut snap_cycle_count,
+            &mut token_to_matic_rates,
+            &mut token_decimals,
+            &mut pool_metas_for_dispatch,
+            &mut arena_base,
+            &mut snap_state_block,
+            &mut snap_state_hash,
+            &mut cycles,
+            &mut quarantine_skipped,
+            &mut rate_skipped,
+            &mut inactive_len,
+            &mut inactive_selected,
+            stream_triggered,
+            pipeline.stream_enabled,
+        ) {
+            Ok((new_gen, hot)) => {
+                selection_generation = new_gen;
+                hot_pools = hot;
             }
-            return Ok(HfTickResult {
-                cycles_considered: 0,
-                profitable_count: 0,
-                best_profit: U256::ZERO,
-                elapsed_ms: now_ms().saturating_sub(start),
-            });
+            Err(_) => {
+                return Ok(HfTickResult {
+                    cycles_considered: snap_cycle_count,
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                });
+            }
         }
     }
 
     let mut arena = arena_base;
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
-
-    let mut flash_tokens = FxHashSet::default();
-    let mut flash_token_list = Vec::new();
-    for c in &cycles {
-        collect_flash_tokens_for_cycle(
-            &arena,
-            c.as_ref(),
-            &mut flash_tokens,
-            &mut flash_token_list,
+    if log_hf_summary {
+        crate::info!(
+            "hf eval input: stream_triggered={stream_triggered} snap_generation={selection_generation} state_generation={evaluation_state_generation} state_block={} hot_pools={} gas_snapshot_age_ms={gas_snapshot_age_ms:?}",
+            ctx.refresh.last_state_block(),
+            hot_pools.len(),
         );
     }
-    let flash_prefetch_started = now_ms();
-    if !flash_token_list.is_empty() {
-        let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
-        flash_cache.track_hot_tokens(&flash_token_list);
-        let stale: Vec<Address> = flash_token_list
-            .iter()
-            .copied()
-            .filter(|addr| !flash_cache.has_fresh_entry(*addr))
-            .collect();
-        if !stale.is_empty() {
-            let flash_budget = std::time::Duration::from_millis(750);
-            let stale_n = stale.len();
-            let fresh_n = flash_token_list.len().saturating_sub(stale_n);
-            match tokio::time::timeout(
-                flash_budget,
-                flash_cache.refresh_with_fallback(&ctx.rpc, &stale),
-            )
-            .await
-            {
-                Ok(Ok(generation)) => {
-                    crate::info!(
-                        "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation}"
-                    );
-                }
-                Ok(Err(e)) => {
-                    crate::info!(
-                        "flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}"
-                    );
-                }
-                Err(_) => crate::info!(
-                    "flash loan: hf_prefetch timeout_ms={} stale={stale_n} fresh={fresh_n}",
-                    flash_budget.as_millis(),
-                ),
-            }
-        }
-        flash_cache.spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_token_list);
-    }
-    let flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
 
     let flash_policy = ctx.config.flash_policy;
     let state_provider = ctx.rpc.connect_state().ok();
@@ -767,6 +939,9 @@ pub async fn run_hf_tick(
                     "scaled_heuristic"
                 },
                 sim_scale_bps: ctx.gas_oracle.sim_scale_bps(),
+                gas_base_fee_wei: gas_snapshot.base_fee,
+                gas_priority_fee_wei: gas_snapshot.priority_fee,
+                gas_snapshot_age_ms,
                 gas_price_gwei: crate::util::u256_to_f64(gas_price) / 1e9,
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
@@ -799,12 +974,12 @@ pub async fn run_hf_tick(
 
     let mut skip_dispatch_refresh = prefetch_ok;
     let mut dispatch_state_generation = evaluation_state_generation;
-    let mut dispatch_state_block = if snap.state_block > 0 {
-        snap.state_block
+    let mut dispatch_state_block = if snap_state_block > 0 {
+        snap_state_block
     } else {
         ctx.refresh.last_state_block()
     };
-    let mut dispatch_state_hash = snap.state_hash;
+    let mut dispatch_state_hash = snap_state_hash;
     let verify_started = now_ms();
     if !profitable.is_empty()
         && let Some(executor) = ctx.config.execution.executor_address

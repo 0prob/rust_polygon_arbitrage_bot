@@ -11,7 +11,8 @@ use crate::pipeline::brent_diag::{
     record_brent_warm_seed,
 };
 use crate::pipeline::local_sim::{
-    cl_amount_cap, precompute_route_shallow_caps, simulate_route_minimal_with_caps,
+    precompute_route_shallow_caps, simulate_route_minimal_with_caps,
+    tickless_cl_start_input_cap,
 };
 use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
@@ -38,7 +39,8 @@ pub struct RouteGasCosting<'a> {
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::util::ten_pow_u256_cached;
 
-const BRENT_CACHE_SLOTS: usize = 24;
+pub const BRENT_SEED_CACHE_SLOTS: usize = 24;
+const BRENT_CACHE_SLOTS: usize = BRENT_SEED_CACHE_SLOTS;
 const GOLDEN_RATIO: u128 = 382;
 const CONVERGENCE_DIVISOR: u128 = 1000;
 const DEFAULT_BRENT_ITERATIONS: u32 = 16;
@@ -127,16 +129,10 @@ where
     }
 
     let mut cached_evaluate = |amount: U256| -> U256 {
-        // ponytail: manual unrolled search over small fixed-size cache (16 slots).
-        // The optimizer struggles to auto-vectorize the dynamic bounds path when
-        // cache_size < BRENT_CACHE_SLOTS, so we search the full allocated region
-        // and short-circuit on ZERO sentinels.
-        for i in 0..BRENT_CACHE_SLOTS {
+        let scan = cache_size.min(BRENT_CACHE_SLOTS);
+        for i in 0..scan {
             if cache_amounts[i] == amount {
                 return cache_profits[i];
-            }
-            if cache_amounts[i].is_zero() {
-                break;
             }
         }
         let profit = evaluate(amount);
@@ -476,30 +472,32 @@ pub fn optimize_cycle(
     })?;
 
     let brent_shallow_caps = precompute_route_shallow_caps(arena, edges);
-    if let Some(cap) = cl_amount_cap(arena, edges) {
-        if cap.is_zero() {
+    if let Some(tickless_high) =
+        tickless_cl_start_input_cap(arena, cycle.start_token, edges)
+    {
+        if tickless_high.is_zero() {
             record_brent_reject(BrentOptimizeReject::ClCapZero);
-            crate::trace!("optimize_cycle: CL cap is zero");
+            crate::trace!("optimize_cycle: tickless CL cap is zero");
             return None;
         }
-        if economic_floor > cap {
+        if economic_floor > tickless_high {
             return optimize_at_amount_cap(
                 arena,
                 edges,
-                cap,
-                cap,
+                tickless_high,
+                tickless_high,
                 start_decimals,
                 start_rate,
                 brent_shallow_caps.as_ref(),
             );
         }
-        if high > cap {
-            high = cap;
+        if high > tickless_high {
+            high = tickless_high;
         }
         if high <= low {
             record_brent_reject(BrentOptimizeReject::ClCapBoundsEmpty);
             crate::trace!(
-                "optimize_cycle: bounds empty after CL cap low={low} high={high} cap={cap}"
+                "optimize_cycle: bounds empty after tickless CL cap low={low} high={high} cap={tickless_high}"
             );
             return None;
         }

@@ -44,8 +44,8 @@ const PYTH_MATIC_USD_ID: &str = "ffd11c5a1cfd42f80afb2df4d9f264c15f956d681533353
 /// Zero rates are rejected downstream by MIN_TOKEN_TO_MATIC_RATE — no trade
 /// executes without a real price. The real MATIC/USD is fetched every tick.
 const DEFAULT_MATIC_USD: f64 = 0.0;
-#[allow(dead_code)]
-const DEFAULT_CACHE_TTL_MS: u64 = 10_000;
+/// Default oracle quote cache TTL (also `OracleConfig::cache_ttl_ms` serde default).
+pub const DEFAULT_CACHE_TTL_MS: u64 = 10_000;
 
 #[derive(Clone, Copy)]
 struct TokenFeed {

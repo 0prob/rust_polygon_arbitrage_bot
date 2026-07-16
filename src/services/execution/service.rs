@@ -29,6 +29,9 @@ use crate::services::execution::gas::{
     profit_reassess_gas, submit_gas_basis,
 };
 use crate::services::execution::gas_oracle::GasOracle;
+use crate::services::execution::mempool::{
+    MEMPOOL_NONCE_CACHE_TTL, MEMPOOL_STALL_TIMEOUT, decide_mempool_gate,
+};
 use crate::services::execution::nonce::NonceManager;
 use crate::services::execution::private_submit::{
     PrivateSubmitConfig, private_submit_mode_requires_chain_id, resolve_submit_mode,
@@ -121,6 +124,8 @@ fn utc_day_number() -> u32 {
 pub struct ExecutionService {
     last_submit: RwLock<FxHashMap<u64, Instant>>,
     last_global_submit: Mutex<Option<Instant>>,
+    /// Cached `(fetched_at, latest_nonce, pending_nonce)` for mempool gate RPC coalescing.
+    mempool_nonce_cache: Mutex<Option<(Instant, u64, u64)>>,
     quarantine: RwLock<FxHashMap<u64, Instant>>,
     route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
     global_quarantine_until: Mutex<Option<Instant>>,
@@ -244,6 +249,7 @@ impl ExecutionService {
         Self {
             last_submit: RwLock::new(FxHashMap::default()),
             last_global_submit: parking_lot::Mutex::new(None),
+            mempool_nonce_cache: parking_lot::Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
             global_quarantine_until: parking_lot::Mutex::new(None),
@@ -269,7 +275,6 @@ impl ExecutionService {
 
 impl ExecutionService {
     #[must_use]
-    #[allow(dead_code)] // used by generation-tracking unit test; dispatch relies on dry-run authority
     fn candidate_matches_state_generation(
         candidate: &CandidateExecution,
         state_cache: &StateCache,
@@ -589,29 +594,54 @@ impl ExecutionService {
         &self,
         provider: &P,
         operator: Address,
-    ) -> anyhow::Result<bool> {
-        const MEMPOOL_STALL_TIMEOUT: Duration = Duration::from_secs(20);
-        let (latest_res, pending_res) = tokio::join!(
-            provider.get_transaction_count(operator),
-            provider
-                .get_transaction_count(operator)
-                .block_id(alloy::eips::BlockId::pending()),
-        );
-        let latest = latest_res.context("failed to read latest operator nonce")?;
-        let pending = pending_res.context("failed to read pending operator nonce")?;
-        if pending == latest {
-            return Ok(true);
-        }
-        if let Some(last) = *self.last_global_submit.lock()
-            && last.elapsed() > MEMPOOL_STALL_TIMEOUT
+    ) -> anyhow::Result<(bool, bool)> {
+        let now = Instant::now();
+        let last_global_submit = *self.last_global_submit.lock();
+
+        let cached = {
+            let guard = self.mempool_nonce_cache.lock();
+            *guard
+        };
+        let (latest, pending) = if let Some((fetched_at, latest, pending)) = cached
+            && fetched_at.elapsed() < MEMPOOL_NONCE_CACHE_TTL
         {
-            crate::warn!(
-                "mempool not clear for {:.0}s — resyncing nonce",
-                last.elapsed().as_secs_f64()
+            (latest, pending)
+        } else {
+            let (latest_res, pending_res) = tokio::join!(
+                provider.get_transaction_count(operator),
+                provider
+                    .get_transaction_count(operator)
+                    .block_id(alloy::eips::BlockId::pending()),
             );
-            return Ok(true);
+            let latest = latest_res.context("failed to read latest operator nonce")?;
+            let pending = pending_res.context("failed to read pending operator nonce")?;
+            *self.mempool_nonce_cache.lock() = Some((Instant::now(), latest, pending));
+            (latest, pending)
+        };
+
+        let decision = decide_mempool_gate(
+            latest,
+            pending,
+            last_global_submit,
+            now,
+            MEMPOOL_STALL_TIMEOUT,
+        );
+
+        if decision.pending_ahead && decision.allow_submit {
+            crate::warn!(
+                "mempool ahead of latest — allowing submit with nonce resync (latest={latest} pending={pending})"
+            );
+        } else if !decision.allow_submit {
+            crate::debug!(
+                "mempool gate: waiting on pending tx (latest={latest} pending={pending})"
+            );
         }
-        Ok(false)
+
+        Ok((decision.allow_submit, decision.pending_ahead))
+    }
+
+    fn invalidate_mempool_nonce_cache(&self) {
+        *self.mempool_nonce_cache.lock() = None;
     }
 
     pub async fn ensure_nonce_manager<P: Provider<Ethereum>>(
@@ -646,7 +676,7 @@ impl ExecutionService {
             })
         };
         if let Some(mgr) = mgr
-            && mgr.in_flight_count() > 0
+            && (mgr.in_flight_count() > 0 || mgr.stale_count() > 0)
             && let Err(e) = mgr.resync(provider).await
         {
             crate::warn!("shutdown nonce resync failed for {operator}: {e:#}");
@@ -728,13 +758,12 @@ impl ExecutionService {
 
         let now = Instant::now();
 
-        let current_generation = state_cache.generation();
-        if candidate.state_generation != current_generation {
+        if !Self::candidate_matches_state_generation(candidate, state_cache) {
             crate::debug!(
                 "dispatch generation drift: fp={}, candidate={} current={} (dry-run is authoritative)",
                 fp,
                 candidate.state_generation,
-                current_generation,
+                state_cache.generation(),
             );
         }
 
@@ -1071,23 +1100,6 @@ impl ExecutionService {
             fp,
             gas_used
         );
-        let mempool_clear = match self.operator_mempool_clear(sim_provider, operator).await {
-            Ok(clear) => clear,
-            Err(e) => {
-                crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
-                return ExecutionOutcome::SubmitFailed {
-                    reason: e.to_string(),
-                };
-            }
-        };
-        if !mempool_clear {
-            crate::info!("dispatch skip: fp={}, mempool not clear — resyncing", fp);
-            let outcome = ExecutionOutcome::SkippedCooldown;
-            if let Some(ui_hook) = ui_hook {
-                ui_hook.on_execution_outcome(&outcome, fp);
-            }
-            return outcome;
-        }
 
         let Some(signer) = wallet.signer() else {
             crate::error!("dispatch skip: fp={}, wallet has no signer", fp);
@@ -1112,6 +1124,25 @@ impl ExecutionService {
                 return outcome;
             }
         };
+
+        let (mempool_clear, pending_ahead) =
+            match self.operator_mempool_clear(&submit_provider, operator).await {
+                Ok(status) => status,
+                Err(e) => {
+                    crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
+                    return ExecutionOutcome::SubmitFailed {
+                        reason: e.to_string(),
+                    };
+                }
+            };
+        if !mempool_clear {
+            crate::info!("dispatch skip: fp={}, mempool not clear — waiting", fp);
+            let outcome = ExecutionOutcome::SkippedCooldown;
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
 
         if shutdown.is_some_and(|rx| *rx.borrow()) {
             let outcome = ExecutionOutcome::SkippedShutdown;
@@ -1199,6 +1230,17 @@ impl ExecutionService {
             }
         };
 
+        if pending_ahead {
+            if let Err(e) = nonce_mgr.resync(&submit_provider).await {
+                crate::warn!(
+                    "dispatch: fp={}, nonce resync after mempool stall failed: {e:#}",
+                    fp
+                );
+            }
+        } else if let Err(e) = nonce_mgr.resync_if_dirty(&submit_provider).await {
+            crate::warn!("dispatch: fp={}, nonce resync_if_dirty failed: {e:#}", fp);
+        }
+
         let mut nonce = match nonce_mgr.next_nonce() {
             Ok(n) => n,
             Err(e) => {
@@ -1216,6 +1258,7 @@ impl ExecutionService {
         let private_cfg = match build_private_config(rpc, signer, chain_id) {
             Ok(cfg) => cfg,
             Err(e) => {
+                nonce_mgr.release(nonce);
                 crate::error!("private submit misconfigured: {e:#}");
                 let outcome = ExecutionOutcome::SubmitFailed {
                     reason: format!("private submit requires chain_id: {e:#}"),
@@ -1251,6 +1294,7 @@ impl ExecutionService {
             Err(e) => {
                 crate::warn!("submit failed: fp={}, nonce={}, error={e:#}", fp, nonce,);
                 nonce_mgr.release(nonce);
+                self.invalidate_mempool_nonce_cache();
                 self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
                 match classify_submit_error(&e) {
                     SubmitAction::ResyncAndRetry => {
@@ -1270,6 +1314,7 @@ impl ExecutionService {
             }
         };
         *self.last_global_submit.lock() = Some(now);
+        self.invalidate_mempool_nonce_cache();
 
         let poller = ReceiptPoller::new(
             Duration::from_millis(config.execution.receipt_timeout_ms),
@@ -1527,7 +1572,21 @@ fn build_private_config(
     let bloxroute_auth = std::env::var("BLOXROUTE_AUTH_HEADER")
         .ok()
         .filter(|s| !s.is_empty());
-    let mode = resolve_submit_mode(private_url.as_deref(), bloxroute_auth.as_deref(), None);
+    let probe = rpc.private_submit_probe();
+    let mode = resolve_submit_mode(
+        private_url.as_deref(),
+        bloxroute_auth.as_deref(),
+        probe.as_ref(),
+    );
+    if rpc.require_private_submit()
+        && !required_private_relay_capability_verified(
+            bloxroute_auth.is_some(),
+            rpc.bloxroute_auth_verified(),
+            probe.is_some_and(|probe| probe.supports_private_rpc_method),
+        )
+    {
+        anyhow::bail!("private submit capability is not verified for the configured relay");
+    }
     if !private_submit_mode_requires_chain_id(mode) {
         return Ok(None);
     }
@@ -1543,6 +1602,18 @@ fn build_private_config(
         private_url,
         bloxroute_auth,
     }))
+}
+
+fn required_private_relay_capability_verified(
+    has_bloxroute_auth: bool,
+    bloxroute_auth_verified: Option<bool>,
+    private_rpc_method_verified: bool,
+) -> bool {
+    if has_bloxroute_auth {
+        bloxroute_auth_verified == Some(true)
+    } else {
+        private_rpc_method_verified
+    }
 }
 
 fn min_operator_balance_wei(config: &AppConfig) -> Option<U256> {
@@ -1570,6 +1641,54 @@ fn required_operator_balance(
 mod safety_tests {
     use super::*;
     use crate::services::execution::candidate::CandidateExecution;
+
+    #[test]
+    fn required_private_submit_needs_verified_private_rpc_capability() {
+        let mut config = AppConfig::default();
+        config.execution.require_private_submit = true;
+        config.rpc.private_rpc_url = Some("https://private.example".into());
+        let rpc = RpcPool::from_config(&config);
+        let signer = "0x0101010101010101010101010101010101010101010101010101010101010101"
+            .parse::<alloy::signers::local::PrivateKeySigner>()
+            .expect("test signer");
+
+        assert!(build_private_config(&rpc, &signer, Some(137)).is_err());
+
+        rpc.record_private_submit_probe(
+            crate::services::execution::private_submit::PrivateSubmitProbe {
+                url: "https://private.example".into(),
+                chain_id_ok: true,
+                supports_private_rpc_method: true,
+                private_method_error: None,
+                recommended_mode:
+                    crate::services::execution::private_submit::PrivateSubmitMode::PolygonPrivateRpc,
+            },
+        );
+        let config = build_private_config(&rpc, &signer, Some(137))
+            .expect("verified private RPC config")
+            .expect("private mode");
+        assert_eq!(
+            config.mode,
+            crate::services::execution::private_submit::PrivateSubmitMode::PolygonPrivateRpc
+        );
+    }
+
+    #[test]
+    fn required_private_submit_requires_positive_bloxroute_auth_probe() {
+        assert!(!required_private_relay_capability_verified(
+            true, None, true
+        ));
+        assert!(!required_private_relay_capability_verified(
+            true,
+            Some(false),
+            true
+        ));
+        assert!(required_private_relay_capability_verified(
+            true,
+            Some(true),
+            false
+        ));
+    }
 
     #[test]
     fn operator_balance_covers_reserve_value_and_worst_case_gas() {

@@ -118,7 +118,7 @@ impl StateArena {
     #[inline]
     pub fn pool_state(&self, index: PoolIndex) -> Option<&PoolState> {
         let idx = index.0 as usize;
-        if let Some(Some(state)) = self.hot_overlay.get(idx) {
+        if let Some(state) = self.hot_overlay.get(idx).and_then(Option::as_ref) {
             return Some(state.as_ref());
         }
         self.inner.pools.get(idx).map(std::convert::AsRef::as_ref)
@@ -220,24 +220,45 @@ impl StateArena {
         idx
     }
 
-    /// Overlay fresh pool states from cache (HF hot-path; Arc clone only).
-    pub fn apply_hot_cache(&mut self, cache: &StateCache, addresses: &[Address]) -> u64 {
+    fn ensure_hot_storage(&mut self) {
         let pool_count = self.inner.pools.len();
         if self.hot_overlay.len() != pool_count {
             self.hot_overlay.resize(pool_count, None);
             self.hot_revisions.resize(pool_count, 0);
         }
-        let (states, generation) = cache.get_arcs_with_generation(addresses);
+    }
+
+    /// Overlay fresh pool states from cache (HF hot-path; Arc clone only).
+    pub fn apply_hot_cache(&mut self, cache: &StateCache, addresses: &[Address]) -> u64 {
+        if addresses.is_empty() {
+            return cache.generation();
+        }
+        self.ensure_hot_storage();
+        let mut unique: Vec<Address> = addresses.to_vec();
+        if unique.len() > 1 {
+            unique.sort_unstable();
+            unique.dedup();
+        }
+        let (states, generation) = cache.get_arcs_with_generation(&unique);
+        let mut fresh: FxHashMap<Address, (Arc<PoolState>, u64)> =
+            FxHashMap::with_capacity_and_hasher(states.len(), Default::default());
         for (address, state, revision) in states {
+            fresh.insert(address, (state, revision));
+        }
+        for address in unique {
             let Some(&idx) = self.inner.address_to_pool.get(&address) else {
                 continue;
             };
-            let slot = idx.0 as usize;
-            if let Some(overlay) = self.hot_overlay.get_mut(slot) {
-                *overlay = Some(state);
-            }
-            if let Some(hot_revision) = self.hot_revisions.get_mut(slot) {
-                *hot_revision = revision;
+            if let Some((state, revision)) = fresh.get(&address) {
+                let slot = idx.0 as usize;
+                if let Some(overlay) = self.hot_overlay.get_mut(slot) {
+                    *overlay = Some(Arc::clone(state));
+                }
+                if let Some(hot_revision) = self.hot_revisions.get_mut(slot) {
+                    *hot_revision = *revision;
+                }
+            } else {
+                self.clear_hot_slot(idx);
             }
         }
         generation
@@ -260,6 +281,8 @@ impl StateArena {
                 .all(|(_, address, _)| self.inner.address_to_pool.contains_key(address));
         if !reusable {
             *Arc::make_mut(&mut self.inner) = ArenaInner::default();
+            self.hot_overlay.clear();
+            self.hot_revisions.clear();
             let inner = Arc::make_mut(&mut self.inner);
             let expected_tokens = tradable
                 .iter()
@@ -727,6 +750,99 @@ mod tests {
             metas.is_empty(),
             "missing weth decimals must not admit pool"
         );
+    }
+
+    #[test]
+    fn apply_hot_cache_clears_overlay_when_cache_entry_missing() {
+        let addr = Address::from([4u8; 20]);
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(addr, v2_state());
+        let cache = StateCache::default();
+        cache.insert(addr, (*v2_state()).clone());
+        arena.apply_hot_cache(&cache, &[addr]);
+        assert!(arena.hot_overlay[0].is_some());
+
+        cache.remove(&addr);
+        arena.apply_hot_cache(&cache, &[addr]);
+        assert!(arena.hot_overlay[0].is_none());
+        assert!(arena.pool_state(idx).is_some());
+    }
+
+    #[test]
+    fn sync_rebuild_clears_hot_overlay_vectors() {
+        let pool_a = Address::with_last_byte(30);
+        let pool_b = Address::with_last_byte(31);
+        let token_a = Address::with_last_byte(40);
+        let token_b = Address::with_last_byte(41);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let cache = StateCache::default();
+        cache.insert(
+            pool_a,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        let discovered_a = [DiscoveredPool {
+            pool_key: pool_a.to_string(),
+            address: pool_a,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "A".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let index_a = discovered_a
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let mut arena = StateArena::default();
+        arena.sync_from_discovery(&cache, &discovered_a, &index_a, None);
+        arena.hot_overlay.resize(1, Some(v2_state()));
+        arena.hot_revisions.resize(1, 99);
+
+        cache.insert(
+            pool_b,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 2,
+            }),
+        );
+        let discovered_b = [DiscoveredPool {
+            pool_key: pool_b.to_string(),
+            address: pool_b,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "B".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 2,
+        }];
+        let index_b = discovered_b
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        arena.sync_from_discovery(&cache, &discovered_b, &index_b, None);
+        assert!(arena.hot_overlay.is_empty());
+        assert!(arena.hot_revisions.is_empty());
+        assert_eq!(arena.pool_count(), 1);
     }
 
     #[test]

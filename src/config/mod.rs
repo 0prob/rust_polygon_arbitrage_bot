@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
+use crate::services::oracle::price_oracle::DEFAULT_CACHE_TTL_MS;
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use anyhow::{Context, ensure};
@@ -316,7 +317,7 @@ fn default_tick_word_range() -> i16 {
     10
 }
 fn default_cache_ttl_ms() -> u64 {
-    10_000
+    DEFAULT_CACHE_TTL_MS
 }
 
 impl Default for RpcConfig {

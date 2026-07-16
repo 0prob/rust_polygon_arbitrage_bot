@@ -30,7 +30,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 
 ## Prerequisites
 
-- **Rust nightly** — `.cargo/config.toml` uses `-Zthreads`; crate is edition 2024.
+- **Rust nightly** — pinned in `rust-toolchain.toml`; `.cargo/config.toml` uses `-Zthreads`; crate is edition 2024.
 - **Polygon RPC** — archival endpoint recommended for pool-state reads (`STATE_RPC_URL` / `POLYGON_RPC_URLS`).
 - **Envio indexer** — PostgreSQL from sibling HyperIndex repo (`PG_URL`; typical default `postgres://postgres@localhost:5433/envio-dev`).
 - **Live execution** — deployed Huff executor from sibling `sol` repo (Foundry + `script/deploy_mainnet.sh`).

@@ -1,7 +1,9 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use rustc_hash::FxHashMap;
 
-use crate::core::types::{EvaluatedRoute, FlashLoanSource, PoolIndex, RouteSimulationResult};
+use crate::core::types::{
+    EvaluatedRoute, FlashLoanSource, PoolIndex, ProtocolType, RouteSimulationResult,
+};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 use crate::services::execution::calldata::{
@@ -82,13 +84,9 @@ fn resolve_executor_entrypoint(
         FlashLoanSource::Direct if balancer_batch_direct_eligible(hops) => {
             ExecutorEntrypoint::Direct
         }
-        FlashLoanSource::Balancer if hops_are_balancer_only(hops) => {
-            ExecutorEntrypoint::BalancerFlash
-        }
+        FlashLoanSource::Balancer => ExecutorEntrypoint::BalancerFlash,
         FlashLoanSource::Dodo => ExecutorEntrypoint::DodoFlash,
-        FlashLoanSource::Direct | FlashLoanSource::AaveV3 | FlashLoanSource::Balancer => {
-            ExecutorEntrypoint::AaveFlash
-        }
+        FlashLoanSource::AaveV3 | FlashLoanSource::Direct => ExecutorEntrypoint::AaveFlash,
     }
 }
 
@@ -101,13 +99,22 @@ fn resolve_dispatch_flash_source(
     has_dodo_pool: bool,
 ) -> Option<FlashLoanSource> {
     let balancer_only = hops_are_balancer_only(hops);
+    let route_uses_balancer_vault = hops
+        .iter()
+        .any(|h| h.edge.protocol == ProtocolType::BalancerV2);
     let source = if flash_source == FlashLoanSource::Direct && !balancer_batch_direct_eligible(hops)
     {
         FlashLoanSource::AaveV3
     } else {
         flash_source
     };
-    align_flash_source_for_dispatch(source, liquidity, balancer_only, has_dodo_pool)
+    align_flash_source_for_dispatch(
+        source,
+        liquidity,
+        balancer_only,
+        has_dodo_pool,
+        route_uses_balancer_vault,
+    )
 }
 
 fn structural_flash_source(
@@ -368,7 +375,7 @@ mod tests {
             Some(FlashLoanSource::AaveV3)
         );
         assert_eq!(
-            resolve_executor_entrypoint(FlashLoanSource::Balancer, &hops),
+            resolve_executor_entrypoint(FlashLoanSource::AaveV3, &hops),
             ExecutorEntrypoint::AaveFlash
         );
     }

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::core::constants::AAVE_V3_POOL;
-use crate::core::types::FlashLoanSource;
-use crate::core::types::FoundCycle;
+use crate::core::types::{FlashLoanSource, FoundCycle, PoolIndex, PoolState, V3Tick};
+use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::{
     HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
@@ -46,8 +46,15 @@ use crate::services::state_refresh::PoolRefreshResult;
 
 enum RoutePoolRefreshAbort {
     NotIndexed { pool_count: usize },
-    Incomplete { updated: usize, pool_count: usize },
+    /// Fetch ran but no pool state was written (cache was cleared pre-refresh).
+    NoUpdates { pool_count: usize },
     Rpc(anyhow::Error),
+}
+
+/// After `cache.remove`, a refresh attempt that updates zero pools cannot dispatch safely.
+#[must_use]
+fn route_pool_refresh_failed(result: &PoolRefreshResult) -> bool {
+    result.attempted && result.updated == 0
 }
 
 async fn refresh_route_pools_into_arena(
@@ -70,11 +77,17 @@ async fn refresh_route_pools_into_arena(
     if !result.can_use_cached_state() {
         return Err(RoutePoolRefreshAbort::NotIndexed { pool_count });
     }
-    if result.updated != result.matched {
-        return Err(RoutePoolRefreshAbort::Incomplete {
-            updated: result.updated,
+    if route_pool_refresh_failed(&result) {
+        return Err(RoutePoolRefreshAbort::NoUpdates {
             pool_count: result.matched,
         });
+    }
+    if result.updated < result.matched {
+        crate::warn!(
+            "route pool refresh partial: {}/{} pools updated — continuing with subset",
+            result.updated,
+            result.matched
+        );
     }
     let generation = arena.apply_hot_cache(cache, pools);
     let fetched = result.updated > 0;
@@ -244,7 +257,9 @@ pub(crate) async fn dispatch_profitable_candidates(
     )
     .await;
 
-    ctx.execution.shutdown_resync(&sim_provider, operator).await;
+    if !ctx.config.is_dry_run() {
+        ctx.execution.shutdown_resync(&sim_provider, operator).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,7 +351,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                     dispatch_state_block = tick_block;
                     dispatch_state_hash = ctx.refresh.last_state_hash();
                     enrich_dispatch_cl_ticks(
-                        sim_provider,
+                        ctx.rpc.as_ref(),
                         arena,
                         &dispatch_cycles,
                         pool_metas,
@@ -355,12 +370,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                 );
                 return;
             }
-            Err(RoutePoolRefreshAbort::Incomplete {
-                updated,
-                pool_count,
-            }) => {
+            Err(RoutePoolRefreshAbort::NoUpdates { pool_count }) => {
                 crate::warn!(
-                    "dispatch aborted: route state refresh incomplete ({updated}/{pool_count} pools)"
+                    "dispatch aborted: route pool refresh returned 0/{pool_count} updates"
                 );
                 return;
             }
@@ -424,6 +436,16 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         ) {
             break;
         }
+        if !ctx.config.is_dry_run()
+            && matches!(
+                outcome,
+                ExecutionOutcome::Confirmed { .. }
+                    | ExecutionOutcome::Reverted { .. }
+                    | ExecutionOutcome::ReceiptTimeout { .. }
+            )
+        {
+            break;
+        }
     }
 
     skipped.log_dispatch_gates(dispatch_candidates, pools_refreshed);
@@ -463,14 +485,6 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 ) -> Option<ExecutionOutcome> {
     let fp = evaluated.route_fingerprint;
     let balancer_batch_verified = evaluated.balancer_batch_verified;
-    if ctx.execution.is_route_quarantined(fp) {
-        skipped.record("quarantine");
-        return None;
-    }
-    if ctx.execution.is_route_on_cooldown(fp, &ctx.config) {
-        skipped.record("cooldown");
-        return None;
-    }
 
     let Some(start_token_addr) = arena.token_address(evaluated.cycle.start_token) else {
         skipped.record("prepare_meta");
@@ -764,8 +778,41 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     Some(outcome)
 }
 
-async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static>(
-    provider: &P,
+fn dispatch_cl_tick_snapshot(
+    arena: &StateArena,
+    tick_pools: &[Address],
+    v4_targets: &[(PoolIndex, B256)],
+) -> Vec<(PoolIndex, Arc<[V3Tick]>)> {
+    let mut snapshots = Vec::with_capacity(tick_pools.len().saturating_add(v4_targets.len()));
+    for pool in tick_pools {
+        let Some(index) = arena.address_to_pool().get(pool).copied() else {
+            continue;
+        };
+        let Some(PoolState::V3(state)) = arena.pool_state(index) else {
+            continue;
+        };
+        snapshots.push((index, Arc::clone(&state.ticks)));
+    }
+    for &(index, _) in v4_targets {
+        let Some(PoolState::V4(state)) = arena.pool_state(index) else {
+            continue;
+        };
+        snapshots.push((index, Arc::clone(&state.ticks)));
+    }
+    snapshots
+}
+
+fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, Arc<[V3Tick]>)>) {
+    for (index, ticks) in snapshots {
+        match arena.pool_state_mut(index) {
+            Some(PoolState::V3(state)) | Some(PoolState::V4(state)) => state.ticks = ticks,
+            _ => {}
+        }
+    }
+}
+
+async fn enrich_dispatch_cl_ticks(
+    rpc: &RpcPool,
     arena: &mut StateArena,
     cycles: &[&FoundCycle],
     pool_metas: &[crate::pipeline::types::PoolMeta],
@@ -780,30 +827,47 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     if tick_pools.is_empty() && v4_targets.is_empty() {
         return;
     }
-    crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
-    crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
+    let snapshots = dispatch_cl_tick_snapshot(arena, &tick_pools, &v4_targets);
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
-    let v3_loaded = enrich_v3_ticks(
-        provider,
-        arena,
-        &tick_pools,
-        word_range,
-        &algebra_pools,
-        &algebra_integral_pools,
-        block_number,
-    )
-    .await;
-    let v4_loaded = enrich_v4_ticks(provider, arena, &v4_targets, word_range, block_number).await;
-    crate::debug!(
-        "dispatch tick enrich: v3_pools={} v3_loaded={} v3_rpc_failed={} v4_targets={} v4_loaded={} v4_rpc_failed={}",
-        tick_pools.len(),
-        v3_loaded.loaded,
-        v3_loaded.rpc_failed,
-        v4_targets.len(),
-        v4_loaded.loaded,
-        v4_loaded.rpc_failed,
-    );
+    for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
+        let Ok(provider) = rpc.connect_state_at(url) else {
+            rpc.deprioritize_state_url(url);
+            continue;
+        };
+        crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
+        crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
+        let v3_loaded = enrich_v3_ticks(
+            &provider,
+            arena,
+            &tick_pools,
+            word_range,
+            &algebra_pools,
+            &algebra_integral_pools,
+            block_number,
+        )
+        .await;
+        let v4_loaded =
+            enrich_v4_ticks(&provider, arena, &v4_targets, word_range, block_number).await;
+        if !v3_loaded.rpc_failed && !v4_loaded.rpc_failed {
+            if url_index > 0 {
+                crate::info!(
+                    "dispatch tick hydration fallback succeeded (url_index={url_index}, v3_loaded={}, v4_loaded={})",
+                    v3_loaded.loaded,
+                    v4_loaded.loaded,
+                );
+            }
+            return;
+        }
+        rpc.deprioritize_state_url(url);
+        crate::warn!(
+            "dispatch tick hydration RPC failed — trying fallback (url_index={url_index}, v3_failed={}, v4_failed={})",
+            v3_loaded.rpc_failed,
+            v4_loaded.rpc_failed,
+        );
+    }
+    restore_dispatch_cl_ticks(arena, snapshots);
+    crate::warn!("dispatch tick hydration failed on all state RPCs — retained prior ticks");
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
@@ -836,12 +900,9 @@ pub(crate) async fn refresh_and_resim_profitable(
                 );
                 return (Vec::new(), false, state_generation);
             }
-            Err(RoutePoolRefreshAbort::Incomplete {
-                updated,
-                pool_count,
-            }) => {
+            Err(RoutePoolRefreshAbort::NoUpdates { pool_count }) => {
                 crate::warn!(
-                    "resim aborted: route state refresh incomplete ({updated}/{pool_count} pools) — dropping {in_count} candidates"
+                    "resim aborted: route pool refresh 0/{pool_count} — dropping {in_count} candidates"
                 );
                 return (Vec::new(), false, state_generation);
             }
@@ -1268,6 +1329,26 @@ fn collect_route_pool_addresses(
 mod tests {
     use super::*;
     use crate::core::types::{PoolState, V3PoolState, V3Tick};
+    use crate::services::state_refresh::PoolRefreshResult;
+
+    #[test]
+    fn route_pool_refresh_failed_only_when_attempted_zero_updates() {
+        assert!(!route_pool_refresh_failed(&PoolRefreshResult {
+            updated: 5,
+            attempted: true,
+            matched: 10,
+        }));
+        assert!(route_pool_refresh_failed(&PoolRefreshResult {
+            updated: 0,
+            attempted: true,
+            matched: 10,
+        }));
+        assert!(!route_pool_refresh_failed(&PoolRefreshResult {
+            updated: 0,
+            attempted: false,
+            matched: 10,
+        }));
+    }
 
     #[test]
     fn clear_dispatch_cl_ticks_removes_stale_v3_ticks() {
@@ -1298,5 +1379,39 @@ mod tests {
             panic!("registered pool must retain V3 state");
         };
         assert!(state.ticks.is_empty());
+    }
+
+    #[test]
+    fn restore_dispatch_cl_ticks_recovers_v3_ticks_after_rpc_failure() {
+        let address = alloy::primitives::Address::from([2u8; 20]);
+        let mut arena = StateArena::default();
+        let pool = arena.register_pool(
+            address,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1_000_000,
+                    liquidity_net: 1_000_000,
+                }]),
+            })),
+        );
+
+        let snapshots = dispatch_cl_tick_snapshot(&arena, &[address], &[]);
+        crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &[address]);
+        restore_dispatch_cl_ticks(&mut arena, snapshots);
+
+        let Some(PoolState::V3(state)) = arena.pool_state(pool) else {
+            panic!("registered pool must retain V3 state");
+        };
+        assert_eq!(state.ticks.len(), 1);
+        assert_eq!(state.ticks[0].tick, -60);
     }
 }

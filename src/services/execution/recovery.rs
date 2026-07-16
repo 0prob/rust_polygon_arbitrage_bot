@@ -44,18 +44,26 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
         });
     }
 
-    if provider
-        .get_transaction_by_hash(tx_hash)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        nonce_mgr.release(nonce);
-        if nonce_mgr.resync(provider).await.is_err() {
-            nonce_mgr.mark_stale(nonce);
+    match provider.get_transaction_by_hash(tx_hash).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            crate::warn!(
+                "receipt timeout: tx not visible on recovery RPC; resyncing nonce nonce={nonce} tx_hash={tx_hash}"
+            );
+            if let Err(e) = nonce_mgr.resync(provider).await {
+                crate::warn!("receipt timeout: nonce resync failed nonce={nonce}: {e:#}");
+                nonce_mgr.mark_stale(nonce);
+                return NonceRecoveryOutcome::StillPending;
+            }
+            return NonceRecoveryOutcome::Dropped;
         }
-        return NonceRecoveryOutcome::Dropped;
+        Err(e) => {
+            crate::warn!(
+                "receipt timeout: tx lookup failed; retaining nonce nonce={nonce} tx_hash={tx_hash}: {e:#}"
+            );
+            nonce_mgr.mark_stale(nonce);
+            return NonceRecoveryOutcome::StillPending;
+        }
     }
 
     let bumped = bump_fees(*fees, FEE_BUMP_BPS);
