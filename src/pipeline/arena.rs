@@ -22,6 +22,67 @@ struct ArenaInner {
     layout_fingerprint: u64,
 }
 
+fn sync_pool_graph_eligible(
+    state: &PoolState,
+    pool: &DiscoveredPool,
+    decimal_hints: Option<&FxHashMap<Address, u8>>,
+) -> bool {
+    let bpt_hint = match state {
+        PoolState::Balancer(b) => b.bpt_index,
+        _ => None,
+    };
+    let token_count = match state {
+        PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
+        PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
+        _ => pool.tokens.len(),
+    };
+    let pair_input_decimals = pool.tokens.first().zip(pool.tokens.get(1)).and_then(
+        |(a0, a1)| match decimal_hints {
+            Some(h) => Some((
+                crate::services::oracle::known_token_decimals(*a0, h)?,
+                crate::services::oracle::known_token_decimals(*a1, h)?,
+            )),
+            None => Some((18, 18)),
+        },
+    );
+    crate::pipeline::graph::pool_state_graph_eligible(
+        None,
+        state,
+        pool.protocol,
+        token_count,
+        bpt_hint,
+        pool.fee_bps,
+        pair_input_decimals,
+    )
+}
+
+/// Fast-path arena refresh when tradable membership, order, and eligibility are unchanged.
+fn arena_reusable_for_tradable(
+    inner: &ArenaInner,
+    tradable: &[(usize, Address, Arc<PoolState>)],
+    pools: &[DiscoveredPool],
+    decimal_hints: Option<&FxHashMap<Address, u8>>,
+) -> bool {
+    if tradable.len() != inner.pools.len() {
+        return false;
+    }
+    for (i, (idx, address, state)) in tradable.iter().enumerate() {
+        if inner.pool_addresses.get(i) != Some(address) {
+            return false;
+        }
+        let Some(pool) = pools.get(*idx) else {
+            return false;
+        };
+        if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
+            return false;
+        }
+        if !inner.address_to_pool.contains_key(address) {
+            return false;
+        }
+    }
+    true
+}
+
 fn compute_layout_fingerprint(inner: &ArenaInner) -> u64 {
     let mut h = FxHasher::default();
     h.write_u32(inner.tokens.len() as u32);
@@ -275,10 +336,8 @@ impl StateArena {
     ) -> Vec<crate::pipeline::types::PoolMeta> {
         let tradable = cache.tradable_by_discovery_index(address_index);
 
-        let reusable = self.inner.pools.len() == tradable.len()
-            && tradable
-                .iter()
-                .all(|(_, address, _)| self.inner.address_to_pool.contains_key(address));
+        let reusable =
+            arena_reusable_for_tradable(&self.inner, &tradable, pools, decimal_hints);
         if !reusable {
             *Arc::make_mut(&mut self.inner) = ArenaInner::default();
             self.hot_overlay.clear();
@@ -302,33 +361,7 @@ impl StateArena {
             let Some(pool) = pools.get(idx) else {
                 continue;
             };
-            let bpt_hint = match state.as_ref() {
-                PoolState::Balancer(b) => b.bpt_index,
-                _ => None,
-            };
-            let token_count = match state.as_ref() {
-                PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
-                PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
-                _ => pool.tokens.len(),
-            };
-            let pair_input_decimals = pool.tokens.first().zip(pool.tokens.get(1)).and_then(
-                |(a0, a1)| match decimal_hints {
-                    Some(h) => Some((
-                        crate::services::oracle::known_token_decimals(*a0, h)?,
-                        crate::services::oracle::known_token_decimals(*a1, h)?,
-                    )),
-                    None => Some((18, 18)),
-                },
-            );
-            if !crate::pipeline::graph::pool_state_graph_eligible(
-                Some(self),
-                state.as_ref(),
-                pool.protocol,
-                token_count,
-                bpt_hint,
-                pool.fee_bps,
-                pair_input_decimals,
-            ) {
+            if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
                 continue;
             }
             // ponytail: borrow token addresses instead of cloning Vec — most
@@ -766,6 +799,122 @@ mod tests {
         arena.apply_hot_cache(&cache, &[addr]);
         assert!(arena.hot_overlay[0].is_none());
         assert!(arena.pool_state(idx).is_some());
+    }
+
+    #[test]
+    fn sync_reuses_arena_when_tradable_layout_unchanged() {
+        let pool_address = Address::with_last_byte(50);
+        let token_a = Address::with_last_byte(51);
+        let token_b = Address::with_last_byte(52);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let cache = StateCache::default();
+        let v2 = PoolState::V2(V2PoolState {
+            reserve0: funded,
+            reserve1: funded + U256::from(1u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 1,
+        });
+        cache.insert(pool_address, v2.clone());
+        let discovered = [DiscoveredPool {
+            pool_key: pool_address.to_string(),
+            address: pool_address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "V2".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let mut arena = StateArena::default();
+        let metas_a = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
+        assert_eq!(metas_a.len(), 1);
+        let pool_idx = metas_a[0].pool_index;
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: funded + U256::from(100u64),
+                reserve1: funded + U256::from(2u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 9,
+            }),
+        );
+        let metas_b = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
+        assert_eq!(metas_b.len(), 1);
+        assert_eq!(metas_b[0].pool_index, pool_idx);
+        let PoolState::V2(updated) = arena.pool_state(pool_idx).expect("state") else {
+            panic!("expected v2");
+        };
+        assert_eq!(updated.block_timestamp_last, 9);
+    }
+
+    #[test]
+    fn sync_rebuilds_when_tradable_pool_becomes_ineligible() {
+        let pool_address = Address::with_last_byte(60);
+        let token_a = Address::with_last_byte(61);
+        let token_b = Address::with_last_byte(62);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let cache = StateCache::default();
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        let discovered = [DiscoveredPool {
+            pool_key: pool_address.to_string(),
+            address: pool_address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "V2".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let mut arena = StateArena::default();
+        assert_eq!(
+            arena.sync_from_discovery(&cache, &discovered, &address_index, None).len(),
+            1
+        );
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: U256::ZERO,
+                reserve1: U256::ZERO,
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 2,
+            }),
+        );
+        assert!(
+            arena
+                .sync_from_discovery(&cache, &discovered, &address_index, None)
+                .is_empty()
+        );
+        assert_eq!(arena.pool_count(), 0);
     }
 
     #[test]

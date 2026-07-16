@@ -709,11 +709,17 @@ impl StateRefreshService {
         arena: &mut crate::pipeline::arena::StateArena,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
     ) -> Vec<crate::pipeline::types::PoolMeta> {
-        let state = self.discovery_state.read();
+        let (discovered, address_index) = {
+            let state = self.discovery_state.read();
+            (
+                Arc::clone(&state.discovered),
+                state.address_index.clone(),
+            )
+        };
         arena.sync_from_discovery(
             &self.cache,
-            state.discovered.as_ref(),
-            &state.address_index,
+            discovered.as_ref(),
+            &address_index,
             decimal_hints,
         )
     }
