@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag;
@@ -90,6 +90,8 @@ impl RouteGasLookup {
 #[derive(Debug)]
 pub struct GasOracle {
     snapshot: ArcSwapOption<FeeSnapshot>,
+    /// Millis from [`crate::util::now_ms`] at last successful [`GasOracle::refresh_once`].
+    snapshot_updated_at_ms: AtomicU64,
     poll_interval: Duration,
     route_gas: DashMap<u64, u32, FxBuildHasher>,
     /// FIFO eviction order — avoids `iter`/`len` on DashMap (deadlock-prone per docs).
@@ -109,6 +111,7 @@ impl GasOracle {
     pub fn new(poll_interval: Duration) -> Self {
         Self {
             snapshot: ArcSwapOption::empty(),
+            snapshot_updated_at_ms: AtomicU64::new(0),
             poll_interval,
             route_gas: DashMap::with_capacity_and_hasher(ROUTE_GAS_HISTORY, FxBuildHasher),
             route_gas_order: parking_lot::Mutex::new(VecDeque::with_capacity(ROUTE_GAS_HISTORY)),
@@ -178,6 +181,7 @@ impl GasOracle {
         self.snapshot.load().as_deref().copied()
     }
 
+    #[inline]
     pub fn snapshot(&self) -> Option<FeeSnapshot> {
         self.loaded_snapshot()
     }
@@ -186,14 +190,42 @@ impl GasOracle {
         self.loaded_snapshot().map(compute_conservative_gas_price)
     }
 
-    /// Prefer [`Self::conservative_gas_price`]; never substitute zero gas price.
-    pub fn conservative_gas_price_required(&self) -> Option<U256> {
+    /// Conservative gas price only when the fee snapshot is fresh enough for live submit.
+    #[must_use]
+    pub fn conservative_gas_price_for_live_submit(&self) -> Option<U256> {
+        if !self.fees_ready_for_live_submit() {
+            return None;
+        }
         self.conservative_gas_price()
+    }
+
+    #[must_use]
+    pub fn snapshot_age_ms(&self) -> Option<u64> {
+        let updated = self.snapshot_updated_at_ms.load(Ordering::Relaxed);
+        if updated == 0 {
+            return None;
+        }
+        Some(crate::util::now_ms().saturating_sub(updated))
+    }
+
+    fn live_snapshot_max_age_ms(&self) -> u64 {
+        self.poll_interval.as_millis().saturating_mul(5).max(15_000) as u64
+    }
+
+    /// Live submit requires a fee snapshot refreshed within [`Self::live_snapshot_max_age_ms`].
+    #[must_use]
+    pub fn fees_ready_for_live_submit(&self) -> bool {
+        self.loaded_snapshot().is_some()
+            && self
+                .snapshot_age_ms()
+                .is_some_and(|age| age <= self.live_snapshot_max_age_ms())
     }
 
     #[cfg(test)]
     pub(crate) fn set_fee_snapshot_for_test(&self, fees: FeeSnapshot) {
         self.snapshot.store(Some(Arc::new(fees)));
+        self.snapshot_updated_at_ms
+            .store(crate::util::now_ms(), Ordering::Relaxed);
     }
 
     pub async fn refresh_once<P: Provider<Ethereum>>(&self, provider: &P) -> anyhow::Result<()> {
@@ -231,6 +263,8 @@ impl GasOracle {
         let previous = self.loaded_snapshot();
         let is_initial_snapshot = previous.is_none();
         self.snapshot.store(Some(Arc::new(snapshot)));
+        self.snapshot_updated_at_ms
+            .store(crate::util::now_ms(), Ordering::Relaxed);
         if is_initial_snapshot {
             crate::info!(
                 "gas oracle initialized: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
@@ -260,8 +294,12 @@ impl GasOracle {
     ) {
         let poll = self.poll_interval;
         tokio::spawn(async move {
+            static REFRESH_FAILS: AtomicU32 = AtomicU32::new(0);
             if let Err(e) = self.refresh_once(&provider).await {
-                crate::debug!("gas oracle initial refresh failed: {e:#}");
+                let n = REFRESH_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::warn!("gas oracle initial refresh failed ({n}): {e:#}");
+            } else {
+                REFRESH_FAILS.store(0, Ordering::Relaxed);
             }
             let mut ticker = tokio::time::interval(poll);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -274,7 +312,14 @@ impl GasOracle {
                     }
                     _ = ticker.tick() => {
                         if let Err(e) = self.refresh_once(&provider).await {
-                            crate::debug!("gas oracle refresh failed: {e:#}");
+                            let n = REFRESH_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n == 1 || n.is_multiple_of(20) {
+                                crate::warn!(
+                                    "gas oracle refresh failed ({n} consecutive): {e:#}"
+                                );
+                            }
+                        } else {
+                            REFRESH_FAILS.store(0, Ordering::Relaxed);
                         }
                     }
                 }
@@ -381,7 +426,7 @@ mod tests {
             base_fee: U256::from(100u64),
             priority_fee: U256::from(2u64),
         };
-        oracle.snapshot.store(Some(Arc::new(fees)));
+        oracle.set_fee_snapshot_for_test(fees);
 
         let loaded = oracle.loaded_snapshot().expect("fees stored");
         assert_eq!(loaded.base_fee, fees.base_fee);
@@ -390,6 +435,26 @@ mod tests {
             oracle.conservative_gas_price(),
             Some(compute_conservative_gas_price(fees))
         );
+    }
+
+    #[test]
+    fn fees_ready_for_live_submit_requires_fresh_timestamp() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        assert!(!oracle.fees_ready_for_live_submit());
+
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(100u64),
+            priority_fee: U256::from(2u64),
+        });
+        assert!(oracle.fees_ready_for_live_submit());
+        assert!(oracle.conservative_gas_price_for_live_submit().is_some());
+
+        oracle.snapshot_updated_at_ms.store(
+            crate::util::now_ms().saturating_sub(60_000),
+            Ordering::Relaxed,
+        );
+        assert!(!oracle.fees_ready_for_live_submit());
+        assert!(oracle.conservative_gas_price_for_live_submit().is_none());
     }
 
     #[test]

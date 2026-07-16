@@ -12,7 +12,7 @@ use crate::core::constants::is_polygon_hub_token;
 use crate::core::protocol::is_fetchable_protocol;
 use crate::core::types::ProtocolType;
 use crate::infra::pool_meta_cache::PoolMetaCache;
-use crate::pipeline::pool_fetch::fetch_pools_batched;
+use crate::pipeline::pool_fetch::{PoolFetchResult, fetch_pools_batched};
 use crate::services::discovery::DiscoveredPool;
 use crate::services::state_cache::StateCache;
 
@@ -23,6 +23,20 @@ const CLMM_MULTI_FETCH_BIAS: usize = 2;
 const V4_FETCH_BIAS: usize = 4;
 /// Discovery rows scanned per LF pass for never-fetched pools (full list is ~260k).
 const NEVER_FETCH_SCAN_CHUNK: usize = 12_288;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchTargetsResult {
+    pub updated: usize,
+    pub attempted: bool,
+    pub rate_limited: bool,
+}
+
+impl FetchTargetsResult {
+    #[must_use]
+    pub fn requires_provider_fallback(self) -> bool {
+        self.attempted && (self.updated == 0 || self.rate_limited)
+    }
+}
 
 /// Fetchable protocol families — round-robin ensures each gets hydration slots per batch.
 const FETCHABLE_PROTOCOLS: [ProtocolType; 8] = [
@@ -90,10 +104,10 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
     priority: &[Address],
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
-) -> (usize, bool) {
+) -> FetchTargetsResult {
     let targets = select_fetch_targets(pools.iter(), cache.as_ref(), max_pools, priority);
     if targets.is_empty() {
-        return (0, false);
+        return FetchTargetsResult::default();
     }
     run_fetch_targets(
         provider,
@@ -121,7 +135,7 @@ pub async fn fetch_missing_pool_states_indexed<P: Provider<Ethereum> + Clone + S
     priority: &[Address],
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
-) -> (usize, bool) {
+) -> FetchTargetsResult {
     let targets = select_fetch_targets_indexed(
         pools,
         address_index,
@@ -131,7 +145,7 @@ pub async fn fetch_missing_pool_states_indexed<P: Provider<Ethereum> + Clone + S
         priority,
     );
     if targets.is_empty() {
-        return (0, false);
+        return FetchTargetsResult::default();
     }
     run_fetch_targets(
         provider,
@@ -154,7 +168,7 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
     batch_pace_ms: u64,
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
-) -> (usize, bool) {
+) -> FetchTargetsResult {
     let mut v2_targets: Vec<&DiscoveredPool> = Vec::new();
     let mut other_targets: Vec<&DiscoveredPool> = Vec::new();
     for &t in targets {
@@ -171,7 +185,7 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
         async {
             let started = crate::util::now_ms();
             if v2_targets.is_empty() {
-                (0usize, 0u64)
+                (PoolFetchResult::default(), 0u64)
             } else {
                 let updated = fetch_pools_batched(
                     provider.clone(),
@@ -189,7 +203,7 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
         async {
             let started = crate::util::now_ms();
             if other_targets.is_empty() {
-                (0usize, 0u64)
+                (PoolFetchResult::default(), 0u64)
             } else {
                 let updated = fetch_pools_batched(
                     provider2,
@@ -205,15 +219,23 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
             }
         },
     );
-    let (updated_v2, v2_ms) = v2_result;
-    let (updated_other, other_ms) = other_result;
+    let (v2_fetch, v2_ms) = v2_result;
+    let (other_fetch, other_ms) = other_result;
+    let updated_v2 = v2_fetch.updated;
+    let updated_other = other_fetch.updated;
     crate::debug!(
-        "pool fetch branches: targets={} v2_targets={} other_targets={} v2_updated={updated_v2} other_updated={updated_other} v2_ms={v2_ms} other_ms={other_ms} max_multicall_calls={max_multicall_calls} batch_pace_ms={batch_pace_ms} pinned_block={block_number:?}",
+        "pool fetch branches: targets={} v2_targets={} other_targets={} v2_updated={updated_v2} v2_rate_limited={} other_updated={updated_other} other_rate_limited={} v2_ms={v2_ms} other_ms={other_ms} max_multicall_calls={max_multicall_calls} batch_pace_ms={batch_pace_ms} pinned_block={block_number:?}",
+        v2_fetch.rate_limited,
+        other_fetch.rate_limited,
         targets.len(),
         v2_targets.len(),
         other_targets.len(),
     );
-    (updated_v2 + updated_other, true)
+    FetchTargetsResult {
+        updated: updated_v2.saturating_add(updated_other),
+        attempted: true,
+        rate_limited: v2_fetch.rate_limited || other_fetch.rate_limited,
+    }
 }
 
 fn select_fetch_targets<'a>(
@@ -417,5 +439,27 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].address, pools[2].address);
+    }
+
+    #[test]
+    fn partial_rate_limited_fetch_requires_provider_fallback() {
+        let result = FetchTargetsResult {
+            updated: 3,
+            attempted: true,
+            rate_limited: true,
+        };
+
+        assert!(result.requires_provider_fallback());
+    }
+
+    #[test]
+    fn complete_partial_fetch_does_not_require_provider_fallback() {
+        let result = FetchTargetsResult {
+            updated: 3,
+            attempted: true,
+            rate_limited: false,
+        };
+
+        assert!(!result.requires_provider_fallback());
     }
 }

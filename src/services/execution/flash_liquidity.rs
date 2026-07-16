@@ -25,7 +25,7 @@ use crate::infra::rpc::{RpcPool, rpc_host_label};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
-use crate::pipeline::sim_sanity::{SimSanityInput, max_flash_borrow_wei};
+use crate::pipeline::sim_sanity::{FlashBorrowCapParams, SimSanityInput};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::aave::{
@@ -384,7 +384,7 @@ impl FlashLiquidityCache {
                             )
                             .await
                         {
-                            crate::debug!("background aave fee refresh failed: {e:#}");
+                            crate::warn!("background aave fee refresh failed: {e:#}");
                         }
                         let tokens = self.hot_token_list();
                         if tokens.is_empty() {
@@ -545,11 +545,13 @@ impl FlashLiquidityCache {
                     .and_then(|bytes| {
                         IAaveV3Pool::getReserveDataCall::abi_decode_returns(bytes).ok()
                     });
-                let has_a_token = decoded.as_ref().is_some_and(|r| !r.aTokenAddress.is_zero());
-                let status = decoded
-                    .as_ref()
-                    .map(|r| reserve_status_from_config(r.configuration, has_a_token))
-                    .unwrap_or(AaveReserveStatus::NoAToken);
+                let status = match decoded.as_ref() {
+                    Some(r) => {
+                        let has_a_token = !r.aTokenAddress.is_zero();
+                        reserve_status_from_config(r.configuration, has_a_token)
+                    }
+                    None => AaveReserveStatus::RpcError,
+                };
                 aave_stats.record(status, pinned);
                 if pinned || status != AaveReserveStatus::Viable {
                     None
@@ -1266,15 +1268,19 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         input.evaluated.cycle.start_token,
         input.token_to_matic_rates,
     );
-    let flash_borrow_cap = max_flash_borrow_wei(
-        input.max_flash_loan_usd,
-        token_decimals,
-        token_to_matic_rate,
-        input.matic_usd,
-        input.matic_usd_chainlink,
-    );
+    let flash_cap = flash_cap_for_prepare(input, token_decimals, token_to_matic_rate);
     if plan.action != FlashPlanAction::Reject
-        && let Some(cap) = flash_borrow_cap
+        && flash_cap.cap_enforced_but_unresolved()
+        && !amount_in.is_zero()
+    {
+        prepare_skip_log(
+            input.log_skips,
+            "prepare skip: flash borrow cap unavailable (missing token/MATIC rate or MATIC/USD)",
+        );
+        return None;
+    }
+    if plan.action != FlashPlanAction::Reject
+        && let Some(cap) = flash_cap.cap_wei()
         && amount_in > cap
     {
         crate::debug!(
@@ -1301,6 +1307,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 input.search_low,
                 token_decimals,
                 token_to_matic_rate,
+                false,
             ) {
                 prepare_skip_log(
                     input.log_skips,
@@ -1463,25 +1470,37 @@ fn prepare_profit_thresholds(
     )
 }
 
+#[inline]
+fn flash_cap_for_prepare(
+    input: &PrepareDispatchInput<'_>,
+    token_decimals: u8,
+    token_to_matic_rate: U256,
+) -> FlashBorrowCapParams {
+    FlashBorrowCapParams {
+        max_flash_loan_usd: input.max_flash_loan_usd,
+        token_decimals,
+        token_to_matic_rate,
+        matic_usd: input.matic_usd,
+        matic_usd_chainlink: input.matic_usd_chainlink,
+    }
+}
+
 fn dispatch_sim_passes_sanity(
     input: &PrepareDispatchInput<'_>,
     result: &crate::core::types::RouteSimulationResult,
     search_low: U256,
     token_decimals: u8,
     token_to_matic_rate: U256,
+    check_flash_cap: bool,
 ) -> bool {
     if token_to_matic_rate < crate::core::constants::MIN_TOKEN_TO_MATIC_RATE {
         return false;
     }
-    if let Some(cap) = max_flash_borrow_wei(
-        input.max_flash_loan_usd,
-        token_decimals,
-        token_to_matic_rate,
-        input.matic_usd,
-        input.matic_usd_chainlink,
-    ) && result.amount_in > cap
-    {
-        return false;
+    if check_flash_cap {
+        let flash_cap = flash_cap_for_prepare(input, token_decimals, token_to_matic_rate);
+        if !flash_cap.amount_within_cap(result.amount_in) {
+            return false;
+        }
     }
     crate::pipeline::sim_sanity::check_sim_sanity_for_dispatch(SimSanityInput {
         amount_in: result.amount_in,
@@ -1513,6 +1532,7 @@ fn capped_sim_passes_sanity(
         search_low,
         token_decimals,
         token_to_matic_rate,
+        true,
     )
 }
 

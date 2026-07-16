@@ -40,7 +40,7 @@ use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
     prepare_evaluated_route,
 };
-use crate::services::oracle::ensure_matic_usd_for_flash_cap;
+use crate::services::oracle::resolve_matic_usd_for_flash_dispatch;
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
 use crate::services::state_refresh::PoolRefreshResult;
 
@@ -274,25 +274,20 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         return;
     }
     let flash_policy = ctx.config.flash_policy;
-    let Some(gas_price) = ctx.gas_oracle.conservative_gas_price() else {
-        crate::warn!("dispatch skipped: gas oracle has no fee snapshot yet");
+    let Some(gas_price) = ctx.gas_oracle.conservative_gas_price_for_live_submit() else {
+        let age = ctx.gas_oracle.snapshot_age_ms();
+        crate::warn!("dispatch skipped: gas fee snapshot missing or stale (age_ms={age:?})");
         return;
     };
     let brent_iters = ctx.config.routing.ternary_search_iterations;
     let base_slippage_bps = ctx.config.execution.slippage_bps;
     let min_profit_roi_bps = ctx.config.execution.min_profit_roi_bps;
     let max_flash_loan_usd = ctx.config.execution.max_flash_loan_usd;
-    let matic_usd = match matic_usd_hint
-        .and_then(crate::pipeline::sim_sanity::matic_usd_for_flash_cap)
-    {
-        Some(usd) => usd,
-        None => match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await {
-            Some(usd) => usd,
-            None => {
-                crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
-                return;
-            }
-        },
+    let Some(matic_usd) =
+        resolve_matic_usd_for_flash_dispatch(&ctx.price_oracle, matic_usd_hint, sim_provider).await
+    else {
+        crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
+        return;
     };
     let deadline_secs = ctx.config.execution.deadline_secs;
 
@@ -801,9 +796,13 @@ async fn enrich_dispatch_cl_ticks<P: Provider<Ethereum> + Clone + Send + 'static
     .await;
     let v4_loaded = enrich_v4_ticks(provider, arena, &v4_targets, word_range, block_number).await;
     crate::debug!(
-        "dispatch tick enrich: v3_pools={} v3_loaded={v3_loaded} v4_targets={} v4_loaded={v4_loaded}",
+        "dispatch tick enrich: v3_pools={} v3_loaded={} v3_rpc_failed={} v4_targets={} v4_loaded={} v4_rpc_failed={}",
         tick_pools.len(),
+        v3_loaded.loaded,
+        v3_loaded.rpc_failed,
         v4_targets.len(),
+        v4_loaded.loaded,
+        v4_loaded.rpc_failed,
     );
 }
 
@@ -1112,7 +1111,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             accepted.assessment = assessment;
             accepted.balancer_batch_verified = true;
             record_balancer_filter_accept();
-            return Some(accepted);
+            Some(accepted)
         }
         BatchQueryVerdict::Rejected(reason) => {
             execution.quarantine_batch_query_failure(fp);
@@ -1265,6 +1264,7 @@ fn collect_route_pool_addresses(
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
     use crate::core::types::{PoolState, V3PoolState, V3Tick};

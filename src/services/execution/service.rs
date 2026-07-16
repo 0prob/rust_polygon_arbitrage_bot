@@ -31,7 +31,7 @@ use crate::services::execution::gas::{
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::nonce::NonceManager;
 use crate::services::execution::private_submit::{
-    PrivateSubmitConfig, PrivateSubmitMode, resolve_submit_mode,
+    PrivateSubmitConfig, private_submit_mode_requires_chain_id, resolve_submit_mode,
 };
 use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
@@ -300,7 +300,7 @@ impl ExecutionService {
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let mut parts = line.split_whitespace();
                     let Some(fp_str) = parts.next() else {
@@ -329,7 +329,6 @@ impl ExecutionService {
                         _ => {}
                     }
                 }
-                Err(_) => break,
             }
         }
         stats
@@ -648,8 +647,9 @@ impl ExecutionService {
         };
         if let Some(mgr) = mgr
             && mgr.in_flight_count() > 0
+            && let Err(e) = mgr.resync(provider).await
         {
-            let _ = mgr.resync(provider).await;
+            crate::warn!("shutdown nonce resync failed for {operator}: {e:#}");
         }
     }
 
@@ -983,9 +983,22 @@ impl ExecutionService {
         // Gas-overflow fallback has no RPC gas observation — reassessing at
         // submit max_fee × sim_gas inflates the safety floor above HF eval.
         let reassess_gas_price = if dry.gas_used.is_none() {
-            gas_oracle
-                .conservative_gas_price()
-                .unwrap_or(fees.max_fee_per_gas)
+            match gas_oracle.conservative_gas_price() {
+                Some(p) => p,
+                None => {
+                    crate::warn!(
+                        "dispatch skip: fp={}, gas oracle missing snapshot for profit reassess",
+                        fp,
+                    );
+                    let outcome = ExecutionOutcome::SubmitFailed {
+                        reason: "gas oracle has no snapshot for profit reassess".into(),
+                    };
+                    if let Some(ui_hook) = ui_hook {
+                        ui_hook.on_execution_outcome(&outcome, fp);
+                    }
+                    return outcome;
+                }
+            }
         } else {
             fees.max_fee_per_gas
         };
@@ -1029,6 +1042,24 @@ impl ExecutionService {
         if config.is_dry_run() {
             self.last_submit.write().insert(fp, now);
             let outcome = ExecutionOutcome::DryRunPassed { gas_used };
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
+
+        if gas_oracle
+            .conservative_gas_price_for_live_submit()
+            .is_none()
+        {
+            let age = gas_oracle.snapshot_age_ms();
+            crate::warn!(
+                "dispatch skip: fp={}, gas fee snapshot missing or stale for live submit (age_ms={age:?})",
+                fp,
+            );
+            let outcome = ExecutionOutcome::SubmitFailed {
+                reason: format!("gas fee snapshot not fresh for live submit (age_ms={age:?})"),
+            };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
             }
@@ -1182,7 +1213,19 @@ impl ExecutionService {
         };
 
         let chain_id = self.cached_chain_id(&submit_provider).await;
-        let private_cfg = build_private_config(rpc, signer, chain_id);
+        let private_cfg = match build_private_config(rpc, signer, chain_id) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                crate::error!("private submit misconfigured: {e:#}");
+                let outcome = ExecutionOutcome::SubmitFailed {
+                    reason: format!("private submit requires chain_id: {e:#}"),
+                };
+                if let Some(ui_hook) = ui_hook {
+                    ui_hook.on_execution_outcome(&outcome, fp);
+                }
+                return outcome;
+            }
+        };
 
         let tx_hash = match submit_with_recovery(
             &submit_provider,
@@ -1279,8 +1322,27 @@ impl ExecutionService {
                         ui_hook,
                     );
                 }
-                NonceRecoveryOutcome::Cancelled(_cancel_hash) => {}
-                NonceRecoveryOutcome::Dropped | NonceRecoveryOutcome::StillPending => {}
+                NonceRecoveryOutcome::Cancelled(cancel_hash) => {
+                    crate::info!(
+                        "receipt timeout: cancel tx submitted fp={}, original={}, cancel={cancel_hash}",
+                        fp,
+                        tx_hash,
+                    );
+                }
+                NonceRecoveryOutcome::Dropped => {
+                    crate::info!(
+                        "receipt timeout: original tx dropped from mempool fp={}, tx_hash={}",
+                        fp,
+                        tx_hash,
+                    );
+                }
+                NonceRecoveryOutcome::StillPending => {
+                    crate::warn!(
+                        "receipt timeout: tx still pending after cancel attempt fp={}, tx_hash={}, nonce={nonce}",
+                        fp,
+                        tx_hash,
+                    );
+                }
             }
 
             self.quarantine_route(fp, now, RouteFailureKind::Timeout);
@@ -1460,23 +1522,27 @@ fn build_private_config(
     rpc: &RpcPool,
     signer: &alloy::signers::local::PrivateKeySigner,
     chain_id: Option<u64>,
-) -> Option<PrivateSubmitConfig> {
+) -> anyhow::Result<Option<PrivateSubmitConfig>> {
     let private_url = rpc.private_url().map(str::to_string);
     let bloxroute_auth = std::env::var("BLOXROUTE_AUTH_HEADER")
         .ok()
         .filter(|s| !s.is_empty());
     let mode = resolve_submit_mode(private_url.as_deref(), bloxroute_auth.as_deref(), None);
-    if mode == PrivateSubmitMode::Standard {
-        return None;
+    if !private_submit_mode_requires_chain_id(mode) {
+        return Ok(None);
     }
-    let chain_id = chain_id?;
-    Some(PrivateSubmitConfig {
+    let chain_id = chain_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "eth_chainId unavailable for private submit mode {mode:?} (refusing public mempool fallback)"
+        )
+    })?;
+    Ok(Some(PrivateSubmitConfig {
         mode,
         signer: signer.clone(),
         chain_id,
         private_url,
         bloxroute_auth,
-    })
+    }))
 }
 
 fn min_operator_balance_wei(config: &AppConfig) -> Option<U256> {

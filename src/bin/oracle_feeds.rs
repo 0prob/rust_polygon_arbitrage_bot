@@ -6,7 +6,21 @@
 //! oracle_feeds verify --file FILE
 //! ```
 
+use std::io::{self, Write};
 use std::path::PathBuf;
+
+fn cli_line(out: &mut impl Write, s: &str) {
+    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(b"\n");
+}
+
+fn cli_stdout(s: &str) {
+    cli_line(&mut io::stdout(), s);
+}
+
+fn cli_stderr(s: &str) {
+    cli_line(&mut io::stderr(), s);
+}
 
 use alloy::primitives::Address;
 use anyhow::Context;
@@ -16,9 +30,8 @@ use rpbot::services::oracle::CURATED_POLYGON_TOKEN_HINTS;
 use rpbot::services::oracle::price_oracle::PriceOracle;
 use rpbot::services::oracle::{
     build_audit_report, default_runtime_demand_path, format_config_pyth_feeds,
-    load_runtime_demand_snapshot, parse_proposed_pyth_feed_lines,
-    parse_runtime_demand_from_log, propose_curated_unmapped_pyth_feeds, propose_pyth_feed_lines,
-    verify_proposed_pyth_feeds,
+    load_runtime_demand_snapshot, parse_proposed_pyth_feed_lines, parse_runtime_demand_from_log,
+    propose_curated_unmapped_pyth_feeds, propose_pyth_feed_lines, verify_proposed_pyth_feeds,
 };
 
 #[tokio::main]
@@ -45,8 +58,14 @@ async fn main() -> anyhow::Result<()> {
         "audit" => {
             let runtime_file = arg_path(&args, "--runtime-file");
             let runtime_log = arg_path(&args, "--runtime-log");
-            run_audit(&config, &oracle, top, runtime_file.as_deref(), runtime_log.as_deref())
-                .await?
+            run_audit(
+                &config,
+                &oracle,
+                top,
+                runtime_file.as_deref(),
+                runtime_log.as_deref(),
+            )
+            .await?
         }
         "propose" => {
             run_propose(
@@ -72,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!(
+    cli_stderr(
         "oracle_feeds — Polygon oracle feed audit (human-in-the-loop)\n\
          \n\
          Commands:\n\
@@ -82,10 +101,10 @@ fn print_usage() {
            propose Suggest oracle.pyth_feeds lines via Hermes (--curated-only, --out FILE, --verify)\n\
            verify  Live-check a proposal file (oracle_live_test-style)\n\
          \n\
-         Curated hints (manual review):"
+         Curated hints (manual review):",
     );
     for (label, addr, query) in CURATED_POLYGON_TOKEN_HINTS {
-        eprintln!("  {label}: {addr} (search: {query})");
+        cli_stderr(&format!("  {label}: {addr} (search: {query})"));
     }
 }
 
@@ -166,22 +185,19 @@ async fn run_audit(
     let runtime = load_runtime_demand(runtime_file, runtime_log)?;
     let report = build_audit_report(oracle, &freq, &runtime);
     let runtime_addrs = runtime.len();
-    println!(
+    cli_stdout(&format!(
         "oracle audit: scanned={} mapped={} unmapped={} runtime_addrs={}",
         report.scanned_tokens,
         report.mapped_count,
         report.rows.len(),
         runtime_addrs
-    );
+    ));
     for row in report.rows.iter().take(top) {
         let label = row.label.unwrap_or("-");
-        println!(
-            "  {label:10} {addr} pools={} runtime={} demand={}",
-            row.pool_hits,
-            row.cycle_hits,
-            row.demand_score,
-            addr = row.address
-        );
+        cli_stdout(&format!(
+            "  {label:10} {} pools={} runtime={} demand={}",
+            row.address, row.pool_hits, row.cycle_hits, row.demand_score,
+        ));
     }
     Ok(())
 }
@@ -218,9 +234,7 @@ async fn run_propose(
         .await?
     };
     if proposals.is_empty() {
-        println!(
-            "propose: no candidates (use --include-non-usd for RR / non-USD review lines)"
-        );
+        cli_stdout("propose: no candidates (use --include-non-usd for RR / non-USD review lines)");
         return Ok(());
     }
     let mut text = String::from(
@@ -232,18 +246,21 @@ async fn run_propose(
     }
     if verify {
         verify_proposed_pyth_feeds(oracle, &proposals).await?;
-        println!("propose: live verify OK for {} feeds", proposals.len());
+        cli_stdout(&format!(
+            "propose: live verify OK for {} feeds",
+            proposals.len()
+        ));
     }
     if let Some(path) = out {
         std::fs::write(path, &text)?;
-        println!("propose: wrote {}", path.display());
+        cli_stdout(&format!("propose: wrote {}", path.display()));
     } else {
-        print!("{text}");
+        let _ = io::stdout().write_all(text.as_bytes());
     }
-    println!(
+    cli_stdout(&format!(
         "\nconfig snippet (comma-separated):\n{}",
         format_config_pyth_feeds(&proposals)
-    );
+    ));
     Ok(())
 }
 
@@ -252,9 +269,12 @@ async fn run_verify(oracle: &PriceOracle, path: &std::path::Path) -> anyhow::Res
     let proposals = parse_proposed_pyth_feed_lines(&raw)?;
     let verified = verify_proposed_pyth_feeds(oracle, &proposals).await?;
     for v in &verified {
-        println!("OK {} feed={} usd={:.6}", v.token, v.feed_id, v.token_usd);
+        cli_stdout(&format!(
+            "OK {} feed={} usd={:.6}",
+            v.token, v.feed_id, v.token_usd
+        ));
     }
-    println!("verify: {} feeds passed", verified.len());
+    cli_stdout(&format!("verify: {} feeds passed", verified.len()));
     Ok(())
 }
 

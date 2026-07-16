@@ -7,6 +7,7 @@ use rustc_hash::FxBuildHasher;
 use crate::pipeline::types::MinimalSimResult;
 
 const ROUTE_SIM_CACHE_CAPACITY: usize = 4096;
+const ROUTE_SIM_LOG_INTERVAL: u64 = 10_000;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 struct RouteSimKey {
@@ -40,6 +41,7 @@ impl RouteSimCacheStats {
 pub struct RouteSimCache {
     entries: DashMap<RouteSimKey, MinimalSimResult, FxBuildHasher>,
     pub stats: RouteSimCacheStats,
+    last_logged_traffic: AtomicU64,
 }
 
 impl RouteSimCache {
@@ -48,6 +50,7 @@ impl RouteSimCache {
         Self {
             entries: DashMap::with_capacity_and_hasher(ROUTE_SIM_CACHE_CAPACITY, FxBuildHasher),
             stats: RouteSimCacheStats::default(),
+            last_logged_traffic: AtomicU64::new(0),
         }
     }
 
@@ -78,11 +81,11 @@ impl RouteSimCache {
         amount: U256,
         sim: MinimalSimResult,
     ) {
-        if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
-            if let Some(victim) = self.entries.iter().next().map(|entry| *entry.key()) {
-                self.entries.remove(&victim);
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+        if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY
+            && let Some(victim) = self.entries.iter().next().map(|entry| *entry.key())
+        {
+            self.entries.remove(&victim);
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
         self.entries.insert(
             RouteSimKey {
@@ -99,7 +102,8 @@ impl RouteSimCache {
     pub fn debug_log_if_active(&self, label: &str) {
         let hits = self.stats.hits.load(Ordering::Relaxed);
         let misses = self.stats.misses.load(Ordering::Relaxed);
-        if hits.saturating_add(misses) == 0 {
+        let traffic = hits.saturating_add(misses);
+        if traffic == 0 || !self.should_log_traffic(traffic) {
             return;
         }
         crate::info!(
@@ -109,6 +113,16 @@ impl RouteSimCache {
             self.stats.evictions.load(Ordering::Relaxed),
             self.entries.len()
         );
+    }
+
+    fn should_log_traffic(&self, traffic: u64) -> bool {
+        let last = self.last_logged_traffic.load(Ordering::Relaxed);
+        if last != 0 && traffic.saturating_sub(last) < ROUTE_SIM_LOG_INTERVAL {
+            return false;
+        }
+        self.last_logged_traffic
+            .compare_exchange(last, traffic, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     #[cfg(test)]
@@ -150,5 +164,14 @@ mod tests {
         assert!(cache.get(1, 10, U256::from(100u64)).is_some());
         assert!(cache.get(2, 10, U256::from(100u64)).is_some());
         assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn cache_diagnostic_logs_initial_and_periodic_traffic() {
+        let cache = RouteSimCache::new();
+
+        assert!(cache.should_log_traffic(1));
+        assert!(!cache.should_log_traffic(9_999));
+        assert!(cache.should_log_traffic(10_001));
     }
 }

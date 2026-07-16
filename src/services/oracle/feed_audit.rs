@@ -1,10 +1,12 @@
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
 
 use alloy::primitives::Address;
-use rustc_hash::FxHashSet;
 use alloy::primitives::address;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 
 use super::RateEnrichStats;
 use super::feed_verify;
@@ -211,7 +213,7 @@ pub fn record_unmapped_token_demand(
     if local.is_empty() {
         return;
     }
-    let Ok(mut global) = RUNTIME_UNMAPPED_DEMAND.try_lock() else {
+    let Some(mut global) = RUNTIME_UNMAPPED_DEMAND.try_lock() else {
         return;
     };
     for (addr, (cycle_hits, pool_hits)) in local {
@@ -234,7 +236,7 @@ pub fn log_ranked_unmapped_demand(
     if lf_pass > 2 && !lf_pass.is_multiple_of(30) {
         return;
     }
-    let Ok(global) = RUNTIME_UNMAPPED_DEMAND.try_lock() else {
+    let Some(global) = RUNTIME_UNMAPPED_DEMAND.try_lock() else {
         return;
     };
     if global.is_empty() {
@@ -487,27 +489,25 @@ pub async fn propose_pyth_feed_lines(
         let candidates = pyth_catalog::search_pyth_feeds(http, hermes_url, hint_query).await?;
         let Some(best) = pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, hint_query)
         else {
-            if include_non_usd {
-                if let Some(any) = candidates.first() {
-                    proposals.push(feed_verify::ProposedPythFeed {
-                        token: row.address,
-                        feed_id: any.id.clone(),
-                        comment: Some(format!(
-                            "REVIEW non-USD {} — not auto-merge safe",
-                            any.symbol
-                        )),
-                    });
-                }
+            if include_non_usd && let Some(any) = candidates.first() {
+                proposals.push(feed_verify::ProposedPythFeed {
+                    token: row.address,
+                    feed_id: any.id.clone(),
+                    comment: Some(format!(
+                        "REVIEW non-USD {} — not auto-merge safe",
+                        any.symbol
+                    )),
+                });
             }
             continue;
         };
         proposals.push(feed_verify::ProposedPythFeed {
             token: row.address,
             feed_id: best.id.clone(),
-            comment: Some(format!("{}", best.symbol)),
+            comment: Some(best.symbol.to_string()),
         });
     }
-    proposals.sort_by(|a, b| a.token.cmp(&b.token));
+    proposals.sort_by_key(|a| a.token);
     proposals.dedup_by(|a, b| a.token == b.token);
     Ok(proposals)
 }

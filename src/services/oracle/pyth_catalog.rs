@@ -158,10 +158,7 @@ mod tests {
 
     #[test]
     fn hint_picker_prefers_exact_shorter_ticker() {
-        let candidates = [
-            cand("Crypto.WFRAGSOL/USD"),
-            cand("Crypto.SOL/USD"),
-        ];
+        let candidates = [cand("Crypto.WFRAGSOL/USD"), cand("Crypto.SOL/USD")];
         let best = pick_best_usd_candidate_for_hint(&candidates, "SOL").expect("SOL feed");
         assert_eq!(best.symbol, "Crypto.SOL/USD");
     }

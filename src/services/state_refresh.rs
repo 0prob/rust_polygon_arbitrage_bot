@@ -16,7 +16,7 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::{fetch_missing_pool_states, fetch_missing_pool_states_indexed};
+use crate::pipeline::fetcher::fetch_missing_pool_states_indexed;
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -805,7 +805,7 @@ impl StateRefreshService {
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
             let address_index = self.discovery_state.read().address_index.clone();
-            let (updated, attempted) = fetch_missing_pool_states_indexed(
+            let fetch_result = fetch_missing_pool_states_indexed(
                 provider,
                 Arc::clone(&self.cache),
                 pools,
@@ -820,8 +820,9 @@ impl StateRefreshService {
             )
             .await;
             fetch_ms = fetch_ms.saturating_add(now_ms().saturating_sub(fetch_started));
-            total_updated = updated;
-            fetch_attempted |= attempted;
+            let updated = fetch_result.updated;
+            total_updated = total_updated.saturating_add(updated);
+            fetch_attempted |= fetch_result.attempted;
             if updated > 0 {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
@@ -845,16 +846,24 @@ impl StateRefreshService {
                         "state RPC fallback succeeded (url_index={idx}, updated={updated})"
                     );
                 }
-                break;
+                if !fetch_result.requires_provider_fallback() {
+                    break;
+                }
             }
-            if !attempted {
+            if !fetch_result.attempted {
                 break;
             }
             self.rpc.deprioritize_state_url(url);
             if idx + 1 < candidates.len() {
-                crate::warn!(
-                    "state RPC returned no pool updates — trying fallback (url_index={idx})"
-                );
+                if fetch_result.rate_limited {
+                    crate::warn!(
+                        "state RPC rate limited after partial refresh — trying fallback (url_index={idx}, updated={updated})"
+                    );
+                } else {
+                    crate::warn!(
+                        "state RPC returned no pool updates — trying fallback (url_index={idx})"
+                    );
+                }
             }
         }
         let refresh_ms = now_ms().saturating_sub(refresh_started);

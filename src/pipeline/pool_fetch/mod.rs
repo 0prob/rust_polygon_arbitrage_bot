@@ -24,6 +24,21 @@ use crate::services::state_cache::StateCache;
 use decode::decode_plan;
 use plans::{PoolFetchPlan, build_plan_with_pool_id};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolFetchResult {
+    pub updated: usize,
+    pub rate_limited: bool,
+}
+
+impl PoolFetchResult {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            updated: self.updated.saturating_add(other.updated),
+            rate_limited: self.rate_limited || other.rate_limited,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WoofiMeta {
     address: Address,
@@ -309,15 +324,22 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
         })
         .collect();
 
-    let Ok(results) = execute_multicall_at_chunked(
+    let results = match execute_multicall_at_chunked(
         provider.clone(),
         Arc::from(items),
         block_number,
         crate::pipeline::multicall::MULTICALL_CHUNK,
     )
     .await
-    else {
-        return out;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::warn!(
+                "balancer pool_id multicall failed for {} pools: {e:#}",
+                needs_rpc.len()
+            );
+            return out;
+        }
     };
 
     for (pool, bytes) in needs_rpc.iter().zip(results.iter()) {
@@ -377,9 +399,9 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     block_number: Option<u64>,
     chunk_size: usize,
     batch_pace_ms: u64,
-) -> usize {
+) -> PoolFetchResult {
     if batches.is_empty() {
-        return 0;
+        return PoolFetchResult::default();
     }
     if batches.len() == 1 {
         return execute_plan_batch(
@@ -395,16 +417,20 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
     // Stagger spawns do not pace in-flight RPC when batches run in parallel — serialize when pacing is on.
     if batch_pace_ms > 0 {
-        let mut updated = 0usize;
+        let mut result = PoolFetchResult::default();
         for (i, batch) in batches.into_iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(pacing).await;
             }
-            updated +=
+            result = result.combine(
                 execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size)
-                    .await;
+                    .await,
+            );
+            if result.rate_limited {
+                break;
+            }
         }
-        return updated;
+        return result;
     }
 
     let sem = Arc::new(tokio::sync::Semaphore::new(
@@ -418,19 +444,19 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
                 crate::warn!("plan batch skipped: fetch semaphore closed");
-                return 0usize;
+                return PoolFetchResult::default();
             };
             execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
         });
     }
-    let mut updated = 0usize;
+    let mut result = PoolFetchResult::default();
     while let Some(res) = tasks.join_next().await {
         match res {
-            Ok(n) => updated += n,
+            Ok(batch_result) => result = result.combine(batch_result),
             Err(e) => crate::warn!("plan batch task failed: {e:#}"),
         }
     }
-    updated
+    result
 }
 
 pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>(
@@ -441,7 +467,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     batch_pace_ms: u64,
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
-) -> usize {
+) -> PoolFetchResult {
     let chunk_size = max_multicall_calls.max(1);
     let plan_batch_calls = plan_batch_call_budget(chunk_size);
     let needs_balancer_hydrate = pools
@@ -538,15 +564,20 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     );
 
     let (woofi_updated, woofi_ms) = woofi_result;
-    let (plan_updated, plan_ms) = plan_result;
+    let (plan_result, plan_ms) = plan_result;
+    let plan_updated = plan_result.updated;
     crate::debug!(
-        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_ms={plan_ms}",
+        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_rate_limited={} plan_ms={plan_ms}",
+        plan_result.rate_limited,
         pools.len(),
         woofi_pools.len(),
         needs_balancer_hydrate,
     );
 
-    woofi_updated + plan_updated
+    PoolFetchResult {
+        updated: woofi_updated.saturating_add(plan_updated),
+        rate_limited: plan_result.rate_limited,
+    }
 }
 
 async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
@@ -555,9 +586,9 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
     cache: &StateCache,
     block_number: Option<u64>,
     chunk_size: usize,
-) -> usize {
+) -> PoolFetchResult {
     if plans.is_empty() {
-        return 0;
+        return PoolFetchResult::default();
     }
     let mut work: Vec<(usize, usize)> = vec![(0, plans.len())];
     let mut updated = 0usize;
@@ -573,7 +604,10 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
                     "plan batch abort: rate limited (updated={updated}, remaining_pools={})",
                     end.saturating_sub(start)
                 );
-                break;
+                return PoolFetchResult {
+                    updated,
+                    rate_limited: true,
+                };
             }
             Err(_e) if slice.len() > 1 => {
                 let mid = start + slice.len() / 2;
@@ -589,7 +623,10 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
             }
         }
     }
-    updated
+    PoolFetchResult {
+        updated,
+        rate_limited: false,
+    }
 }
 
 async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static>(

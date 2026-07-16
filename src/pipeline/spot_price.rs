@@ -512,6 +512,7 @@ pub fn finalize_enumerated_cycles(cycles: Vec<FoundCycle>, max_cycles: usize) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::manual_let_else)]
 mod tests {
     use super::*;
     use crate::core::types::PoolIndex;

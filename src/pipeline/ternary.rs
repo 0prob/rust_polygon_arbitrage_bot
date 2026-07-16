@@ -11,13 +11,12 @@ use crate::pipeline::brent_diag::{
     record_brent_warm_seed,
 };
 use crate::pipeline::local_sim::{
-    cl_amount_cap, precompute_route_shallow_caps, simulate_route_minimal,
-    simulate_route_minimal_with_caps,
+    cl_amount_cap, precompute_route_shallow_caps, simulate_route_minimal_with_caps,
 };
 use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, check_sim_sanity_fast, check_sim_sanity_for_dispatch,
-    max_flash_borrow_wei, min_economic_amount_in,
+    FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_fast,
+    check_sim_sanity_for_dispatch, min_economic_amount_in,
 };
 use crate::pipeline::ternary_diag::{
     TernaryBoundsReject, record_ternary_bounds_call, record_ternary_bounds_ok,
@@ -85,7 +84,7 @@ fn optimize_at_amount_cap(
 }
 
 /// Bounded golden-section maximization over a U256 search range.
-pub fn solve_brent_optimal<F>(low: U256, high: U256, mut evaluate: F, max_iterations: u32) -> U256
+pub fn solve_brent_optimal<F>(low: U256, high: U256, evaluate: F, max_iterations: u32) -> U256
 where
     F: FnMut(U256) -> U256,
 {
@@ -297,6 +296,18 @@ fn compute_ternary_search_bounds(
     liquidity_cap: Option<U256>,
 ) -> Option<TernarySearchBounds> {
     record_ternary_bounds_call();
+    let flash_cap_params = FlashBorrowCapParams {
+        max_flash_loan_usd,
+        token_decimals: start_decimals,
+        token_to_matic_rate: start_rate,
+        matic_usd,
+        matic_usd_chainlink,
+    };
+    if flash_cap_params.cap_enforced_but_unresolved() {
+        record_ternary_bounds_reject(TernaryBoundsReject::FlashCapUnavailable);
+        crate::trace!("ternary: bounds flash_cap_unavailable");
+        return None;
+    }
     let mut min_capacity = U256::MAX;
     let mut can_normalize_all = true;
     let mut saw_capacity = false;
@@ -351,13 +362,8 @@ fn compute_ternary_search_bounds(
         if min_economic <= max_search_low && low < min_economic {
             low = min_economic;
         }
-        if let Some(max_wei) = max_flash_borrow_wei(
-            max_flash_loan_usd,
-            start_decimals,
-            start_rate,
-            matic_usd,
-            matic_usd_chainlink,
-        ) && high > max_wei
+        if let Some(max_wei) = flash_cap_params.cap_wei()
+            && high > max_wei
         {
             record_ternary_flash_cap_clamp();
             high = max_wei;
@@ -401,13 +407,7 @@ fn compute_ternary_search_bounds(
         record_ternary_economic_high_raise();
         out_high = economic_floor.saturating_mul(U256::from(100u8));
         if !start_rate.is_zero()
-            && let Some(max_wei) = max_flash_borrow_wei(
-                max_flash_loan_usd,
-                start_decimals,
-                start_rate,
-                matic_usd,
-                matic_usd_chainlink,
-            )
+            && let Some(max_wei) = flash_cap_params.cap_wei()
             && out_high > max_wei
         {
             record_ternary_flash_cap_clamp();
@@ -454,7 +454,7 @@ pub fn optimize_cycle(
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
-    let TernarySearchBounds { mut low, mut high } = compute_ternary_search_bounds(
+    let TernarySearchBounds { low, mut high } = compute_ternary_search_bounds(
         cycle,
         arena,
         token_to_matic_rates,

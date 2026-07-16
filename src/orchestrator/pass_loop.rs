@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloy::primitives::U256;
 use parking_lot::Mutex as ParkingMutex;
@@ -503,14 +503,28 @@ fn spawn_pass_loop_sidecars(
     if let Some(url) = ctx.rpc.private_url().or_else(|| ctx.rpc.execution_url()) {
         let probe_url = url.to_string();
         tokio::spawn(async move {
-            let _probe =
+            let probe =
                 crate::services::execution::private_submit::probe_submit_endpoint(&probe_url).await;
+            crate::info!(
+                "submit probe: chain_id_ok={} private_rpc_method={} recommended={:?} private_method_err={:?}",
+                probe.chain_id_ok,
+                probe.supports_private_rpc_method,
+                probe.recommended_mode,
+                probe.private_method_error,
+            );
             if let Some(auth) = std::env::var("BLOXROUTE_AUTH_HEADER")
                 .ok()
                 .filter(|s| !s.is_empty())
             {
-                let _ =
+                let blox_ok =
                     crate::services::execution::private_submit::probe_bloxroute_auth(&auth).await;
+                if blox_ok {
+                    crate::info!("submit probe: bloXroute auth accepted");
+                } else {
+                    crate::warn!(
+                        "submit probe: bloXroute auth failed — live private submit may fail"
+                    );
+                }
             }
         });
     }
@@ -613,6 +627,7 @@ fn spawn_matic_usd_oracle_background(
 ) {
     let period_ms = (cache_ttl_ms / 2).clamp(2_000, 8_000);
     tokio::spawn(async move {
+        static MATIC_USD_FAILS: AtomicU32 = AtomicU32::new(0);
         let mut ticker = interval(Duration::from_millis(period_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -626,7 +641,17 @@ fn spawn_matic_usd_oracle_background(
             }
             let provider = rpc.connect_state().ok();
             let provider_ref = provider.as_ref();
-            let _ = ensure_matic_usd_for_flash_cap(&price_oracle, provider_ref).await;
+            match ensure_matic_usd_for_flash_cap(&price_oracle, provider_ref).await {
+                Some(_) => MATIC_USD_FAILS.store(0, Ordering::Relaxed),
+                None => {
+                    let n = MATIC_USD_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(20) {
+                        crate::warn!(
+                            "matic/usd oracle refresh failed ({n} consecutive) — HF eval may skip"
+                        );
+                    }
+                }
+            }
         }
     });
 }

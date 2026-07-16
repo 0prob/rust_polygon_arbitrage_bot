@@ -107,7 +107,12 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                 pending.push((mid, end));
                 pending.push((start, mid));
             }
-            Err(_e) => {}
+            Err(e) => {
+                crate::warn!(
+                    "multicall chunk failed ({} call(s) at index {start}): {e:#}",
+                    slice.len()
+                );
+            }
         }
     }
     Ok(out)

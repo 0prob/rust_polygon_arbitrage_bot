@@ -16,7 +16,7 @@ use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
 use crate::pipeline::local_sim::{self, simulate_route_detailed, simulate_route_minimal};
 use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
-    SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch, max_flash_borrow_wei,
+    FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_for_dispatch,
     min_economic_amount_in,
 };
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
@@ -256,7 +256,7 @@ fn minimal_rank_probe(
             best = Some((amount, sim));
         }
     });
-    best.ok_or_else(|| {
+    best.ok_or({
         if !saw_simulation {
             MinimalProbeReject::NoSimulation
         } else if !saw_profit {
@@ -855,9 +855,9 @@ fn probe_fallback_amounts(
     input: &HfEvalInput<'_>,
     probe_seed: Option<(U256, MinimalSimResult)>,
 ) -> [U256; 3] {
-    let dec =
-        resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
-    let rate = resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
+    let flash_cap = flash_cap_for_cycle(input, cycle);
+    let dec = flash_cap.token_decimals;
+    let rate = flash_cap.token_to_matic_rate;
     let economic = min_economic_amount_in(dec, rate);
     let spot = crate::pipeline::spot_price::spot_probe_for_decimals(dec);
     let seed = probe_seed.map(|(a, _)| a).unwrap_or(economic);
@@ -872,17 +872,7 @@ fn probe_fallback_amounts(
         if duplicate {
             continue;
         }
-        // Skip spot probe if it exceeds the flash loan cap for this token.
-        if candidate == spot
-            && let Some(cap) = max_flash_borrow_wei(
-                input.max_flash_loan_usd,
-                dec,
-                rate,
-                input.matic_usd,
-                input.matic_usd_chainlink,
-            )
-            && spot > cap
-        {
+        if candidate == spot && !flash_cap.amount_within_cap(spot) {
             continue;
         }
         amounts[n] = candidate;
@@ -1244,6 +1234,23 @@ fn assess_route_for_cycle(
     }))
 }
 
+fn flash_cap_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> FlashBorrowCapParams {
+    FlashBorrowCapParams {
+        max_flash_loan_usd: input.max_flash_loan_usd,
+        token_decimals: resolve_token_decimals_for_index(
+            cycle.start_token,
+            input.arena,
+            input.token_decimals,
+        ),
+        token_to_matic_rate: resolve_token_to_matic_rate(
+            cycle.start_token,
+            input.token_to_matic_rates,
+        ),
+        matic_usd: input.matic_usd,
+        matic_usd_chainlink: input.matic_usd_chainlink,
+    }
+}
+
 fn validate_optimized_sim(
     input: &HfEvalInput<'_>,
     cycle: &FoundCycle,
@@ -1251,23 +1258,14 @@ fn validate_optimized_sim(
     optimal_input: U256,
     search_low: U256,
 ) -> bool {
-    let token_to_matic_rate =
-        resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
-    let token_decimals =
-        resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
-    let within_flash_cap = max_flash_borrow_wei(
-        input.max_flash_loan_usd,
-        token_decimals,
-        token_to_matic_rate,
-        input.matic_usd,
-        input.matic_usd_chainlink,
-    )
-    .is_none_or(|cap| sim.amount_in <= cap);
+    let flash_cap = flash_cap_for_cycle(input, cycle);
+    let token_to_matic_rate = flash_cap.token_to_matic_rate;
+    let token_decimals = flash_cap.token_decimals;
 
     sim.amount_in == optimal_input
         && local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts)
         && !sim.profit.is_zero()
-        && within_flash_cap
+        && flash_cap.amount_within_cap(sim.amount_in)
         && check_sim_sanity_for_dispatch(SimSanityInput {
             amount_in: sim.amount_in,
             gross_profit: sim.profit,

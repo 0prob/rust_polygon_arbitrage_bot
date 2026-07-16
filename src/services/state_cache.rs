@@ -344,12 +344,12 @@ impl StateCache {
 
     pub fn insert(&self, address: Address, state: PoolState) {
         let mut guard = self.inner.write();
-        if guard.len() >= self.max_entries && !guard.contains_key(&address) {
-            if guard.len() >= self.max_entries
-                && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
-            {
-                guard.remove(&victim);
-            }
+        if guard.len() >= self.max_entries
+            && !guard.contains_key(&address)
+            && guard.len() >= self.max_entries
+            && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
+        {
+            guard.remove(&victim);
         }
         let revision = self
             .generation

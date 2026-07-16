@@ -100,9 +100,8 @@ impl TuiBridgeHook {
 
     fn send_metric(&self, event: UiEvent) {
         match self.tx.try_send(event) {
-            Ok(()) => {}
             Err(TrySendError::Full(ev)) => self.stash_metric(ev),
-            Err(TrySendError::Closed(_)) => {}
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
         }
     }
 

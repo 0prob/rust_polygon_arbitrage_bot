@@ -302,24 +302,27 @@ fn unique_route_tokens(snap: &crate::services::hf_snapshot::HfSnapshot) -> Vec<A
         if ordered.len() >= TOKEN_LIMIT {
             break;
         }
-        if let Some(addr) = snap.arena.token_address(cycle.start_token) {
-            if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
-                ordered.push(addr);
-            }
+        if let Some(addr) = snap.arena.token_address(cycle.start_token)
+            && seen.insert(addr)
+            && ordered.len() < TOKEN_LIMIT
+        {
+            ordered.push(addr);
         }
         for edge in &cycle.edges {
             if ordered.len() >= TOKEN_LIMIT {
                 break;
             }
-            if let Some(addr) = snap.arena.token_address(edge.token_in) {
-                if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
-                    ordered.push(addr);
-                }
+            if let Some(addr) = snap.arena.token_address(edge.token_in)
+                && seen.insert(addr)
+                && ordered.len() < TOKEN_LIMIT
+            {
+                ordered.push(addr);
             }
-            if let Some(addr) = snap.arena.token_address(edge.token_out) {
-                if seen.insert(addr) && ordered.len() < TOKEN_LIMIT {
-                    ordered.push(addr);
-                }
+            if let Some(addr) = snap.arena.token_address(edge.token_out)
+                && seen.insert(addr)
+                && ordered.len() < TOKEN_LIMIT
+            {
+                ordered.push(addr);
             }
         }
     }

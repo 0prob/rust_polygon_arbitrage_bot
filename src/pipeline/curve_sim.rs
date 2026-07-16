@@ -48,10 +48,8 @@ fn record_crypto_reject(reason: CurveCryptoReject) {
         CurveCryptoReject::NewtonY => {
             CRYPTO_NEWTON_Y.fetch_add(1, Ordering::Relaxed);
         }
-        CurveCryptoReject::ImplausibleOutput => {
-            CRYPTO_OTHER.fetch_add(1, Ordering::Relaxed);
-        }
-        CurveCryptoReject::ZeroAmount
+        CurveCryptoReject::ImplausibleOutput
+        | CurveCryptoReject::ZeroAmount
         | CurveCryptoReject::InvalidIndices
         | CurveCryptoReject::MissingGamma => {
             CRYPTO_OTHER.fetch_add(1, Ordering::Relaxed);

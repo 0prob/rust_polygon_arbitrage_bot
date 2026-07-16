@@ -319,7 +319,9 @@ impl PriceOracle {
         let usd = {
             let cache = self.token_usd.read();
             let entry = cache.get(&WMATIC)?;
-            if !self.fresh(entry) || !(entry.value > 0.0) {
+            if !self.fresh(entry)
+                || entry.value.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            {
                 return None;
             }
             entry.value
@@ -328,8 +330,14 @@ impl PriceOracle {
         Some(usd)
     }
 
-    pub(crate) fn cache_token_usd(&self, token: Address, usd: f64, chainlink_raw: I256, now: Instant) {
-        if !(usd > 0.0) {
+    pub(crate) fn cache_token_usd(
+        &self,
+        token: Address,
+        usd: f64,
+        chainlink_raw: I256,
+        now: Instant,
+    ) {
+        if usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return;
         }
         self.token_usd.write().insert(
@@ -647,7 +655,7 @@ impl PriceOracle {
     async fn fetch_pyth_matic_usd(&self) -> Option<f64> {
         let prices = self.fetch_pyth(&[PYTH_MATIC_USD_ID]).await.ok()?;
         let quote = prices.get(PYTH_MATIC_USD_ID)?;
-        if !(quote.usd > 0.0) {
+        if quote.usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return None;
         }
         self.cache_token_usd(WMATIC, quote.usd, quote.chainlink_raw, Instant::now());
@@ -719,7 +727,8 @@ impl PriceOracle {
     pub(crate) fn fresh_token_usd(&self, token: &Address) -> Option<f64> {
         let cache = self.token_usd.read();
         let entry = cache.get(token)?;
-        if !self.fresh(entry) || !(entry.value > 0.0) {
+        if !self.fresh(entry) || entry.value.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        {
             return None;
         }
         Some(entry.value)
@@ -911,25 +920,6 @@ impl OracleFeedSources {
 }
 
 impl PriceOracle {
-    /// Chainlink aggregator address for `token`: checks built-in feeds first,
-    /// then config-driven overrides.
-    #[inline]
-    fn chainlink_feed_dyn(&self, token: &Address) -> Option<Address> {
-        chainlink_feed(token).or_else(|| self.custom_chainlink.read().get(token).copied())
-    }
-
-    /// True when `token` has any Pyth feed (static or custom).
-    #[inline]
-    fn has_pyth_feed(&self, token: &Address) -> bool {
-        pyth_feed(token).is_some() || self.custom_pyth.read().contains_key(token)
-    }
-
-    /// True when `token` has any Chainlink feed (static or custom).
-    #[inline]
-    fn has_chainlink_feed(&self, token: &Address) -> bool {
-        chainlink_feed(token).is_some() || self.custom_chainlink.read().contains_key(token)
-    }
-
     /// Static + config oracle mappings (no network fetch).
     #[must_use]
     pub fn feed_sources(&self, token: &Address) -> OracleFeedSources {
@@ -1125,7 +1115,7 @@ mod tests {
     fn chainlink_round_trusted_rejects_stale_and_incomplete_rounds() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs();
         let answer = I256::from(U256::from(100_000_000u64));
         assert!(chainlink_round_trusted(1, answer, U256::from(now), 1));
@@ -1143,7 +1133,7 @@ mod tests {
     fn pyth_quote_trusted_rejects_stale_and_wide_confidence() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs() as i64;
         assert!(pyth_quote_trusted(1_000_000, Some(5_000), Some(now)));
         assert!(!pyth_quote_trusted(1_000_000, Some(20_000), Some(now)));
@@ -1177,7 +1167,7 @@ mod tests {
         assert_eq!(raw, I256::from(U256::from(73_717_820u64)));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs() as i64;
         let quote = pyth_fields_to_quote(100_000_000, -8, Some(50_000), Some(now)).expect("quote");
         assert_eq!(quote.usd, 1.0);
@@ -1334,10 +1324,7 @@ mod tests {
                 address!("0x50B728D8D964fd00C2d0AAD81718b71311feF68a"),
                 "SNX",
             ),
-            (
-                address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"),
-                "SD",
-            ),
+            (address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"), "SD"),
             (
                 address!("0x6f8a06447Ff6FcF75d803135a7de15CE88C1d4ec"),
                 "SHIB",

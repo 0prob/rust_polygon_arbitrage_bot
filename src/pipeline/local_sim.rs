@@ -518,7 +518,6 @@ pub fn route_resim_fidelity_reject_profiled(
 
 #[must_use]
 /// Precomputed CL shallow caps for Brent — avoids rebuilding per `simulate_route_minimal` call.
-#[must_use]
 pub fn precompute_route_shallow_caps(
     arena: &StateArena,
     edges: &[Edge],

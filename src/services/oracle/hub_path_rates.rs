@@ -226,12 +226,8 @@ mod tests {
         let mut arena = StateArena::default();
         let wmatic = arena.register_token(WMATIC);
         let graph = RoutingGraph::new(1);
-        let rates = hub_path_matic_rates_batch(
-            &arena,
-            &graph,
-            &[wmatic],
-            HubPathRateParams::default(),
-        );
+        let rates =
+            hub_path_matic_rates_batch(&arena, &graph, &[wmatic], HubPathRateParams::default());
         assert_eq!(rates.get(&wmatic), Some(&RATE_PRECISION));
     }
 }

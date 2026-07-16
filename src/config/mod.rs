@@ -794,10 +794,10 @@ impl AppConfig {
     pub fn state_read_urls(&self) -> Vec<String> {
         let exec = self.rpc.execution_rpc_url.trim();
         let mut urls = Vec::with_capacity(1 + self.rpc.polygon_rpc_urls.len());
-        if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty()) {
-            if exec.is_empty() || url != exec {
-                urls.push(url.to_string());
-            }
+        if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty())
+            && (exec.is_empty() || url != exec)
+        {
+            urls.push(url.to_string());
         }
         for url in &self.rpc.polygon_rpc_urls {
             if url.is_empty() || urls.iter().any(|u| u == url) {

@@ -35,6 +35,7 @@ const WSS_PING_INTERVAL: Duration = Duration::from_secs(15);
 const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Coalesce rapid LF stream-target updates before tearing down subscriptions.
 const WSS_ADDR_DEBOUNCE: Duration = Duration::from_millis(400);
+const WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS: u64 = 60_000;
 
 /// Why a live subscription session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ enum SubscriptionExit {
 pub struct PoolLogFeed {
     wss_urls: Vec<String>,
     sticky_url: Arc<Mutex<Option<String>>>,
+    subscription_cooldowns: Arc<Mutex<rustc_hash::FxHashMap<String, u64>>>,
     partial: Arc<PartialPoolCache>,
     addresses: StreamAddressSet,
     shutdown: watch::Receiver<bool>,
@@ -63,6 +65,7 @@ impl PoolLogFeed {
         Self {
             wss_urls,
             sticky_url: Arc::new(Mutex::new(None)),
+            subscription_cooldowns: Arc::new(Mutex::new(rustc_hash::FxHashMap::default())),
             partial,
             addresses,
             shutdown,
@@ -84,7 +87,8 @@ impl PoolLogFeed {
                 backoff_ms = BASE_RECONNECT_DELAY_MS;
             } else {
                 let sticky = self.sticky_url.lock().clone();
-                match select_wss_url(&self.wss_urls, sticky.as_deref()).await {
+                let cooldowns = self.subscription_cooldowns.lock().clone();
+                match select_wss_url(&self.wss_urls, sticky.as_deref(), &cooldowns).await {
                     Some(url) => {
                         backoff_ms = BASE_RECONNECT_DELAY_MS;
                         match self
@@ -98,12 +102,14 @@ impl PoolLogFeed {
                         {
                             Err(e) => {
                                 warn!("WSS subscription error ({}): {e}", rpc_host_label(&url));
+                                self.cool_down_subscription_endpoint(&url);
                                 *self.sticky_url.lock() = None;
                             }
                             Ok(SubscriptionExit::AddressChange) => {
                                 *self.sticky_url.lock() = Some(url);
                             }
                             Ok(SubscriptionExit::Unhealthy) => {
+                                self.cool_down_subscription_endpoint(&url);
                                 *self.sticky_url.lock() = None;
                             }
                         }
@@ -218,6 +224,17 @@ impl PoolLogFeed {
         let ts = now_ms();
         self.partial.apply_log(pool, topic0, data, ts);
     }
+
+    fn cool_down_subscription_endpoint(&self, url: &str) {
+        let until_ms = now_ms().saturating_add(WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS);
+        self.subscription_cooldowns
+            .lock()
+            .insert(url.to_string(), until_ms);
+        warn!(
+            "WSS endpoint subscription cooldown ({}, cooldown_ms={WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS})",
+            rpc_host_label(url)
+        );
+    }
 }
 
 /// Spawn the WSS log feed when streaming is enabled in config.
@@ -264,14 +281,24 @@ fn wss_url_candidates(config: &AppConfig) -> Vec<String> {
     urls
 }
 
-fn ordered_wss_urls(urls: &[String], sticky: Option<&str>) -> Vec<String> {
+fn ordered_wss_urls(
+    urls: &[String],
+    sticky: Option<&str>,
+    cooldowns: &rustc_hash::FxHashMap<String, u64>,
+    now: u64,
+) -> Vec<String> {
+    let has_eligible = urls
+        .iter()
+        .any(|url| cooldowns.get(url).is_none_or(|until| *until <= now));
+    let is_candidate =
+        |url: &String| !has_eligible || cooldowns.get(url).is_none_or(|until| *until <= now);
     let mut ordered = Vec::with_capacity(urls.len());
     let mut seen = rustc_hash::FxHashSet::default();
-    if let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s)) {
+    if let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s && is_candidate(u))) {
         ordered.push(url.to_string());
         seen.insert(url);
     }
-    for url in urls {
+    for url in urls.iter().filter(|url| is_candidate(url)) {
         if seen.insert(url.as_str()) {
             ordered.push(url.clone());
         }
@@ -317,12 +344,19 @@ async fn probe_wss_urls(urls: &[String]) -> Option<(String, Duration)> {
     best
 }
 
-async fn select_wss_url(urls: &[String], sticky: Option<&str>) -> Option<String> {
+async fn select_wss_url(
+    urls: &[String],
+    sticky: Option<&str>,
+    cooldowns: &rustc_hash::FxHashMap<String, u64>,
+) -> Option<String> {
     if urls.is_empty() {
         return None;
     }
-    if sticky.is_some()
-        && let Some(url) = sticky.filter(|s| urls.iter().any(|u| u == *s))
+    let now = now_ms();
+    let sticky_eligible =
+        sticky.filter(|url| cooldowns.get(*url).is_none_or(|until| *until <= now));
+    if sticky_eligible.is_some()
+        && let Some(url) = sticky_eligible.filter(|s| urls.iter().any(|u| u == *s))
     {
         crate::debug!(
             "WSS sticky reconnect ({}, probe skipped)",
@@ -331,7 +365,7 @@ async fn select_wss_url(urls: &[String], sticky: Option<&str>) -> Option<String>
         return Some(url.to_string());
     }
 
-    let candidates = ordered_wss_urls(urls, sticky);
+    let candidates = ordered_wss_urls(urls, sticky_eligible, cooldowns, now);
     let (url, latency) = probe_wss_urls(&candidates).await?;
     info!(
         "WSS endpoint selected ({}, probe_ms={})",
@@ -387,14 +421,37 @@ mod tests {
             "wss://b".to_string(),
             "wss://c".to_string(),
         ];
+        let cooldowns = rustc_hash::FxHashMap::default();
         assert_eq!(
-            ordered_wss_urls(&urls, Some("wss://c")),
+            ordered_wss_urls(&urls, Some("wss://c"), &cooldowns, 1_000),
             vec![
                 "wss://c".to_string(),
                 "wss://a".to_string(),
                 "wss://b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn ordered_wss_urls_skips_subscription_cooled_endpoint() {
+        let urls = vec!["wss://a".to_string(), "wss://b".to_string()];
+        let mut cooldowns = rustc_hash::FxHashMap::default();
+        cooldowns.insert("wss://a".to_string(), 2_000);
+
+        assert_eq!(
+            ordered_wss_urls(&urls, None, &cooldowns, 1_000),
+            vec!["wss://b".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_wss_urls_retries_all_endpoints_when_all_are_cooled() {
+        let urls = vec!["wss://a".to_string(), "wss://b".to_string()];
+        let mut cooldowns = rustc_hash::FxHashMap::default();
+        cooldowns.insert("wss://a".to_string(), 2_000);
+        cooldowns.insert("wss://b".to_string(), 2_000);
+
+        assert_eq!(ordered_wss_urls(&urls, None, &cooldowns, 1_000), urls);
     }
 
     #[test]

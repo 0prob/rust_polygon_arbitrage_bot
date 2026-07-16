@@ -76,7 +76,10 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
             nonce_mgr.mark_stale(nonce);
             NonceRecoveryOutcome::Cancelled(hash)
         }
-        Err(_e) => {
+        Err(e) => {
+            crate::warn!(
+                "receipt timeout: cancel tx failed nonce={nonce} original={tx_hash}: {e:#}"
+            );
             nonce_mgr.mark_stale(nonce);
             NonceRecoveryOutcome::StillPending
         }

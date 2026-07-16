@@ -96,12 +96,11 @@ fn probe_context_for_cycle(
     } else {
         arena.token_decimals(cycle.start_token)
     };
-    if let Some(c) = ctx {
-        if let Some(rate_map) = c.token_to_matic_rates
-            && let Some(&r) = rate_map.get(&cycle.start_token)
-        {
-            rate = r;
-        }
+    if let Some(c) = ctx
+        && let Some(rate_map) = c.token_to_matic_rates
+        && let Some(&r) = rate_map.get(&cycle.start_token)
+    {
+        rate = r;
     }
     (min_economic_amount_in(decimals, rate), rate, decimals)
 }

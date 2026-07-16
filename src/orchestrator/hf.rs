@@ -105,6 +105,14 @@ fn inactive_indices(offset: usize, inactive_len: usize, take: usize) -> Vec<usiz
         .collect()
 }
 
+fn stream_pending_pools(partial_cache: &PartialPoolCache, hot_pools: &[Address]) -> Vec<Address> {
+    partial_cache
+        .dirty_addresses()
+        .into_iter()
+        .filter(|address| hot_pools.iter().any(|hot| hot == address))
+        .collect()
+}
+
 /// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
 fn cycle_with_reliable_start(
     cycle: &Arc<FoundCycle>,
@@ -225,6 +233,17 @@ fn cycle_activity_score(
         .sum()
 }
 
+struct RescoreSelection {
+    cycles: Vec<Arc<FoundCycle>>,
+    hot_pools: FxHashSet<Address>,
+    quarantine_skipped: usize,
+    rate_skipped: usize,
+    activity_candidates: usize,
+    activity_selected: usize,
+    inactive_len: usize,
+    inactive_selected: usize,
+}
+
 fn select_cycles_for_rescore(
     snap_cycles: &[Arc<FoundCycle>],
     arena: &crate::pipeline::arena::StateArena,
@@ -233,16 +252,7 @@ fn select_cycles_for_rescore(
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     rescore_cap: usize,
     inactive_offset: usize,
-) -> (
-    Vec<Arc<FoundCycle>>,
-    FxHashSet<Address>,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-) {
+) -> RescoreSelection {
     let activity_now = now_ms();
     let mut candidates: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len());
     let mut quarantine_skipped = 0usize;
@@ -260,16 +270,16 @@ fn select_cycles_for_rescore(
         candidates.push((ready, 0));
     }
     if candidates.is_empty() {
-        return (
-            Vec::new(),
-            FxHashSet::default(),
+        return RescoreSelection {
+            cycles: Vec::new(),
+            hot_pools: FxHashSet::default(),
             quarantine_skipped,
             rate_skipped,
-            0,
-            0,
-            0,
-            0,
-        );
+            activity_candidates: 0,
+            activity_selected: 0,
+            inactive_len: 0,
+            inactive_selected: 0,
+        };
     }
 
     for (cycle, score) in &mut candidates {
@@ -304,7 +314,7 @@ fn select_cycles_for_rescore(
         }
         cycles.push(cycle);
     }
-    (
+    RescoreSelection {
         cycles,
         hot_pools,
         quarantine_skipped,
@@ -313,7 +323,7 @@ fn select_cycles_for_rescore(
         activity_selected,
         inactive_len,
         inactive_selected,
-    )
+    }
 }
 
 pub async fn run_hf_tick(
@@ -359,8 +369,6 @@ pub async fn run_hf_tick(
     let mut hot_pools_set;
     let mut quarantine_skipped;
     let mut rate_skipped;
-    let activity_candidates;
-    let activity_selected;
     let mut inactive_len;
     let mut inactive_selected;
     let mut selection_generation = snap_generation;
@@ -368,16 +376,7 @@ pub async fn run_hf_tick(
         .inactive_rotation
         .lock()
         .offset_for(selection_generation, snap_cycle_count);
-    (
-        cycles,
-        hot_pools_set,
-        quarantine_skipped,
-        rate_skipped,
-        activity_candidates,
-        activity_selected,
-        inactive_len,
-        inactive_selected,
-    ) = select_cycles_for_rescore(
+    let selection = select_cycles_for_rescore(
         &snap.cycles,
         &arena_base,
         &ctx.partial_cache,
@@ -386,6 +385,14 @@ pub async fn run_hf_tick(
         rescore_cap,
         inactive_offset,
     );
+    cycles = selection.cycles;
+    hot_pools_set = selection.hot_pools;
+    quarantine_skipped = selection.quarantine_skipped;
+    rate_skipped = selection.rate_skipped;
+    let activity_candidates = selection.activity_candidates;
+    let activity_selected = selection.activity_selected;
+    inactive_len = selection.inactive_len;
+    inactive_selected = selection.inactive_selected;
     if should_log_hf_summary() || stream_triggered {
         crate::info!(
             "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
@@ -452,23 +459,73 @@ pub async fn run_hf_tick(
             ),
         }
     }
-    let pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
+    let mut pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
 
     if stream_triggered && pipeline.stream_enabled {
         let flushed = ctx
             .partial_cache
             .flush_to_state_cache(&ctx.cache, hot_pools.as_ref());
-        let pending = ctx
-            .partial_cache
-            .dirty_addresses()
-            .into_iter()
-            .filter(|a| hot_pools.iter().any(|h| h == a))
-            .count();
-        if pending > 0 {
+        let pending_pools = stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
+        if !pending_pools.is_empty() {
             crate::warn!(
-                "stream flush incomplete: flushed={flushed} hot_dirty_pending={pending} — HF eval may use stale StateCache"
+                "stream flush incomplete: flushed={flushed} hot_dirty_pending={} — refreshing before HF eval",
+                pending_pools.len(),
             );
-            prefetch_ok = false;
+            let recovery_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+            match timeout(
+                recovery_budget,
+                ctx.refresh
+                    .refresh_pool_states_for(&pending_pools, pending_pools.len()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let recovered = ctx
+                        .partial_cache
+                        .flush_to_state_cache(&ctx.cache, &pending_pools);
+                    let remaining = stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
+                    if remaining.is_empty() {
+                        prefetch_ok = true;
+                        crate::info!(
+                            "stream state recovery: refreshed={} flushed={recovered}",
+                            pending_pools.len()
+                        );
+                    } else {
+                        crate::warn!(
+                            "hf tick skipped: stream state recovery incomplete (remaining={})",
+                            remaining.len()
+                        );
+                        return Ok(HfTickResult {
+                            cycles_considered: cycles.len(),
+                            profitable_count: 0,
+                            best_profit: U256::ZERO,
+                            elapsed_ms: now_ms().saturating_sub(start),
+                        });
+                    }
+                }
+                Ok(Err(e)) => {
+                    crate::warn!("hf tick skipped: stream state recovery failed: {e:#}");
+                    return Ok(HfTickResult {
+                        cycles_considered: cycles.len(),
+                        profitable_count: 0,
+                        best_profit: U256::ZERO,
+                        elapsed_ms: now_ms().saturating_sub(start),
+                    });
+                }
+                Err(_) => {
+                    crate::warn!(
+                        "hf tick skipped: stream state recovery timed out after {}ms",
+                        recovery_budget.as_millis()
+                    );
+                    return Ok(HfTickResult {
+                        cycles_considered: cycles.len(),
+                        profitable_count: 0,
+                        best_profit: U256::ZERO,
+                        elapsed_ms: now_ms().saturating_sub(start),
+                    });
+                }
+            }
+            pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
         } else if flushed > 0 {
             prefetch_ok = true;
         }
@@ -496,12 +553,12 @@ pub async fn run_hf_tick(
             rescore_cap,
             inactive_offset,
         );
-        cycles = selected.0;
-        hot_pools = selected.1.into_iter().collect::<Vec<_>>().into();
-        quarantine_skipped = selected.2;
-        rate_skipped = selected.3;
-        inactive_len = selected.6;
-        inactive_selected = selected.7;
+        cycles = selected.cycles;
+        hot_pools = selected.hot_pools.into_iter().collect::<Vec<_>>().into();
+        quarantine_skipped = selected.quarantine_skipped;
+        rate_skipped = selected.rate_skipped;
+        inactive_len = selected.inactive_len;
+        inactive_selected = selected.inactive_selected;
         if cycles.is_empty() {
             if should_log_hf_summary() {
                 crate::info!(
@@ -749,7 +806,9 @@ pub async fn run_hf_tick(
     };
     let mut dispatch_state_hash = snap.state_hash;
     let verify_started = now_ms();
-    if !profitable.is_empty() && ctx.config.execution.executor_address.is_some() {
+    if !profitable.is_empty()
+        && let Some(executor) = ctx.config.execution.executor_address
+    {
         let sim_provider = match ctx.rpc.connect_simulation() {
             Ok(p) => Some(p),
             Err(e) => {
@@ -762,11 +821,6 @@ pub async fn run_hf_tick(
             }
         };
         if let Some(sim_provider) = sim_provider {
-            let executor = ctx
-                .config
-                .execution
-                .executor_address
-                .expect("checked above");
             let (resimmed, resim_refreshed, resim_generation) = refresh_and_resim_profitable(
                 &ctx.refresh,
                 &ctx.cache,
@@ -1085,7 +1139,7 @@ mod tests {
         let mut rates = rustc_hash::FxHashMap::default();
         rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
 
-        let (selected, _, _, _, _, _, _, _) = select_cycles_for_rescore(
+        let selected = select_cycles_for_rescore(
             &cycles,
             &arena,
             &partial_cache,
@@ -1095,8 +1149,8 @@ mod tests {
             0,
         );
 
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].score, 4.0);
+        assert_eq!(selected.cycles.len(), 1);
+        assert_eq!(selected.cycles[0].score, 4.0);
     }
 
     #[test]
@@ -1106,5 +1160,24 @@ mod tests {
         rotation.advance(1, 5, 3);
         assert_eq!(inactive_indices(rotation.offset_for(1, 5), 5, 3), [3, 4, 0]);
         assert_eq!(inactive_indices(rotation.offset_for(2, 5), 5, 3), [0, 1, 2]);
+    }
+
+    #[test]
+    fn stream_pending_pools_only_contains_dirty_selected_pools() {
+        let partial = PartialPoolCache::new();
+        let selected = Address::with_last_byte(1);
+        let unselected = Address::with_last_byte(2);
+        for pool in [selected, unselected] {
+            partial.apply_patch(
+                pool,
+                crate::services::partial_cache::LogPatch::V2Reserves {
+                    reserve0: U256::from(10u8),
+                    reserve1: U256::from(20u8),
+                },
+                1,
+            );
+        }
+
+        assert_eq!(stream_pending_pools(&partial, &[selected]), vec![selected]);
     }
 }

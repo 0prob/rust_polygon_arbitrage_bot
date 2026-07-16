@@ -1,10 +1,10 @@
 pub mod feed_audit;
 pub mod feed_verify;
 pub mod hub_path_rates;
-pub mod token_labels;
 pub mod price_oracle;
 pub mod pyth_catalog;
 pub mod rates;
+pub mod token_labels;
 
 pub use feed_audit::{
     CURATED_POLYGON_TOKEN_HINTS, FeedAuditReport, UnmappedTokenRow, build_audit_report,
@@ -58,6 +58,41 @@ where
     P: Provider<Ethereum> + Clone + Send + 'static,
 {
     oracle.ensure_matic_usd_for_flash_cap(state_provider).await
+}
+
+/// Hint from HF eval, else live oracle refresh — for dispatch flash-cap sizing.
+pub async fn resolve_matic_usd_for_flash_dispatch<P>(
+    oracle: &PriceOracle,
+    hint: Option<f64>,
+    provider: &P,
+) -> Option<f64>
+where
+    P: Provider<Ethereum> + Clone + Send + 'static,
+{
+    if let Some(hint) = hint.and_then(matic_usd_for_flash_cap) {
+        // Only trust the HF hint when it still matches the oracle cache (same tick / no drift).
+        if oracle
+            .resolve_matic_usd_cached()
+            .and_then(matic_usd_for_flash_cap)
+            .is_some_and(|cached| (cached - hint).abs() < f64::EPSILON)
+        {
+            return Some(hint);
+        }
+    }
+    ensure_matic_usd_for_flash_cap(oracle, Some(provider)).await
+}
+
+#[inline]
+fn matic_usd_for_lf_rate_enrich(raw: f64, context: &'static str) -> f64 {
+    match matic_usd_for_flash_cap(raw) {
+        Some(usd) => usd,
+        None => {
+            crate::warn!(
+                "{context}: MATIC/USD not usable for flash cap (raw={raw}) — token/MATIC rates may be incomplete"
+            );
+            0.0
+        }
+    }
 }
 
 #[must_use]
@@ -276,12 +311,7 @@ where
     let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd(&addrs, provider).await;
-    let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
-        Some(usd) => usd,
-        None if provider.is_some() => oracle.get_matic_usd(provider).await,
-        None => oracle.get_matic_usd_offline().await,
-    };
-    let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
+    let matic_usd = matic_usd_raw_for_lf_enrich(oracle, provider, true).await;
     build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
 }
 
@@ -299,12 +329,32 @@ where
     let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd_offline(&addrs).await;
-    let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
+    let matic_usd = matic_usd_raw_for_lf_enrich_offline(oracle).await;
+    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
+}
+
+async fn matic_usd_raw_for_lf_enrich<P>(
+    oracle: &PriceOracle,
+    provider: Option<&P>,
+    allow_rpc: bool,
+) -> f64
+where
+    P: Provider<Ethereum> + Clone + Send + 'static,
+{
+    let raw = match oracle.resolve_matic_usd_cached() {
+        Some(usd) => usd,
+        None if allow_rpc && provider.is_some() => oracle.get_matic_usd(provider).await,
+        None => oracle.get_matic_usd_offline().await,
+    };
+    matic_usd_for_lf_rate_enrich(raw, "LF rate enrich")
+}
+
+async fn matic_usd_raw_for_lf_enrich_offline(oracle: &PriceOracle) -> f64 {
+    let raw = match oracle.resolve_matic_usd_cached() {
         Some(usd) => usd,
         None => oracle.get_matic_usd_offline().await,
     };
-    let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
-    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
+    matic_usd_for_lf_rate_enrich(raw, "LF offline rate enrich")
 }
 
 fn hub_rates_for_tokens(
@@ -349,20 +399,14 @@ where
     tokens.into_iter().filter(|t| seen.insert(*t)).collect()
 }
 
-fn token_addresses(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Address> {
+#[cfg(test)]
+/// Cycle tokens plus static hub feeds — one prefetch warms profit conversion
+/// for spoke tokens even when they are not on the current cycle list.
+fn prefetch_addrs_for_rates(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Address> {
     let mut addrs: Vec<Address> = tokens
         .iter()
         .filter_map(|idx| arena.token_address(*idx))
         .collect();
-    addrs.sort_unstable();
-    addrs.dedup();
-    addrs
-}
-
-/// Cycle tokens plus static hub feeds — one prefetch warms profit conversion
-/// for spoke tokens even when they are not on the current cycle list.
-fn prefetch_addrs_for_rates(arena: &StateArena, tokens: &[TokenIndex]) -> Vec<Address> {
-    let mut addrs = token_addresses(arena, tokens);
     addrs.extend(POLYGON_HUB_TOKENS);
     addrs.sort_unstable();
     addrs.dedup();
@@ -401,7 +445,7 @@ fn insert_missing_wmatic_self_rates(
                 }
             })
             .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE)
-            .unwrap_or_else(|| {
+            .unwrap_or({
                 if matic_usd > 0.0 {
                     rate_one
                 } else {
@@ -513,10 +557,10 @@ fn build_token_to_matic_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
     use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::arena::StateArena;
     use crate::pipeline::types::PoolMeta;
+    use alloy::primitives::address;
 
     #[test]
     fn arena_tokens_without_decimal_hints_counts_gaps() {
@@ -650,7 +694,7 @@ mod tests {
 
     #[test]
     fn prefetch_addrs_for_rates_includes_hubs() {
-            let mut arena = StateArena::default();
+        let mut arena = StateArena::default();
         let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
         let usdc_idx = arena.register_token(usdc);
         let addrs = prefetch_addrs_for_rates(&arena, &[usdc_idx]);
@@ -675,13 +719,14 @@ mod tests {
         assert_eq!(out.get(&wmatic_idx).copied(), Some(RATE_PRECISION));
     }
 
-
     #[test]
     fn hub_path_rate_wins_over_configured_float_oracle_leverage() {
         use super::price_oracle::PriceOracle;
 
         let mut arena = StateArena::default();
-        let token: Address = "0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09".parse().expect("frax");
+        let token: Address = "0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09"
+            .parse()
+            .expect("frax");
         let idx = arena.register_token(token);
         let oracle = PriceOracle::new(
             reqwest::Client::new(),

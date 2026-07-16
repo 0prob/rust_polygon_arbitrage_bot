@@ -51,6 +51,7 @@ pub enum AaveReserveStatus {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AaveRefreshStats {
     pub listed_viable: u32,
+    pub rpc_error: u32,
     pub no_atoken: u32,
     pub inactive: u32,
     pub frozen: u32,
@@ -67,7 +68,7 @@ impl AaveRefreshStats {
         }
         match status {
             AaveReserveStatus::Viable => self.listed_viable += 1,
-            AaveReserveStatus::RpcError => {}
+            AaveReserveStatus::RpcError => self.rpc_error += 1,
             AaveReserveStatus::NoAToken => self.no_atoken += 1,
             AaveReserveStatus::Inactive => self.inactive += 1,
             AaveReserveStatus::Frozen => self.frozen += 1,
@@ -85,15 +86,17 @@ impl AaveRefreshStats {
             + self.frozen
             + self.paused
             + self.flash_disabled
-            + self.pinned_inactive;
+            + self.pinned_inactive
+            + self.rpc_error;
         if self.listed_viable == 0 && ineligible == 0 {
             return;
         }
         crate::info!(
             "aave: refresh tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
-             (no_atoken={} inactive={} frozen={} paused={} flash_off={} pinned={}) fee_bps={}",
+             (rpc_err={} no_atoken={} inactive={} frozen={} paused={} flash_off={} pinned={}) fee_bps={}",
             self.listed_viable,
             ineligible,
+            self.rpc_error,
             self.no_atoken,
             self.inactive,
             self.frozen,

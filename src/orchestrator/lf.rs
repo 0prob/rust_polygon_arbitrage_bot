@@ -35,8 +35,8 @@ use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
     HubPathRateParams, RateEnrichContext, arena_tokens_without_decimal_hints,
-    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline,
-    expand_hub_spoke_resolvable, merge_token_rates, resolvable_token_set,
+    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
+    merge_token_rates, resolvable_token_set,
 };
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet, select_stream_targets};
 use crate::services::pipeline_survival::PipelineSurvival;
@@ -506,43 +506,69 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let ticks_started = crate::util::now_ms();
     let mut v3_tick_targets = 0;
     let mut v3_ticks_loaded = 0;
-    let mut v3_ticks_ms = 0;
+    let mut v3_ticks_ms = 0u64;
     let mut v4_tick_targets = 0;
     let mut v4_ticks_loaded = 0;
-    let mut v4_ticks_ms = 0;
-    if let Some(ref provider) = state_provider {
+    let mut v4_ticks_ms = 0u64;
+    if state_provider.is_some() {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
         let v4_tick_pools = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
         v3_tick_targets = tick_pools.len();
         v4_tick_targets = v4_tick_pools.len();
-        crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools);
-        crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools);
         let state_block = ctx.refresh.last_state_block();
         let pinned_block = (state_block > 0).then_some(state_block);
         let (algebra_pools, algebra_integral_pools) =
             crate::pipeline::tick_fetch::collect_algebra_pools(&arena, pool_metas.as_ref());
-        let v3_ticks_started = crate::util::now_ms();
-        v3_ticks_loaded = enrich_v3_ticks(
-            provider,
-            &mut arena,
-            &tick_pools,
-            ctx.config.oracle.tick_word_range,
-            &algebra_pools,
-            &algebra_integral_pools,
-            pinned_block,
-        )
-        .await;
-        v3_ticks_ms = crate::util::now_ms().saturating_sub(v3_ticks_started);
-        let v4_ticks_started = crate::util::now_ms();
-        v4_ticks_loaded = enrich_v4_ticks(
-            provider,
-            &mut arena,
-            &v4_tick_pools,
-            ctx.config.oracle.tick_word_range,
-            pinned_block,
-        )
-        .await;
-        v4_ticks_ms = crate::util::now_ms().saturating_sub(v4_ticks_started);
+        for (url_index, url) in ctx.rpc.state_url_candidates().iter().enumerate() {
+            let Ok(provider) = ctx.rpc.connect_state_at(url) else {
+                ctx.rpc.deprioritize_state_url(url);
+                continue;
+            };
+            crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools);
+            crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools);
+            let v3_ticks_started = crate::util::now_ms();
+            let v3 = enrich_v3_ticks(
+                &provider,
+                &mut arena,
+                &tick_pools,
+                ctx.config.oracle.tick_word_range,
+                &algebra_pools,
+                &algebra_integral_pools,
+                pinned_block,
+            )
+            .await;
+            v3_ticks_ms =
+                v3_ticks_ms.saturating_add(crate::util::now_ms().saturating_sub(v3_ticks_started));
+            let v4_ticks_started = crate::util::now_ms();
+            let v4 = enrich_v4_ticks(
+                &provider,
+                &mut arena,
+                &v4_tick_pools,
+                ctx.config.oracle.tick_word_range,
+                pinned_block,
+            )
+            .await;
+            v4_ticks_ms =
+                v4_ticks_ms.saturating_add(crate::util::now_ms().saturating_sub(v4_ticks_started));
+            v3_ticks_loaded = v3.loaded;
+            v4_ticks_loaded = v4.loaded;
+            if !v3.rpc_failed && !v4.rpc_failed {
+                if url_index > 0 {
+                    crate::info!(
+                        "LF tick hydration fallback succeeded (url_index={url_index}, v3_loaded={}, v4_loaded={})",
+                        v3.loaded,
+                        v4.loaded
+                    );
+                }
+                break;
+            }
+            ctx.rpc.deprioritize_state_url(url);
+            crate::warn!(
+                "LF tick hydration RPC failed — trying fallback (url_index={url_index}, v3_failed={}, v4_failed={})",
+                v3.rpc_failed,
+                v4.rpc_failed
+            );
+        }
     }
     let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);
 
@@ -608,11 +634,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         {
             let layout_fp = arena.routing_layout_fingerprint();
             let routable_count = pool_metas.len();
-            let eligible = count_graph_eligible_pools_with_gate(
-                &arena,
-                pool_metas.as_ref(),
-                Some(&post_gate),
-            );
+            let eligible =
+                count_graph_eligible_pools_with_gate(&arena, pool_metas.as_ref(), Some(&post_gate));
             let state_generation = ctx.cache.generation();
             let g = Arc::make_mut(&mut routing_graph);
             let report = attach_missing_eligible_pools_with_gate(

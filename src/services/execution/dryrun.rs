@@ -422,10 +422,10 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                     .map(gas_overflow_estimate_fallback)
                     .unwrap_or_else(gas_overflow_dry_run_failure);
             }
-            if let Some(profit) = realized_profit {
-                if msg == "estimate_gas timed out" {
-                    return gas_overflow_estimate_fallback(profit);
-                }
+            if let Some(profit) = realized_profit
+                && msg == "estimate_gas timed out"
+            {
+                return gas_overflow_estimate_fallback(profit);
             }
             DryRunResult {
                 semantic_success: false,

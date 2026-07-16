@@ -92,6 +92,44 @@ pub fn max_flash_loan_matic_wei_from_usd(usd_cap: u64, matic_usd: f64) -> Option
     Some(numer / U256::from(matic_usd_micros))
 }
 
+/// Inputs shared by flash-cap sizing across HF eval, Brent bounds, and dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct FlashBorrowCapParams {
+    pub max_flash_loan_usd: u64,
+    pub token_decimals: u8,
+    pub token_to_matic_rate: U256,
+    pub matic_usd: f64,
+    pub matic_usd_chainlink: Option<I256>,
+}
+
+impl FlashBorrowCapParams {
+    #[must_use]
+    pub fn cap_wei(self) -> Option<U256> {
+        max_flash_borrow_wei(
+            self.max_flash_loan_usd,
+            self.token_decimals,
+            self.token_to_matic_rate,
+            self.matic_usd,
+            self.matic_usd_chainlink,
+        )
+    }
+
+    /// Fail-closed when [`Self::max_flash_loan_usd`] is set but cap math cannot run.
+    #[must_use]
+    pub fn cap_enforced_but_unresolved(self) -> bool {
+        self.max_flash_loan_usd > 0 && self.cap_wei().is_none()
+    }
+
+    /// Whether `amount_in` respects the configured USD flash borrow cap.
+    #[must_use]
+    pub fn amount_within_cap(self, amount_in: U256) -> bool {
+        if self.max_flash_loan_usd == 0 || amount_in.is_zero() {
+            return true;
+        }
+        self.cap_wei().is_some_and(|cap| amount_in <= cap)
+    }
+}
+
 /// Max borrow in start-token wei from the configured USD flash cap.
 #[must_use]
 pub fn max_flash_borrow_wei(
@@ -137,29 +175,13 @@ pub fn check_sim_sanity_fast(input: SimSanityInput) -> Result<(), SimSanityRejec
 }
 
 pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
-    if input.token_decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
-        return Err(SimSanityReject::UnsupportedTokenDecimals);
-    }
-    if input.amount_in.is_zero() {
-        return Err(SimSanityReject::AmountBelowEconomicFloor);
-    }
+    check_sim_sanity_fast(input)?;
 
     let floor = min_economic_amount_in(input.token_decimals, input.token_to_matic_rate);
     let tickless_probe = crate::pipeline::spot_price::spot_probe_for_decimals(input.token_decimals);
     let tickless_cap_trade = input.amount_in >= tickless_probe && input.amount_in < floor;
     if input.amount_in < floor && !tickless_cap_trade {
         return Err(SimSanityReject::AmountBelowEconomicFloor);
-    }
-
-    let Some(max_sane_profit) = input
-        .amount_in
-        .checked_mul(U256::from(MAX_SANE_PROFIT_RATIO_BPS))
-        .map(|value| value / BPS_SCALE)
-    else {
-        return Err(SimSanityReject::InsaneProfitRatio);
-    };
-    if input.gross_profit > max_sane_profit {
-        return Err(SimSanityReject::InsaneProfitRatio);
     }
 
     if input.token_to_matic_rate >= MIN_TOKEN_TO_MATIC_RATE {
@@ -319,6 +341,20 @@ mod tests {
             check_sim_sanity(dispatch_mismatch),
             Err(SimSanityReject::OptimizerPinnedAtFloor)
         ));
+    }
+
+    #[test]
+    fn flash_borrow_cap_params_fail_closed_when_unresolved() {
+        let p = FlashBorrowCapParams {
+            max_flash_loan_usd: 50_000,
+            token_decimals: 18,
+            token_to_matic_rate: U256::ZERO,
+            matic_usd: 1.0,
+            matic_usd_chainlink: None,
+        };
+        assert!(p.cap_enforced_but_unresolved());
+        assert!(!p.amount_within_cap(U256::from(1u64)));
+        assert!(p.amount_within_cap(U256::ZERO));
     }
 
     #[test]

@@ -5,6 +5,22 @@ use std::sync::Arc;
 use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
 use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TickEnrichment {
+    pub loaded: usize,
+    pub rpc_failed: bool,
+}
+
+impl TickEnrichment {
+    #[cfg(test)]
+    fn combine(self, other: Self) -> Self {
+        Self {
+            loaded: self.loaded.saturating_add(other.loaded),
+            rpc_failed: self.rpc_failed || other.rpc_failed,
+        }
+    }
+}
 use crate::core::v4_storage::{
     compute_v4_tick_bitmap_slot, compute_v4_tick_info_slot, decode_v4_tick_liquidity,
 };
@@ -157,7 +173,7 @@ pub async fn enrich_v3_ticks<
     algebra_pools: &FxHashSet<Address>,
     algebra_integral_pools: &FxHashSet<Address>,
     block_number: Option<u64>,
-) -> usize {
+) -> TickEnrichment {
     use alloy::sol_types::SolCall;
 
     use crate::abis::ITickLens;
@@ -165,7 +181,7 @@ pub async fn enrich_v3_ticks<
     use crate::pipeline::multicall::{MulticallItem, encode_call};
 
     if pool_addresses.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
     let tick_lens = TICK_LENS_POLYGON;
     let word_count = word_range.saturating_mul(2).saturating_add(1) as usize;
@@ -202,27 +218,27 @@ pub async fn enrich_v3_ticks<
     }
 
     if items.is_empty() && algebra_targets.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
 
     let mut updated = 0usize;
     if !items.is_empty() {
-        let Ok(results) =
-            crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
-        else {
-            crate::warn!(
-                "v3 tick lens multicall failed ({} pools); trying algebra fallback",
-                pool_addresses.len()
-            );
-            return enrich_algebra_ticks(
-                provider,
-                arena,
-                &algebra_targets,
-                algebra_integral_pools,
-                block_number,
-            )
-            .await;
-        };
+        let results =
+            match crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number)
+                .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    crate::warn!(
+                        "v3 tick lens multicall failed ({} pools): {error:#}",
+                        pool_addresses.len(),
+                    );
+                    return TickEnrichment {
+                        loaded: 0,
+                        rpc_failed: true,
+                    };
+                }
+            };
 
         let mut incomplete_pools = 0usize;
         let mut empty_pools = 0usize;
@@ -274,7 +290,7 @@ pub async fn enrich_v3_ticks<
         }
         let direct_loaded = updated;
         let algebra_target_count = algebra_targets.len();
-        let algebra_loaded = enrich_algebra_ticks(
+        let algebra = enrich_algebra_ticks(
             provider,
             arena,
             &algebra_targets,
@@ -282,7 +298,7 @@ pub async fn enrich_v3_ticks<
             block_number,
         )
         .await;
-        updated += algebra_loaded;
+        updated += algebra.loaded;
         crate::debug!(
             "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} loaded={}",
             pool_addresses.len(),
@@ -290,12 +306,15 @@ pub async fn enrich_v3_ticks<
             empty_pools,
             incomplete_pools,
             algebra_target_count,
-            algebra_loaded,
+            algebra.loaded,
             updated
         );
-        return updated;
+        return TickEnrichment {
+            loaded: updated,
+            rpc_failed: algebra.rpc_failed,
+        };
     }
-    updated += enrich_algebra_ticks(
+    let algebra = enrich_algebra_ticks(
         provider,
         arena,
         &algebra_targets,
@@ -303,7 +322,10 @@ pub async fn enrich_v3_ticks<
         block_number,
     )
     .await;
-    updated
+    TickEnrichment {
+        loaded: updated.saturating_add(algebra.loaded),
+        rpc_failed: algebra.rpc_failed,
+    }
 }
 
 pub async fn enrich_v4_ticks<
@@ -314,13 +336,13 @@ pub async fn enrich_v4_ticks<
     targets: &[(PoolIndex, FixedBytes<32>)],
     word_range: i16,
     block_number: Option<u64>,
-) -> usize {
+) -> TickEnrichment {
     use crate::pipeline::abi_cache::{decode_abi_word, encode_extsload};
     use crate::pipeline::multicall::{MulticallItem, execute_multicall_at};
     use alloy::primitives::U256;
 
     if targets.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
 
     let manager = UNISWAP_V4_POOL_MANAGER;
@@ -345,12 +367,21 @@ pub async fn enrich_v4_ticks<
         spans.push((idx, pool_id, spacing, word_min, start, bitmap_calls.len()));
     }
     if bitmap_calls.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
 
-    let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
-        crate::warn!("v4 tick bitmap multicall failed ({} pools)", targets.len());
-        return 0;
+    let bitmaps = match execute_multicall_at(provider, &bitmap_calls, block_number).await {
+        Ok(bitmaps) => bitmaps,
+        Err(error) => {
+            crate::warn!(
+                "v4 tick bitmap multicall failed ({} pools): {error:#}",
+                targets.len()
+            );
+            return TickEnrichment {
+                loaded: 0,
+                rpc_failed: true,
+            };
+        }
     };
 
     let mut tick_calls = Vec::new();
@@ -395,15 +426,21 @@ pub async fn enrich_v4_ticks<
     }
 
     if tick_calls.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
 
-    let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
-        crate::warn!(
-            "v4 tick state multicall failed ({} tick reads)",
-            tick_calls.len()
-        );
-        return 0;
+    let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
+        Ok(states) => states,
+        Err(error) => {
+            crate::warn!(
+                "v4 tick state multicall failed ({} tick reads): {error:#}",
+                tick_calls.len(),
+            );
+            return TickEnrichment {
+                loaded: 0,
+                rpc_failed: true,
+            };
+        }
     };
 
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
@@ -444,7 +481,10 @@ pub async fn enrich_v4_ticks<
             incomplete_pools.len()
         );
     }
-    updated
+    TickEnrichment {
+        loaded: updated,
+        rpc_failed: false,
+    }
 }
 
 async fn enrich_algebra_ticks<
@@ -455,7 +495,7 @@ async fn enrich_algebra_ticks<
     targets: &[(Address, PoolIndex, i32, i32, i32)],
     integral_pools: &FxHashSet<Address>,
     block_number: Option<u64>,
-) -> usize {
+) -> TickEnrichment {
     use crate::abis::{IAlgebraIntegralPool, IAlgebraPool};
     use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall_at};
     use alloy::primitives::U256;
@@ -480,14 +520,20 @@ async fn enrich_algebra_ticks<
         spans.push((pool, idx, spacing, word_min, start, bitmap_calls.len()));
     }
     if bitmap_calls.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
-    let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
-        crate::warn!(
-            "algebra tick bitmap multicall failed ({} pools)",
-            targets.len()
-        );
-        return 0;
+    let bitmaps = match execute_multicall_at(provider, &bitmap_calls, block_number).await {
+        Ok(bitmaps) => bitmaps,
+        Err(error) => {
+            crate::warn!(
+                "algebra tick bitmap multicall failed ({} pools): {error:#}",
+                targets.len(),
+            );
+            return TickEnrichment {
+                loaded: 0,
+                rpc_failed: true,
+            };
+        }
     };
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
@@ -519,12 +565,18 @@ async fn enrich_algebra_ticks<
             }
         }
     }
-    let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
-        crate::warn!(
-            "algebra tick state multicall failed ({} tick reads)",
-            tick_calls.len()
-        );
-        return 0;
+    let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
+        Ok(states) => states,
+        Err(error) => {
+            crate::warn!(
+                "algebra tick state multicall failed ({} tick reads): {error:#}",
+                tick_calls.len(),
+            );
+            return TickEnrichment {
+                loaded: 0,
+                rpc_failed: true,
+            };
+        }
     };
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
         rustc_hash::FxHashMap::default();
@@ -570,7 +622,10 @@ async fn enrich_algebra_ticks<
             updated += 1;
         }
     }
-    updated
+    TickEnrichment {
+        loaded: updated,
+        rpc_failed: false,
+    }
 }
 
 #[cfg(test)]
@@ -614,5 +669,20 @@ mod tests {
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].tick, -60);
         assert_eq!(ticks[1].tick, 60);
+    }
+
+    #[test]
+    fn tick_enrichment_combines_provider_failures() {
+        let result = TickEnrichment {
+            loaded: 3,
+            rpc_failed: false,
+        }
+        .combine(TickEnrichment {
+            loaded: 2,
+            rpc_failed: true,
+        });
+
+        assert_eq!(result.loaded, 5);
+        assert!(result.rpc_failed);
     }
 }

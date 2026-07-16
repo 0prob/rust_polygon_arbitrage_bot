@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TernaryBoundsReject {
     HopCapacity,
+    FlashCapUnavailable,
     InvalidRange,
 }
 
 static BOUNDS_CALLS: AtomicU32 = AtomicU32::new(0);
 static BOUNDS_OK: AtomicU32 = AtomicU32::new(0);
 static HOP_CAPACITY_FAIL: AtomicU32 = AtomicU32::new(0);
+static FLASH_CAP_UNAVAILABLE: AtomicU32 = AtomicU32::new(0);
 static INVALID_RANGE: AtomicU32 = AtomicU32::new(0);
 static RATE_FALLBACK: AtomicU32 = AtomicU32::new(0);
 static LIQUIDITY_CAP_CLAMP: AtomicU32 = AtomicU32::new(0);
@@ -28,6 +30,9 @@ pub fn record_ternary_bounds_reject(reason: TernaryBoundsReject) {
     match reason {
         TernaryBoundsReject::HopCapacity => {
             HOP_CAPACITY_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+        TernaryBoundsReject::FlashCapUnavailable => {
+            FLASH_CAP_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
         }
         TernaryBoundsReject::InvalidRange => {
             INVALID_RANGE.fetch_add(1, Ordering::Relaxed);
@@ -61,10 +66,11 @@ pub fn log_ternary_summary() {
         return;
     }
     crate::info!(
-        "ternary: bounds_calls={calls} bounds_ok={} hop_fail={} invalid_range={} rate_fallback={} \
+        "ternary: bounds_calls={calls} bounds_ok={} hop_fail={} flash_cap_unavail={} invalid_range={} rate_fallback={} \
          liq_cap_clamp={} flash_cap_clamp={} economic_high_raise={} golden_zero_exit={}",
         BOUNDS_OK.load(Ordering::Relaxed),
         HOP_CAPACITY_FAIL.load(Ordering::Relaxed),
+        FLASH_CAP_UNAVAILABLE.load(Ordering::Relaxed),
         INVALID_RANGE.load(Ordering::Relaxed),
         RATE_FALLBACK.load(Ordering::Relaxed),
         LIQUIDITY_CAP_CLAMP.load(Ordering::Relaxed),

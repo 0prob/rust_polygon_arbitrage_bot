@@ -69,7 +69,7 @@ pub async fn verify_proposed_pyth_feeds(
         let usd = oracle
             .token_usd(&proposal.token)
             .ok_or_else(|| anyhow::anyhow!("no USD quote for {}", proposal.token))?;
-        if !(usd > 0.0) {
+        if usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             anyhow::bail!("non-positive USD for {}", proposal.token);
         }
         let matic_rate_ok = oracle

@@ -13,14 +13,38 @@ pub fn lookup_symbol(addr: &Address) -> Option<&'static str> {
 
 /// Top PG + runtime demand addresses (DexScreener polygon pairs, 2026-07).
 const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
-    (&address!("0x61fFE097137d543f019F5257E1a1Ff7A6C5F0b68"), "UNI"),
-    (&address!("0x831753DD7087CaC61aB5644b308642cc1c33Dc13"), "QUICK"),
-    (&address!("0xB5C064F955D8e7F38fE0460C556a72987494eE17"), "QUICKv2"),
-    (&address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"), "SD"),
-    (&address!("0x3d2bD0e15829AA5C362a4144FdF4A1112fa29B5c"), "FBX"),
-    (&address!("0x72d31b6dD46DaaE07391036097A2CB4648991eCD"), "JPYC"),
-    (&address!("0x4b0dF7EDe79be6b046a4Ed71580A3733A109e641"), "BANANA"),
-    (&address!("0xbbC11D55375F0B37f8A30b102C9ce143B097671e"), "SUSHI"),
+    (
+        &address!("0x61fFE097137d543f019F5257E1a1Ff7A6C5F0b68"),
+        "UNI",
+    ),
+    (
+        &address!("0x831753DD7087CaC61aB5644b308642cc1c33Dc13"),
+        "QUICK",
+    ),
+    (
+        &address!("0xB5C064F955D8e7F38fE0460C556a72987494eE17"),
+        "QUICKv2",
+    ),
+    (
+        &address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"),
+        "SD",
+    ),
+    (
+        &address!("0x3d2bD0e15829AA5C362a4144FdF4A1112fa29B5c"),
+        "FBX",
+    ),
+    (
+        &address!("0x72d31b6dD46DaaE07391036097A2CB4648991eCD"),
+        "JPYC",
+    ),
+    (
+        &address!("0x4b0dF7EDe79be6b046a4Ed71580A3733A109e641"),
+        "BANANA",
+    ),
+    (
+        &address!("0xbbC11D55375F0B37f8A30b102C9ce143B097671e"),
+        "SUSHI",
+    ),
     (
         &address!("0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4"),
         "stMATIC",
@@ -37,29 +61,83 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         &address!("0xFa68FB4628dFF1028C0C610198bB4D9B5AfE0902"),
         "MaticX",
     ),
-    (&address!("0xa3Fa99A148fA48D14Ed51d610c367C61876997F1"), "miMATIC"),
-    (&address!("0x5Dd05762b831A977B974Db8759772D41F3D5Ff0b"), "FCD"),
-    (&address!("0x82a0E6c02b91eC9f6ff943C0A933c03dBaa19689"), "WETH"),
-    (&address!("0xF32E6dC7709c596c5a5f328fa01eDd8eC3F62517"), "EURA"),
-    (&address!("0x3A29CAb2E124919d14a6F735b6033a3AaD2B260F"), "GNS"),
-    (&address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"), "GNS"),
-    (&address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD"), "wstETH"),
-    (&address!("0x63d38FCf3cC014735B28339F47EC3FA9BA97b4B9"), "miMATIC"),
-    (&address!("0x692597b009d13C4049a947CAB2239b7d6517875F"), "ADDY"),
-    (&address!("0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"), "DOLA"),
-    (&address!("0x0d929e52EFBf26F2322fd4033B157538c3b80474"), "jGBP"),
-    (&address!("0x6f7C932e7684666C9fd1d44527765433e01fF61d"), "miMATIC"),
-    (&address!("0x553d3D295e0f695B9228246232eDF400ed3560B5"), "PAXG"),
+    (
+        &address!("0xa3Fa99A148fA48D14Ed51d610c367C61876997F1"),
+        "miMATIC",
+    ),
+    (
+        &address!("0x5Dd05762b831A977B974Db8759772D41F3D5Ff0b"),
+        "FCD",
+    ),
+    (
+        &address!("0x82a0E6c02b91eC9f6ff943C0A933c03dBaa19689"),
+        "WETH",
+    ),
+    (
+        &address!("0xF32E6dC7709c596c5a5f328fa01eDd8eC3F62517"),
+        "EURA",
+    ),
+    (
+        &address!("0x3A29CAb2E124919d14a6F735b6033a3AaD2B260F"),
+        "GNS",
+    ),
+    (
+        &address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
+        "GNS",
+    ),
+    (
+        &address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD"),
+        "wstETH",
+    ),
+    (
+        &address!("0x63d38FCf3cC014735B28339F47EC3FA9BA97b4B9"),
+        "miMATIC",
+    ),
+    (
+        &address!("0x692597b009d13C4049a947CAB2239b7d6517875F"),
+        "ADDY",
+    ),
+    (
+        &address!("0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"),
+        "DOLA",
+    ),
+    (
+        &address!("0x0d929e52EFBf26F2322fd4033B157538c3b80474"),
+        "jGBP",
+    ),
+    (
+        &address!("0x6f7C932e7684666C9fd1d44527765433e01fF61d"),
+        "miMATIC",
+    ),
+    (
+        &address!("0x553d3D295e0f695B9228246232eDF400ed3560B5"),
+        "PAXG",
+    ),
     (
         &address!("0xcE20F7cb738aA5Cf32441B2ba0EFBA1E6f42c0b4"),
         "sUSD",
     ),
     (&address!("0x6631eE651DA438Db2BE611B5A44dFE2Ca04590C5"), "A"),
-    (&address!("0xF5c068f28eBF91b22e52C2ecD230621879e914B8"), "ALA"),
-    (&address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01"), "LGNS"),
-    (&address!("0x6f8a06447Ff6FcF75d803135a7de15CE88C1d4ec"), "SHIB"),
-    (&address!("0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683"), "SAND"),
-    (&address!("0x50B728D8D964fd00C2d0AAD81718b71311feF68a"), "SNX"),
+    (
+        &address!("0xF5c068f28eBF91b22e52C2ecD230621879e914B8"),
+        "ALA",
+    ),
+    (
+        &address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01"),
+        "LGNS",
+    ),
+    (
+        &address!("0x6f8a06447Ff6FcF75d803135a7de15CE88C1d4ec"),
+        "SHIB",
+    ),
+    (
+        &address!("0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683"),
+        "SAND",
+    ),
+    (
+        &address!("0x50B728D8D964fd00C2d0AAD81718b71311feF68a"),
+        "SNX",
+    ),
     (
         &address!("0x43635fe8B19551B8Bc6eF2959989d481Cf464f02"),
         "deUSDC",

@@ -135,18 +135,16 @@ pub fn find_cycles_for_mode(
     };
 
     match mode {
-        CycleFinderMode::Hybrid => {
-            return find_cycles_hybrid_multi_pass(
-                arena,
-                graph,
-                pool_metas,
-                passes,
-                atomic_prefilter,
-                probe_ctx,
-                enum_started,
-                &mut diag,
-            );
-        }
+        CycleFinderMode::Hybrid => find_cycles_hybrid_multi_pass(
+            arena,
+            graph,
+            pool_metas,
+            passes,
+            atomic_prefilter,
+            probe_ctx,
+            enum_started,
+            &mut diag,
+        ),
         CycleFinderMode::Dfs => {
             let raw = find_cycles_multi_pass(graph, arena, pool_metas, passes);
             diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
@@ -170,6 +168,7 @@ pub fn find_cycles_for_mode(
 }
 
 /// Parallel DFS + Bellman-Ford, merged and atomically prefiltered.
+#[allow(clippy::too_many_arguments)]
 fn find_cycles_hybrid_multi_pass(
     arena: &StateArena,
     graph: &RoutingGraph,

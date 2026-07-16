@@ -170,7 +170,13 @@ pub fn try_from_env(rpc: &RpcConfig) -> Option<HyperSyncService> {
     let token = std::env::var("ENVIO_API_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())?;
-    HyperSyncService::from_config(rpc, &token).ok()
+    match HyperSyncService::from_config(rpc, &token) {
+        Ok(svc) => Some(svc),
+        Err(e) => {
+            crate::warn!("HyperSync client build failed (receipt acceleration disabled): {e:#}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

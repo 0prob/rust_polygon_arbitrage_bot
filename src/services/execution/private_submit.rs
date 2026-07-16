@@ -304,7 +304,15 @@ pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Res
     hash_str.parse().context("invalid tx hash")
 }
 
+/// Signed-raw private paths need `chain_id` for EIP-155 signing; must not fall back to public mempool.
 #[must_use]
+pub fn private_submit_mode_requires_chain_id(mode: PrivateSubmitMode) -> bool {
+    matches!(
+        mode,
+        PrivateSubmitMode::Bloxroute | PrivateSubmitMode::PolygonPrivateRpc
+    )
+}
+
 pub fn resolve_submit_mode(
     private_rpc_url: Option<&str>,
     bloxroute_auth: Option<&str>,
@@ -447,6 +455,17 @@ mod tests {
             resolve_submit_mode(Some("https://private.example"), Some("auth"), None),
             PrivateSubmitMode::Bloxroute
         );
+    }
+
+    #[test]
+    fn private_submit_mode_requires_chain_id_for_signed_raw_paths() {
+        assert!((private_submit_mode_requires_chain_id(PrivateSubmitMode::Bloxroute)));
+        assert!(private_submit_mode_requires_chain_id(
+            PrivateSubmitMode::PolygonPrivateRpc
+        ));
+        assert!(!private_submit_mode_requires_chain_id(
+            PrivateSubmitMode::Standard
+        ));
     }
 
     #[test]

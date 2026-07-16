@@ -282,7 +282,6 @@ pub enum CurveCryptoReject {
     ZeroOut,
 }
 
-#[must_use]
 pub fn try_curve_crypto_amount_out(
     state: &CurvePoolState,
     amount_in: U256,

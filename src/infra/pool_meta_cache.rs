@@ -36,10 +36,20 @@ pub struct PoolMetaCache {
 
 impl PoolMetaCache {
     pub fn new(path: PathBuf) -> Self {
-        let data = std::fs::read(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .unwrap_or_default();
+        let data = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PoolMetaData::default(),
+            Err(e) => {
+                crate::warn!("pool meta cache read failed ({}): {e}", path.display());
+                PoolMetaData::default()
+            }
+            Ok(raw) => match serde_json::from_slice(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    crate::warn!("pool meta cache parse failed ({}): {e}", path.display());
+                    PoolMetaData::default()
+                }
+            },
+        };
         Self {
             inner: std::sync::Arc::new(RwLock::new(data)),
             path: std::sync::Arc::new(path),
@@ -107,6 +117,7 @@ impl PoolMetaCache {
                 let seq = write_seq.fetch_add(1, Ordering::Relaxed);
                 let tmp = path.with_extension(format!("json.{seq}.tmp"));
                 let Ok(file) = std::fs::File::create(&tmp) else {
+                    crate::warn!("pool meta cache persist: cannot create {}", tmp.display());
                     running.store(false, Ordering::Release);
                     return;
                 };
@@ -115,12 +126,24 @@ impl PoolMetaCache {
                     let data = inner.read();
                     serde_json::to_writer(&mut writer, &*data)
                 };
-                if serialized.is_err() || writer.flush().is_err() {
+                if let Err(e) = serialized {
+                    crate::warn!("pool meta cache persist: serialize failed: {e}");
                     let _ = std::fs::remove_file(&tmp);
                     running.store(false, Ordering::Release);
                     return;
                 }
-                if std::fs::rename(&tmp, &*path).is_err() {
+                if let Err(e) = writer.flush() {
+                    crate::warn!("pool meta cache persist: flush failed: {e}");
+                    let _ = std::fs::remove_file(&tmp);
+                    running.store(false, Ordering::Release);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &*path) {
+                    crate::warn!(
+                        "pool meta cache persist: rename {} -> {} failed: {e}",
+                        tmp.display(),
+                        path.display()
+                    );
                     let _ = std::fs::remove_file(&tmp);
                 }
                 if revision.load(Ordering::Acquire) == target_revision {
