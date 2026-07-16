@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use rustc_hash::FxHashMap;
 
-use crate::core::types::{PoolIndex, PoolState, ProtocolType, TokenIndex};
+use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::services::discovery::{DiscoveredPool, discovered_to_pool_meta};
 use crate::services::state_cache::StateCache;
 use rustc_hash::FxHasher;
@@ -44,6 +44,7 @@ pub struct StateArena {
     inner: Arc<ArenaInner>,
     /// Per-pool hot overlay indexed by `PoolIndex.0` (O(1) lookup on HF path).
     hot_overlay: Vec<Option<Arc<PoolState>>>,
+    hot_revisions: Vec<u64>,
 }
 
 impl Default for StateArena {
@@ -53,6 +54,7 @@ impl Default for StateArena {
         Self {
             inner: Arc::new(inner),
             hot_overlay: Vec::new(),
+            hot_revisions: Vec::new(),
         }
     }
 }
@@ -62,6 +64,7 @@ impl Clone for StateArena {
         Self {
             inner: Arc::clone(&self.inner),
             hot_overlay: Vec::new(),
+            hot_revisions: Vec::new(),
         }
     }
 }
@@ -121,6 +124,23 @@ impl StateArena {
         self.inner.pools.get(idx).map(std::convert::AsRef::as_ref)
     }
 
+    #[must_use]
+    pub fn route_state_revision(&self, edges: &[Edge]) -> Option<u64> {
+        let mut h = FxHasher::default();
+        h.write_usize(edges.len());
+        for edge in edges {
+            let index = edge.pool_index.0 as usize;
+            self.hot_overlay.get(index)?.as_ref()?;
+            let revision = *self.hot_revisions.get(index)?;
+            if revision == 0 {
+                return None;
+            }
+            h.write_u32(edge.pool_index.0);
+            h.write_u64(revision);
+        }
+        Some(h.finish())
+    }
+
     pub fn pool_state_mut(&mut self, index: PoolIndex) -> Option<&mut PoolState> {
         let idx = index.0 as usize;
         let inner = Arc::make_mut(&mut self.inner);
@@ -177,6 +197,9 @@ impl StateArena {
         if let Some(slot) = self.hot_overlay.get_mut(index.0 as usize) {
             *slot = None;
         }
+        if let Some(revision) = self.hot_revisions.get_mut(index.0 as usize) {
+            *revision = 0;
+        }
     }
 
     pub fn register_pool(&mut self, address: Address, state: Arc<PoolState>) -> PoolIndex {
@@ -202,15 +225,19 @@ impl StateArena {
         let pool_count = self.inner.pools.len();
         if self.hot_overlay.len() != pool_count {
             self.hot_overlay.resize(pool_count, None);
+            self.hot_revisions.resize(pool_count, 0);
         }
         let (states, generation) = cache.get_arcs_with_generation(addresses);
-        for (address, state) in states {
+        for (address, state, revision) in states {
             let Some(&idx) = self.inner.address_to_pool.get(&address) else {
                 continue;
             };
             let slot = idx.0 as usize;
             if let Some(overlay) = self.hot_overlay.get_mut(slot) {
                 *overlay = Some(state);
+            }
+            if let Some(hot_revision) = self.hot_revisions.get_mut(slot) {
+                *hot_revision = revision;
             }
         }
         generation
@@ -261,17 +288,15 @@ impl StateArena {
                 PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
                 _ => pool.tokens.len(),
             };
-            let pair_input_decimals =
-                pool.tokens
-                    .first()
-                    .zip(pool.tokens.get(1))
-                    .and_then(|(a0, a1)| match decimal_hints {
-                        Some(h) => Some((
-                            crate::services::oracle::known_token_decimals(*a0, h)?,
-                            crate::services::oracle::known_token_decimals(*a1, h)?,
-                        )),
-                        None => Some((18, 18)),
-                    });
+            let pair_input_decimals = pool.tokens.first().zip(pool.tokens.get(1)).and_then(
+                |(a0, a1)| match decimal_hints {
+                    Some(h) => Some((
+                        crate::services::oracle::known_token_decimals(*a0, h)?,
+                        crate::services::oracle::known_token_decimals(*a1, h)?,
+                    )),
+                    None => Some((18, 18)),
+                },
+            );
             if !crate::pipeline::graph::pool_state_graph_eligible(
                 Some(self),
                 state.as_ref(),
@@ -335,7 +360,10 @@ impl StateArena {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
-    use crate::core::types::{V2PoolState, WoofiBaseTokenState, WoofiPoolState};
+    use crate::core::types::{
+        CycleEdges, Edge, ProtocolType, TokenIndex, V2PoolState, WoofiBaseTokenState,
+        WoofiPoolState,
+    };
     use alloy::primitives::U256;
 
     const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
@@ -531,6 +559,43 @@ mod tests {
     }
 
     #[test]
+    fn route_state_revision_ignores_unrelated_pool_updates() {
+        let route_addr = Address::with_last_byte(1);
+        let unrelated_addr = Address::with_last_byte(2);
+        let mut arena = StateArena::default();
+        let route_pool = arena.register_pool(route_addr, v2_state());
+        let _ = arena.register_pool(unrelated_addr, v2_state());
+        let cache = StateCache::default();
+        cache.insert(route_addr, (*v2_state()).clone());
+        cache.insert(unrelated_addr, (*v2_state()).clone());
+        let addresses = [route_addr, unrelated_addr];
+        arena.apply_hot_cache(&cache, &addresses);
+        let edges: CycleEdges = [Edge {
+            pool_index: route_pool,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]
+        .into_iter()
+        .collect();
+        let before = arena
+            .route_state_revision(&edges)
+            .expect("hot route revision");
+
+        cache.insert(unrelated_addr, (*v2_state()).clone());
+        arena.apply_hot_cache(&cache, &addresses);
+        assert_eq!(arena.route_state_revision(&edges), Some(before));
+
+        cache.insert(route_addr, (*v2_state()).clone());
+        arena.apply_hot_cache(&cache, &addresses);
+        assert_ne!(arena.route_state_revision(&edges), Some(before));
+    }
+
+    #[test]
     fn sync_skips_tradable_pools_without_graph_edges() {
         let pool_address = Address::with_last_byte(21);
         let a = Address::with_last_byte(22);
@@ -658,7 +723,10 @@ mod tests {
             .collect();
         let mut arena = StateArena::default();
         let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, Some(&hints));
-        assert!(metas.is_empty(), "missing weth decimals must not admit pool");
+        assert!(
+            metas.is_empty(),
+            "missing weth decimals must not admit pool"
+        );
     }
 
     #[test]

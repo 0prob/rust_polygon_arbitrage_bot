@@ -65,6 +65,15 @@ const INDEXER_LEGACY_SQL: &str = r#"SELECT "lastProcessedBlock" FROM "IndexerPro
 
 const TOKEN_METAS_SQL: &str = r#"SELECT id, decimals FROM "TokenMeta""#;
 
+const TOKEN_POOL_FREQUENCY_SQL: &str = r#"
+    SELECT lower(t) AS token, COUNT(*)::bigint AS pool_count
+    FROM "PoolMeta" p, unnest(p.tokens) AS t
+    WHERE cardinality(p.tokens) >= 2
+    GROUP BY 1
+    ORDER BY pool_count DESC
+    LIMIT $1
+"#;
+
 const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
 const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -342,6 +351,29 @@ impl PgClient {
         Ok(parse_token_meta_rows(&rows))
     }
 
+    /// Token addresses ranked by how many valid `PoolMeta` rows reference them.
+    pub async fn fetch_token_pool_frequency(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(Address, i64)>> {
+        let rows = pg_query(&self.pool, TOKEN_POOL_FREQUENCY_SQL, &[&limit]).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let token: String = row.try_get("token")?;
+            let count: i64 = row.try_get("pool_count")?;
+            let hex = if token.starts_with("0x") {
+                token
+            } else {
+                format!("0x{token}")
+            };
+            let addr: Address = hex
+                .parse()
+                .context("invalid token address in pool frequency")?;
+            out.push((addr, count));
+        }
+        Ok(out)
+    }
+
     pub async fn fetch_indexer_progress(
         &self,
         chain_id: u64,
@@ -476,12 +508,7 @@ fn parse_incremental_rows(
             record_pg_row(&mut stats, &protocol, false);
         }
     }
-    (
-        pools,
-        max_created,
-        max_updated.max(max_created),
-        stats,
-    )
+    (pools, max_created, max_updated.max(max_created), stats)
 }
 
 fn is_transient_pg_error(error: &anyhow::Error) -> bool {

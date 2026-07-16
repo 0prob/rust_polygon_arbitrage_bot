@@ -8,7 +8,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
 use crate::pipeline::cycle_filter::{
     PrefilterDiagnostics, ProbeContext, dedupe_cycles_by_edges,
-    prefilter_cycles_by_atomic_sim_with_context_and_diag,
+    prefilter_cycles_by_atomic_sim_with_context_and_diag, retain_cycles_with_priced_start,
 };
 use crate::pipeline::cycle_finder::{
     find_cycles_multi_pass, find_cycles_multi_pass_with_prep, index_pool_metas,
@@ -79,12 +79,21 @@ fn finalize_cycles(
     diag: &mut CycleSearchDiagnostics,
 ) -> Vec<FoundCycle> {
     diag.raw_collected = cycles.len();
-    let merged = dedupe_cycles_by_edges(cycles);
+    let mut merged = dedupe_cycles_by_edges(cycles);
     diag.post_dedupe = merged.len();
+    if let Some(rates) = probe_ctx.and_then(|c| c.token_to_matic_rates) {
+        let before = merged.len();
+        retain_cycles_with_priced_start(&mut merged, rates);
+        let pruned = before.saturating_sub(merged.len());
+        if pruned > 0 {
+            crate::debug!("cycle search: pruned_unpriced={pruned}");
+        }
+    }
     let max_keep = passes.iter().map(|p| p.max_cycles).max().unwrap_or(0);
     let out = if atomic_prefilter {
-        let (out, prefilter_diag) =
-            prefilter_cycles_by_atomic_sim_with_context_and_diag(arena, merged, max_keep, probe_ctx);
+        let (out, prefilter_diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
+            arena, merged, max_keep, probe_ctx,
+        );
         diag.prefilter = prefilter_diag;
         out
     } else {
@@ -142,14 +151,8 @@ pub fn find_cycles_for_mode(
             let raw = find_cycles_multi_pass(graph, arena, pool_metas, passes);
             diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
             let finalize_started = crate::util::now_ms();
-            let cycles = finalize_cycles(
-                arena,
-                raw,
-                passes,
-                atomic_prefilter,
-                probe_ctx,
-                &mut diag,
-            );
+            let cycles =
+                finalize_cycles(arena, raw, passes, atomic_prefilter, probe_ctx, &mut diag);
             diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
             CycleSearchOutcome { cycles, diag }
         }
@@ -158,14 +161,8 @@ pub fn find_cycles_for_mode(
             let raw = find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes);
             diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
             let finalize_started = crate::util::now_ms();
-            let cycles = finalize_cycles(
-                arena,
-                raw,
-                passes,
-                atomic_prefilter,
-                probe_ctx,
-                &mut diag,
-            );
+            let cycles =
+                finalize_cycles(arena, raw, passes, atomic_prefilter, probe_ctx, &mut diag);
             diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
             CycleSearchOutcome { cycles, diag }
         }
@@ -243,14 +240,7 @@ fn find_cycles_hybrid_multi_pass(
 
     diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
     let finalize_started = crate::util::now_ms();
-    let cycles = finalize_cycles(
-        arena,
-        dfs_cycles,
-        passes,
-        atomic_prefilter,
-        probe_ctx,
-        diag,
-    );
+    let cycles = finalize_cycles(arena, dfs_cycles, passes, atomic_prefilter, probe_ctx, diag);
     diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
     CycleSearchOutcome {
         cycles,

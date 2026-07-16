@@ -33,12 +33,24 @@ pub struct SlimPoolState {
 impl SlimPoolState {
     #[must_use]
     pub fn from_v3(sqrt_price_x96: U256, liquidity: u128, tick: i32, now_ms: u64) -> Self {
-        Self::from_cl(ProtocolType::UniswapV3, sqrt_price_x96, liquidity, tick, now_ms)
+        Self::from_cl(
+            ProtocolType::UniswapV3,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            now_ms,
+        )
     }
 
     #[must_use]
     pub fn from_v4(sqrt_price_x96: U256, liquidity: u128, tick: i32, now_ms: u64) -> Self {
-        Self::from_cl(ProtocolType::UniswapV4, sqrt_price_x96, liquidity, tick, now_ms)
+        Self::from_cl(
+            ProtocolType::UniswapV4,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            now_ms,
+        )
     }
 
     #[must_use]

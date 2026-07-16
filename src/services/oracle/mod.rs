@@ -1,6 +1,29 @@
+pub mod feed_audit;
+pub mod feed_verify;
+pub mod hub_path_rates;
+pub mod token_labels;
 pub mod price_oracle;
+pub mod pyth_catalog;
 pub mod rates;
 
+pub use feed_audit::{
+    CURATED_POLYGON_TOKEN_HINTS, FeedAuditReport, UnmappedTokenRow, build_audit_report,
+    default_runtime_demand_path, load_runtime_demand_snapshot, log_ranked_unmapped_demand,
+    parse_runtime_demand_from_log, persist_runtime_demand_snapshot,
+    propose_curated_unmapped_pyth_feeds, propose_pyth_feed_lines, record_unmapped_token_demand,
+    snapshot_runtime_unmapped_demand, token_symbol_label,
+};
+pub use feed_verify::{
+    ProposedPythFeed, VerifiedPythFeed, format_config_pyth_feeds, parse_proposed_pyth_feed_lines,
+    verify_proposed_pyth_feeds,
+};
+pub use price_oracle::{OracleFeedSources, builtin_chainlink_feed, builtin_pyth_feed_id};
+pub use pyth_catalog::{
+    pick_best_rr_candidate_for_hint, pick_best_usd_candidate_for_hint, pyth_symbol_matches_hint,
+};
+
+pub use hub_path_rates::HubPathRateParams;
+pub use hub_path_rates::hub_path_matic_rates_batch;
 pub use rates::{
     has_reliable_matic_rate, resolve_token_to_matic_rate, resolve_token_to_matic_rate_or_bootstrap,
 };
@@ -24,6 +47,7 @@ use crate::services::discovery::TokenMeta;
 
 use self::price_oracle::{PriceOracle, token_usd_to_matic_rate_per_unit};
 use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
+use crate::pipeline::types::RoutingGraph;
 
 /// MATIC/USD for flash borrow caps — see [`PriceOracle::ensure_matic_usd_for_flash_cap`].
 pub async fn ensure_matic_usd_for_flash_cap<P>(
@@ -73,9 +97,9 @@ pub fn cycle_tokens_have_known_decimals(
         return false;
     }
     cycle.edges.iter().all(|edge| {
-        [edge.token_in, edge.token_out].into_iter().all(|token| {
-            explicit_decimals_for_index(token, arena, hints).is_some()
-        })
+        [edge.token_in, edge.token_out]
+            .into_iter()
+            .all(|token| explicit_decimals_for_index(token, arena, hints).is_some())
     })
 }
 
@@ -186,27 +210,36 @@ pub fn expand_hub_spoke_resolvable(
     }
 }
 
-/// Merge oracle rates without cloning `prior` when `fresh` is empty or unchanged.
+/// Replace rates for tokens refreshed this LF pass and retain unrelated cached rates.
+///
+/// A requested token absent from `fresh` failed its current freshness check, so its
+/// old rate must be removed to keep HF pricing fail-closed.
 #[must_use]
 pub fn merge_token_rates(
     prior: &Arc<FxHashMap<TokenIndex, U256>>,
+    refreshed_tokens: &FxHashSet<TokenIndex>,
     fresh: FxHashMap<TokenIndex, U256>,
 ) -> Arc<FxHashMap<TokenIndex, U256>> {
-    if fresh.is_empty() {
-        return Arc::clone(prior);
-    }
     if prior.is_empty() {
         return Arc::new(fresh);
     }
-    let needs_merge = fresh
+    let needs_merge = refreshed_tokens
         .iter()
-        .any(|(token, rate)| prior.get(token) != Some(rate));
+        .any(|token| prior.contains_key(token) && !fresh.contains_key(token))
+        || fresh
+            .iter()
+            .any(|(token, rate)| prior.get(token) != Some(rate));
     if !needs_merge {
         return Arc::clone(prior);
     }
     let mut merged =
         FxHashMap::with_capacity_and_hasher(prior.len().saturating_add(fresh.len()), FxBuildHasher);
-    merged.extend(prior.iter().map(|(&k, &v)| (k, v)));
+    merged.extend(
+        prior
+            .iter()
+            .filter(|(token, _)| !refreshed_tokens.contains(token))
+            .map(|(&token, &rate)| (token, rate)),
+    );
     merged.extend(fresh);
     Arc::new(merged)
 }
@@ -217,7 +250,15 @@ pub struct RateEnrichStats {
     pub resolved: usize,
     pub chainlink: usize,
     pub pyth_or_float: usize,
+    pub hub_path: usize,
     pub unresolved: usize,
+}
+
+/// LF/HF snapshot inputs for base-price enrichment (hub-path + oracle).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateEnrichContext<'a> {
+    pub graph: Option<&'a RoutingGraph>,
+    pub hub_path: HubPathRateParams,
 }
 
 pub async fn enrich_token_to_matic_rates<P, I>(
@@ -225,13 +266,15 @@ pub async fn enrich_token_to_matic_rates<P, I>(
     arena: &StateArena,
     tokens: I,
     provider: Option<&P>,
+    ctx: RateEnrichContext<'_>,
 ) -> (FxHashMap<TokenIndex, U256>, RateEnrichStats)
 where
     P: Provider<Ethereum> + Clone + Send + 'static,
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens = dedupe_token_indices(tokens);
-    let addrs = prefetch_addrs_for_rates(arena, &tokens);
+    let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
+    let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd(&addrs, provider).await;
     let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
         Some(usd) => usd,
@@ -239,7 +282,7 @@ where
         None => oracle.get_matic_usd_offline().await,
     };
     let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
-    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd)
+    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
 }
 
 /// Pyth + in-memory cache only (no Chainlink RPC). Used when state RPC is down.
@@ -247,19 +290,55 @@ pub async fn enrich_token_to_matic_rates_offline<I>(
     oracle: &PriceOracle,
     arena: &StateArena,
     tokens: I,
+    ctx: RateEnrichContext<'_>,
 ) -> (FxHashMap<TokenIndex, U256>, RateEnrichStats)
 where
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens = dedupe_token_indices(tokens);
-    let addrs = prefetch_addrs_for_rates(arena, &tokens);
+    let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
+    let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd_offline(&addrs).await;
     let matic_usd_raw = match oracle.resolve_matic_usd_cached() {
         Some(usd) => usd,
         None => oracle.get_matic_usd_offline().await,
     };
     let matic_usd = matic_usd_for_flash_cap(matic_usd_raw).unwrap_or(0.0);
-    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd)
+    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
+}
+
+fn hub_rates_for_tokens(
+    arena: &StateArena,
+    graph: Option<&RoutingGraph>,
+    tokens: &[TokenIndex],
+    params: HubPathRateParams,
+) -> FxHashMap<TokenIndex, U256> {
+    match graph {
+        Some(g) => hub_path_matic_rates_batch(arena, g, tokens, params),
+        None => FxHashMap::default(),
+    }
+}
+
+/// Oracle prefetch for configured feeds, hub tokens, and tokens without a hub-path rate.
+fn prefetch_addrs_for_oracle_fallback(
+    arena: &StateArena,
+    oracle: &PriceOracle,
+    tokens: &[TokenIndex],
+    hub_rates: &FxHashMap<TokenIndex, U256>,
+) -> Vec<Address> {
+    let mut addrs = Vec::new();
+    for idx in tokens {
+        let Some(addr) = arena.token_address(*idx) else {
+            continue;
+        };
+        if oracle.has_configured_feed(&addr) || !hub_rates.contains_key(idx) {
+            addrs.push(addr);
+        }
+    }
+    addrs.extend(POLYGON_HUB_TOKENS);
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
 fn dedupe_token_indices<I>(tokens: I) -> Vec<TokenIndex>
@@ -340,6 +419,7 @@ fn build_token_to_matic_rates(
     arena: &StateArena,
     tokens: &[TokenIndex],
     matic_usd: f64,
+    hub_rates: &FxHashMap<TokenIndex, U256>,
 ) -> (FxHashMap<TokenIndex, U256>, RateEnrichStats) {
     let wmatic = WMATIC;
     let rate_one = crate::core::constants::RATE_PRECISION;
@@ -360,24 +440,42 @@ fn build_token_to_matic_rates(
             stats.unresolved += 1;
             continue;
         };
-        let integer = integer_by_addr.get(&addr).copied();
-        let rate = integer
-            .or_else(|| {
-                if matic_usd > 0.0 {
-                    oracle
-                        .fresh_token_usd(&addr)
-                        .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
-                } else {
-                    None
-                }
-            })
-            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
-        if let Some(rate) = rate {
-            if integer.is_some() {
-                stats.chainlink += 1;
+        if addr == wmatic {
+            stats.resolved += 1;
+            stats.hub_path += 1;
+            out.insert(*idx, rate_one);
+            continue;
+        }
+        if let Some(rate) = integer_by_addr
+            .get(&addr)
+            .copied()
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE)
+        {
+            stats.chainlink += 1;
+            stats.resolved += 1;
+            out.insert(*idx, rate);
+            continue;
+        }
+        // Arena hub-path sim reflects executable pool basis; prefer it over
+        // float oracle leverage (token/USD × MATIC/USD) for configured feeds.
+        if let Some(&rate) = hub_rates.get(idx) {
+            stats.resolved += 1;
+            stats.hub_path += 1;
+            out.insert(*idx, rate);
+            continue;
+        }
+        let float_oracle_rate = oracle.has_configured_feed(&addr).then(|| {
+            if matic_usd > 0.0 {
+                oracle
+                    .fresh_token_usd(&addr)
+                    .map(|usd| token_usd_to_matic_rate_per_unit(usd, matic_usd))
+                    .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE)
             } else {
-                stats.pyth_or_float += 1;
+                None
             }
+        });
+        if let Some(Some(rate)) = float_oracle_rate {
+            stats.pyth_or_float += 1;
             stats.resolved += 1;
             out.insert(*idx, rate);
         } else {
@@ -400,11 +498,12 @@ fn build_token_to_matic_rates(
     }
     if stats.requested > 0 {
         crate::debug!(
-            "token rates enrich: requested={} resolved={} chainlink={} pyth_or_float={} unresolved={}",
+            "token rates enrich: requested={} resolved={} chainlink={} pyth_or_float={} hub_path={} unresolved={}",
             stats.requested,
             stats.resolved,
             stats.chainlink,
             stats.pyth_or_float,
+            stats.hub_path,
             stats.unresolved
         );
     }
@@ -414,6 +513,7 @@ fn build_token_to_matic_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
     use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::arena::StateArena;
     use crate::pipeline::types::PoolMeta;
@@ -508,13 +608,16 @@ mod tests {
             (TokenIndex(0), U256::from(1_000u64)),
             (TokenIndex(1), U256::from(2_000u64)),
         ]));
+        let refreshed = FxHashSet::from_iter([TokenIndex(0)]);
         let merged = merge_token_rates(
             &prior,
+            &refreshed,
             FxHashMap::from_iter([(TokenIndex(0), U256::from(1_000u64))]),
         );
         assert!(Arc::ptr_eq(&prior, &merged));
         let changed = merge_token_rates(
             &prior,
+            &refreshed,
             FxHashMap::from_iter([(TokenIndex(0), U256::from(9_000u64))]),
         );
         assert!(!Arc::ptr_eq(&prior, &changed));
@@ -529,9 +632,25 @@ mod tests {
     }
 
     #[test]
+    fn merge_token_rates_evicts_unresolved_refreshed_tokens() {
+        let prior = Arc::new(FxHashMap::from_iter([
+            (TokenIndex(0), U256::from(1_000u64)),
+            (TokenIndex(1), U256::from(2_000u64)),
+        ]));
+        let refreshed = FxHashSet::from_iter([TokenIndex(0)]);
+
+        let merged = merge_token_rates(&prior, &refreshed, FxHashMap::default());
+
+        assert!(!merged.contains_key(&TokenIndex(0)));
+        assert_eq!(
+            merged.get(&TokenIndex(1)).copied(),
+            Some(U256::from(2_000u64))
+        );
+    }
+
+    #[test]
     fn prefetch_addrs_for_rates_includes_hubs() {
-        use alloy::primitives::address;
-        let mut arena = StateArena::default();
+            let mut arena = StateArena::default();
         let usdc = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
         let usdc_idx = arena.register_token(usdc);
         let addrs = prefetch_addrs_for_rates(&arena, &[usdc_idx]);
@@ -554,6 +673,52 @@ mod tests {
         let mut out = FxHashMap::default();
         insert_missing_wmatic_self_rates(&oracle, &arena, 0.5, &mut out);
         assert_eq!(out.get(&wmatic_idx).copied(), Some(RATE_PRECISION));
+    }
+
+
+    #[test]
+    fn hub_path_rate_wins_over_configured_float_oracle_leverage() {
+        use super::price_oracle::PriceOracle;
+
+        let mut arena = StateArena::default();
+        let token: Address = "0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09".parse().expect("frax");
+        let idx = arena.register_token(token);
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            10_000,
+        );
+        oracle.seed_float_usd_for_test(token, 1.0);
+
+        let hub_rate = RATE_PRECISION * U256::from(3u64);
+        let hub_rates = FxHashMap::from_iter([(idx, hub_rate)]);
+        let (out, stats) = build_token_to_matic_rates(&oracle, &arena, &[idx], 0.5, &hub_rates);
+
+        assert_eq!(out.get(&idx).copied(), Some(hub_rate));
+        assert_eq!(stats.hub_path, 1);
+        assert_eq!(stats.pyth_or_float, 0);
+    }
+
+    #[test]
+    fn unconfigured_token_skips_generic_oracle_leverage_without_hub_path() {
+        use super::price_oracle::PriceOracle;
+
+        let mut arena = StateArena::default();
+        let token = Address::from([0x77u8; 20]);
+        let idx = arena.register_token(token);
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            10_000,
+        );
+        oracle.seed_float_usd_for_test(token, 2.0);
+
+        let (out, stats) =
+            build_token_to_matic_rates(&oracle, &arena, &[idx], 0.5, &FxHashMap::default());
+
+        assert!(!out.contains_key(&idx));
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(stats.pyth_or_float, 0);
     }
 
     #[test]

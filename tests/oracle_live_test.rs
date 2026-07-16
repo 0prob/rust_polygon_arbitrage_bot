@@ -156,6 +156,48 @@ struct PythFeedAttributes {
     symbol: String,
 }
 
+#[tokio::test]
+#[ignore = "live network — run: cargo test --test oracle_live_test curated_extensions -- --ignored"]
+async fn pyth_curated_polygon_extensions_prefetch_enable_rates() {
+    let oracle = hermes_oracle();
+    let feeds: [(Address, &str, &str); 2] = [
+        (
+            address!("0x03b54A0eF8042C0f6A77B15e637c9f5d7c6790D0"),
+            "6df640f3b8963d8f8358f791f352b8364513f6ab1cca5ed3f1f7b5448980e784",
+            "Crypto.WSTETH/USD",
+        ),
+        (
+            address!("0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09"),
+            "735f591e4fed988cd38df74d8fcedecf2fe8d9111664e0fd500db9aa78b316b1",
+            "Crypto.FRAX/USD",
+        ),
+    ];
+    for (_, feed_id, expected_symbol) in feeds {
+        assert_eq!(
+            pyth_feed_id(expected_symbol).await.as_deref(),
+            Some(feed_id),
+            "wrong Pyth feed id for {expected_symbol}"
+        );
+    }
+    let tokens: Vec<Address> = feeds.into_iter().map(|(token, _, _)| token).collect();
+    let bridged_wsteth = address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD");
+    let _ = oracle.get_matic_usd_offline().await;
+    oracle.prefetch_token_usd_offline(&tokens).await;
+    oracle.prefetch_token_usd_offline(&[bridged_wsteth]).await;
+    for token in tokens {
+        assert!(oracle.token_usd(&token).is_some());
+        let rate = oracle
+            .token_matic_rate_per_unit_integer(&token)
+            .expect("missing token/MATIC integer rate");
+        assert!(rate >= MIN_TOKEN_TO_MATIC_RATE);
+    }
+    assert!(oracle.token_usd(&bridged_wsteth).is_some());
+    let bridged_rate = oracle
+        .token_matic_rate_per_unit_integer(&bridged_wsteth)
+        .expect("bridged wstETH/MATIC rate");
+    assert!(bridged_rate >= MIN_TOKEN_TO_MATIC_RATE);
+}
+
 async fn pyth_feed_id(symbol: &str) -> Option<String> {
     let url = format!("https://hermes.pyth.network/v2/price_feeds?query={symbol}");
     let feeds: Vec<PythFeedMeta> = reqwest::get(url).await.ok()?.json().await.ok()?;

@@ -18,6 +18,7 @@ use super::gas::{FeeSnapshot, compute_conservative_gas_price, scaled_simulated_g
 const ROUTE_GAS_HISTORY: usize = 256;
 /// Cap sim→observed uplift so one outlier receipt cannot dominate Brent ranking.
 const MAX_SIM_SCALE_BPS: u32 = 30_000;
+const SNAPSHOT_LOG_CHANGE_BPS: u64 = 500;
 
 /// Prefetch observed route gas when an HF tick evaluates at least this many routes.
 pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 48;
@@ -207,22 +208,48 @@ impl GasOracle {
             .map(U256::from)
             .ok_or_else(|| anyhow::anyhow!("block header missing base_fee_per_gas"))?;
 
-        let mut priority_fee = match provider.get_max_priority_fee_per_gas().await {
-            Ok(v) => U256::from(v),
-            Err(_e) => self
-                .snapshot
-                .load()
-                .as_deref()
-                .map_or(U256::ZERO, |snap| snap.priority_fee),
-        };
+        let (mut priority_fee, mut priority_fee_source) =
+            match provider.get_max_priority_fee_per_gas().await {
+                Ok(v) => (U256::from(v), "rpc"),
+                Err(_e) => (
+                    self.snapshot
+                        .load()
+                        .as_deref()
+                        .map_or(U256::ZERO, |snap| snap.priority_fee),
+                    "previous_snapshot",
+                ),
+            };
         if priority_fee.is_zero() {
             priority_fee = U256::from(25_000_000_000u64);
+            priority_fee_source = "fallback_25gwei";
         }
 
-        self.snapshot.store(Some(Arc::new(FeeSnapshot {
+        let snapshot = FeeSnapshot {
             base_fee,
             priority_fee,
-        })));
+        };
+        let previous = self.loaded_snapshot();
+        let is_initial_snapshot = previous.is_none();
+        self.snapshot.store(Some(Arc::new(snapshot)));
+        if is_initial_snapshot {
+            crate::info!(
+                "gas oracle initialized: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
+                snapshot.base_fee,
+                snapshot.priority_fee,
+                priority_fee_source,
+                compute_conservative_gas_price(snapshot),
+            );
+        } else if priority_fee_source != "rpc"
+            || previous.is_some_and(|prior| snapshot_changed_materially(prior, snapshot))
+        {
+            crate::info!(
+                "gas oracle update: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
+                snapshot.base_fee,
+                snapshot.priority_fee,
+                priority_fee_source,
+                compute_conservative_gas_price(snapshot),
+            );
+        }
         Ok(())
     }
 
@@ -254,6 +281,23 @@ impl GasOracle {
             }
         });
     }
+}
+
+fn snapshot_changed_materially(previous: FeeSnapshot, current: FeeSnapshot) -> bool {
+    fee_changed_by_at_least(previous.base_fee, current.base_fee)
+        || fee_changed_by_at_least(previous.priority_fee, current.priority_fee)
+}
+
+fn fee_changed_by_at_least(previous: U256, current: U256) -> bool {
+    if previous.is_zero() {
+        return !current.is_zero();
+    }
+    let delta = if current >= previous {
+        current - previous
+    } else {
+        previous - current
+    };
+    delta >= previous.saturating_mul(U256::from(SNAPSHOT_LOG_CHANGE_BPS)) / U256::from(10_000)
 }
 
 #[cfg(test)]
@@ -346,5 +390,27 @@ mod tests {
             oracle.conservative_gas_price(),
             Some(compute_conservative_gas_price(fees))
         );
+    }
+
+    #[test]
+    fn snapshot_logging_ignores_small_fee_moves() {
+        let previous = FeeSnapshot {
+            base_fee: U256::from(200u64),
+            priority_fee: U256::from(30u64),
+        };
+        assert!(!snapshot_changed_materially(
+            previous,
+            FeeSnapshot {
+                base_fee: U256::from(209u64),
+                priority_fee: U256::from(30u64),
+            }
+        ));
+        assert!(snapshot_changed_materially(
+            previous,
+            FeeSnapshot {
+                base_fee: U256::from(210u64),
+                priority_fee: U256::from(30u64),
+            }
+        ));
     }
 }

@@ -172,8 +172,6 @@ pub fn log_balancer_prepare_gate_summary(candidates: u32) {
     );
 }
 
-
-
 /// True when every hop amount stays within the vault `MAX_IN_RATIO` (30%) limit.
 #[must_use]
 pub fn balancer_batch_within_max_in_ratio(arena: &StateArena, hops: &[CalldataHop]) -> bool {
@@ -259,7 +257,9 @@ pub fn evaluate_batch_query(
         BatchQueryOutcome::NonPositiveDelta(_) => {
             BatchQueryVerdict::Rejected(BalancerBatchReject::NonPositiveDelta)
         }
-        BatchQueryOutcome::RpcError(_) => BatchQueryVerdict::Rejected(BalancerBatchReject::RpcError),
+        BatchQueryOutcome::RpcError(_) => {
+            BatchQueryVerdict::Rejected(BalancerBatchReject::RpcError)
+        }
         BatchQueryOutcome::Timeout => BatchQueryVerdict::Rejected(BalancerBatchReject::Timeout),
         BatchQueryOutcome::BuildFailed | BatchQueryOutcome::DecodeFailed => {
             BatchQueryVerdict::Rejected(BalancerBatchReject::BuildDecodeFailed)
@@ -328,12 +328,7 @@ mod tests {
     fn evaluate_batch_query_accepts_when_floor_met() {
         let on_chain = U256::from(111_906_298_841_187_462u128);
         let amount_in = U256::from(7_978_784_081_956_178u128);
-        let verdict = evaluate_batch_query(
-            BatchQueryOutcome::Profit(on_chain),
-            amount_in,
-            476,
-            2,
-        );
+        let verdict = evaluate_batch_query(BatchQueryOutcome::Profit(on_chain), amount_in, 476, 2);
         assert!(matches!(verdict, BatchQueryVerdict::Accepted(_)));
     }
 

@@ -179,6 +179,19 @@ pub struct OracleConfig {
     /// Oracle USD price cache TTL in milliseconds (default 10_000 = 10s).
     #[serde(default = "default_cache_ttl_ms")]
     pub cache_ttl_ms: u64,
+    /// Derive base token→MATIC rates from hub paths on the routing graph (arena sim).
+    #[serde(default = "default_hub_path_rates")]
+    pub hub_path_rates: bool,
+    /// Max direct hops for hub-path base pricing (WMATIC target).
+    #[serde(default = "default_hub_path_max_hops")]
+    pub hub_path_max_hops: u32,
+}
+
+fn default_hub_path_rates() -> bool {
+    true
+}
+fn default_hub_path_max_hops() -> u32 {
+    4
 }
 
 fn default_pg_url() -> String {
@@ -389,6 +402,8 @@ impl Default for OracleConfig {
             pyth_feeds: String::new(),
             chainlink_feeds: String::new(),
             cache_ttl_ms: default_cache_ttl_ms(),
+            hub_path_rates: default_hub_path_rates(),
+            hub_path_max_hops: default_hub_path_max_hops(),
         }
     }
 }
@@ -883,10 +898,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.rpc.execution_rpc_url = "https://shared.drpc".into();
         config.rpc.state_rpc_url = Some("https://state.example".into());
-        config.rpc.polygon_rpc_urls = vec![
-            "https://shared.drpc".into(),
-            "https://poly.example".into(),
-        ];
+        config.rpc.polygon_rpc_urls =
+            vec!["https://shared.drpc".into(), "https://poly.example".into()];
         assert_eq!(
             config.state_read_urls(),
             vec![

@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy::primitives::U256;
 
-use crate::core::math::curve::{try_curve_stable_amount_out, CurveStableReject};
-use crate::core::math::curve_crypto::{try_curve_crypto_amount_out, CurveCryptoReject};
+use crate::core::math::curve::{CurveStableReject, try_curve_stable_amount_out};
+use crate::core::math::curve_crypto::{CurveCryptoReject, try_curve_crypto_amount_out};
 use crate::core::types::{CurvePoolState, ProtocolType};
 
 static STABLE_OK: AtomicU32 = AtomicU32::new(0);
@@ -48,6 +48,9 @@ fn record_crypto_reject(reason: CurveCryptoReject) {
         CurveCryptoReject::NewtonY => {
             CRYPTO_NEWTON_Y.fetch_add(1, Ordering::Relaxed);
         }
+        CurveCryptoReject::ImplausibleOutput => {
+            CRYPTO_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
         CurveCryptoReject::ZeroAmount
         | CurveCryptoReject::InvalidIndices
         | CurveCryptoReject::MissingGamma => {
@@ -66,44 +69,38 @@ pub fn curve_hop_amount_out(
     token_out_idx: usize,
 ) -> Option<U256> {
     match protocol {
-        ProtocolType::CurveStable => match try_curve_stable_amount_out(
-            state,
-            amount_in,
-            token_in_idx,
-            token_out_idx,
-        ) {
-            Ok(out) if !out.is_zero() => {
-                STABLE_OK.fetch_add(1, Ordering::Relaxed);
-                Some(out)
+        ProtocolType::CurveStable => {
+            match try_curve_stable_amount_out(state, amount_in, token_in_idx, token_out_idx) {
+                Ok(out) if !out.is_zero() => {
+                    STABLE_OK.fetch_add(1, Ordering::Relaxed);
+                    Some(out)
+                }
+                Ok(_) => {
+                    record_stable_reject(CurveStableReject::ZeroOut);
+                    None
+                }
+                Err(reason) => {
+                    record_stable_reject(reason);
+                    None
+                }
             }
-            Ok(_) => {
-                record_stable_reject(CurveStableReject::ZeroOut);
-                None
+        }
+        ProtocolType::CurveCrypto => {
+            match try_curve_crypto_amount_out(state, amount_in, token_in_idx, token_out_idx) {
+                Ok(out) if !out.is_zero() => {
+                    CRYPTO_OK.fetch_add(1, Ordering::Relaxed);
+                    Some(out)
+                }
+                Ok(_) => {
+                    record_crypto_reject(CurveCryptoReject::ZeroOut);
+                    None
+                }
+                Err(reason) => {
+                    record_crypto_reject(reason);
+                    None
+                }
             }
-            Err(reason) => {
-                record_stable_reject(reason);
-                None
-            }
-        },
-        ProtocolType::CurveCrypto => match try_curve_crypto_amount_out(
-            state,
-            amount_in,
-            token_in_idx,
-            token_out_idx,
-        ) {
-            Ok(out) if !out.is_zero() => {
-                CRYPTO_OK.fetch_add(1, Ordering::Relaxed);
-                Some(out)
-            }
-            Ok(_) => {
-                record_crypto_reject(CurveCryptoReject::ZeroOut);
-                None
-            }
-            Err(reason) => {
-                record_crypto_reject(reason);
-                None
-            }
-        },
+        }
         _ => None,
     }
 }
@@ -152,13 +149,15 @@ mod tests {
             gamma: None,
             d: None,
         };
-        assert!(curve_hop_amount_out(
-            &state,
-            ProtocolType::CurveStable,
-            U256::from(1_000u64),
-            0,
-            1,
-        )
-        .is_none());
+        assert!(
+            curve_hop_amount_out(
+                &state,
+                ProtocolType::CurveStable,
+                U256::from(1_000u64),
+                0,
+                1,
+            )
+            .is_none()
+        );
     }
 }

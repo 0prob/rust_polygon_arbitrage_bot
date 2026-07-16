@@ -15,8 +15,12 @@ use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::ProbeContext;
+use crate::pipeline::cycle_filter::{ProbeContext, retain_cycles_with_priced_start};
 use crate::pipeline::cycle_search::find_cycles_for_mode;
+use crate::pipeline::graph::{
+    GraphBuildGate, attach_missing_eligible_pools_with_gate, build_graph_with_gate,
+    count_graph_eligible_pools_with_gate, has_missing_eligible_pools_with_gate,
+};
 use crate::pipeline::graph_cache::GraphCache;
 use crate::pipeline::spot_price::{
     SpotTable, finalize_enumerated_cycles, rescore_cycles_with_table,
@@ -26,12 +30,13 @@ use crate::pipeline::tick_fetch::{
 };
 use crate::pipeline::types::CycleSearchPass;
 use crate::services::execution::GasOracle;
+use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
-    arena_tokens_without_decimal_hints, enrich_token_to_matic_rates,
-    enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable, merge_token_rates,
-    resolvable_token_set,
+    HubPathRateParams, RateEnrichContext, arena_tokens_without_decimal_hints,
+    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline,
+    expand_hub_spoke_resolvable, merge_token_rates, resolvable_token_set,
 };
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet, select_stream_targets};
 use crate::services::pipeline_survival::PipelineSurvival;
@@ -52,6 +57,7 @@ struct LfCpuWork {
     prior_rates: Arc<FxHashMap<TokenIndex, U256>>,
     token_decimals: Arc<FxHashMap<Address, u8>>,
     gas_price_wei: Option<U256>,
+    flash_liquidity: Arc<FlashLiquidityCache>,
 }
 
 struct LfCpuResult {
@@ -86,13 +92,21 @@ fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearch
     passes
 }
 
+fn lf_graph_build_gate(work: &LfCpuWork) -> GraphBuildGate {
+    GraphBuildGate {
+        token_to_matic_rates: Arc::clone(&work.prior_rates),
+        flash: work.flash_liquidity.load(),
+        flash_ttl: work.flash_liquidity.ttl(),
+    }
+}
+
 fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
     let routable_count = work.pool_metas.len();
-    // Graph admission is topology-only; token valuation is enforced later in
-    // HF evaluation. Pricing changes must not force connectivity rebuilds.
+    let graph_gate = lf_graph_build_gate(work);
+    let gate_ref = graph_gate.active().then_some(&graph_gate);
     let layout_fp = work.arena.routing_layout_fingerprint();
     let eligible_count =
-        crate::pipeline::graph::count_graph_eligible_pools(&work.arena, work.pool_metas.as_ref());
+        count_graph_eligible_pools_with_gate(&work.arena, work.pool_metas.as_ref(), gate_ref);
 
     // Snapshot decisions without holding lock for duration of heavy work.
     let (needs_rebuild, connectivity_stale) = {
@@ -120,9 +134,10 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         }
         let build_started = crate::util::now_ms();
         // Build outside lock to keep critical section short.
-        let g = Arc::new(crate::pipeline::graph::build_graph(
+        let g = Arc::new(build_graph_with_gate(
             &work.arena,
             work.pool_metas.as_ref(),
+            gate_ref,
         ));
         let build_ms = crate::util::now_ms().saturating_sub(build_started);
         let stats = crate::pipeline::graph::topology_stats(g.as_ref());
@@ -144,9 +159,10 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         graph_action = "cache";
         let mut gc = work.graph_cache.lock();
         if gc.graph().is_none() {
-            let gg = Arc::new(crate::pipeline::graph::build_graph(
+            let gg = Arc::new(build_graph_with_gate(
                 &work.arena,
                 work.pool_metas.as_ref(),
+                gate_ref,
             ));
             gc.store(
                 Arc::clone(&gg),
@@ -204,18 +220,15 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         }
     };
 
-    let missing_graph_pools = if crate::pipeline::graph::has_missing_eligible_pools(
+    let missing_graph_pools = if has_missing_eligible_pools_with_gate(
         &work.arena,
         work.pool_metas.as_ref(),
         graph.as_ref(),
+        gate_ref,
     ) {
         let g = Arc::make_mut(&mut graph);
-        crate::pipeline::graph::attach_missing_eligible_pools(
-            &work.arena,
-            g,
-            work.pool_metas.as_ref(),
-        )
-        .attached_pools
+        attach_missing_eligible_pools_with_gate(&work.arena, g, work.pool_metas.as_ref(), gate_ref)
+            .attached_pools
     } else {
         0
     };
@@ -324,8 +337,7 @@ fn run_lf_cpu_work(work: &LfCpuWork) -> LfCpuResult {
         && missing_graph_pools == 0
         && (work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30))
     {
-        crate::pipeline::graph::topology_stats(graph.as_ref())
-            .log_summary("cache_hit");
+        crate::pipeline::graph::topology_stats(graph.as_ref()).log_summary("cache_hit");
     }
 
     LfCpuResult {
@@ -359,6 +371,7 @@ pub struct LfContext {
     pub arena: Arc<parking_lot::Mutex<StateArena>>,
     pub tick_lock: Arc<AsyncMutex<()>>,
     pub ui_hook: SharedUiHook,
+    pub flash_liquidity: Arc<FlashLiquidityCache>,
 }
 
 pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> anyhow::Result<()> {
@@ -443,6 +456,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         prior_rates: Arc::clone(&prior_rates),
         token_decimals: Arc::clone(&decimals),
         gas_price_wei,
+        flash_liquidity: Arc::clone(&ctx.flash_liquidity),
     };
     // ponytail: skip enrich_all_token_to_matic_rates — prior_rates from last tick
     // is sufficient for resolvable set computation. Cycle-token enrichment below
@@ -460,7 +474,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let resolvable_count = resolvable.len();
 
     let cycles_arc = cpu.cycles;
-    let routing_graph = cpu.graph;
+    let mut routing_graph = cpu.graph;
     let cycle_search_ms = cpu.enumeration_ms;
     let enumerated_cycles = cpu.enumerated_cycles;
 
@@ -490,16 +504,25 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     let ticks_started = crate::util::now_ms();
+    let mut v3_tick_targets = 0;
+    let mut v3_ticks_loaded = 0;
+    let mut v3_ticks_ms = 0;
+    let mut v4_tick_targets = 0;
+    let mut v4_ticks_loaded = 0;
+    let mut v4_ticks_ms = 0;
     if let Some(ref provider) = state_provider {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
-        let v4_tick_targets = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
+        let v4_tick_pools = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
+        v3_tick_targets = tick_pools.len();
+        v4_tick_targets = v4_tick_pools.len();
         crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools);
-        crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_targets);
+        crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools);
         let state_block = ctx.refresh.last_state_block();
         let pinned_block = (state_block > 0).then_some(state_block);
         let (algebra_pools, algebra_integral_pools) =
             crate::pipeline::tick_fetch::collect_algebra_pools(&arena, pool_metas.as_ref());
-        let _ticks_loaded = enrich_v3_ticks(
+        let v3_ticks_started = crate::util::now_ms();
+        v3_ticks_loaded = enrich_v3_ticks(
             provider,
             &mut arena,
             &tick_pools,
@@ -509,19 +532,22 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             pinned_block,
         )
         .await;
-        let _v4_ticks_loaded = enrich_v4_ticks(
+        v3_ticks_ms = crate::util::now_ms().saturating_sub(v3_ticks_started);
+        let v4_ticks_started = crate::util::now_ms();
+        v4_ticks_loaded = enrich_v4_ticks(
             provider,
             &mut arena,
-            &v4_tick_targets,
+            &v4_tick_pools,
             ctx.config.oracle.tick_word_range,
             pinned_block,
         )
         .await;
+        v4_ticks_ms = crate::util::now_ms().saturating_sub(v4_ticks_started);
     }
     let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);
 
     let finalize_started = crate::util::now_ms();
-    let mut capped = Arc::try_unwrap(cycles_arc).unwrap_or_else(|arc| (*arc).clone());
+    let mut capped = (*cycles_arc).clone();
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
@@ -531,25 +557,95 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT
             && (c.cycle_ratio.is_zero() || c.cycle_ratio > ONE)
     });
+    // Priced-cycle filter runs after enrich+merge below so newly configured feeds
+    // (batch mints) can rotate/retain cycles on the same LF tick.
     // ponytail: rescore reorders by score and would undo enumeration-time protocol
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
     capped = finalize_enumerated_cycles(capped, max_paths);
     let finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
 
     let rates_started = crate::util::now_ms();
+    let rate_ctx = RateEnrichContext {
+        graph: Some(&routing_graph),
+        hub_path: HubPathRateParams {
+            enabled: ctx.config.oracle.hub_path_rates,
+            max_hops: ctx.config.oracle.hub_path_max_hops.max(1),
+        },
+    };
     let (fresh_rates, rate_stats) = if let Some(ref provider) = state_provider {
         enrich_token_to_matic_rates(
             &ctx.price_oracle,
             &arena,
             cycle_tokens.iter().copied(),
             Some(provider),
+            rate_ctx,
         )
         .await
     } else {
-        enrich_token_to_matic_rates_offline(&ctx.price_oracle, &arena, cycle_tokens.iter().copied())
-            .await
+        enrich_token_to_matic_rates_offline(
+            &ctx.price_oracle,
+            &arena,
+            cycle_tokens.iter().copied(),
+            rate_ctx,
+        )
+        .await
     };
-    let rates = merge_token_rates(&prior_rates, fresh_rates);
+    let rates = merge_token_rates(&prior_rates, &cycle_tokens_set, fresh_rates);
+    retain_cycles_with_priced_start(&mut capped, rates.as_ref());
+    if rates.len() > prior_rates.len() {
+        let post_gate = GraphBuildGate {
+            token_to_matic_rates: Arc::clone(&rates),
+            flash: ctx.flash_liquidity.load(),
+            flash_ttl: ctx.flash_liquidity.ttl(),
+        };
+        if post_gate.active()
+            && has_missing_eligible_pools_with_gate(
+                &arena,
+                pool_metas.as_ref(),
+                routing_graph.as_ref(),
+                Some(&post_gate),
+            )
+        {
+            let layout_fp = arena.routing_layout_fingerprint();
+            let routable_count = pool_metas.len();
+            let eligible = count_graph_eligible_pools_with_gate(
+                &arena,
+                pool_metas.as_ref(),
+                Some(&post_gate),
+            );
+            let state_generation = ctx.cache.generation();
+            let g = Arc::make_mut(&mut routing_graph);
+            let report = attach_missing_eligible_pools_with_gate(
+                &arena,
+                g,
+                pool_metas.as_ref(),
+                Some(&post_gate),
+            );
+            if report.attached_pools > 0 {
+                ctx.graph_cache.lock().store(
+                    Arc::clone(&routing_graph),
+                    None,
+                    routable_count,
+                    layout_fp,
+                    state_generation,
+                    eligible,
+                );
+                crate::info!(
+                    "lf graph post-rate patch: attached={} merged_rates={} prior_rates={}",
+                    report.attached_pools,
+                    rates.len(),
+                    prior_rates.len()
+                );
+            }
+        }
+    }
+    crate::services::oracle::record_unmapped_token_demand(
+        &ctx.price_oracle,
+        &arena,
+        pool_metas.as_ref(),
+        cycles_arc.as_ref(),
+    );
+    crate::services::oracle::log_ranked_unmapped_demand(&ctx.price_oracle, lf_pass, &rate_stats);
     if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
         crate::debug!(
             "token rates: cycle_tokens={} prior_rates={} merged_rates={} {:?}",
@@ -560,6 +656,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         );
     }
     let cycle_and_rates_ms = crate::util::now_ms().saturating_sub(cpu_started);
+    let post_cpu_ms = cycle_and_rates_ms.saturating_sub(cpu_ms);
     let rates_ms = crate::util::now_ms().saturating_sub(rates_started);
 
     let hot: Vec<Address> = {
@@ -589,13 +686,20 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         resolvable_count
     );
     crate::info!(
-        "lf latency: total_ms={} discovery_ms={} refresh_ms={} arena_sync_ms={} cpu_ms={} ticks_ms={} finalize_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
+        "lf latency: total_ms={} discovery_ms={} refresh_ms={} arena_sync_ms={} cpu_ms={} post_cpu_ms={} ticks_ms={} v3_tick_targets={} v3_ticks_loaded={} v3_ticks_ms={} v4_tick_targets={} v4_ticks_loaded={} v4_ticks_ms={} finalize_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
         crate::util::now_ms().saturating_sub(lf_started),
         discovery_ms,
         refresh_ms,
         arena_sync_ms,
         cpu_ms,
+        post_cpu_ms,
         ticks_ms,
+        v3_tick_targets,
+        v3_ticks_loaded,
+        v3_ticks_ms,
+        v4_tick_targets,
+        v4_ticks_loaded,
+        v4_ticks_ms,
         finalize_ms,
         cycle_and_rates_ms,
         rates_ms,

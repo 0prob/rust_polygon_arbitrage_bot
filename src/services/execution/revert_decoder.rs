@@ -241,10 +241,10 @@ fn decode_external_call_failed(payload: &[u8]) -> Option<DecodedRevert> {
             reason: String::new(),
         });
     }
-    if let Some(decoded) = decode_external_call_failed_abi(payload) {
+    if let Some(decoded) = decode_huff_external_call_failed_payload(payload) {
         return Some(decoded);
     }
-    if let Some(decoded) = decode_huff_external_call_failed_payload(payload) {
+    if let Some(decoded) = decode_external_call_failed_abi(payload) {
         return Some(decoded);
     }
     let reason = if payload.len() > 128 {
@@ -364,5 +364,28 @@ impl std::fmt::Display for DecodedRevert {
                 write!(f, "Unknown: selector=0x{sel:02x?}, data={hex}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn huff_external_call_failure_wins_over_abi_shape_collision() {
+        let target = address!("c8024d73455853224df33bcda42b82502a964b9e");
+        let mut payload = [0u8; 128];
+        payload[31] = 3;
+        payload[44..64].copy_from_slice(target.as_slice());
+
+        assert!(matches!(
+            decode_external_call_failed(&payload),
+            Some(DecodedRevert::ExternalCallFailed {
+                index: 3,
+                target: decoded_target,
+                ..
+            }) if decoded_target == target
+        ));
     }
 }

@@ -69,6 +69,8 @@ sol! {
     #[sol(rpc)]
     interface ICurveCryptoPool {
         function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
+        function price_scale(uint256 i) external view returns (uint256);
+        function precisions() external view returns (uint256[2]);
     }
 
     #[sol(rpc)]

@@ -17,6 +17,10 @@ name = "tui"
 path = "src/bin/tui.rs"
 required-features = ["tui"]
 
+[[bin]]
+name = "oracle_feeds"
+path = "src/bin/oracle_feeds.rs"
+
 [features]
 default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:libc"]

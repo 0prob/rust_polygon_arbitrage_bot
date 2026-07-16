@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::core::constants::AAVE_V3_POOL;
-use crate::core::types::FoundCycle;
 use crate::core::types::FlashLoanSource;
+use crate::core::types::FoundCycle;
 use crate::orchestrator::hf::HfContext;
 use crate::orchestrator::hf_eval::{
     HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
@@ -19,20 +19,20 @@ use crate::pipeline::local_sim::{self, simulate_route_detailed};
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
 };
-use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
 use crate::services::execution::aave::{
-    aave_flash_reserve_status_live, record_aave_prepare_skip_inactive, AaveReserveStatus,
+    AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
 };
+use crate::services::execution::flash_liquidity::resolve_flash_source_for_cycle;
 use crate::services::execution::flash_liquidity::{
-    collect_flash_tokens_for_cycle, cycle_has_dodo_pool,
+    collect_flash_tokens_for_cycle, dodo_base_flash_pool_for_cycle,
 };
 use crate::services::execution::gas_oracle::RouteGasLookup;
 
 use crate::services::execution::balancer_verify::{
-    evaluate_batch_query, log_balancer_batch_filter_summary, log_balancer_prepare_gate_summary,
+    BalancerBatchReject, BatchQueryOutcome, BatchQueryVerdict, evaluate_batch_query,
+    log_balancer_batch_filter_summary, log_balancer_prepare_gate_summary,
     query_balancer_batch_profit, record_balancer_batch_reject, record_balancer_filter_accept,
-    record_balancer_filter_window, record_balancer_prepare_skip, BalancerBatchReject,
-    BatchQueryOutcome, BatchQueryVerdict,
+    record_balancer_filter_window, record_balancer_prepare_skip,
 };
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
@@ -46,6 +46,7 @@ use crate::services::state_refresh::PoolRefreshResult;
 
 enum RoutePoolRefreshAbort {
     NotIndexed { pool_count: usize },
+    Incomplete { updated: usize, pool_count: usize },
     Rpc(anyhow::Error),
 }
 
@@ -59,12 +60,21 @@ async fn refresh_route_pools_into_arena(
         return Ok((false, cache.generation()));
     }
     let pool_count = pools.len();
+    for pool in pools {
+        cache.remove(pool);
+    }
     let result = refresh
         .refresh_pool_states_for(pools, pool_count)
         .await
         .map_err(RoutePoolRefreshAbort::Rpc)?;
     if !result.can_use_cached_state() {
         return Err(RoutePoolRefreshAbort::NotIndexed { pool_count });
+    }
+    if result.updated != result.matched {
+        return Err(RoutePoolRefreshAbort::Incomplete {
+            updated: result.updated,
+            pool_count: result.matched,
+        });
     }
     let generation = arena.apply_hot_cache(cache, pools);
     let fetched = result.updated > 0;
@@ -80,9 +90,7 @@ fn log_route_refresh_cache_only(result: PoolRefreshResult, pool_count: usize) {
             "route pool refresh: 0/{pool_count} updated after fetch — using cached state"
         );
     } else {
-        crate::debug!(
-            "route pool refresh: {pool_count} pools already fresh — using cached state"
-        );
+        crate::debug!("route pool refresh: {pool_count} pools already fresh — using cached state");
     }
 }
 
@@ -278,8 +286,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         .and_then(crate::pipeline::sim_sanity::matic_usd_for_flash_cap)
     {
         Some(usd) => usd,
-        None => match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await
-        {
+        None => match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, Some(sim_provider)).await {
             Some(usd) => usd,
             None => {
                 crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
@@ -321,13 +328,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let pools_refreshed = if !refresh_required {
         false
     } else {
-        match refresh_route_pools_into_arena(
-            &ctx.refresh,
-            &ctx.cache,
-            arena,
-            &dispatch_pools,
-        )
-        .await
+        match refresh_route_pools_into_arena(&ctx.refresh, &ctx.cache, arena, &dispatch_pools).await
         {
             Ok((fetched, generation)) => {
                 dispatch_state_generation = generation;
@@ -359,6 +360,15 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
                 );
                 return;
             }
+            Err(RoutePoolRefreshAbort::Incomplete {
+                updated,
+                pool_count,
+            }) => {
+                crate::warn!(
+                    "dispatch aborted: route state refresh incomplete ({updated}/{pool_count} pools)"
+                );
+                return;
+            }
             Err(RoutePoolRefreshAbort::Rpc(e)) => {
                 crate::warn!("dispatch aborted: route pool refresh failed ({e:#})");
                 return;
@@ -368,10 +378,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     // HF tick already prefetches stale flash tokens (750ms budget); avoid a second blocking refresh here.
     if !flash_tokens.is_empty() {
-        ctx.execution.flash_liquidity.spawn_refresh_if_stale(
-            Arc::clone(&ctx.rpc),
-            &flash_tokens,
-        );
+        ctx.execution
+            .flash_liquidity
+            .spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_tokens);
     }
 
     let skipped = Arc::new(SkipCounts::default());
@@ -483,8 +492,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         return None;
     };
 
-    let hop_fidelity_caps =
-        local_sim::precompute_route_shallow_caps(arena, &evaluated.cycle.edges);
+    let hop_fidelity_caps = local_sim::precompute_route_shallow_caps(arena, &evaluated.cycle.edges);
 
     let sim = if pools_refreshed {
         let amount_in = evaluated.sim.amount_in;
@@ -599,12 +607,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             .flash_liquidity
             .aave_viable_for_dispatch(start_token_addr);
         if !cache_viable {
-            let status = aave_flash_reserve_status_live(
-                sim_provider,
-                AAVE_V3_POOL,
-                start_token_addr,
-            )
-            .await;
+            let status =
+                aave_flash_reserve_status_live(sim_provider, AAVE_V3_POOL, start_token_addr).await;
             if status != AaveReserveStatus::Viable {
                 skipped.record("prepare_aave");
                 record_aave_prepare_skip_inactive();
@@ -706,7 +710,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         state_hash,
         route_fingerprint: fp,
         flash_liquidity: liquidity,
-        has_dodo_pool: cycle_has_dodo_pool(arena, &prepared.evaluated.cycle),
+        has_dodo_pool: dodo_base_flash_pool_for_cycle(arena, &prepared.evaluated.cycle).is_some(),
         trust_prepared_flash: true,
     };
 
@@ -833,6 +837,15 @@ pub(crate) async fn refresh_and_resim_profitable(
                 );
                 return (Vec::new(), false, state_generation);
             }
+            Err(RoutePoolRefreshAbort::Incomplete {
+                updated,
+                pool_count,
+            }) => {
+                crate::warn!(
+                    "resim aborted: route state refresh incomplete ({updated}/{pool_count} pools) — dropping {in_count} candidates"
+                );
+                return (Vec::new(), false, state_generation);
+            }
             Err(RoutePoolRefreshAbort::Rpc(e)) => {
                 crate::warn!(
                     "resim aborted: route pool refresh failed ({e:#}) — dropping {in_count} candidates"
@@ -858,8 +871,7 @@ pub(crate) async fn refresh_and_resim_profitable(
         .filter_map(|mut result| {
             let baseline = result.sim;
             let amount = result.opt.optimal_input;
-            let hop_caps =
-                local_sim::precompute_route_shallow_caps(arena, &result.cycle.edges);
+            let hop_caps = local_sim::precompute_route_shallow_caps(arena, &result.cycle.edges);
             let refreshed = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
             if refreshed.profit.is_zero() {
                 resim_unprofitable += 1;
@@ -1148,13 +1160,24 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         );
         return;
     };
+    let route = hops
+        .iter()
+        .map(|hop| {
+            format!(
+                "{}@{}",
+                hop.protocol_label.as_deref().unwrap_or("unknown"),
+                hop.pool_address
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("->");
     let modeled = result.sim.profit;
     let query_block = (state_block > 0).then_some(state_block);
     match query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await
     {
         BatchQueryOutcome::Profit(on_chain) => {
             crate::info!(
-                "hf near-miss-verify: fp={fp} modeled={modeled} on_chain={on_chain} net_matic={}",
+                "hf near-miss-verify: fp={fp} route={route} modeled={modeled} on_chain={on_chain} net_matic={}",
                 result.assessment.net_profit_after_gas_matic_wei,
             );
         }
@@ -1162,17 +1185,21 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
             execution.quarantine_batch_query_failure(fp);
             log_phantom_balancer_diag(arena, result, &hops);
             crate::info!(
-                "hf near-miss-verify: fp={fp} phantom sim modeled={modeled} vault_delta={delta} quarantined",
+                "hf near-miss-verify: fp={fp} route={route} phantom sim modeled={modeled} vault_delta={delta} quarantined",
             );
         }
         BatchQueryOutcome::RpcError(reason) => {
-            crate::info!("hf near-miss-verify: fp={fp} rpc_error={reason} modeled={modeled}");
+            crate::info!(
+                "hf near-miss-verify: fp={fp} route={route} rpc_error={reason} modeled={modeled}"
+            );
         }
         BatchQueryOutcome::Timeout => {
-            crate::info!("hf near-miss-verify: fp={fp} timeout modeled={modeled}");
+            crate::info!("hf near-miss-verify: fp={fp} route={route} timeout modeled={modeled}");
         }
         BatchQueryOutcome::BuildFailed | BatchQueryOutcome::DecodeFailed => {
-            crate::info!("hf near-miss-verify: fp={fp} build_decode_failed modeled={modeled}");
+            crate::info!(
+                "hf near-miss-verify: fp={fp} route={route} build_decode_failed modeled={modeled}"
+            );
         }
     }
 }

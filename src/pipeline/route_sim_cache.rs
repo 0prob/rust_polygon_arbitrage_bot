@@ -10,7 +10,7 @@ const ROUTE_SIM_CACHE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 struct RouteSimKey {
-    generation: u64,
+    route_state_revision: u64,
     route_fp: u64,
     amount: U256,
 }
@@ -36,11 +36,9 @@ impl RouteSimCacheStats {
     }
 }
 
-/// Cross-tick route simulation cache keyed by `(state_generation, route_fp, amount)`.
 #[derive(Debug, Default)]
 pub struct RouteSimCache {
     entries: DashMap<RouteSimKey, MinimalSimResult, FxBuildHasher>,
-    pruned_generation: AtomicU64,
     pub stats: RouteSimCacheStats,
 }
 
@@ -49,27 +47,19 @@ impl RouteSimCache {
     pub fn new() -> Self {
         Self {
             entries: DashMap::with_capacity_and_hasher(ROUTE_SIM_CACHE_CAPACITY, FxBuildHasher),
-            pruned_generation: AtomicU64::new(u64::MAX),
             stats: RouteSimCacheStats::default(),
         }
     }
 
-    pub fn clear_stale(&self, current_generation: u64) {
-        let before = self.entries.len();
-        self.entries
-            .retain(|key, _| key.generation == current_generation);
-        if before != self.entries.len()
-            || self.pruned_generation.load(Ordering::Acquire) != current_generation
-        {
-            self.pruned_generation
-                .store(current_generation, Ordering::Release);
-        }
-    }
-
     #[must_use]
-    pub fn get(&self, generation: u64, route_fp: u64, amount: U256) -> Option<MinimalSimResult> {
+    pub fn get(
+        &self,
+        route_state_revision: u64,
+        route_fp: u64,
+        amount: U256,
+    ) -> Option<MinimalSimResult> {
         let key = RouteSimKey {
-            generation,
+            route_state_revision,
             route_fp,
             amount,
         };
@@ -81,26 +71,22 @@ impl RouteSimCache {
         None
     }
 
-    pub fn insert(&self, generation: u64, route_fp: u64, amount: U256, sim: MinimalSimResult) {
+    pub fn insert(
+        &self,
+        route_state_revision: u64,
+        route_fp: u64,
+        amount: U256,
+        sim: MinimalSimResult,
+    ) {
         if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
-            let before = self.entries.len();
-            self.clear_stale(generation);
-            let cleared = before.saturating_sub(self.entries.len());
-            if cleared > 0 {
-                self.stats
-                    .evictions
-                    .fetch_add(cleared as u64, Ordering::Relaxed);
-            }
-            if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY
-                && let Some(victim) = self.entries.iter().next().map(|entry| *entry.key())
-            {
+            if let Some(victim) = self.entries.iter().next().map(|entry| *entry.key()) {
                 self.entries.remove(&victim);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.entries.insert(
             RouteSimKey {
-                generation,
+                route_state_revision,
                 route_fp,
                 amount,
             },
@@ -136,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clear_stale_keeps_current_generation_entries() {
+    fn route_state_revision_partitions_entries() {
         let cache = RouteSimCache::new();
         cache.insert(
             7,
@@ -148,13 +134,11 @@ mod tests {
                 total_gas: 0,
             },
         );
-        cache.clear_stale(7);
-
         assert_eq!(cache.entry_count(), 1);
     }
 
     #[test]
-    fn clear_stale_prunes_old_generation_even_when_marker_matches() {
+    fn different_route_state_revisions_do_not_alias() {
         let cache = RouteSimCache::new();
         let sim = MinimalSimResult {
             profit: U256::ONE,
@@ -163,10 +147,8 @@ mod tests {
         };
         cache.insert(1, 10, U256::from(100u64), sim);
         cache.insert(2, 10, U256::from(100u64), sim);
-        cache.clear_stale(2);
-        assert!(cache.get(1, 10, U256::from(100u64)).is_none());
+        assert!(cache.get(1, 10, U256::from(100u64)).is_some());
         assert!(cache.get(2, 10, U256::from(100u64)).is_some());
-        cache.clear_stale(2);
-        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.entry_count(), 2);
     }
 }

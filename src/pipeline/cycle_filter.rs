@@ -10,6 +10,8 @@ use crate::pipeline::local_sim::simulate_route_minimal;
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::spot_price::spot_probe_for_decimals;
 use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
+use crate::services::execution::flash_liquidity::rotate_cycle_to_start;
+use crate::services::oracle::has_reliable_matic_rate;
 
 #[must_use]
 pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
@@ -27,6 +29,37 @@ fn cycle_spot_negative(cycle: &FoundCycle) -> bool {
     }
     // Pre-rescore / cache paths may only have graph f64 score.
     cycle.cycle_ratio.is_zero() && cycle.score < 0.0
+}
+
+/// Drop cycles with no oracle-priced start; rotate to the first priced hop when possible.
+pub fn retain_cycles_with_priced_start(
+    cycles: &mut Vec<FoundCycle>,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+) {
+    if token_to_matic_rates.is_empty() {
+        return;
+    }
+    cycles.retain_mut(|cycle| normalize_cycle_to_priced_start(cycle, token_to_matic_rates));
+}
+
+#[must_use]
+fn normalize_cycle_to_priced_start(
+    cycle: &mut FoundCycle,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+) -> bool {
+    if has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+        return true;
+    }
+    for edge in &cycle.edges {
+        if !has_reliable_matic_rate(edge.token_in, token_to_matic_rates) {
+            continue;
+        }
+        if let Some(rotated) = rotate_cycle_to_start(cycle, edge.token_in) {
+            *cycle = rotated;
+            return true;
+        }
+    }
+    false
 }
 
 /// Token metadata for per-cycle probe sizing during atomic prefilter.
@@ -59,11 +92,7 @@ fn probe_context_for_cycle(
 ) -> (U256, U256, u8) {
     let mut rate = U256::ZERO;
     let decimals = if let Some(c) = ctx.and_then(|c| c.token_decimals) {
-        crate::services::oracle::resolve_token_decimals_for_index(
-            cycle.start_token,
-            arena,
-            c,
-        )
+        crate::services::oracle::resolve_token_decimals_for_index(cycle.start_token, arena, c)
     } else {
         arena.token_decimals(cycle.start_token)
     };
@@ -204,7 +233,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     }
 
     simulable.sort_unstable_by(compare_cycle_score);
-    let rescue_cap = graph_negative_rescue_cap(max_keep);
+    let rescue_cap = max_keep;
     let sim_window = simulable.len().min(max_keep.saturating_add(rescue_cap));
     diag.sim_window = sim_window;
     let candidates: Vec<FoundCycle> = simulable.into_iter().take(sim_window).collect();
@@ -370,6 +399,52 @@ mod tests {
     }
 
     #[test]
+    fn retain_cycles_drops_unpriced_and_keeps_priced_start() {
+        use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+
+        let mut rates = FxHashMap::default();
+        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+        let mut cycles = vec![cycle(1.0, false)];
+        retain_cycles_with_priced_start(&mut cycles, &rates);
+        assert_eq!(cycles.len(), 1);
+
+        rates.clear();
+        let mut deferred = vec![cycle(1.0, false)];
+        retain_cycles_with_priced_start(&mut deferred, &rates);
+        assert_eq!(
+            deferred.len(),
+            1,
+            "empty rate map defers filtering until oracle rates load"
+        );
+
+        rates.insert(TokenIndex(1), MIN_TOKEN_TO_MATIC_RATE);
+        let mut unpriced = vec![cycle(1.0, false)];
+        retain_cycles_with_priced_start(&mut unpriced, &rates);
+        assert!(unpriced.is_empty());
+    }
+
+    #[test]
+    fn priced_filter_after_enrich_keeps_cycle_for_newly_mapped_start() {
+        use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+
+        let mut prior = FxHashMap::default();
+        prior.insert(TokenIndex(1), MIN_TOKEN_TO_MATIC_RATE);
+        let mut cycles = vec![cycle(1.0, false)];
+        retain_cycles_with_priced_start(&mut cycles, &prior);
+        assert!(
+            cycles.is_empty(),
+            "start token 0 unpriced in prior map drops cycle"
+        );
+
+        let mut merged = FxHashMap::default();
+        merged.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+        merged.insert(TokenIndex(1), MIN_TOKEN_TO_MATIC_RATE);
+        let mut restored = vec![cycle(1.0, false)];
+        retain_cycles_with_priced_start(&mut restored, &merged);
+        assert_eq!(restored.len(), 1, "post-enrich merged rates retain cycle");
+    }
+
+    #[test]
     fn edge_hop_key_distinguishes_pool_local_direction() {
         let mut forward = cycle(0.0, false);
         forward.edges[0].token_in_idx = 1;
@@ -448,13 +523,12 @@ mod tests {
         let mut flat = cycle(-0.1, false);
         flat.cycle_ratio = ONE;
         flat.score = 0.1;
-        let (_, diag) =
-            prefilter_cycles_by_atomic_sim_with_context_and_diag(
-                &crate::pipeline::arena::StateArena::default(),
-                vec![flat],
-                8,
-                None,
-            );
+        let (_, diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
+            &crate::pipeline::arena::StateArena::default(),
+            vec![flat],
+            8,
+            None,
+        );
         assert_eq!(diag.pruned_spot_flat, 1);
         assert_eq!(diag.sim_window, 0);
     }
@@ -467,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn spot_negative_cycle_survives_zero_profit_probe_rescue() {
+    fn spot_negative_cycles_fill_the_configured_route_budget() {
         let mut arena = crate::pipeline::arena::StateArena::default();
         let a = arena.register_token(Address::from([1u8; 20]));
         let b = arena.register_token(Address::from([2u8; 20]));
@@ -535,15 +609,15 @@ mod tests {
 
         let (kept, diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
             &arena,
-            vec![graph_negative.clone()],
-            8,
+            std::iter::repeat_n(graph_negative.clone(), 33).collect(),
+            33,
             None,
         );
-        assert_eq!(kept.len(), 1, "spot-negative cycle should be rescued");
+        assert_eq!(kept.len(), 33, "spot-negative cycles should be rescued");
         assert_eq!(kept[0].cycle_ratio, graph_negative.cycle_ratio);
-        assert!(
-            diag.spot_rescue >= 1 || diag.gas_rescue >= 1,
-            "rescued cycle should be counted: {diag:?}"
+        assert_eq!(
+            diag.rescue_cap_drop, 0,
+            "route budget should not pre-drop rescues"
         );
     }
 }

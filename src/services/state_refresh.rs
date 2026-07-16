@@ -16,7 +16,7 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::fetch_missing_pool_states;
+use crate::pipeline::fetcher::{fetch_missing_pool_states, fetch_missing_pool_states_indexed};
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -93,6 +93,7 @@ pub struct StateRefreshService {
     last_state_hash: parking_lot::RwLock<Option<B256>>,
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
+    fetch_never_scan_offset: AtomicUsize,
     /// Set to true by the LISTEN/NOTIFY task when a pool_meta_channel notification arrives.
     /// Cleared by `maybe_discover` after triggering an early incremental refresh.
     pg_notify_pending: Arc<AtomicBool>,
@@ -127,6 +128,7 @@ impl StateRefreshService {
             last_state_hash: parking_lot::RwLock::new(None),
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
+            fetch_never_scan_offset: AtomicUsize::new(0),
             pg_notify_pending: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -506,9 +508,11 @@ impl StateRefreshService {
             let (page, last_block, last_updated_block, has_more, page_stats) =
                 self.pg.fetch_pool_meta_incremental(&work_cursor).await?;
             record_index_incremental_rows(
-                u32::try_from(page_stats.parsed.values().sum::<usize>()
-                    + page_stats.rejected.values().sum::<usize>())
-                    .unwrap_or(u32::MAX),
+                u32::try_from(
+                    page_stats.parsed.values().sum::<usize>()
+                        + page_stats.rejected.values().sum::<usize>(),
+                )
+                .unwrap_or(u32::MAX),
             );
             merge_parse_stats(&mut parse_stats, &page_stats);
             pools.extend(page.into_iter().filter_map(retain_routable_pool));
@@ -778,6 +782,12 @@ impl StateRefreshService {
 
         let mut total_updated = 0usize;
         let mut fetch_attempted = false;
+        let refresh_started = now_ms();
+        let mut rpc_head_ms = 0u64;
+        let mut fetch_ms = 0u64;
+        let mut hash_ms = 0u64;
+        let mut rpc_attempts = 0usize;
+        let mut last_pinned_block = None;
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,
@@ -787,12 +797,20 @@ impl StateRefreshService {
                     continue;
                 }
             };
+            rpc_attempts += 1;
             let provider_for_hash = provider.clone();
+            let head_started = now_ms();
             let pinned_block = provider.get_block_number().await.ok().or(cached_block);
-            let (updated, attempted) = fetch_missing_pool_states(
+            rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
+            last_pinned_block = pinned_block;
+            let fetch_started = now_ms();
+            let address_index = self.discovery_state.read().address_index.clone();
+            let (updated, attempted) = fetch_missing_pool_states_indexed(
                 provider,
                 Arc::clone(&self.cache),
                 pools,
+                &address_index,
+                &self.fetch_never_scan_offset,
                 max_pools,
                 self.config.max_multicall_calls as usize,
                 self.config.rpc.batch_pace_ms,
@@ -801,12 +819,14 @@ impl StateRefreshService {
                 &self.pool_meta_cache,
             )
             .await;
+            fetch_ms = fetch_ms.saturating_add(now_ms().saturating_sub(fetch_started));
             total_updated = updated;
             fetch_attempted |= attempted;
             if updated > 0 {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
                 }
+                let hash_started = now_ms();
                 let pinned_hash = match pinned_block {
                     Some(block) => provider_for_hash
                         .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
@@ -816,6 +836,7 @@ impl StateRefreshService {
                         .map(|b| b.header.hash),
                     None => None,
                 };
+                hash_ms = hash_ms.saturating_add(now_ms().saturating_sub(hash_started));
                 if let Some(hash) = pinned_hash {
                     *self.last_state_hash.write() = Some(hash);
                 }
@@ -835,6 +856,14 @@ impl StateRefreshService {
                     "state RPC returned no pool updates — trying fallback (url_index={idx})"
                 );
             }
+        }
+        let refresh_ms = now_ms().saturating_sub(refresh_started);
+        if refresh_ms >= self.config.lf_interval_ms {
+            crate::warn!(
+                "state refresh overrun: total_ms={refresh_ms} interval_ms={} matched={matched} updated={total_updated} attempted={fetch_attempted} rpc_attempts={rpc_attempts}/{} head_ms={rpc_head_ms} fetch_ms={fetch_ms} hash_ms={hash_ms} pinned_block={last_pinned_block:?}",
+                self.config.lf_interval_ms,
+                candidates.len(),
+            );
         }
         Ok(PoolRefreshResult {
             updated: total_updated,

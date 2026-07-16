@@ -5,9 +5,9 @@ use crate::core::protocol::{
     fee_to_bps, is_fetchable_protocol, is_known_protocol_label, normalize_balancer_pool_type,
     resolve_protocol_from_pg,
 };
-use crate::services::index_diag::{IndexParseReject, IndexRoutableSkip, record_index_parse_reject};
 use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
 use crate::pipeline::types::PoolMeta;
+use crate::services::index_diag::{IndexParseReject, IndexRoutableSkip, record_index_parse_reject};
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredPool {

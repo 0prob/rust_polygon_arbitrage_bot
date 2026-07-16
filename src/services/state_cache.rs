@@ -19,6 +19,7 @@ const DEFAULT_STALE_TRADABLE_TTL: Duration = Duration::from_secs(300);
 struct CachedEntry {
     pub state: Arc<PoolState>,
     pub updated_at: Instant,
+    pub revision: u64,
 }
 
 #[derive(Debug)]
@@ -194,6 +195,11 @@ impl StateCache {
         self.len() == 0
     }
 
+    /// Whether any cached row exists (including expired), for fetch target scans.
+    pub fn has_any_entry(&self, address: &Address) -> bool {
+        self.inner.read().contains_key(address)
+    }
+
     fn lookup_pool_state(&self, address: &Address) -> Option<Arc<PoolState>> {
         let guard = self.inner.read();
         let entry = guard.get(address)?;
@@ -251,7 +257,7 @@ impl StateCache {
     pub fn get_arcs_with_generation(
         &self,
         addresses: &[Address],
-    ) -> (Vec<(Address, Arc<PoolState>)>, u64) {
+    ) -> (Vec<(Address, Arc<PoolState>, u64)>, u64) {
         let guard = self.inner.read();
         // Load generation while the read lock is still held so no concurrent
         // writer can advance it between reading states and loading generation.
@@ -262,7 +268,7 @@ impl StateCache {
                 continue;
             };
             if entry.updated_at.elapsed() <= self.ttl {
-                states.push((*address, Arc::clone(&entry.state)));
+                states.push((*address, Arc::clone(&entry.state), entry.revision));
             }
         }
         (states, generation)
@@ -282,7 +288,10 @@ impl StateCache {
         // the Arc is uniquely held (common for hot-patched pool states from WSS).
         f(Arc::make_mut(&mut entry.state));
         entry.updated_at = Instant::now();
-        self.generation.fetch_add(1, Ordering::Release);
+        entry.revision = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         self.mark_dirty(address);
         true
     }
@@ -342,14 +351,18 @@ impl StateCache {
                 guard.remove(&victim);
             }
         }
+        let revision = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         guard.insert(
             address,
             CachedEntry {
                 state: Arc::new(state),
                 updated_at: Instant::now(),
+                revision,
             },
         );
-        self.generation.fetch_add(1, Ordering::Release);
         self.mark_dirty(address);
     }
 
@@ -366,6 +379,16 @@ impl StateCache {
         self.inner.read().keys().copied().collect()
     }
 
+    fn fetch_class_for_entry(&self, entry: &CachedEntry) -> Option<u8> {
+        if entry.state.is_tradable() {
+            (entry.updated_at.elapsed() > self.stale_tradable_ttl).then_some(3)
+        } else if entry.updated_at.elapsed() > self.invalid_retry_ttl {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
     /// Single read-lock pass over pools that need fetch (1=never, 2=invalid, 3=stale).
     pub fn for_each_fetch_candidate<'a>(
         &self,
@@ -376,20 +399,32 @@ impl StateCache {
         for pool in pools {
             let class = match guard.get(&pool.address) {
                 None => 1,
-                Some(entry) if entry.state.is_tradable() => {
-                    if entry.updated_at.elapsed() > self.stale_tradable_ttl {
-                        3
-                    } else {
-                        continue;
-                    }
-                }
-                Some(entry) => {
-                    if entry.updated_at.elapsed() > self.invalid_retry_ttl {
-                        2
-                    } else {
-                        continue;
-                    }
-                }
+                Some(entry) => match self.fetch_class_for_entry(entry) {
+                    Some(class) => class,
+                    None => continue,
+                },
+            };
+            f(pool, class);
+        }
+    }
+
+    /// Scan cache entries only (O(cache)) for stale/invalid candidates still in discovery.
+    pub fn for_each_cached_fetch_candidate<'a>(
+        &self,
+        address_index: &FxHashMap<Address, usize>,
+        pools: &'a [DiscoveredPool],
+        mut f: impl FnMut(&'a DiscoveredPool, u8),
+    ) {
+        let guard = self.inner.read();
+        for (address, entry) in guard.iter() {
+            let Some(class) = self.fetch_class_for_entry(entry) else {
+                continue;
+            };
+            let Some(&idx) = address_index.get(address) else {
+                continue;
+            };
+            let Some(pool) = pools.get(idx) else {
+                continue;
             };
             f(pool, class);
         }

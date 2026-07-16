@@ -7,6 +7,8 @@ use crate::core::types::CurvePoolState;
 use super::fixed_point::ONE;
 
 type CurveXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
+/// Extra guard for crypto-pool dynamic fees and integer rounding beyond the stable-pool buffer.
+const CURVE_CRYPTO_OUTPUT_BUFFER: U256 = U256::from_limbs([5_000_000, 0, 0, 0]);
 const A_MULTIPLIER: U256 = U256::from_limbs([10_000, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 128;
 
@@ -276,6 +278,7 @@ pub enum CurveCryptoReject {
     MissingGamma,
     NewtonD,
     NewtonY,
+    ImplausibleOutput,
     ZeroOut,
 }
 
@@ -320,16 +323,23 @@ pub fn try_curve_crypto_amount_out(
     if token_in_idx >= xp.len() || token_out_idx >= xp.len() {
         return Err(CurveCryptoReject::InvalidIndices);
     }
-    xp[token_in_idx] += (amount_in * rates[token_in_idx]) / ONE;
     let d_result = curve_crypto_newton_d(ann, gamma, &xp);
     if !d_result.converged {
         return Err(CurveCryptoReject::NewtonD);
     }
+    let input_xp = (amount_in * rates[token_in_idx]) / ONE;
+    xp[token_in_idx] += input_xp;
     let y_result = curve_crypto_newton_y(ann, gamma, &xp, d_result.value, token_out_idx);
     if !y_result.converged {
         return Err(CurveCryptoReject::NewtonY);
     }
     let dy = xp[token_out_idx].saturating_sub(y_result.value);
+    if input_xp
+        .checked_mul(U256::from(2u64))
+        .is_some_and(|max_output| dy > max_output)
+    {
+        return Err(CurveCryptoReject::ImplausibleOutput);
+    }
     let fee = state.fee;
     let fee_denom = POW_10_10;
     let out_rate = rates[token_out_idx];
@@ -340,7 +350,7 @@ pub fn try_curve_crypto_amount_out(
     let fee_amount = (out * fee) / fee_denom;
     let out_after_fee = out.saturating_sub(fee_amount);
     let buffered = out_after_fee.saturating_sub(
-        (out_after_fee * crate::core::math::curve::CURVE_OUTPUT_BUFFER)
+        (out_after_fee * CURVE_CRYPTO_OUTPUT_BUFFER)
             / crate::core::math::curve::CURVE_FEE_DENOMINATOR,
     );
     if buffered.is_zero() {
@@ -399,6 +409,27 @@ mod tests {
         let out = get_curve_crypto_amount_out(&state, U256::from(10_000u64) * ONE, 0, 1);
         assert!(out > U256::ZERO);
         assert!(out <= state.balances[1]);
+    }
+
+    #[test]
+    fn crypto_quote_uses_pre_trade_invariant_with_scaled_raw_balances() {
+        let scale = U256::from(2_112_531_811_800_907_072u128);
+        let state = CurvePoolState {
+            balances: vec![U256::from(2_040_747u64), U256::from(969_801_590u64)],
+            a: U256::from(2_700_000u64),
+            fee: U256::from(10_000_000u64),
+            rates: vec![
+                U256::from(1_000_000_000_000u64) * ONE,
+                U256::from(1_000_000_000u64) * scale,
+            ],
+            n_coins: 2,
+            gamma: Some(U256::from(1_300_000_000_000u64)),
+            d: None,
+        };
+
+        let out = get_curve_crypto_amount_out(&state, U256::from(8_305u64), 0, 1);
+        assert!(out > U256::from(3_900_000u64), "out={out}");
+        assert!(out <= U256::from(3_926_799u64), "out={out}");
     }
 }
 

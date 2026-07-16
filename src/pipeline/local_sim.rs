@@ -3,7 +3,6 @@ use crate::core::constants::{
     GAS_V3_BASE, GAS_V4_BASE, GAS_WOOFI_HOP, HOP_CAP_USIZE,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
-use crate::pipeline::curve_sim::curve_hop_amount_out;
 use crate::core::math::dodo::get_dodo_amount_out;
 use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
@@ -12,6 +11,7 @@ use crate::core::types::{
     Edge, PoolState, ProtocolType, RouteSimulationResult, hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
+use crate::pipeline::curve_sim::curve_hop_amount_out;
 use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::types::MinimalSimResult;
 use alloy::primitives::U256;
@@ -56,14 +56,12 @@ fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
     if walked_hop_gas == 0 || crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
         return static_gas;
     }
-    let dynamic = crate::services::execution::gas::estimate_route_gas_from_hops(
-        walked_hop_gas,
-        hop_count,
-    )
-    .saturating_add(crate::services::execution::gas::estimate_route_storage_gas(
-        hop_count,
-        hop_count as u32,
-    ));
+    let dynamic =
+        crate::services::execution::gas::estimate_route_gas_from_hops(walked_hop_gas, hop_count)
+            .saturating_add(crate::services::execution::gas::estimate_route_storage_gas(
+                hop_count,
+                hop_count as u32,
+            ));
     static_gas.max(dynamic)
 }
 
@@ -639,13 +637,8 @@ pub fn simulate_route_detailed(
         });
     }
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    let (amount_out, walked_gas) = walk_route_hops(
-        arena,
-        edges,
-        amount_in,
-        Some(&mut hop_amounts),
-        None,
-    )?;
+    let (amount_out, walked_gas) =
+        walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts), None)?;
     let profit = amount_out.saturating_sub(amount_in);
     let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(RouteSimulationResult {

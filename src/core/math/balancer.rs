@@ -242,15 +242,36 @@ pub fn get_balancer_stable_amount_out(
         return U256::ZERO;
     }
 
+    if state.bpt_index == Some(in_idx) || state.bpt_index == Some(out_idx) {
+        return U256::ZERO;
+    }
+
     let n = state.balances.len();
+    if in_idx >= n || out_idx >= n {
+        return U256::ZERO;
+    }
+    let mut stable_in_idx = None;
+    let mut stable_out_idx = None;
     let mut scaled_balances: BalXp = SmallVec::with_capacity(n);
-    scaled_balances.extend(
-        state
-            .balances
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (*b * scaling[i]) / ONE),
-    );
+    for (i, balance) in state.balances.iter().enumerate() {
+        if state.bpt_index == Some(i) {
+            continue;
+        }
+        let stable_idx = scaled_balances.len();
+        if i == in_idx {
+            stable_in_idx = Some(stable_idx);
+        }
+        if i == out_idx {
+            stable_out_idx = Some(stable_idx);
+        }
+        scaled_balances.push((*balance * scaling[i]) / ONE);
+    }
+    let Some(stable_in_idx) = stable_in_idx else {
+        return U256::ZERO;
+    };
+    let Some(stable_out_idx) = stable_out_idx else {
+        return U256::ZERO;
+    };
 
     if scaled_balances.iter().any(U256::is_zero) {
         return U256::ZERO;
@@ -282,10 +303,10 @@ pub fn get_balancer_stable_amount_out(
     }
 
     let mut xp = scaled_balances.clone();
-    xp[in_idx] += scaled_amount_in;
+    xp[stable_in_idx] += scaled_amount_in;
     let final_balance_out =
-        token_balance_given_invariant(state.amp, &xp, invariant, out_idx, amp_precision);
-    let original_out = scaled_balances[out_idx];
+        token_balance_given_invariant(state.amp, &xp, invariant, stable_out_idx, amp_precision);
+    let original_out = scaled_balances[stable_out_idx];
     if final_balance_out.is_zero() || final_balance_out >= original_out {
         return U256::ZERO;
     }
@@ -542,6 +563,36 @@ mod tests {
             ONE / U256::from(2)
         );
         assert_eq!(simulate_balancer_swap(&state, ONE, 0, 2), U256::ZERO);
+    }
+
+    #[test]
+    fn composable_stable_quote_ignores_bpt_balance() {
+        let state = BalancerPoolState {
+            pool_id: None,
+            tokens: vec![],
+            balances: vec![
+                U256::from(5) * ONE,
+                U256::from(3) * ONE,
+                U256::from(7) * ONE,
+            ],
+            weights: vec![],
+            scaling_factors: vec![ONE, ONE, ONE],
+            amp: U256::from(5_000u64),
+            amp_precision: U256::from(1_000u64),
+            fee: U256::ZERO,
+            pool_type: BalancerPoolKind::Stable,
+            linear: None,
+            bpt_index: Some(2),
+            is_updating: false,
+            last_change_block: 0,
+        };
+        let mut huge_bpt = state.clone();
+        huge_bpt.balances[2] = U256::from(2_596u64) * U256::from(10u64).pow(U256::from(30u64));
+
+        assert_eq!(
+            get_balancer_stable_amount_out(&state, ONE / U256::from(10u64), 0, 1),
+            get_balancer_stable_amount_out(&huge_bpt, ONE / U256::from(10u64), 0, 1),
+        );
     }
 }
 

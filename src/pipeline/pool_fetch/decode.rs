@@ -3,12 +3,12 @@ use alloy::sol_types::SolCall;
 use std::sync::Arc;
 
 use crate::abis::{
-    IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurvePool, IDodoPoolState,
+    IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurveCryptoPool, ICurvePool,
+    IDodoPoolState,
 };
 use crate::core::math::balancer::balancer_swap_fee_from_pool_meta_fee;
 use crate::core::math::fixed_point::ONE;
 
-const DODO_FEE_RATE_SCALE: U256 = U256::from_limbs([100_000_000_000_000, 0, 0, 0]); // 1e14
 use crate::core::types::{
     BalancerLinearState, BalancerPoolKind, BalancerPoolState, CurvePoolState, DodoPoolState,
     DodoRState, PoolState, ProtocolType, V2PoolState, V3PoolState, V4PoolState,
@@ -203,7 +203,7 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
     }))
 }
 
-fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let base = decode_u256(results.first()?.as_ref()?)?;
     let quote = decode_u256(results.get(1)?.as_ref()?)?;
     let base_token = decode_address(results.get(2)?.as_ref()?)?;
@@ -213,6 +213,8 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
     let lp_fee_rate = decode_u256(results.get(6)?.as_ref()?)?;
     let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(results.get(7)?.as_ref()?)
         .ok()?;
+    let pmm_i = U256::from(pmm.i);
+    let pmm_k = U256::from(pmm.K);
     let r_state = match pmm.R {
         r if r == U256::ZERO => DodoRState::One,
         r if r == U256::ONE => DodoRState::AboveOne,
@@ -223,9 +225,11 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
         || quote.is_zero()
         || base_token.is_zero()
         || quote_token.is_zero()
-        || i.is_zero()
-        || k > ONE
+        || pmm_i.is_zero()
+        || pmm_k > ONE
         || lp_fee_rate >= ONE
+        || i != pmm_i
+        || k != pmm_k
         || U256::from(pmm.B) != base
         || U256::from(pmm.Q) != quote
         || U256::from(pmm.B0).is_zero()
@@ -233,7 +237,6 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
     {
         return None;
     }
-    let mt_fee_rate = dodo_mt_fee_from_indexer_bps(plan.pool.fee_bps, lp_fee_rate);
     Some(PoolState::Dodo(DodoPoolState {
         base_reserve: base,
         quote_reserve: quote,
@@ -242,10 +245,10 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
         base_target: U256::from(pmm.B0),
         quote_target: U256::from(pmm.Q0),
         r_state,
-        i,
-        k,
+        i: pmm_i,
+        k: pmm_k,
         lp_fee_rate,
-        mt_fee_rate,
+        mt_fee_rate: U256::ZERO,
     }))
 }
 
@@ -297,19 +300,32 @@ fn decode_curve_stored_rates(
     Some(vec![ONE; n_fetched])
 }
 
-fn decode_curve_crypto_rates(n_fetched: usize, price_scale: Option<U256>) -> Vec<U256> {
-    let mut rates = vec![ONE; n_fetched];
-    if n_fetched >= 2
-        && let Some(scale) = price_scale.filter(|scale| !scale.is_zero())
-    {
-        rates[1] = scale;
+fn decode_curve_crypto_rates(
+    n_fetched: usize,
+    price_scale: U256,
+    precisions: [U256; 2],
+) -> Option<Vec<U256>> {
+    if n_fetched != 2 || price_scale.is_zero() || precisions.iter().any(U256::is_zero) {
+        return None;
     }
-    rates
+    Some(vec![
+        precisions[0].checked_mul(ONE)?,
+        precisions[1].checked_mul(price_scale)?,
+    ])
 }
 
 fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let balances = decode_curve_balances(plan, results)?;
     let n_fetched = balances.len();
+    if plan
+        .pool
+        .pool_type
+        .as_deref()
+        .is_some_and(|pool_type| pool_type.to_ascii_lowercase().contains("stable_ng"))
+        && n_fetched != 2
+    {
+        return None;
+    }
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
@@ -337,6 +353,7 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let fee_idx = n_fetched + 1;
     let gamma_idx = n_fetched + 2;
     let price_scale_idx = n_fetched + 3;
+    let precisions_idx = n_fetched + 4;
     let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
     let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
     let gamma = results
@@ -350,9 +367,12 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let price_scale = results
         .get(price_scale_idx)
         .and_then(|b| b.as_ref())
-        .and_then(|b| ICurvePool::price_scaleCall::abi_decode_returns(b).ok())
-        .map(U256::from);
-    let rates = decode_curve_crypto_rates(n_fetched, price_scale);
+        .and_then(|b| ICurveCryptoPool::price_scaleCall::abi_decode_returns(b).ok())?;
+    let precisions = results
+        .get(precisions_idx)
+        .and_then(|b| b.as_ref())
+        .and_then(|b| ICurveCryptoPool::precisionsCall::abi_decode_returns(b).ok())?;
+    let rates = decode_curve_crypto_rates(n_fetched, price_scale, precisions)?;
     Some(PoolState::Curve(CurvePoolState {
         balances,
         a,
@@ -362,18 +382,6 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
         gamma: Some(gamma),
         d: None,
     }))
-}
-
-fn dodo_mt_fee_from_indexer_bps(fee_bps: u32, lp_fee_rate: U256) -> U256 {
-    if fee_bps == 0 {
-        return U256::ZERO;
-    }
-    let total = U256::from(fee_bps) * DODO_FEE_RATE_SCALE;
-    if total > lp_fee_rate && total < ONE {
-        total - lp_fee_rate
-    } else {
-        U256::ZERO
-    }
 }
 
 fn decode_balancer_linear(
@@ -555,8 +563,7 @@ mod tests {
             fee_denominator: den,
             block_timestamp_last: 0,
         };
-        let (num, denom) =
-            crate::core::math::uniswap_v2::resolve_v2_fee_with_edge(&state, None);
+        let (num, denom) = crate::core::math::uniswap_v2::resolve_v2_fee_with_edge(&state, None);
         assert_eq!(num, U256::from(9970u64));
         assert_eq!(denom, U256::from(10_000u64));
     }
@@ -678,6 +685,152 @@ mod tests {
             Some(Bytes::copy_from_slice(&abi_word(0))),
         ];
         assert!(decode_plan(&plan, &results).is_none());
+    }
+
+    #[test]
+    fn dodo_decode_rejects_non_atomic_price_snapshot() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::Dodo,
+                tokens: Vec::new(),
+                fee_bps: 100,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::DodoBase,
+                CallKind::DodoQuote,
+                CallKind::DodoBaseToken,
+                CallKind::DodoQuoteToken,
+                CallKind::DodoI,
+                CallKind::DodoK,
+                CallKind::DodoLpFee,
+                CallKind::DodoPmmState,
+            ],
+        };
+        let mut pmm = Vec::with_capacity(32 * 7);
+        for value in [20u64, 5, 100, 100, 120, 80, 1] {
+            pmm.extend_from_slice(&abi_word(value));
+        }
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(100))),
+            Some(Bytes::copy_from_slice(&abi_word(100))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(2))),
+            Some(Bytes::copy_from_slice(&abi_word(10))),
+            Some(Bytes::copy_from_slice(&abi_word(5))),
+            Some(Bytes::copy_from_slice(&abi_word(0))),
+            Some(Bytes::from(pmm)),
+        ];
+
+        assert!(decode_plan(&plan, &results).is_none());
+    }
+
+    #[test]
+    fn dodo_decode_matches_captured_query_sell_base_without_inferred_mt_fee() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::Dodo,
+                tokens: Vec::new(),
+                fee_bps: 1_000,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::DodoBase,
+                CallKind::DodoQuote,
+                CallKind::DodoBaseToken,
+                CallKind::DodoQuoteToken,
+                CallKind::DodoI,
+                CallKind::DodoK,
+                CallKind::DodoLpFee,
+                CallKind::DodoPmmState,
+            ],
+        };
+        let values = [
+            2_040_000_000_000_000u64,
+            5_000_000_000_000_000,
+            2_628_567_256_663,
+            12_288_863_768,
+            2_764_216_862_899,
+            12_012_067_168,
+            1,
+        ];
+        let mut pmm = Vec::with_capacity(32 * values.len());
+        for value in values {
+            pmm.extend_from_slice(&abi_word(value));
+        }
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(values[2]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[3]))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(2))),
+            Some(Bytes::copy_from_slice(&abi_word(values[0]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[1]))),
+            Some(Bytes::copy_from_slice(&abi_word(10_000_000_000_000_000))),
+            Some(Bytes::from(pmm)),
+        ];
+        let Some(PoolState::Dodo(state)) = decode_plan(&plan, &results) else {
+            panic!("DODO snapshot should decode");
+        };
+
+        assert_eq!(
+            crate::core::math::dodo::get_dodo_amount_out(&state, U256::from(474_425u64), true),
+            U256::from(959u64),
+        );
+    }
+
+    #[test]
+    fn curve_crypto_rates_require_indexed_scale_and_precisions() {
+        let scale = U256::from(2_112_531_811_800_907_072u128);
+        let precisions = [
+            U256::from(1_000_000_000_000u64),
+            U256::from(1_000_000_000u64),
+        ];
+
+        assert_eq!(
+            decode_curve_crypto_rates(2, scale, precisions),
+            Some(vec![precisions[0] * ONE, precisions[1] * scale])
+        );
+        assert!(decode_curve_crypto_rates(2, U256::ZERO, precisions).is_none());
+        assert!(decode_curve_crypto_rates(3, scale, precisions).is_none());
+    }
+
+    #[test]
+    fn stable_ng_with_more_than_two_coins_fails_closed() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![
+                    Address::ZERO,
+                    Address::with_last_byte(1),
+                    Address::with_last_byte(2),
+                ],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("stable_ng".to_string()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: Vec::new(),
+        };
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+        ];
+
+        assert!(decode_curve_stable(&plan, &results).is_none());
     }
 
     #[test]

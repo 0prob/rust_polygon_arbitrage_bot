@@ -55,7 +55,10 @@ pub fn matic_usd_for_flash_cap(matic_usd: f64) -> Option<f64> {
 
 /// USD notional cap → MATIC wei from a Chainlink MATIC/USD answer (8 decimals).
 #[must_use]
-pub fn max_flash_loan_matic_wei_from_usd_chainlink_8(usd_cap: u64, matic_usd_answer: I256) -> Option<U256> {
+pub fn max_flash_loan_matic_wei_from_usd_chainlink_8(
+    usd_cap: u64,
+    matic_usd_answer: I256,
+) -> Option<U256> {
     if usd_cap == 0 {
         return None;
     }
@@ -323,14 +326,8 @@ mod tests {
         let cap =
             max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(18)), 1.0, None).expect("cap");
         assert_eq!(cap, U256::from(50_000u64) * ONE);
-        let low_rate_cap = max_flash_borrow_wei(
-            50_000,
-            18,
-            U256::from(10u128.pow(15)),
-            1.0,
-            None,
-        )
-        .expect("cap");
+        let low_rate_cap =
+            max_flash_borrow_wei(50_000, 18, U256::from(10u128.pow(15)), 1.0, None).expect("cap");
         assert!(low_rate_cap > cap);
     }
 

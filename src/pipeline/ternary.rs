@@ -6,15 +6,9 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::brent_diag::{
-    record_brent_attempt, record_brent_cache_local, record_brent_cache_route,
+    BrentOptimizeReject, record_brent_attempt, record_brent_cache_local, record_brent_cache_route,
     record_brent_eval_reject, record_brent_eval_sim, record_brent_ok, record_brent_reject,
-    record_brent_warm_seed, BrentOptimizeReject,
-};
-use crate::pipeline::ternary_diag::{
-    record_ternary_bounds_call, record_ternary_bounds_ok, record_ternary_bounds_reject,
-    record_ternary_economic_high_raise, record_ternary_flash_cap_clamp,
-    record_ternary_golden_zero_exit, record_ternary_liquidity_cap_clamp,
-    record_ternary_rate_fallback, TernaryBoundsReject,
+    record_brent_warm_seed,
 };
 use crate::pipeline::local_sim::{
     cl_amount_cap, precompute_route_shallow_caps, simulate_route_minimal,
@@ -24,6 +18,12 @@ use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
     SimSanityInput, check_sim_sanity, check_sim_sanity_fast, check_sim_sanity_for_dispatch,
     max_flash_borrow_wei, min_economic_amount_in,
+};
+use crate::pipeline::ternary_diag::{
+    TernaryBoundsReject, record_ternary_bounds_call, record_ternary_bounds_ok,
+    record_ternary_bounds_reject, record_ternary_economic_high_raise,
+    record_ternary_flash_cap_clamp, record_ternary_golden_zero_exit,
+    record_ternary_liquidity_cap_clamp, record_ternary_rate_fallback,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -454,27 +454,26 @@ pub fn optimize_cycle(
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
-    let TernarySearchBounds { mut low, mut high } =
-        compute_ternary_search_bounds(
-            cycle,
-            arena,
-            token_to_matic_rates,
-            token_decimals,
-            start_rate,
-            start_decimals,
-            max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
-            matic_usd,
-            matic_usd_chainlink,
-            liquidity_cap,
-        )
-        .or_else(|| {
-            record_brent_reject(BrentOptimizeReject::BoundsEmpty);
-            crate::trace!(
-                "optimize_cycle: ternary bounds empty economic_floor={economic_floor} edge_count={}",
-                edges.len()
-            );
-            None
-        })?;
+    let TernarySearchBounds { mut low, mut high } = compute_ternary_search_bounds(
+        cycle,
+        arena,
+        token_to_matic_rates,
+        token_decimals,
+        start_rate,
+        start_decimals,
+        max_flash_loan_usd.unwrap_or(DEFAULT_MAX_FLASH_LOAN_USD),
+        matic_usd,
+        matic_usd_chainlink,
+        liquidity_cap,
+    )
+    .or_else(|| {
+        record_brent_reject(BrentOptimizeReject::BoundsEmpty);
+        crate::trace!(
+            "optimize_cycle: ternary bounds empty economic_floor={economic_floor} edge_count={}",
+            edges.len()
+        );
+        None
+    })?;
 
     let brent_shallow_caps = precompute_route_shallow_caps(arena, edges);
     if let Some(cap) = cl_amount_cap(arena, edges) {
@@ -538,8 +537,8 @@ pub fn optimize_cycle(
             record_brent_cache_local();
             return net_profit_matic_from_sim(sim, amount, profit_ctx);
         }
-        if let Some((cache, generation, route_fp)) = route_sim_cache
-            && let Some(cached) = cache.get(generation, route_fp, amount)
+        if let Some((cache, route_state_revision, route_fp)) = route_sim_cache
+            && let Some(cached) = cache.get(route_state_revision, route_fp, amount)
         {
             record_brent_cache_route();
             if sim_cache.len() < BRENT_CACHE_SLOTS {
@@ -571,8 +570,8 @@ pub fn optimize_cycle(
                     return U256::ZERO;
                 }
                 let score = net_profit_matic_from_sim(&sim, amount, profit_ctx);
-                if let Some((cache, generation, route_fp)) = route_sim_cache {
-                    cache.insert(generation, route_fp, amount, sim);
+                if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
+                    cache.insert(route_state_revision, route_fp, amount, sim);
                 }
                 if sim_cache.len() < BRENT_CACHE_SLOTS {
                     sim_cache.insert(amount, sim);
@@ -599,8 +598,8 @@ pub fn optimize_cycle(
         .get(&optimal)
         .copied()
         .or_else(|| {
-            route_sim_cache.and_then(|(cache, generation, route_fp)| {
-                cache.get(generation, route_fp, optimal)
+            route_sim_cache.and_then(|(cache, route_state_revision, route_fp)| {
+                cache.get(route_state_revision, route_fp, optimal)
             })
         })
         .or_else(|| {
@@ -685,10 +684,15 @@ mod tests {
     fn warm_seed_reduces_evaluate_calls() {
         let peak = U256::from(50u8);
         let mut cold = 0u32;
-        let _ = solve_brent_optimal(U256::ZERO, U256::from(100u8), |x| {
-            cold += 1;
-            peaked_at(x, 50)
-        }, 8);
+        let _ = solve_brent_optimal(
+            U256::ZERO,
+            U256::from(100u8),
+            |x| {
+                cold += 1;
+                peaked_at(x, 50)
+            },
+            8,
+        );
         let mut hot = 0u32;
         let _ = solve_brent_optimal_warm(
             U256::ZERO,

@@ -6,10 +6,10 @@ use crate::core::v4_storage::{V4_LIQUIDITY_OFFSET, compute_v4_pool_field_slot};
 use crate::pipeline::abi_cache::{
     ALGEBRA_GLOBAL_STATE, BALANCER_AMP, BALANCER_LINEAR_MAIN, BALANCER_LINEAR_RATE,
     BALANCER_LINEAR_TARGETS, BALANCER_LINEAR_WRAPPED, BALANCER_SCALING, BALANCER_SWAP_FEE,
-    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_FEE, CURVE_GAMMA, CURVE_PRICE_SCALE,
-    CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K, DODO_LP_FEE,
-    DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY,
-    V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
+    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_CRYPTO_PRECISIONS, CURVE_CRYPTO_PRICE_SCALE,
+    CURVE_FEE, CURVE_GAMMA, CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K,
+    DODO_LP_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE,
+    V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
 use crate::services::discovery::{DiscoveredPool, resolve_v4_pool_id};
@@ -35,7 +35,8 @@ pub(super) enum CallKind {
     CurveA,
     CurveFee,
     CurveRates,
-    CurvePriceScale,
+    CurveCryptoPriceScale,
+    CurveCryptoPrecisions,
     BalancerTokens,
     BalancerSwapFee,
     BalancerWeights,
@@ -191,8 +192,14 @@ fn build_curve_plan(plan: &mut PoolFetchPlan) {
         push_call(
             plan,
             plan.pool.address,
-            CURVE_PRICE_SCALE.clone(),
-            CallKind::CurvePriceScale,
+            CURVE_CRYPTO_PRICE_SCALE.clone(),
+            CallKind::CurveCryptoPriceScale,
+        );
+        push_call(
+            plan,
+            plan.pool.address,
+            CURVE_CRYPTO_PRECISIONS.clone(),
+            CallKind::CurveCryptoPrecisions,
         );
     } else {
         push_call(

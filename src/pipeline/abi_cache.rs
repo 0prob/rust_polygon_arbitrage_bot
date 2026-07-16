@@ -6,9 +6,9 @@ use alloy::primitives::{Bytes, FixedBytes, U256};
 use alloy::sol_types::SolCall;
 
 use crate::abis::{
-    IAlgebraPool, IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurvePool,
-    IDodoPoolState, IERC20Metadata, IUniswapV2Pair, IUniswapV3Pool, IUniswapV4PoolManager,
-    IWoofiPool,
+    IAlgebraPool, IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurveCryptoPool,
+    ICurvePool, IDodoPoolState, IERC20Metadata, IUniswapV2Pair, IUniswapV3Pool,
+    IUniswapV4PoolManager, IWoofiPool,
 };
 
 /// Decode the last 32-byte ABI word (or an exact 32-byte return).
@@ -90,7 +90,11 @@ cached_view_call!(CURVE_A, ICurvePool::ACall {});
 cached_view_call!(CURVE_FEE, ICurvePool::feeCall {});
 cached_view_call!(CURVE_STORED_RATES, ICurvePool::stored_ratesCall {});
 cached_view_call!(CURVE_GAMMA, ICurvePool::gammaCall {});
-cached_view_call!(CURVE_PRICE_SCALE, ICurvePool::price_scaleCall {});
+cached_view_call!(
+    CURVE_CRYPTO_PRICE_SCALE,
+    ICurveCryptoPool::price_scaleCall { i: U256::ZERO }
+);
+cached_view_call!(CURVE_CRYPTO_PRECISIONS, ICurveCryptoPool::precisionsCall {});
 cached_view_call!(
     BALANCER_SWAP_FEE,
     IBalancerPool::getSwapFeePercentageCall {}

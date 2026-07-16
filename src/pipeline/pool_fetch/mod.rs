@@ -400,14 +400,9 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
             if i > 0 {
                 tokio::time::sleep(pacing).await;
             }
-            updated += execute_plan_batch(
-                &provider,
-                &batch,
-                cache.as_ref(),
-                block_number,
-                chunk_size,
-            )
-            .await;
+            updated +=
+                execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size)
+                    .await;
         }
         return updated;
     }
@@ -452,11 +447,13 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     let needs_balancer_hydrate = pools
         .iter()
         .any(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified);
+    let hydrate_started = crate::util::now_ms();
     let balancer_ids = if needs_balancer_hydrate {
         hydrate_balancer_pool_ids(&provider, pools, block_number, meta_cache).await
     } else {
         rustc_hash::FxHashMap::default()
     };
+    let balancer_hydrate_ms = crate::util::now_ms().saturating_sub(hydrate_started);
 
     let mut woofi_pools: Vec<&DiscoveredPool> = Vec::with_capacity(pools.len());
     for pool in pools {
@@ -465,6 +462,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
         }
     }
 
+    let mut protocol_work = rustc_hash::FxHashMap::default();
     let mut plans = Vec::with_capacity(pools.len().saturating_sub(woofi_pools.len()));
     for pool in pools {
         if pool.protocol == ProtocolType::Woofi {
@@ -472,12 +470,23 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
         }
         let pool_id = balancer_pool_id(pool, &balancer_ids);
         if let Some(plan) = build_plan_with_pool_id(pool, pool_id) {
+            let entry = protocol_work
+                .entry(pool.protocol)
+                .or_insert((0usize, 0usize));
+            entry.0 += 1;
+            entry.1 += plan.calls.len();
             plans.push(plan);
         } else {
             cache.insert(pool.address, PoolState::Invalid);
         }
     }
 
+    let plan_count = plans.len();
+    let plan_calls = plans.iter().map(|plan| plan.calls.len()).sum::<usize>();
+    let expected_chunks = plans
+        .iter()
+        .map(|plan| plan.calls.len().div_ceil(chunk_size))
+        .sum::<usize>();
     let mut batches: Vec<Vec<PoolFetchPlan>> = Vec::new();
     if !plans.is_empty() {
         let mut batch: Vec<PoolFetchPlan> = Vec::with_capacity(plans.len());
@@ -497,24 +506,44 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
         }
     }
 
+    let plan_batches = batches.len();
     let provider_woofi = provider.clone();
-    let (woofi_updated, plan_updated) = tokio::join!(
-        apply_woofi_results(
-            &provider_woofi,
-            &woofi_pools,
-            block_number,
-            chunk_size,
-            cache.as_ref(),
-            meta_cache,
-        ),
-        run_plan_batches(
-            provider,
-            batches,
-            Arc::clone(&cache),
-            block_number,
-            chunk_size,
-            batch_pace_ms,
-        ),
+    let (woofi_result, plan_result) = tokio::join!(
+        async {
+            let started = crate::util::now_ms();
+            let updated = apply_woofi_results(
+                &provider_woofi,
+                &woofi_pools,
+                block_number,
+                chunk_size,
+                cache.as_ref(),
+                meta_cache,
+            )
+            .await;
+            (updated, crate::util::now_ms().saturating_sub(started))
+        },
+        async {
+            let started = crate::util::now_ms();
+            let updated = run_plan_batches(
+                provider,
+                batches,
+                Arc::clone(&cache),
+                block_number,
+                chunk_size,
+                batch_pace_ms,
+            )
+            .await;
+            (updated, crate::util::now_ms().saturating_sub(started))
+        },
+    );
+
+    let (woofi_updated, woofi_ms) = woofi_result;
+    let (plan_updated, plan_ms) = plan_result;
+    crate::debug!(
+        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_ms={plan_ms}",
+        pools.len(),
+        woofi_pools.len(),
+        needs_balancer_hydrate,
     );
 
     woofi_updated + plan_updated
@@ -580,19 +609,15 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
     }
 
     let item_count = items.len();
-    let results = execute_multicall_at_chunked(
-        provider.clone(),
-        Arc::from(items),
-        block_number,
-        chunk_size,
-    )
-    .await
-    .inspect_err(|e| {
-        crate::warn!(
-            "multicall batch failed ({item_count} items, {} pools): {e:#}",
-            plans.len()
-        );
-    })?;
+    let results =
+        execute_multicall_at_chunked(provider.clone(), Arc::from(items), block_number, chunk_size)
+            .await
+            .inspect_err(|e| {
+                crate::warn!(
+                    "multicall batch failed ({item_count} items, {} pools): {e:#}",
+                    plans.len()
+                );
+            })?;
 
     let mut updated = 0usize;
     for (plan, start, end) in spans {

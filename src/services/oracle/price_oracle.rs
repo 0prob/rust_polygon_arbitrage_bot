@@ -155,6 +155,109 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("9a4df90b25497f66b1afb012467e316e801ca3d839456db028892fe8c70c8016"),
     },
+    TokenFeed {
+        token: address!("0x03b54A0eF8042C0f6A77B15e637c9f5d7c6790D0"),
+        chainlink: None,
+        pyth_id: Some("6df640f3b8963d8f8358f791f352b8364513f6ab1cca5ed3f1f7b5448980e784"),
+    },
+    // Polygon-bridged wstETH (Aave/runtime demand); same WSTETH/USD Pyth feed.
+    TokenFeed {
+        token: address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD"),
+        chainlink: None,
+        pyth_id: Some("6df640f3b8963d8f8358f791f352b8364513f6ab1cca5ed3f1f7b5448980e784"),
+    },
+    TokenFeed {
+        token: address!("0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09"),
+        chainlink: None,
+        pyth_id: Some("735f591e4fed988cd38df74d8fcedecf2fe8d9111664e0fd500db9aa78b316b1"),
+    },
+    // Polygon-bridged / runtime-demand mints (oracle_feeds verify 2026-07).
+    TokenFeed {
+        token: address!("0x61fFE097137d543f019F5257E1a1Ff7A6C5F0b68"),
+        chainlink: None,
+        pyth_id: Some("78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501"),
+    },
+    TokenFeed {
+        token: address!("0x50B728D8D964fd00C2d0AAD81718b71311feF68a"),
+        chainlink: None,
+        pyth_id: Some("39d020f60982ed892abbcd4a06a276a9f9b7bfbce003204c110b6e488f502da3"),
+    },
+    TokenFeed {
+        token: address!("0xbbC11D55375F0B37f8A30b102C9ce143B097671e"),
+        chainlink: None,
+        pyth_id: Some("26e4f737fde0263a9eea10ae63ac36dcedab2aaf629261a994e1eeb6ee0afe53"),
+    },
+    TokenFeed {
+        token: address!("0x9c2C5fd7b07E95EE044DDeba0E97a665F142394f"),
+        chainlink: None,
+        pyth_id: Some("63f341689d98a12ef60a5cff1d7f85c70a9e17bf1575f0e7c0b2512d48b1c8b3"),
+    },
+    TokenFeed {
+        token: address!("0x1C954E8fe737F99f68Fa1CCda3e51ebDB291948C"),
+        chainlink: None,
+        pyth_id: Some("b9ccc817bfeded3926af791f09f76c5ffbc9b789cac6e9699ec333a79cacbe2a"),
+    },
+    TokenFeed {
+        token: address!("0x8505b9d2254A7Ae468c0E9dd10Ccea3A837aef5c"),
+        chainlink: None,
+        pyth_id: Some("4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478"),
+    },
+    TokenFeed {
+        token: address!("0x5fe2B58c013d7601147DcdD68C143A77499f5531"),
+        chainlink: None,
+        pyth_id: Some("4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7"),
+    },
+    TokenFeed {
+        token: address!("0x2C89bbc92BD86F8075d1DEcc58C7F4E0107f286b"),
+        chainlink: None,
+        pyth_id: Some("93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7"),
+    },
+    TokenFeed {
+        token: address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912"),
+        chainlink: None,
+        pyth_id: Some("ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"),
+    },
+    TokenFeed {
+        token: address!("0x553d3D295e0f695B9228246232eDF400ed3560B5"),
+        chainlink: None,
+        pyth_id: Some("273717b49430906f4b0c230e99aa1007f83758e3199edbc887c0d06c3e332494"),
+    },
+    // Batch 2 — oracle_feeds verify 2026-07-16 (target/oracle-proposed-batch2.txt).
+    TokenFeed {
+        token: address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"),
+        chainlink: None,
+        pyth_id: Some("83aac6fae150e8850204ef5dce696c05ae2efa335a41c7e5c112bc73e5cbae35"),
+    },
+    TokenFeed {
+        token: address!("0x6f8a06447Ff6FcF75d803135a7de15CE88C1d4ec"),
+        chainlink: None,
+        pyth_id: Some("f0d57deca57b3da2fe63a493f4c25925fdfd8edf834b20f93e1f84dbd1504d4a"),
+    },
+    TokenFeed {
+        token: address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
+        chainlink: None,
+        pyth_id: Some("5a5d5f7fb72cc84b579d74d1c06d258d751962e9a010c0b1cce7e6023aacb71b"),
+    },
+    TokenFeed {
+        token: address!("0xE5417Af564e4bFDA1c483642db72007871397896"),
+        chainlink: None,
+        pyth_id: Some("5a5d5f7fb72cc84b579d74d1c06d258d751962e9a010c0b1cce7e6023aacb71b"),
+    },
+    TokenFeed {
+        token: address!("0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683"),
+        chainlink: None,
+        pyth_id: Some("cb7a1d45139117f8d3da0a4b67264579aa905e3b124efede272634f094e1e9d1"),
+    },
+    TokenFeed {
+        token: address!("0x61299774020dA444Af134c82fa83E3810b309991"),
+        chainlink: None,
+        pyth_id: Some("3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d"),
+    },
+    TokenFeed {
+        token: address!("0xD14E0cd48CF32007D0F0b294Ee3d0b1530D8b04F"),
+        chainlink: None,
+        pyth_id: Some("07ad7b4a7662d19a6bc675f6b467172d2f3947fa653ca97555a9b20236406628"),
+    },
 ];
 
 #[derive(Clone)]
@@ -225,7 +328,7 @@ impl PriceOracle {
         Some(usd)
     }
 
-    fn cache_token_usd(&self, token: Address, usd: f64, chainlink_raw: I256, now: Instant) {
+    pub(crate) fn cache_token_usd(&self, token: Address, usd: f64, chainlink_raw: I256, now: Instant) {
         if !(usd > 0.0) {
             return;
         }
@@ -457,8 +560,7 @@ impl PriceOracle {
             let Some(bytes) = bytes else {
                 continue;
             };
-            let Ok(data) =
-                IChainlinkAggregator::latestRoundDataCall::abi_decode_returns(&bytes)
+            let Ok(data) = IChainlinkAggregator::latestRoundDataCall::abi_decode_returns(&bytes)
             else {
                 continue;
             };
@@ -492,8 +594,7 @@ impl PriceOracle {
                 if cache.get(token).is_some_and(|entry| self.fresh(entry)) {
                     continue;
                 }
-                let has_cl =
-                    chainlink_feed(token).is_some() || custom_cl.contains_key(token);
+                let has_cl = chainlink_feed(token).is_some() || custom_cl.contains_key(token);
                 let has_py = pyth_feed(token).is_some() || custom_py.contains_key(token);
                 if has_cl || has_py {
                     need.push(*token);
@@ -637,10 +738,7 @@ impl PriceOracle {
     }
 
     /// One lock for batch rate builds (LF/HF snapshot enrich).
-    pub(crate) fn integer_matic_rates_batch(
-        &self,
-        addrs: &[Address],
-    ) -> FxHashMap<Address, U256> {
+    pub(crate) fn integer_matic_rates_batch(&self, addrs: &[Address]) -> FxHashMap<Address, U256> {
         if !self.usd_quote_fresh_for_token(&WMATIC) {
             return FxHashMap::default();
         }
@@ -769,6 +867,18 @@ fn chainlink_latest_round_usd(
     Some((usd, answer))
 }
 
+/// Built-in Chainlink aggregator for a Polygon token, if any.
+#[must_use]
+pub fn builtin_chainlink_feed(token: &Address) -> Option<Address> {
+    chainlink_feed(token)
+}
+
+/// Built-in Pyth price feed id (hex, no `0x` prefix), if any.
+#[must_use]
+pub fn builtin_pyth_feed_id(token: &Address) -> Option<&'static str> {
+    pyth_feed(token)
+}
+
 #[inline]
 fn chainlink_feed(token: &Address) -> Option<Address> {
     TOKEN_FEEDS
@@ -783,6 +893,21 @@ fn pyth_feed(token: &Address) -> Option<&'static str> {
         .iter()
         .find(|entry| entry.token == *token)
         .and_then(|entry| entry.pyth_id)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OracleFeedSources {
+    pub builtin_pyth: bool,
+    pub builtin_chainlink: bool,
+    pub custom_pyth: bool,
+    pub custom_chainlink: bool,
+}
+
+impl OracleFeedSources {
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.builtin_pyth || self.builtin_chainlink || self.custom_pyth || self.custom_chainlink
+    }
 }
 
 impl PriceOracle {
@@ -803,6 +928,22 @@ impl PriceOracle {
     #[inline]
     fn has_chainlink_feed(&self, token: &Address) -> bool {
         chainlink_feed(token).is_some() || self.custom_chainlink.read().contains_key(token)
+    }
+
+    /// Static + config oracle mappings (no network fetch).
+    #[must_use]
+    pub fn feed_sources(&self, token: &Address) -> OracleFeedSources {
+        OracleFeedSources {
+            builtin_pyth: pyth_feed(token).is_some(),
+            builtin_chainlink: chainlink_feed(token).is_some(),
+            custom_pyth: self.custom_pyth.read().contains_key(token),
+            custom_chainlink: self.custom_chainlink.read().contains_key(token),
+        }
+    }
+
+    #[must_use]
+    pub fn has_configured_feed(&self, token: &Address) -> bool {
+        self.feed_sources(token).any()
     }
 }
 
@@ -963,6 +1104,19 @@ pub fn bootstrap_matic_rate_per_unit() -> U256 {
 }
 
 #[cfg(test)]
+impl PriceOracle {
+    pub(crate) fn seed_float_usd_for_test(&self, token: Address, usd: f64) {
+        self.token_usd.write().insert(
+            token,
+            PriceEntry {
+                value: usd,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::address;
@@ -974,12 +1128,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let answer = I256::from(U256::from(100_000_000u64));
-        assert!(chainlink_round_trusted(
-            1,
-            answer,
-            U256::from(now),
-            1
-        ));
+        assert!(chainlink_round_trusted(1, answer, U256::from(now), 1));
         assert!(!chainlink_round_trusted(
             1,
             answer,
@@ -997,11 +1146,7 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         assert!(pyth_quote_trusted(1_000_000, Some(5_000), Some(now)));
-        assert!(!pyth_quote_trusted(
-            1_000_000,
-            Some(20_000),
-            Some(now)
-        ));
+        assert!(!pyth_quote_trusted(1_000_000, Some(20_000), Some(now)));
         assert!(!pyth_quote_trusted(
             1_000_000,
             Some(5_000),
@@ -1131,6 +1276,16 @@ mod tests {
     }
 
     #[test]
+    fn oracle_feeds_include_polygon_wsteth_and_frax() {
+        let wsteth = address!("0x03b54A0eF8042C0f6A77B15e637c9f5d7c6790D0");
+        let bridged_wsteth = address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD");
+        let frax = address!("0x45c32fA6DF82ead1e2EF74d32b0366496F5fDe09");
+        assert!(pyth_feed(&wsteth).is_some());
+        assert!(pyth_feed(&bridged_wsteth).is_some());
+        assert!(pyth_feed(&frax).is_some());
+    }
+
+    #[test]
     fn oracle_feeds_include_polygon_wbtc() {
         // Given: Polygon's canonical WBTC token address.
         let wbtc = address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6");
@@ -1161,6 +1316,55 @@ mod tests {
             chainlink_feed(&wbtc),
             Some(address!("0xDE31F8bFBD8c84b5360CFACCa3539B938dd78ae6"))
         );
+    }
+
+    #[test]
+    fn oracle_feeds_include_batch1_and_batch2_polygon_mints() {
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            DEFAULT_CACHE_TTL_MS,
+        );
+        let tokens = [
+            (
+                address!("0x61fFE097137d543f019F5257E1a1Ff7A6C5F0b68"),
+                "UNI",
+            ),
+            (
+                address!("0x50B728D8D964fd00C2d0AAD81718b71311feF68a"),
+                "SNX",
+            ),
+            (
+                address!("0xA571963278014B5B3A686778747fDf8ad4dFBb94"),
+                "SD",
+            ),
+            (
+                address!("0x6f8a06447Ff6FcF75d803135a7de15CE88C1d4ec"),
+                "SHIB",
+            ),
+            (
+                address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
+                "GNS",
+            ),
+            (
+                address!("0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683"),
+                "SAND",
+            ),
+            (
+                address!("0x61299774020dA444Af134c82fa83E3810b309991"),
+                "RNDR",
+            ),
+        ];
+        for (token, label) in tokens {
+            assert!(
+                builtin_pyth_feed_id(&token).is_some(),
+                "{label} missing builtin Pyth feed id"
+            );
+            assert!(
+                oracle.has_configured_feed(&token),
+                "{label} missing configured oracle feed"
+            );
+        }
     }
 
     #[test]

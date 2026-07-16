@@ -50,7 +50,9 @@ struct SkipCounters {
     flash: u32,
     flash_source: u32,
     missing_decimals: u32,
-    minimal_sim: u32,
+    minimal_no_sim: u32,
+    minimal_zero_profit: u32,
+    minimal_sanity: u32,
     net: u32,
     executor_budget: u32,
 }
@@ -61,13 +63,36 @@ impl SkipCounters {
         self.flash += other.flash;
         self.flash_source += other.flash_source;
         self.missing_decimals += other.missing_decimals;
-        self.minimal_sim += other.minimal_sim;
+        self.minimal_no_sim += other.minimal_no_sim;
+        self.minimal_zero_profit += other.minimal_zero_profit;
+        self.minimal_sanity += other.minimal_sanity;
         self.net += other.net;
         self.executor_budget += other.executor_budget;
     }
 
     fn probe(&self) -> u32 {
-        self.missing_decimals + self.minimal_sim
+        self.missing_decimals + self.minimal_sim()
+    }
+
+    fn minimal_sim(&self) -> u32 {
+        self.minimal_no_sim + self.minimal_zero_profit + self.minimal_sanity
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MinimalProbeReject {
+    NoSimulation,
+    ZeroProfit,
+    SanityReject,
+}
+
+impl MinimalProbeReject {
+    fn record(self, skip: &mut SkipCounters) {
+        match self {
+            Self::NoSimulation => skip.minimal_no_sim += 1,
+            Self::ZeroProfit => skip.minimal_zero_profit += 1,
+            Self::SanityReject => skip.minimal_sanity += 1,
+        }
     }
 }
 
@@ -187,7 +212,7 @@ fn try_rank_probe_minimal(
     cycle: &FoundCycle,
     start_decimals: u8,
     rate: U256,
-) -> Option<(U256, MinimalSimResult)> {
+) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
     minimal_rank_probe(arena, cycle, start_decimals, rate, true)
 }
 
@@ -198,15 +223,19 @@ fn minimal_rank_probe(
     start_decimals: u8,
     rate: U256,
     rank_amount_as_search_low: bool,
-) -> Option<(U256, MinimalSimResult)> {
+) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
     let mut best: Option<(U256, MinimalSimResult)> = None;
+    let mut saw_simulation = false;
+    let mut saw_profit = false;
     for_each_rank_probe_amount(start_decimals, rate, |amount| {
         let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
             return;
         };
+        saw_simulation = true;
         if sim.profit.is_zero() {
             return;
         }
+        saw_profit = true;
         let search_low = if rank_amount_as_search_low {
             amount
         } else {
@@ -227,7 +256,15 @@ fn minimal_rank_probe(
             best = Some((amount, sim));
         }
     });
-    best
+    best.ok_or_else(|| {
+        if !saw_simulation {
+            MinimalProbeReject::NoSimulation
+        } else if !saw_profit {
+            MinimalProbeReject::ZeroProfit
+        } else {
+            MinimalProbeReject::SanityReject
+        }
+    })
 }
 
 /// Routes that cannot minimal-sim at probe or spot size waste Brent work.
@@ -245,7 +282,7 @@ fn cycle_simulatable(
     }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-    minimal_rank_probe(arena, cycle, decimals, rate, false).is_some()
+    minimal_rank_probe(arena, cycle, decimals, rate, false).is_ok()
 }
 
 fn cycle_flash_evaluable(
@@ -285,7 +322,8 @@ fn simulatable_score_fallback(
         .iter()
         .take(fallback_limit)
         .filter_map(|cycle| {
-            let ready = prefer_aave_flash_start(cycle, arena, &flash, flash_ttl);
+            let ready =
+                prefer_aave_flash_start(cycle, arena, &flash, flash_ttl, token_to_matic_rates);
             if cycle_simulatable(arena, &ready, token_decimals, token_to_matic_rates)
                 && cycle_flash_evaluable(
                     &ready,
@@ -353,7 +391,7 @@ fn rank_one_cycle_probe(
     profit_priority_alpha_bps: u64,
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
-    let cycle = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl);
+    let cycle = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
     let fp = hash_cycle_edges(&cycle.edges);
     if !route_fits_executor(&cycle.edges) {
         out.skip.executor_budget = 1;
@@ -384,14 +422,16 @@ fn rank_one_cycle_probe(
     };
     let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-    let Some((probe_amount, probe)) = try_rank_probe_minimal(arena, &cycle, start_decimals, rate)
-    else {
-        if cycle.score < 0.0 {
-            out.rescue.push((fp, cycle.into_owned()));
-        } else {
-            out.skip.minimal_sim = 1;
+    let (probe_amount, probe) = match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
+        Ok(probe) => probe,
+        Err(reject) => {
+            if cycle.score < 0.0 {
+                out.rescue.push((fp, cycle.into_owned()));
+            } else {
+                reject.record(&mut out.skip);
+            }
+            return out;
         }
-        return out;
     };
     let Some(flash_source) =
         resolve_flash_source_with_context(&flash_ctx, flash_policy, probe_amount)
@@ -446,7 +486,7 @@ fn rank_one_cycle_probe(
             );
         } else {
             crate::trace!(
-                "probe net=0 (gas eats profit): fp={fp:#x} hops={hop_count} sim_profit={} probe_amt={probe_amount} gas={} gas_cost_in_token={} rate={rate} dec={start_decimals}",
+                "probe net=0 (gas eats profit): fp={fp:#x} hops={hop_count} sim_profit={} probe_amt={probe_amount} gas={} gas_price_wei={} rate={rate} dec={start_decimals}",
                 probe.profit,
                 ranked_probe.total_gas,
                 ctx.gas_price,
@@ -609,13 +649,16 @@ pub fn rank_cycles_by_probe_net(
         }
         if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={near_net_count} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
                 skip.probe(),
                 skip.missing_decimals,
-                skip.minimal_sim,
+                skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
                 skip.net,
             );
         }
@@ -625,19 +668,22 @@ pub fn rank_cycles_by_probe_net(
     if kept.is_empty() && !scanned.is_empty() {
         let sample = flash_diag.as_deref().unwrap_or("none");
         crate::debug!(
-            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} rescue={rescue_len} sample={sample}",
+            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} rescue={rescue_len} sample={sample}",
             scanned.len(),
             skip.rate,
             skip.flash,
             skip.flash_source,
             skip.probe(),
             skip.missing_decimals,
-            skip.minimal_sim,
+            skip.minimal_sim(),
+            skip.minimal_no_sim,
+            skip.minimal_zero_profit,
+            skip.minimal_sanity,
             skip.net,
         );
     } else if kept.len() * 4 < scanned.len() {
         crate::info!(
-            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={}) skip_net={} near_net={}",
+            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} near_net={}",
             kept.len(),
             scanned.len(),
             skip.rate,
@@ -646,7 +692,10 @@ pub fn rank_cycles_by_probe_net(
             skip.flash_source,
             skip.probe(),
             skip.missing_decimals,
-            skip.minimal_sim,
+            skip.minimal_sim(),
+            skip.minimal_no_sim,
+            skip.minimal_zero_profit,
+            skip.minimal_sanity,
             skip.net,
             near_net_count,
         );
@@ -825,14 +874,13 @@ fn probe_fallback_amounts(
         }
         // Skip spot probe if it exceeds the flash loan cap for this token.
         if candidate == spot
-            && let Some(cap) =
-                max_flash_borrow_wei(
-                    input.max_flash_loan_usd,
-                    dec,
-                    rate,
-                    input.matic_usd,
-                    input.matic_usd_chainlink,
-                )
+            && let Some(cap) = max_flash_borrow_wei(
+                input.max_flash_loan_usd,
+                dec,
+                rate,
+                input.matic_usd,
+                input.matic_usd_chainlink,
+            )
             && spot > cap
         {
             continue;
@@ -867,11 +915,8 @@ fn probe_fallback_opt(
             pzp += 1;
             continue;
         }
-        if !local_sim::route_hop_fidelity_ok_after_walk(
-            input.arena,
-            &cycle.edges,
-            &sim.hop_amounts,
-        ) {
+        if !local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts)
+        {
             pf += 1;
             continue;
         }
@@ -886,7 +931,15 @@ fn probe_fallback_opt(
             token_to_matic_rate: rate,
         }) {
             crate::debug!(
-                "probe fallback sanity reject: fp={_fp:#x} amount={amount} profit={} rate={rate} dec={decimals} reason={reason:?}",
+                "probe fallback sanity reject: fp={_fp:#x} start_token={} hops={} pool_addrs={:?} edges={:?} amount={amount} profit={} rate={rate} dec={decimals} reason={reason:?}",
+                cycle.start_token.0,
+                cycle.hop_count,
+                cycle
+                    .edges
+                    .iter()
+                    .filter_map(|edge| input.arena.pool_address(edge.pool_index))
+                    .collect::<Vec<_>>(),
+                cycle.edges,
                 sim.profit,
             );
             ps += 1;
@@ -925,6 +978,7 @@ fn evaluate_one(
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
     let fp = hash_cycle_edges(&cycle.edges);
+    let route_state_revision = input.arena.route_state_revision(&cycle.edges);
     if !route_fits_executor(&cycle.edges) {
         inc(&stats.executor_budget);
         return None;
@@ -955,11 +1009,9 @@ fn evaluate_one(
         inc(&stats.flash_source);
         return None;
     };
-    let Some(flash_source_brent) = resolve_flash_source_with_context(
-        &flash_ctx,
-        input.flash_policy,
-        brent_probe_amount,
-    ) else {
+    let Some(flash_source_brent) =
+        resolve_flash_source_with_context(&flash_ctx, input.flash_policy, brent_probe_amount)
+    else {
         inc(&stats.flash_source);
         return None;
     };
@@ -1003,11 +1055,8 @@ fn evaluate_one(
         &profit_ctx,
         probe_seed.as_ref().map(std::slice::from_ref),
         Some(route_gas_costing),
-        Some((
-            input.execution.route_sim_cache.as_ref(),
-            input.state_generation,
-            fp,
-        )),
+        route_state_revision
+            .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
     ) {
         Some(opt) => {
             let Some(sim) = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)
@@ -1044,11 +1093,9 @@ fn evaluate_one(
         }
     };
 
-    let Some(flash_source) = resolve_flash_source_with_context(
-        &flash_ctx,
-        input.flash_policy,
-        opt.optimal_input,
-    ) else {
+    let Some(flash_source) =
+        resolve_flash_source_with_context(&flash_ctx, input.flash_policy, opt.optimal_input)
+    else {
         inc(&stats.flash_source);
         return None;
     };
@@ -1095,11 +1142,8 @@ fn evaluate_one(
                 &depth_ctx,
                 None,
                 Some(route_gas_costing),
-                Some((
-                    input.execution.route_sim_cache.as_ref(),
-                    input.state_generation,
-                    fp,
-                )),
+                route_state_revision
+                    .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
             ) {
                 opt = reopt;
                 sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
@@ -1221,11 +1265,7 @@ fn validate_optimized_sim(
     .is_none_or(|cap| sim.amount_in <= cap);
 
     sim.amount_in == optimal_input
-        && local_sim::route_hop_fidelity_ok_after_walk(
-            input.arena,
-            &cycle.edges,
-            &sim.hop_amounts,
-        )
+        && local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts)
         && !sim.profit.is_zero()
         && within_flash_cap
         && check_sim_sanity_for_dispatch(SimSanityInput {
@@ -1297,13 +1337,26 @@ mod tests {
         let mut aggregate = SkipCounters::default();
         aggregate.merge(SkipCounters {
             missing_decimals: 2,
-            minimal_sim: 3,
+            minimal_no_sim: 3,
             ..SkipCounters::default()
         });
 
         assert_eq!(aggregate.missing_decimals, 2);
-        assert_eq!(aggregate.minimal_sim, 3);
+        assert_eq!(aggregate.minimal_sim(), 3);
         assert_eq!(aggregate.probe(), 5);
+    }
+
+    #[test]
+    fn minimal_probe_rejects_preserve_their_reason() {
+        let mut skip = SkipCounters::default();
+        MinimalProbeReject::NoSimulation.record(&mut skip);
+        MinimalProbeReject::ZeroProfit.record(&mut skip);
+        MinimalProbeReject::SanityReject.record(&mut skip);
+
+        assert_eq!(skip.minimal_no_sim, 1);
+        assert_eq!(skip.minimal_zero_profit, 1);
+        assert_eq!(skip.minimal_sanity, 1);
+        assert_eq!(skip.minimal_sim(), 3);
     }
 
     #[test]

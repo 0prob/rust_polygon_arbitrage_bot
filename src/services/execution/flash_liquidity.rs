@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use crate::abis::{IAaveV3Pool, IERC20Metadata};
-use crate::core::constants::{AAVE_V3_POOL, BALANCER_VAULT};
+use crate::core::constants::{AAVE_V3_POOL, BALANCER_VAULT, is_polygon_hub_token};
 use crate::core::types::{
     EvaluatedRoute, FlashLoanSource, FoundCycle, PoolState, ProfitAssessment, ProtocolType,
     TokenIndex,
@@ -38,7 +38,9 @@ use crate::services::execution::profit::{
     route_profit_thresholds,
 };
 use crate::services::execution::rpc_errors::is_rpc_rate_limited;
-use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
+use crate::services::oracle::{
+    has_reliable_matic_rate, resolve_token_decimals_for_index, resolve_token_to_matic_rate,
+};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
@@ -130,7 +132,7 @@ impl FlashLoanDiagnostics {
         if rejects == 0 && self.refresh_tokens == 0 {
             return;
         }
-        crate::info!(
+        crate::debug!(
             "flash loan: {label} mixed_no_aave={} cold={} zero_liq={} aave_unlisted={} zero_amt={} align={} refresh_tokens={} gen={}",
             self.mixed_no_aave,
             self.reject_cold_cache,
@@ -543,9 +545,7 @@ impl FlashLiquidityCache {
                     .and_then(|bytes| {
                         IAaveV3Pool::getReserveDataCall::abi_decode_returns(bytes).ok()
                     });
-                let has_a_token = decoded
-                    .as_ref()
-                    .is_some_and(|r| !r.aTokenAddress.is_zero());
+                let has_a_token = decoded.as_ref().is_some_and(|r| !r.aTokenAddress.is_zero());
                 let status = decoded
                     .as_ref()
                     .map(|r| reserve_status_from_config(r.configuration, has_a_token))
@@ -607,9 +607,7 @@ impl FlashLiquidityCache {
         let n = to_fetch.len();
         let generation = self.generation();
         self.publish_updates(updates);
-        crate::info!(
-            "flash liquidity refresh: tokens={n} generation={generation}",
-        );
+        crate::info!("flash liquidity refresh: tokens={n} generation={generation}",);
         aave_stats.log_refresh_summary(n, self.generation());
         Ok(())
     }
@@ -653,6 +651,21 @@ pub fn cycle_has_dodo_pool(arena: &StateArena, cycle: &FoundCycle) -> bool {
         .edges
         .iter()
         .any(|edge| matches!(arena.pool_state(edge.pool_index), Some(PoolState::Dodo(_))))
+}
+
+/// Return a DODO pool that can lend the cycle start token through the executor's
+/// base-asset-only flash entrypoint.
+#[must_use]
+pub fn dodo_base_flash_pool_for_cycle(arena: &StateArena, cycle: &FoundCycle) -> Option<Address> {
+    let start_token = arena.token_address(cycle.start_token)?;
+    cycle.edges.iter().find_map(|edge| {
+        let PoolState::Dodo(state) = arena.pool_state(edge.pool_index)? else {
+            return None;
+        };
+        (state.base_token == start_token)
+            .then(|| arena.pool_address(edge.pool_index))
+            .flatten()
+    })
 }
 
 /// Map eval-time flash plans onto sources the executor can actually dispatch.
@@ -718,6 +731,38 @@ pub fn rotate_cycle_to_start(cycle: &FoundCycle, new_start: TokenIndex) -> Optio
     }
 }
 
+/// Non-zero flash liquidity on at least one provider (Aave listed + balance, Balancer vault, or DODO).
+#[must_use]
+pub fn token_flash_liquidity_borrowable(liquidity: &TokenFlashLiquidity) -> bool {
+    !liquidity.balancer.is_zero()
+        || !liquidity.dodo.is_zero()
+        || (liquidity.aave_listed && !liquidity.aave.is_zero())
+}
+
+/// Fresh cache shows the token cannot fund any flash borrow size.
+#[must_use]
+pub fn token_flash_borrow_proven_unviable(
+    token: Address,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
+) -> bool {
+    flash.has_fresh(token, ttl)
+        && !token_flash_liquidity_borrowable(&flash.token_liquidity(token, ttl))
+}
+
+/// Graph/cycle gates: borrow may exist, or hub allowlist while flash cache is still cold.
+#[must_use]
+pub fn token_eligible_for_flash_borrow_graph(
+    token: Address,
+    flash: &FlashLiquiditySnapshot,
+    ttl: Duration,
+) -> bool {
+    if flash.has_fresh(token, ttl) {
+        return token_flash_liquidity_borrowable(&flash.token_liquidity(token, ttl));
+    }
+    is_polygon_hub_token(token)
+}
+
 /// True when any hop token is listed on Aave V3 (flash borrow candidate).
 pub fn cycle_has_aave_listed_token(
     cycle: &FoundCycle,
@@ -762,8 +807,8 @@ fn cycle_flash_tokens_all_fresh(
     checked > 0
 }
 
-/// Mixed Balancer routes need an Aave-listed token for flash borrow. Pure Balancer routes
-/// use `executeArbDirect` + `batchSwap` and do not require Aave liquidity.
+/// Mixed Balancer routes need Aave liquidity or a DODO pool that lends the cycle's
+/// start token as base. Pure Balancer routes use `executeArbDirect` + `batchSwap`.
 pub fn balancer_route_flash_feasible(
     cycle: &FoundCycle,
     arena: &StateArena,
@@ -781,6 +826,7 @@ pub fn balancer_route_flash_feasible(
         return true;
     }
     cycle_has_aave_listed_token(cycle, arena, flash, ttl)
+        || dodo_base_flash_pool_for_cycle(arena, cycle).is_some()
 }
 /// Mixed Balancer routes forbid Balancer flash loans (`BalancerVaultReentrancy`). Prefer an Aave-listed token
 /// already present in the cycle as the flash borrow asset.
@@ -789,8 +835,9 @@ pub fn prefer_aave_flash_start<'a>(
     arena: &StateArena,
     flash: &FlashLiquiditySnapshot,
     ttl: Duration,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) -> Cow<'a, FoundCycle> {
-    if !route_uses_balancer_vault_swap(cycle) {
+    if !route_uses_balancer_vault_swap(cycle) || route_is_balancer_only(cycle) {
         return Cow::Borrowed(cycle);
     }
 
@@ -811,7 +858,10 @@ pub fn prefer_aave_flash_start<'a>(
     let snapshots = flash.tokens_liquidity(&token_addrs, ttl);
     let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
     for (liq, token) in snapshots.into_iter().zip(token_indices) {
-        if liq.aave_listed && !liq.aave.is_zero() {
+        if liq.aave_listed
+            && !liq.aave.is_zero()
+            && has_reliable_matic_rate(token, token_to_matic_rates)
+        {
             candidates.push((liq.aave, token));
         }
     }
@@ -854,7 +904,10 @@ pub fn plan_flash_loan(
                 cap: amount_in,
             };
         }
-        if !liquidity.aave_listed {
+        if !liquidity.aave_listed || liquidity.aave.is_zero() {
+            if !liquidity.dodo.is_zero() {
+                return plan_single(FlashLoanSource::Dodo, amount_in, liquidity.dodo, false);
+            }
             return FlashPlan {
                 source: FlashLoanSource::AaveV3,
                 action: FlashPlanAction::Reject,
@@ -975,7 +1028,7 @@ pub fn build_cycle_flash_context(
     let start_addr = arena.token_address(cycle.start_token)?;
     let snapshot = flash.token_liquidity(start_addr, ttl);
     let route_cap = route_balancer_flash_capacity(arena, cycle);
-    let has_dodo = cycle_has_dodo_pool(arena, cycle);
+    let has_dodo = dodo_base_flash_pool_for_cycle(arena, cycle).is_some();
     Some(CycleFlashContext {
         liquidity: TokenFlashLiquidity {
             balancer: effective_balancer_liquidity(snapshot.balancer, route_cap),
@@ -1187,7 +1240,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
         .token_address(input.evaluated.cycle.start_token)?;
     let amount_in = input.evaluated.result.amount_in;
     let route_cap = route_balancer_flash_capacity(input.arena, &input.evaluated.cycle);
-    let has_dodo = cycle_has_dodo_pool(input.arena, &input.evaluated.cycle);
+    let has_dodo = dodo_base_flash_pool_for_cycle(input.arena, &input.evaluated.cycle).is_some();
     let liquidity = TokenFlashLiquidity {
         balancer: effective_balancer_liquidity(input.liquidity.balancer, route_cap),
         aave: input.liquidity.aave,
@@ -1196,7 +1249,13 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
     };
     let forbid_balancer_flash = route_uses_balancer_vault_swap(&input.evaluated.cycle);
     let balancer_only = route_is_balancer_only(&input.evaluated.cycle);
-    let plan = plan_flash_loan(input.policy, amount_in, liquidity, forbid_balancer_flash, balancer_only);
+    let plan = plan_flash_loan(
+        input.policy,
+        amount_in,
+        liquidity,
+        forbid_balancer_flash,
+        balancer_only,
+    );
 
     let token_decimals = resolve_token_decimals_for_index(
         input.evaluated.cycle.start_token,
@@ -1514,6 +1573,65 @@ pub fn collect_flash_tokens_for_cycle(
 mod tests {
     use super::*;
 
+    fn dodo_cycle(
+        start_token: TokenIndex,
+        pool_index: crate::core::types::PoolIndex,
+    ) -> FoundCycle {
+        FoundCycle {
+            start_token,
+            edges: smallvec::smallvec![crate::core::types::Edge {
+                pool_index,
+                token_in: start_token,
+                token_out: start_token,
+                token_in_idx: 0,
+                token_out_idx: 0,
+                protocol: ProtocolType::Dodo,
+                fee_bps: 0,
+                zero_for_one: true,
+            }],
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        }
+    }
+
+    #[test]
+    fn dodo_flash_pool_requires_cycle_start_as_base() {
+        let base = Address::repeat_byte(0x01);
+        let quote = Address::repeat_byte(0x02);
+        let pool_address = Address::repeat_byte(0x03);
+        let mut arena = StateArena::default();
+        let base_index = arena.register_token(base);
+        let quote_index = arena.register_token(quote);
+        let pool_index = arena.register_pool(
+            pool_address,
+            Arc::new(PoolState::Dodo(crate::core::types::DodoPoolState {
+                base_reserve: U256::from(1_000u64),
+                quote_reserve: U256::from(1_000u64),
+                base_token: base,
+                quote_token: quote,
+                base_target: U256::from(1_000u64),
+                quote_target: U256::from(1_000u64),
+                r_state: crate::core::types::DodoRState::One,
+                i: U256::from(1u64),
+                k: U256::from(1u64),
+                lp_fee_rate: U256::ZERO,
+                mt_fee_rate: U256::ZERO,
+            })),
+        );
+
+        assert_eq!(
+            dodo_base_flash_pool_for_cycle(&arena, &dodo_cycle(base_index, pool_index)),
+            Some(pool_address)
+        );
+        assert_eq!(
+            dodo_base_flash_pool_for_cycle(&arena, &dodo_cycle(quote_index, pool_index)),
+            None
+        );
+    }
+
     #[test]
     fn align_dispatch_rejects_aave_when_unlisted_on_mixed_route() {
         let liquidity = TokenFlashLiquidity {
@@ -1546,6 +1664,25 @@ mod tests {
         assert_eq!(plan.source, FlashLoanSource::AaveV3);
         assert_eq!(plan.action, FlashPlanAction::CapAndReoptimize);
         assert_eq!(plan.cap, U256::from(400u64));
+    }
+
+    #[test]
+    fn mixed_balancer_route_uses_compatible_dodo_fallback_without_aave() {
+        let plan = plan_flash_loan(
+            FlashLoanPolicy::Auto,
+            U256::from(1_000u64),
+            TokenFlashLiquidity {
+                balancer: U256::from(10_000u64),
+                aave: U256::ZERO,
+                aave_listed: false,
+                dodo: U256::from(2_000u64),
+            },
+            true,
+            false,
+        );
+
+        assert_eq!(plan.source, FlashLoanSource::Dodo);
+        assert_eq!(plan.action, FlashPlanAction::Direct);
     }
 
     #[test]
@@ -1620,8 +1757,6 @@ mod tests {
             U256::from(10_000u64)
         );
     }
-
-
 
     #[test]
     fn flash_source_at_economic_probe_differs_from_unit_probe() {

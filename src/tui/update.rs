@@ -724,7 +724,9 @@ pub async fn build_portfolio_rows(
                 else {
                     continue;
                 };
-                let unit_usd = oracle.token_usd_fresh(token).or_else(|| oracle.token_usd(token));
+                let unit_usd = oracle
+                    .token_usd_fresh(token)
+                    .or_else(|| oracle.token_usd(token));
                 let balance_units = u256_to_f64(balance) / u256_to_f64(ten_pow_u256(decimals));
                 let usd = unit_usd.map(|price| price * balance_units);
                 rows.push(PortfolioRow {

@@ -16,7 +16,7 @@ use crate::infra::hypersync::HyperSyncService;
 use crate::infra::pg::PgClient;
 use crate::infra::rpc::RpcPool;
 use crate::infra::wss_feed::spawn_pool_log_feed;
-use crate::orchestrator::hf::{HfContext, run_hf_tick};
+use crate::orchestrator::hf::{HfContext, InactiveCycleRotation, run_hf_tick};
 use crate::orchestrator::lf::{LfContext, spawn_lf_background};
 use crate::orchestrator::ui_hook::SharedUiHook;
 #[cfg(feature = "tui")]
@@ -153,6 +153,7 @@ impl RuntimeContext {
             arena: Arc::clone(&self.arena),
             tick_lock: Arc::clone(&self.lf_tick_lock),
             ui_hook: Arc::clone(&self.ui_hook),
+            flash_liquidity: Arc::clone(&self.execution.flash_liquidity),
         }
     }
 
@@ -172,6 +173,7 @@ impl RuntimeContext {
             hypersync: self.hypersync.clone(),
             shutdown,
             ui_hook: Arc::clone(&self.ui_hook),
+            inactive_rotation: parking_lot::Mutex::new(InactiveCycleRotation::default()),
         }
     }
 }

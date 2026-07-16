@@ -20,7 +20,8 @@ const ETH_CALL_SIM_SCALE_BPS: u64 = 20_000;
 
 #[must_use]
 fn eth_call_gas_limit(simulated_gas: u32) -> u64 {
-    let scaled = u128::from(simulated_gas).saturating_mul(u128::from(ETH_CALL_SIM_SCALE_BPS)) / 10_000;
+    let scaled =
+        u128::from(simulated_gas).saturating_mul(u128::from(ETH_CALL_SIM_SCALE_BPS)) / 10_000;
     let gas = u64::try_from(scaled).unwrap_or(MAX_ETH_CALL_GAS);
     gas.clamp(MIN_ETH_CALL_GAS, MAX_ETH_CALL_GAS)
         .max(u64::from(simulated_gas))
@@ -263,10 +264,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
         Err(raw) if is_gas_limit_rpc_error(&raw) => gas_overflow_dry_run_failure(),
         Err(raw) => {
             let decoded = try_decode_revert(&raw);
-            let reason = decoded
-                .as_ref()
-                .map(|r| r.to_string())
-                .unwrap_or(raw);
+            let reason = decoded.as_ref().map(|r| r.to_string()).unwrap_or(raw);
             DryRunResult {
                 semantic_success: false,
                 success: false,

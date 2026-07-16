@@ -39,11 +39,7 @@ pub fn spot_probe_for_token(arena: &StateArena, token: TokenIndex) -> U256 {
 }
 
 /// Economic floor then decimal-aware spot probe (deduped) for route ranking / TUI sim.
-pub fn for_each_rank_probe_amount(
-    decimals: u8,
-    rate: U256,
-    mut visit: impl FnMut(U256),
-) {
+pub fn for_each_rank_probe_amount(decimals: u8, rate: U256, mut visit: impl FnMut(U256)) {
     let economic = min_economic_amount_in(decimals, rate);
     if !economic.is_zero() {
         visit(economic);
@@ -330,9 +326,7 @@ pub fn edge_ratio_from_state(state: &PoolState, edge: &Edge, probe: U256) -> U25
             v2_edge_ratio_u256(s, edge, probe).unwrap_or(U256::ZERO)
         }
         (PoolState::V3(s), ProtocolType::UniswapV3)
-        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            cl_edge_ratio_from_state(s, edge, probe)
-        }
+        | (PoolState::V4(s), ProtocolType::UniswapV4) => cl_edge_ratio_from_state(s, edge, probe),
         _ => {
             let out = simulate_hop_amount_out_with_cap(state, edge, probe, shallow_cap)
                 .unwrap_or(U256::ZERO);
@@ -569,14 +563,17 @@ mod tests {
         };
         let ratio = compute_edge_ratio(&arena, &edge);
         assert!(ratio > U256::ZERO);
-        assert_eq!(ratio, cl_edge_ratio_from_state(
-            match arena.pool_state(pool).expect("pool") {
-                PoolState::V3(s) => s,
-                _ => panic!("expected v3"),
-            },
-            &edge,
-            spot_probe_for_token(&arena, t0),
-        ));
+        assert_eq!(
+            ratio,
+            cl_edge_ratio_from_state(
+                match arena.pool_state(pool).expect("pool") {
+                    PoolState::V3(s) => s,
+                    _ => panic!("expected v3"),
+                },
+                &edge,
+                spot_probe_for_token(&arena, t0),
+            )
+        );
     }
 
     #[test]
@@ -654,7 +651,8 @@ mod tests {
             PoolState::V2(s) => s,
             _ => panic!("v2"),
         };
-        let ratio = super::v2_edge_ratio_u256(v2, &edge, U256::from(10u128.pow(18))).expect("ratio");
+        let ratio =
+            super::v2_edge_ratio_u256(v2, &edge, U256::from(10u128.pow(18))).expect("ratio");
         assert!(!ratio.is_zero());
     }
 

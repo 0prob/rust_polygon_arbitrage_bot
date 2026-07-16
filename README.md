@@ -9,7 +9,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Cycle search** — Hybrid parallel DFS + Johnson hub search + Bellman-Ford (default), or `dfs` / `johnson` / `bellman-ford` alone; spot-weighted adjacency graph, atomic probe prefilter, graph/cycle caching.
 - **Pool discovery** — PostgreSQL direct SQL feed from HyperIndex; periodic refresh and dead-pool pruning.
 - **State refresh** — Archival RPC multicall for reserves, V3 ticks (TickLens), V4 storage slots, and protocol-specific fields.
-- **Profit scoring** — Optional Chainlink + Pyth oracle enrichment (token → MATIC rates), gas oracle, flash-loan fee deduction, slippage buffer, circuit breaker. Min-profit threshold is MATIC-denominated (`MIN_PROFIT_MATIC_WEI`).
+- **Profit scoring** — Hop simulation uses on-chain pool state in-memory; base pricing uses an LF snapshot (`token_to_matic_rates`) from hub-path arena sim (token → WPOL; enabled by default in `OracleConfig`) plus Chainlink/Pyth for configured feeds and POL/USD caps. Gas oracle, flash-loan fees, slippage, circuit breaker. Min profit is MATIC-denominated (`MIN_PROFIT_MATIC_WEI`).
 - **Learned route risk** — Per-route success/failure history persists at `ROUTE_STATS_PATH`; unreliable routes require proportionally more expected net profit before preflight.
 - **Flash-loan routing** — `FLASH_LOAN_SOURCE=auto` (default) uses a Balancer-first waterfall: on-chain liquidity checks per token, Aave fallback, and cap-and-reoptimize when borrow size exceeds provider liquidity. HF eval uses pessimistic Aave fees in auto mode.
 - **Execution** — Dry-run simulation or live submit via Huff `ArbExecutor`; optional MEV-protected `PRIVATE_RPC_URL`, profit-scaled priority fees, nonce management, route cooldown/quarantine, receipt polling.
@@ -21,14 +21,15 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 | Binary | Purpose |
 |---|---|
 | `rpbot` | Main bot (default) |
-| `tui` | Terminal dashboard |
+| `tui` | Terminal dashboard (`--features tui`) |
+| `oracle_feeds` | Audit / propose / verify Pyth feed mappings (human-in-the-loop); verified Polygon mints are merged into `TOKEN_FEEDS` in `price_oracle.rs` |
 
 ## Prerequisites
 
-- **Rust** nightly (uses `-Zthreads` in `.cargo/config.toml` and edition 2024)
-- **Polygon RPC** — archival endpoint recommended for pool-state reads (`STATE_RPC_URL`)
-- **Envio indexer** — PostgreSQL database from `/home/x/arb/h` (`PG_URL`; start with `cd ../h && bun run dev`)
-- **Live execution** — deployed Huff executor from sibling repo `/home/x/arb/sol` (Foundry + `script/deploy_mainnet.sh`)
+- **Rust nightly** — `.cargo/config.toml` uses `-Zthreads`; crate is edition 2024.
+- **Polygon RPC** — archival endpoint recommended for pool-state reads (`STATE_RPC_URL` / `POLYGON_RPC_URLS`).
+- **Envio indexer** — PostgreSQL from sibling HyperIndex repo (`PG_URL`; typical default `postgres://postgres@localhost:5433/envio-dev`).
+- **Live execution** — deployed Huff executor from sibling `sol` repo (Foundry + `script/deploy_mainnet.sh`).
 
 ## Setup
 
@@ -43,29 +44,28 @@ Configure the bot:
 
 ```bash
 cp .env.example .env
-# Edit .env — see comments in .env.example for all options
-# Ensure PG_URL points to the running PostgreSQL (default: postgres://postgres@localhost:5433/envio-dev)
+# Edit .env — all documented options are in .env.example
 ```
 
-Minimum to run in dry-run mode:
+**Dry-run minimum**
 
 | Variable | Purpose |
 |---|---|
-| `PG_URL` | PostgreSQL connection string for HyperIndex data |
-| `STATE_RPC_URL` or `POLYGON_RPC_URLS` | Pool state reads |
-| `EXECUTION_RPC` | Tx simulation (dry-run) |
-| `EXECUTION_MODE=dry-run` | No on-chain submits |
+| `PG_URL` | PostgreSQL for HyperIndex pool metadata |
+| `STATE_RPC_URL` or `POLYGON_RPC_URLS` | Multicall pool-state reads (not execution quota) |
+| `EXECUTION_RPC` | HF `eth_call` simulation, gas, receipts |
+| `EXECUTION_MODE=dry-run` | No on-chain submits (default) |
 
-For live trading, also set `PRIVATE_KEY` (or `PRIVATE_KEY_FILE`), `EXECUTOR_ADDRESS`, and `EXECUTION_MODE=live`. Optionally set `PRIVATE_RPC_URL` for MEV-protected submission, or `BLOXROUTE_AUTH_HEADER` for bloXroute BDN.
+**Live trading** additionally requires `PRIVATE_KEY` or `PRIVATE_KEY_FILE`, `EXECUTOR_ADDRESS`, and `EXECUTION_MODE=live`. Use `PRIVATE_RPC_URL` and/or `BLOXROUTE_AUTH_HEADER` for private submission; if `REQUIRE_PRIVATE_SUBMIT=true`, at least one of those must be set.
 
 Deploy the Huff executor (requires Foundry):
 
 ```bash
 cd ../sol && ./script/deploy_mainnet.sh
-# Set EXECUTOR_ADDRESS in .env to the logged address
+# Set EXECUTOR_ADDRESS in .env to the deployed address
 ```
 
-Config precedence: code defaults → `.env` (or `DOTENV_PATH`) → variables already set in the process environment. Tuned LF/HF/routing/RPC values live in `.env.example`; copy to `.env` and adjust for your RPC tier.
+**Config precedence:** code defaults → `.env` (or `DOTENV_PATH`) → variables already set in the process environment. Env names map to nested config in `src/config/mod.rs` (`env_key_to_figment_path`); see `.env.example` for tuned LF/HF/RPC values.
 
 ## Run
 
@@ -78,58 +78,42 @@ cargo run --release
 TUI dashboard (live pipeline):
 
 ```bash
-cargo run --bin tui --release
+cargo run --bin tui --features tui --release
 ```
 
-Current active env values in this checkout:
+Oracle feed workflow:
 
 ```bash
-RPBOT_LOG=info
-EXECUTION_MODE=live
-DISCOVERY_INTERVAL_MS=5000
-LF_INTERVAL_MS=4000
-LF_BOOTSTRAP_BATCH=5000
-STREAM_ENABLED=true
-REQUIRE_PRIVATE_SUBMIT=true
-FLASH_LOAN_SOURCE=auto
-QUICKSWAP_V2_ENABLED=false
-UNISWAP_V2_ENABLED=false
-MAX_MULTICALL_CALLS=200
-RPC_BATCH_PACE_MS=8
+cargo run --bin oracle_feeds --release -- audit --top 50
+cargo run --bin oracle_feeds --release -- propose --curated-only --verify --out proposed-feeds.txt
+cargo run --bin oracle_feeds --release -- verify --file proposed-feeds.txt
 ```
 
-The checked-in `.env` currently points at:
-
-- `PG_URL=postgres://postgres:testing@localhost:5433/envio-dev`
-- `EXECUTION_RPC` on Alchemy
-- `STATE_RPC_URL` / `POLYGON_RPC_URLS` on dRPC + Chainstack + Ankr + PublicNode
-- `POLYGON_WSS_URLS` on dRPC + Alchemy + Chainstack
-- `ENVIO_API_TOKEN` enabled
-- `EXECUTION_MODE=live`
-- `REQUIRE_PRIVATE_SUBMIT=true`
-- `PRIVATE_RPC_URL=https://api.blxrbdn.com`
-- `BLOXROUTE_AUTH_HEADER=...`
-
-Continuous runner and log dashboard (after `cargo build --release`):
+Continuous runner and log tail (after `cargo build --release`):
 
 ```bash
-./scripts/run-continuous.sh   # restart loop with backoff, logs to target/run-logs/
-./scripts/watch.sh              # tail metrics from the latest run log
+./scripts/run-continuous.sh   # restart loop; stdout → target/run-logs/
+./scripts/watch.sh            # metrics from latest run log (RPBOT_LOG_DIR, default /tmp/bot)
 ```
+
+`run-continuous.sh` forces `EXECUTION_MODE=dry-run` for the child process regardless of `.env`.
 
 ## Development
 
 ```bash
 cargo test
-cargo bench   # simulate_v2_swap, simulate_v3_swap_ticks, simulate_route_3hop,
-              # rescore_graph_64_pools, find_cycles_hybrid_3pool, optimize_cycle_2hop
+cargo bench   # routing benches: v2/v3 swap, route sim, graph rescore, cycle find, optimize
 ```
 
 Calldata golden tests in `tests/calldata_test.rs` verify route encoding and executor selectors.
 
 ## Project docs
 
-- **`docs/`**, **`graphify-rs-out/`** — regenerable, gitignored
+| Path | Content |
+|---|---|
+| `doc/routing.md` | Protocol graph rules, liquidity gates, simulation fidelity |
+| `.env.example` | Environment reference (with `src/config/mod.rs`) |
+| `graphify-out/`, `docs/` | Regenerable analysis output (gitignored) |
 
 ## Architecture
 
@@ -147,10 +131,8 @@ pass_loop
         └── dry-run / submit via private RPC or bloXroute BDN
 ```
 
-Pool metadata flows from PostgreSQL → `StateRefreshService` → `StateCache` → routing graph. LF publishes cycle snapshots; HF reads them lock-free via `SnapshotStore` (ArcSwap). Stream patches merge into `StateCache` on the hot path without a full node.
+Pool metadata flows PostgreSQL → `StateRefreshService` → `StateCache` → routing graph. LF publishes cycle snapshots; HF reads them lock-free via `SnapshotStore` (ArcSwap). Stream patches merge into `StateCache` on the hot path without a full node refresh.
 
-Set `STREAM_ENABLED=true` and `WSS_URL` (or rely on `wss://` auto-conversion from `STATE_RPC_URL`). Live submits should use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER` for direct mempool injection (not the public execution RPC).
+Set `STREAM_ENABLED=true` and configure `POLYGON_WSS_URLS` or `WSS_URL` (or rely on `wss://` conversion from HTTP state RPCs). Live submits should not use the public execution RPC for mempool injection — use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER`.
 
-Live logs use a compact, `tput`-colored stdout format with fixed level and component columns. The same events are buffered asynchronously as JSONL under `/tmp/bot/run-<timestamp>-<pid>/{system,infra,state,oracle,routing,orchestrator,execution,tui}.jsonl`; private run directories prevent mixed sessions, the newest 10 runs are retained, and each active component is capped at 16 MiB. Set `RPBOT_LOG=debug` for more detail or `RPBOT_LOG_DIR` to move the run directories. The TUI suppresses stdout logs while retaining the component files.
-
-When the TUI is running, `UiBridge` receives snapshot and event updates from the orchestrator for live display.
+**Logging:** compact colored stdout (`RPBOT_LOG`, default `info`). Component JSONL under `$RPBOT_LOG_DIR/run-<timestamp>-<pid>/` (default `/tmp/bot`). The TUI suppresses stdout logs while retaining JSONL files.

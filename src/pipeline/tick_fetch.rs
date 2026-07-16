@@ -3,11 +3,11 @@ use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
+use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 use crate::core::v4_storage::{
     compute_v4_tick_bitmap_slot, compute_v4_tick_info_slot, decode_v4_tick_liquidity,
 };
-use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 
@@ -27,10 +27,7 @@ pub fn clear_v3_pool_ticks(arena: &mut StateArena, pool_addresses: &[Address]) {
     }
 }
 
-pub fn clear_v4_pool_ticks(
-    arena: &mut StateArena,
-    targets: &[(PoolIndex, FixedBytes<32>)],
-) {
+pub fn clear_v4_pool_ticks(arena: &mut StateArena, targets: &[(PoolIndex, FixedBytes<32>)]) {
     for &(index, _) in targets {
         if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(index) {
             state.ticks = Arc::from([]);
@@ -53,9 +50,7 @@ pub fn cl_tick_bitmap_center_word(tick: i32, spacing: i32) -> i32 {
 
 #[inline]
 fn cl_tick_from_bitmap_bit(word: i32, bit: u16, spacing: i32) -> Option<i32> {
-    let compressed = word
-        .saturating_mul(256)
-        .saturating_add(i32::from(bit));
+    let compressed = word.saturating_mul(256).saturating_add(i32::from(bit));
     let tick = compressed.saturating_mul(spacing.max(1));
     (MIN_TICK..=MAX_TICK).contains(&tick).then_some(tick)
 }
@@ -229,26 +224,40 @@ pub async fn enrich_v3_ticks<
             .await;
         };
 
+        let mut incomplete_pools = 0usize;
+        let mut empty_pools = 0usize;
         for (start, end, idx) in spans {
             let mut ticks: Vec<V3Tick> = Vec::new();
-            for bytes in results[start..end].iter().flatten() {
-                if let Ok(populated) =
+            let mut complete = true;
+            for bytes in &results[start..end] {
+                let Some(bytes) = bytes else {
+                    complete = false;
+                    break;
+                };
+                let Ok(populated) =
                     ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
-                {
-                    for pt in populated {
-                        let tick = pt.tick.as_i32();
-                        if !(MIN_TICK..=MAX_TICK).contains(&tick) {
-                            continue;
-                        }
-                        ticks.push(V3Tick {
-                            tick,
-                            liquidity_gross: pt.liquidityGross,
-                            liquidity_net: pt.liquidityNet,
-                        });
+                else {
+                    complete = false;
+                    break;
+                };
+                for pt in populated {
+                    let tick = pt.tick.as_i32();
+                    if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+                        continue;
                     }
+                    ticks.push(V3Tick {
+                        tick,
+                        liquidity_gross: pt.liquidityGross,
+                        liquidity_net: pt.liquidityNet,
+                    });
                 }
             }
+            if !complete {
+                incomplete_pools += 1;
+                continue;
+            }
             if ticks.is_empty() {
+                empty_pools += 1;
                 continue;
             }
             finalize_cl_ticks(&mut ticks);
@@ -257,6 +266,34 @@ pub async fn enrich_v3_ticks<
                 updated += 1;
             }
         }
+        if incomplete_pools > 0 {
+            crate::warn!(
+                "v3 tick lens left {} pools tickless after partial word responses",
+                incomplete_pools
+            );
+        }
+        let direct_loaded = updated;
+        let algebra_target_count = algebra_targets.len();
+        let algebra_loaded = enrich_algebra_ticks(
+            provider,
+            arena,
+            &algebra_targets,
+            algebra_integral_pools,
+            block_number,
+        )
+        .await;
+        updated += algebra_loaded;
+        crate::debug!(
+            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} loaded={}",
+            pool_addresses.len(),
+            direct_loaded,
+            empty_pools,
+            incomplete_pools,
+            algebra_target_count,
+            algebra_loaded,
+            updated
+        );
+        return updated;
     }
     updated += enrich_algebra_ticks(
         provider,
@@ -318,16 +355,23 @@ pub async fn enrich_v4_ticks<
 
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
+    let mut incomplete_pools = FxHashSet::default();
+    let mut capped = false;
     'pools: for (idx, pool_id, spacing, word_min, start, end) in spans {
+        let mut complete = true;
         for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
             let Some(bytes) = bytes else {
-                continue;
+                complete = false;
+                break;
             };
             let Some(bitmap) = decode_abi_word(bytes) else {
-                continue;
+                complete = false;
+                break;
             };
             for bit in 0..256u16 {
                 if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                    incomplete_pools.insert(idx);
+                    capped = true;
                     break 'pools;
                 }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
@@ -344,6 +388,9 @@ pub async fn enrich_v4_ticks<
                 });
                 tick_owners.push((idx, tick));
             }
+        }
+        if !complete {
+            incomplete_pools.insert(idx);
         }
     }
 
@@ -363,9 +410,11 @@ pub async fn enrich_v4_ticks<
         rustc_hash::FxHashMap::default();
     for ((idx, tick), bytes) in tick_owners.into_iter().zip(states) {
         let Some(bytes) = bytes else {
+            incomplete_pools.insert(idx);
             continue;
         };
         let Some(raw) = decode_abi_word(&bytes) else {
+            incomplete_pools.insert(idx);
             continue;
         };
         let (liquidity_gross, liquidity_net) = decode_v4_tick_liquidity(raw);
@@ -380,11 +429,20 @@ pub async fn enrich_v4_ticks<
 
     let mut updated = 0;
     for (idx, mut ticks) in grouped {
+        if incomplete_pools.contains(&idx) {
+            continue;
+        }
         finalize_cl_ticks(&mut ticks);
         if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(idx) {
             state.ticks = Arc::from(ticks);
             updated += 1;
         }
+    }
+    if !incomplete_pools.is_empty() || capped {
+        crate::warn!(
+            "v4 tick hydration left {} pools tickless after partial responses or read cap (capped={capped})",
+            incomplete_pools.len()
+        );
     }
     updated
 }

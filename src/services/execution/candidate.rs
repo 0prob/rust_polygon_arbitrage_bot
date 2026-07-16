@@ -1,9 +1,7 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use rustc_hash::FxHashMap;
 
-use crate::core::types::{
-    EvaluatedRoute, FlashLoanSource, PoolIndex, PoolState, RouteSimulationResult,
-};
+use crate::core::types::{EvaluatedRoute, FlashLoanSource, PoolIndex, RouteSimulationResult};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 use crate::services::execution::calldata::{
@@ -11,7 +9,7 @@ use crate::services::execution::calldata::{
     hops_are_balancer_only,
 };
 use crate::services::execution::flash_liquidity::{
-    TokenFlashLiquidity, align_flash_source_for_dispatch,
+    TokenFlashLiquidity, align_flash_source_for_dispatch, dodo_base_flash_pool_for_cycle,
 };
 use crate::services::execution::gas::buffer_gas_limit;
 use crate::services::execution::profit::AssessProfitInput;
@@ -65,18 +63,6 @@ pub struct CandidateBuildConfig {
     pub has_dodo_pool: bool,
     /// Skip liquidity re-alignment when `prepare_evaluated_route` already validated the plan.
     pub trust_prepared_flash: bool,
-}
-
-fn dodo_pool_address_for_cycle(
-    arena: &StateArena,
-    edges: &[crate::core::types::Edge],
-) -> Option<Address> {
-    for edge in edges {
-        if matches!(arena.pool_state(edge.pool_index)?, PoolState::Dodo(_)) {
-            return arena.pool_address(edge.pool_index);
-        }
-    }
-    None
 }
 
 #[must_use]
@@ -225,8 +211,9 @@ pub fn build_execution_candidate(
     // DODO flash loan: packRoute flash_token field must be the DODO pool address,
     // not the token address — the Huff contract calls flashLoan on it directly.
     let flash_token = if entrypoint == ExecutorEntrypoint::DodoFlash {
-        dodo_pool_address_for_cycle(arena, &evaluated.cycle.edges)
-            .ok_or_else(|| anyhow::anyhow!("DODO flash entrypoint but no DODO pool in route"))?
+        dodo_base_flash_pool_for_cycle(arena, &evaluated.cycle).ok_or_else(|| {
+            anyhow::anyhow!("DODO flash entrypoint but no base-compatible DODO pool in route")
+        })?
     } else {
         start_token
     };

@@ -52,6 +52,7 @@ pub struct HfContext {
     pub hypersync: Option<Arc<HyperSyncService>>,
     pub shutdown: watch::Receiver<bool>,
     pub ui_hook: SharedUiHook,
+    pub inactive_rotation: parking_lot::Mutex<InactiveCycleRotation>,
 }
 
 pub struct HfTickResult {
@@ -71,6 +72,38 @@ static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
 const HF_ORACLE_SKIP_INTERVAL_MS: u64 = 30_000;
 /// MATIC/USD refresh can hold singleflight longer than cache TTL; HF may use slightly stale price.
 const HF_MATIC_STALE_WARN_MS: u64 = 45_000;
+
+#[derive(Default)]
+pub struct InactiveCycleRotation {
+    snapshot_generation: u64,
+    next_inactive: usize,
+}
+
+impl InactiveCycleRotation {
+    fn offset_for(&mut self, snapshot_generation: u64, inactive_len: usize) -> usize {
+        if self.snapshot_generation != snapshot_generation {
+            self.snapshot_generation = snapshot_generation;
+            self.next_inactive = 0;
+        }
+        if inactive_len == 0 {
+            0
+        } else {
+            self.next_inactive % inactive_len
+        }
+    }
+
+    fn advance(&mut self, snapshot_generation: u64, inactive_len: usize, served: usize) {
+        if self.snapshot_generation == snapshot_generation && inactive_len > 0 {
+            self.next_inactive = (self.next_inactive + served) % inactive_len;
+        }
+    }
+}
+
+fn inactive_indices(offset: usize, inactive_len: usize, take: usize) -> Vec<usize> {
+    (0..take.min(inactive_len))
+        .map(|index| (offset + index) % inactive_len)
+        .collect()
+}
 
 /// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
 fn cycle_with_reliable_start(
@@ -192,7 +225,6 @@ fn cycle_activity_score(
         .sum()
 }
 
-/// Rank LF cycles for HF rescore: quarantine filter → score pre-prune → activity rank.
 fn select_cycles_for_rescore(
     snap_cycles: &[Arc<FoundCycle>],
     arena: &crate::pipeline::arena::StateArena,
@@ -200,7 +232,17 @@ fn select_cycles_for_rescore(
     execution: &ExecutionService,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
     rescore_cap: usize,
-) -> (Vec<Arc<FoundCycle>>, FxHashSet<Address>, usize, usize) {
+    inactive_offset: usize,
+) -> (
+    Vec<Arc<FoundCycle>>,
+    FxHashSet<Address>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
     let activity_now = now_ms();
     let mut candidates: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len());
     let mut quarantine_skipped = 0usize;
@@ -223,33 +265,38 @@ fn select_cycles_for_rescore(
             FxHashSet::default(),
             quarantine_skipped,
             rate_skipped,
+            0,
+            0,
+            0,
+            0,
         );
-    }
-
-    let prefilter_cap = rescore_cap.saturating_mul(3).max(rescore_cap + 1);
-    if candidates.len() > prefilter_cap {
-        let pivot = prefilter_cap - 1;
-        candidates.select_nth_unstable_by(pivot, |a, b| {
-            compare_cycle_score(a.0.as_ref(), b.0.as_ref())
-        });
-        candidates.truncate(prefilter_cap);
     }
 
     for (cycle, score) in &mut candidates {
         *score = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now);
     }
+    let activity_candidates = candidates.iter().filter(|(_, score)| *score > 0).count();
     // ponytail: all candidates already passed has_reliable_matic_rate filter
     // above, so sort by activity score then cycle score directly.
     candidates.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| compare_cycle_score(a.0.as_ref(), b.0.as_ref()))
     });
-    candidates.truncate(rescore_cap);
+    let activity_selected = activity_candidates.min(rescore_cap);
+    let inactive_len = candidates.len().saturating_sub(activity_candidates);
+    let inactive_slots = rescore_cap.saturating_sub(activity_selected);
+    let inactive_selected = inactive_slots.min(inactive_len);
+    let mut selected = candidates[..activity_selected].to_vec();
+    selected.extend(
+        inactive_indices(inactive_offset, inactive_len, inactive_selected)
+            .into_iter()
+            .map(|index| candidates[activity_candidates + index].clone()),
+    );
 
-    let mut cycles = Vec::with_capacity(candidates.len());
+    let mut cycles = Vec::with_capacity(selected.len());
     let mut hot_pools =
-        FxHashSet::with_capacity_and_hasher(candidates.len().saturating_mul(3), Default::default());
-    for (cycle, _) in candidates {
+        FxHashSet::with_capacity_and_hasher(selected.len().saturating_mul(3), Default::default());
+    for (cycle, _) in selected {
         for edge in &cycle.edges {
             if let Some(addr) = arena.pool_address(edge.pool_index) {
                 hot_pools.insert(addr);
@@ -257,7 +304,16 @@ fn select_cycles_for_rescore(
         }
         cycles.push(cycle);
     }
-    (cycles, hot_pools, quarantine_skipped, rate_skipped)
+    (
+        cycles,
+        hot_pools,
+        quarantine_skipped,
+        rate_skipped,
+        activity_candidates,
+        activity_selected,
+        inactive_len,
+        inactive_selected,
+    )
 }
 
 pub async fn run_hf_tick(
@@ -303,17 +359,36 @@ pub async fn run_hf_tick(
     let mut hot_pools_set;
     let mut quarantine_skipped;
     let mut rate_skipped;
-    (cycles, hot_pools_set, quarantine_skipped, rate_skipped) = select_cycles_for_rescore(
+    let activity_candidates;
+    let activity_selected;
+    let mut inactive_len;
+    let mut inactive_selected;
+    let mut selection_generation = snap_generation;
+    let inactive_offset = ctx
+        .inactive_rotation
+        .lock()
+        .offset_for(selection_generation, snap_cycle_count);
+    (
+        cycles,
+        hot_pools_set,
+        quarantine_skipped,
+        rate_skipped,
+        activity_candidates,
+        activity_selected,
+        inactive_len,
+        inactive_selected,
+    ) = select_cycles_for_rescore(
         &snap.cycles,
         &arena_base,
         &ctx.partial_cache,
         &ctx.execution,
         &token_to_matic_rates,
         rescore_cap,
+        inactive_offset,
     );
     if should_log_hf_summary() || stream_triggered {
         crate::info!(
-            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} hot_pools={} rescore_cap={rescore_cap}",
+            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
             cycles.len(),
             hot_pools_set.len(),
         );
@@ -363,6 +438,7 @@ pub async fn run_hf_tick(
         }))
     };
 
+    let pool_prefetch_started = now_ms();
     if let Some(handle) = prefetch {
         let prefetch_budget =
             std::time::Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
@@ -376,6 +452,7 @@ pub async fn run_hf_tick(
             ),
         }
     }
+    let pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
 
     if stream_triggered && pipeline.stream_enabled {
         let flushed = ctx
@@ -405,6 +482,11 @@ pub async fn run_hf_tick(
         pool_metas_for_dispatch = Arc::clone(&snap.pool_metas);
         arena_base = snap.arena.clone();
         snap_cycle_count = snap.cycles.len();
+        selection_generation = snap.generation;
+        let inactive_offset = ctx
+            .inactive_rotation
+            .lock()
+            .offset_for(selection_generation, snap_cycle_count);
         let selected = select_cycles_for_rescore(
             &snap.cycles,
             &arena_base,
@@ -412,11 +494,14 @@ pub async fn run_hf_tick(
             &ctx.execution,
             &token_to_matic_rates,
             rescore_cap,
+            inactive_offset,
         );
         cycles = selected.0;
         hot_pools = selected.1.into_iter().collect::<Vec<_>>().into();
         quarantine_skipped = selected.2;
         rate_skipped = selected.3;
+        inactive_len = selected.6;
+        inactive_selected = selected.7;
         if cycles.is_empty() {
             if should_log_hf_summary() {
                 crate::info!(
@@ -434,9 +519,6 @@ pub async fn run_hf_tick(
 
     let mut arena = arena_base;
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
-    ctx.execution
-        .route_sim_cache
-        .clear_stale(evaluation_state_generation);
 
     let mut flash_tokens = FxHashSet::default();
     let mut flash_token_list = Vec::new();
@@ -448,6 +530,7 @@ pub async fn run_hf_tick(
             &mut flash_token_list,
         );
     }
+    let flash_prefetch_started = now_ms();
     if !flash_token_list.is_empty() {
         let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
         flash_cache.track_hot_tokens(&flash_token_list);
@@ -484,10 +567,12 @@ pub async fn run_hf_tick(
         }
         flash_cache.spawn_refresh_if_stale(Arc::clone(&ctx.rpc), &flash_token_list);
     }
+    let flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
 
     let flash_policy = ctx.config.flash_policy;
     let state_provider = ctx.rpc.connect_state().ok();
     let state_provider_ref = state_provider.as_ref();
+    let oracle_started = now_ms();
     let matic_usd = match ctx
         .price_oracle
         .resolve_matic_usd_cached()
@@ -532,6 +617,7 @@ pub async fn run_hf_tick(
             }
         },
     };
+    let oracle_ms = now_ms().saturating_sub(oracle_started);
 
     let matic_usd_chainlink = ctx.price_oracle.fresh_matic_usd_chainlink_raw();
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
@@ -557,6 +643,7 @@ pub async fn run_hf_tick(
         execution: Arc::clone(&ctx.execution),
     });
     let cycles_considered = cycles.len();
+    let eval_started = now_ms();
     let (eval_results, mut eval_arena, probe_kept) = match timeout(
         HF_EVAL_BUDGET,
         rescore_rank_and_evaluate_async(cycles, Arc::clone(&reassess_ctx), sim_cap),
@@ -578,6 +665,10 @@ pub async fn run_hf_tick(
             });
         }
     };
+    ctx.inactive_rotation
+        .lock()
+        .advance(selection_generation, inactive_len, inactive_selected);
+    let eval_ms = now_ms().saturating_sub(eval_started);
     let eval_count = eval_results.len();
 
     let mut profitable: Vec<HfEvalResult> = Vec::new();
@@ -657,6 +748,7 @@ pub async fn run_hf_tick(
         ctx.refresh.last_state_block()
     };
     let mut dispatch_state_hash = snap.state_hash;
+    let verify_started = now_ms();
     if !profitable.is_empty() && ctx.config.execution.executor_address.is_some() {
         let sim_provider = match ctx.rpc.connect_simulation() {
             Ok(p) => Some(p),
@@ -713,6 +805,7 @@ pub async fn run_hf_tick(
                 .unwrap_or(U256::ZERO);
         }
     }
+    let verify_ms = now_ms().saturating_sub(verify_started);
 
     profitable.sort_unstable_by(|a, b| {
         let a_direct = route_is_balancer_only(&a.cycle);
@@ -731,7 +824,7 @@ pub async fn run_hf_tick(
         let log_summary = profitable_count > 0 || should_log_hf_summary();
         if log_summary {
             crate::info!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count})"
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
             );
             if profitable_count == 0 && eval_count > 0 {
                 crate::info!(
@@ -920,4 +1013,98 @@ fn log_near_miss_diagnostic(
         assessment.flash_loan_fee,
         reason,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+    use crate::core::types::{CycleEdges, Edge, PoolIndex, PoolState, TokenIndex, V2PoolState};
+    use crate::services::partial_cache::SlimPoolState;
+
+    fn cycle(pool_index: PoolIndex, score: f64) -> Arc<FoundCycle> {
+        Arc::new(FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_slice(&[Edge {
+                pool_index,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]),
+            hop_count: 1,
+            log_weight: score,
+            cumulative_fee_bps: 30,
+            score,
+            cycle_ratio: U256::ZERO,
+        })
+    }
+
+    fn v2_state() -> Arc<PoolState> {
+        Arc::new(PoolState::V2(V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(1_000_000u64),
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 1,
+        }))
+    }
+
+    #[test]
+    fn activity_rank_considers_routes_outside_the_static_top_three() {
+        let mut arena = StateArena::default();
+        let addresses: Vec<_> = (1u8..=4)
+            .map(|id| {
+                let address = Address::from([id; 20]);
+                arena.register_pool(address, v2_state());
+                address
+            })
+            .collect();
+        let partial_cache = PartialPoolCache::new();
+        partial_cache.seed(
+            addresses[3],
+            SlimPoolState {
+                protocol: ProtocolType::UniswapV2,
+                sqrt_price_x96: U256::ZERO,
+                liquidity: 0,
+                tick: 0,
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                patched_at_ms: now_ms(),
+                activity_count: 1,
+            },
+        );
+        let cycles: Vec<_> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| cycle(PoolIndex(index as u32), score))
+            .collect();
+        let mut rates = rustc_hash::FxHashMap::default();
+        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+
+        let (selected, _, _, _, _, _, _, _) = select_cycles_for_rescore(
+            &cycles,
+            &arena,
+            &partial_cache,
+            &ExecutionService::new(),
+            &rates,
+            1,
+            0,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].score, 4.0);
+    }
+
+    #[test]
+    fn inactive_rotation_wraps_without_duplicates_and_resets_on_snapshot_change() {
+        let mut rotation = InactiveCycleRotation::default();
+        assert_eq!(inactive_indices(rotation.offset_for(1, 5), 5, 3), [0, 1, 2]);
+        rotation.advance(1, 5, 3);
+        assert_eq!(inactive_indices(rotation.offset_for(1, 5), 5, 3), [3, 4, 0]);
+        assert_eq!(inactive_indices(rotation.offset_for(2, 5), 5, 3), [0, 1, 2]);
+    }
 }

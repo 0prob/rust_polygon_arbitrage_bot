@@ -1,11 +1,12 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy::network::Ethereum;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::constants::is_polygon_hub_token;
 use crate::core::protocol::is_fetchable_protocol;
@@ -20,6 +21,8 @@ use crate::services::state_cache::StateCache;
 const CLMM_MULTI_FETCH_BIAS: usize = 2;
 /// Extra V4 hydration slots per round — large indexer set, singleton-hub graph depends on live slot0.
 const V4_FETCH_BIAS: usize = 4;
+/// Discovery rows scanned per LF pass for never-fetched pools (full list is ~260k).
+const NEVER_FETCH_SCAN_CHUNK: usize = 12_288;
 
 /// Fetchable protocol families — round-robin ensures each gets hydration slots per batch.
 const FETCHABLE_PROTOCOLS: [ProtocolType; 8] = [
@@ -92,11 +95,69 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
     if targets.is_empty() {
         return (0, false);
     }
-    // Group targets by protocol so we can parallelize fetch across protocol families.
-    // V2 gets its own group (dominant count), the rest are batched together.
+    run_fetch_targets(
+        provider,
+        cache,
+        &targets,
+        max_multicall_calls,
+        batch_pace_ms,
+        block_number,
+        meta_cache,
+    )
+    .await
+}
+
+/// Full-discovery refresh: cache-first stale/invalid scan + rotating never-fetched window.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_missing_pool_states_indexed<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: P,
+    cache: Arc<StateCache>,
+    pools: &[DiscoveredPool],
+    address_index: &FxHashMap<Address, usize>,
+    never_scan_cursor: &AtomicUsize,
+    max_pools: usize,
+    max_multicall_calls: usize,
+    batch_pace_ms: u64,
+    priority: &[Address],
+    block_number: Option<u64>,
+    meta_cache: &PoolMetaCache,
+) -> (usize, bool) {
+    let targets = select_fetch_targets_indexed(
+        pools,
+        address_index,
+        never_scan_cursor,
+        cache.as_ref(),
+        max_pools,
+        priority,
+    );
+    if targets.is_empty() {
+        return (0, false);
+    }
+    run_fetch_targets(
+        provider,
+        cache,
+        &targets,
+        max_multicall_calls,
+        batch_pace_ms,
+        block_number,
+        meta_cache,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: P,
+    cache: Arc<StateCache>,
+    targets: &[&DiscoveredPool],
+    max_multicall_calls: usize,
+    batch_pace_ms: u64,
+    block_number: Option<u64>,
+    meta_cache: &PoolMetaCache,
+) -> (usize, bool) {
     let mut v2_targets: Vec<&DiscoveredPool> = Vec::new();
     let mut other_targets: Vec<&DiscoveredPool> = Vec::new();
-    for &t in &targets {
+    for &t in targets {
         if t.protocol == ProtocolType::UniswapV2 {
             v2_targets.push(t);
         } else {
@@ -104,17 +165,15 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
         }
     }
 
-    // ponytail: only split into 2 groups (V2 vs rest) — finer splits starve individual
-    // multicall batching. The chunk-level parallelism inside fetch_pools_batched
-    // (8 concurrent chunks) provides further parallelism.
     let provider2 = provider.clone();
     let cache2 = Arc::clone(&cache);
-    let (updated_v2, updated_other) = tokio::join!(
+    let (v2_result, other_result) = tokio::join!(
         async {
+            let started = crate::util::now_ms();
             if v2_targets.is_empty() {
-                0usize
+                (0usize, 0u64)
             } else {
-                fetch_pools_batched(
+                let updated = fetch_pools_batched(
                     provider.clone(),
                     Arc::clone(&cache),
                     &v2_targets,
@@ -123,14 +182,16 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
                     block_number,
                     meta_cache,
                 )
-                .await
+                .await;
+                (updated, crate::util::now_ms().saturating_sub(started))
             }
         },
         async {
+            let started = crate::util::now_ms();
             if other_targets.is_empty() {
-                0usize
+                (0usize, 0u64)
             } else {
-                fetch_pools_batched(
+                let updated = fetch_pools_batched(
                     provider2,
                     cache2,
                     &other_targets,
@@ -139,9 +200,18 @@ pub async fn fetch_missing_pool_states<P: Provider<Ethereum> + Clone + Send + 's
                     block_number,
                     meta_cache,
                 )
-                .await
+                .await;
+                (updated, crate::util::now_ms().saturating_sub(started))
             }
         },
+    );
+    let (updated_v2, v2_ms) = v2_result;
+    let (updated_other, other_ms) = other_result;
+    crate::debug!(
+        "pool fetch branches: targets={} v2_targets={} other_targets={} v2_updated={updated_v2} other_updated={updated_other} v2_ms={v2_ms} other_ms={other_ms} max_multicall_calls={max_multicall_calls} batch_pace_ms={batch_pace_ms} pinned_block={block_number:?}",
+        targets.len(),
+        v2_targets.len(),
+        other_targets.len(),
     );
     (updated_v2 + updated_other, true)
 }
@@ -166,24 +236,101 @@ fn select_fetch_targets<'a>(
             .into_iter()
             .filter(|p| is_fetchable_protocol(p.protocol)),
         |pool, class| {
-            if priority_set.contains(&pool.address) {
-                priority_candidates.push(pool);
-            } else if let Some(slot) = pool.protocol.fetch_slot() {
-                let ranked = RankedPool {
-                    rank: fetch_rank(pool, class),
-                    pool,
-                };
-                let queue = &mut per_protocol[slot];
-                if queue.len() < max_pools {
-                    queue.push(ranked);
-                } else if queue.peek().is_some_and(|worst| ranked < *worst) {
-                    let _ = queue.pop();
-                    queue.push(ranked);
-                }
-            }
+            enqueue_fetch_candidate(
+                pool,
+                class,
+                &priority_set,
+                max_pools,
+                &mut priority_candidates,
+                &mut per_protocol,
+            );
         },
     );
 
+    finalize_fetch_targets(max_pools, priority_candidates, per_protocol)
+}
+
+fn select_fetch_targets_indexed<'a>(
+    pools: &'a [DiscoveredPool],
+    address_index: &FxHashMap<Address, usize>,
+    never_scan_cursor: &AtomicUsize,
+    cache: &StateCache,
+    max_pools: usize,
+    priority: &[Address],
+) -> Vec<&'a DiscoveredPool> {
+    if max_pools == 0 || pools.is_empty() {
+        return Vec::new();
+    }
+
+    let priority_set: FxHashSet<Address> = priority.iter().copied().collect();
+    let mut priority_candidates = Vec::with_capacity(priority_set.len());
+    let mut per_protocol: [BinaryHeap<RankedPool<'a>>; FETCHABLE_PROTOCOLS.len()] =
+        std::array::from_fn(|_| BinaryHeap::new());
+
+    cache.for_each_cached_fetch_candidate(address_index, pools, |pool, class| {
+        enqueue_fetch_candidate(
+            pool,
+            class,
+            &priority_set,
+            max_pools,
+            &mut priority_candidates,
+            &mut per_protocol,
+        );
+    });
+
+    let scan_budget = NEVER_FETCH_SCAN_CHUNK.min(pools.len());
+    let start = never_scan_cursor.fetch_add(scan_budget, Ordering::Relaxed) % pools.len();
+    for offset in 0..scan_budget {
+        let pool = &pools[(start + offset) % pools.len()];
+        if !is_fetchable_protocol(pool.protocol) {
+            continue;
+        }
+        if cache.has_any_entry(&pool.address) {
+            continue;
+        }
+        enqueue_fetch_candidate(
+            pool,
+            1,
+            &priority_set,
+            max_pools,
+            &mut priority_candidates,
+            &mut per_protocol,
+        );
+    }
+
+    finalize_fetch_targets(max_pools, priority_candidates, per_protocol)
+}
+
+fn enqueue_fetch_candidate<'a>(
+    pool: &'a DiscoveredPool,
+    class: u8,
+    priority_set: &FxHashSet<Address>,
+    max_pools: usize,
+    priority_candidates: &mut Vec<&'a DiscoveredPool>,
+    per_protocol: &mut [BinaryHeap<RankedPool<'a>>; FETCHABLE_PROTOCOLS.len()],
+) {
+    if priority_set.contains(&pool.address) {
+        priority_candidates.push(pool);
+    } else if let Some(slot) = pool.protocol.fetch_slot() {
+        let ranked = RankedPool {
+            rank: fetch_rank(pool, class),
+            pool,
+        };
+        let queue = &mut per_protocol[slot];
+        if queue.len() < max_pools {
+            queue.push(ranked);
+        } else if queue.peek().is_some_and(|worst| ranked < *worst) {
+            let _ = queue.pop();
+            queue.push(ranked);
+        }
+    }
+}
+
+fn finalize_fetch_targets<'a>(
+    max_pools: usize,
+    priority_candidates: Vec<&'a DiscoveredPool>,
+    per_protocol: [BinaryHeap<RankedPool<'a>>; FETCHABLE_PROTOCOLS.len()],
+) -> Vec<&'a DiscoveredPool> {
     let mut out: Vec<&'a DiscoveredPool> = Vec::with_capacity(max_pools);
     let mut selected: FxHashSet<Address> = FxHashSet::default();
     for pool in priority_candidates {

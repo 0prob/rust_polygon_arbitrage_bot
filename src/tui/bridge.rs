@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::{
-    mpsc::{Receiver, Sender, channel},
     mpsc::error::TrySendError,
+    mpsc::{Receiver, Sender, channel},
     watch,
 };
 
@@ -144,9 +144,7 @@ impl PipelineUiHook for TuiBridgeHook {
             return;
         }
         self.clear_coalesced_metrics();
-        if self.tx.try_send(event.clone()).is_err()
-            && self.tx.blocking_send(event).is_err()
-        {
+        if self.tx.try_send(event.clone()).is_err() && self.tx.blocking_send(event).is_err() {
             crate::warn!("tui event channel closed — execution outcome not shown");
         }
     }
@@ -212,7 +210,13 @@ mod tests {
         );
         let mut saw = false;
         while let Ok(ev) = rx.try_recv() {
-            if matches!(ev, UiEvent::ExecutionOutcome { route_fingerprint: 42, .. }) {
+            if matches!(
+                ev,
+                UiEvent::ExecutionOutcome {
+                    route_fingerprint: 42,
+                    ..
+                }
+            ) {
                 saw = true;
             }
         }

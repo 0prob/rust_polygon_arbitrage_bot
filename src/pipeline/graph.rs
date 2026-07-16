@@ -1,3 +1,8 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use rustc_hash::FxHashMap;
+
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
@@ -6,12 +11,32 @@ use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
 use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
+use crate::services::execution::flash_liquidity::{
+    FlashLiquiditySnapshot, token_eligible_for_flash_borrow_graph,
+    token_flash_borrow_proven_unviable,
+};
+use crate::services::oracle::has_reliable_matic_rate;
 use alloy::primitives::U256;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
 /// Max parallel edges per `(token_in, token_out, protocol)` after rescoring.
 const MAX_PARALLEL_EDGES_PER_PAIR: usize = 2;
+
+/// Optional LF gate: drop pools with no priced, flash-viable token once oracle rates exist.
+#[derive(Clone)]
+pub struct GraphBuildGate {
+    pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
+    pub flash: Arc<FlashLiquiditySnapshot>,
+    pub flash_ttl: Duration,
+}
+
+impl GraphBuildGate {
+    #[must_use]
+    pub fn active(&self) -> bool {
+        !self.token_to_matic_rates.is_empty()
+    }
+}
 
 /// Pending token-in context when traversing a virtual pool hub node.
 #[derive(Debug, Clone, Copy)]
@@ -317,9 +342,18 @@ pub fn resolve_lazy_swap_edge(
 /// Pools that would receive at least one directed edge on the next graph build.
 #[must_use]
 pub fn count_graph_eligible_pools(arena: &StateArena, pools: &[PoolMeta]) -> usize {
+    count_graph_eligible_pools_with_gate(arena, pools, None)
+}
+
+#[must_use]
+pub fn count_graph_eligible_pools_with_gate(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    gate: Option<&GraphBuildGate>,
+) -> usize {
     pools
         .iter()
-        .filter(|meta| pool_has_admissible_edges(arena, meta))
+        .filter(|meta| pool_has_admissible_edges(arena, meta, gate))
         .count()
 }
 
@@ -394,8 +428,38 @@ pub fn pool_state_graph_eligible(
     false
 }
 
+fn pool_touches_flash_executable_token(
+    arena: &StateArena,
+    meta: &PoolMeta,
+    gate: &GraphBuildGate,
+) -> bool {
+    let bpt_index = meta.bpt_index;
+    for (i, &token) in meta.tokens.iter().enumerate() {
+        if bpt_index == Some(i) {
+            continue;
+        }
+        if !has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref()) {
+            continue;
+        }
+        let Some(addr) = arena.token_address(token) else {
+            continue;
+        };
+        if token_flash_borrow_proven_unviable(addr, gate.flash.as_ref(), gate.flash_ttl) {
+            continue;
+        }
+        if token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl) {
+            return true;
+        }
+    }
+    false
+}
+
 #[inline]
-fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
+fn pool_has_admissible_edges(
+    arena: &StateArena,
+    meta: &PoolMeta,
+    gate: Option<&GraphBuildGate>,
+) -> bool {
     let Some(state) = arena.pool_state(meta.pool_index) else {
         return false;
     };
@@ -408,13 +472,12 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
         PoolState::Balancer(b) => b.bpt_index,
         _ => None,
     });
-    let pair_input_decimals = meta.tokens.first().zip(meta.tokens.get(1)).map(|(&t0, &t1)| {
-        (
-            arena.token_decimals(t0),
-            arena.token_decimals(t1),
-        )
-    });
-    pool_state_graph_eligible(
+    let pair_input_decimals = meta
+        .tokens
+        .first()
+        .zip(meta.tokens.get(1))
+        .map(|(&t0, &t1)| (arena.token_decimals(t0), arena.token_decimals(t1)));
+    if !pool_state_graph_eligible(
         Some(arena),
         state,
         meta.protocol,
@@ -422,7 +485,13 @@ fn pool_has_admissible_edges(arena: &StateArena, meta: &PoolMeta) -> bool {
         bpt_index,
         meta.fee_bps,
         pair_input_decimals,
-    )
+    ) {
+        return false;
+    }
+    if let Some(gate) = gate.filter(|gate| gate.active()) {
+        return pool_touches_flash_executable_token(arena, meta, gate);
+    }
+    true
 }
 
 #[inline]
@@ -525,7 +594,12 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
     }
 }
 
-fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &PoolMeta) -> bool {
+fn attach_pool_to_graph(
+    graph: &mut RoutingGraph,
+    arena: &StateArena,
+    meta: &PoolMeta,
+    gate: Option<&GraphBuildGate>,
+) -> bool {
     if graph.pool_has_live_edges(meta.pool_index) {
         return false;
     }
@@ -535,7 +609,7 @@ fn attach_pool_to_graph(graph: &mut RoutingGraph, arena: &StateArena, meta: &Poo
     else {
         return false;
     };
-    if !pool_has_admissible_edges(arena, meta) {
+    if !pool_has_admissible_edges(arena, meta, gate) {
         return false;
     }
 
@@ -662,17 +736,27 @@ pub fn topology_stats(graph: &RoutingGraph) -> GraphTopologyStats {
 
 /// Eligible arena pools that have no live edges in the cached graph yet.
 #[must_use]
+pub fn count_eligible_pools_missing_from_graph_with_gate(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    graph: &RoutingGraph,
+    gate: Option<&GraphBuildGate>,
+) -> usize {
+    pools
+        .iter()
+        .filter(|meta| {
+            pool_has_admissible_edges(arena, meta, gate)
+                && !graph.pool_has_live_edges(meta.pool_index)
+        })
+        .count()
+}
+
 pub fn count_eligible_pools_missing_from_graph(
     arena: &StateArena,
     pools: &[PoolMeta],
     graph: &RoutingGraph,
 ) -> usize {
-    pools
-        .iter()
-        .filter(|meta| {
-            pool_has_admissible_edges(arena, meta) && !graph.pool_has_live_edges(meta.pool_index)
-        })
-        .count()
+    count_eligible_pools_missing_from_graph_with_gate(arena, pools, graph, None)
 }
 
 #[must_use]
@@ -681,8 +765,18 @@ pub fn has_missing_eligible_pools(
     pools: &[PoolMeta],
     graph: &RoutingGraph,
 ) -> bool {
+    has_missing_eligible_pools_with_gate(arena, pools, graph, None)
+}
+
+#[must_use]
+pub fn has_missing_eligible_pools_with_gate(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    graph: &RoutingGraph,
+    gate: Option<&GraphBuildGate>,
+) -> bool {
     pools.iter().any(|meta| {
-        pool_has_admissible_edges(arena, meta) && !graph.pool_has_live_edges(meta.pool_index)
+        pool_has_admissible_edges(arena, meta, gate) && !graph.pool_has_live_edges(meta.pool_index)
     })
 }
 
@@ -696,12 +790,22 @@ pub fn attach_missing_eligible_pools(
     graph: &mut RoutingGraph,
     pools: &[PoolMeta],
 ) -> GraphAttachReport {
+    attach_missing_eligible_pools_with_gate(arena, graph, pools, None)
+}
+
+#[must_use]
+pub fn attach_missing_eligible_pools_with_gate(
+    arena: &StateArena,
+    graph: &mut RoutingGraph,
+    pools: &[PoolMeta],
+    gate: Option<&GraphBuildGate>,
+) -> GraphAttachReport {
     let mut attached_pools: Vec<PoolIndex> = Vec::new();
     for meta in pools {
         if graph.pool_has_live_edges(meta.pool_index) {
             continue;
         }
-        if attach_pool_to_graph(graph, arena, meta) {
+        if attach_pool_to_graph(graph, arena, meta, gate) {
             attached_pools.push(meta.pool_index);
         }
     }
@@ -716,10 +820,19 @@ pub fn attach_missing_eligible_pools(
 }
 
 pub fn build_graph(arena: &StateArena, pools: &[PoolMeta]) -> RoutingGraph {
+    build_graph_with_gate(arena, pools, None)
+}
+
+#[must_use]
+pub fn build_graph_with_gate(
+    arena: &StateArena,
+    pools: &[PoolMeta],
+    gate: Option<&GraphBuildGate>,
+) -> RoutingGraph {
     let mut graph = RoutingGraph::new(arena.token_count());
 
     for meta in pools {
-        attach_pool_to_graph(&mut graph, arena, meta);
+        attach_pool_to_graph(&mut graph, arena, meta, gate);
     }
 
     finalize_graph_topology(arena, &mut graph);
@@ -746,11 +859,7 @@ pub fn rescore_dirty_pools_or_full(
         rescore_graph_in_place(arena, graph);
         GraphRescoreReport {
             mode: Some(GraphRescoreMode::Full),
-            edges_touched: graph
-                .adjacency
-                .iter()
-                .map(|adj| adj.len())
-                .sum(),
+            edges_touched: graph.adjacency.iter().map(|adj| adj.len()).sum(),
             dirty_pools: dirty_pools.len(),
         }
     } else {
@@ -1600,7 +1709,7 @@ mod tests {
         let mut meta1 = pool_meta_from_pair(pool1, ProtocolType::UniswapV4, c, d, 30);
         meta1.pool_id = Some(alloy::primitives::FixedBytes::repeat_byte(1));
 
-        attach_pool_to_graph(&mut graph, &arena, &meta0);
+        attach_pool_to_graph(&mut graph, &arena, &meta0, None);
         finalize_graph_topology(&arena, &mut graph);
         assert!(graph.pool_has_live_edges(pool0));
         assert!(!graph.pool_has_live_edges(pool1));
@@ -1633,5 +1742,54 @@ mod tests {
         assert_eq!(graph.pool_edge_positions[pool.0 as usize].len(), 2);
         assert_eq!(graph.adjacency[a.0 as usize].len(), 1);
         assert_eq!(graph.adjacency[b.0 as usize].len(), 1);
+    }
+
+    #[test]
+    fn graph_gate_keeps_hub_pool_and_drops_priced_non_hub_only_pair() {
+        use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, WMATIC};
+        use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
+
+        let mut arena = StateArena::default();
+        let hub = arena.register_token(WMATIC);
+        let tail_a = arena.register_token(Address::from([0xaau8; 20]));
+        let tail_b = arena.register_token(Address::from([0xbbu8; 20]));
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let hub_pool = arena.register_pool(
+            Address::from([0x01u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let tail_pool = arena.register_pool(
+            Address::from([0x02u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let hub_meta = pool_meta_from_pair(hub_pool, ProtocolType::UniswapV2, hub, tail_a, 30);
+        let tail_meta = pool_meta_from_pair(tail_pool, ProtocolType::UniswapV2, tail_a, tail_b, 30);
+
+        let mut rates = FxHashMap::default();
+        rates.insert(hub, MIN_TOKEN_TO_MATIC_RATE);
+        rates.insert(tail_a, MIN_TOKEN_TO_MATIC_RATE);
+        rates.insert(tail_b, MIN_TOKEN_TO_MATIC_RATE);
+
+        let gate = GraphBuildGate {
+            token_to_matic_rates: Arc::new(rates),
+            flash: Arc::new(FlashLiquiditySnapshot::default()),
+            flash_ttl: Duration::from_secs(60),
+        };
+
+        let gated = build_graph_with_gate(&arena, &[hub_meta, tail_meta], Some(&gate));
+        assert!(gated.pool_has_live_edges(hub_pool));
+        assert!(!gated.pool_has_live_edges(tail_pool));
     }
 }

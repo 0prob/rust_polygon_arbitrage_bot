@@ -239,6 +239,26 @@ mod tests {
         assert!(out > U256::ZERO);
         assert!(out <= state.balances[1]);
     }
+
+    #[test]
+    fn stable_ng_quote_matches_captured_wstpol_wpol_pool_magnitude() {
+        let state = CurvePoolState {
+            balances: vec![
+                U256::from(44_342_439_882_218_174_841_778u128),
+                U256::from(76_448_922_753_221_051_110_075u128),
+            ],
+            a: U256::from(500u64),
+            fee: U256::from(1_000_000u64),
+            rates: vec![U256::from(1_340_225_880_628_655_045u128), ONE],
+            n_coins: 2,
+            gamma: None,
+            d: None,
+        };
+
+        let out = get_curve_stable_amount_out(&state, U256::from(152_587_890_625_000u64), 1, 0);
+        assert!(out > U256::from(100_000_000_000_000u64), "out={out}");
+        assert!(out < U256::from(120_000_000_000_000u64), "out={out}");
+    }
 }
 
 #[cfg(test)]
