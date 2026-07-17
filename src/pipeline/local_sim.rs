@@ -276,18 +276,34 @@ pub fn simulate_hop_amount_out_with_cap(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinimalSimFailure {
     InvalidRoute,
-    MissingPool { hop: usize },
-    NonTradable { hop: usize },
+    MissingPool {
+        hop: usize,
+    },
+    NonTradable {
+        hop: usize,
+    },
     /// CL hop rejected: empty tick array (not yet hydrated).
-    ClTickless { hop: usize },
+    ClTickless {
+        hop: usize,
+    },
     /// CL hop input exceeds the spot-derived shallow liquidity cap.
-    ClCapExceeded { hop: usize },
+    ClCapExceeded {
+        hop: usize,
+    },
     /// Legacy aggregate — prefer `ClTickless` / `ClCapExceeded` when classified.
-    ShallowCl { hop: usize },
-    V2ReserveExhausted { hop: usize },
+    ShallowCl {
+        hop: usize,
+    },
+    V2ReserveExhausted {
+        hop: usize,
+    },
     /// Edge TokenIndex addresses disagree with Balancer/Woofi `state.tokens[idx]`.
-    TokenMismatch { hop: usize },
-    Math { hop: usize },
+    TokenMismatch {
+        hop: usize,
+    },
+    Math {
+        hop: usize,
+    },
     /// Edge protocol does not match arena `PoolState` variant (stale meta / wrong fetch).
     UnsupportedState {
         hop: usize,
@@ -295,7 +311,9 @@ pub enum MinimalSimFailure {
         actual: UnsupportedStateKind,
     },
     /// Balancer vault `MAX_IN_RATIO` (30%) — sim returns zero / BAL#304.
-    BalancerMaxInRatio { hop: usize },
+    BalancerMaxInRatio {
+        hop: usize,
+    },
     ZeroOutput {
         hop: usize,
         protocol: ProtocolType,
@@ -423,11 +441,7 @@ pub fn resolve_multi_token_vault_indices(
 /// Rewrite Balancer/Woofi `token_*_idx` to match live `state.tokens` addresses.
 /// Returns `false` when the edge tokens are absent from the vault (unrecoverable).
 #[must_use]
-pub fn realign_multi_token_edge(
-    arena: &StateArena,
-    state: &PoolState,
-    edge: &mut Edge,
-) -> bool {
+pub fn realign_multi_token_edge(arena: &StateArena, state: &PoolState, edge: &mut Edge) -> bool {
     if !matches!(
         edge.protocol,
         ProtocolType::BalancerV2 | ProtocolType::Woofi
@@ -676,7 +690,13 @@ pub fn micro_probe_insane_gross_phantom(
     token_decimals: u8,
     token_to_matic_rate: U256,
 ) -> bool {
-    probe_insane_gross_phantom(arena, edges, micro_probe, token_decimals, token_to_matic_rate)
+    probe_insane_gross_phantom(
+        arena,
+        edges,
+        micro_probe,
+        token_decimals,
+        token_to_matic_rate,
+    )
 }
 
 /// Rank probe now starts at economic floor (except tickless CL spot-cap). Cycles
@@ -820,7 +840,10 @@ pub fn tickless_cl_start_input_cap(
     if cl_amount_cap(arena, edges) != Some(U256::ZERO) {
         return None;
     }
-    Some(crate::pipeline::spot_price::spot_probe_for_token(arena, cycle_start))
+    Some(crate::pipeline::spot_price::spot_probe_for_token(
+        arena,
+        cycle_start,
+    ))
 }
 
 /// Max trade size with faithful CL simulation. `None` = full tick coverage.
@@ -1256,9 +1279,21 @@ mod tests {
     #[test]
     fn hop_drift_zero_refreshed_does_not_panic() {
         // Regression: refreshed hop amount 0 with non-zero baseline used to /0.
-        assert!(!hop_amount_within_drift(U256::from(100u64), U256::ZERO, 200));
-        assert!(!hop_amount_within_drift(U256::ZERO, U256::from(100u64), 200));
-        assert!(hop_amount_within_drift(U256::from(100u64), U256::from(100u64), 200));
+        assert!(!hop_amount_within_drift(
+            U256::from(100u64),
+            U256::ZERO,
+            200
+        ));
+        assert!(!hop_amount_within_drift(
+            U256::ZERO,
+            U256::from(100u64),
+            200
+        ));
+        assert!(hop_amount_within_drift(
+            U256::from(100u64),
+            U256::from(100u64),
+            200
+        ));
         assert!(hop_amount_within_drift(
             U256::from(10_000u64),
             U256::from(9_900u64),
@@ -1485,11 +1520,7 @@ mod tests {
             ..edge
         };
         assert_eq!(
-            first_v2_hop_below_reserve(
-                &arena,
-                &[v3_edge, edge],
-                U256::from(1_000_000u64)
-            ),
+            first_v2_hop_below_reserve(&arena, &[v3_edge, edge], U256::from(1_000_000u64)),
             None
         );
     }
@@ -2104,10 +2135,7 @@ mod tests {
         }];
         assert_eq!(cl_amount_cap(&arena, &edges), Some(U256::ZERO));
         let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
-        assert_eq!(
-            tickless_cl_start_input_cap(&arena, t0, &edges),
-            Some(probe)
-        );
+        assert_eq!(tickless_cl_start_input_cap(&arena, t0, &edges), Some(probe));
         // Ranking may quote tickless at spot-probe size; execution fidelity still refuses.
         assert!(
             simulate_route_minimal(&arena, &edges, probe).is_some(),

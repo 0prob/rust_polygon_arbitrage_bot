@@ -6,9 +6,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::local_sim::{
-    precompute_route_shallow_caps, simulate_route_minimal_with_caps,
-};
+use crate::pipeline::local_sim::{precompute_route_shallow_caps, simulate_route_minimal_with_caps};
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::spot_price::spot_probe_for_decimals;
 use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};

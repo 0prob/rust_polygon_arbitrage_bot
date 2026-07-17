@@ -6,8 +6,8 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::brent_diag::{
-    BrentOptimizeReject, record_brent_attempt, record_brent_bal_zero_other,
-    record_brent_cache_local, record_brent_cache_route, BrentEvalReject, BrentSimNoneKind,
+    BrentEvalReject, BrentOptimizeReject, BrentSimNoneKind, record_brent_attempt,
+    record_brent_bal_zero_other, record_brent_cache_local, record_brent_cache_route,
     record_brent_cl_depth_clamp, record_brent_eval_reject, record_brent_eval_sim, record_brent_ok,
     record_brent_reject, record_brent_seed_high_clamp, record_brent_shallow_hop,
     record_brent_sim_none_kind, record_brent_unsupported_protocol, record_brent_warm_seed,
@@ -23,12 +23,11 @@ use crate::pipeline::sim_sanity::{
     check_sim_sanity_for_dispatch, min_economic_amount_in,
 };
 use crate::pipeline::ternary_diag::{
-    TernaryBoundsReject, record_ternary_bounds_call, record_ternary_bounds_ok,
-    record_ternary_bounds_reject, record_ternary_economic_high_raise,
-    record_ternary_flash_cap_clamp, record_ternary_golden_zero_exit,
-    record_ternary_bal_high_clamp, record_ternary_cl_depth_clamp,
-    record_ternary_liquidity_cap_clamp, record_ternary_rate_fallback,
-    record_ternary_seed_high_clamp,
+    TernaryBoundsReject, record_ternary_bal_high_clamp, record_ternary_bounds_call,
+    record_ternary_bounds_ok, record_ternary_bounds_reject, record_ternary_cl_depth_clamp,
+    record_ternary_economic_high_raise, record_ternary_flash_cap_clamp,
+    record_ternary_golden_zero_exit, record_ternary_liquidity_cap_clamp,
+    record_ternary_rate_fallback, record_ternary_seed_high_clamp,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -191,9 +190,7 @@ where
                 // mid-window dead band exits without ever comparing ladder seeds.
                 if let Some((hint, _)) = warm
                     .iter()
-                    .filter(|(amt, score)| {
-                        *amt >= a && *amt <= b && !score.is_zero()
-                    })
+                    .filter(|(amt, score)| *amt >= a && *amt <= b && !score.is_zero())
                     .max_by_key(|(_, score)| *score)
                 {
                     let width = b.saturating_sub(a);
@@ -698,10 +695,7 @@ pub fn optimize_cycle(
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
-    let TernarySearchBounds {
-        mut low,
-        mut high,
-    } = compute_ternary_search_bounds(
+    let TernarySearchBounds { mut low, mut high } = compute_ternary_search_bounds(
         cycle,
         arena,
         token_to_matic_rates,
@@ -723,9 +717,7 @@ pub fn optimize_cycle(
     })?;
 
     let brent_shallow_caps = precompute_route_shallow_caps(arena, edges);
-    if let Some(tickless_high) =
-        tickless_cl_start_input_cap(arena, cycle.start_token, edges)
-    {
+    if let Some(tickless_high) = tickless_cl_start_input_cap(arena, cycle.start_token, edges) {
         if tickless_high.is_zero() {
             record_brent_reject(BrentOptimizeReject::ClCapZero);
             crate::trace!("optimize_cycle: tickless CL cap is zero");
@@ -1070,14 +1062,16 @@ mod tests {
     #[test]
     fn balancer_max_in_high_clamp_noop_without_balancer() {
         // Empty edge list → no Balancer hops → no clamp.
-        assert!(balancer_max_in_high_clamp(
-            &StateArena::default(),
-            &[],
-            U256::from(1u8),
-            U256::from(100u8),
-            U256::from(1u8),
-        )
-        .is_none());
+        assert!(
+            balancer_max_in_high_clamp(
+                &StateArena::default(),
+                &[],
+                U256::from(1u8),
+                U256::from(100u8),
+                U256::from(1u8),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1123,7 +1117,9 @@ mod tests {
         )];
         assert!(clamp_brent_high_to_probe_seeds(high, low, floor, &dust).is_none());
         // Already-tight high is left alone.
-        assert!(clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds).is_none());
+        assert!(
+            clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds).is_none()
+        );
     }
 
     #[test]

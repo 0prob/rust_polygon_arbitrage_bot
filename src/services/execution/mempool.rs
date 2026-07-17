@@ -27,8 +27,8 @@ pub fn decide_mempool_gate(
             pending_ahead: false,
         };
     }
-    let waiting_on_recent_local_submit = last_global_submit
-        .is_some_and(|t| now.saturating_duration_since(t) <= stall_timeout);
+    let waiting_on_recent_local_submit =
+        last_global_submit.is_some_and(|t| now.saturating_duration_since(t) <= stall_timeout);
     if waiting_on_recent_local_submit {
         return MempoolGateDecision {
             allow_submit: false,
@@ -59,7 +59,13 @@ mod tests {
     #[test]
     fn blocks_while_recent_local_submit_pending() {
         let t0 = now();
-        let d = decide_mempool_gate(5, 7, Some(t0), t0 + Duration::from_secs(5), MEMPOOL_STALL_TIMEOUT);
+        let d = decide_mempool_gate(
+            5,
+            7,
+            Some(t0),
+            t0 + Duration::from_secs(5),
+            MEMPOOL_STALL_TIMEOUT,
+        );
         assert!(!d.allow_submit);
         assert!(!d.pending_ahead);
     }

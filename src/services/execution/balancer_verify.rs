@@ -16,9 +16,7 @@ use crate::pipeline::arena::StateArena;
 use crate::services::execution::calldata::encoders::balancer::{
     build_balancer_batch_swap_request, encode_balancer_batch_route,
 };
-use crate::services::execution::calldata::{
-    CalldataHop, ExecutorEntrypoint, build_arb_calldata,
-};
+use crate::services::execution::calldata::{CalldataHop, ExecutorEntrypoint, build_arb_calldata};
 use crate::services::execution::profit::on_chain_min_profit_for_route;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);

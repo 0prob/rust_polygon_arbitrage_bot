@@ -9,6 +9,7 @@ use tokio::time::timeout;
 use crate::config::AppConfig;
 use crate::config::WalletSecrets;
 use crate::core::constants::BPS_SCALE;
+use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 use crate::core::types::{FlashLoanSource, FoundCycle, ProtocolType};
 use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
@@ -16,14 +17,14 @@ use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
     cycle_tickless_cl_all_on_miss_cooldown, dispatch_profitable_candidates,
-    drain_cooldown_stuck_tickless_cycles,
-    filter_balancer_onchain_verified, hydrate_tickless_cl_for_cycles, probe_near_miss_balancer,
-    refresh_and_resim_profitable,
+    drain_cooldown_stuck_tickless_cycles, filter_balancer_onchain_verified,
+    hydrate_tickless_cl_for_cycles, probe_near_miss_balancer, refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::sim_sanity::{matic_usd_for_flash_cap, min_economic_amount_in};
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
+use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
 };
@@ -32,19 +33,15 @@ use crate::services::execution::{
     rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
-use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::oracle::price_oracle::PriceOracle;
-use crate::services::oracle::{
-    resolve_token_decimals_for_index, resolve_token_to_matic_rate,
-};
-use crate::util::ten_pow_u256;
+use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::services::partial_cache::PartialPoolCache;
 use crate::services::state_cache::StateCache;
-use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::state_refresh::{PoolRefreshResult, StateRefreshService};
 use crate::util::now_ms;
+use crate::util::ten_pow_u256;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub struct HfContext {
@@ -134,7 +131,11 @@ fn build_hf_candidate_ui_rows(
     dispatch: &[HfEvalResult],
     near_miss: Option<&HfEvalResult>,
 ) -> Vec<HfCandidateUiRow> {
-    let mut out = Vec::with_capacity(dispatch.len().saturating_add(usize::from(near_miss.is_some())));
+    let mut out = Vec::with_capacity(
+        dispatch
+            .len()
+            .saturating_add(usize::from(near_miss.is_some())),
+    );
     for result in dispatch {
         out.push(hf_eval_to_ui_row(arena, pool_metas, result, false));
     }
@@ -192,21 +193,14 @@ async fn hf_flash_prefetch_stale(
         crate::debug!("flash loan: hf_prefetch skipped stale={stale_n} (refresh inflight)");
         return;
     };
-    match timeout(
-        flash_budget,
-        flash_cache.refresh_with_fallback(rpc, &stale),
-    )
-    .await
-    {
+    match timeout(flash_budget, flash_cache.refresh_with_fallback(rpc, &stale)).await {
         Ok(Ok(generation)) => {
             crate::info!(
                 "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation}"
             );
         }
         Ok(Err(e)) => {
-            crate::info!(
-                "flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}"
-            );
+            crate::info!("flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}");
         }
         Err(_) => crate::info!(
             "flash loan: hf_prefetch timeout_ms={} stale={stale_n} fresh={fresh_n}",
@@ -380,7 +374,10 @@ fn cycle_with_reliable_start(
 /// True when any start-rotation of `edges` is quarantined. Assess may Aave-rotate
 /// after select; `cycle_key` includes hop order + vault idxs so a single fp miss
 /// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
-fn cycle_edges_quarantined(execution: &ExecutionService, edges: &[crate::core::types::Edge]) -> bool {
+fn cycle_edges_quarantined(
+    execution: &ExecutionService,
+    edges: &[crate::core::types::Edge],
+) -> bool {
     let n = edges.len();
     if n == 0 {
         return false;
@@ -576,7 +573,8 @@ fn select_cycles_for_rescore(
     let activity_now = now_ms();
     // Partition during the filter pass: actives (score>0) and inactives separately so we
     // never full-sort the combined list. Hot routes are activity-first; cold routes rotate.
-    let mut active: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len().min(rescore_cap.saturating_mul(2)));
+    let mut active: Vec<(Arc<FoundCycle>, u64)> =
+        Vec::with_capacity(snap_cycles.len().min(rescore_cap.saturating_mul(2)));
     let mut inactive: Vec<Arc<FoundCycle>> = Vec::with_capacity(snap_cycles.len());
     let mut quarantine_skipped = 0usize;
     let mut rate_skipped = 0usize;
@@ -603,8 +601,7 @@ fn select_cycles_for_rescore(
         };
         // Recover Balancer/Woofi vault-index skew (meta vs getPoolTokens) before
         // quarantine/micro-dead — otherwise we only prune recoverable liquidity.
-        let Some(ready) =
-            crate::pipeline::local_sim::realign_multi_token_found_cycle(arena, ready)
+        let Some(ready) = crate::pipeline::local_sim::realign_multi_token_found_cycle(arena, ready)
         else {
             micro_dead_skipped += 1;
             continue;
@@ -677,11 +674,15 @@ fn select_cycles_for_rescore(
                 &ready.edges,
                 economic_floor,
             ) {
-                Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
+                Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio {
+                    ..
+                }) => {
                     bal_floor_dead_skipped += 1;
                     continue;
                 }
-                Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
+                Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted {
+                    ..
+                }) => {
                     v2_dead_skipped += 1;
                     continue;
                 }
@@ -792,8 +793,8 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: 0,
-            candidates: Vec::new(),
-        });
+                candidates: Vec::new(),
+            });
         }
     }
 
@@ -934,8 +935,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                    candidates: Vec::new(),
+                });
             }
         }
     }
@@ -943,8 +944,7 @@ pub async fn run_hf_tick(
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
     let skip_prefetch = stream_triggered && pipeline.stream_enabled;
     let mut prefetch_ok = skip_prefetch;
-    let pool_prefetch_budget =
-        Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+    let pool_prefetch_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
     let pool_prefetch_started = now_ms();
 
     if stream_triggered && pipeline.stream_enabled {
@@ -986,8 +986,8 @@ pub async fn run_hf_tick(
                             profitable_count: 0,
                             best_profit: U256::ZERO,
                             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                            candidates: Vec::new(),
+                        });
                     }
                 }
                 Ok(Err(e)) => {
@@ -997,8 +997,8 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                        candidates: Vec::new(),
+                    });
                 }
                 Err(_) => {
                     crate::warn!(
@@ -1010,8 +1010,8 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                        candidates: Vec::new(),
+                    });
                 }
             }
         } else if flushed > 0 {
@@ -1039,11 +1039,8 @@ pub async fn run_hf_tick(
             )
             .await
         };
-        let flash_fut = hf_flash_prefetch_stale(
-            flash_cache.as_ref(),
-            rpc.as_ref(),
-            &flash_token_list,
-        );
+        let flash_fut =
+            hf_flash_prefetch_stale(flash_cache.as_ref(), rpc.as_ref(), &flash_token_list);
         let (pool_out, _) = tokio::join!(pool_fut, flash_fut);
         match pool_out {
             Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
@@ -1100,8 +1097,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                    candidates: Vec::new(),
+                });
             }
         }
     }
@@ -1151,8 +1148,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                    candidates: Vec::new(),
+                });
             }
             Err(_) => {
                 warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
@@ -1161,8 +1158,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                    candidates: Vec::new(),
+                });
             }
         },
     };
@@ -1170,13 +1167,8 @@ pub async fn run_hf_tick(
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
-    let probe_tick_budget = Duration::from_millis(
-        ctx.config
-            .pipeline
-            .hf_prefetch_budget_ms
-            .min(900)
-            .max(200),
-    );
+    let probe_tick_budget =
+        Duration::from_millis(ctx.config.pipeline.hf_prefetch_budget_ms.min(900).max(200));
     let probe_tick_started = now_ms();
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
@@ -1277,8 +1269,8 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
-        });
+                candidates: Vec::new(),
+            });
         }
     };
     ctx.inactive_rotation
@@ -1332,9 +1324,7 @@ pub async fn run_hf_tick(
         } else {
             U256::ZERO
         };
-        let gas_shortfall_matic = assessment
-            .gas_cost_wei
-            .saturating_sub(available_matic);
+        let gas_shortfall_matic = assessment.gas_cost_wei.saturating_sub(available_matic);
         let gas_cover_bps = if assessment.gas_cost_wei.is_zero() {
             0u64
         } else {
@@ -1506,8 +1496,7 @@ pub async fn run_hf_tick(
     let elapsed_ms = now_ms().saturating_sub(start);
 
     if cycles_considered > 0 {
-        let log_summary =
-            profitable_count > 0 || stream_triggered || should_log_hf_summary();
+        let log_summary = profitable_count > 0 || stream_triggered || should_log_hf_summary();
         if log_summary {
             crate::info!(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"

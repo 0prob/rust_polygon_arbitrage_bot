@@ -794,11 +794,7 @@ impl StateRefreshService {
                 };
                 selected_pools.push(pool.clone());
             }
-            (
-                addrs,
-                selected_pools,
-                Arc::clone(&state.address_index),
-            )
+            (addrs, selected_pools, Arc::clone(&state.address_index))
         };
         if selected_pools.is_empty() {
             return Ok(PoolRefreshResult::default());
@@ -977,10 +973,7 @@ fn dedupe_sorted_addresses(addresses: &[Address]) -> Vec<Address> {
 
 fn rebuild_discovery_indexes(
     pools: &[DiscoveredPool],
-) -> (
-    FxHashMap<String, usize>,
-    Arc<FxHashMap<Address, usize>>,
-) {
+) -> (FxHashMap<String, usize>, Arc<FxHashMap<Address, usize>>) {
     let mut pool_key_index =
         FxHashMap::with_capacity_and_hasher(pools.len(), rustc_hash::FxBuildHasher);
     let mut address_index =
@@ -1019,24 +1012,30 @@ mod tests {
     fn prefetch_tick_succeeded_when_nothing_stale_or_updates_applied() {
         use super::PoolRefreshResult;
 
-        assert!(PoolRefreshResult {
-            attempted: false,
-            updated: 0,
-            matched: 12,
-        }
-        .prefetch_tick_succeeded());
-        assert!(PoolRefreshResult {
-            attempted: true,
-            updated: 3,
-            matched: 12,
-        }
-        .prefetch_tick_succeeded());
-        assert!(!PoolRefreshResult {
-            attempted: true,
-            updated: 0,
-            matched: 12,
-        }
-        .prefetch_tick_succeeded());
+        assert!(
+            PoolRefreshResult {
+                attempted: false,
+                updated: 0,
+                matched: 12,
+            }
+            .prefetch_tick_succeeded()
+        );
+        assert!(
+            PoolRefreshResult {
+                attempted: true,
+                updated: 3,
+                matched: 12,
+            }
+            .prefetch_tick_succeeded()
+        );
+        assert!(
+            !PoolRefreshResult {
+                attempted: true,
+                updated: 0,
+                matched: 12,
+            }
+            .prefetch_tick_succeeded()
+        );
     }
 
     #[test]

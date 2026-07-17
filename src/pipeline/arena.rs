@@ -49,8 +49,11 @@ fn sync_pool_graph_eligible(
     // Missing decimal hints used to fail closed (`known_token_decimals?` → None)
     // and permanently exclude live Uni V3 venues from the arena/universe. Fall
     // back to 18 like the no-hints path; still reject unbounded metadata.
-    let pair_input_decimals = pool.tokens.first().zip(pool.tokens.get(1)).and_then(
-        |(a0, a1)| match decimal_hints {
+    let pair_input_decimals = pool
+        .tokens
+        .first()
+        .zip(pool.tokens.get(1))
+        .and_then(|(a0, a1)| match decimal_hints {
             Some(h) => {
                 let d0 = h.get(a0).copied().unwrap_or(18);
                 let d1 = h.get(a1).copied().unwrap_or(18);
@@ -62,8 +65,7 @@ fn sync_pool_graph_eligible(
                 }
             }
             None => Some((18, 18)),
-        },
-    );
+        });
     crate::pipeline::graph::pool_state_graph_eligible(
         None,
         state,
@@ -595,8 +597,7 @@ impl StateArena {
         decimal_hints: Option<&FxHashMap<Address, u8>>,
         touch_layout: bool,
     ) -> crate::pipeline::types::PoolMeta {
-        let pool_index =
-            self.register_pool_inner(pool.address, Arc::clone(&state), touch_layout);
+        let pool_index = self.register_pool_inner(pool.address, Arc::clone(&state), touch_layout);
         let token_indices =
             self.token_indices_for_pool(state.as_ref(), pool, decimal_hints, touch_layout);
         pool_meta_from_synced(pool, pool_index, &token_indices, state.as_ref())
@@ -614,21 +615,17 @@ impl StateArena {
         // Woofi) can be borrowed directly. Dodo always allocates: meta order
         // must be [base, quote] so token_in_idx 0 ⇔ sellBase matches sim,
         // capacity, and encode (indexer discovery order is not authoritative).
-        let token_addrs: &[Address];
+
         let dodo_owned; // extends lifetime of the Dodo [base, quote] vec
-        match state {
-            PoolState::Balancer(b) if !b.tokens.is_empty() => {
-                token_addrs = &b.tokens;
-            }
-            PoolState::Woofi(w) if !w.tokens.is_empty() => {
-                token_addrs = &w.tokens;
-            }
+        let token_addrs: &[Address] = match state {
+            PoolState::Balancer(b) if !b.tokens.is_empty() => &b.tokens,
+            PoolState::Woofi(w) if !w.tokens.is_empty() => &w.tokens,
             PoolState::Dodo(d) if !d.base_token.is_zero() && !d.quote_token.is_zero() => {
                 dodo_owned = vec![d.base_token, d.quote_token];
-                token_addrs = &dodo_owned;
+                &dodo_owned
             }
-            _ => token_addrs = &pool.tokens,
-        }
+            _ => &pool.tokens,
+        };
         let mut token_indices = Vec::with_capacity(token_addrs.len());
         for &addr in token_addrs {
             token_indices.push(self.register_token_with_hints_inner(
@@ -652,8 +649,7 @@ fn pool_meta_from_synced(
     // on V3 arena → graph/probe UnsupportedState). Prefer arena family; keep
     // `protocol_label` for Algebra/factory selection at execution time.
     if !crate::pipeline::local_sim::protocol_matches_pool_state(meta.protocol, state) {
-        let corrected =
-            crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
+        let corrected = crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
         if corrected != meta.protocol {
             META_PROTOCOL_CORRECTED.fetch_add(1, Ordering::Relaxed);
             meta.protocol = corrected;
@@ -1304,7 +1300,11 @@ mod tests {
             panic!("expected v3");
         };
         assert_eq!(s.liquidity, 1_100_000);
-        assert_eq!(s.ticks.len(), 1, "LF ticks must survive HF hot-cache overlay");
+        assert_eq!(
+            s.ticks.len(),
+            1,
+            "LF ticks must survive HF hot-cache overlay"
+        );
         assert_eq!(s.ticks[0].tick, 0);
     }
 
@@ -1560,7 +1560,9 @@ mod tests {
             .collect();
         let mut arena = StateArena::default();
         assert_eq!(
-            arena.sync_from_discovery(&cache, &discovered, &address_index, None).len(),
+            arena
+                .sync_from_discovery(&cache, &discovered, &address_index, None)
+                .len(),
             1
         );
         cache.insert(

@@ -113,8 +113,8 @@ mod tests {
             router: None,
             hooks: None,
         };
-        let calls = encode_v2_hop(&arena, &hop, Address::repeat_byte(0xee), 50, false)
-            .expect("encode");
+        let calls =
+            encode_v2_hop(&arena, &hop, Address::repeat_byte(0xee), 50, false).expect("encode");
         assert_eq!(calls.len(), 2);
         // swap calldata: selector + amount0Out + amount1Out + to + data offset/len
         // data must be empty — last dynamic section length word is 0.
@@ -124,9 +124,13 @@ mod tests {
         let amount1 = U256::from_be_slice(&swap_data[4 + 32..4 + 64]);
         assert!(!amount1.is_zero());
         // Empty `data` encodes as offset + length 0 (no payload bytes after head).
-        let data_offset = usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128])).unwrap();
+        let data_offset =
+            usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128])).unwrap();
         let len_word_at = 4 + data_offset;
         let data_len = U256::from_be_slice(&swap_data[len_word_at..len_word_at + 32]);
-        assert!(data_len.is_zero(), "v2 pre-fund path must use empty callback data");
+        assert!(
+            data_len.is_zero(),
+            "v2 pre-fund path must use empty callback data"
+        );
     }
 }

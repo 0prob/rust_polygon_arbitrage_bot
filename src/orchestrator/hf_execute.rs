@@ -36,9 +36,9 @@ use crate::services::execution::balancer_verify::{
     log_balancer_prepare_gate_summary, query_balancer_batch_profit, record_balancer_batch_reject,
     record_balancer_filter_accept, record_balancer_filter_window, record_balancer_prepare_skip,
 };
-use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
+use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
     prepare_evaluated_route,
@@ -48,9 +48,13 @@ use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
 use crate::services::state_refresh::PoolRefreshResult;
 
 enum RoutePoolRefreshAbort {
-    NotIndexed { pool_count: usize },
+    NotIndexed {
+        pool_count: usize,
+    },
     /// Fetch ran but no pool state was written (cache was cleared pre-refresh).
-    NoUpdates { pool_count: usize },
+    NoUpdates {
+        pool_count: usize,
+    },
     Rpc(anyhow::Error),
 }
 
@@ -943,10 +947,7 @@ pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
 /// Previously used at HF selection (over-pruned to `selected=0`); select now uses
 /// [`cycle_tickless_cl_all_on_miss_cooldown`]. Kept for unit tests / hydrate helpers.
 #[allow(dead_code)]
-pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
-    arena: &StateArena,
-    cycle: &FoundCycle,
-) -> bool {
+pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(arena: &StateArena, cycle: &FoundCycle) -> bool {
     for edge in &cycle.edges {
         if !matches!(
             edge.protocol,
@@ -1057,8 +1058,7 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
         stats.cycles_tickless_after = stats.cycles_tickless_before;
         return stats;
     }
-    let (v3_total, v3) =
-        tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
+    let (v3_total, v3) = tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
     let (v4_total, v4) =
         tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
     stats.v3_total = v3_total;
@@ -1630,16 +1630,11 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         }
         BatchQueryOutcome::NonPositiveDelta(delta) => {
             execution.quarantine_batch_query_failure(fp);
-            log_balancer_verify_diag(arena, result, &hops);
             crate::info!(
                 "hf near-miss-verify: fp={fp} route={route} phantom sim modeled={modeled} vault_delta={delta} quarantined",
             );
         }
         BatchQueryOutcome::RpcError(reason) => {
-            // BAL#521 TOKEN_NOT_REGISTERED and similar vault rejects need hop-level
-            // pool_id/token evidence; the bare RPC string alone cannot distinguish
-            // stale indices from a wrong pool_id.
-            log_balancer_verify_diag(arena, result, &hops);
             crate::info!(
                 "hf near-miss-verify: fp={fp} route={route} rpc_error={reason} modeled={modeled}"
             );
@@ -1652,67 +1647,6 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
                 "hf near-miss-verify: fp={fp} route={route} build_decode_failed modeled={modeled}"
             );
         }
-    }
-}
-
-fn log_balancer_verify_diag(
-    arena: &StateArena,
-    result: &HfEvalResult,
-    hops: &[crate::services::execution::calldata::CalldataHop],
-) {
-    use crate::core::types::{BalancerPoolKind, PoolState};
-    let mut hop = U256::ZERO;
-    for (i, h) in hops.iter().enumerate() {
-        let edge = &h.edge;
-        let Some(addr) = arena.pool_address(edge.pool_index) else {
-            continue;
-        };
-        // Balancer V2 poolId specialization: first 20 bytes are the pool contract.
-        let pool_id_prefix = h.pool_id.map(|id| Address::from_slice(&id.as_slice()[..20]));
-        let pool_id_matches_addr = pool_id_prefix == Some(addr);
-        let detail = match arena.pool_state(edge.pool_index) {
-            Some(PoolState::Balancer(s)) => {
-                let tin = edge.token_in_idx as usize;
-                let tout = edge.token_out_idx as usize;
-                let kind = match s.pool_type {
-                    BalancerPoolKind::Weighted => "weighted",
-                    BalancerPoolKind::Stable => "stable",
-                    BalancerPoolKind::Linear => "linear",
-                };
-                let sim_out =
-                    crate::core::math::balancer::simulate_balancer_swap(s, h.amount_in, tin, tout);
-                let state_tin = s.tokens.get(tin).copied();
-                let state_tout = s.tokens.get(tout).copied();
-                let tin_registered = s.tokens.iter().any(|t| *t == h.token_in);
-                let tout_registered = s.tokens.iter().any(|t| *t == h.token_out);
-                let tin_idx_ok = state_tin == Some(h.token_in);
-                let tout_idx_ok = state_tout == Some(h.token_out);
-                let state_pool_id_prefix = s
-                    .pool_id
-                    .map(|id| Address::from_slice(&id.as_slice()[..20]));
-                format!(
-                    "pool={addr} kind={kind} pool_id={:?} pool_id_prefix={pool_id_prefix:?} pool_id_ok={pool_id_matches_addr} state_pool_id_prefix={state_pool_id_prefix:?} tin={tin} tout={tout} hop_tin={} hop_tout={} state_tin={state_tin:?} state_tout={state_tout:?} tin_reg={tin_registered} tout_reg={tout_registered} tin_idx_ok={tin_idx_ok} tout_idx_ok={tout_idx_ok} state_tokens={:?} bal_in={} bal_out={} amt_in={} sim_out={sim_out} bpt={:?}",
-                    h.pool_id,
-                    h.token_in,
-                    h.token_out,
-                    s.tokens,
-                    s.balances.get(tin).copied().unwrap_or_default(),
-                    s.balances.get(tout).copied().unwrap_or_default(),
-                    h.amount_in,
-                    s.bpt_index,
-                )
-            }
-            _ => format!(
-                "non_balancer_state pool={addr} pool_id={:?} pool_id_prefix={pool_id_prefix:?} pool_id_ok={pool_id_matches_addr} hop_tin={} hop_tout={}",
-                h.pool_id, h.token_in, h.token_out,
-            ),
-        };
-        crate::info!(
-            "hf balancer-verify-hop[{i}]: fp={} route_amt={} {detail}",
-            result.route_fingerprint,
-            if i == 0 { result.sim.amount_in } else { hop },
-        );
-        hop = h.amount_out;
     }
 }
 
@@ -1898,18 +1832,9 @@ mod tests {
         assert!(all_stuck.is_empty());
 
         // Selection skip keys off cooldown membership even when LF still has ticks.
-        assert!(cycle_has_cl_pool_on_miss_cooldown(
-            &arena,
-            &mk(dead, 5)
-        ));
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(
-            &arena,
-            &mk(live, 6)
-        ));
+        assert!(cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 5)));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(live, 6)));
         clear_tick_miss_cooldown(&[addr_dead]);
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(
-            &arena,
-            &mk(dead, 7)
-        ));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 7)));
     }
 }

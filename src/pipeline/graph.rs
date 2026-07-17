@@ -157,7 +157,9 @@ pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallV
     // Balancer/Woofi indices must follow vault/oracle token order (state.tokens), not
     // discovery meta order — a mismatch yields phantom local sim and BAL#521 on-chain.
     let (n, bpt) = match state {
-        PoolState::Balancer(b) if !b.tokens.is_empty() => (b.tokens.len(), b.bpt_index.or(meta.bpt_index)),
+        PoolState::Balancer(b) if !b.tokens.is_empty() => {
+            (b.tokens.len(), b.bpt_index.or(meta.bpt_index))
+        }
         PoolState::Woofi(w) if !w.tokens.is_empty() => (w.tokens.len(), None),
         _ => (meta.tokens.len(), meta.bpt_index),
     };
@@ -357,9 +359,7 @@ pub fn resolve_lazy_swap_edge(
             {
                 (pending.token_in_idx, token_out_idx)
             } else {
-                crate::pipeline::local_sim::resolve_multi_token_vault_indices(
-                    &b.tokens, tin, tout,
-                )?
+                crate::pipeline::local_sim::resolve_multi_token_vault_indices(&b.tokens, tin, tout)?
             }
         }
         PoolState::Woofi(w) if !w.tokens.is_empty() => {
@@ -370,9 +370,7 @@ pub fn resolve_lazy_swap_edge(
             {
                 (pending.token_in_idx, token_out_idx)
             } else {
-                crate::pipeline::local_sim::resolve_multi_token_vault_indices(
-                    &w.tokens, tin, tout,
-                )?
+                crate::pipeline::local_sim::resolve_multi_token_vault_indices(&w.tokens, tin, tout)?
             }
         }
         _ => (pending.token_in_idx, token_out_idx),
@@ -562,8 +560,7 @@ fn pool_has_admissible_edges(
         return true;
     };
     let has_priced_token = meta.tokens.iter().enumerate().any(|(i, &token)| {
-        bpt_index != Some(i)
-            && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
+        bpt_index != Some(i) && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
     });
     if has_priced_token {
         return true;
@@ -1874,7 +1871,11 @@ mod tests {
         assert!(graph.pool_has_live_edges(pool1));
         // New tokens must sit in the token region, not collide with the V4 hub slot.
         assert_eq!(graph.token_count, arena.token_count());
-        assert!(graph.v4_singleton_hub.is_some_and(|h| h >= graph.token_count));
+        assert!(
+            graph
+                .v4_singleton_hub
+                .is_some_and(|h| h >= graph.token_count)
+        );
         assert!(c.0 < graph.token_count && d.0 < graph.token_count);
         assert!(
             graph

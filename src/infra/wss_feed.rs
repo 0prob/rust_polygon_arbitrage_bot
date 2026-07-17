@@ -238,7 +238,7 @@ impl PoolLogFeed {
         static RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let raw = RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if raw == 1 || raw % 100 == 0 {
+        if raw == 1 || raw.is_multiple_of(100) {
             info!(
                 "WSS raw log: n={raw} pool={pool} topic0={topic0} data_len={}",
                 data.len()
@@ -255,7 +255,7 @@ impl PoolLogFeed {
             .apply_log_notify(pool, topic0, data, ts, wake_hf)
         {
             let miss = MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if miss == 1 || miss % 50 == 0 {
+            if miss == 1 || miss.is_multiple_of(50) {
                 warn!(
                     "WSS log decode miss: n={miss} pool={pool} topic0={topic0} data_len={}",
                     data.len()

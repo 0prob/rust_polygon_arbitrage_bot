@@ -229,8 +229,7 @@ pub fn optimizer_pinned_at_floor(input: SimSanityInput) -> bool {
     let Some(pin_ceiling) = optimizer_pin_ceiling(input.search_low) else {
         return false;
     };
-    input.amount_in <= pin_ceiling
-        && input.gross_profit > input.amount_in / U256::from(20u64)
+    input.amount_in <= pin_ceiling && input.gross_profit > input.amount_in / U256::from(20u64)
 }
 
 /// Dispatch/Brent final check: pinned-at-floor can be a real high-ROI arb on shallow pools.
@@ -436,14 +435,16 @@ mod tests {
             }),
             Err(SimSanityReject::OptimizerPinnedAtFloor)
         ));
-        assert!(check_sim_sanity(SimSanityInput {
-            amount_in,
-            gross_profit: profit,
-            search_low: U256::ZERO,
-            token_decimals: 18,
-            token_to_matic_rate: rate,
-        })
-        .is_ok());
+        assert!(
+            check_sim_sanity(SimSanityInput {
+                amount_in,
+                gross_profit: profit,
+                search_low: U256::ZERO,
+                token_decimals: 18,
+                token_to_matic_rate: rate,
+            })
+            .is_ok()
+        );
     }
 
     #[test]

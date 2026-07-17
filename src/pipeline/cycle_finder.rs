@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -823,7 +823,7 @@ fn collect_cycles_dfs_single_start(
                         max_cycles,
                         budget,
                         global_cap,
-                    cycles,
+                        cycles,
                         seen,
                     );
                 }
@@ -874,7 +874,7 @@ fn collect_cycles_dfs_single_start(
                         max_cycles,
                         budget,
                         global_cap,
-                    cycles,
+                        cycles,
                         seen,
                     );
                     path.pop();
@@ -1618,25 +1618,22 @@ mod tests {
         assert_eq!(cycles.len(), 3);
     }
 
-    fn ranked_cycle(
-        pool: u32,
-        protocol: ProtocolType,
-        ratio: u64,
-        score: f64,
-    ) -> FoundCycle {
+    fn ranked_cycle(pool: u32, protocol: ProtocolType, ratio: u64, score: f64) -> FoundCycle {
         FoundCycle {
             start_token: TokenIndex(0),
-            edges: CycleEdges::from([Edge {
-                pool_index: PoolIndex(pool),
-                token_in: TokenIndex(0),
-                token_out: TokenIndex(1),
-                token_in_idx: 0,
-                token_out_idx: 1,
-                protocol,
-                fee_bps: 30,
-                zero_for_one: true,
-            }]
-            .as_slice()),
+            edges: CycleEdges::from(
+                [Edge {
+                    pool_index: PoolIndex(pool),
+                    token_in: TokenIndex(0),
+                    token_out: TokenIndex(1),
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                }]
+                .as_slice(),
+            ),
             hop_count: 1,
             log_weight: score,
             cumulative_fee_bps: 30,
@@ -1661,10 +1658,7 @@ mod tests {
         ];
         let selected = apply_protocol_diverse_selection(cycles, 3);
         assert_eq!(selected.len(), 3);
-        let pools: Vec<u32> = selected
-            .iter()
-            .map(|c| c.edges[0].pool_index.0)
-            .collect();
+        let pools: Vec<u32> = selected.iter().map(|c| c.edges[0].pool_index.0).collect();
         assert!(pools.contains(&1), "missing best V2: {pools:?}");
         assert!(pools.contains(&10), "missing best Balancer: {pools:?}");
         assert!(
@@ -1735,7 +1729,12 @@ mod tests {
         // One V3 cycle, many V2 — RR should not stall after V3 empties.
         let mut cycles = vec![ranked_cycle(99, ProtocolType::UniswapV3, 900, -9.0)];
         for i in 0..5u32 {
-            cycles.push(ranked_cycle(i, ProtocolType::UniswapV2, 500 - i as u64, -5.0));
+            cycles.push(ranked_cycle(
+                i,
+                ProtocolType::UniswapV2,
+                500 - i as u64,
+                -5.0,
+            ));
         }
         let selected = apply_protocol_diverse_selection(cycles, 4);
         assert_eq!(selected.len(), 4);

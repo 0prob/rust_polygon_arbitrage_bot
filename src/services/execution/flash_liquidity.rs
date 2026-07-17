@@ -699,11 +699,7 @@ pub fn dodo_base_flash_pool_for_cycle(arena: &StateArena, cycle: &FoundCycle) ->
 
 /// True when a DODO pool address is also a swap hop in the cycle (flash-incompatible).
 #[must_use]
-pub fn dodo_pool_is_route_swap_hop(
-    arena: &StateArena,
-    cycle: &FoundCycle,
-    pool: Address,
-) -> bool {
+pub fn dodo_pool_is_route_swap_hop(arena: &StateArena, cycle: &FoundCycle, pool: Address) -> bool {
     cycle.edges.iter().any(|edge| {
         matches!(arena.pool_state(edge.pool_index), Some(PoolState::Dodo(_)))
             && arena.pool_address(edge.pool_index) == Some(pool)
@@ -1754,13 +1750,7 @@ mod tests {
         };
         // has_dodo=false: cycle-local only (reentrancy-incompatible).
         assert_eq!(
-            align_flash_source_for_dispatch(
-                FlashLoanSource::Dodo,
-                &liquidity,
-                false,
-                false,
-                true
-            ),
+            align_flash_source_for_dispatch(FlashLoanSource::Dodo, &liquidity, false, false, true),
             None
         );
         assert_eq!(
@@ -1784,7 +1774,13 @@ mod tests {
             dodo: U256::MAX,
         };
         assert_eq!(
-            align_flash_source_for_dispatch(FlashLoanSource::Balancer, &liquidity, false, false, true),
+            align_flash_source_for_dispatch(
+                FlashLoanSource::Balancer,
+                &liquidity,
+                false,
+                false,
+                true
+            ),
             None
         );
     }
@@ -1973,7 +1969,11 @@ mod tests {
         }
         cache.track_hot_tokens(&old);
         let new_batch: Vec<Address> = (0u8..6)
-            .map(|i| Address::from([0xfe, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .map(|i| {
+                Address::from([
+                    0xfe, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ])
+            })
             .collect();
         cache.track_hot_tokens(&new_batch);
         let hot = cache.hot_tokens_for_test();

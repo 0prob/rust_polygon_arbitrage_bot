@@ -91,7 +91,7 @@ pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 50_000;
 /// "profits" that dry-ran `ExternalCallFailed`. Even 2 POL still admitted a
 /// ~1.1 MATIC DODO→V4 phantom. Cap at 1 POL: above gas (~0.2) for real near-misses,
 /// below typical V4 local-sim artifacts.
-pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 1u128 * 10u128.pow(18);
+pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 10u128.pow(18);
 
 /// Per-hop gas seeds for route simulation (Polygon executor context).
 /// GasOracle.record_sim_observed calibrates global uplift; per-route

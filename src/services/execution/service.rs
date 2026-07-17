@@ -617,8 +617,8 @@ impl ExecutionService {
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
     /// Returns true only when a *new* cooldown was applied (not on refresh / first strike).
     pub fn quarantine_chronic_gas_underwater(&self, fingerprint: u64, gas_cover_bps: u64) -> bool {
-        if gas_cover_bps >= CHRONIC_UNDERWATER_COVER_BPS
-            || gas_cover_bps < CHRONIC_UNDERWATER_MIN_COVER_BPS
+        if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS)
+            .contains(&gas_cover_bps)
         {
             return false;
         }
@@ -1206,16 +1206,18 @@ impl ExecutionService {
             }
         };
 
-        let (mempool_clear, pending_ahead) =
-            match self.operator_mempool_clear(&submit_provider, operator).await {
-                Ok(status) => status,
-                Err(e) => {
-                    crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
-                    return ExecutionOutcome::SubmitFailed {
-                        reason: e.to_string(),
-                    };
-                }
-            };
+        let (mempool_clear, pending_ahead) = match self
+            .operator_mempool_clear(&submit_provider, operator)
+            .await
+        {
+            Ok(status) => status,
+            Err(e) => {
+                crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
+                return ExecutionOutcome::SubmitFailed {
+                    reason: e.to_string(),
+                };
+            }
+        };
         if !mempool_clear {
             crate::info!("dispatch skip: fp={}, mempool not clear — waiting", fp);
             let outcome = ExecutionOutcome::SkippedCooldown;

@@ -134,7 +134,9 @@ pub fn record_brent_eval_reject(reason: BrentEvalReject) {
 /// Sample whether this SimNone should run `minimal_sim_failure` (every 16th).
 #[must_use]
 pub fn should_sample_brent_sim_none() -> bool {
-    SIM_NONE_SAMPLE.fetch_add(1, Ordering::Relaxed) % 16 == 0
+    SIM_NONE_SAMPLE
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(16)
 }
 
 pub fn record_brent_sim_none_kind(kind: BrentSimNoneKind) {

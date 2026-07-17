@@ -40,19 +40,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             theme::bad()
         };
-        rows.push(Row::new(vec![
-            Cell::from(format!("{:x}", row.fingerprint)),
-            Cell::from(row.hops.to_string()),
-            Cell::from(row.flash.as_str()),
-            Cell::from(row.route.clone()),
-            Cell::from(format!("{} M", row.net_profit_matic)),
-            Cell::from(gate),
-            Cell::from(
-                row.outcome
-                    .as_deref()
-                    .unwrap_or(if row.near_miss { "gate reject" } else { "queued" }),
-            ),
-        ]).style(net_style));
+        rows.push(
+            Row::new(vec![
+                Cell::from(format!("{:x}", row.fingerprint)),
+                Cell::from(row.hops.to_string()),
+                Cell::from(row.flash.as_str()),
+                Cell::from(row.route.clone()),
+                Cell::from(format!("{} M", row.net_profit_matic)),
+                Cell::from(gate),
+                Cell::from(row.outcome.as_deref().unwrap_or(if row.near_miss {
+                    "gate reject"
+                } else {
+                    "queued"
+                })),
+            ])
+            .style(net_style),
+        );
     }
 
     frame.render_widget(
@@ -120,10 +123,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             theme::label_value(
                 "flash / slip / gas",
-                format!(
-                    "{}  |  {} bps  |  {} gas",
-                    row.flash, row.slip_bps, row.gas
-                ),
+                format!("{}  |  {} bps  |  {} gas", row.flash, row.slip_bps, row.gas),
                 Severity::Info,
             ),
             theme::label_value(
@@ -146,15 +146,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             theme::label_value(
                 "outcome",
-                row.outcome
-                    .clone()
-                    .unwrap_or_else(|| {
-                        if row.near_miss {
-                            "not dispatched (near-miss)".into()
-                        } else {
-                            "awaiting dispatch/dry-run".into()
-                        }
-                    }),
+                row.outcome.clone().unwrap_or_else(|| {
+                    if row.near_miss {
+                        "not dispatched (near-miss)".into()
+                    } else {
+                        "awaiting dispatch/dry-run".into()
+                    }
+                }),
                 row.outcome_severity,
             ),
             Line::from(Span::styled(

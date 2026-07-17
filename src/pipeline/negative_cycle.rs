@@ -272,8 +272,8 @@ mod tests {
         let r99 = 990_000_000_000_000_000u64;
         let r105 = 1_050_000_000_000_000_000u64;
         let adj = vec![
-            vec![we(1, 0, 1, 0.01, r99)],  // 0→1 lossy
-            vec![we(2, 1, 2, 0.01, r99)],  // 1→2 lossy
+            vec![we(1, 0, 1, 0.01, r99)],     // 0→1 lossy
+            vec![we(2, 1, 2, 0.01, r99)],     // 1→2 lossy
             vec![we(3, 2, 0, -0.0488, r105)], // 2→0 strong
         ];
         let found = find_cycles_bellman_ford_multi_pass_with_adj(

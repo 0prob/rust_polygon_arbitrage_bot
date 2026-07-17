@@ -719,12 +719,7 @@ fn schedule_hf_tick(
     let hf_inflight_acquire = Arc::clone(&hf_inflight);
     let Ok(permit) = hf_inflight_acquire.try_acquire_owned() else {
         hf_pending.store(true, Ordering::Release);
-        if stream_triggered
-            || hf_ctx
-                .partial_cache
-                .trigger()
-                .stream_triggered_pending()
-        {
+        if stream_triggered || hf_ctx.partial_cache.trigger().stream_triggered_pending() {
             hf_stream_pending.store(true, Ordering::Release);
         }
         return;

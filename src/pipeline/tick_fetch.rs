@@ -27,9 +27,7 @@ impl TickEnrichment {
             loaded: self.loaded.saturating_add(other.loaded),
             rpc_failed: self.rpc_failed || other.rpc_failed,
             empty_pools: self.empty_pools.saturating_add(other.empty_pools),
-            incomplete_pools: self
-                .incomplete_pools
-                .saturating_add(other.incomplete_pools),
+            incomplete_pools: self.incomplete_pools.saturating_add(other.incomplete_pools),
             algebra_loaded: self.algebra_loaded.saturating_add(other.algebra_loaded),
             seeded_pools: self.seeded_pools.saturating_add(other.seeded_pools),
         }
@@ -286,8 +284,7 @@ pub async fn enrich_v3_ticks<
                         continue;
                     }
                     finalize_cl_ticks(&mut ticks);
-                    if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(*idx)
-                    {
+                    if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(*idx) {
                         s.ticks = Arc::from(ticks);
                         updated += 1;
                     }
@@ -354,14 +351,9 @@ pub async fn enrich_v3_ticks<
             }
         }
         if !still_empty.is_empty() {
-            wide_loaded = enrich_v3_tick_lens_only(
-                provider,
-                arena,
-                &still_empty,
-                wide_range,
-                block_number,
-            )
-            .await;
+            wide_loaded =
+                enrich_v3_tick_lens_only(provider, arena, &still_empty, wide_range, block_number)
+                    .await;
             updated += wide_loaded;
         }
     }
@@ -383,17 +375,17 @@ pub async fn enrich_v3_ticks<
             let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
                 continue;
             };
-            if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state(idx) {
-                if s.ticks.is_empty() {
-                    crate::info!(
-                        "v3 tick hydration miss: pool={pool} tick={} spacing={} liquidity={} labeled_algebra={}",
-                        s.tick,
-                        s.tick_spacing,
-                        s.liquidity,
-                        algebra_pools.contains(&pool) || algebra_integral_pools.contains(&pool),
-                    );
-                    break;
-                }
+            if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state(idx)
+                && s.ticks.is_empty()
+            {
+                crate::info!(
+                    "v3 tick hydration miss: pool={pool} tick={} spacing={} liquidity={} labeled_algebra={}",
+                    s.tick,
+                    s.tick_spacing,
+                    s.liquidity,
+                    algebra_pools.contains(&pool) || algebra_integral_pools.contains(&pool),
+                );
+                break;
             }
         }
     } else {
@@ -625,9 +617,9 @@ pub async fn enrich_v4_ticks<
     }
 
     let mut updated = 0usize;
-    let empty_pools;
-    if tick_calls.is_empty() {
-        empty_pools = targets.len();
+
+    let empty_pools = if tick_calls.is_empty() {
+        targets.len()
     } else {
         let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
             Ok(states) => states,
@@ -674,14 +666,14 @@ pub async fn enrich_v4_ticks<
                 updated += 1;
             }
         }
-        empty_pools = targets
+        targets
             .iter()
             .filter(|(idx, _)| match arena.pool_state(*idx) {
                 Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
                 _ => false,
             })
-            .count();
-    }
+            .count()
+    };
     if !incomplete_pools.is_empty() || capped {
         crate::warn!(
             "v4 tick hydration left {} pools tickless after partial responses or read cap (capped={capped})",
@@ -710,18 +702,18 @@ pub async fn enrich_v4_ticks<
 
     if empty_pools > 0 || wide_loaded > 0 || updated > 0 {
         for &(idx, pool_id) in targets {
-            if let Some(crate::core::types::PoolState::V4(s)) = arena.pool_state(idx) {
-                if s.ticks.is_empty() {
-                    let addr = arena.pool_address(idx).unwrap_or_default();
-                    crate::info!(
-                        "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_loaded={}",
-                        s.tick,
-                        s.tick_spacing,
-                        s.liquidity,
-                        wide_loaded,
-                    );
-                    break;
-                }
+            if let Some(crate::core::types::PoolState::V4(s)) = arena.pool_state(idx)
+                && s.ticks.is_empty()
+            {
+                let addr = arena.pool_address(idx).unwrap_or_default();
+                crate::info!(
+                    "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_loaded={}",
+                    s.tick,
+                    s.tick_spacing,
+                    s.liquidity,
+                    wide_loaded,
+                );
+                break;
             }
         }
     }

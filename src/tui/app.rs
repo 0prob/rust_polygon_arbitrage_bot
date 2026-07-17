@@ -1175,10 +1175,7 @@ mod tests {
         let status = app.snapshot.as_ref().unwrap().opportunities[0].status;
         assert_eq!(status, RouteStatus::Hot);
 
-        app.register_trade_outcome(
-            ExecutionOutcome::DryRunPassed { gas_used: 200_000 },
-            0xabc,
-        );
+        app.register_trade_outcome(ExecutionOutcome::DryRunPassed { gas_used: 200_000 }, 0xabc);
         assert_eq!(
             app.hf_candidates[0].outcome.as_deref(),
             Some("dry-run passed")

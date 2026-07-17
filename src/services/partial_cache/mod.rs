@@ -364,7 +364,7 @@ impl PartialPoolCache {
             }
         }
         let n = self.patches.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n % 50 == 0 {
+        if n == 1 || n.is_multiple_of(50) {
             crate::info!("WSS patch applied: n={n} pool={pool} wake_hf={wake_hf}");
         }
         if wake_hf {
@@ -389,8 +389,7 @@ impl PartialPoolCache {
         let now = crate::util::now_ms();
         const KEEP_ACTIVE_MS: u64 = 300_000;
         self.pools.retain(|addr, state| {
-            keep_set.contains(addr)
-                || now.saturating_sub(state.patched_at_ms) <= KEEP_ACTIVE_MS
+            keep_set.contains(addr) || now.saturating_sub(state.patched_at_ms) <= KEEP_ACTIVE_MS
         });
         dirty.retain(|addr| {
             keep_set.contains(addr)
@@ -752,9 +751,9 @@ pub fn select_stream_targets_with_epoch(
                 0
             };
             // Keep cycle-hot pools eligible after silence; only rotate the fill.
-            let demote_penalty = u64::from(
-                demote_set.contains(&pool.address) && !hot_set.contains(&pool.address),
-            ) * 50_000;
+            let demote_penalty =
+                u64::from(demote_set.contains(&pool.address) && !hot_set.contains(&pool.address))
+                    * 50_000;
             let score = cycle_hot
                 .saturating_add(live_boost)
                 .saturating_add(liq.saturating_mul(1_000))

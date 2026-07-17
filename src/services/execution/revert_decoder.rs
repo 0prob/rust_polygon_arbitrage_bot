@@ -460,7 +460,7 @@ mod tests {
         inner.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
         inner.extend_from_slice(&U256::from(msg.len() as u64).to_be_bytes::<32>());
         inner.extend_from_slice(msg);
-        inner.resize(4 + 64 + ((msg.len() + 31) / 32) * 32, 0);
+        inner.resize(4 + 64 + msg.len().div_ceil(32) * 32, 0);
 
         // Huff ExternalCallFailed body: index, target, offset(0x60), rd_size, rd
         let mut payload = vec![0u8; 128 + inner.len()];
