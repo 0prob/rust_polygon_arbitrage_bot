@@ -69,10 +69,24 @@ impl GraphCache {
         routable_pool_count: usize,
         layout_fingerprint: u64,
     ) -> bool {
-        self.lf_pass_count.is_multiple_of(self.rebuild_interval)
-            || self.graph.is_none()
-            || self.pool_count_rebuild_due(routable_pool_count)
-            || self.cached_layout_fingerprint != layout_fingerprint
+        if self.graph.is_none() {
+            return true;
+        }
+        if self.lf_pass_count.is_multiple_of(self.rebuild_interval) {
+            return true;
+        }
+        if self.pool_count_rebuild_due(routable_pool_count) {
+            return true;
+        }
+        // Fingerprint change with same or fewer pools ⇒ reorder / drop / replace.
+        // Pure growth (more pools, new fingerprint) is patched via attach_missing
+        // until the pool-count or eligible-count thresholds force a rebuild.
+        if self.cached_layout_fingerprint != layout_fingerprint
+            && routable_pool_count <= self.cached_pool_count
+        {
+            return true;
+        }
+        false
     }
 
     #[must_use]
@@ -352,6 +366,27 @@ mod tests {
         assert!(!cache.needs_connectivity_rebuild(10, 1));
         assert!(cache.needs_connectivity_rebuild(10, 2));
         assert!(cache.needs_cycle_refind(10, 2, 0, 0, 10));
+    }
+
+    #[test]
+    fn pure_growth_fingerprint_does_not_force_rebuild() {
+        // Append-only arena growth changes layout fingerprint but should patch
+        // via attach_missing until pool-count / eligible thresholds fire.
+        let mut cache = GraphCache::with_rebuild_interval(60);
+        cache.advance_pass();
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            1_000,
+            1,
+            5,
+            800,
+        );
+        // +30 pools, new fingerprint: below rebuild delta (64 / 5%).
+        assert!(!cache.needs_connectivity_rebuild(1_030, 99));
+        // Shrinkage/reorder with fingerprint change still rebuilds.
+        assert!(cache.needs_connectivity_rebuild(1_000, 99));
+        assert!(cache.needs_connectivity_rebuild(990, 99));
     }
 
     #[test]

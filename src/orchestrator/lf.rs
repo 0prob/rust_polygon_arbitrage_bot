@@ -290,7 +290,9 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
 
     let need_cycle_refind = {
         let gc = work.graph_cache.lock();
+        // Newly attached pools are invisible to cached cycles until we re-enumerate.
         needs_rebuild
+            || missing_graph_pools > 0
             || gc.cycles().is_none()
             || gc.needs_cycle_refind(
                 routable_count,

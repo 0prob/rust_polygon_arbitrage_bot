@@ -56,31 +56,57 @@ fn sync_pool_graph_eligible(
     )
 }
 
-/// Fast-path arena refresh when tradable membership, order, and eligibility are unchanged.
-fn arena_reusable_for_tradable(
+/// How much of the current arena layout is a stable prefix of the new tradable set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArenaReuse {
+    /// Full membership match — update Arcs only.
+    Exact,
+    /// First `prefix_len` pools match order+eligibility; append the rest.
+    Prefix { prefix_len: usize },
+    /// Must wipe and rebuild (reorder, shrink, or ineligible prefix entry).
+    Rebuild,
+}
+
+/// Fast-path arena refresh when tradable membership, order, and eligibility are unchanged
+/// or only extended by higher discovery-index pools (append-only growth).
+fn arena_reuse_for_tradable(
     inner: &ArenaInner,
     tradable: &[(usize, Address, Arc<PoolState>)],
     pools: &[DiscoveredPool],
     decimal_hints: Option<&FxHashMap<Address, u8>>,
-) -> bool {
-    if tradable.len() != inner.pools.len() {
-        return false;
+) -> ArenaReuse {
+    let existing = inner.pools.len();
+    if existing == 0 {
+        return if tradable.is_empty() {
+            ArenaReuse::Exact
+        } else {
+            ArenaReuse::Rebuild
+        };
     }
-    for (i, (idx, address, state)) in tradable.iter().enumerate() {
+    if tradable.len() < existing {
+        return ArenaReuse::Rebuild;
+    }
+    for (i, (idx, address, state)) in tradable.iter().take(existing).enumerate() {
         if inner.pool_addresses.get(i) != Some(address) {
-            return false;
+            return ArenaReuse::Rebuild;
         }
         let Some(pool) = pools.get(*idx) else {
-            return false;
+            return ArenaReuse::Rebuild;
         };
         if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
-            return false;
+            return ArenaReuse::Rebuild;
         }
         if !inner.address_to_pool.contains_key(address) {
-            return false;
+            return ArenaReuse::Rebuild;
         }
     }
-    true
+    if tradable.len() == existing {
+        ArenaReuse::Exact
+    } else {
+        ArenaReuse::Prefix {
+            prefix_len: existing,
+        }
+    }
 }
 
 fn compute_layout_fingerprint(inner: &ArenaInner) -> u64 {
@@ -382,10 +408,14 @@ impl StateArena {
     ) -> Vec<crate::pipeline::types::PoolMeta> {
         let tradable = cache.tradable_by_discovery_index(address_index);
 
-        let reusable =
-            arena_reusable_for_tradable(&self.inner, &tradable, pools, decimal_hints);
-        if reusable {
-            return self.sync_tradable_inplace(&tradable, pools, decimal_hints);
+        match arena_reuse_for_tradable(&self.inner, &tradable, pools, decimal_hints) {
+            ArenaReuse::Exact => {
+                return self.sync_tradable_inplace(&tradable, pools, decimal_hints);
+            }
+            ArenaReuse::Prefix { prefix_len } => {
+                return self.sync_tradable_append(&tradable, pools, decimal_hints, prefix_len);
+            }
+            ArenaReuse::Rebuild => {}
         }
 
         // LF clones the arena Arc before sync. Using `Arc::make_mut` here would
@@ -412,9 +442,8 @@ impl StateArena {
             let Some(pool) = pools.get(idx) else {
                 continue;
             };
-            // Eligibility already validated in arena_reusable_for_tradable when
-            // reusable; on rebuild we still filter — some tradable cache entries
-            // fail graph-eligibility (e.g. missing pair decimals).
+            // On rebuild we still filter — some tradable cache entries fail
+            // graph-eligibility (e.g. missing pair decimals).
             if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
                 continue;
             }
@@ -426,6 +455,56 @@ impl StateArena {
             ));
         }
         // One layout fingerprint for the full bulk rebuild (not per insert).
+        self.recompute_layout_fingerprint();
+        metas
+    }
+
+    /// Prefix-stable growth: refresh existing pools in place, append new ones.
+    /// Preserves `PoolIndex` for the shared prefix so graph edges stay valid.
+    fn sync_tradable_append(
+        &mut self,
+        tradable: &[(usize, Address, Arc<PoolState>)],
+        pools: &[DiscoveredPool],
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        prefix_len: usize,
+    ) -> Vec<crate::pipeline::types::PoolMeta> {
+        debug_assert!(prefix_len <= tradable.len());
+        debug_assert_eq!(prefix_len, self.inner.pools.len());
+
+        // Refresh prefix (same as exact reuse).
+        let mut metas = self.sync_tradable_inplace(&tradable[..prefix_len], pools, decimal_hints);
+        metas.reserve(tradable.len().saturating_sub(prefix_len));
+
+        // Append only the newly tradable tail without rehashing the prefix.
+        let extra_tokens: usize = tradable[prefix_len..]
+            .iter()
+            .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
+            .sum();
+        {
+            let inner = Arc::make_mut(&mut self.inner);
+            let grow = tradable.len() - prefix_len;
+            inner.pools.reserve(grow);
+            inner.pool_addresses.reserve(grow);
+            inner.address_to_pool.reserve(grow);
+            inner.tokens.reserve(extra_tokens);
+            inner.token_decimals.reserve(extra_tokens);
+            inner.address_to_token.reserve(extra_tokens);
+        }
+
+        for (idx, _address, state) in &tradable[prefix_len..] {
+            let Some(pool) = pools.get(*idx) else {
+                continue;
+            };
+            if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
+                continue;
+            }
+            metas.push(self.append_synced_pool(
+                pool,
+                Arc::clone(state),
+                decimal_hints,
+                /*touch_layout=*/ false,
+            ));
+        }
         self.recompute_layout_fingerprint();
         metas
     }
@@ -982,6 +1061,77 @@ mod tests {
         arena.apply_hot_cache(&cache, &[addr]);
         assert!(arena.hot_overlay[0].is_none());
         assert!(arena.pool_state(idx).is_some());
+    }
+
+    #[test]
+    fn sync_appends_when_tradable_extends_existing_prefix() {
+        let pool_a = Address::with_last_byte(80);
+        let pool_b = Address::with_last_byte(81);
+        let token_a = Address::with_last_byte(82);
+        let token_b = Address::with_last_byte(83);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let cache = StateCache::default();
+        let v2 = |ts| {
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: ts,
+            })
+        };
+        cache.insert(pool_a, v2(1));
+        let discovered = [
+            DiscoveredPool {
+                pool_key: pool_a.to_string(),
+                address: pool_a,
+                protocol: ProtocolType::UniswapV2,
+                protocol_label: "A".into(),
+                tokens: vec![token_a, token_b],
+                fee_bps: 30,
+                tick_spacing: None,
+                pool_id: None,
+                pool_id_verified: false,
+                hooks: None,
+                pool_type: None,
+                created_block: 1,
+            },
+            DiscoveredPool {
+                pool_key: pool_b.to_string(),
+                address: pool_b,
+                protocol: ProtocolType::UniswapV2,
+                protocol_label: "B".into(),
+                tokens: vec![token_a, token_b],
+                fee_bps: 30,
+                tick_spacing: None,
+                pool_id: None,
+                pool_id_verified: false,
+                hooks: None,
+                pool_type: None,
+                created_block: 2,
+            },
+        ];
+        let index = discovered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let mut arena = StateArena::default();
+        // First sync: only pool A is tradable.
+        let metas_a = arena.sync_from_discovery(&cache, &discovered[..1], &index, None);
+        assert_eq!(metas_a.len(), 1);
+        let idx_a = metas_a[0].pool_index;
+        let fp_a = arena.routing_layout_fingerprint();
+
+        // Second sync: pool B becomes tradable — append, preserve A's index.
+        cache.insert(pool_b, v2(2));
+        let metas_ab = arena.sync_from_discovery(&cache, &discovered, &index, None);
+        assert_eq!(metas_ab.len(), 2);
+        assert_eq!(metas_ab[0].pool_index, idx_a);
+        assert_eq!(arena.pool_address(idx_a), Some(pool_a));
+        assert_eq!(arena.pool_address(PoolIndex(1)), Some(pool_b));
+        assert_ne!(arena.routing_layout_fingerprint(), fp_a);
+        assert_eq!(arena.pool_count(), 2);
     }
 
     #[test]

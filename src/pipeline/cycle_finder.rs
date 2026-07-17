@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -28,6 +30,54 @@ const DFS_MAX_START_SOURCES: usize = 32;
 const LOG_WEIGHT_PRUNE_THRESHOLD: f64 = 0.0;
 /// Edges rescored to this weight are non-tradable — skip during enumeration.
 pub(crate) const DEAD_EDGE_LOG_WEIGHT: f64 = 15.0;
+
+/// Shared across parallel DFS start shards so the global `max_cycles` cap
+/// stops all workers once enough cycles are collected (not just per-shard).
+struct SharedCycleCap {
+    max: usize,
+    found: AtomicUsize,
+}
+
+impl SharedCycleCap {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            found: AtomicUsize::new(0),
+        })
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.found.load(AtomicOrdering::Relaxed) >= self.max
+    }
+
+    /// Reserve one slot. Returns false when the global cap is already filled.
+    #[inline]
+    fn try_claim(&self) -> bool {
+        let mut cur = self.found.load(AtomicOrdering::Relaxed);
+        loop {
+            if cur >= self.max {
+                return false;
+            }
+            match self.found.compare_exchange_weak(
+                cur,
+                cur + 1,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    /// Reset the claimed count before a reallocation pass (deduped merge may
+    /// free headroom; re-runs must be allowed to re-claim up to `max`).
+    fn reset_to(&self, count: usize) {
+        self.found
+            .store(count.min(self.max), AtomicOrdering::Relaxed);
+    }
+}
 
 type PoolMetaIndex<'a> = Vec<Option<&'a PoolMeta>>;
 
@@ -331,6 +381,13 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
                 }
                 live.push(*ge);
             }
+            // Best (most negative log-weight) edges first so DFS finds
+            // profitable cycles earlier and can hit max_cycles before deadline.
+            live.sort_unstable_by(|a, b| {
+                a.log_weight
+                    .partial_cmp(&b.log_weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             NodePrep {
                 live,
                 protos,
@@ -551,6 +608,7 @@ fn collect_cycles_dfs_single_start(
     hop_limit: u32,
     max_cycles: usize,
     budget: &SharedDeadlineGuard,
+    global_cap: &SharedCycleCap,
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
     let token_count = graph.token_count as usize;
@@ -588,10 +646,11 @@ fn collect_cycles_dfs_single_start(
         hop_cap: u32,
         max_cycles: usize,
         budget: &SharedDeadlineGuard,
+        global_cap: &SharedCycleCap,
         cycles: &mut Vec<FoundCycle>,
         seen: &mut rustc_hash::FxHashSet<u64>,
     ) {
-        if budget.tick() || cycles.len() >= max_cycles {
+        if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
             return;
         }
 
@@ -608,7 +667,7 @@ fn collect_cycles_dfs_single_start(
                 if out_leg == pending.token_in_idx {
                     continue;
                 }
-                if budget.tick() || cycles.len() >= max_cycles {
+                if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                     break;
                 }
                 let Some(meta) = pool_metas
@@ -663,6 +722,7 @@ fn collect_cycles_dfs_single_start(
                     hop_cap,
                     max_cycles,
                     budget,
+                    global_cap,
                     cycles,
                     seen,
                 );
@@ -687,6 +747,9 @@ fn collect_cycles_dfs_single_start(
             }
             let fp = cycle_key(path);
             if seen.contains(&fp) {
+                return;
+            }
+            if !global_cap.try_claim() {
                 return;
             }
             seen.insert(fp);
@@ -717,7 +780,7 @@ fn collect_cycles_dfs_single_start(
         used_tokens[curr_node as usize] = true;
 
         for ge in next_edges {
-            if budget.tick() || cycles.len() >= max_cycles {
+            if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                 break;
             }
             match ge.phase {
@@ -748,7 +811,8 @@ fn collect_cycles_dfs_single_start(
                         hop_cap,
                         max_cycles,
                         budget,
-                        cycles,
+                        global_cap,
+                    cycles,
                         seen,
                     );
                 }
@@ -798,7 +862,8 @@ fn collect_cycles_dfs_single_start(
                         hop_cap,
                         max_cycles,
                         budget,
-                        cycles,
+                        global_cap,
+                    cycles,
                         seen,
                     );
                     path.pop();
@@ -818,7 +883,7 @@ fn collect_cycles_dfs_single_start(
 
     used_tokens[start.0 as usize] = true;
     for ge in first_edges {
-        if budget.tick() || cycles.len() >= max_cycles {
+        if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
             break;
         }
         match ge.phase {
@@ -849,6 +914,7 @@ fn collect_cycles_dfs_single_start(
                     hop_cap,
                     max_cycles,
                     budget,
+                    global_cap,
                     &mut cycles,
                     &mut seen,
                 );
@@ -894,6 +960,7 @@ fn collect_cycles_dfs_single_start(
                     hop_cap,
                     max_cycles,
                     budget,
+                    global_cap,
                     &mut cycles,
                     &mut seen,
                 );
@@ -920,6 +987,7 @@ fn collect_cycles_dfs_parallel(
     if start_tokens.is_empty() || max_cycles == 0 || budget.tick() {
         return Vec::new();
     }
+    let global_cap = SharedCycleCap::new(max_cycles);
     let per_shard = max_cycles.div_ceil(start_tokens.len()).max(1);
     let mut shard_caps = vec![per_shard; start_tokens.len()];
     let mut shard_cycles: Vec<Vec<FoundCycle>> =
@@ -937,6 +1005,7 @@ fn collect_cycles_dfs_parallel(
                         hop_limit,
                         *cap,
                         budget.as_ref(),
+                        global_cap.as_ref(),
                     )
                 })
                 .collect()
@@ -954,6 +1023,7 @@ fn collect_cycles_dfs_parallel(
                         hop_limit,
                         *cap,
                         budget.as_ref(),
+                        global_cap.as_ref(),
                     )
                 })
                 .collect()
@@ -978,6 +1048,9 @@ fn collect_cycles_dfs_parallel(
         if saturated.is_empty() {
             break;
         }
+        // Re-runs replace shard vectors from scratch; free all claim slots so a
+        // saturated hub can re-collect its full quota (not only remaining headroom).
+        global_cap.reset_to(0);
         let extra = (max_cycles - merged.len()).div_ceil(saturated.len());
         let rerun: Vec<(usize, Vec<FoundCycle>)> = if crate::util::should_use_rayon(saturated.len())
         {
@@ -996,6 +1069,7 @@ fn collect_cycles_dfs_parallel(
                             hop_limit,
                             cap,
                             budget.as_ref(),
+                            global_cap.as_ref(),
                         ),
                     )
                 })
@@ -1016,6 +1090,7 @@ fn collect_cycles_dfs_parallel(
                             hop_limit,
                             cap,
                             budget.as_ref(),
+                            global_cap.as_ref(),
                         ),
                     )
                 })
