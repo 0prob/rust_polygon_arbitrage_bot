@@ -227,13 +227,32 @@ impl StateArena {
         address: Address,
         hints: Option<&FxHashMap<Address, u8>>,
     ) -> TokenIndex {
+        self.register_token_with_hints_inner(address, hints, true)
+    }
+
+    /// `touch_layout`: recompute fingerprint on new token inserts. Bulk sync
+    /// defers this to one final pass (avoids O(n²) hashing during rebuild).
+    fn register_token_with_hints_inner(
+        &mut self,
+        address: Address,
+        hints: Option<&FxHashMap<Address, u8>>,
+        touch_layout: bool,
+    ) -> TokenIndex {
         if let Some(&idx) = self.inner.address_to_token.get(&address) {
             if let Some(hints) = hints
                 && let Some(&dec) = hints.get(&address)
             {
-                let inner = Arc::make_mut(&mut self.inner);
-                if let Some(slot) = inner.token_decimals.get_mut(idx.0 as usize) {
-                    *slot = dec;
+                // Skip COW+write when the decimal is already correct.
+                let needs_update = self
+                    .inner
+                    .token_decimals
+                    .get(idx.0 as usize)
+                    .is_some_and(|slot| *slot != dec);
+                if needs_update {
+                    let inner = Arc::make_mut(&mut self.inner);
+                    if let Some(slot) = inner.token_decimals.get_mut(idx.0 as usize) {
+                        *slot = dec;
+                    }
                 }
             }
             return idx;
@@ -244,7 +263,9 @@ impl StateArena {
         inner.tokens.push(address);
         inner.token_decimals.push(dec);
         inner.address_to_token.insert(address, idx);
-        inner.layout_fingerprint = compute_layout_fingerprint(inner);
+        if touch_layout {
+            inner.layout_fingerprint = compute_layout_fingerprint(inner);
+        }
         idx
     }
 
@@ -264,10 +285,28 @@ impl StateArena {
     }
 
     pub fn register_pool(&mut self, address: Address, state: Arc<PoolState>) -> PoolIndex {
+        self.register_pool_inner(address, state, true)
+    }
+
+    fn register_pool_inner(
+        &mut self,
+        address: Address,
+        state: Arc<PoolState>,
+        touch_layout: bool,
+    ) -> PoolIndex {
         if let Some(&idx) = self.inner.address_to_pool.get(&address) {
-            let inner = Arc::make_mut(&mut self.inner);
-            if let Some(slot) = inner.pools.get_mut(idx.0 as usize) {
-                *slot = state;
+            // Skip COW when the Arc pointer is already the same (common on stable
+            // LF ticks that re-sync unchanged cache entries).
+            let same = self
+                .inner
+                .pools
+                .get(idx.0 as usize)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &state));
+            if !same {
+                let inner = Arc::make_mut(&mut self.inner);
+                if let Some(slot) = inner.pools.get_mut(idx.0 as usize) {
+                    *slot = state;
+                }
             }
             self.clear_hot_slot(idx);
             return idx;
@@ -277,8 +316,15 @@ impl StateArena {
         inner.pools.push(state);
         inner.pool_addresses.push(address);
         inner.address_to_pool.insert(address, idx);
-        inner.layout_fingerprint = compute_layout_fingerprint(inner);
+        if touch_layout {
+            inner.layout_fingerprint = compute_layout_fingerprint(inner);
+        }
         idx
+    }
+
+    fn recompute_layout_fingerprint(&mut self) {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.layout_fingerprint = compute_layout_fingerprint(inner);
     }
 
     fn ensure_hot_storage(&mut self) {
@@ -338,71 +384,162 @@ impl StateArena {
 
         let reusable =
             arena_reusable_for_tradable(&self.inner, &tradable, pools, decimal_hints);
-        if !reusable {
-            *Arc::make_mut(&mut self.inner) = ArenaInner::default();
-            self.hot_overlay.clear();
-            self.hot_revisions.clear();
-            let inner = Arc::make_mut(&mut self.inner);
-            let expected_tokens = tradable
-                .iter()
-                .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
-                .sum::<usize>()
-                .max(1);
-            inner.tokens.reserve(expected_tokens);
-            inner.token_decimals.reserve(expected_tokens);
-            inner.pools.reserve(tradable.len());
-            inner.pool_addresses.reserve(tradable.len());
-            inner.address_to_pool.reserve(tradable.len());
-            inner.address_to_token.reserve(expected_tokens);
+        if reusable {
+            return self.sync_tradable_inplace(&tradable, pools, decimal_hints);
         }
+
+        // LF clones the arena Arc before sync. Using `Arc::make_mut` here would
+        // deep-clone the previous multi-thousand-pool layout just to discard it.
+        // Replace the Arc so rebuild starts from an empty uniquely-owned inner.
+        let expected_tokens = tradable
+            .iter()
+            .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
+            .sum::<usize>()
+            .max(1);
+        let mut fresh = ArenaInner::default();
+        fresh.tokens.reserve(expected_tokens);
+        fresh.token_decimals.reserve(expected_tokens);
+        fresh.pools.reserve(tradable.len());
+        fresh.pool_addresses.reserve(tradable.len());
+        fresh.address_to_pool.reserve(tradable.len());
+        fresh.address_to_token.reserve(expected_tokens);
+        self.inner = Arc::new(fresh);
+        self.hot_overlay.clear();
+        self.hot_revisions.clear();
 
         let mut metas = Vec::with_capacity(tradable.len().max(1));
         for (idx, _address, state) in tradable {
             let Some(pool) = pools.get(idx) else {
                 continue;
             };
+            // Eligibility already validated in arena_reusable_for_tradable when
+            // reusable; on rebuild we still filter — some tradable cache entries
+            // fail graph-eligibility (e.g. missing pair decimals).
             if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
                 continue;
             }
-            // ponytail: borrow token addresses instead of cloning Vec — most
-            // pools use the discovery order, and state-hydrated tokens (Balancer,
-            // Woofi) can be borrowed directly. Dodo always allocates: meta order
-            // must be [base, quote] so token_in_idx 0 ⇔ sellBase matches sim,
-            // capacity, and encode (indexer discovery order is not authoritative).
-            let token_addrs: &[Address];
-            let dodo_owned; // extends lifetime of the Dodo [base, quote] vec
-            match state.as_ref() {
-                PoolState::Balancer(b) if !b.tokens.is_empty() => {
-                    token_addrs = &b.tokens;
+            metas.push(self.append_synced_pool(
+                pool,
+                state,
+                decimal_hints,
+                /*touch_layout=*/ false,
+            ));
+        }
+        // One layout fingerprint for the full bulk rebuild (not per insert).
+        self.recompute_layout_fingerprint();
+        metas
+    }
+
+    /// Layout-stable fast path: refresh pool Arcs + metas without rehashing tokens.
+    fn sync_tradable_inplace(
+        &mut self,
+        tradable: &[(usize, Address, Arc<PoolState>)],
+        pools: &[DiscoveredPool],
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+    ) -> Vec<crate::pipeline::types::PoolMeta> {
+        let mut metas = Vec::with_capacity(tradable.len().max(1));
+        for (i, (idx, _address, state)) in tradable.iter().enumerate() {
+            let Some(pool) = pools.get(*idx) else {
+                continue;
+            };
+            // Reusable check already proved eligibility; only refresh state + meta.
+            let pool_index = PoolIndex(i as u32);
+            let same = self
+                .inner
+                .pools
+                .get(i)
+                .is_some_and(|slot| Arc::ptr_eq(slot, state));
+            if !same {
+                let inner = Arc::make_mut(&mut self.inner);
+                if let Some(slot) = inner.pools.get_mut(i) {
+                    *slot = Arc::clone(state);
                 }
-                PoolState::Woofi(w) if !w.tokens.is_empty() => {
-                    token_addrs = &w.tokens;
-                }
-                PoolState::Dodo(d) if !d.base_token.is_zero() && !d.quote_token.is_zero() => {
-                    dodo_owned = vec![d.base_token, d.quote_token];
-                    token_addrs = &dodo_owned;
-                }
-                _ => token_addrs = &pool.tokens,
             }
-            let pool_index = self.register_pool(pool.address, Arc::clone(&state));
-            let mut token_indices = Vec::with_capacity(token_addrs.len());
-            for &addr in token_addrs {
-                token_indices.push(self.register_token_with_hints(addr, decimal_hints));
-            }
-            let mut meta = discovered_to_pool_meta(pool, pool_index, &token_indices);
-            if pool.protocol == ProtocolType::BalancerV2
-                && let PoolState::Balancer(b) = state.as_ref()
-            {
-                // Use the hydrated Vault result for phantom-BPT exclusion.
-                meta.bpt_index = b.bpt_index;
-                if let Some(id) = b.pool_id {
-                    meta.pool_id = Some(id);
-                }
-            }
-            metas.push(meta);
+            self.clear_hot_slot(pool_index);
+
+            // Tokens already registered; register only updates decimal hints if needed.
+            let token_indices =
+                self.token_indices_for_pool(state.as_ref(), pool, decimal_hints, false);
+            metas.push(pool_meta_from_synced(
+                pool,
+                pool_index,
+                &token_indices,
+                state.as_ref(),
+            ));
         }
         metas
     }
+
+    fn append_synced_pool(
+        &mut self,
+        pool: &DiscoveredPool,
+        state: Arc<PoolState>,
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        touch_layout: bool,
+    ) -> crate::pipeline::types::PoolMeta {
+        let pool_index =
+            self.register_pool_inner(pool.address, Arc::clone(&state), touch_layout);
+        let token_indices =
+            self.token_indices_for_pool(state.as_ref(), pool, decimal_hints, touch_layout);
+        pool_meta_from_synced(pool, pool_index, &token_indices, state.as_ref())
+    }
+
+    fn token_indices_for_pool(
+        &mut self,
+        state: &PoolState,
+        pool: &DiscoveredPool,
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        touch_layout: bool,
+    ) -> Vec<TokenIndex> {
+        // ponytail: borrow token addresses instead of cloning Vec — most
+        // pools use the discovery order, and state-hydrated tokens (Balancer,
+        // Woofi) can be borrowed directly. Dodo always allocates: meta order
+        // must be [base, quote] so token_in_idx 0 ⇔ sellBase matches sim,
+        // capacity, and encode (indexer discovery order is not authoritative).
+        let token_addrs: &[Address];
+        let dodo_owned; // extends lifetime of the Dodo [base, quote] vec
+        match state {
+            PoolState::Balancer(b) if !b.tokens.is_empty() => {
+                token_addrs = &b.tokens;
+            }
+            PoolState::Woofi(w) if !w.tokens.is_empty() => {
+                token_addrs = &w.tokens;
+            }
+            PoolState::Dodo(d) if !d.base_token.is_zero() && !d.quote_token.is_zero() => {
+                dodo_owned = vec![d.base_token, d.quote_token];
+                token_addrs = &dodo_owned;
+            }
+            _ => token_addrs = &pool.tokens,
+        }
+        let mut token_indices = Vec::with_capacity(token_addrs.len());
+        for &addr in token_addrs {
+            token_indices.push(self.register_token_with_hints_inner(
+                addr,
+                decimal_hints,
+                touch_layout,
+            ));
+        }
+        token_indices
+    }
+}
+
+fn pool_meta_from_synced(
+    pool: &DiscoveredPool,
+    pool_index: PoolIndex,
+    token_indices: &[TokenIndex],
+    state: &PoolState,
+) -> crate::pipeline::types::PoolMeta {
+    let mut meta = discovered_to_pool_meta(pool, pool_index, token_indices);
+    if pool.protocol == ProtocolType::BalancerV2
+        && let PoolState::Balancer(b) = state
+    {
+        // Use the hydrated Vault result for phantom-BPT exclusion.
+        meta.bpt_index = b.bpt_index;
+        if let Some(id) = b.pool_id {
+            meta.pool_id = Some(id);
+        }
+    }
+    meta
 }
 
 #[cfg(test)]
@@ -845,6 +982,92 @@ mod tests {
         arena.apply_hot_cache(&cache, &[addr]);
         assert!(arena.hot_overlay[0].is_none());
         assert!(arena.pool_state(idx).is_some());
+    }
+
+    #[test]
+    fn sync_rebuild_after_shared_clone_replaces_without_stale_layout() {
+        // LF does `ctx.arena.lock().clone()` before sync. Rebuild must drop the
+        // shared Arc (not make_mut-clone-then-clear) and produce a clean layout.
+        let pool_a = Address::with_last_byte(70);
+        let pool_b = Address::with_last_byte(71);
+        let token_a = Address::with_last_byte(72);
+        let token_b = Address::with_last_byte(73);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let cache = StateCache::default();
+        cache.insert(
+            pool_a,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        let discovered_a = [DiscoveredPool {
+            pool_key: pool_a.to_string(),
+            address: pool_a,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "A".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let index_a = discovered_a
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let mut shared = StateArena::default();
+        shared.sync_from_discovery(&cache, &discovered_a, &index_a, None);
+        let layout_a = shared.routing_layout_fingerprint();
+        assert_eq!(shared.pool_count(), 1);
+
+        // Simulate LF: clone (shared Arc) then rebuild with a different set.
+        let mut local = shared.clone();
+        cache.insert(
+            pool_b,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(2u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 2,
+            }),
+        );
+        let discovered_b = [DiscoveredPool {
+            pool_key: pool_b.to_string(),
+            address: pool_b,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "B".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 2,
+        }];
+        let index_b = discovered_b
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let metas = local.sync_from_discovery(&cache, &discovered_b, &index_b, None);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(local.pool_count(), 1);
+        assert_eq!(local.pool_address(metas[0].pool_index), Some(pool_b));
+        assert_ne!(local.routing_layout_fingerprint(), layout_a);
+        // Original shared arena must remain untouched (COW replace, not mutate-in-place).
+        assert_eq!(shared.pool_count(), 1);
+        assert_eq!(shared.pool_address(PoolIndex(0)), Some(pool_a));
+        assert_eq!(shared.routing_layout_fingerprint(), layout_a);
     }
 
     #[test]

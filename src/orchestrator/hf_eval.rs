@@ -768,31 +768,48 @@ pub fn rank_cycles_by_probe_net(
             skip.net,
         );
     } else if kept.len() * 4 < scanned.len() {
-        crate::info!(
-            "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={}",
-            kept.len(),
-            scanned.len(),
-            skip.rate,
-            skip.executor_budget,
-            skip.flash,
-            skip.flash_source,
-            skip.probe(),
-            skip.missing_decimals,
-            skip.minimal_sim(),
-            skip.minimal_no_sim,
-            skip.minimal_zero_profit,
-            skip.minimal_sanity,
-            minimal_sim_reasons.invalid_route,
-            minimal_sim_reasons.missing_pool,
-            minimal_sim_reasons.non_tradable,
-            minimal_sim_reasons.shallow_cl,
-            minimal_sim_reasons.v2_reserve_exhausted,
-            minimal_sim_reasons.math,
-            minimal_sim_reasons.unsupported_state,
-            minimal_sim_reasons.zero_output,
-            skip.net,
-            near_net_count,
-        );
+        // HF may rank hundreds of times per second; keep the signal without
+        // flooding INFO (was ~70% of orchestrator log volume in live runs).
+        static LAST_PROBE_RANK_LOG_MS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now = crate::util::now_ms();
+        let prev = LAST_PROBE_RANK_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 2_000
+            && LAST_PROBE_RANK_LOG_MS
+                .compare_exchange(
+                    prev,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            crate::info!(
+                "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={}",
+                kept.len(),
+                scanned.len(),
+                skip.rate,
+                skip.executor_budget,
+                skip.flash,
+                skip.flash_source,
+                skip.probe(),
+                skip.missing_decimals,
+                skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
+                minimal_sim_reasons.invalid_route,
+                minimal_sim_reasons.missing_pool,
+                minimal_sim_reasons.non_tradable,
+                minimal_sim_reasons.shallow_cl,
+                minimal_sim_reasons.v2_reserve_exhausted,
+                minimal_sim_reasons.math,
+                minimal_sim_reasons.unsupported_state,
+                minimal_sim_reasons.zero_output,
+                skip.net,
+                near_net_count,
+            );
+        }
     }
     flash_loan.cache_generation = flash.generation();
     flash_loan.log_summary("probe_rank");

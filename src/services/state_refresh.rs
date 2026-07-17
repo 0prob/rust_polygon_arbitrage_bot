@@ -71,7 +71,8 @@ const DECIMALS_ENRICH_BATCH: usize = 512;
 struct DiscoveryState {
     discovered: Arc<Vec<DiscoveredPool>>,
     pool_key_index: FxHashMap<String, usize>,
-    address_index: FxHashMap<Address, usize>,
+    /// Shared so LF/HF readers can Arc-clone without copying ~80k entries each tick.
+    address_index: Arc<FxHashMap<Address, usize>>,
     token_metas: Arc<Vec<TokenMeta>>,
     token_decimals: Arc<FxHashMap<Address, u8>>,
     discovery_cursor: DiscoveryCursor,
@@ -183,7 +184,8 @@ impl StateRefreshService {
 
         let count = {
             let state = self.discovery_state.read();
-            self.cache.count_tradable_in_discovery(&state.address_index)
+            self.cache
+                .count_tradable_in_discovery(state.address_index.as_ref())
         };
         self.routable_pool_count.store(count, Ordering::Relaxed);
         self.routable_pool_count_generation
@@ -403,12 +405,13 @@ impl StateRefreshService {
             let mut state = self.discovery_state.write();
             let mut added = 0usize;
             let mut updated = 0usize;
-            // Move the index map out (no data clone) first.
+            // Move indexes out (no data clone) first.
             let mut index = std::mem::take(&mut state.pool_key_index);
             let mut address_index = std::mem::take(&mut state.address_index);
             {
                 // Then make_mut on discovered; its borrow lives only inside this block.
                 let discovered = Arc::make_mut(&mut state.discovered);
+                let address_index = Arc::make_mut(&mut address_index);
                 for pool in result.pools {
                     if !is_routable_pool(&pool) {
                         continue;
@@ -648,7 +651,7 @@ impl StateRefreshService {
         let invalid_set: rustc_hash::FxHashSet<Address> = {
             let state = self.discovery_state.read();
             self.cache
-                .pools_past_invalid_retry_indexed(&state.address_index)
+                .pools_past_invalid_retry_indexed(state.address_index.as_ref())
                 .into_iter()
                 .collect()
         };
@@ -713,13 +716,13 @@ impl StateRefreshService {
             let state = self.discovery_state.read();
             (
                 Arc::clone(&state.discovered),
-                state.address_index.clone(),
+                Arc::clone(&state.address_index),
             )
         };
         arena.sync_from_discovery(
             &self.cache,
             discovered.as_ref(),
-            &address_index,
+            address_index.as_ref(),
             decimal_hints,
         )
     }
@@ -727,7 +730,7 @@ impl StateRefreshService {
     pub async fn refresh_pool_states(&self, max_pools: usize) -> anyhow::Result<PoolRefreshResult> {
         let pools = self.discovered_pools();
         let hot = self.hot_addresses();
-        let address_index = self.discovery_state.read().address_index.clone();
+        let address_index = Arc::clone(&self.discovery_state.read().address_index);
         crate::debug!(
             "state refresh: {} pools, {} hot, max_pools={}",
             pools.len(),
@@ -748,7 +751,7 @@ impl StateRefreshService {
         }
         let (addrs, selected_pools, address_index) = {
             let state = self.discovery_state.read();
-            let address_index = &state.address_index;
+            let address_index = state.address_index.as_ref();
             // ponytail: sort+dedupe addresses once, then do direct discovery-index lookups.
             // That keeps targeted refresh bounded by requested addresses instead of
             // scanning the full discovery list on every call.
@@ -766,7 +769,7 @@ impl StateRefreshService {
             (
                 addrs,
                 selected_pools,
-                state.address_index.clone(),
+                Arc::clone(&state.address_index),
             )
         };
         if selected_pools.is_empty() {
@@ -781,7 +784,7 @@ impl StateRefreshService {
         pools: &[DiscoveredPool],
         max_pools: usize,
         hot: &[Address],
-        address_index: FxHashMap<Address, usize>,
+        address_index: Arc<FxHashMap<Address, usize>>,
     ) -> anyhow::Result<PoolRefreshResult> {
         let matched = pools.len();
         let candidates = self.rpc.state_url_candidates();
@@ -946,7 +949,10 @@ fn dedupe_sorted_addresses(addresses: &[Address]) -> Vec<Address> {
 
 fn rebuild_discovery_indexes(
     pools: &[DiscoveredPool],
-) -> (FxHashMap<String, usize>, FxHashMap<Address, usize>) {
+) -> (
+    FxHashMap<String, usize>,
+    Arc<FxHashMap<Address, usize>>,
+) {
     let mut pool_key_index =
         FxHashMap::with_capacity_and_hasher(pools.len(), rustc_hash::FxBuildHasher);
     let mut address_index =
@@ -955,7 +961,7 @@ fn rebuild_discovery_indexes(
         pool_key_index.insert(pool.pool_key.clone(), idx);
         address_index.insert(pool.address, idx);
     }
-    (pool_key_index, address_index)
+    (pool_key_index, Arc::new(address_index))
 }
 
 fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {

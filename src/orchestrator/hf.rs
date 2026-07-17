@@ -1184,29 +1184,36 @@ pub async fn run_hf_tick(
         } else if profitable_count == 0
             && let Some(ref near_miss) = best_near_miss
         {
-            log_near_miss_diagnostic(
-                &ctx.execution,
-                near_miss,
-                eval_arena.as_ref(),
-                pool_metas_for_dispatch.as_ref(),
-                ctx.config.execution.profit_safety_multiplier_bps,
-                ctx.config.min_profit_matic,
-            );
-            if route_is_balancer_only(&near_miss.cycle)
-                && let Some(executor) = ctx.config.execution.executor_address
-                && let Ok(sim_provider) =
-                    near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
-            {
-                probe_near_miss_balancer(
+            // Rate-limit diagnostic + on-chain vault probe together. Without this,
+            // a sticky Balancer near-miss re-queries every HF tick (~200ms).
+            if ctx.execution.should_log_near_miss(
+                near_miss.route_fingerprint,
+                near_miss.assessment.net_profit_after_gas_matic_wei,
+            ) {
+                log_near_miss_diagnostic(
                     &ctx.execution,
-                    eval_arena.as_ref(),
                     near_miss,
+                    eval_arena.as_ref(),
                     pool_metas_for_dispatch.as_ref(),
-                    &sim_provider,
-                    executor,
-                    dispatch_state_block,
-                )
-                .await;
+                    ctx.config.execution.profit_safety_multiplier_bps,
+                    ctx.config.min_profit_matic,
+                );
+                if route_is_balancer_only(&near_miss.cycle)
+                    && let Some(executor) = ctx.config.execution.executor_address
+                    && let Ok(sim_provider) =
+                        near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
+                {
+                    probe_near_miss_balancer(
+                        &ctx.execution,
+                        eval_arena.as_ref(),
+                        near_miss,
+                        pool_metas_for_dispatch.as_ref(),
+                        &sim_provider,
+                        executor,
+                        dispatch_state_block,
+                    )
+                    .await;
+                }
             }
         } else if profitable_count == 0
             && best_profit_matic.is_zero()
@@ -1215,6 +1222,10 @@ pub async fn run_hf_tick(
         {
             log_best_eval_diagnostic(diag);
             if let Some(ref probe) = best_gross_probe
+                && ctx.execution.should_log_near_miss(
+                    probe.route_fingerprint,
+                    probe.assessment.net_profit_after_gas_matic_wei,
+                )
                 && let Some(executor) = ctx.config.execution.executor_address
                 && let Ok(sim_provider) =
                     near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
@@ -1331,18 +1342,16 @@ fn near_miss_route_summary(
 }
 
 fn log_near_miss_diagnostic(
-    execution: &ExecutionService,
+    _execution: &ExecutionService,
     result: &HfEvalResult,
     arena: &StateArena,
     pool_metas: &[PoolMeta],
     safety_bps: u64,
     min_profit_matic: U256,
 ) {
+    // Caller owns rate-limiting via `should_log_near_miss` (shared with vault probe).
     let assessment = &result.assessment;
     let net_matic = assessment.net_profit_after_gas_matic_wei;
-    if !execution.should_log_near_miss(result.route_fingerprint, net_matic) {
-        return;
-    }
     let safety_floor = crate::services::execution::profit::safety_floor_matic_wei(
         assessment.gas_cost_wei,
         safety_bps,
