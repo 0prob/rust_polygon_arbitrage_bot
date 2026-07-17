@@ -23,9 +23,9 @@ fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
         return (0, 0);
     }
     if hub_heavy {
-        // Bellman-Ford only walks Direct edges; V4/Balancer hub-spoke pools need DFS.
-        let bf = (total / 16).max(1).min(total);
-        (total.saturating_sub(bf), bf)
+        // BF only walks Direct edges; hub-spoke (V4/Balancer/Curve/WooFi) needs DFS.
+        // Give the full budget to DFS instead of paying for a blind BF pass.
+        (total, 0)
     } else {
         let dfs = total.div_ceil(2);
         (dfs, total.saturating_sub(dfs))
@@ -191,8 +191,24 @@ pub fn find_cycles_for_mode_with_budget(
             CycleSearchOutcome { cycles, diag }
         }
         CycleFinderMode::Johnson | CycleFinderMode::BellmanFord => {
-            let adj = build_weighted_adjacency(graph);
-            let raw = find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes);
+            let prep = prepare_active_graph(graph);
+            diag.hub_heavy = prep.hub_heavy;
+            diag.start_tokens = prep.start_token_count();
+            // BF adjacency strips Enter/Exit legs; fall back to DFS on hub-spoke graphs.
+            let raw = if prep.hub_heavy {
+                let pool_index = index_pool_metas(pool_metas);
+                find_cycles_multi_pass_with_prep_budget(
+                    graph,
+                    arena,
+                    &pool_index,
+                    &prep,
+                    passes,
+                    enum_budget,
+                )
+            } else {
+                let adj = build_weighted_adjacency(graph);
+                find_cycles_bellman_ford_multi_pass_with_adj(&adj, passes)
+            };
             diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
             let finalize_started = crate::util::now_ms();
             let cycles =
@@ -247,7 +263,7 @@ fn find_cycles_hybrid_multi_pass(
             }
         })
         .collect();
-    let bf_enabled = bf_budget.iter().any(|p| p.max_cycles > 0);
+    let bf_enabled = !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
     let pool_index = index_pool_metas(pool_metas);
     let prep_dfs = Arc::clone(&prep);
 
@@ -318,7 +334,7 @@ mod tests {
 
     #[test]
     fn hub_heavy_budget_favors_dfs() {
-        assert_eq!(split_hybrid_budget(500, true), (469, 31));
-        assert_eq!(split_hybrid_budget(8, true), (7, 1));
+        assert_eq!(split_hybrid_budget(500, true), (500, 0));
+        assert_eq!(split_hybrid_budget(8, true), (8, 0));
     }
 }

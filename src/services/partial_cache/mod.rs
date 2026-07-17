@@ -198,10 +198,18 @@ impl PartialPoolCache {
                 dirty.insert(*addr);
                 // Stamp activity so HF `cycle_activity_score` can mark cycles
                 // containing this pool as active (seed-only states had count=0).
-                self.pools.entry(*addr).and_modify(|state| {
-                    state.patched_at_ms = now;
-                    state.activity_count = state.activity_count.max(1);
-                });
+                // or_insert: seed may have skipped Balancer/missing cache rows.
+                self.pools
+                    .entry(*addr)
+                    .and_modify(|state| {
+                        state.patched_at_ms = now;
+                        state.activity_count = state.activity_count.max(1);
+                    })
+                    .or_insert_with(|| {
+                        let mut state = SlimPoolState::from_v3(U256::ZERO, 0, 0, now);
+                        state.activity_count = 1;
+                        state
+                    });
                 woke = woke.saturating_add(1);
             }
         }
@@ -445,10 +453,20 @@ impl PartialPoolCache {
             let mut dirty = self.dirty.lock();
             for addr in addrs {
                 dirty.insert(*addr);
-                self.pools.entry(*addr).and_modify(|state| {
-                    state.patched_at_ms = now;
-                    state.activity_count = state.activity_count.max(1);
-                });
+                // or_insert when LF seed missed the row (not in StateCache yet /
+                // non-V2/V3 seed path) — otherwise activity stays 0 and HF never
+                // marks live-touching cycles active (livehold: active_candidates=0).
+                self.pools
+                    .entry(*addr)
+                    .and_modify(|state| {
+                        state.patched_at_ms = now;
+                        state.activity_count = state.activity_count.max(1);
+                    })
+                    .or_insert_with(|| {
+                        let mut state = SlimPoolState::from_v3(U256::ZERO, 0, 0, now);
+                        state.activity_count = 1;
+                        state
+                    });
             }
         }
         self.trigger.notify();

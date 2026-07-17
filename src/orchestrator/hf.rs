@@ -617,34 +617,16 @@ fn select_cycles_for_rescore(
             quarantine_skipped += 1;
             continue;
         }
-        // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
-        // ranks were ~75% `v2_reserve` after unsupported cleared).
+        // Activity first: live-touching cycles were dying as micro_dead before
+        // score (livehold: cycles_touching=22 → selected=4 active=0). Fresh WSS
+        // moves can look shallow on stale local sim — still probe them.
+        let score = cycle_activity_score(ready.as_ref(), arena, partial_cache, activity_now);
         let start_decimals = arena.token_decimals(ready.start_token);
         let micro_probe = if start_decimals >= 6 {
             crate::util::ten_pow_u256_cached(start_decimals - 6)
         } else {
             U256::from(1u64)
         };
-        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
-            arena,
-            &ready.edges,
-            micro_probe,
-        )
-        .is_some()
-        {
-            v2_dead_skipped += 1;
-            continue;
-        }
-        if crate::pipeline::local_sim::micro_probe_liquidity_dead(
-            arena,
-            &ready.edges,
-            micro_probe,
-        )
-        .is_some()
-        {
-            micro_dead_skipped += 1;
-            continue;
-        }
         let start_rate = resolve_token_to_matic_rate(ready.start_token, token_to_matic_rates);
         let economic_floor = min_economic_amount_in(start_decimals, start_rate);
         // Insane gross at micro or economic floor → probe `sanity` phantoms
@@ -665,32 +647,53 @@ fn select_cycles_for_rescore(
             micro_dead_skipped += 1;
             continue;
         }
-        // After rank probe skips below-floor dust, micro-only survivors fail as
-        // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
-        match crate::pipeline::local_sim::economic_floor_liquidity_dead(
-            arena,
-            &ready.edges,
-            economic_floor,
-        ) {
-            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
-                bal_floor_dead_skipped += 1;
-                continue;
-            }
-            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
+        if score == 0 {
+            // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
+            // ranks were ~75% `v2_reserve` after unsupported cleared).
+            if crate::pipeline::local_sim::first_v2_hop_below_reserve(
+                arena,
+                &ready.edges,
+                micro_probe,
+            )
+            .is_some()
+            {
                 v2_dead_skipped += 1;
                 continue;
             }
-            Some(_) => {
+            if crate::pipeline::local_sim::micro_probe_liquidity_dead(
+                arena,
+                &ready.edges,
+                micro_probe,
+            )
+            .is_some()
+            {
                 micro_dead_skipped += 1;
                 continue;
             }
-            None => {}
-        }
-        let score = cycle_activity_score(ready.as_ref(), arena, partial_cache, activity_now);
-        if score > 0 {
-            active.push((ready, score));
-        } else {
+            // After rank probe skips below-floor dust, micro-only survivors fail as
+            // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
+            match crate::pipeline::local_sim::economic_floor_liquidity_dead(
+                arena,
+                &ready.edges,
+                economic_floor,
+            ) {
+                Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
+                    bal_floor_dead_skipped += 1;
+                    continue;
+                }
+                Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
+                    v2_dead_skipped += 1;
+                    continue;
+                }
+                Some(_) => {
+                    micro_dead_skipped += 1;
+                    continue;
+                }
+                None => {}
+            }
             inactive.push(ready);
+        } else {
+            active.push((ready, score));
         }
     }
 

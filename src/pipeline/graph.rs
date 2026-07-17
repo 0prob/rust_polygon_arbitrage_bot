@@ -12,7 +12,9 @@ use crate::pipeline::local_sim::protocol_matches_pool_state;
 use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
-use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
+use crate::services::execution::flash_liquidity::{
+    FlashLiquiditySnapshot, token_eligible_for_flash_borrow_graph,
+};
 use crate::services::oracle::has_reliable_matic_rate;
 use alloy::primitives::U256;
 use rayon::prelude::*;
@@ -520,7 +522,7 @@ pub fn pool_state_graph_eligible(
 fn pool_has_admissible_edges(
     arena: &StateArena,
     meta: &PoolMeta,
-    _gate: Option<&GraphBuildGate>,
+    gate: Option<&GraphBuildGate>,
 ) -> bool {
     let Some(state) = arena.pool_state(meta.pool_index) else {
         return false;
@@ -555,7 +557,23 @@ fn pool_has_admissible_edges(
     ) {
         return false;
     }
-    true
+    // Pricing/flash gate: keep pools with a priced token, or an unpriced flash/hub borrow leg.
+    let Some(gate) = gate.filter(|g| g.active()) else {
+        return true;
+    };
+    let has_priced_token = meta.tokens.iter().enumerate().any(|(i, &token)| {
+        bpt_index != Some(i)
+            && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
+    });
+    if has_priced_token {
+        return true;
+    }
+    meta.tokens.iter().enumerate().any(|(i, &token)| {
+        bpt_index != Some(i)
+            && arena.token_address(token).is_some_and(|addr| {
+                token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl)
+            })
+    })
 }
 
 #[inline]
@@ -2053,5 +2071,47 @@ mod tests {
             count_graph_eligible_unpriced_pools(&arena, &metas, &gate),
             1
         );
+    }
+
+    #[test]
+    fn graph_gate_rejects_unpriced_non_flash_pool() {
+        use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+        use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
+
+        let mut arena = StateArena::default();
+        let priced = arena.register_token(Address::from([0x11u8; 20]));
+        let a = arena.register_token(Address::from([0xaau8; 20]));
+        let b = arena.register_token(Address::from([0xbbu8; 20]));
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let pool = arena.register_pool(
+            Address::from([0x33u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let meta = pool_meta_from_pair(pool, ProtocolType::UniswapV2, a, b, 30);
+
+        let mut rates = FxHashMap::default();
+        rates.insert(priced, MIN_TOKEN_TO_MATIC_RATE);
+        let gate = GraphBuildGate {
+            token_to_matic_rates: Arc::new(rates),
+            flash: Arc::new(FlashLiquiditySnapshot::default()),
+            flash_ttl: Duration::from_secs(60),
+        };
+
+        let metas = [meta];
+        let gated = build_graph_with_gate(&arena, &metas, Some(&gate));
+        assert!(!gated.pool_has_live_edges(pool));
+        assert_eq!(
+            count_graph_eligible_unpriced_pools(&arena, &metas, &gate),
+            0
+        );
+        // Ungated build still admits the pool.
+        let ungated = build_graph(&arena, &metas);
+        assert!(ungated.pool_has_live_edges(pool));
     }
 }
