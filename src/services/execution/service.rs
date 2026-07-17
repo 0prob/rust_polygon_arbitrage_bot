@@ -48,7 +48,17 @@ use crate::services::state_cache::StateCache;
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
 const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
 const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 2;
+/// Best-eval cover below this (bps of gas cost) is chronic dust — soft-quarantine
+/// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
+/// at ~358 bps across captures while ge_1000 stayed 0).
+const CHRONIC_UNDERWATER_COVER_BPS: u64 = 2_000;
+/// Sticky V3 dust (~355 bps) is static for hours — 120s let it re-burn the probe
+/// window each expiry. 30m matches direct-token quarantine scale.
+const CHRONIC_UNDERWATER_QUARANTINE: Duration = Duration::from_secs(1800);
 const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
+/// Start-token cooldown when vault query profit does not appear in executor balance
+/// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
+const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800);
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -128,6 +138,8 @@ pub struct ExecutionService {
     mempool_nonce_cache: Mutex<Option<(Instant, u64, u64)>>,
     quarantine: RwLock<FxHashMap<u64, Instant>>,
     route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
+    /// Direct (`executeArbDirect`) start tokens that failed zero-realized confirm.
+    direct_token_quarantine: RwLock<FxHashMap<Address, Instant>>,
     global_quarantine_until: Mutex<Option<Instant>>,
     fail_counts: RwLock<FxHashMap<u64, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
@@ -252,6 +264,7 @@ impl ExecutionService {
             mempool_nonce_cache: parking_lot::Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
+            direct_token_quarantine: RwLock::new(FxHashMap::default()),
             global_quarantine_until: parking_lot::Mutex::new(None),
             fail_counts: RwLock::new(FxHashMap::default()),
             nonce: RwLock::new(None),
@@ -539,6 +552,21 @@ impl ExecutionService {
         self.prepare_skip_counts.write().remove(&fingerprint);
     }
 
+    /// Cool down a Direct start token after `executeArbDirect` realizes zero vs vault query.
+    pub fn quarantine_direct_token_zero_realized(&self, token: Address) {
+        self.direct_token_quarantine.write().insert(
+            token,
+            Instant::now() + DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE,
+        );
+    }
+
+    #[must_use]
+    pub fn is_direct_token_quarantined(&self, token: Address) -> bool {
+        let q = self.direct_token_quarantine.read();
+        let now = Instant::now();
+        q.get(&token).is_some_and(|expiry| now < *expiry)
+    }
+
     /// Cool down routes that repeatedly fail dispatch prepare after HF marked profitable.
     pub fn record_prepare_skip(&self, fingerprint: u64) {
         let count = {
@@ -573,6 +601,21 @@ impl ExecutionService {
     fn quarantine_route_soft(&self, fp: u64, now: Instant) {
         let mut q = self.quarantine.write();
         q.insert(fp, now + ROUTE_COOLDOWN);
+    }
+
+    /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
+    /// Returns true only when a *new* cooldown was applied (not on refresh).
+    pub fn quarantine_chronic_gas_underwater(&self, fingerprint: u64, gas_cover_bps: u64) -> bool {
+        if gas_cover_bps >= CHRONIC_UNDERWATER_COVER_BPS {
+            return false;
+        }
+        let mut q = self.quarantine.write();
+        let now = Instant::now();
+        if q.get(&fingerprint).is_some_and(|expiry| now < *expiry) {
+            return false;
+        }
+        q.insert(fingerprint, now + CHRONIC_UNDERWATER_QUARANTINE);
+        true
     }
 
     pub fn quarantine_global(&self, duration: Duration, now: Instant) {
@@ -894,6 +937,11 @@ impl ExecutionService {
             if matches!(dry.decoded_revert, Some(DecodedRevert::AaveReserveInactive)) {
                 self.flash_liquidity
                     .mark_aave_inactive(candidate.profit_token);
+            }
+            if candidate.flash_loan_source == FlashLoanSource::Direct
+                && dry.realized_profit.is_some_and(|p| p.is_zero())
+            {
+                self.quarantine_direct_token_zero_realized(candidate.profit_token);
             }
             if sim_fidelity_miss {
                 self.quarantine_route_soft(fp, now);

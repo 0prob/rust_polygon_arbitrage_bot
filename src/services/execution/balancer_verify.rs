@@ -13,14 +13,21 @@ use crate::core::constants::BALANCER_VAULT;
 use crate::core::math::balancer::exceeds_balancer_max_in_ratio;
 use crate::core::types::{FlashLoanSource, PoolState};
 use crate::pipeline::arena::StateArena;
-use crate::services::execution::calldata::CalldataHop;
-use crate::services::execution::calldata::encoders::balancer::build_balancer_batch_swap_request;
+use crate::services::execution::calldata::encoders::balancer::{
+    build_balancer_batch_swap_request, encode_balancer_batch_route,
+};
+use crate::services::execution::calldata::{
+    CalldataHop, ExecutorEntrypoint, build_arb_calldata,
+};
 use crate::services::execution::profit::on_chain_min_profit_for_route;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// `queryBatchSwap` is a static vault view; cap avoids RPC default gas overflow on heavy batches.
 const BALANCER_QUERY_BATCH_GAS: u64 = 2_000_000;
+/// `executeArbDirect` eth_call confirmation after vault query (batch + profit asserts).
+const BALANCER_DIRECT_CONFIRM_GAS: u64 = 3_000_000;
 const BALANCER_GIVEN_IN: u8 = 0;
+const DIRECT_CONFIRM_DEADLINE_SECS: u64 = 120;
 
 fn query_block_id(block_number: Option<u64>) -> Option<BlockId> {
     block_number
@@ -54,6 +61,8 @@ pub enum BalancerBatchReject {
     ProfitBelowMin,
     NonPositiveDelta,
     ReassessAfterOnChain,
+    /// Vault `queryBatchSwap` was profitable but `executeArbDirect` eth_call realized 0.
+    ZeroRealized,
     RpcError,
     Timeout,
     BuildDecodeFailed,
@@ -69,6 +78,7 @@ static BAL_REJECT_BUILD: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_PROFIT_FLOOR: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_NON_POS: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_REASSESS: AtomicU32 = AtomicU32::new(0);
+static BAL_REJECT_ZERO_REALIZED: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_RPC: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_TIMEOUT: AtomicU32 = AtomicU32::new(0);
 static BAL_REJECT_DECODE: AtomicU32 = AtomicU32::new(0);
@@ -90,6 +100,9 @@ pub fn record_balancer_batch_reject(reason: BalancerBatchReject) {
         }
         BalancerBatchReject::ReassessAfterOnChain => {
             BAL_REJECT_REASSESS.fetch_add(1, Ordering::Relaxed);
+        }
+        BalancerBatchReject::ZeroRealized => {
+            BAL_REJECT_ZERO_REALIZED.fetch_add(1, Ordering::Relaxed);
         }
         BalancerBatchReject::RpcError => {
             BAL_REJECT_RPC.fetch_add(1, Ordering::Relaxed);
@@ -131,6 +144,7 @@ pub fn log_balancer_batch_filter_summary() {
         + BAL_REJECT_PROFIT_FLOOR.load(Ordering::Relaxed)
         + BAL_REJECT_NON_POS.load(Ordering::Relaxed)
         + BAL_REJECT_REASSESS.load(Ordering::Relaxed)
+        + BAL_REJECT_ZERO_REALIZED.load(Ordering::Relaxed)
         + BAL_REJECT_RPC.load(Ordering::Relaxed)
         + BAL_REJECT_TIMEOUT.load(Ordering::Relaxed)
         + BAL_REJECT_DECODE.load(Ordering::Relaxed);
@@ -140,12 +154,13 @@ pub fn log_balancer_batch_filter_summary() {
     crate::info!(
         "balancer: batch_filter jobs={jobs} accept={accept} skip_verified={skip_verified} passthrough={passthrough} \
          reject_max_in={} reject_build={} reject_profit_floor={} reject_non_pos={} reject_reassess={} \
-         reject_rpc={} reject_timeout={} reject_decode={}",
+         reject_zero_realized={} reject_rpc={} reject_timeout={} reject_decode={}",
         BAL_REJECT_MAX_IN.load(Ordering::Relaxed),
         BAL_REJECT_BUILD.load(Ordering::Relaxed),
         BAL_REJECT_PROFIT_FLOOR.load(Ordering::Relaxed),
         BAL_REJECT_NON_POS.load(Ordering::Relaxed),
         BAL_REJECT_REASSESS.load(Ordering::Relaxed),
+        BAL_REJECT_ZERO_REALIZED.load(Ordering::Relaxed),
         BAL_REJECT_RPC.load(Ordering::Relaxed),
         BAL_REJECT_TIMEOUT.load(Ordering::Relaxed),
         BAL_REJECT_DECODE.load(Ordering::Relaxed),
@@ -179,7 +194,12 @@ pub fn balancer_batch_within_max_in_ratio(arena: &StateArena, hops: &[CalldataHo
         let Some(PoolState::Balancer(state)) = arena.pool_state(hop.edge.pool_index) else {
             return false;
         };
-        let in_idx = hop.edge.token_in_idx as usize;
+        // Prefer vault address lookup — edge idxs may lag meta vs getPoolTokens.
+        let in_idx = state
+            .tokens
+            .iter()
+            .position(|&t| t == hop.token_in)
+            .unwrap_or(hop.edge.token_in_idx as usize);
         state
             .balances
             .get(in_idx)
@@ -230,6 +250,69 @@ pub async fn query_balancer_batch_profit<P: Provider<Ethereum>>(
         Some(profit) => BatchQueryOutcome::Profit(profit),
         None => BatchQueryOutcome::NonPositiveDelta(delta),
     }
+}
+
+fn decode_u256_return(output: &[u8]) -> Option<U256> {
+    if output.len() == 32 {
+        return Some(U256::from_be_slice(output));
+    }
+    if output.len() > 32 {
+        return Some(U256::from_be_slice(&output[output.len() - 32..]));
+    }
+    None
+}
+
+fn direct_confirm_deadline() -> U256 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_add(DIRECT_CONFIRM_DEADLINE_SECS))
+        .unwrap_or(DIRECT_CONFIRM_DEADLINE_SECS);
+    U256::from(secs)
+}
+
+/// Confirm vault-query profit with an `executeArbDirect` eth_call (same packing as dispatch).
+///
+/// `queryBatchSwap` can report a positive vault delta while the executor balance delta is
+/// zero — those phantoms previously passed the batch filter and failed dry-run later.
+pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
+    provider: &P,
+    executor: Address,
+    operator: Address,
+    hops: &[CalldataHop],
+    profit_token: Address,
+    amount_in: U256,
+    min_profit: U256,
+    block_number: Option<u64>,
+) -> Option<U256> {
+    let deadline = direct_confirm_deadline();
+    let calls = encode_balancer_batch_route(hops, executor, deadline).ok()?;
+    let built = build_arb_calldata(
+        executor,
+        profit_token,
+        profit_token,
+        amount_in,
+        min_profit,
+        deadline,
+        calls,
+        ExecutorEntrypoint::Direct,
+    )
+    .ok()?;
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(built.to)
+        .input(built.data.into())
+        .value(built.value)
+        .from(operator)
+        .gas_limit(BALANCER_DIRECT_CONFIRM_GAS);
+    let mut eth_call = provider.call(tx);
+    if let Some(block) = query_block_id(block_number) {
+        eth_call = eth_call.block(block);
+    }
+    let output = match timeout(QUERY_TIMEOUT, eth_call).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    let realized = decode_u256_return(&output)?;
+    (!realized.is_zero()).then_some(realized)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

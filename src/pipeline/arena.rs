@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy::primitives::Address;
 use rustc_hash::FxHashMap;
@@ -8,6 +9,15 @@ use crate::services::discovery::{DiscoveredPool, discovered_to_pool_meta};
 use crate::services::state_cache::StateCache;
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
+
+/// Discovery protocol rewritten to match fetched arena state family.
+static META_PROTOCOL_CORRECTED: AtomicU32 = AtomicU32::new(0);
+
+/// How many pool metas had discovery protocol rewritten from arena state.
+#[must_use]
+pub fn meta_protocol_corrected_count() -> u32 {
+    META_PROTOCOL_CORRECTED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Default, Clone)]
 struct ArenaInner {
@@ -384,8 +394,24 @@ impl StateArena {
             };
             if let Some((state, revision)) = fresh.get(&address) {
                 let slot = idx.0 as usize;
+                // Cache multicall states are tickless; keep LF/dispatch tick arrays when
+                // the price level is unchanged so HF probe does not classify every CL
+                // hop as shallow_cl after apply_hot_cache.
+                let prior = self
+                    .hot_overlay
+                    .get(slot)
+                    .and_then(|overlay| overlay.as_deref())
+                    .or_else(|| self.inner.pools.get(slot).map(std::convert::AsRef::as_ref));
+                // Reject protocol-family swaps (live: V2 edges + V3 overlay → UnsupportedState).
+                // Keep the prior family until a matching refresh arrives.
+                if let Some(prior_state) = prior
+                    && !pool_state_family_compatible(prior_state, state.as_ref())
+                {
+                    continue;
+                }
+                let merged = preserve_cl_ticks_on_replace(prior, Arc::clone(state));
                 if let Some(overlay) = self.hot_overlay.get_mut(slot) {
-                    *overlay = Some(Arc::clone(state));
+                    *overlay = Some(merged);
                 }
                 if let Some(hot_revision) = self.hot_revisions.get_mut(slot) {
                     *hot_revision = *revision;
@@ -613,7 +639,18 @@ fn pool_meta_from_synced(
     state: &PoolState,
 ) -> crate::pipeline::types::PoolMeta {
     let mut meta = discovered_to_pool_meta(pool, pool_index, token_indices);
-    if pool.protocol == ProtocolType::BalancerV2
+    // Discovery labels can disagree with the fetched state family (live: V2 meta
+    // on V3 arena → graph/probe UnsupportedState). Prefer arena family; keep
+    // `protocol_label` for Algebra/factory selection at execution time.
+    if !crate::pipeline::local_sim::protocol_matches_pool_state(meta.protocol, state) {
+        let corrected =
+            crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
+        if corrected != meta.protocol {
+            META_PROTOCOL_CORRECTED.fetch_add(1, Ordering::Relaxed);
+            meta.protocol = corrected;
+        }
+    }
+    if meta.protocol == ProtocolType::BalancerV2
         && let PoolState::Balancer(b) = state
     {
         // Use the hydrated Vault result for phantom-BPT exclusion.
@@ -625,6 +662,23 @@ fn pool_meta_from_synced(
     meta
 }
 
+/// Same simulation family (V2/V3/V4/Curve/…) — blocks hot-cache kind swaps.
+#[inline]
+fn pool_state_family_compatible(prior: &PoolState, incoming: &PoolState) -> bool {
+    matches!(
+        (prior, incoming),
+        (PoolState::Invalid, _)
+            | (_, PoolState::Invalid)
+            | (PoolState::V2(_), PoolState::V2(_))
+            | (PoolState::V3(_), PoolState::V3(_))
+            | (PoolState::V4(_), PoolState::V4(_))
+            | (PoolState::Curve(_), PoolState::Curve(_))
+            | (PoolState::Balancer(_), PoolState::Balancer(_))
+            | (PoolState::Dodo(_), PoolState::Dodo(_))
+            | (PoolState::Woofi(_), PoolState::Woofi(_))
+    )
+}
+
 /// Keep LF-hydrated tick arrays when replacing a cache Arc that has no ticks.
 fn preserve_cl_ticks_on_replace(
     prior: Option<&PoolState>,
@@ -633,13 +687,15 @@ fn preserve_cl_ticks_on_replace(
     let Some(prior) = prior else {
         return incoming;
     };
+    // Keep tick arrays when the concentrated price level is unchanged. Global
+    // liquidity may move on refresh without invalidating the bitmap; a tick or
+    // sqrt move fails closed (incoming tickless state wins until re-enrich).
     match (prior, incoming.as_ref()) {
         (PoolState::V3(old), PoolState::V3(new))
             if !old.ticks.is_empty()
                 && new.ticks.is_empty()
                 && old.tick == new.tick
-                && old.sqrt_price_x96 == new.sqrt_price_x96
-                && old.liquidity == new.liquidity =>
+                && old.sqrt_price_x96 == new.sqrt_price_x96 =>
         {
             let mut merged = new.clone();
             merged.ticks = Arc::clone(&old.ticks);
@@ -649,8 +705,7 @@ fn preserve_cl_ticks_on_replace(
             if !old.ticks.is_empty()
                 && new.ticks.is_empty()
                 && old.tick == new.tick
-                && old.sqrt_price_x96 == new.sqrt_price_x96
-                && old.liquidity == new.liquidity =>
+                && old.sqrt_price_x96 == new.sqrt_price_x96 =>
         {
             let mut merged = new.clone();
             merged.ticks = Arc::clone(&old.ticks);
@@ -890,6 +945,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_hot_cache_rejects_protocol_family_swap() {
+        use crate::core::types::V3PoolState;
+        let addr = Address::from([15u8; 20]);
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(addr, v2_state());
+        let cache = StateCache::default();
+        cache.insert(
+            addr,
+            PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u64) << 96,
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Default::default(),
+            }),
+        );
+        arena.apply_hot_cache(&cache, &[addr]);
+        assert!(
+            matches!(arena.pool_state(idx), Some(PoolState::V2(_))),
+            "V3 overlay must not replace V2 base state"
+        );
+    }
+
+    #[test]
     fn apply_hot_cache_overlays_by_pool_index() {
         let addr = Address::from([5u8; 20]);
         let mut arena = StateArena::default();
@@ -1109,7 +1192,6 @@ mod tests {
         let pool = Address::with_last_byte(90);
         let token_a = Address::with_last_byte(91);
         let token_b = Address::with_last_byte(92);
-        let funded = MIN_HOP_TOKEN_BALANCE;
         let ticks: Arc<[V3Tick]> = Arc::from([
             V3Tick {
                 tick: -60,
@@ -1167,6 +1249,54 @@ mod tests {
         };
         assert_eq!(s.ticks.len(), 2, "ticks should survive cache re-sync");
         assert_eq!(s.ticks[0].tick, -60);
+    }
+
+    #[test]
+    fn apply_hot_cache_preserves_v3_ticks_across_liquidity_refresh() {
+        use crate::core::types::{V3PoolState, V3Tick};
+
+        let pool = Address::with_last_byte(93);
+        let ticks: Arc<[V3Tick]> = Arc::from([V3Tick {
+            tick: 0,
+            liquidity_gross: 10,
+            liquidity_net: 0,
+        }]);
+        let with_ticks = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::clone(&ticks),
+        };
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(pool, Arc::new(PoolState::V3(with_ticks)));
+        let cache = StateCache::default();
+        // HF multicall refresh: same tick/sqrt, new liquidity, empty ticks.
+        cache.insert(
+            pool,
+            PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_100_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from([]),
+            }),
+        );
+        arena.apply_hot_cache(&cache, &[pool]);
+        let PoolState::V3(s) = arena.pool_state(idx).expect("overlay") else {
+            panic!("expected v3");
+        };
+        assert_eq!(s.liquidity, 1_100_000);
+        assert_eq!(s.ticks.len(), 1, "LF ticks must survive HF hot-cache overlay");
+        assert_eq!(s.ticks[0].tick, 0);
     }
 
     #[test]

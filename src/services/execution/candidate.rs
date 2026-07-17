@@ -15,7 +15,7 @@ use crate::services::execution::flash_liquidity::{
 };
 use crate::services::execution::gas::buffer_gas_limit;
 use crate::services::execution::profit::AssessProfitInput;
-use crate::services::execution::profit::on_chain_min_profit_for_route;
+use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 
 #[derive(Debug, Clone)]
 pub struct CandidateExecution {
@@ -196,6 +196,7 @@ pub fn build_execution_candidate(
         )?
     };
     let encode_cfg = RouteEncodeConfig {
+        // Per-hop config only — hop minOut must not re-apply full-route depth haircut.
         slippage_bps: config.slippage_bps,
         deadline,
     };
@@ -206,14 +207,11 @@ pub fn build_execution_candidate(
         encode_cfg,
         dispatch_flash_source,
     )?;
-    let min_profit = on_chain_min_profit_for_route(
-        evaluated.result.profit,
-        evaluated.result.amount_in,
-        config.slippage_bps,
-        evaluated.cycle.hop_count,
-        dispatch_flash_source,
-    )
-    .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
+    // minProfit must match the route-level assessment (already compound+depth slip + flash fee).
+    // Rebuilding via per-hop `on_chain_min_profit_for_route` double-compounds slip and can
+    // set a floor above what prepare/reassess modeled — dry-run InsufficientProfit ghosts.
+    let min_profit = on_chain_min_profit_from_assessment(assessment)
+        .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
 
     // DODO flash loan: packRoute flash_token field must be the DODO pool address,
     // not the token address — the Huff contract calls flashLoan on it directly.

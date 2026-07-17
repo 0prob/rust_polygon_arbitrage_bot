@@ -99,7 +99,7 @@ impl PipelineSurvival {
         }
 
         crate::info!(
-            "pipeline totals: index={}/{} disc={} cache={} tradable={} arena={} no_graph={} graph={} cycle_capable={}",
+            "pipeline totals: index={}/{} disc={} cache={} tradable={} arena={} no_graph={} graph={} cycle_capable={} meta_corr={}",
             totals.index_parsed,
             totals.index_rejected,
             totals.discovered,
@@ -109,6 +109,7 @@ impl PipelineSurvival {
             totals.no_graph,
             totals.graph,
             totals.cycle_capable,
+            crate::pipeline::arena::meta_protocol_corrected_count(),
         );
     }
 

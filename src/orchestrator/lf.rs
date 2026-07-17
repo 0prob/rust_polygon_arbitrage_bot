@@ -943,10 +943,13 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     ctx.refresh.set_hot_addresses(hot);
 
     if let Some(targets) = stream_targets {
-        ctx.partial_cache.retain_tracked(&targets);
-        ctx.partial_cache
-            .seed_from_state_cache(&ctx.cache, &targets, crate::util::now_ms());
+        // Apply hysteresis first so retain/seed match the addresses WSS actually
+        // watches (replace may keep the prior set on small top-N churn).
         let _ = ctx.stream_addresses.replace(targets);
+        let tracked: Vec<_> = ctx.stream_addresses.read().clone();
+        ctx.partial_cache.retain_tracked(&tracked);
+        ctx.partial_cache
+            .seed_from_state_cache(&ctx.cache, &tracked, crate::util::now_ms());
     }
 
     Ok(())

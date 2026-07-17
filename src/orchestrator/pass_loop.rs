@@ -233,7 +233,10 @@ pub async fn run_pass_loop(
                 }
             }
             _ = hf_scheduler.timer.tick() => {
-                hf_scheduler.schedule(false);
+                // Promote WSS patches that the watch arm rate-limited or lost to
+                // select races (live: stream=true, patches/activity advance, but
+                // stream_triggered stayed false for whole captures).
+                hf_scheduler.schedule_timer_tick();
             }
             event = async {
                 match height_rx.as_mut() {
@@ -248,7 +251,7 @@ pub async fn run_pass_loop(
                         if let Some(hs) = ctx.hypersync.as_ref() {
                             hs.record_height(height);
                         }
-                        hf_scheduler.schedule(false);
+                        hf_scheduler.schedule_timer_tick();
                     }
                     Some(HeightStreamEvent::Reconnecting { delay, error_msg }) => {
                         let now = crate::util::now_ms();
@@ -313,6 +316,9 @@ pub async fn run_pass_loop(
             }, if stream_rx.is_some() => {
                 match result {
                     Ok(()) => {
+                        let _ = stream_rx
+                            .as_mut()
+                            .map(|rx| rx.borrow_and_update());
                         if hf_scheduler.try_schedule_stream_triggered() {
                             crate::debug!("stream pool update triggered hf tick");
                         }
@@ -428,9 +434,32 @@ impl HfScheduler {
         );
     }
 
+    /// HF interval tick: attach stream-trigger if WSS patched since last stream HF.
+    fn schedule_timer_tick(&mut self) {
+        let pending = self.stream_pending.swap(false, Ordering::AcqRel);
+        let patched = self
+            .hf_ctx
+            .partial_cache
+            .trigger()
+            .take_stream_triggered();
+        let stream_triggered = pending || patched;
+        if stream_triggered {
+            self.last_stream_hf_at = std::time::Instant::now();
+            crate::info!(
+                "hf stream promote: pending={pending} patched={patched} patches={}",
+                self.hf_ctx.partial_cache.patch_count()
+            );
+        }
+        self.schedule(stream_triggered);
+    }
+
     fn try_schedule_stream_triggered(&mut self) -> bool {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_stream_hf_at) < self.stream_min_interval {
+            // Do not drop the signal — timer/HF-completion must still promote a
+            // stream-triggered tick (live: stream=true but stream_triggered=false
+            // for entire captures while WSS patches + active_candidates advanced).
+            self.stream_pending.store(true, Ordering::Release);
             return false;
         }
         self.last_stream_hf_at = now;

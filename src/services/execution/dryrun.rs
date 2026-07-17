@@ -361,6 +361,25 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
         }
     };
 
+    // Fail closed on empty/zero profit before a second RPC (estimate_gas). Most dry-runs
+    // that "succeed" eth_call but return zero profit were paying an extra RTT for nothing.
+    if !is_acceptable_realized_profit(realized_profit) {
+        let error = if realized_profit.is_some() {
+            "eth_call succeeded but on-chain realized profit is zero".into()
+        } else {
+            "eth_call succeeded but returned no decodable realized profit (wrong entrypoint or empty return)"
+                .into()
+        };
+        return DryRunResult {
+            semantic_success: false,
+            success: false,
+            gas_used: None,
+            realized_profit,
+            error: Some(error),
+            decoded_revert: None,
+        };
+    }
+
     let estimate_gas_cap = eth_call_gas_limit(candidate.simulated_gas);
     let gas_from_estimate = async {
         let tx = build_tx(candidate, from, Some(estimate_gas_cap));
@@ -389,32 +408,14 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
     .await;
 
     match gas_from_estimate {
-        Ok(gas) => {
-            if !is_acceptable_realized_profit(realized_profit) {
-                let error = if realized_profit.is_some() {
-                    "eth_call succeeded but on-chain realized profit is zero".into()
-                } else {
-                    "eth_call succeeded but returned no decodable realized profit (wrong entrypoint or empty return)"
-                        .into()
-                };
-                return DryRunResult {
-                    semantic_success: false,
-                    success: false,
-                    gas_used: Some(gas),
-                    realized_profit,
-                    error: Some(error),
-                    decoded_revert: None,
-                };
-            }
-            DryRunResult {
-                semantic_success: true,
-                success: true,
-                gas_used: Some(gas),
-                realized_profit,
-                error: None,
-                decoded_revert: None,
-            }
-        }
+        Ok(gas) => DryRunResult {
+            semantic_success: true,
+            success: true,
+            gas_used: Some(gas),
+            realized_profit,
+            error: None,
+            decoded_revert: None,
+        },
         Err(msg) => {
             if is_gas_limit_rpc_error(&msg) {
                 return realized_profit
@@ -476,6 +477,13 @@ mod tests {
 
         let tx = build_tx(&candidate, Address::repeat_byte(3), None);
         assert_eq!(tx.gas, None);
+    }
+
+    #[test]
+    fn zero_realized_profit_is_not_acceptable() {
+        assert!(!is_acceptable_realized_profit(None));
+        assert!(!is_acceptable_realized_profit(Some(U256::ZERO)));
+        assert!(is_acceptable_realized_profit(Some(U256::from(1u8))));
     }
 
     #[test]

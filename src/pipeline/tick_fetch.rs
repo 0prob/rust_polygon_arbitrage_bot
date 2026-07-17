@@ -10,6 +10,14 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 pub struct TickEnrichment {
     pub loaded: usize,
     pub rpc_failed: bool,
+    /// TickLens/bitmap returned complete words but zero populated ticks.
+    pub empty_pools: usize,
+    /// Partial multicall word responses (reverts / missing returns).
+    pub incomplete_pools: usize,
+    /// Pools hydrated via Algebra tickTable after TickLens miss / label route.
+    pub algebra_loaded: usize,
+    /// Deprecated: probe sentinel seeding removed (phantom depth). Always 0.
+    pub seeded_pools: usize,
 }
 
 impl TickEnrichment {
@@ -18,6 +26,12 @@ impl TickEnrichment {
         Self {
             loaded: self.loaded.saturating_add(other.loaded),
             rpc_failed: self.rpc_failed || other.rpc_failed,
+            empty_pools: self.empty_pools.saturating_add(other.empty_pools),
+            incomplete_pools: self
+                .incomplete_pools
+                .saturating_add(other.incomplete_pools),
+            algebra_loaded: self.algebra_loaded.saturating_add(other.algebra_loaded),
+            seeded_pools: self.seeded_pools.saturating_add(other.seeded_pools),
         }
     }
 }
@@ -222,110 +236,295 @@ pub async fn enrich_v3_ticks<
     }
 
     let mut updated = 0usize;
+    let mut empty_pools = 0usize;
+    let mut incomplete_pools = 0usize;
+    // TickLens miss / revert often means Algebra (QuickSwap) — retry those via tickTable.
+    let mut algebra_fallback: Vec<(Address, PoolIndex, i32, i32, i32)> = Vec::new();
+    let mut tick_lens_rpc_failed = false;
     if !items.is_empty() {
-        let results =
-            match crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number)
-                .await
-            {
-                Ok(results) => results,
-                Err(error) => {
-                    crate::warn!(
-                        "v3 tick lens multicall failed ({} pools): {error:#}",
-                        pool_addresses.len(),
-                    );
-                    return TickEnrichment {
-                        loaded: 0,
-                        rpc_failed: true,
-                    };
-                }
-            };
-
-        let mut incomplete_pools = 0usize;
-        let mut empty_pools = 0usize;
-        for (start, end, idx) in spans {
-            let mut ticks: Vec<V3Tick> = Vec::new();
-            let mut complete = true;
-            for bytes in &results[start..end] {
-                let Some(bytes) = bytes else {
-                    complete = false;
-                    break;
-                };
-                let Ok(populated) =
-                    ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
-                else {
-                    complete = false;
-                    break;
-                };
-                for pt in populated {
-                    let tick = pt.tick.as_i32();
-                    if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+        match crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
+        {
+            Ok(results) => {
+                for (start, end, idx) in &spans {
+                    let mut ticks: Vec<V3Tick> = Vec::new();
+                    let mut complete = true;
+                    for bytes in &results[*start..*end] {
+                        let Some(bytes) = bytes else {
+                            complete = false;
+                            break;
+                        };
+                        let Ok(populated) =
+                            ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
+                        else {
+                            complete = false;
+                            break;
+                        };
+                        for pt in populated {
+                            let tick = pt.tick.as_i32();
+                            if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+                                continue;
+                            }
+                            ticks.push(V3Tick {
+                                tick,
+                                liquidity_gross: pt.liquidityGross,
+                                liquidity_net: pt.liquidityNet,
+                            });
+                        }
+                    }
+                    if !complete {
+                        incomplete_pools += 1;
+                        if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                            algebra_fallback.push(fb);
+                        }
                         continue;
                     }
-                    ticks.push(V3Tick {
-                        tick,
-                        liquidity_gross: pt.liquidityGross,
-                        liquidity_net: pt.liquidityNet,
-                    });
+                    if ticks.is_empty() {
+                        empty_pools += 1;
+                        if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                            algebra_fallback.push(fb);
+                        }
+                        continue;
+                    }
+                    finalize_cl_ticks(&mut ticks);
+                    if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(*idx)
+                    {
+                        s.ticks = Arc::from(ticks);
+                        updated += 1;
+                    }
+                }
+                if incomplete_pools > 0 {
+                    crate::warn!(
+                        "v3 tick lens left {} pools tickless after partial word responses",
+                        incomplete_pools
+                    );
                 }
             }
-            if !complete {
-                incomplete_pools += 1;
-                continue;
-            }
-            if ticks.is_empty() {
-                empty_pools += 1;
-                continue;
-            }
-            finalize_cl_ticks(&mut ticks);
-            if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(idx) {
-                s.ticks = Arc::from(ticks);
-                updated += 1;
+            Err(error) => {
+                crate::warn!(
+                    "v3 tick lens multicall failed ({} pools) — trying algebra/seed: {error:#}",
+                    pool_addresses.len(),
+                );
+                tick_lens_rpc_failed = true;
+                for (_, _, idx) in &spans {
+                    if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                        algebra_fallback.push(fb);
+                    }
+                }
             }
         }
-        if incomplete_pools > 0 {
-            crate::warn!(
-                "v3 tick lens left {} pools tickless after partial word responses",
-                incomplete_pools
+    }
+
+    let direct_loaded = updated;
+    // Labeled algebra first, then TickLens-empty/incomplete fallbacks (dedupe by pool index).
+    let mut algebra_seen: FxHashSet<PoolIndex> = FxHashSet::default();
+    let mut all_algebra = Vec::with_capacity(algebra_targets.len() + algebra_fallback.len());
+    for t in algebra_targets.into_iter().chain(algebra_fallback) {
+        if algebra_seen.insert(t.1) {
+            all_algebra.push(t);
+        }
+    }
+    let algebra_target_count = all_algebra.len();
+    let algebra = enrich_algebra_ticks(
+        provider,
+        arena,
+        &all_algebra,
+        algebra_integral_pools,
+        block_number,
+    )
+    .await;
+    updated += algebra.loaded;
+
+    // One wider TickLens pass for pools still tickless. Quiet UniV3 pools often have
+    // initialized ticks outside word_range=10 (Algebra-only widen misses them).
+    let mut wide_loaded = 0usize;
+    if updated < pool_addresses.len() && word_range < 48 {
+        let wide_range = word_range.saturating_mul(3).max(24).min(48);
+        let mut still_empty = Vec::new();
+        let mut seen: FxHashSet<Address> = FxHashSet::default();
+        for &pool in pool_addresses {
+            let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+                continue;
+            };
+            let tickless = matches!(
+                arena.pool_state(idx),
+                Some(crate::core::types::PoolState::V3(s)) if s.ticks.is_empty()
             );
+            if tickless && seen.insert(pool) {
+                still_empty.push(pool);
+            }
         }
-        let direct_loaded = updated;
-        let algebra_target_count = algebra_targets.len();
-        let algebra = enrich_algebra_ticks(
-            provider,
-            arena,
-            &algebra_targets,
-            algebra_integral_pools,
-            block_number,
-        )
-        .await;
-        updated += algebra.loaded;
-        crate::debug!(
-            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} loaded={}",
+        if !still_empty.is_empty() {
+            wide_loaded = enrich_v3_tick_lens_only(
+                provider,
+                arena,
+                &still_empty,
+                wide_range,
+                block_number,
+            )
+            .await;
+            updated += wide_loaded;
+        }
+    }
+
+    if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
+        crate::info!(
+            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} wide_loaded={} loaded={}",
             pool_addresses.len(),
             direct_loaded,
             empty_pools,
             incomplete_pools,
             algebra_target_count,
             algebra.loaded,
+            wide_loaded,
             updated
         );
-        return TickEnrichment {
-            loaded: updated,
-            rpc_failed: algebra.rpc_failed,
-        };
+        // Sample the first still-tickless target for offline diagnosis.
+        for &pool in pool_addresses {
+            let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+                continue;
+            };
+            if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state(idx) {
+                if s.ticks.is_empty() {
+                    crate::info!(
+                        "v3 tick hydration miss: pool={pool} tick={} spacing={} liquidity={} labeled_algebra={}",
+                        s.tick,
+                        s.tick_spacing,
+                        s.liquidity,
+                        algebra_pools.contains(&pool) || algebra_integral_pools.contains(&pool),
+                    );
+                    break;
+                }
+            }
+        }
+    } else {
+        crate::debug!(
+            "v3 tick hydration: targets={} direct_loaded={} loaded={}",
+            pool_addresses.len(),
+            direct_loaded,
+            updated
+        );
     }
-    let algebra = enrich_algebra_ticks(
-        provider,
-        arena,
-        &algebra_targets,
-        algebra_integral_pools,
-        block_number,
-    )
-    .await;
     TickEnrichment {
-        loaded: updated.saturating_add(algebra.loaded),
-        rpc_failed: algebra.rpc_failed,
+        loaded: updated,
+        // Fail closed only when both TickLens and Algebra produced nothing.
+        rpc_failed: (tick_lens_rpc_failed || algebra.rpc_failed) && updated == 0,
+        empty_pools,
+        incomplete_pools,
+        algebra_loaded: algebra.loaded.saturating_add(wide_loaded),
+        ..TickEnrichment::default()
     }
+}
+
+fn algebra_fallback_target(
+    arena: &StateArena,
+    idx: PoolIndex,
+    word_range: i16,
+) -> Option<(Address, PoolIndex, i32, i32, i32)> {
+    let addr = arena.pool_address(idx)?;
+    let (tick, spacing) = match arena.pool_state(idx) {
+        Some(crate::core::types::PoolState::V3(s)) => (s.tick, s.tick_spacing),
+        _ => return None,
+    };
+    let center_word = cl_tick_bitmap_center_word(tick, spacing);
+    Some((
+        addr,
+        idx,
+        spacing,
+        center_word - i32::from(word_range),
+        center_word + i32::from(word_range),
+    ))
+}
+
+/// TickLens-only widen pass (no Algebra / no further widen) for still-empty UniV3 pools.
+async fn enrich_v3_tick_lens_only<
+    P: alloy::providers::Provider<alloy::network::Ethereum> + Clone + Send + 'static,
+>(
+    provider: &P,
+    arena: &mut StateArena,
+    pool_addresses: &[Address],
+    word_range: i16,
+    block_number: Option<u64>,
+) -> usize {
+    use alloy::sol_types::SolCall;
+
+    use crate::abis::ITickLens;
+    use crate::core::constants::TICK_LENS_POLYGON;
+    use crate::pipeline::multicall::{MulticallItem, encode_call};
+
+    if pool_addresses.is_empty() {
+        return 0;
+    }
+    let tick_lens = TICK_LENS_POLYGON;
+    let word_count = word_range.saturating_mul(2).saturating_add(1) as usize;
+    let mut items = Vec::with_capacity(pool_addresses.len().saturating_mul(word_count));
+    let mut spans: Vec<(usize, usize, PoolIndex)> = Vec::with_capacity(pool_addresses.len());
+    for &pool in pool_addresses {
+        let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+            continue;
+        };
+        let (tick, spacing) = match arena.pool_state(idx) {
+            Some(crate::core::types::PoolState::V3(s)) => (s.tick, s.tick_spacing),
+            _ => continue,
+        };
+        let center_word = cl_tick_bitmap_center_word(tick, spacing);
+        let word_min = center_word - i32::from(word_range);
+        let word_max = center_word + i32::from(word_range);
+        let start = items.len();
+        for word in word_min..=word_max {
+            items.push(MulticallItem {
+                target: tick_lens,
+                data: encode_call(&ITickLens::getPopulatedTicksInWordCall {
+                    pool,
+                    tickBitmapIndex: word as i16,
+                }),
+            });
+        }
+        spans.push((start, items.len(), idx));
+    }
+    if items.is_empty() {
+        return 0;
+    }
+    let Ok(results) =
+        crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
+    else {
+        return 0;
+    };
+    let mut loaded = 0usize;
+    for (start, end, idx) in spans {
+        let mut ticks: Vec<V3Tick> = Vec::new();
+        let mut complete = true;
+        for bytes in &results[start..end] {
+            let Some(bytes) = bytes else {
+                complete = false;
+                break;
+            };
+            let Ok(populated) = ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
+            else {
+                complete = false;
+                break;
+            };
+            for pt in populated {
+                let tick = pt.tick.as_i32();
+                if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+                    continue;
+                }
+                ticks.push(V3Tick {
+                    tick,
+                    liquidity_gross: pt.liquidityGross,
+                    liquidity_net: pt.liquidityNet,
+                });
+            }
+        }
+        if !complete || ticks.is_empty() {
+            continue;
+        }
+        finalize_cl_ticks(&mut ticks);
+        if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state_mut(idx) {
+            s.ticks = Arc::from(ticks);
+            loaded += 1;
+        }
+    }
+    loaded
 }
 
 pub async fn enrich_v4_ticks<
@@ -378,8 +577,8 @@ pub async fn enrich_v4_ticks<
                 targets.len()
             );
             return TickEnrichment {
-                loaded: 0,
                 rpc_failed: true,
+                ..TickEnrichment::default()
             };
         }
     };
@@ -425,33 +624,203 @@ pub async fn enrich_v4_ticks<
         }
     }
 
+    let mut updated = 0usize;
+    let empty_pools;
     if tick_calls.is_empty() {
-        return TickEnrichment::default();
+        empty_pools = targets.len();
+    } else {
+        let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
+            Ok(states) => states,
+            Err(error) => {
+                crate::warn!(
+                    "v4 tick state multicall failed ({} tick reads): {error:#}",
+                    tick_calls.len(),
+                );
+                return TickEnrichment {
+                    rpc_failed: true,
+                    ..TickEnrichment::default()
+                };
+            }
+        };
+
+        let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
+            rustc_hash::FxHashMap::default();
+        for ((idx, tick), bytes) in tick_owners.into_iter().zip(states) {
+            let Some(bytes) = bytes else {
+                incomplete_pools.insert(idx);
+                continue;
+            };
+            let Some(raw) = decode_abi_word(&bytes) else {
+                incomplete_pools.insert(idx);
+                continue;
+            };
+            let (liquidity_gross, liquidity_net) = decode_v4_tick_liquidity(raw);
+            if liquidity_gross > 0 {
+                grouped.entry(idx).or_default().push(V3Tick {
+                    tick,
+                    liquidity_gross,
+                    liquidity_net,
+                });
+            }
+        }
+
+        for (idx, mut ticks) in grouped {
+            if incomplete_pools.contains(&idx) {
+                continue;
+            }
+            finalize_cl_ticks(&mut ticks);
+            if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(idx) {
+                state.ticks = Arc::from(ticks);
+                updated += 1;
+            }
+        }
+        empty_pools = targets
+            .iter()
+            .filter(|(idx, _)| match arena.pool_state(*idx) {
+                Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
+                _ => false,
+            })
+            .count();
+    }
+    if !incomplete_pools.is_empty() || capped {
+        crate::warn!(
+            "v4 tick hydration left {} pools tickless after partial responses or read cap (capped={capped})",
+            incomplete_pools.len()
+        );
     }
 
-    let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
-        Ok(states) => states,
-        Err(error) => {
-            crate::warn!(
-                "v4 tick state multicall failed ({} tick reads): {error:#}",
-                tick_calls.len(),
-            );
-            return TickEnrichment {
-                loaded: 0,
-                rpc_failed: true,
-            };
+    // Wider bitmap window for still-empty V4 (same sparse-tick pattern as V3).
+    let mut wide_loaded = 0usize;
+    if updated < targets.len() && word_range < 48 {
+        let wide_range = word_range.saturating_mul(3).max(24).min(48);
+        let still: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|(idx, _)| match arena.pool_state(*idx) {
+                Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
+                _ => false,
+            })
+            .collect();
+        if !still.is_empty() {
+            wide_loaded =
+                enrich_v4_ticks_once(provider, arena, &still, wide_range, block_number).await;
+            updated += wide_loaded;
         }
-    };
+    }
 
+    if empty_pools > 0 || wide_loaded > 0 || updated > 0 {
+        for &(idx, pool_id) in targets {
+            if let Some(crate::core::types::PoolState::V4(s)) = arena.pool_state(idx) {
+                if s.ticks.is_empty() {
+                    let addr = arena.pool_address(idx).unwrap_or_default();
+                    crate::info!(
+                        "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_loaded={}",
+                        s.tick,
+                        s.tick_spacing,
+                        s.liquidity,
+                        wide_loaded,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    TickEnrichment {
+        loaded: updated,
+        empty_pools,
+        incomplete_pools: incomplete_pools.len(),
+        ..TickEnrichment::default()
+    }
+}
+
+/// Single-pass V4 bitmap→tick enrich without further widen (used by wide retry).
+async fn enrich_v4_ticks_once<
+    P: alloy::providers::Provider<alloy::network::Ethereum> + Clone + Send + 'static,
+>(
+    provider: &P,
+    arena: &mut StateArena,
+    targets: &[(PoolIndex, FixedBytes<32>)],
+    word_range: i16,
+    block_number: Option<u64>,
+) -> usize {
+    use crate::pipeline::abi_cache::{decode_abi_word, encode_extsload};
+    use crate::pipeline::multicall::{MulticallItem, execute_multicall_at};
+    use alloy::primitives::U256;
+
+    if targets.is_empty() {
+        return 0;
+    }
+    let manager = UNISWAP_V4_POOL_MANAGER;
+    let mut bitmap_calls = Vec::new();
+    let mut spans = Vec::new();
+    for &(idx, pool_id) in targets {
+        let Some(crate::core::types::PoolState::V4(s)) = arena.pool_state(idx) else {
+            continue;
+        };
+        let spacing = s.tick_spacing.max(1);
+        let center_word = cl_tick_bitmap_center_word(s.tick, spacing);
+        let word_min = center_word - i32::from(word_range);
+        let word_max = center_word + i32::from(word_range);
+        let start = bitmap_calls.len();
+        for word in word_min..=word_max {
+            let slot = compute_v4_tick_bitmap_slot(&pool_id, word as i16);
+            bitmap_calls.push(MulticallItem {
+                target: manager,
+                data: encode_extsload(slot),
+            });
+        }
+        spans.push((idx, pool_id, spacing, word_min, start, bitmap_calls.len()));
+    }
+    if bitmap_calls.is_empty() {
+        return 0;
+    }
+    let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
+        return 0;
+    };
+    let mut tick_calls = Vec::new();
+    let mut tick_owners = Vec::new();
+    for (idx, pool_id, spacing, word_min, start, end) in spans {
+        for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let Some(bitmap) = decode_abi_word(bytes) else {
+                continue;
+            };
+            for bit in 0..256u16 {
+                if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                    break;
+                }
+                if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
+                    continue;
+                }
+                let word = word_min + offset as i32;
+                let Some(tick) = cl_tick_from_bitmap_bit(word, bit, spacing) else {
+                    continue;
+                };
+                let slot = compute_v4_tick_info_slot(&pool_id, tick);
+                tick_calls.push(MulticallItem {
+                    target: manager,
+                    data: encode_extsload(slot),
+                });
+                tick_owners.push((idx, tick));
+            }
+        }
+    }
+    if tick_calls.is_empty() {
+        return 0;
+    }
+    let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
+        return 0;
+    };
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
         rustc_hash::FxHashMap::default();
     for ((idx, tick), bytes) in tick_owners.into_iter().zip(states) {
         let Some(bytes) = bytes else {
-            incomplete_pools.insert(idx);
             continue;
         };
         let Some(raw) = decode_abi_word(&bytes) else {
-            incomplete_pools.insert(idx);
             continue;
         };
         let (liquidity_gross, liquidity_net) = decode_v4_tick_liquidity(raw);
@@ -463,27 +832,42 @@ pub async fn enrich_v4_ticks<
             });
         }
     }
-
-    let mut updated = 0;
+    let mut loaded = 0usize;
     for (idx, mut ticks) in grouped {
-        if incomplete_pools.contains(&idx) {
-            continue;
-        }
         finalize_cl_ticks(&mut ticks);
         if let Some(crate::core::types::PoolState::V4(state)) = arena.pool_state_mut(idx) {
             state.ticks = Arc::from(ticks);
-            updated += 1;
+            loaded += 1;
         }
     }
-    if !incomplete_pools.is_empty() || capped {
-        crate::warn!(
-            "v4 tick hydration left {} pools tickless after partial responses or read cap (capped={capped})",
-            incomplete_pools.len()
-        );
-    }
-    TickEnrichment {
-        loaded: updated,
-        rpc_failed: false,
+    loaded
+}
+
+fn decode_algebra_tick_entry(bytes: &[u8], tick: i32, integral: bool) -> Option<V3Tick> {
+    use crate::abis::{IAlgebraIntegralPool, IAlgebraPool};
+    use alloy::sol_types::SolCall;
+
+    if integral {
+        let state = IAlgebraIntegralPool::ticksCall::abi_decode_returns(bytes).ok()?;
+        let liquidity_gross = u128::try_from(state.liquidityTotal).ok()?;
+        if liquidity_gross == 0 {
+            return None;
+        }
+        Some(V3Tick {
+            tick,
+            liquidity_gross,
+            liquidity_net: state.liquidityDelta,
+        })
+    } else {
+        let state = IAlgebraPool::ticksCall::abi_decode_returns(bytes).ok()?;
+        if !state.initialized || state.liquidityTotal == 0 {
+            return None;
+        }
+        Some(V3Tick {
+            tick,
+            liquidity_gross: state.liquidityTotal,
+            liquidity_net: state.liquidityDelta,
+        })
     }
 }
 
@@ -496,7 +880,7 @@ async fn enrich_algebra_ticks<
     integral_pools: &FxHashSet<Address>,
     block_number: Option<u64>,
 ) -> TickEnrichment {
-    use crate::abis::{IAlgebraIntegralPool, IAlgebraPool};
+    use crate::abis::IAlgebraPool;
     use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall_at};
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
@@ -530,8 +914,8 @@ async fn enrich_algebra_ticks<
                 targets.len(),
             );
             return TickEnrichment {
-                loaded: 0,
                 rpc_failed: true,
+                ..TickEnrichment::default()
             };
         }
     };
@@ -573,8 +957,8 @@ async fn enrich_algebra_ticks<
                 tick_calls.len(),
             );
             return TickEnrichment {
-                loaded: 0,
                 rpc_failed: true,
+                ..TickEnrichment::default()
             };
         }
     };
@@ -584,33 +968,14 @@ async fn enrich_algebra_ticks<
         let Some(bytes) = bytes else {
             continue;
         };
-        let tick_entry = if integral_pools.contains(&pool) {
-            let Ok(state) = IAlgebraIntegralPool::ticksCall::abi_decode_returns(&bytes) else {
-                continue;
-            };
-            let Ok(liquidity_gross) = u128::try_from(state.liquidityTotal) else {
-                continue;
-            };
-            if liquidity_gross == 0 {
-                continue;
-            }
-            V3Tick {
-                tick,
-                liquidity_gross,
-                liquidity_net: state.liquidityDelta,
-            }
-        } else {
-            let Ok(state) = IAlgebraPool::ticksCall::abi_decode_returns(&bytes) else {
-                continue;
-            };
-            if !state.initialized || state.liquidityTotal == 0 {
-                continue;
-            }
-            V3Tick {
-                tick,
-                liquidity_gross: state.liquidityTotal,
-                liquidity_net: state.liquidityDelta,
-            }
+        // Prefer labeled ABI, then fall back to the other Algebra ticks() layout.
+        // Mis-labeled QuickSwap Integral pools otherwise stay permanently tickless.
+        let prefer_integral = integral_pools.contains(&pool);
+        let tick_entry = match decode_algebra_tick_entry(&bytes, tick, prefer_integral)
+            .or_else(|| decode_algebra_tick_entry(&bytes, tick, !prefer_integral))
+        {
+            Some(entry) => entry,
+            None => continue,
         };
         grouped.entry(idx).or_default().push(tick_entry);
     }
@@ -624,7 +989,7 @@ async fn enrich_algebra_ticks<
     }
     TickEnrichment {
         loaded: updated,
-        rpc_failed: false,
+        ..TickEnrichment::default()
     }
 }
 
@@ -675,11 +1040,12 @@ mod tests {
     fn tick_enrichment_combines_provider_failures() {
         let result = TickEnrichment {
             loaded: 3,
-            rpc_failed: false,
+            ..TickEnrichment::default()
         }
         .combine(TickEnrichment {
             loaded: 2,
             rpc_failed: true,
+            ..TickEnrichment::default()
         });
 
         assert_eq!(result.loaded, 5);

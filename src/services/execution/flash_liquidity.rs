@@ -1384,11 +1384,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 );
                 return reoptimize_capped(input, plan.source, liquidity.balancer);
             }
-            let assessment = input
-                .existing_assessment
-                .clone()
-                .filter(|a| a.should_execute && a.gross_profit == input.evaluated.result.profit)
-                .or_else(|| reassess_route(input, plan.source))?;
+            let assessment = reuse_or_reassess(input, plan.source)?;
             if !assessment.should_execute {
                 prepare_skip_log(
                     input.log_skips,
@@ -1614,6 +1610,39 @@ fn reassess_route(
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
     }))
+}
+
+/// Reuse HF assessment when sim profit + flash fee still match the planned source.
+fn reuse_or_reassess(
+    input: &PrepareDispatchInput<'_>,
+    source: FlashLoanSource,
+) -> Option<ProfitAssessment> {
+    // Risk haircut is applied only at reassess; never reuse under elevated risk.
+    if input.risk_multiplier_bps > 10_000 {
+        return reassess_route(input, source);
+    }
+    if let Some(existing) = input.existing_assessment.as_ref()
+        && existing.should_execute
+        && existing.gross_profit == input.evaluated.result.profit
+        && assessment_flash_fee_matches(existing, source, input.evaluated.result.amount_in)
+    {
+        return Some(existing.clone());
+    }
+    reassess_route(input, source)
+}
+
+#[inline]
+fn assessment_flash_fee_matches(
+    assessment: &ProfitAssessment,
+    source: FlashLoanSource,
+    amount_in: U256,
+) -> bool {
+    let fee_bps = crate::services::execution::profit::flash_loan_fee_bps(source);
+    let expected = amount_in
+        .checked_mul(U256::from(fee_bps))
+        .map(|v| v / crate::core::constants::BPS_SCALE)
+        .unwrap_or(U256::MAX);
+    assessment.flash_loan_fee == expected
 }
 
 fn push_flash_token(

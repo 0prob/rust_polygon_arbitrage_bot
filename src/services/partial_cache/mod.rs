@@ -261,7 +261,10 @@ impl PartialPoolCache {
             }
         }
         self.dirty.lock().insert(pool);
-        self.patches.fetch_add(1, Ordering::Relaxed);
+        let n = self.patches.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 50 == 0 {
+            crate::info!("WSS patch applied: n={n} pool={pool}");
+        }
         self.trigger.notify();
     }
 
@@ -357,6 +360,32 @@ fn apply_slim_to_pool_state(state: &mut PoolState, slim: &SlimPoolState) {
 pub struct StreamAddressSet {
     inner: Arc<RwLock<Vec<Address>>>,
     addr_tx: watch::Sender<Vec<Address>>,
+    /// Wall time of last accepted replace; used to freeze membership churn.
+    last_replace_ms: Arc<AtomicU64>,
+}
+
+/// Symmetric difference size for two sorted, deduped address lists.
+fn sorted_symmetric_diff_len(a: &[Address], b: &[Address]) -> usize {
+    let mut i = 0;
+    let mut j = 0;
+    let mut diff = 0;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                diff += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                diff += 1;
+                j += 1;
+            }
+        }
+    }
+    diff + a.len().saturating_sub(i) + b.len().saturating_sub(j)
 }
 
 impl StreamAddressSet {
@@ -366,6 +395,7 @@ impl StreamAddressSet {
         Self {
             inner: Arc::new(RwLock::new(Vec::new())),
             addr_tx,
+            last_replace_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -373,7 +403,9 @@ impl StreamAddressSet {
         self.inner.read()
     }
 
-    /// Replace tracked addresses; returns true when the set changed.
+    /// Replace tracked addresses; returns true when the set changed enough to
+    /// warrant a WSS resubscribe. Small top-N churn is ignored so LF score
+    /// reshuffles do not tear down live Sync/Swap subscriptions every cycle.
     #[must_use]
     pub fn replace(&self, mut addrs: Vec<Address>) -> bool {
         addrs.sort_unstable();
@@ -382,8 +414,23 @@ impl StreamAddressSet {
         if *guard == addrs {
             return false;
         }
+        if !guard.is_empty() && !addrs.is_empty() {
+            let now = crate::util::now_ms();
+            let last = self.last_replace_ms.load(Ordering::Relaxed);
+            // Keep WSS filters stable long enough for Sync/Swap to flow; LF
+            // bootstrap reshuffles top-N every cycle far above sym-diff hysteresis.
+            if last > 0 && now.saturating_sub(last) < 120_000 {
+                return false;
+            }
+            let diff = sorted_symmetric_diff_len(&guard, &addrs);
+            let threshold = (guard.len().max(addrs.len()) / 12).max(16);
+            if diff < threshold {
+                return false;
+            }
+        }
         guard.clone_from(&addrs);
         let _ = self.addr_tx.send(addrs);
+        self.last_replace_ms.store(crate::util::now_ms(), Ordering::Relaxed);
         true
     }
 

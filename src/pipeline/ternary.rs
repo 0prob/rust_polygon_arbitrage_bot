@@ -6,13 +6,16 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::brent_diag::{
-    BrentOptimizeReject, record_brent_attempt, record_brent_cache_local, record_brent_cache_route,
-    record_brent_eval_reject, record_brent_eval_sim, record_brent_ok, record_brent_reject,
-    record_brent_warm_seed,
+    BrentOptimizeReject, record_brent_attempt, record_brent_bal_zero_other,
+    record_brent_cache_local, record_brent_cache_route, BrentEvalReject, BrentSimNoneKind,
+    record_brent_cl_depth_clamp, record_brent_eval_reject, record_brent_eval_sim, record_brent_ok,
+    record_brent_reject, record_brent_seed_high_clamp, record_brent_shallow_hop,
+    record_brent_sim_none_kind, record_brent_unsupported_protocol, record_brent_warm_seed,
+    record_brent_zero_out_protocol, should_sample_brent_sim_none,
 };
 use crate::pipeline::local_sim::{
-    precompute_route_shallow_caps, simulate_route_minimal_with_caps,
-    tickless_cl_start_input_cap,
+    MinimalSimFailure, minimal_sim_failure, precompute_route_shallow_caps,
+    simulate_route_minimal_with_caps, tickless_cl_start_input_cap,
 };
 use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
@@ -23,11 +26,13 @@ use crate::pipeline::ternary_diag::{
     TernaryBoundsReject, record_ternary_bounds_call, record_ternary_bounds_ok,
     record_ternary_bounds_reject, record_ternary_economic_high_raise,
     record_ternary_flash_cap_clamp, record_ternary_golden_zero_exit,
+    record_ternary_bal_high_clamp, record_ternary_cl_depth_clamp,
     record_ternary_liquidity_cap_clamp, record_ternary_rate_fallback,
+    record_ternary_seed_high_clamp,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
-use crate::services::execution::profit::{ProfitEvalContext, net_profit_matic_from_sim};
+use crate::services::execution::profit::{ProfitEvalContext, brent_score_matic_from_sim};
 
 /// Resolve simulated hop gas the same way probe ranking does before Brent scoring.
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +187,26 @@ where
         if left_value.is_zero() && right_value.is_zero() {
             zero_streak += 1;
             if zero_streak >= 2 {
+                // Re-center on best warm seed once before giving up — otherwise a
+                // mid-window dead band exits without ever comparing ladder seeds.
+                if let Some((hint, _)) = warm
+                    .iter()
+                    .filter(|(amt, score)| {
+                        *amt >= a && *amt <= b && !score.is_zero()
+                    })
+                    .max_by_key(|(_, score)| *score)
+                {
+                    let width = b.saturating_sub(a);
+                    let quarter = width * U256::from(GOLDEN_RATIO) / U256::from(1_000u16);
+                    left = hint.saturating_sub(quarter).max(a);
+                    right = hint.saturating_add(quarter).min(b);
+                    if right > left {
+                        left_value = cached_evaluate(left);
+                        right_value = cached_evaluate(right);
+                        zero_streak = 0;
+                        continue;
+                    }
+                }
                 record_ternary_golden_zero_exit();
                 break;
             }
@@ -204,16 +229,24 @@ where
         }
     }
 
-    let candidates = [
-        (low, cached_evaluate(low)),
+    // Always compete warm seeds against the golden-section endpoints. Early zero-exit
+    // used to discard mid-window ladder scores that never landed on left/right.
+    let mut best = (low, cached_evaluate(low));
+    for candidate in [
         (left, left_value),
         (right, right_value),
         (high, cached_evaluate(high)),
-    ];
-    let mut best = candidates[0];
-    for candidate in candidates.into_iter().skip(1) {
+    ] {
         if candidate.1 > best.1 {
             best = candidate;
+        }
+    }
+    for &(amount, score) in warm {
+        if amount < low || amount > high || score.is_zero() {
+            continue;
+        }
+        if score > best.1 {
+            best = (amount, score);
         }
     }
     best.0
@@ -256,7 +289,11 @@ fn hop_capacity(arena: &StateArena, edge: &Edge) -> Option<U256> {
         }
         (PoolState::Balancer(s), ProtocolType::BalancerV2) => {
             let idx = edge.token_in_idx as usize;
-            let cap = s.balances.get(idx).copied().unwrap_or(U256::ZERO);
+            let bal = s.balances.get(idx).copied().unwrap_or(U256::ZERO);
+            // Vault `MAX_IN_RATIO` = 30%. Live `bal_zo` samples were 100% max_in
+            // even at a 20% soft cap — FX-normalized mid-hop start amounts still
+            // overshoot when prior hops diverge from oracle rates. Use 10%.
+            let cap = bal / U256::from(10u8);
             Some(cap_or_default(cap, default_cap))
         }
         (PoolState::Dodo(s), ProtocolType::Dodo) => {
@@ -307,7 +344,7 @@ fn compute_ternary_search_bounds(
     }
     let mut min_capacity = U256::MAX;
     let mut can_normalize_all = true;
-    let mut saw_capacity = false;
+    let mut saw_start_unit_capacity = false;
     let start_scale = ten_pow_u256_cached(start_decimals);
 
     for edge in &cycle.edges {
@@ -316,12 +353,21 @@ fn compute_ternary_search_bounds(
             crate::trace!("ternary: bounds hop_capacity_fail");
             return None;
         };
-        saw_capacity = true;
 
-        let token_in_rate = resolve_token_to_matic_rate(edge.token_in, token_to_matic_rates);
-        if token_in_rate.is_zero() || start_rate.is_zero() {
-            can_normalize_all = false;
+        // Only fold hop caps that are already in start-token units. Mixing raw
+        // hop-token balances into min_capacity then wiping to 100*ONE on any
+        // missing FX rate discarded Balancer/V2 soft caps (live rate_fallback
+        // ~6% of bounds) and let Brent high land in ZeroOutput / BAL#304.
+        if edge.token_in == cycle.start_token {
+            // Capacity already denominated in the search token.
         } else {
+            let token_in_rate = resolve_token_to_matic_rate(edge.token_in, token_to_matic_rates);
+            if token_in_rate.is_zero() || start_rate.is_zero() {
+                // Path-aware `clamp_high_to_balancer_max_in` still constrains Balancer
+                // after bounds; skipping here only loses the soft-cap contribution.
+                can_normalize_all = false;
+                continue;
+            }
             let token_in_decimals =
                 resolve_token_decimals_for_index(edge.token_in, arena, token_decimals);
             let token_in_scale = ten_pow_u256_cached(token_in_decimals);
@@ -330,16 +376,26 @@ fn compute_ternary_search_bounds(
             let num = U512::from(capacity) * U512::from(token_in_rate) * U512::from(start_scale);
             let den = U512::from(start_rate) * U512::from(token_in_scale);
             capacity = crate::util::u512_to_u256(num / den);
+            // Extra haircut on FX-converted Balancer caps: oracle rates disagree
+            // with path execution, so start-token sizing overshoots hop MAX_IN.
+            if edge.protocol == ProtocolType::BalancerV2 {
+                capacity /= U256::from(2u8);
+            }
         }
 
+        saw_start_unit_capacity = true;
         if capacity < min_capacity {
             min_capacity = capacity;
         }
     }
 
-    if !can_normalize_all || !saw_capacity || min_capacity.is_zero() || min_capacity == U256::MAX {
+    if !saw_start_unit_capacity || min_capacity.is_zero() || min_capacity == U256::MAX {
         record_ternary_rate_fallback();
         min_capacity = ONE * U256::from(100u8);
+    } else if !can_normalize_all {
+        // Partial FX: keep start-unit bottleneck (incl. Balancer soft cap on
+        // start hop) instead of replacing with the unbounded 100*ONE default.
+        record_ternary_rate_fallback();
     }
 
     // Search window: ~0.02%–10% of bottleneck hop capacity (start-token units).
@@ -427,6 +483,198 @@ fn compute_ternary_search_bounds(
     })
 }
 
+/// Cap Brent `high` to `8 ×` largest profitable probe seed when that is tighter
+/// than the capacity-derived window. Returns `None` when no clamp applies.
+#[must_use]
+fn clamp_brent_high_to_probe_seeds(
+    high: U256,
+    low: U256,
+    economic_floor: U256,
+    seeds: &[(U256, crate::pipeline::types::MinimalSimResult)],
+) -> Option<U256> {
+    let mut max_feasible_seed = U256::ZERO;
+    for (amount, sim) in seeds {
+        if !sim.profit.is_zero() && *amount > max_feasible_seed {
+            max_feasible_seed = *amount;
+        }
+    }
+    if max_feasible_seed.is_zero() {
+        return None;
+    }
+    // 8× headroom: 4× cut ok-rate in live capture (774→530) by starving Brent
+    // of room above dust probes; 8× still far below capacity-derived highs.
+    let mut seed_high = max_feasible_seed.saturating_mul(U256::from(8u8));
+    if seed_high < economic_floor || seed_high >= high {
+        return None;
+    }
+    if seed_high <= low {
+        seed_high = low.saturating_add(U256::from(1u8));
+    }
+    Some(seed_high)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClDepthHighClamp {
+    /// `high` already walks — no clamp.
+    Noop,
+    /// Tighten Brent `high` to max simulatable start.
+    Clamped(U256),
+    /// Even `economic_floor`/`low` is CL-shallow (live residual hop 2+) — abandon.
+    WindowInfeasible,
+}
+
+/// When Brent `high` itself is CL-shallow (seed/capacity clamps still overshoot tick
+/// depth), binary-search the largest start amount that still simulates. If the
+/// floor is also shallow, mark the window infeasible so Brent does not thrash
+/// hop-2+ SimNone (cldepth2: shallow_hop 2p=24 after clamp-only).
+#[must_use]
+fn clamp_brent_high_to_cl_feasible(
+    arena: &StateArena,
+    edges: &[Edge],
+    low: U256,
+    high: U256,
+    economic_floor: U256,
+    shallow_caps: Option<&[U256; crate::core::constants::HOP_CAP_USIZE]>,
+) -> ClDepthHighClamp {
+    if !edges.iter().any(|edge| {
+        matches!(
+            edge.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        )
+    }) {
+        return ClDepthHighClamp::Noop;
+    }
+    if simulate_route_minimal_with_caps(arena, edges, high, shallow_caps).is_some() {
+        return ClDepthHighClamp::Noop;
+    }
+    let floor = if economic_floor > low {
+        economic_floor
+    } else {
+        low
+    };
+    if floor >= high {
+        return ClDepthHighClamp::WindowInfeasible;
+    }
+    if simulate_route_minimal_with_caps(arena, edges, floor, shallow_caps).is_none() {
+        return ClDepthHighClamp::WindowInfeasible;
+    }
+    let mut lo = floor;
+    let mut hi = high;
+    for _ in 0..12 {
+        if hi <= lo.saturating_add(U256::from(1u8)) {
+            break;
+        }
+        let mid = lo + (hi - lo) / U256::from(2u8);
+        if simulate_route_minimal_with_caps(arena, edges, mid, shallow_caps).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < high && lo >= floor {
+        ClDepthHighClamp::Clamped(lo)
+    } else {
+        ClDepthHighClamp::WindowInfeasible
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BalancerHighClamp {
+    /// No start amount in `[floor, high]` stays under vault `MAX_IN_RATIO`.
+    WindowInfeasible,
+    /// Tighten `high` (and optionally raise-shrink `low`) to a feasible band.
+    Clamped { low: U256, high: U256 },
+}
+
+/// Path-aware Balancer `MAX_IN_RATIO` bound. Soft FX caps alone still overshoot
+/// when prior-hop execution diverges from oracle rates (`bal_zo` 100% max_in).
+/// When capacity-derived `low` already trips MAX_IN, search downward toward
+/// `economic_floor` (live: ~54% of Brent attempts were `bounds_fail` from
+/// infeasible Balancer windows).
+#[must_use]
+fn balancer_max_in_high_clamp(
+    arena: &StateArena,
+    edges: &[Edge],
+    low: U256,
+    high: U256,
+    economic_floor: U256,
+) -> Option<BalancerHighClamp> {
+    if high <= low || !edges.iter().any(|e| e.protocol == ProtocolType::BalancerV2) {
+        return None;
+    }
+    let hits_max_in = |amount: U256| {
+        matches!(
+            minimal_sim_failure(arena, edges, amount),
+            Some(MinimalSimFailure::BalancerMaxInRatio { .. })
+        )
+    };
+    let search_low = low;
+    if hits_max_in(low) {
+        let floor = economic_floor.min(low);
+        if floor.is_zero() || hits_max_in(floor) {
+            return Some(BalancerHighClamp::WindowInfeasible);
+        }
+        // Largest feasible amount in [floor, low).
+        let mut lo = floor;
+        let mut hi = low;
+        for _ in 0..48 {
+            if hi.saturating_sub(lo) <= U256::from(1u8) {
+                break;
+            }
+            let mid = lo + (hi - lo) / U256::from(2u8);
+            if hits_max_in(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let mut clamped = lo.saturating_mul(U256::from(95u8)) / U256::from(100u8);
+        if clamped < floor {
+            clamped = floor;
+        }
+        if clamped <= floor {
+            return Some(BalancerHighClamp::Clamped {
+                low: floor,
+                high: floor.saturating_add(U256::from(1u8)).min(lo.max(floor)),
+            });
+        }
+        return Some(BalancerHighClamp::Clamped {
+            low: floor,
+            high: clamped,
+        });
+    }
+    if !hits_max_in(high) {
+        return None;
+    }
+    let mut lo = search_low;
+    let mut hi = high;
+    for _ in 0..48 {
+        if hi.saturating_sub(lo) <= U256::from(1u8) {
+            break;
+        }
+        let mid = lo + (hi - lo) / U256::from(2u8);
+        if hits_max_in(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // Haircut 5% below the last feasible probe so golden-section right endpoint
+    // cannot land on the first infeasible integer after binary-search quantization.
+    let mut clamped = lo.saturating_mul(U256::from(95u8)) / U256::from(100u8);
+    if clamped <= search_low {
+        clamped = search_low.saturating_add(U256::from(1u8));
+    }
+    if clamped < high {
+        Some(BalancerHighClamp::Clamped {
+            low: search_low,
+            high: clamped,
+        })
+    } else {
+        None
+    }
+}
+
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn optimize_cycle(
@@ -450,7 +698,10 @@ pub fn optimize_cycle(
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
-    let TernarySearchBounds { low, mut high } = compute_ternary_search_bounds(
+    let TernarySearchBounds {
+        mut low,
+        mut high,
+    } = compute_ternary_search_bounds(
         cycle,
         arena,
         token_to_matic_rates,
@@ -503,6 +754,74 @@ pub fn optimize_cycle(
         }
     }
 
+    // Capacity-based high is often far above any amount that still simulates
+    // (ZeroOutput dominated Brent SimNone). Cap search to a small multiple of the
+    // largest profitable probe seed so Brent stays in the feasible band; the
+    // first_infeasible wall still catches residual overshoots.
+    if let Some(seeds) = seed_sims
+        && let Some(clamped) = clamp_brent_high_to_probe_seeds(high, low, economic_floor, seeds)
+    {
+        record_ternary_seed_high_clamp();
+        record_brent_seed_high_clamp();
+        high = clamped;
+    }
+
+    // Path-aware Balancer MAX_IN_RATIO clamp (after seed clamp). Soft FX caps still
+    // overshoot when prior hops amplify vs oracle — binary-search real feasible high.
+    // If capacity `low` already trips MAX_IN, shrink the window toward economic_floor.
+    match balancer_max_in_high_clamp(arena, edges, low, high, economic_floor) {
+        Some(BalancerHighClamp::WindowInfeasible) => {
+            record_brent_reject(BrentOptimizeReject::BalancerBoundsEmpty);
+            crate::trace!(
+                "optimize_cycle: balancer MAX_IN_RATIO infeasible at low={low} high={high} floor={economic_floor}"
+            );
+            return None;
+        }
+        Some(BalancerHighClamp::Clamped {
+            low: new_low,
+            high: new_high,
+        }) => {
+            record_ternary_bal_high_clamp();
+            low = new_low;
+            high = new_high;
+            if high <= low {
+                record_brent_reject(BrentOptimizeReject::BalancerBoundsEmpty);
+                return None;
+            }
+        }
+        None => {}
+    }
+
+    // Seed/capacity highs still overshoot ticked CL depth → Brent SimNone=shallow.
+    // Tighten high to the max amount that still walks; if floor is also shallow
+    // (typical hop-2+ depth), abandon before Brent thrash.
+    match clamp_brent_high_to_cl_feasible(
+        arena,
+        edges,
+        low,
+        high,
+        economic_floor,
+        brent_shallow_caps.as_ref(),
+    ) {
+        ClDepthHighClamp::Noop => {}
+        ClDepthHighClamp::WindowInfeasible => {
+            record_brent_reject(BrentOptimizeReject::ClCapBoundsEmpty);
+            crate::trace!(
+                "optimize_cycle: CL depth infeasible at floor low={low} high={high} floor={economic_floor}"
+            );
+            return None;
+        }
+        ClDepthHighClamp::Clamped(clamped) => {
+            record_ternary_cl_depth_clamp();
+            record_brent_cl_depth_clamp();
+            high = clamped;
+            if high <= low {
+                record_brent_reject(BrentOptimizeReject::ClCapBoundsEmpty);
+                return None;
+            }
+        }
+    }
+
     let mut sim_cache: FxHashMap<U256, crate::pipeline::types::MinimalSimResult> =
         FxHashMap::default();
     if let Some(seeds) = seed_sims {
@@ -524,16 +843,23 @@ pub fn optimize_cycle(
     let mut warm_scores: Vec<(U256, U256)> = Vec::with_capacity(sim_cache.len());
     for (amount, sim) in &sim_cache {
         if *amount >= low && *amount <= high {
-            warm_scores.push((*amount, net_profit_matic_from_sim(sim, *amount, profit_ctx)));
+            warm_scores.push((
+                *amount,
+                brent_score_matic_from_sim(sim, *amount, profit_ctx),
+            ));
         }
     }
+    // First amount that failed to simulate. AMM depth failures are monotonic in
+    // size — once A is infeasible, every B >= A is too. Without this wall Brent
+    // re-sims the dead upper band thousands of times per tick (SimNone ~80%).
+    let mut first_infeasible = high.saturating_add(U256::from(1u8));
     let evaluate = |amount: U256| -> U256 {
-        if amount < economic_floor {
+        if amount < economic_floor || amount >= first_infeasible {
             return U256::ZERO;
         }
         if let Some(sim) = sim_cache.get(&amount) {
             record_brent_cache_local();
-            return net_profit_matic_from_sim(sim, amount, profit_ctx);
+            return brent_score_matic_from_sim(sim, amount, profit_ctx);
         }
         if let Some((cache, route_state_revision, route_fp)) = route_sim_cache
             && let Some(cached) = cache.get(route_state_revision, route_fp, amount)
@@ -542,7 +868,7 @@ pub fn optimize_cycle(
             if sim_cache.len() < BRENT_CACHE_SLOTS {
                 sim_cache.insert(amount, cached);
             }
-            return net_profit_matic_from_sim(&cached, amount, profit_ctx);
+            return brent_score_matic_from_sim(&cached, amount, profit_ctx);
         }
         record_brent_eval_sim();
         match simulate_route_minimal_with_caps(arena, edges, amount, brent_shallow_caps.as_ref()) {
@@ -554,20 +880,23 @@ pub fn optimize_cycle(
                         sim.total_gas,
                     );
                 }
-                if sim.profit.is_zero()
-                    || check_sim_sanity_fast(SimSanityInput {
-                        amount_in: amount,
-                        gross_profit: sim.profit,
-                        search_low: low,
-                        token_decimals: start_decimals,
-                        token_to_matic_rate: start_rate,
-                    })
-                    .is_err()
-                {
-                    record_brent_eval_reject();
+                if sim.profit.is_zero() {
+                    record_brent_eval_reject(BrentEvalReject::ZeroProfit);
                     return U256::ZERO;
                 }
-                let score = net_profit_matic_from_sim(&sim, amount, profit_ctx);
+                if check_sim_sanity_fast(SimSanityInput {
+                    amount_in: amount,
+                    gross_profit: sim.profit,
+                    search_low: low,
+                    token_decimals: start_decimals,
+                    token_to_matic_rate: start_rate,
+                })
+                .is_err()
+                {
+                    record_brent_eval_reject(BrentEvalReject::Sanity);
+                    return U256::ZERO;
+                }
+                let score = brent_score_matic_from_sim(&sim, amount, profit_ctx);
                 if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
                     cache.insert(route_state_revision, route_fp, amount, sim);
                 }
@@ -577,7 +906,45 @@ pub fn optimize_cycle(
                 score
             }
             None => {
-                record_brent_eval_reject();
+                first_infeasible = amount;
+                record_brent_eval_reject(BrentEvalReject::SimNone);
+                if should_sample_brent_sim_none() {
+                    let failure = minimal_sim_failure(arena, edges, amount);
+                    let kind = match failure {
+                        Some(MinimalSimFailure::V2ReserveExhausted { .. }) => {
+                            BrentSimNoneKind::V2Reserve
+                        }
+                        Some(MinimalSimFailure::ShallowCl { hop })
+                        | Some(MinimalSimFailure::ClCapExceeded { hop }) => {
+                            record_brent_shallow_hop(hop);
+                            BrentSimNoneKind::ShallowCl
+                        }
+                        Some(MinimalSimFailure::ClTickless { .. }) => BrentSimNoneKind::ClTickless,
+                        Some(MinimalSimFailure::BalancerMaxInRatio { hop }) => {
+                            if let Some(edge) = edges.get(hop) {
+                                record_brent_zero_out_protocol(edge.protocol);
+                            }
+                            BrentSimNoneKind::BalancerMaxIn
+                        }
+                        Some(MinimalSimFailure::ZeroOutput { hop, protocol }) => {
+                            record_brent_zero_out_protocol(protocol);
+                            if protocol == ProtocolType::BalancerV2 {
+                                record_brent_bal_zero_other();
+                            }
+                            let _ = hop;
+                            BrentSimNoneKind::ZeroOutput
+                        }
+                        Some(MinimalSimFailure::UnsupportedState { expected, .. }) => {
+                            record_brent_unsupported_protocol(expected);
+                            BrentSimNoneKind::Unsupported
+                        }
+                        Some(MinimalSimFailure::TokenMismatch { .. }) => {
+                            BrentSimNoneKind::TokenMismatch
+                        }
+                        _ => BrentSimNoneKind::Other,
+                    };
+                    record_brent_sim_none_kind(kind);
+                }
                 U256::ZERO
             }
         }
@@ -676,6 +1043,87 @@ mod tests {
     fn optimizer_explores_right_of_midpoint() {
         let optimal = solve_brent_optimal(U256::ZERO, U256::from(100u8), |x| peaked_at(x, 80), 16);
         assert!((U256::from(78u8)..=U256::from(82u8)).contains(&optimal));
+    }
+
+    #[test]
+    fn warm_seed_survives_mid_window_zero_band() {
+        // Evaluate returns 0 everywhere except a mid-window ladder seed.
+        // Old solver golden-zero-exited and only compared endpoints → missed the seed.
+        let seed = U256::from(40u8);
+        let warm = [(seed, U256::from(9_000u64))];
+        let optimal = solve_brent_optimal_warm(
+            U256::from(1u8),
+            U256::from(100u8),
+            |x| {
+                if x == seed {
+                    U256::from(9_000u64)
+                } else {
+                    U256::ZERO
+                }
+            },
+            16,
+            &warm,
+        );
+        assert_eq!(optimal, seed);
+    }
+
+    #[test]
+    fn balancer_max_in_high_clamp_noop_without_balancer() {
+        // Empty edge list → no Balancer hops → no clamp.
+        assert!(balancer_max_in_high_clamp(
+            &StateArena::default(),
+            &[],
+            U256::from(1u8),
+            U256::from(100u8),
+            U256::from(1u8),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn clamp_brent_high_to_cl_feasible_noop_without_cl() {
+        assert_eq!(
+            clamp_brent_high_to_cl_feasible(
+                &StateArena::default(),
+                &[],
+                U256::from(1u8),
+                U256::from(100u8),
+                U256::from(1u8),
+                None,
+            ),
+            ClDepthHighClamp::Noop
+        );
+    }
+
+    #[test]
+    fn clamp_brent_high_uses_eight_x_profitable_probe_seed() {
+        use crate::pipeline::types::MinimalSimResult;
+        let seed = U256::from(1_000u64);
+        let seeds = [(
+            seed,
+            MinimalSimResult {
+                profit: U256::from(1u8),
+                amount_out: seed + U256::from(1u8),
+                total_gas: 100_000,
+            },
+        )];
+        let high = U256::from(1_000_000u64);
+        let low = U256::from(1u8);
+        let floor = U256::from(10u8);
+        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, &seeds).unwrap();
+        assert_eq!(clamped, seed * U256::from(8u8));
+        // Zero-profit seeds do not clamp.
+        let dust = [(
+            seed,
+            MinimalSimResult {
+                profit: U256::ZERO,
+                amount_out: seed,
+                total_gas: 100_000,
+            },
+        )];
+        assert!(clamp_brent_high_to_probe_seeds(high, low, floor, &dust).is_none());
+        // Already-tight high is left alone.
+        assert!(clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds).is_none());
     }
 
     #[test]

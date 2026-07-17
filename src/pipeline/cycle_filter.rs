@@ -6,7 +6,9 @@ use rustc_hash::{FxHashMap, FxHasher};
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::local_sim::simulate_route_minimal;
+use crate::pipeline::local_sim::{
+    precompute_route_shallow_caps, simulate_route_minimal_with_caps,
+};
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::spot_price::spot_probe_for_decimals;
 use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
@@ -109,6 +111,7 @@ fn probe_context_for_cycle(
 pub struct PrefilterDiagnostics {
     pub merged_in: usize,
     pub pruned_non_simulable: usize,
+    pub pruned_protocol_mismatch: usize,
     pub pruned_spot_flat: usize,
     pub pruned_executor_budget: usize,
     pub simulable: usize,
@@ -126,10 +129,11 @@ impl PrefilterDiagnostics {
             return;
         }
         crate::info!(
-            "cycle prefilter: in={} pruned_sim={} pruned_spot={} pruned_executor={} simulable={} window={} \
+            "cycle prefilter: in={} pruned_sim={} pruned_proto={} pruned_spot={} pruned_executor={} simulable={} window={} \
              keep={} gas_rescue={} spot_rescue={} rescue_cap_drop={} out={}",
             self.merged_in,
             self.pruned_non_simulable,
+            self.pruned_protocol_mismatch,
             self.pruned_spot_flat,
             self.pruned_executor_budget,
             self.simulable,
@@ -157,11 +161,14 @@ fn atomic_sim_verdict_for_cycle(
     ctx: Option<&ProbeContext<'_>>,
 ) -> PrefilterVerdict {
     let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
-    let mut probe = simulate_route_minimal(arena, &cycle.edges, probe_amount);
+    // One shallow-cap table for both probe sizes (avoids dual CL probe rebuild).
+    let shallow_caps = precompute_route_shallow_caps(arena, &cycle.edges);
+    let caps = shallow_caps.as_ref();
+    let mut probe = simulate_route_minimal_with_caps(arena, &cycle.edges, probe_amount, caps);
     if probe.as_ref().is_none_or(|s| s.profit.is_zero()) {
         let spot = spot_probe_for_decimals(decimals);
         if spot != probe_amount && !spot.is_zero() {
-            probe = simulate_route_minimal(arena, &cycle.edges, spot);
+            probe = simulate_route_minimal_with_caps(arena, &cycle.edges, spot, caps);
         }
     }
     match &probe {
@@ -214,6 +221,10 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     for c in cycles {
         if !is_fully_simulable_route(&c.edges) {
             diag.pruned_non_simulable += 1;
+            continue;
+        }
+        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &c.edges) {
+            diag.pruned_protocol_mismatch += 1;
             continue;
         }
         if !cycle_spot_negative(&c) {
@@ -370,6 +381,7 @@ pub fn is_fully_simulable_route(edges: &[Edge]) -> bool {
 mod tests {
     use super::*;
     use crate::core::types::{CycleEdges, PoolIndex, ProtocolType};
+    use crate::pipeline::local_sim::simulate_route_minimal;
 
     fn cycle(score: f64, reverse: bool) -> FoundCycle {
         let (token_in, token_out) = if reverse {

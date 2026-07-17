@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::Address;
@@ -9,17 +9,19 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::types::{
-    FlashLoanSource, FoundCycle, PoolState, ProfitAssessment, ProtocolType, RouteSimulationResult,
-    TokenIndex,
+    FlashLoanSource, FoundCycle, ProfitAssessment, ProtocolType, RouteSimulationResult,
+    TokenIndex, hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
 use crate::pipeline::local_sim::{
-    self, MinimalSimFailure, simulate_route_detailed, simulate_route_minimal,
+    self, MinimalSimFailure, first_protocol_state_mismatch, first_v2_hop_below_reserve,
+    precompute_route_shallow_caps, simulate_route_detailed, simulate_route_detailed_with_caps,
+    simulate_route_minimal,
 };
 use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
-    FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_fast,
+    FlashBorrowCapParams, SimSanityInput, SimSanityReject, check_sim_sanity, check_sim_sanity_fast,
     check_sim_sanity_for_dispatch, min_economic_amount_in,
 };
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
@@ -39,7 +41,8 @@ use crate::services::execution::impact_slippage::{
 };
 use crate::services::execution::profit::{
     AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
-    net_profit_matic_from_sim, route_profit_thresholds,
+    brent_score_matic_from_sim, cover_matic_from_sim, net_profit_matic_from_sim,
+    route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
@@ -60,7 +63,21 @@ struct SkipCounters {
     executor_budget: u32,
 }
 
-static MINIMAL_SIM_DIAGNOSTICS: AtomicU32 = AtomicU32::new(0);
+/// Last `now_ms()` we emitted an `hf minimal-sim reject` sample (time-based, not
+/// process-lifetime — a hard count of 3 permanently silenced token_mismatch detail).
+static MINIMAL_SIM_DIAG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+const MINIMAL_SIM_DIAG_INTERVAL_MS: u64 = 5_000;
+
+fn should_log_minimal_sim_diag() -> bool {
+    let now = crate::util::now_ms();
+    let prev = MINIMAL_SIM_DIAG_LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < MINIMAL_SIM_DIAG_INTERVAL_MS {
+        return false;
+    }
+    MINIMAL_SIM_DIAG_LAST_MS
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
 
 impl SkipCounters {
     fn merge(&mut self, other: SkipCounters) {
@@ -90,10 +107,47 @@ struct MinimalSimReasonCounts {
     missing_pool: u32,
     non_tradable: u32,
     shallow_cl: u32,
+    cl_tickless: u32,
+    cl_cap: u32,
     v2_reserve_exhausted: u32,
+    token_mismatch: u32,
     math: u32,
     unsupported_state: u32,
+    bal_max_in: u32,
     zero_output: u32,
+    /// ZeroOutput hop protocol buckets (probe rank).
+    zo_proto_v2: u32,
+    zo_proto_v3: u32,
+    zo_proto_v4: u32,
+    zo_proto_bal: u32,
+    zo_proto_other: u32,
+    /// ZeroOutput hop index buckets.
+    zo_hop0: u32,
+    zo_hop1: u32,
+    zo_hop2p: u32,
+    /// UnsupportedState expected-protocol buckets (probe rank).
+    unsup_exp_v2: u32,
+    unsup_exp_v3: u32,
+    unsup_exp_v4: u32,
+    unsup_exp_bal: u32,
+    unsup_exp_crv: u32,
+    unsup_exp_dodo: u32,
+    unsup_exp_woofi: u32,
+    /// UnsupportedState actual arena state-kind buckets.
+    unsup_act_invalid: u32,
+    unsup_act_v2: u32,
+    unsup_act_v3: u32,
+    unsup_act_v4: u32,
+    unsup_act_curve: u32,
+    unsup_act_bal: u32,
+    unsup_act_dodo: u32,
+    unsup_act_woofi: u32,
+    /// SanityReject reason buckets (probe rank).
+    sanity_ratio: u32,
+    sanity_matic: u32,
+    sanity_floor: u32,
+    sanity_decimals: u32,
+    sanity_pin: u32,
 }
 
 impl MinimalSimReasonCounts {
@@ -102,10 +156,52 @@ impl MinimalSimReasonCounts {
         self.missing_pool += other.missing_pool;
         self.non_tradable += other.non_tradable;
         self.shallow_cl += other.shallow_cl;
+        self.cl_tickless += other.cl_tickless;
+        self.cl_cap += other.cl_cap;
         self.v2_reserve_exhausted += other.v2_reserve_exhausted;
+        self.token_mismatch += other.token_mismatch;
         self.math += other.math;
         self.unsupported_state += other.unsupported_state;
+        self.bal_max_in += other.bal_max_in;
         self.zero_output += other.zero_output;
+        self.zo_proto_v2 += other.zo_proto_v2;
+        self.zo_proto_v3 += other.zo_proto_v3;
+        self.zo_proto_v4 += other.zo_proto_v4;
+        self.zo_proto_bal += other.zo_proto_bal;
+        self.zo_proto_other += other.zo_proto_other;
+        self.zo_hop0 += other.zo_hop0;
+        self.zo_hop1 += other.zo_hop1;
+        self.zo_hop2p += other.zo_hop2p;
+        self.unsup_exp_v2 += other.unsup_exp_v2;
+        self.unsup_exp_v3 += other.unsup_exp_v3;
+        self.unsup_exp_v4 += other.unsup_exp_v4;
+        self.unsup_exp_bal += other.unsup_exp_bal;
+        self.unsup_exp_crv += other.unsup_exp_crv;
+        self.unsup_exp_dodo += other.unsup_exp_dodo;
+        self.unsup_exp_woofi += other.unsup_exp_woofi;
+        self.unsup_act_invalid += other.unsup_act_invalid;
+        self.unsup_act_v2 += other.unsup_act_v2;
+        self.unsup_act_v3 += other.unsup_act_v3;
+        self.unsup_act_v4 += other.unsup_act_v4;
+        self.unsup_act_curve += other.unsup_act_curve;
+        self.unsup_act_bal += other.unsup_act_bal;
+        self.unsup_act_dodo += other.unsup_act_dodo;
+        self.unsup_act_woofi += other.unsup_act_woofi;
+        self.sanity_ratio += other.sanity_ratio;
+        self.sanity_matic += other.sanity_matic;
+        self.sanity_floor += other.sanity_floor;
+        self.sanity_decimals += other.sanity_decimals;
+        self.sanity_pin += other.sanity_pin;
+    }
+
+    fn record_sanity(&mut self, reason: SimSanityReject) {
+        match reason {
+            SimSanityReject::InsaneProfitRatio => self.sanity_ratio += 1,
+            SimSanityReject::InsaneProfitMatic => self.sanity_matic += 1,
+            SimSanityReject::AmountBelowEconomicFloor => self.sanity_floor += 1,
+            SimSanityReject::UnsupportedTokenDecimals => self.sanity_decimals += 1,
+            SimSanityReject::OptimizerPinnedAtFloor => self.sanity_pin += 1,
+        }
     }
 
     fn record(&mut self, reason: MinimalSimFailure) {
@@ -113,11 +209,57 @@ impl MinimalSimReasonCounts {
             MinimalSimFailure::InvalidRoute => self.invalid_route += 1,
             MinimalSimFailure::MissingPool { .. } => self.missing_pool += 1,
             MinimalSimFailure::NonTradable { .. } => self.non_tradable += 1,
+            MinimalSimFailure::ClTickless { .. } => self.cl_tickless += 1,
+            MinimalSimFailure::ClCapExceeded { .. } => self.cl_cap += 1,
             MinimalSimFailure::ShallowCl { .. } => self.shallow_cl += 1,
             MinimalSimFailure::V2ReserveExhausted { .. } => self.v2_reserve_exhausted += 1,
+            MinimalSimFailure::TokenMismatch { .. } => self.token_mismatch += 1,
             MinimalSimFailure::Math { .. } => self.math += 1,
-            MinimalSimFailure::UnsupportedState { .. } => self.unsupported_state += 1,
-            MinimalSimFailure::ZeroOutput { .. } => self.zero_output += 1,
+            MinimalSimFailure::UnsupportedState {
+                expected, actual, ..
+            } => {
+                self.unsupported_state += 1;
+                use crate::core::types::ProtocolType;
+                use crate::pipeline::local_sim::UnsupportedStateKind;
+                match expected {
+                    ProtocolType::UniswapV2 => self.unsup_exp_v2 += 1,
+                    ProtocolType::UniswapV3 => self.unsup_exp_v3 += 1,
+                    ProtocolType::UniswapV4 => self.unsup_exp_v4 += 1,
+                    ProtocolType::BalancerV2 => self.unsup_exp_bal += 1,
+                    ProtocolType::CurveStable | ProtocolType::CurveCrypto => {
+                        self.unsup_exp_crv += 1
+                    }
+                    ProtocolType::Dodo => self.unsup_exp_dodo += 1,
+                    ProtocolType::Woofi => self.unsup_exp_woofi += 1,
+                }
+                match actual {
+                    UnsupportedStateKind::Invalid => self.unsup_act_invalid += 1,
+                    UnsupportedStateKind::V2 => self.unsup_act_v2 += 1,
+                    UnsupportedStateKind::V3 => self.unsup_act_v3 += 1,
+                    UnsupportedStateKind::V4 => self.unsup_act_v4 += 1,
+                    UnsupportedStateKind::Curve => self.unsup_act_curve += 1,
+                    UnsupportedStateKind::Balancer => self.unsup_act_bal += 1,
+                    UnsupportedStateKind::Dodo => self.unsup_act_dodo += 1,
+                    UnsupportedStateKind::Woofi => self.unsup_act_woofi += 1,
+                }
+            }
+            MinimalSimFailure::BalancerMaxInRatio { .. } => self.bal_max_in += 1,
+            MinimalSimFailure::ZeroOutput { hop, protocol } => {
+                self.zero_output += 1;
+                use crate::core::types::ProtocolType;
+                match protocol {
+                    ProtocolType::UniswapV2 => self.zo_proto_v2 += 1,
+                    ProtocolType::UniswapV3 => self.zo_proto_v3 += 1,
+                    ProtocolType::UniswapV4 => self.zo_proto_v4 += 1,
+                    ProtocolType::BalancerV2 => self.zo_proto_bal += 1,
+                    _ => self.zo_proto_other += 1,
+                }
+                match hop {
+                    0 => self.zo_hop0 += 1,
+                    1 => self.zo_hop1 += 1,
+                    _ => self.zo_hop2p += 1,
+                }
+            }
         }
     }
 }
@@ -126,7 +268,24 @@ impl MinimalSimReasonCounts {
 enum MinimalProbeReject {
     NoSimulation,
     ZeroProfit,
-    SanityReject,
+    SanityReject(SimSanityReject),
+}
+
+/// Whether a probe reject should enter the graph-negative rescue list for Brent.
+fn should_rescue_probe_reject(
+    reject: MinimalProbeReject,
+    _attempt_failures: &[Option<local_sim::MinimalSimFailure>],
+) -> bool {
+    match reject {
+        // ZeroProfit: every ladder size walked with gross==0. Rescuing them filled
+        // probe_kept with seedless cycles → evaluated=0 / all opt_none. Gas-underwater
+        // routes with gross>0 already land in near_net (not this reject).
+        // Sanity rejects are phantoms (ROI/MATIC caps); rescuing them only yields opt_none.
+        // NoSimulation: every ladder size failed to walk — Brent cannot invent a size.
+        MinimalProbeReject::ZeroProfit
+        | MinimalProbeReject::SanityReject(_)
+        | MinimalProbeReject::NoSimulation => false,
+    }
 }
 
 impl MinimalProbeReject {
@@ -134,7 +293,7 @@ impl MinimalProbeReject {
         match self {
             Self::NoSimulation => skip.minimal_no_sim += 1,
             Self::ZeroProfit => skip.minimal_zero_profit += 1,
-            Self::SanityReject => skip.minimal_sanity += 1,
+            Self::SanityReject(_) => skip.minimal_sanity += 1,
         }
     }
 }
@@ -253,45 +412,39 @@ pub struct HfEvalResult {
     pub balancer_batch_verified: bool,
 }
 
-/// True when any V3/V4 hop still lacks hydrated ticks (cannot simulate depth).
-#[inline]
-fn cycle_has_empty_cl_ticks(arena: &StateArena, cycle: &FoundCycle) -> bool {
-    for edge in &cycle.edges {
-        match (arena.pool_state(edge.pool_index), edge.protocol) {
-            (Some(PoolState::V3(s)), ProtocolType::UniswapV3)
-            | (Some(PoolState::V4(s)), ProtocolType::UniswapV4)
-                if s.ticks.is_empty() =>
-            {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Economic probe first, then decimal-aware spot probe for tickless CL routes.
+/// Economic / spot / size-ladder probes for ranking. Deliberate probe sizes must not use
+/// `search_low=amount` — that makes every >5% ROI look like OptimizerPinnedAtFloor.
 fn try_rank_probe_minimal(
     arena: &StateArena,
     cycle: &FoundCycle,
     start_decimals: u8,
     rate: U256,
 ) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
-    minimal_rank_probe(arena, cycle, start_decimals, rate, true)
+    minimal_rank_probe(arena, cycle, start_decimals, rate)
 }
 
-/// Shared minimal probe used by rank + simulatable checks (`search_low` differs for rank vs filter).
+/// Shared minimal probe used by rank + simulatable checks.
 fn minimal_rank_probe(
     arena: &StateArena,
     cycle: &FoundCycle,
     start_decimals: u8,
     rate: U256,
-    rank_amount_as_search_low: bool,
 ) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
     let mut best: Option<(U256, MinimalSimResult)> = None;
     let mut saw_simulation = false;
     let mut saw_profit = false;
+    let mut last_sanity: Option<SimSanityReject> = None;
+    let economic_floor = min_economic_amount_in(start_decimals, rate);
+    let spot_probe = crate::pipeline::spot_price::spot_probe_for_decimals(start_decimals);
     for_each_rank_probe_amount(start_decimals, rate, |amount| {
+        // Ladder includes micro/spot below economic floor for thin V2 attribution.
+        // Those dust hits were poisoning empty ranks as sanity_why(floor=…) (live
+        // clfloor: floor=166) when economic+ sizes simply failed to sim/profit.
+        // Keep tickless CL spot-cap trades (spot ≤ amount < floor); skip other dust.
+        let tickless_cap_trade = amount >= spot_probe && amount < economic_floor;
+        if amount < economic_floor && !tickless_cap_trade {
+            return;
+        }
         let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
             return;
         };
@@ -300,22 +453,19 @@ fn minimal_rank_probe(
             return;
         }
         saw_profit = true;
-        let search_low = if rank_amount_as_search_low {
-            amount
-        } else {
-            U256::ZERO
-        };
-        if check_sim_sanity(SimSanityInput {
+        // search_low=0: pin heuristic is for Brent bounds, not static probe amounts.
+        if let Err(reason) = check_sim_sanity(SimSanityInput {
             amount_in: amount,
             gross_profit: sim.profit,
-            search_low,
+            search_low: U256::ZERO,
             token_decimals: start_decimals,
             token_to_matic_rate: rate,
-        })
-        .is_err()
-        {
+        }) {
+            last_sanity = Some(reason);
             return;
         }
+        // Prefer larger absolute gross among ladder sizes (token units; cross-token
+        // ranking happens later via brent_score in rank_one_cycle_probe).
         if best.as_ref().is_none_or(|(_, b)| sim.profit > b.profit) {
             best = Some((amount, sim));
         }
@@ -326,7 +476,9 @@ fn minimal_rank_probe(
         } else if !saw_profit {
             MinimalProbeReject::ZeroProfit
         } else {
-            MinimalProbeReject::SanityReject
+            MinimalProbeReject::SanityReject(
+                last_sanity.unwrap_or(SimSanityReject::InsaneProfitRatio),
+            )
         }
     })
 }
@@ -346,7 +498,7 @@ fn cycle_simulatable(
     }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-    minimal_rank_probe(arena, cycle, decimals, rate, false).is_ok()
+    minimal_rank_probe(arena, cycle, decimals, rate).is_ok()
 }
 
 fn cycle_flash_evaluable(
@@ -469,16 +621,8 @@ fn rank_one_cycle_probe(
         out.skip.missing_decimals = 1;
         return out;
     }
-    // Fail closed before multi-amount minimal sims when a CL hop has no ticks.
-    // Avoids repeated tickless depth work that always classifies as shallow_cl.
-    if cycle_has_empty_cl_ticks(arena, &cycle) {
-        out.skip.minimal_no_sim = 1;
-        out.minimal_sim_reasons.shallow_cl = 1;
-        if cycle.score < 0.0 {
-            out.rescue.push((fp, cycle.into_owned()));
-        }
-        return out;
-    }
+    // Tickless CL hops may still rank at spot-probe size (see simulate_hop); do not
+    // hard-skip the whole cycle — that forced fake tick seeding and phantom Brent depth.
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {
         out.skip.flash = 1;
         out.flash_loan.mixed_no_aave += 1;
@@ -496,42 +640,94 @@ fn rank_one_cycle_probe(
     };
     let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
+    // Micro ladder floor — skip dead V2 pools before burning the full probe ladder.
+    let micro_probe = if start_decimals >= 6 {
+        crate::util::ten_pow_u256_cached(start_decimals - 6)
+    } else {
+        U256::from(1u64)
+    };
+    if let Some(hop) = first_v2_hop_below_reserve(arena, &cycle.edges, micro_probe) {
+        out.minimal_sim_reasons
+            .record(MinimalSimFailure::V2ReserveExhausted { hop });
+        MinimalProbeReject::NoSimulation.record(&mut out.skip);
+        return out;
+    }
+    // V2-edge/V3-state (and kin) never simulate — skip before the probe ladder.
+    if let Some((hop, expected, actual)) = first_protocol_state_mismatch(arena, &cycle.edges) {
+        out.minimal_sim_reasons.record(MinimalSimFailure::UnsupportedState {
+            hop,
+            expected,
+            actual,
+        });
+        MinimalProbeReject::NoSimulation.record(&mut out.skip);
+        return out;
+    }
     let (probe_amount, probe) = match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
         Ok(probe) => probe,
         Err(reject) => {
+            let mut attempt_failures: Vec<Option<local_sim::MinimalSimFailure>> = Vec::new();
             if matches!(reject, MinimalProbeReject::NoSimulation) {
-                let mut first_failure = None;
                 for_each_rank_probe_amount(start_decimals, rate, |amount| {
-                    if first_failure.is_none() {
-                        first_failure = local_sim::minimal_sim_failure(arena, &cycle.edges, amount);
-                    }
+                    attempt_failures
+                        .push(local_sim::minimal_sim_failure(arena, &cycle.edges, amount));
                 });
-                if let Some(reason) = first_failure {
+                if let Some(reason) = attempt_failures.iter().flatten().next().copied() {
                     out.minimal_sim_reasons.record(reason);
                 }
+                if should_log_minimal_sim_diag() {
+                    let attempts: Vec<(U256, Option<local_sim::MinimalSimFailure>)> = {
+                        let mut amounts = Vec::with_capacity(attempt_failures.len());
+                        for_each_rank_probe_amount(start_decimals, rate, |amount| {
+                            amounts.push(amount);
+                        });
+                        amounts.into_iter().zip(attempt_failures.iter().copied()).collect()
+                    };
+                    let route: Vec<_> = cycle
+                        .edges
+                        .iter()
+                        .map(|edge| {
+                            (
+                                edge.pool_index,
+                                edge.protocol,
+                                arena.pool_address(edge.pool_index),
+                            )
+                        })
+                        .collect();
+                    let mismatch_detail: Vec<_> = attempts
+                        .iter()
+                        .filter_map(|(_, fail)| match fail {
+                            Some(local_sim::MinimalSimFailure::TokenMismatch { hop }) => {
+                                let edge = cycle.edges.get(*hop)?;
+                                Some((
+                                    *hop,
+                                    arena.pool_address(edge.pool_index),
+                                    edge.protocol,
+                                    arena.token_address(edge.token_in),
+                                    arena.token_address(edge.token_out),
+                                    edge.token_in_idx,
+                                    edge.token_out_idx,
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if mismatch_detail.is_empty() {
+                        crate::info!(
+                            "hf minimal-sim reject: fp={fp:#x} route={route:?} attempts={attempts:?}"
+                        );
+                    } else {
+                        crate::info!(
+                            "hf minimal-sim reject: fp={fp:#x} route={route:?} attempts={attempts:?} token_mismatch={mismatch_detail:?}"
+                        );
+                    }
+                }
             }
-            if matches!(reject, MinimalProbeReject::NoSimulation)
-                && MINIMAL_SIM_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 3
-            {
-                let mut attempts = Vec::with_capacity(2);
-                for_each_rank_probe_amount(start_decimals, rate, |amount| {
-                    attempts.push((
-                        amount,
-                        local_sim::minimal_sim_failure(arena, &cycle.edges, amount),
-                    ));
-                });
-                let route: Vec<_> = cycle
-                    .edges
-                    .iter()
-                    .map(|edge| (edge.pool_index, edge.protocol))
-                    .collect();
-                crate::info!(
-                    "hf minimal-sim reject: fp={fp:#x} route={route:?} attempts={attempts:?}"
-                );
-            }
-            if cycle.score < 0.0 {
+            if should_rescue_probe_reject(reject, &attempt_failures) {
                 out.rescue.push((fp, cycle.into_owned()));
             } else {
+                if let MinimalProbeReject::SanityReject(reason) = &reject {
+                    out.minimal_sim_reasons.record_sanity(*reason);
+                }
                 reject.record(&mut out.skip);
             }
             return out;
@@ -581,7 +777,10 @@ fn rank_one_cycle_probe(
         if !probe.profit.is_zero()
             && cycle_simulatable(arena, &cycle, token_decimals, token_to_matic_rates)
         {
-            out.near_net.push((fp, probe.profit, cycle.into_owned()));
+            // Prefer absolute MATIC cover over brent shortfall so low-gas dust
+            // (tiny gross, cheap gas) does not crowd out larger-edge near-misses.
+            let cover_matic = cover_matic_from_sim(&ranked_probe, probe_amount, &ctx);
+            out.near_net.push((fp, cover_matic, cycle.into_owned()));
         }
         out.skip.net = 1;
         if probe.profit.is_zero() {
@@ -704,11 +903,10 @@ pub fn rank_cycles_by_probe_net(
     });
     let rescue_len = rescue.len();
     let had_net_ranked = !profitable_ranked.is_empty();
-    let mut kept = if had_net_ranked {
-        select_probe_survivors(profitable_ranked, rescue, max_keep, rescue_cap)
-    } else {
-        Vec::new()
-    };
+    // Fill order: profitable → near_net (simulatable underwater) → rescue → score fallback.
+    // Rescue must not run before near_net: when profitable is empty, admitting rescue_cap
+    // first crowded out cover-ranked near-misses and produced probe_kept>0 with evaluated=0.
+    let mut kept = select_probe_survivors(profitable_ranked, Vec::new(), max_keep, 0);
     let mut seen: rustc_hash::FxHashSet<u64> = kept.iter().map(|(fp, _)| *fp).collect();
     let near_net_count = near_net.len();
     if kept.len() < max_keep && !scanned.is_empty() {
@@ -733,6 +931,15 @@ pub fn rank_cycles_by_probe_net(
                 }
             }
         }
+        if kept.len() < max_keep && !rescue.is_empty() {
+            rescue.sort_by(|a, b| compare_cycle_score(&a.1, &b.1));
+            let remaining = max_keep - kept.len();
+            for (fp, cycle) in rescue.into_iter().take(rescue_cap.min(remaining)) {
+                if seen.insert(fp) {
+                    kept.push((fp, cycle));
+                }
+            }
+        }
         if kept.len() < max_keep {
             let fallback = simulatable_score_fallback(
                 &scanned,
@@ -748,14 +955,28 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
-                if seen.insert(fp) {
-                    kept.push((fp, cycle));
+                if !seen.insert(fp) {
+                    continue;
+                }
+                // Score-fallback used to admit seedless cycles → assess all opt_none
+                // (probe_kept>0 evaluated=0). Only keep when a non-zero minimal seed exists.
+                let start_decimals =
+                    resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
+                let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
+                match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
+                    Ok((amount, sim)) if !sim.profit.is_zero() => {
+                        probe_seeds.insert(fp, (amount, sim));
+                        kept.push((fp, cycle));
+                    }
+                    _ => {
+                        seen.remove(&fp);
+                    }
                 }
             }
         }
         if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} sanity_why(ratio={} matic={} floor={} dec={} pin={}) probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2_reserve={} token_mismatch={} math={} unsupported={} bal_max_in={} zero_output={}) zo_proto(v2={} v3={} v4={} bal={} other={}) zo_hop(0={} 1={} 2p={}) unsup_exp(v2={} v3={} v4={} bal={} crv={} dodo={} woofi={}) unsup_act(invalid={} v2={} v3={} v4={} curve={} bal={} dodo={} woofi={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
@@ -765,14 +986,46 @@ pub fn rank_cycles_by_probe_net(
                 skip.minimal_no_sim,
                 skip.minimal_zero_profit,
                 skip.minimal_sanity,
+                minimal_sim_reasons.sanity_ratio,
+                minimal_sim_reasons.sanity_matic,
+                minimal_sim_reasons.sanity_floor,
+                minimal_sim_reasons.sanity_decimals,
+                minimal_sim_reasons.sanity_pin,
                 minimal_sim_reasons.invalid_route,
                 minimal_sim_reasons.missing_pool,
                 minimal_sim_reasons.non_tradable,
+                minimal_sim_reasons.cl_tickless,
+                minimal_sim_reasons.cl_cap,
                 minimal_sim_reasons.shallow_cl,
                 minimal_sim_reasons.v2_reserve_exhausted,
+                minimal_sim_reasons.token_mismatch,
                 minimal_sim_reasons.math,
                 minimal_sim_reasons.unsupported_state,
+                minimal_sim_reasons.bal_max_in,
                 minimal_sim_reasons.zero_output,
+                minimal_sim_reasons.zo_proto_v2,
+                minimal_sim_reasons.zo_proto_v3,
+                minimal_sim_reasons.zo_proto_v4,
+                minimal_sim_reasons.zo_proto_bal,
+                minimal_sim_reasons.zo_proto_other,
+                minimal_sim_reasons.zo_hop0,
+                minimal_sim_reasons.zo_hop1,
+                minimal_sim_reasons.zo_hop2p,
+                minimal_sim_reasons.unsup_exp_v2,
+                minimal_sim_reasons.unsup_exp_v3,
+                minimal_sim_reasons.unsup_exp_v4,
+                minimal_sim_reasons.unsup_exp_bal,
+                minimal_sim_reasons.unsup_exp_crv,
+                minimal_sim_reasons.unsup_exp_dodo,
+                minimal_sim_reasons.unsup_exp_woofi,
+                minimal_sim_reasons.unsup_act_invalid,
+                minimal_sim_reasons.unsup_act_v2,
+                minimal_sim_reasons.unsup_act_v3,
+                minimal_sim_reasons.unsup_act_v4,
+                minimal_sim_reasons.unsup_act_curve,
+                minimal_sim_reasons.unsup_act_bal,
+                minimal_sim_reasons.unsup_act_dodo,
+                minimal_sim_reasons.unsup_act_woofi,
                 skip.net,
             );
         }
@@ -781,20 +1034,91 @@ pub fn rank_cycles_by_probe_net(
 
     if kept.is_empty() && !scanned.is_empty() {
         let sample = flash_diag.as_deref().unwrap_or("none");
-        crate::debug!(
-            "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} rescue={rescue_len} sample={sample}",
-            scanned.len(),
-            skip.rate,
-            skip.flash,
-            skip.flash_source,
-            skip.probe(),
-            skip.missing_decimals,
-            skip.minimal_sim(),
-            skip.minimal_no_sim,
-            skip.minimal_zero_profit,
-            skip.minimal_sanity,
-            skip.net,
-        );
+        // Empty ranks used to be debug-only; rate-limit INFO so probe_kept=0 ticks are visible.
+        static LAST_EMPTY_PROBE_RANK_LOG_MS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now = crate::util::now_ms();
+        let prev = LAST_EMPTY_PROBE_RANK_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 2_000
+            && LAST_EMPTY_PROBE_RANK_LOG_MS
+                .compare_exchange(
+                    prev,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            crate::info!(
+                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} sanity_why(ratio={} matic={} floor={} dec={} pin={}) probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2_reserve={} token_mismatch={} math={} unsupported={} bal_max_in={} zero_output={}) zo_proto(v2={} v3={} v4={} bal={} other={}) zo_hop(0={} 1={} 2p={}) unsup_exp(v2={} v3={} v4={} bal={} crv={} dodo={} woofi={}) unsup_act(invalid={} v2={} v3={} v4={} curve={} bal={} dodo={} woofi={})) skip_net={} rescue={rescue_len} sample={sample}",
+                scanned.len(),
+                skip.rate,
+                skip.flash,
+                skip.flash_source,
+                skip.probe(),
+                skip.missing_decimals,
+                skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
+                minimal_sim_reasons.sanity_ratio,
+                minimal_sim_reasons.sanity_matic,
+                minimal_sim_reasons.sanity_floor,
+                minimal_sim_reasons.sanity_decimals,
+                minimal_sim_reasons.sanity_pin,
+                minimal_sim_reasons.invalid_route,
+                minimal_sim_reasons.missing_pool,
+                minimal_sim_reasons.non_tradable,
+                minimal_sim_reasons.cl_tickless,
+                minimal_sim_reasons.cl_cap,
+                minimal_sim_reasons.shallow_cl,
+                minimal_sim_reasons.v2_reserve_exhausted,
+                minimal_sim_reasons.token_mismatch,
+                minimal_sim_reasons.math,
+                minimal_sim_reasons.unsupported_state,
+                minimal_sim_reasons.bal_max_in,
+                minimal_sim_reasons.zero_output,
+                minimal_sim_reasons.zo_proto_v2,
+                minimal_sim_reasons.zo_proto_v3,
+                minimal_sim_reasons.zo_proto_v4,
+                minimal_sim_reasons.zo_proto_bal,
+                minimal_sim_reasons.zo_proto_other,
+                minimal_sim_reasons.zo_hop0,
+                minimal_sim_reasons.zo_hop1,
+                minimal_sim_reasons.zo_hop2p,
+                minimal_sim_reasons.unsup_exp_v2,
+                minimal_sim_reasons.unsup_exp_v3,
+                minimal_sim_reasons.unsup_exp_v4,
+                minimal_sim_reasons.unsup_exp_bal,
+                minimal_sim_reasons.unsup_exp_crv,
+                minimal_sim_reasons.unsup_exp_dodo,
+                minimal_sim_reasons.unsup_exp_woofi,
+                minimal_sim_reasons.unsup_act_invalid,
+                minimal_sim_reasons.unsup_act_v2,
+                minimal_sim_reasons.unsup_act_v3,
+                minimal_sim_reasons.unsup_act_v4,
+                minimal_sim_reasons.unsup_act_curve,
+                minimal_sim_reasons.unsup_act_bal,
+                minimal_sim_reasons.unsup_act_dodo,
+                minimal_sim_reasons.unsup_act_woofi,
+                skip.net,
+            );
+        } else {
+            crate::debug!(
+                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={}) skip_net={} rescue={rescue_len} sample={sample}",
+                scanned.len(),
+                skip.rate,
+                skip.flash,
+                skip.flash_source,
+                skip.probe(),
+                skip.missing_decimals,
+                skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
+                skip.net,
+            );
+        }
     } else if kept.len() * 4 < scanned.len() {
         // HF may rank hundreds of times per second; keep the signal without
         // flooding INFO (was ~70% of orchestrator log volume in live runs).
@@ -813,7 +1137,7 @@ pub fn rank_cycles_by_probe_net(
                 .is_ok()
         {
             crate::info!(
-                "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} shallow_cl={} v2_reserve={} math={} unsupported={} zero_output={})) skip_net={} near_net={}",
+                "route probe rank: kept={} scanned={} skip_rate={} skip_executor={} skip_flash={} skip_flash_source={} skip_probe={} (missing_decimals={} minimal_sim={} no_sim={} zero_profit={} sanity={} sanity_why(ratio={} matic={} floor={} dec={} pin={}) probe_fail_reasons=(invalid={} missing_pool={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2_reserve={} token_mismatch={} math={} unsupported={} bal_max_in={} zero_output={}) zo_proto(v2={} v3={} v4={} bal={} other={}) zo_hop(0={} 1={} 2p={}) unsup_exp(v2={} v3={} v4={} bal={} crv={} dodo={} woofi={}) unsup_act(invalid={} v2={} v3={} v4={} curve={} bal={} dodo={} woofi={})) skip_net={} near_net={}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
@@ -826,14 +1150,46 @@ pub fn rank_cycles_by_probe_net(
                 skip.minimal_no_sim,
                 skip.minimal_zero_profit,
                 skip.minimal_sanity,
+                minimal_sim_reasons.sanity_ratio,
+                minimal_sim_reasons.sanity_matic,
+                minimal_sim_reasons.sanity_floor,
+                minimal_sim_reasons.sanity_decimals,
+                minimal_sim_reasons.sanity_pin,
                 minimal_sim_reasons.invalid_route,
                 minimal_sim_reasons.missing_pool,
                 minimal_sim_reasons.non_tradable,
+                minimal_sim_reasons.cl_tickless,
+                minimal_sim_reasons.cl_cap,
                 minimal_sim_reasons.shallow_cl,
                 minimal_sim_reasons.v2_reserve_exhausted,
+                minimal_sim_reasons.token_mismatch,
                 minimal_sim_reasons.math,
                 minimal_sim_reasons.unsupported_state,
+                minimal_sim_reasons.bal_max_in,
                 minimal_sim_reasons.zero_output,
+                minimal_sim_reasons.zo_proto_v2,
+                minimal_sim_reasons.zo_proto_v3,
+                minimal_sim_reasons.zo_proto_v4,
+                minimal_sim_reasons.zo_proto_bal,
+                minimal_sim_reasons.zo_proto_other,
+                minimal_sim_reasons.zo_hop0,
+                minimal_sim_reasons.zo_hop1,
+                minimal_sim_reasons.zo_hop2p,
+                minimal_sim_reasons.unsup_exp_v2,
+                minimal_sim_reasons.unsup_exp_v3,
+                minimal_sim_reasons.unsup_exp_v4,
+                minimal_sim_reasons.unsup_exp_bal,
+                minimal_sim_reasons.unsup_exp_crv,
+                minimal_sim_reasons.unsup_exp_dodo,
+                minimal_sim_reasons.unsup_exp_woofi,
+                minimal_sim_reasons.unsup_act_invalid,
+                minimal_sim_reasons.unsup_act_v2,
+                minimal_sim_reasons.unsup_act_v3,
+                minimal_sim_reasons.unsup_act_v4,
+                minimal_sim_reasons.unsup_act_curve,
+                minimal_sim_reasons.unsup_act_bal,
+                minimal_sim_reasons.unsup_act_dodo,
+                minimal_sim_reasons.unsup_act_woofi,
                 skip.net,
                 near_net_count,
             );
@@ -852,6 +1208,7 @@ struct EvalFailStats {
     executor_budget: AtomicU32,
     flash: AtomicU32,
     flash_source: AtomicU32,
+    missing_decimals: AtomicU32,
     opt_none: AtomicU32,
     detailed_none: AtomicU32,
     fallback_none: AtomicU32,
@@ -867,11 +1224,12 @@ impl EvalFailStats {
             return;
         }
         crate::info!(
-            "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
+            "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} missing_decimals={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
             load(&self.quarantine),
             load(&self.executor_budget),
             load(&self.flash),
             load(&self.flash_source),
+            load(&self.missing_decimals),
             load(&self.opt_none),
             load(&self.detailed_none),
             load(&self.fallback_none),
@@ -917,9 +1275,12 @@ pub fn evaluate_cycles_parallel(
     if in_count > 0 && (results.len() < in_count || results.is_empty()) {
         stats.log_assess_summary(in_count, results.len());
         crate::pipeline::curve_sim::log_curve_sim_summary();
-        crate::pipeline::brent_diag::log_brent_summary();
-        crate::pipeline::ternary_diag::log_ternary_summary();
     }
+    // Always emit when Brent/ternary work ran — full assess success used to skip
+    // these and hide shallow/cl_depth_clamp (live cldepth capture had attempts>0
+    // but no `brent:` line).
+    crate::pipeline::brent_diag::log_brent_summary();
+    crate::pipeline::ternary_diag::log_ternary_summary();
     results
 }
 
@@ -993,30 +1354,24 @@ fn probe_fallback_amounts(
     cycle: &FoundCycle,
     input: &HfEvalInput<'_>,
     probe_seed: Option<(U256, MinimalSimResult)>,
-) -> [U256; 3] {
+) -> Vec<U256> {
     let flash_cap = flash_cap_for_cycle(input, cycle);
     let dec = flash_cap.token_decimals;
     let rate = flash_cap.token_to_matic_rate;
-    let economic = min_economic_amount_in(dec, rate);
-    let spot = crate::pipeline::spot_price::spot_probe_for_decimals(dec);
-    let seed = probe_seed.map(|(a, _)| a).unwrap_or(economic);
-    // Try economic first, then the probe seed amount, then the decimal-aware spot probe.
-    let mut amounts = [U256::ZERO; 3];
-    let mut n = 0usize;
-    for candidate in [economic, seed, spot] {
-        if candidate.is_zero() {
-            continue;
+    let mut amounts = Vec::with_capacity(5);
+    let push = |amounts: &mut Vec<U256>, candidate: U256| {
+        if candidate.is_zero() || amounts.iter().any(|a| *a == candidate) {
+            return;
         }
-        let duplicate = (0..n).any(|i| amounts[i] == candidate);
-        if duplicate {
-            continue;
+        if !flash_cap.amount_within_cap(candidate) {
+            return;
         }
-        if candidate == spot && !flash_cap.amount_within_cap(spot) {
-            continue;
-        }
-        amounts[n] = candidate;
-        n += 1;
+        amounts.push(candidate);
+    };
+    if let Some((seed, _)) = probe_seed {
+        push(&mut amounts, seed);
     }
+    for_each_rank_probe_amount(dec, rate, |candidate| push(&mut amounts, candidate));
     amounts
 }
 
@@ -1030,13 +1385,73 @@ fn probe_fallback_opt(
     let rate = resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates);
     let decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
+    let flash = input.flash_liquidity.load();
+    let flash_source = resolve_flash_source_for_cycle(
+        cycle,
+        input.arena,
+        &flash,
+        input.flash_ttl,
+        input.flash_policy,
+        min_economic_amount_in(decimals, rate),
+    )
+    .unwrap_or(FlashLoanSource::Balancer);
+    let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
+        cycle.start_token,
+        input.arena,
+        input.token_to_matic_rates,
+        input.token_decimals,
+        input.gas_price,
+        effective_slippage_bps(input.slippage_bps, cycle.hop_count, 0),
+        flash_source,
+        input.safety_multiplier_bps,
+    );
+    profit_ctx.gas_scale_bps = 10_000;
+    profit_ctx.hop_count = cycle.hop_count;
+    profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let (mut psn, mut pzp, mut pf, mut ps) = (0u32, 0u32, 0u32, 0u32);
-    let mut best: Option<(OptimizationResult, RouteSimulationResult)> = None;
+    let mut best: Option<(OptimizationResult, RouteSimulationResult, U256)> = None;
+    let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
     for amount in probe_fallback_amounts(cycle, input, probe_seed) {
         if amount.is_zero() {
             continue;
         }
-        let Some(sim) = simulate_route_detailed(input.arena, &cycle.edges, amount) else {
+        let seed_backed = probe_seed
+            .as_ref()
+            .is_some_and(|(seed_amt, seed_sim)| *seed_amt == amount && !seed_sim.profit.is_zero());
+        // Prefer capped detailed walk (matches rank/Brent). Plain detailed often None's
+        // the same amount that minimal ranked successfully.
+        let mut minimal_backed = false;
+        let Some(sim) = simulate_route_detailed_with_caps(
+            input.arena,
+            &cycle.edges,
+            amount,
+            route_shallow_caps.as_ref(),
+        )
+        .or_else(|| {
+            if seed_backed {
+                simulate_route_detailed(input.arena, &cycle.edges, amount)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            // Seedless rescue/score-fallback: detailed caps often fail while minimal still
+            // walks — without this, probe_kept>0 evaluates to all opt_none.
+            let m = local_sim::simulate_route_minimal(input.arena, &cycle.edges, amount)?;
+            if m.profit.is_zero() {
+                return None;
+            }
+            minimal_backed = true;
+            Some(RouteSimulationResult {
+                amount_in: amount,
+                amount_out: m.amount_out,
+                profit: m.profit,
+                profitable: true,
+                hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
+                total_gas: m.total_gas,
+                hop_count: cycle.edges.len() as u32,
+            })
+        }) else {
             psn += 1;
             continue;
         };
@@ -1044,10 +1459,15 @@ fn probe_fallback_opt(
             pzp += 1;
             continue;
         }
+        // Ranked near_net seeds already cleared minimal+sanity; post-walk fidelity
+        // (shallow CL) must not drop them into opt_none before best-eval can see them.
+        // Minimal-synthesized hops have zeroed amounts — skip fidelity for those too.
         if !local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts)
         {
-            pf += 1;
-            continue;
+            if !seed_backed && !minimal_backed {
+                pf += 1;
+                continue;
+            }
         }
         // search_low=ZERO so check_sim_sanity's OptimizerPinnedAtFloor check
         // doesn't false-positive: this is a static probe, not a Brent search
@@ -1074,6 +1494,12 @@ fn probe_fallback_opt(
             ps += 1;
             continue;
         }
+        let minimal = MinimalSimResult {
+            profit: sim.profit,
+            amount_out: sim.amount_out,
+            total_gas: sim.total_gas,
+        };
+        let score = brent_score_matic_from_sim(&minimal, amount, &profit_ctx);
         let candidate = (
             OptimizationResult {
                 optimal_input: amount,
@@ -1083,20 +1509,57 @@ fn probe_fallback_opt(
                 search_low: U256::ZERO,
             },
             sim,
+            score,
         );
-        let replace = best
-            .as_ref()
-            .is_none_or(|(best_opt, _)| candidate.0.net_profit > best_opt.net_profit);
+        let replace = best.as_ref().is_none_or(|(_, _, best_score)| score > *best_score);
         if replace {
             best = Some(candidate);
         }
+    }
+    // Ranked near_net seeds must not become opt_none when detailed re-sim flakes.
+    // Synthesize a probe-only result from the minimal seed for assessment/best-eval.
+    if best.is_none()
+        && let Some((amount, seed)) = probe_seed
+        && !seed.profit.is_zero()
+        && !amount.is_zero()
+        && flash_cap_for_cycle(input, cycle).amount_within_cap(amount)
+        && check_sim_sanity(SimSanityInput {
+            amount_in: amount,
+            gross_profit: seed.profit,
+            search_low: U256::ZERO,
+            token_decimals: decimals,
+            token_to_matic_rate: rate,
+        })
+        .is_ok()
+    {
+        let sim = RouteSimulationResult {
+            amount_in: amount,
+            amount_out: seed.amount_out,
+            profit: seed.profit,
+            profitable: true,
+            hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
+            total_gas: seed.total_gas,
+            hop_count: cycle.edges.len() as u32,
+        };
+        let score = brent_score_matic_from_sim(&seed, amount, &profit_ctx);
+        best = Some((
+            OptimizationResult {
+                optimal_input: amount,
+                expected_gross: seed.amount_out,
+                net_profit: seed.profit,
+                total_gas: seed.total_gas,
+                search_low: U256::ZERO,
+            },
+            sim,
+            score,
+        ));
     }
     let s = stats;
     add(&s.probe_sim_none, psn);
     add(&s.probe_zero_profit, pzp);
     add(&s.probe_fidelity, pf);
     add(&s.probe_sanity, ps);
-    best
+    best.map(|(opt, sim, _)| (opt, sim))
 }
 
 /// Economic + spot probe sims for Brent warm-start (deduped, sanity-filtered).
@@ -1158,7 +1621,7 @@ fn evaluate_one(
         return None;
     }
     if !cycle_tokens_have_known_decimals(cycle, input.arena, input.token_decimals) {
-        inc(&stats.opt_none);
+        inc(&stats.missing_decimals);
         return None;
     }
     let flash = input.flash_liquidity.load();
@@ -1215,6 +1678,8 @@ fn evaluate_one(
     let brent_seeds =
         build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
     let brent_seed_slice = (!brent_seeds.is_empty()).then_some(brent_seeds.as_slice());
+    // Shared CL shallow caps for post-Brent detailed walks (and depth reopt).
+    let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
 
     let (mut opt, mut sim, probe_only) = match optimize_cycle(
         input.arena,
@@ -1233,8 +1698,12 @@ fn evaluate_one(
             .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
     ) {
         Some(opt) => {
-            let Some(sim) = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)
-            else {
+            let Some(sim) = simulate_route_detailed_with_caps(
+                input.arena,
+                &cycle.edges,
+                opt.optimal_input,
+                route_shallow_caps.as_ref(),
+            ) else {
                 crate::trace!(
                     "evaluate_one detailed_none: fp={fp:#x} opt_input={}",
                     opt.optimal_input
@@ -1321,7 +1790,12 @@ fn evaluate_one(
                     .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
             ) {
                 opt = reopt;
-                sim = simulate_route_detailed(input.arena, &cycle.edges, opt.optimal_input)?;
+                sim = simulate_route_detailed_with_caps(
+                    input.arena,
+                    &cycle.edges,
+                    opt.optimal_input,
+                    route_shallow_caps.as_ref(),
+                )?;
                 if !validate_optimized_sim(input, cycle, &sim, opt.optimal_input, opt.search_low) {
                     return None;
                 }
@@ -1384,6 +1858,23 @@ pub fn reassess_hf_eval_result(
     )
 }
 
+/// V4 local quoter still admits sub-1 POL phantoms that dry-run ExternalCallFailed.
+/// Tighter than global `MAX_SANE_PROFIT_MATIC_WEI` for any route touching Uniswap V4.
+const MAX_SANE_V4_ROUTE_MATIC_WEI: u128 = 25u128 * 10u128.pow(16); // 0.25 POL
+
+fn route_has_uniswap_v4(cycle: &FoundCycle) -> bool {
+    cycle
+        .edges
+        .iter()
+        .any(|e| e.protocol == ProtocolType::UniswapV4)
+}
+
+/// Gate phantom V4 local-sim profits that pass the global 1 POL MATIC cap.
+#[must_use]
+fn v4_route_net_exceeds_fidelity_cap(has_v4: bool, net_matic_wei: U256) -> bool {
+    has_v4 && net_matic_wei > U256::from(MAX_SANE_V4_ROUTE_MATIC_WEI)
+}
+
 fn assess_route_for_cycle(
     input: &HfEvalInput<'_>,
     sim: &RouteSimulationResult,
@@ -1400,7 +1891,7 @@ fn assess_route_for_cycle(
         input.profit_priority_alpha_bps,
         risk_bps,
     );
-    Some(assess_route_from_sim(&RouteAssessRequest {
+    let mut assessment = assess_route_from_sim(&RouteAssessRequest {
         cycle_start: cycle.start_token,
         arena: input.arena,
         gross_profit: sim.profit,
@@ -1418,7 +1909,21 @@ fn assess_route_for_cycle(
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
-    }))
+    });
+    if assessment.should_execute
+        && v4_route_net_exceeds_fidelity_cap(
+            route_has_uniswap_v4(cycle),
+            assessment.net_profit_after_gas_matic_wei,
+        )
+    {
+        assessment.should_execute = false;
+        assessment.reject_reason = Some(format!(
+            "V4 route net {} MATIC wei exceeds sane cap {}",
+            assessment.net_profit_after_gas_matic_wei,
+            MAX_SANE_V4_ROUTE_MATIC_WEI
+        ));
+    }
+    Some(assessment)
 }
 
 fn flash_cap_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> FlashBorrowCapParams {
@@ -1518,6 +2023,42 @@ mod tests {
     }
 
     #[test]
+    fn rescues_fill_when_no_profitable_probes() {
+        let kept = select_probe_survivors(
+            Vec::new(),
+            vec![(10, cycle(10)), (11, cycle(11)), (12, cycle(12))],
+            4,
+            2,
+        );
+        assert_eq!(kept.len(), 2);
+        // Lower (more negative) graph score sorts first when cycle_ratio is zero.
+        assert_eq!(kept[0].1.start_token, TokenIndex(12));
+        assert_eq!(kept[1].1.start_token, TokenIndex(11));
+    }
+
+    #[test]
+    fn rescue_skips_zero_profit_and_no_simulation() {
+        use MinimalSimFailure::{ClCapExceeded, V2ReserveExhausted};
+        assert!(!should_rescue_probe_reject(
+            MinimalProbeReject::NoSimulation,
+            &[Some(ClCapExceeded { hop: 0 })],
+        ));
+        assert!(!should_rescue_probe_reject(
+            MinimalProbeReject::NoSimulation,
+            &[Some(V2ReserveExhausted { hop: 0 })],
+        ));
+        // ZeroProfit rescue only produced seedless opt_none (kept>0 evaluated=0).
+        assert!(!should_rescue_probe_reject(
+            MinimalProbeReject::ZeroProfit,
+            &[Some(V2ReserveExhausted { hop: 0 })],
+        ));
+        assert!(!should_rescue_probe_reject(
+            MinimalProbeReject::SanityReject(SimSanityReject::InsaneProfitRatio),
+            &[],
+        ));
+    }
+
+    #[test]
     fn probe_skip_counters_keep_missing_decimals_distinct_from_simulation_rejects() {
         let mut aggregate = SkipCounters::default();
         aggregate.merge(SkipCounters {
@@ -1536,7 +2077,7 @@ mod tests {
         let mut skip = SkipCounters::default();
         MinimalProbeReject::NoSimulation.record(&mut skip);
         MinimalProbeReject::ZeroProfit.record(&mut skip);
-        MinimalProbeReject::SanityReject.record(&mut skip);
+        MinimalProbeReject::SanityReject(SimSanityReject::InsaneProfitRatio).record(&mut skip);
 
         assert_eq!(skip.minimal_no_sim, 1);
         assert_eq!(skip.minimal_zero_profit, 1);
@@ -1556,5 +2097,20 @@ mod tests {
         aggregate.merge(reduced);
 
         assert_eq!(aggregate.probe(), 2);
+    }
+
+    #[test]
+    fn v4_fidelity_cap_is_tighter_than_global_matic_sane_cap() {
+        assert_eq!(MAX_SANE_V4_ROUTE_MATIC_WEI, 25 * 10u128.pow(16));
+        assert!(MAX_SANE_V4_ROUTE_MATIC_WEI < crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI);
+    }
+
+    #[test]
+    fn v4_fidelity_cap_rejects_only_v4_routes_above_quarter_pol() {
+        let under = U256::from(MAX_SANE_V4_ROUTE_MATIC_WEI);
+        let over = under + U256::from(1u64);
+        assert!(!v4_route_net_exceeds_fidelity_cap(true, under));
+        assert!(v4_route_net_exceeds_fidelity_cap(true, over));
+        assert!(!v4_route_net_exceeds_fidelity_cap(false, over));
     }
 }

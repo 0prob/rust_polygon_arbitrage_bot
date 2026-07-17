@@ -301,11 +301,36 @@ mod tests {
     }
 
     #[test]
+    fn ten_x_roi_fails_closed_after_phantom_v4() {
+        let amount = U256::from(100_000u64);
+        assert_eq!(
+            check_sim_sanity_fast(SimSanityInput {
+                amount_in: amount,
+                gross_profit: amount * U256::from(10u8), // 1000% — former cap
+                search_low: U256::ZERO,
+                token_decimals: 8,
+                token_to_matic_rate: U256::from(10u128.pow(18)),
+            }),
+            Err(SimSanityReject::InsaneProfitRatio)
+        );
+        assert!(
+            check_sim_sanity_fast(SimSanityInput {
+                amount_in: amount,
+                gross_profit: amount * U256::from(2u8), // 200% — still allowed
+                search_low: U256::ZERO,
+                token_decimals: 8,
+                token_to_matic_rate: U256::from(10u128.pow(18)),
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn insane_matic_profit_is_rejected() {
         let rate = U256::from(10u128.pow(18));
         let amount_in = U256::from(10u128.pow(20));
-        // MAX_SANE_PROFIT_MATIC_WEI = 50 POL; use 100 POL to exceed the cap.
-        let profit = U256::from(100u128 * 10u128.pow(18));
+        // MAX_SANE_PROFIT_MATIC_WEI = 1 POL; use 2 POL to exceed the cap.
+        let profit = U256::from(2u128 * 10u128.pow(18));
         assert!(matches!(
             check_sim_sanity(SimSanityInput {
                 amount_in,
@@ -392,6 +417,33 @@ mod tests {
             }),
             Err(SimSanityReject::OptimizerPinnedAtFloor)
         ));
+    }
+
+    #[test]
+    fn search_low_eq_amount_falsely_pins_every_high_roi_probe() {
+        // Regression: rank probes used search_low=amount_in, so any >5% ROI failed
+        // OptimizerPinnedAtFloor even though the size was a deliberate probe.
+        let rate = U256::from(10u128.pow(18));
+        let amount_in = min_economic_amount_in(18, rate);
+        let profit = amount_in / U256::from(5u64); // 20% ROI
+        assert!(matches!(
+            check_sim_sanity(SimSanityInput {
+                amount_in,
+                gross_profit: profit,
+                search_low: amount_in,
+                token_decimals: 18,
+                token_to_matic_rate: rate,
+            }),
+            Err(SimSanityReject::OptimizerPinnedAtFloor)
+        ));
+        assert!(check_sim_sanity(SimSanityInput {
+            amount_in,
+            gross_profit: profit,
+            search_low: U256::ZERO,
+            token_decimals: 18,
+            token_to_matic_rate: rate,
+        })
+        .is_ok());
     }
 
     #[test]

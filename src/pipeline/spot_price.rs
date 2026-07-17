@@ -38,15 +38,36 @@ pub fn spot_probe_for_token(arena: &StateArena, token: TokenIndex) -> U256 {
     spot_probe_for_decimals(arena.token_decimals(token))
 }
 
-/// Economic floor then decimal-aware spot probe (deduped) for route ranking / TUI sim.
+/// Micro / spot / economic / 0.1 / 1.0 token ladder for ranking / Brent warm seeds.
+/// Visits in **ascending** size order so thin V2 pools are probed at dust before
+/// 0.1–1.0 token (avoids false `V2ReserveExhausted` attribution and wasted sims).
+/// Micro (`10^(decimals-6)` when below spot) recovers pools that exhaust at spot=0.001.
 pub fn for_each_rank_probe_amount(decimals: u8, rate: U256, mut visit: impl FnMut(U256)) {
     let economic = min_economic_amount_in(decimals, rate);
-    if !economic.is_zero() {
-        visit(economic);
-    }
     let spot = spot_probe_for_decimals(decimals);
-    if !spot.is_zero() && spot != economic {
-        visit(spot);
+    let scale = ten_pow_u256_cached(decimals);
+    let micro = if decimals >= 6 {
+        ten_pow_u256_cached(decimals - 6)
+    } else {
+        U256::from(1u64)
+    };
+    let tenth = scale / U256::from(10u8);
+    let one = scale;
+    let mut amounts = [U256::ZERO; 5];
+    let mut n = 0usize;
+    for candidate in [micro, spot, economic, tenth, one] {
+        if candidate.is_zero() {
+            continue;
+        }
+        if (0..n).any(|i| amounts[i] == candidate) {
+            continue;
+        }
+        amounts[n] = candidate;
+        n += 1;
+    }
+    amounts[..n].sort_unstable();
+    for amount in amounts.iter().take(n) {
+        visit(*amount);
     }
 }
 
@@ -822,5 +843,21 @@ mod tests {
         table.set_ratio(&reverse, ONE * U256::from(4u64));
         assert!((table.get(&forward) - 3.0).abs() < 1e-9);
         assert!((table.get(&reverse) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rank_probe_ladder_visits_ascending() {
+        // WMATIC-like: micro 1e12 < spot 1e15 < economic … < one 1e18
+        let rate = ONE; // 1:1 MATIC
+        let mut seen = Vec::new();
+        for_each_rank_probe_amount(18, rate, |a| seen.push(a));
+        assert!(!seen.is_empty());
+        for w in seen.windows(2) {
+            assert!(w[0] <= w[1], "ladder must be ascending: {seen:?}");
+        }
+        let micro = U256::from(10u128.pow(12));
+        let spot = spot_probe_for_decimals(18);
+        assert!(micro < spot);
+        assert_eq!(seen[0], micro, "micro-dust before spot (thin V2 friendly)");
     }
 }

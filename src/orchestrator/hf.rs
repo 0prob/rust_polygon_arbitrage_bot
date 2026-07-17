@@ -15,24 +15,31 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    dispatch_profitable_candidates, filter_balancer_onchain_verified, probe_near_miss_balancer,
+    cycle_tickless_cl_all_on_miss_cooldown, dispatch_profitable_candidates,
+    drain_cooldown_stuck_tickless_cycles,
+    filter_balancer_onchain_verified, hydrate_tickless_cl_for_cycles, probe_near_miss_balancer,
     refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
+use crate::pipeline::sim_sanity::{matic_usd_for_flash_cap, min_economic_amount_in};
 use crate::pipeline::types::{PoolMeta, compare_cycle_score};
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
 };
 use crate::services::execution::{
-    ExecutionService, GasOracle, compute_conservative_gas_price, hash_cycle_edges,
+    ExecutionService, GasOracle, compute_assessment_gas_price, hash_cycle_edges,
     rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
+use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::oracle::price_oracle::PriceOracle;
+use crate::services::oracle::{
+    resolve_token_decimals_for_index, resolve_token_to_matic_rate,
+};
+use crate::util::ten_pow_u256;
 use crate::services::partial_cache::PartialPoolCache;
 use crate::services::state_cache::StateCache;
 use crate::services::execution::flash_liquidity::FlashLiquidityCache;
@@ -282,6 +289,11 @@ fn hf_reselect_from_snapshot(
     cycles: &mut Vec<Arc<FoundCycle>>,
     quarantine_skipped: &mut usize,
     rate_skipped: &mut usize,
+    tickless_stuck_skipped: &mut usize,
+    protocol_mismatch_skipped: &mut usize,
+    v2_dead_skipped: &mut usize,
+    micro_dead_skipped: &mut usize,
+    bal_floor_dead_skipped: &mut usize,
     inactive_len: &mut usize,
     inactive_selected: &mut usize,
     stream_triggered: bool,
@@ -313,6 +325,11 @@ fn hf_reselect_from_snapshot(
     *cycles = selected.cycles;
     *quarantine_skipped = selected.quarantine_skipped;
     *rate_skipped = selected.rate_skipped;
+    *tickless_stuck_skipped = selected.tickless_stuck_skipped;
+    *protocol_mismatch_skipped = selected.protocol_mismatch_skipped;
+    *v2_dead_skipped = selected.v2_dead_skipped;
+    *micro_dead_skipped = selected.micro_dead_skipped;
+    *bal_floor_dead_skipped = selected.bal_floor_dead_skipped;
     *inactive_len = selected.inactive_len;
     *inactive_selected = selected.inactive_selected;
     if cycles.is_empty() {
@@ -358,6 +375,25 @@ fn cycle_with_reliable_start(
         }
     }
     None
+}
+
+/// True when any start-rotation of `edges` is quarantined. Assess may Aave-rotate
+/// after select; `cycle_key` includes hop order + vault idxs so a single fp miss
+/// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
+fn cycle_edges_quarantined(execution: &ExecutionService, edges: &[crate::core::types::Edge]) -> bool {
+    let n = edges.len();
+    if n == 0 {
+        return false;
+    }
+    let mut rotated: smallvec::SmallVec<[crate::core::types::Edge; 8]> =
+        edges.iter().copied().collect();
+    for _ in 0..n {
+        if execution.is_route_quarantined(hash_cycle_edges(&rotated)) {
+            return true;
+        }
+        rotated.rotate_left(1);
+    }
+    false
 }
 
 fn warn_hf_oracle_skip(message: &str) {
@@ -417,6 +453,12 @@ struct BestEvalDiag {
     gross: U256,
     net_matic: U256,
     gas_cost_wei: U256,
+    /// Tokens short of covering gas after flash+slip (0 = at/above breakeven).
+    gas_shortfall_tokens: U256,
+    /// MATIC-wei short of covering gas (cross-token comparable).
+    gas_shortfall_matic_wei: U256,
+    /// available_matic / gas_cost in bps (10000 = breakeven before min-profit).
+    gas_cover_bps: u64,
     slippage_bps: u64,
     slippage: U256,
     flash_fee: U256,
@@ -426,7 +468,7 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_base_fee_wei={} gas_priority_fee_wei={} gas_snapshot_age_ms={:?} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} slippage_bps={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_base_fee_wei={} gas_priority_fee_wei={} gas_snapshot_age_ms={:?} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} gas_shortfall_tokens={} gas_shortfall_matic_wei={} gas_cover_bps={} slippage_bps={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
         diag.route,
@@ -442,6 +484,9 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
         diag.gross,
         diag.net_matic,
         diag.gas_cost_wei,
+        diag.gas_shortfall_tokens,
+        diag.gas_shortfall_matic_wei,
+        diag.gas_cover_bps,
         diag.slippage_bps,
         diag.slippage,
         diag.flash_fee,
@@ -475,6 +520,16 @@ struct RescoreSelection {
     hot_pools: FxHashSet<Address>,
     quarantine_skipped: usize,
     rate_skipped: usize,
+    /// Cycles skipped because every tickless CL hop is on HF tick-miss cooldown.
+    tickless_stuck_skipped: usize,
+    /// Edge protocol disagrees with arena `PoolState` (would be probe UnsupportedState).
+    protocol_mismatch_skipped: usize,
+    /// Hop-0 UniswapV2 reserve ≤ start-token micro probe (would be probe `v2_reserve`).
+    v2_dead_skipped: usize,
+    /// Micro-probe `ZeroOutput` / Balancer MAX_IN (would empty-rank as those reasons).
+    micro_dead_skipped: usize,
+    /// Balancer route infeasible at economic floor (would be Brent `bal_bounds_fail`).
+    bal_floor_dead_skipped: usize,
     activity_candidates: usize,
     activity_selected: usize,
     inactive_len: usize,
@@ -496,6 +551,11 @@ fn select_cycles_for_rescore(
             hot_pools: FxHashSet::default(),
             quarantine_skipped: 0,
             rate_skipped: 0,
+            tickless_stuck_skipped: 0,
+            protocol_mismatch_skipped: 0,
+            v2_dead_skipped: 0,
+            micro_dead_skipped: 0,
+            bal_floor_dead_skipped: 0,
             activity_candidates: 0,
             activity_selected: 0,
             inactive_len: 0,
@@ -510,16 +570,112 @@ fn select_cycles_for_rescore(
     let mut inactive: Vec<Arc<FoundCycle>> = Vec::with_capacity(snap_cycles.len());
     let mut quarantine_skipped = 0usize;
     let mut rate_skipped = 0usize;
+    let mut tickless_stuck_skipped = 0usize;
+    let mut protocol_mismatch_skipped = 0usize;
+    let mut v2_dead_skipped = 0usize;
+    let mut micro_dead_skipped = 0usize;
+    let mut bal_floor_dead_skipped = 0usize;
     for cycle in snap_cycles {
-        let fp = hash_cycle_edges(&cycle.edges);
-        if execution.is_route_quarantined(fp) {
-            quarantine_skipped += 1;
+        // Skip only when every tickless CL hop is on miss cooldown. Skipping any
+        // CL pool on cooldown (even with LF ticks) wiped the HF window
+        // (`selected=0`, tickless_stuck≫candidates) whenever a hub pool missed.
+        if cycle_tickless_cl_all_on_miss_cooldown(arena, cycle.as_ref()) {
+            tickless_stuck_skipped += 1;
+            continue;
+        }
+        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &cycle.edges) {
+            protocol_mismatch_skipped += 1;
             continue;
         }
         let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
             rate_skipped += 1;
             continue;
         };
+        // Recover Balancer/Woofi vault-index skew (meta vs getPoolTokens) before
+        // quarantine/micro-dead — otherwise we only prune recoverable liquidity.
+        let Some(ready) =
+            crate::pipeline::local_sim::realign_multi_token_found_cycle(arena, ready)
+        else {
+            micro_dead_skipped += 1;
+            continue;
+        };
+        // Quarantine keys are assess/best-eval fingerprints (post start-rotation /
+        // vault-idx remap). Check every hop-start rotation of remapped + raw edges.
+        if cycle_edges_quarantined(execution, &ready.edges)
+            || cycle_edges_quarantined(execution, &cycle.edges)
+        {
+            quarantine_skipped += 1;
+            continue;
+        }
+        // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
+        // ranks were ~75% `v2_reserve` after unsupported cleared).
+        let start_decimals = arena.token_decimals(ready.start_token);
+        let micro_probe = if start_decimals >= 6 {
+            crate::util::ten_pow_u256_cached(start_decimals - 6)
+        } else {
+            U256::from(1u64)
+        };
+        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
+            arena,
+            &ready.edges,
+            micro_probe,
+        )
+        .is_some()
+        {
+            v2_dead_skipped += 1;
+            continue;
+        }
+        if crate::pipeline::local_sim::micro_probe_liquidity_dead(
+            arena,
+            &ready.edges,
+            micro_probe,
+        )
+        .is_some()
+        {
+            micro_dead_skipped += 1;
+            continue;
+        }
+        let start_rate = resolve_token_to_matic_rate(ready.start_token, token_to_matic_rates);
+        let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+        // Insane gross at micro or economic floor → probe `sanity` phantoms
+        // (residual after micro-only prune was mostly InsaneProfitMatic).
+        if crate::pipeline::local_sim::probe_insane_gross_phantom(
+            arena,
+            &ready.edges,
+            micro_probe,
+            start_decimals,
+            start_rate,
+        ) || crate::pipeline::local_sim::probe_insane_gross_phantom(
+            arena,
+            &ready.edges,
+            economic_floor,
+            start_decimals,
+            start_rate,
+        ) {
+            micro_dead_skipped += 1;
+            continue;
+        }
+        // After rank probe skips below-floor dust, micro-only survivors fail as
+        // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
+        match crate::pipeline::local_sim::economic_floor_liquidity_dead(
+            arena,
+            &ready.edges,
+            economic_floor,
+        ) {
+            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
+                bal_floor_dead_skipped += 1;
+                continue;
+            }
+            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
+                v2_dead_skipped += 1;
+                continue;
+            }
+            Some(_) => {
+                micro_dead_skipped += 1;
+                continue;
+            }
+            None => {}
+        }
         let score = cycle_activity_score(ready.as_ref(), arena, partial_cache, activity_now);
         if score > 0 {
             active.push((ready, score));
@@ -536,6 +692,11 @@ fn select_cycles_for_rescore(
             hot_pools: FxHashSet::default(),
             quarantine_skipped,
             rate_skipped,
+            tickless_stuck_skipped,
+            protocol_mismatch_skipped,
+            v2_dead_skipped,
+            micro_dead_skipped,
+            bal_floor_dead_skipped,
             activity_candidates: 0,
             activity_selected: 0,
             inactive_len: 0,
@@ -584,6 +745,11 @@ fn select_cycles_for_rescore(
         hot_pools,
         quarantine_skipped,
         rate_skipped,
+        tickless_stuck_skipped,
+        protocol_mismatch_skipped,
+        v2_dead_skipped,
+        micro_dead_skipped,
+        bal_floor_dead_skipped,
         activity_candidates,
         activity_selected,
         inactive_len,
@@ -650,6 +816,11 @@ pub async fn run_hf_tick(
     let hot_pools_set = selection.hot_pools;
     let mut quarantine_skipped = selection.quarantine_skipped;
     let mut rate_skipped = selection.rate_skipped;
+    let mut tickless_stuck_skipped = selection.tickless_stuck_skipped;
+    let mut protocol_mismatch_skipped = selection.protocol_mismatch_skipped;
+    let mut v2_dead_skipped = selection.v2_dead_skipped;
+    let mut micro_dead_skipped = selection.micro_dead_skipped;
+    let mut bal_floor_dead_skipped = selection.bal_floor_dead_skipped;
     let activity_candidates = selection.activity_candidates;
     let activity_selected = selection.activity_selected;
     let mut inactive_len = selection.inactive_len;
@@ -660,7 +831,7 @@ pub async fn run_hf_tick(
     let log_hf_summary = should_log_hf_summary() || stream_triggered;
     if log_hf_summary {
         crate::info!(
-            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
+            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} tickless_stuck_skip={tickless_stuck_skipped} proto_mismatch_skip={protocol_mismatch_skipped} v2_dead_skip={v2_dead_skipped} micro_dead_skip={micro_dead_skipped} bal_floor_dead_skip={bal_floor_dead_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
             cycles.len(),
             hot_pools_set.len(),
         );
@@ -696,7 +867,8 @@ pub async fn run_hf_tick(
             candidates: Vec::new(),
         });
     };
-    let gas_price = compute_conservative_gas_price(gas_snapshot);
+    // Spot tip for ranking/assess; submit still uses compute_conservative_gas_price.
+    let gas_price = compute_assessment_gas_price(gas_snapshot);
     let gas_snapshot_age_ms = ctx.gas_oracle.snapshot_age_ms();
 
     if ctx.snapshots.generation() != selection_generation {
@@ -714,6 +886,11 @@ pub async fn run_hf_tick(
             &mut cycles,
             &mut quarantine_skipped,
             &mut rate_skipped,
+            &mut tickless_stuck_skipped,
+            &mut protocol_mismatch_skipped,
+            &mut v2_dead_skipped,
+            &mut micro_dead_skipped,
+            &mut bal_floor_dead_skipped,
             &mut inactive_len,
             &mut inactive_selected,
             stream_triggered,
@@ -880,6 +1057,11 @@ pub async fn run_hf_tick(
             &mut cycles,
             &mut quarantine_skipped,
             &mut rate_skipped,
+            &mut tickless_stuck_skipped,
+            &mut protocol_mismatch_skipped,
+            &mut v2_dead_skipped,
+            &mut micro_dead_skipped,
+            &mut bal_floor_dead_skipped,
             &mut inactive_len,
             &mut inactive_selected,
             stream_triggered,
@@ -963,6 +1145,72 @@ pub async fn run_hf_tick(
     };
     let oracle_ms = now_ms().saturating_sub(oracle_started);
 
+    // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
+    // the selected HF set before probe ranking (otherwise cl_tickless dominates).
+    let probe_tick_budget = Duration::from_millis(
+        ctx.config
+            .pipeline
+            .hf_prefetch_budget_ms
+            .min(900)
+            .max(200),
+    );
+    let probe_tick_started = now_ms();
+    // Use latest block for tick lens: hot-cache overlay may be newer than
+    // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
+    let hydrate_stats = match timeout(
+        probe_tick_budget,
+        hydrate_tickless_cl_for_cycles(
+            ctx.rpc.as_ref(),
+            &mut arena,
+            &cycles,
+            pool_metas_for_dispatch.as_ref(),
+            ctx.config.oracle.tick_word_range,
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(stats) => stats,
+        Err(_) => {
+            crate::debug!(
+                "hf probe-tick hydrate timed out after {}ms",
+                probe_tick_budget.as_millis()
+            );
+            crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
+        }
+    };
+    let probe_tick_ms = now_ms().saturating_sub(probe_tick_started);
+    if hydrate_stats.v3_total > 0
+        || hydrate_stats.v4_total > 0
+        || hydrate_stats.cycles_tickless_before > 0
+    {
+        crate::info!(
+            "hf probe-tick hydrate: cycles_tickless={}->{} v3_total={} v3_fetch={} v3_loaded={} (empty={} incomplete={} algebra={} seeded={}) v4_total={} v4_fetch={} v4_loaded={} ms={}",
+            hydrate_stats.cycles_tickless_before,
+            hydrate_stats.cycles_tickless_after,
+            hydrate_stats.v3_total,
+            hydrate_stats.v3_needed,
+            hydrate_stats.v3_loaded,
+            hydrate_stats.v3_empty,
+            hydrate_stats.v3_incomplete,
+            hydrate_stats.v3_algebra_loaded,
+            hydrate_stats.v3_seeded,
+            hydrate_stats.v4_total,
+            hydrate_stats.v4_needed,
+            hydrate_stats.v4_loaded,
+            probe_tick_ms,
+        );
+    }
+    // After hydrate+cooldown mark, drop cycles whose CL hops are empty and already
+    // known-dead this minute so probe/Brent budget is not spent on dust-only phantoms.
+    let stuck_tickless = drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles);
+    if stuck_tickless > 0 {
+        crate::info!(
+            "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} remaining={}",
+            cycles.len()
+        );
+    }
+
     let matic_usd_chainlink = ctx.price_oracle.fresh_matic_usd_chainlink_raw();
     let dispatch_token_to_matic_rates = Arc::clone(&token_to_matic_rates);
     let dispatch_token_decimals = Arc::clone(&token_decimals);
@@ -1023,6 +1271,11 @@ pub async fn run_hf_tick(
     let mut best_gross_probe: Option<HfEvalResult> = None;
     let mut zero_net_rejects = 0usize;
     let mut positive_net_rejects = 0usize;
+    let mut cover_n = 0u32;
+    let mut cover_max_bps = 0u64;
+    let mut cover_sum_bps = 0u64;
+    let mut cover_ge_1000 = 0u32;
+    let mut cover_ge_5000 = 0u32;
 
     for result in eval_results {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
@@ -1030,10 +1283,69 @@ pub async fn run_hf_tick(
             best_profit_matic = matic;
         }
         let assessment = &result.assessment;
-        let gross_dominated = best_gross_diag
-            .as_ref()
-            .is_none_or(|best| assessment.gross_profit > best.gross);
-        if gross_dominated && !assessment.gross_profit.is_zero() {
+        // Prefer closest-to-breakeven in MATIC (token shortfall is not cross-token comparable).
+        let available_for_gas = assessment
+            .gross_profit
+            .saturating_sub(assessment.flash_loan_fee)
+            .saturating_sub(assessment.slippage_deduction);
+        let gas_shortfall_tokens = assessment
+            .gas_cost_in_tokens
+            .saturating_sub(available_for_gas);
+        let start_decimals = resolve_token_decimals_for_index(
+            result.cycle.start_token,
+            eval_arena.as_ref(),
+            reassess_ctx.token_decimals.as_ref(),
+        );
+        let start_rate = resolve_token_to_matic_rate(
+            result.cycle.start_token,
+            reassess_ctx.token_to_matic_rates.as_ref(),
+        );
+        let scale = ten_pow_u256(start_decimals);
+        let available_matic = if start_rate >= MIN_TOKEN_TO_MATIC_RATE && !scale.is_zero() {
+            available_for_gas
+                .checked_mul(start_rate)
+                .map(|v| v / scale)
+                .unwrap_or(U256::ZERO)
+        } else {
+            U256::ZERO
+        };
+        let gas_shortfall_matic = assessment
+            .gas_cost_wei
+            .saturating_sub(available_matic);
+        let gas_cover_bps = if assessment.gas_cost_wei.is_zero() {
+            0u64
+        } else {
+            available_matic
+                .checked_mul(U256::from(10_000u64))
+                .map(|v| v / assessment.gas_cost_wei)
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(u64::MAX)
+        };
+        if !assessment.gross_profit.is_zero() {
+            cover_n = cover_n.saturating_add(1);
+            cover_sum_bps = cover_sum_bps.saturating_add(gas_cover_bps);
+            cover_max_bps = cover_max_bps.max(gas_cover_bps);
+            if gas_cover_bps >= 1_000 {
+                cover_ge_1000 = cover_ge_1000.saturating_add(1);
+            }
+            if gas_cover_bps >= 5_000 {
+                cover_ge_5000 = cover_ge_5000.saturating_add(1);
+            }
+        }
+        // Prefer absolute MATIC available toward gas. Cover% alone lets USDT-wei
+        // dust (live: input≈8e3, cover_bps≥5000) beat ~0.008 MATIC V3 edges.
+        let better_near_breakeven = best_gross_diag.as_ref().is_none_or(|best| {
+            prefer_near_miss_by_absolute_matic(
+                available_matic,
+                gas_shortfall_matic,
+                gas_cover_bps,
+                best.gas_cost_wei
+                    .saturating_sub(best.gas_shortfall_matic_wei),
+                best.gas_shortfall_matic_wei,
+                best.gas_cover_bps,
+            )
+        });
+        if better_near_breakeven && !assessment.gross_profit.is_zero() {
             let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
@@ -1062,6 +1374,9 @@ pub async fn run_hf_tick(
                 gross: assessment.gross_profit,
                 net_matic: assessment.net_profit_after_gas_matic_wei,
                 gas_cost_wei: assessment.gas_cost_wei,
+                gas_shortfall_tokens,
+                gas_shortfall_matic_wei: gas_shortfall_matic,
+                gas_cover_bps,
                 slippage_bps: result.effective_slippage_bps,
                 slippage: assessment.slippage_deduction,
                 flash_fee: assessment.flash_loan_fee,
@@ -1131,12 +1446,14 @@ pub async fn run_hf_tick(
                     profitable.clear();
                 }
             }
+            let operator = ctx.wallet.operator_address(executor);
             profitable = filter_balancer_onchain_verified(
                 Arc::clone(&ctx.execution),
                 eval_arena.as_ref(),
                 profitable,
                 &sim_provider,
                 executor,
+                operator,
                 pool_metas_for_dispatch.as_ref(),
                 ctx.config.execution.slippage_bps,
                 Arc::clone(&reassess_ctx),
@@ -1181,15 +1498,64 @@ pub async fn run_hf_tick(
             crate::debug!(
                 "hf assess: 0/{cycles_considered} routes produced assessments (sim_cap={sim_cap})"
             );
-        } else if profitable_count == 0
-            && let Some(ref near_miss) = best_near_miss
-        {
+        } else if profitable_count == 0 {
+            // Underwater quarantine must not sit behind the positive-net near_miss
+            // branch — that else-if starved sticky V3↔V3 (~350 cover_bps) rotation
+            // whenever any tiny positive-net reject existed in the same tick.
+            // Also ignore best_profit_matic: positive_net rejects bump it above zero
+            // even when profitable_count==0, which previously skipped quarantine.
+            if let Some(ref diag) = best_gross_diag {
+                if ctx
+                    .execution
+                    .quarantine_chronic_gas_underwater(diag.fp, diag.gas_cover_bps)
+                {
+                    crate::info!(
+                        "hf underwater quarantine: fp={} cover_bps={}",
+                        diag.fp,
+                        diag.gas_cover_bps
+                    );
+                }
+                if should_log_best_eval() {
+                    log_best_eval_diagnostic(diag);
+                    let cover_avg = if cover_n == 0 {
+                        0
+                    } else {
+                        cover_sum_bps / u64::from(cover_n)
+                    };
+                    crate::info!(
+                        "hf cover-dist: n={cover_n} max_bps={cover_max_bps} avg_bps={cover_avg} ge_1000={cover_ge_1000} ge_5000={cover_ge_5000} best_fp={}",
+                        diag.fp,
+                    );
+                    if let Some(ref probe) = best_gross_probe
+                        && ctx.execution.should_log_near_miss(
+                            probe.route_fingerprint,
+                            probe.assessment.net_profit_after_gas_matic_wei,
+                        )
+                        && let Some(executor) = ctx.config.execution.executor_address
+                        && let Ok(sim_provider) =
+                            near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
+                    {
+                        probe_near_miss_balancer(
+                            &ctx.execution,
+                            eval_arena.as_ref(),
+                            probe,
+                            pool_metas_for_dispatch.as_ref(),
+                            &sim_provider,
+                            executor,
+                            dispatch_state_block,
+                        )
+                        .await;
+                    }
+                }
+            }
             // Rate-limit diagnostic + on-chain vault probe together. Without this,
             // a sticky Balancer near-miss re-queries every HF tick (~200ms).
-            if ctx.execution.should_log_near_miss(
-                near_miss.route_fingerprint,
-                near_miss.assessment.net_profit_after_gas_matic_wei,
-            ) {
+            if let Some(ref near_miss) = best_near_miss
+                && ctx.execution.should_log_near_miss(
+                    near_miss.route_fingerprint,
+                    near_miss.assessment.net_profit_after_gas_matic_wei,
+                )
+            {
                 log_near_miss_diagnostic(
                     &ctx.execution,
                     near_miss,
@@ -1214,32 +1580,6 @@ pub async fn run_hf_tick(
                     )
                     .await;
                 }
-            }
-        } else if profitable_count == 0
-            && best_profit_matic.is_zero()
-            && should_log_best_eval()
-            && let Some(ref diag) = best_gross_diag
-        {
-            log_best_eval_diagnostic(diag);
-            if let Some(ref probe) = best_gross_probe
-                && ctx.execution.should_log_near_miss(
-                    probe.route_fingerprint,
-                    probe.assessment.net_profit_after_gas_matic_wei,
-                )
-                && let Some(executor) = ctx.config.execution.executor_address
-                && let Ok(sim_provider) =
-                    near_miss_verify_provider(&ctx.rpc, &ctx.config.execution.mode)
-            {
-                probe_near_miss_balancer(
-                    &ctx.execution,
-                    eval_arena.as_ref(),
-                    probe,
-                    pool_metas_for_dispatch.as_ref(),
-                    &sim_provider,
-                    executor,
-                    dispatch_state_block,
-                )
-                .await;
             }
         }
     }
@@ -1379,12 +1719,52 @@ fn log_near_miss_diagnostic(
     );
 }
 
+/// Rank near-miss candidates by absolute MATIC available toward gas, then shortfall,
+/// then cover bps. Cover% alone promotes dust inputs with tiny gas denominators.
+#[must_use]
+fn prefer_near_miss_by_absolute_matic(
+    available_matic: U256,
+    shortfall_matic: U256,
+    cover_bps: u64,
+    best_available_matic: U256,
+    best_shortfall_matic: U256,
+    best_cover_bps: u64,
+) -> bool {
+    available_matic > best_available_matic
+        || (available_matic == best_available_matic
+            && (shortfall_matic < best_shortfall_matic
+                || (shortfall_matic == best_shortfall_matic && cover_bps > best_cover_bps)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
     use crate::core::types::{CycleEdges, Edge, PoolIndex, PoolState, TokenIndex, V2PoolState};
     use crate::services::partial_cache::SlimPoolState;
+
+    #[test]
+    fn near_miss_prefers_absolute_matic_over_cover_bps_dust() {
+        // Live balremap: USDT dust cover_bps=7800 vs V3 edge ~0.008 MATIC @ ~350 bps.
+        let dust_avail = U256::from(1_000u64); // wei-scale dust
+        let v3_avail = U256::from(8_000_000_000_000_000u64); // 0.008 MATIC
+        assert!(prefer_near_miss_by_absolute_matic(
+            v3_avail,
+            U256::from(200_000_000_000_000_000u64),
+            350,
+            dust_avail,
+            U256::from(1u64),
+            7_800,
+        ));
+        assert!(!prefer_near_miss_by_absolute_matic(
+            dust_avail,
+            U256::from(1u64),
+            7_800,
+            v3_avail,
+            U256::from(200_000_000_000_000_000u64),
+            350,
+        ));
+    }
 
     fn cycle(pool_index: PoolIndex, score: f64) -> Arc<FoundCycle> {
         Arc::new(FoundCycle {

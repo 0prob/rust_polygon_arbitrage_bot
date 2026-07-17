@@ -8,6 +8,7 @@ use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
+use crate::pipeline::local_sim::protocol_matches_pool_state;
 use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
@@ -151,8 +152,15 @@ pub fn edges_for_pair(
 
 pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallVec<[u8; 8]> {
     let mut out = SmallVec::new();
-    for i in 0..meta.tokens.len() {
-        if meta.bpt_index == Some(i) {
+    // Balancer/Woofi indices must follow vault/oracle token order (state.tokens), not
+    // discovery meta order — a mismatch yields phantom local sim and BAL#521 on-chain.
+    let (n, bpt) = match state {
+        PoolState::Balancer(b) if !b.tokens.is_empty() => (b.tokens.len(), b.bpt_index.or(meta.bpt_index)),
+        PoolState::Woofi(w) if !w.tokens.is_empty() => (w.tokens.len(), None),
+        _ => (meta.tokens.len(), meta.bpt_index),
+    };
+    for i in 0..n {
+        if bpt == Some(i) {
             continue;
         }
         if state.hop_token_funded(i) {
@@ -160,6 +168,28 @@ pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallV
         }
     }
     out
+}
+
+/// Resolve the graph `TokenIndex` for a pool-local leg.
+/// Prefer live state token addresses (vault order) when present.
+#[must_use]
+pub(crate) fn routing_token_at_leg(
+    arena: &StateArena,
+    state: &PoolState,
+    meta: &PoolMeta,
+    leg: usize,
+) -> Option<TokenIndex> {
+    match state {
+        PoolState::Balancer(b) if !b.tokens.is_empty() => {
+            let addr = *b.tokens.get(leg)?;
+            arena.address_to_token().get(&addr).copied()
+        }
+        PoolState::Woofi(w) if !w.tokens.is_empty() => {
+            let addr = *w.tokens.get(leg)?;
+            arena.address_to_token().get(&addr).copied()
+        }
+        _ => meta.tokens.get(leg).copied(),
+    }
 }
 
 fn ensure_per_pool_hub(
@@ -255,20 +285,30 @@ fn push_exit_edge(
     );
 }
 
-fn attach_hub_spoke_pool(graph: &mut RoutingGraph, meta: &PoolMeta, state: &PoolState) {
-    let funded = funded_token_indices(state, meta);
+fn attach_hub_spoke_pool(
+    graph: &mut RoutingGraph,
+    arena: &StateArena,
+    meta: &PoolMeta,
+    state: &PoolState,
+) {
+    let funded: SmallVec<[(u8, TokenIndex); 8]> = funded_token_indices(state, meta)
+        .into_iter()
+        .filter_map(|leg| {
+            routing_token_at_leg(arena, state, meta, leg as usize).map(|token| (leg, token))
+        })
+        .collect();
     if funded.len() < 2 {
         return;
     }
 
+    let exit_legs: SmallVec<[u8; 8]> = funded.iter().map(|(leg, _)| *leg).collect();
     let hub_node = if meta.protocol == ProtocolType::UniswapV4 {
         ensure_v4_singleton_hub(graph)
     } else {
-        ensure_per_pool_hub(graph, meta.pool_index, meta.protocol, funded.clone())
+        ensure_per_pool_hub(graph, meta.pool_index, meta.protocol, exit_legs)
     };
 
-    for &leg in &funded {
-        let token = meta.tokens[leg as usize];
+    for &(leg, token) in &funded {
         push_enter_edge(
             graph,
             token,
@@ -281,8 +321,7 @@ fn attach_hub_spoke_pool(graph: &mut RoutingGraph, meta: &PoolMeta, state: &Pool
     }
 
     if meta.protocol != ProtocolType::UniswapV4 {
-        for &leg in &funded {
-            let token = meta.tokens[leg as usize];
+        for &(leg, token) in &funded {
             push_exit_edge(
                 graph,
                 hub_node,
@@ -305,21 +344,52 @@ pub fn resolve_lazy_swap_edge(
     token_out_idx: u8,
 ) -> Option<(Edge, f64, U256)> {
     let state = arena.pool_state(pending.pool_index)?;
-    if !state.hop_pair_routable(pending.token_in_idx as usize, token_out_idx as usize) {
+    // Prefer pending idxs when they already match vault addresses; otherwise remap
+    // by address (hot-cache can reshuffle getPoolTokens vs discovery meta).
+    let (resolved_in_idx, resolved_out_idx) = match state {
+        PoolState::Balancer(b) if !b.tokens.is_empty() => {
+            let tin = arena.token_address(pending.token_in)?;
+            let tout = arena.token_address(token_out)?;
+            if b.tokens.get(pending.token_in_idx as usize).copied() == Some(tin)
+                && b.tokens.get(token_out_idx as usize).copied() == Some(tout)
+            {
+                (pending.token_in_idx, token_out_idx)
+            } else {
+                crate::pipeline::local_sim::resolve_multi_token_vault_indices(
+                    &b.tokens, tin, tout,
+                )?
+            }
+        }
+        PoolState::Woofi(w) if !w.tokens.is_empty() => {
+            let tin = arena.token_address(pending.token_in)?;
+            let tout = arena.token_address(token_out)?;
+            if w.tokens.get(pending.token_in_idx as usize).copied() == Some(tin)
+                && w.tokens.get(token_out_idx as usize).copied() == Some(tout)
+            {
+                (pending.token_in_idx, token_out_idx)
+            } else {
+                crate::pipeline::local_sim::resolve_multi_token_vault_indices(
+                    &w.tokens, tin, tout,
+                )?
+            }
+        }
+        _ => (pending.token_in_idx, token_out_idx),
+    };
+    if !state.hop_pair_routable(resolved_in_idx as usize, resolved_out_idx as usize) {
         return None;
     }
     let zero_for_one = match pending.protocol {
         ProtocolType::UniswapV3 | ProtocolType::UniswapV4 => {
             cl_zero_for_one_from_addresses(arena, pending.token_in, token_out)?
         }
-        _ => multi_zero_for_one(pending.token_in_idx, token_out_idx),
+        _ => multi_zero_for_one(resolved_in_idx, resolved_out_idx),
     };
     let edge = Edge {
         pool_index: pending.pool_index,
         token_in: pending.token_in,
         token_out,
-        token_in_idx: pending.token_in_idx,
-        token_out_idx,
+        token_in_idx: resolved_in_idx,
+        token_out_idx: resolved_out_idx,
         protocol: pending.protocol,
         fee_bps: pending.fee_bps,
         zero_for_one,
@@ -455,6 +525,11 @@ fn pool_has_admissible_edges(
     let Some(state) = arena.pool_state(meta.pool_index) else {
         return false;
     };
+    // Meta protocol from discovery can disagree with the fetched arena variant
+    // (live: V2 edges on V3 state → probe UnsupportedState ~20/scan).
+    if !protocol_matches_pool_state(meta.protocol, state) {
+        return false;
+    }
     let token_count = match state {
         PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
         PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
@@ -606,7 +681,7 @@ fn attach_pool_to_graph(
     graph.ensure_token_capacity(arena.token_count());
 
     if uses_hub_spoke(meta) {
-        attach_hub_spoke_pool(graph, meta, state);
+        attach_hub_spoke_pool(graph, arena, meta, state);
     } else if meta.tokens.len() == 2 {
         for mut edge in edges_for_pair(
             meta.pool_index,
@@ -998,6 +1073,11 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
         ge.ratio = U256::ZERO;
         return 1;
     };
+    if !protocol_matches_pool_state(ge.edge.protocol, state) {
+        ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+        ge.ratio = U256::ZERO;
+        return 1;
+    }
     let tin = ge.edge.token_in_idx as usize;
     let tout = ge.edge.token_out_idx as usize;
     if !state.hop_pair_routable(tin, tout) {
@@ -1287,6 +1367,67 @@ mod tests {
             .filter(|ge| ge.phase == GraphHopPhase::EnterPool)
             .count();
         assert_eq!(enter, 2);
+        // Hub legs must bind vault addresses (0x00.., 0x01..), not discovery meta (0x0a..).
+        let enter_tokens: Vec<_> = graph
+            .adjacency
+            .iter()
+            .take(graph.token_count as usize)
+            .flat_map(|adj| adj.iter())
+            .filter(|ge| ge.phase == GraphHopPhase::EnterPool)
+            .map(|ge| ge.edge.token_in)
+            .collect();
+        assert!(enter_tokens.contains(&TokenIndex(0)));
+        assert!(enter_tokens.contains(&TokenIndex(1)));
+        assert!(!enter_tokens.contains(&a));
+        assert!(!enter_tokens.contains(&b));
+    }
+
+    #[test]
+    fn resolve_lazy_swap_rejects_meta_vault_token_mismatch() {
+        use crate::core::math::fixed_point::ONE;
+        let mut arena = StateArena::default();
+        let vault0 = arena.register_token(Address::from([1u8; 20]));
+        let vault1 = arena.register_token(Address::from([2u8; 20]));
+        let meta_wrong = arena.register_token(Address::from([9u8; 20]));
+        let bal = U256::from(5u64) * ONE;
+        let w = ONE / U256::from(2u64);
+        let pool = arena.register_pool(
+            Address::from([15u8; 20]),
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: None,
+                tokens: vec![Address::from([1u8; 20]), Address::from([2u8; 20])],
+                balances: vec![bal, bal],
+                weights: vec![w, w],
+                scaling_factors: vec![ONE, ONE],
+                amp: U256::ZERO,
+                amp_precision: U256::ZERO,
+                fee: U256::ZERO,
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        let pending = PendingHubSwap {
+            pool_index: pool,
+            token_in: meta_wrong,
+            token_in_idx: 0,
+            protocol: ProtocolType::BalancerV2,
+            fee_bps: 10,
+        };
+        assert!(
+            resolve_lazy_swap_edge(&arena, pending, vault1, 1).is_none(),
+            "wrong token_in address must not resolve"
+        );
+        let pending_ok = PendingHubSwap {
+            token_in: vault0,
+            ..pending
+        };
+        assert!(
+            resolve_lazy_swap_edge(&arena, pending_ok, vault1, 1).is_some(),
+            "vault-aligned legs must still resolve"
+        );
     }
 
     #[test]

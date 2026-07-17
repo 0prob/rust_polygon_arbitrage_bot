@@ -3,13 +3,17 @@ use alloy::primitives::{Address, U256};
 use crate::core::math::uniswap_v3::{resolve_v3_fee_pips, simulate_v3_swap};
 use crate::core::types::{PoolState, V3PoolState};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::local_sim::simulate_hop_amount_out;
+use crate::pipeline::local_sim::{realign_multi_token_edge, simulate_hop_amount_out};
 use crate::services::execution::calldata::CalldataHop;
 
 #[must_use]
 pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<U256> {
     let state = arena.pool_state(hop.edge.pool_index)?;
-    simulate_hop_amount_out(state, &hop.edge, hop.amount_in)
+    let mut edge = hop.edge;
+    if !realign_multi_token_edge(arena, state, &mut edge) {
+        return None;
+    }
+    simulate_hop_amount_out(state, &edge, hop.amount_in)
 }
 
 #[must_use]

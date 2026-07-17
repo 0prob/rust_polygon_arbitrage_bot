@@ -464,6 +464,91 @@ pub fn net_profit_matic_from_sim(
     assess_profit(&probe_assess_input(sim, amount_in, ctx)).net_profit_after_gas_matic_wei
 }
 
+/// Bias so Brent can rank sizes that are still below gas breakeven.
+/// Without this, every unprofitable size scores `U256::ZERO` and size search is blind.
+const BRENT_MATIC_SCORE_BIAS: U256 = U256::from_limbs([0, 0, 1, 0]); // 2^128 wei ≈ 3.4e20 MATIC
+
+struct ProbeMaticParts {
+    gross_matic: U256,
+    flash_matic: U256,
+    gas_cost_wei: U256,
+    priority_uplift: U256,
+}
+
+fn probe_matic_parts(
+    sim: &MinimalSimResult,
+    amount_in: U256,
+    ctx: &ProfitEvalContext,
+) -> Option<ProbeMaticParts> {
+    let input = probe_assess_input(sim, amount_in, ctx);
+    let flash_fee_bps = flash_loan_fee_bps(input.flash_loan_source);
+    let flash_loan_fee = input
+        .amount_in
+        .checked_mul(U256::from(flash_fee_bps))
+        .map(|v| v / BPS_SCALE)?;
+    if input.slippage_bps >= 10_000 {
+        return None;
+    }
+    let amount_out = input.gross_profit.saturating_add(input.amount_in);
+    let adjusted_out = slippage_adjusted(amount_out, input.slippage_bps)?;
+    let adjusted_gross = adjusted_out.saturating_sub(input.amount_in);
+    let gas_cost_wei = U256::from(input.gas_units).checked_mul(input.gas_price_wei)?;
+    let scale = crate::util::ten_pow_u256(input.token_decimals);
+    if input.token_to_matic_rate < MIN_TOKEN_TO_MATIC_RATE || scale.is_zero() {
+        return None;
+    }
+    let gross_matic = adjusted_gross
+        .checked_mul(input.token_to_matic_rate)
+        .map(|v| v / scale)?;
+    let flash_matic = flash_loan_fee
+        .checked_mul(input.token_to_matic_rate)
+        .map(|v| v / scale)?;
+    let priority_uplift = profit_priority_uplift_wei(
+        gross_matic,
+        input.profit_priority_alpha_bps,
+        input.gas_units,
+    );
+    Some(ProbeMaticParts {
+        gross_matic,
+        flash_matic,
+        gas_cost_wei,
+        priority_uplift,
+    })
+}
+
+/// Slip-adjusted gross − flash in MATIC wei (gas not deducted).
+/// Rank underwater probe routes by absolute edge so low-gas dust does not crowd out
+/// larger gross candidates that Brent can still size into profitability.
+#[must_use]
+pub fn cover_matic_from_sim(
+    sim: &MinimalSimResult,
+    amount_in: U256,
+    ctx: &ProfitEvalContext,
+) -> U256 {
+    probe_matic_parts(sim, amount_in, ctx)
+        .map(|p| p.gross_matic.saturating_sub(p.flash_matic))
+        .unwrap_or(U256::ZERO)
+}
+
+/// Brent objective: maximize MATIC net (gross − flash − gas − priority) with a bias so
+/// below-breakeven sizes keep relative order (closer-to-profitable wins).
+#[must_use]
+pub fn brent_score_matic_from_sim(
+    sim: &MinimalSimResult,
+    amount_in: U256,
+    ctx: &ProfitEvalContext,
+) -> U256 {
+    let Some(p) = probe_matic_parts(sim, amount_in, ctx) else {
+        return U256::ZERO;
+    };
+    // bias + gross - flash - gas - priority (each sub saturates independently)
+    BRENT_MATIC_SCORE_BIAS
+        .saturating_add(p.gross_matic)
+        .saturating_sub(p.flash_matic)
+        .saturating_sub(p.gas_cost_wei)
+        .saturating_sub(p.priority_uplift)
+}
+
 #[must_use]
 pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     let flash_fee_bps = flash_loan_fee_bps(input.flash_loan_source);
@@ -718,6 +803,44 @@ mod safety_tests {
         );
     }
 
+    /// Depth-inflated route slip is already route-level on assessment; re-compounding
+    /// per-hop config would set a higher minProfit than assess_profit modeled.
+    #[test]
+    fn on_chain_min_profit_from_assessment_respects_route_level_depth_slip() {
+        let gross = U256::from(1_000_000u64);
+        let amount_in = U256::from(10_000_000u64);
+        // Depth haircut 500 bps on a 3-hop path exceeds compound(50, 3).
+        let route_level_slip =
+            crate::services::execution::support::effective_slippage_bps(50, 3, 500);
+        assert!(route_level_slip >= 500);
+        let assessment = assess_profit(&AssessProfitInput {
+            gross_profit: gross,
+            amount_in,
+            gas_units: 0,
+            gas_price_wei: U256::ZERO,
+            token_to_matic_rate: RATE_PRECISION,
+            token_decimals: 18,
+            hop_count: 3,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            slippage_bps: route_level_slip,
+            flash_loan_source: FlashLoanSource::Balancer,
+            safety_multiplier_bps: 0,
+            profit_priority_alpha_bps: 0,
+        });
+        assert!(assessment.net_profit > U256::ZERO);
+        let from_assessment = on_chain_min_profit_from_assessment(&assessment).unwrap();
+        // Wrong path: treat base 50 as per-hop and compound (ignores depth 500).
+        let from_per_hop =
+            on_chain_min_profit_for_route(gross, amount_in, 50, 3, FlashLoanSource::Balancer)
+                .unwrap();
+        // Assessment uses higher slip → lower net → lower minProfit (matches on-chain reality).
+        assert!(
+            from_assessment < from_per_hop,
+            "assessment minProfit {from_assessment} should be < per-hop rebuild {from_per_hop}"
+        );
+    }
+
     #[test]
     fn priority_uplift_reduces_executable_net() {
         let mut i = input();
@@ -737,9 +860,9 @@ mod safety_tests {
     #[test]
     fn insane_net_matic_profit_fails_closed() {
         let mut i = input();
-        // MAX_SANE_PROFIT_MATIC_WEI = 50 POL; use 100 POL to exceed the cap.
-        i.gross_profit = U256::from(100u128 * 10u128.pow(18));
-        i.amount_in = U256::from(100u128 * 10u128.pow(18));
+        // MAX_SANE_PROFIT_MATIC_WEI = 1 POL; use 2 POL to exceed the cap.
+        i.gross_profit = U256::from(2u128 * 10u128.pow(18));
+        i.amount_in = U256::from(2u128 * 10u128.pow(18));
         i.slippage_bps = 0;
         i.safety_multiplier_bps = 0;
         let result = assess_profit(&i);
@@ -749,6 +872,91 @@ mod safety_tests {
                 .reject_reason
                 .as_deref()
                 .is_some_and(|r| r.contains("sane cap"))
+        );
+    }
+
+    #[test]
+    fn brent_score_ranks_below_breakeven_by_shortfall() {
+        // Gas ≈ 0.2 MATIC; both sizes underwater, larger gross must score higher.
+        let ctx = ProfitEvalContext {
+            gas_price: U256::from(300_000_000_000u64), // 300 gwei
+            flash_source: FlashLoanSource::Balancer,
+            slippage_bps: 0,
+            token_to_matic_rate: RATE_PRECISION,
+            token_decimals: 18,
+            safety_multiplier_bps: 0,
+            gas_scale_bps: 10_000,
+            profit_priority_alpha_bps: 0,
+            hop_count: 2,
+        };
+        let small = MinimalSimResult {
+            amount_out: U256::from(10u128.pow(17)) + U256::from(10u128.pow(15)),
+            profit: U256::from(10u128.pow(15)), // 0.001 MATIC gross
+            total_gas: 700_000,
+        };
+        let large = MinimalSimResult {
+            amount_out: U256::from(10u128.pow(17)) + U256::from(5 * 10u128.pow(15)),
+            profit: U256::from(5 * 10u128.pow(15)), // 0.005 MATIC gross
+            total_gas: 700_000,
+        };
+        let amount = U256::from(10u128.pow(17));
+        assert!(
+            net_profit_matic_from_sim(&small, amount, &ctx).is_zero()
+                && net_profit_matic_from_sim(&large, amount, &ctx).is_zero(),
+            "fixture must be below gas breakeven so net saturates to 0"
+        );
+        let small_score = brent_score_matic_from_sim(&small, amount, &ctx);
+        let large_score = brent_score_matic_from_sim(&large, amount, &ctx);
+        assert!(
+            large_score > small_score,
+            "brent must prefer closer-to-breakeven size: large={large_score} small={small_score}"
+        );
+        assert!(!small_score.is_zero() && !large_score.is_zero());
+    }
+
+    #[test]
+    fn cover_matic_prefers_larger_gross_over_low_gas_dust() {
+        // Dust: tiny gross, cheap gas → smaller shortfall but worse absolute cover.
+        // Fat: 10× gross, higher gas → larger shortfall, better cover for Brent.
+        let ctx = ProfitEvalContext {
+            gas_price: U256::from(280_000_000_000u64), // 280 gwei
+            flash_source: FlashLoanSource::Balancer,
+            slippage_bps: 0,
+            token_to_matic_rate: RATE_PRECISION,
+            token_decimals: 18,
+            safety_multiplier_bps: 0,
+            gas_scale_bps: 10_000,
+            profit_priority_alpha_bps: 0,
+            hop_count: 2,
+        };
+        let dust = MinimalSimResult {
+            amount_out: U256::from(10u128.pow(15)) + U256::from(56 * 10u128.pow(13)),
+            profit: U256::from(56 * 10u128.pow(13)), // ~0.00056 MATIC
+            total_gas: 525_000,
+        };
+        let fat = MinimalSimResult {
+            amount_out: U256::from(10u128.pow(17)) + U256::from(5 * 10u128.pow(16)),
+            profit: U256::from(5 * 10u128.pow(16)), // 0.05 MATIC
+            total_gas: 900_000,
+        };
+        let dust_in = U256::from(10u128.pow(15));
+        let fat_in = U256::from(10u128.pow(17));
+        assert!(
+            net_profit_matic_from_sim(&dust, dust_in, &ctx).is_zero()
+                && net_profit_matic_from_sim(&fat, fat_in, &ctx).is_zero()
+        );
+        let dust_cover = cover_matic_from_sim(&dust, dust_in, &ctx);
+        let fat_cover = cover_matic_from_sim(&fat, fat_in, &ctx);
+        assert!(
+            fat_cover > dust_cover,
+            "cover must prefer absolute edge: fat={fat_cover} dust={dust_cover}"
+        );
+        // Brent shortfall score can still prefer dust (lower gas); that is OK for sizing.
+        let dust_brent = brent_score_matic_from_sim(&dust, dust_in, &ctx);
+        let fat_brent = brent_score_matic_from_sim(&fat, fat_in, &ctx);
+        assert!(
+            dust_brent > fat_brent,
+            "fixture expects dust to win brent shortfall: dust={dust_brent} fat={fat_brent}"
         );
     }
 

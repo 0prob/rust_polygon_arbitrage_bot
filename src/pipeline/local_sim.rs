@@ -15,7 +15,6 @@ use crate::pipeline::curve_sim::curve_hop_amount_out;
 use crate::pipeline::spot_price::spot_probe_for_token;
 use crate::pipeline::types::MinimalSimResult;
 use alloy::primitives::U256;
-use rustc_hash::FxHashMap;
 
 /// Per-hop gas estimate for route ranking (matches simulation constants).
 #[must_use]
@@ -86,29 +85,55 @@ struct HopResult {
     gas: u32,
 }
 
-/// Per-hop shallow caps for CL routes only; other protocols use `U256::MAX`.
+/// Per-hop input caps for **tickless** CL hops only (spot-probe sized).
+/// Hops with tick coverage keep `U256::MAX` — `simulate_v3_swap` reports `shallow`
+/// when the walk exhausts tick data. Capping ticked pools at the spot probe was
+/// pinning Brent/eval at dust (`cl_cap` flood, best-eval input≈1e15).
+/// Routes are short (≤ HOP_CAP); reuse probes by linear scan — no HashMap alloc.
 #[inline]
 fn route_shallow_caps_with(
     edges: &[Edge],
     mut probe_for_token: impl FnMut(crate::core::types::TokenIndex) -> U256,
+    mut hop_is_tickless: impl FnMut(usize, &Edge) -> bool,
 ) -> [U256; HOP_CAP_USIZE] {
     let mut caps = [U256::MAX; HOP_CAP_USIZE];
-    let mut token_caps: FxHashMap<crate::core::types::TokenIndex, U256> = FxHashMap::default();
     for (i, edge) in edges.iter().enumerate() {
-        if matches!(
+        if !matches!(
             edge.protocol,
             ProtocolType::UniswapV3 | ProtocolType::UniswapV4
         ) {
-            caps[i] = *token_caps
-                .entry(edge.token_in)
-                .or_insert_with(|| probe_for_token(edge.token_in));
+            continue;
         }
+        if !hop_is_tickless(i, edge) {
+            continue;
+        }
+        let mut reused = None;
+        for j in 0..i {
+            if matches!(
+                edges[j].protocol,
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ) && edges[j].token_in == edge.token_in
+                && caps[j] < U256::MAX
+            {
+                reused = Some(caps[j]);
+                break;
+            }
+        }
+        caps[i] = reused.unwrap_or_else(|| probe_for_token(edge.token_in));
     }
     caps
 }
 
 fn route_shallow_caps(arena: &StateArena, edges: &[Edge]) -> [U256; HOP_CAP_USIZE] {
-    route_shallow_caps_with(edges, |token| spot_probe_for_token(arena, token))
+    route_shallow_caps_with(
+        edges,
+        |token| spot_probe_for_token(arena, token),
+        |_, edge| match arena.pool_state(edge.pool_index) {
+            Some(PoolState::V3(s) | PoolState::V4(s)) => s.ticks.is_empty(),
+            // Missing/non-CL state: fail closed at probe size.
+            _ => true,
+        },
+    )
 }
 
 #[inline]
@@ -156,7 +181,15 @@ fn simulate_hop(
         | (PoolState::V4(s), ProtocolType::UniswapV4) => {
             let r = simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps));
             if r.shallow {
-                return None;
+                // Tickless pools always mark shallow, but the no-tick step path can
+                // still quote within the spot-probe cap. Accept that; refuse larger.
+                let tickless = s.ticks.is_empty();
+                if !tickless
+                    || cl_hop_exceeds_shallow_cap(amount_in, shallow_cap)
+                    || r.amount_out.is_zero()
+                {
+                    return None;
+                }
             }
             Some(HopResult {
                 amount_out: r.amount_out,
@@ -245,11 +278,227 @@ pub enum MinimalSimFailure {
     InvalidRoute,
     MissingPool { hop: usize },
     NonTradable { hop: usize },
+    /// CL hop rejected: empty tick array (not yet hydrated).
+    ClTickless { hop: usize },
+    /// CL hop input exceeds the spot-derived shallow liquidity cap.
+    ClCapExceeded { hop: usize },
+    /// Legacy aggregate — prefer `ClTickless` / `ClCapExceeded` when classified.
     ShallowCl { hop: usize },
     V2ReserveExhausted { hop: usize },
+    /// Edge TokenIndex addresses disagree with Balancer/Woofi `state.tokens[idx]`.
+    TokenMismatch { hop: usize },
     Math { hop: usize },
-    UnsupportedState { hop: usize },
-    ZeroOutput { hop: usize },
+    /// Edge protocol does not match arena `PoolState` variant (stale meta / wrong fetch).
+    UnsupportedState {
+        hop: usize,
+        expected: ProtocolType,
+        actual: UnsupportedStateKind,
+    },
+    /// Balancer vault `MAX_IN_RATIO` (30%) — sim returns zero / BAL#304.
+    BalancerMaxInRatio { hop: usize },
+    ZeroOutput {
+        hop: usize,
+        protocol: ProtocolType,
+    },
+}
+
+/// Coarse arena state tag for `UnsupportedState` attribution (probe + Brent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedStateKind {
+    Invalid,
+    V2,
+    V3,
+    V4,
+    Curve,
+    Balancer,
+    Dodo,
+    Woofi,
+}
+
+#[inline]
+#[must_use]
+pub fn pool_state_kind(state: &PoolState) -> UnsupportedStateKind {
+    match state {
+        PoolState::Invalid => UnsupportedStateKind::Invalid,
+        PoolState::V2(_) => UnsupportedStateKind::V2,
+        PoolState::V3(_) => UnsupportedStateKind::V3,
+        PoolState::V4(_) => UnsupportedStateKind::V4,
+        PoolState::Curve(_) => UnsupportedStateKind::Curve,
+        PoolState::Balancer(_) => UnsupportedStateKind::Balancer,
+        PoolState::Dodo(_) => UnsupportedStateKind::Dodo,
+        PoolState::Woofi(_) => UnsupportedStateKind::Woofi,
+    }
+}
+
+/// True when edge/meta protocol agrees with the arena `PoolState` variant.
+/// Live probe skips were dominated by `unsup_exp(v2)` × `unsup_act(v3)`.
+#[inline]
+#[must_use]
+pub fn protocol_matches_pool_state(protocol: ProtocolType, state: &PoolState) -> bool {
+    matches!(
+        (state, protocol),
+        (PoolState::V2(_), ProtocolType::UniswapV2)
+            | (PoolState::V3(_), ProtocolType::UniswapV3)
+            | (PoolState::V4(_), ProtocolType::UniswapV4)
+            | (
+                PoolState::Curve(_),
+                ProtocolType::CurveStable | ProtocolType::CurveCrypto
+            )
+            | (PoolState::Balancer(_), ProtocolType::BalancerV2)
+            | (PoolState::Dodo(_), ProtocolType::Dodo)
+            | (PoolState::Woofi(_), ProtocolType::Woofi)
+    )
+}
+
+/// Simulation-family protocol implied by arena state. Curve keeps a curve-family
+/// `fallback` (stable vs crypto); other mismatches take the state's family.
+#[inline]
+#[must_use]
+pub fn protocol_from_pool_state(state: &PoolState, fallback: ProtocolType) -> ProtocolType {
+    match state {
+        PoolState::V2(_) => ProtocolType::UniswapV2,
+        PoolState::V3(_) => ProtocolType::UniswapV3,
+        PoolState::V4(_) => ProtocolType::UniswapV4,
+        PoolState::Curve(_) => match fallback {
+            ProtocolType::CurveStable | ProtocolType::CurveCrypto => fallback,
+            _ => ProtocolType::CurveStable,
+        },
+        PoolState::Balancer(_) => ProtocolType::BalancerV2,
+        PoolState::Dodo(_) => ProtocolType::Dodo,
+        PoolState::Woofi(_) => ProtocolType::Woofi,
+        PoolState::Invalid => fallback,
+    }
+}
+
+/// Every hop's edge protocol matches the arena `PoolState` variant (else probe is
+/// `UnsupportedState` — live: V2 edges on V3/Balancer state crowding the HF window).
+#[must_use]
+pub fn cycle_edges_match_arena_state(arena: &StateArena, edges: &[Edge]) -> bool {
+    edges.iter().all(|edge| {
+        arena
+            .pool_state(edge.pool_index)
+            .is_some_and(|state| protocol_matches_pool_state(edge.protocol, state))
+    })
+}
+
+/// Vault/oracle token order must match edge TokenIndex addresses at the pool-local indices.
+#[inline]
+#[must_use]
+pub fn multi_token_edge_aligned(
+    state: &PoolState,
+    edge: &Edge,
+    token_in: alloy::primitives::Address,
+    token_out: alloy::primitives::Address,
+) -> bool {
+    match state {
+        PoolState::Balancer(s) if !s.tokens.is_empty() => {
+            s.tokens.get(edge.token_in_idx as usize).copied() == Some(token_in)
+                && s.tokens.get(edge.token_out_idx as usize).copied() == Some(token_out)
+        }
+        PoolState::Woofi(s) if !s.tokens.is_empty() => {
+            s.tokens.get(edge.token_in_idx as usize).copied() == Some(token_in)
+                && s.tokens.get(edge.token_out_idx as usize).copied() == Some(token_out)
+        }
+        _ => true,
+    }
+}
+
+/// Look up vault/oracle leg indices by token address (meta order can diverge from
+/// `getPoolTokens` after hot-cache refresh — live sticky Balancer `token_mismatch`).
+#[inline]
+#[must_use]
+pub fn resolve_multi_token_vault_indices(
+    tokens: &[alloy::primitives::Address],
+    token_in: alloy::primitives::Address,
+    token_out: alloy::primitives::Address,
+) -> Option<(u8, u8)> {
+    if token_in == token_out {
+        return None;
+    }
+    let in_idx = tokens.iter().position(|&t| t == token_in)?;
+    let out_idx = tokens.iter().position(|&t| t == token_out)?;
+    Some((u8::try_from(in_idx).ok()?, u8::try_from(out_idx).ok()?))
+}
+
+/// Rewrite Balancer/Woofi `token_*_idx` to match live `state.tokens` addresses.
+/// Returns `false` when the edge tokens are absent from the vault (unrecoverable).
+#[must_use]
+pub fn realign_multi_token_edge(
+    arena: &StateArena,
+    state: &PoolState,
+    edge: &mut Edge,
+) -> bool {
+    if !matches!(
+        edge.protocol,
+        ProtocolType::BalancerV2 | ProtocolType::Woofi
+    ) {
+        return true;
+    }
+    let tokens = match state {
+        PoolState::Balancer(s) if !s.tokens.is_empty() => s.tokens.as_slice(),
+        PoolState::Woofi(s) if !s.tokens.is_empty() => s.tokens.as_slice(),
+        _ => return true,
+    };
+    let Some(tin) = arena.token_address(edge.token_in) else {
+        return false;
+    };
+    let Some(tout) = arena.token_address(edge.token_out) else {
+        return false;
+    };
+    if multi_token_edge_aligned(state, edge, tin, tout) {
+        return true;
+    }
+    let Some((in_idx, out_idx)) = resolve_multi_token_vault_indices(tokens, tin, tout) else {
+        return false;
+    };
+    if !state.hop_pair_routable(in_idx as usize, out_idx as usize) {
+        return false;
+    }
+    edge.token_in_idx = in_idx;
+    edge.token_out_idx = out_idx;
+    edge.zero_for_one = in_idx < out_idx;
+    true
+}
+
+/// Clone-and-fix Balancer/Woofi vault indices on a ranked cycle. `None` = unrecoverable
+/// mismatch (tokens not in vault) — caller should treat like micro-dead.
+#[must_use]
+pub fn realign_multi_token_found_cycle(
+    arena: &StateArena,
+    cycle: std::sync::Arc<crate::core::types::FoundCycle>,
+) -> Option<std::sync::Arc<crate::core::types::FoundCycle>> {
+    let needs_scan = cycle.edges.iter().any(|edge| {
+        matches!(
+            edge.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi
+        )
+    });
+    if !needs_scan {
+        return Some(cycle);
+    }
+    let mut owned = (*cycle).clone();
+    let mut changed = false;
+    for edge in &mut owned.edges {
+        if !matches!(
+            edge.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi
+        ) {
+            continue;
+        }
+        let state = arena.pool_state(edge.pool_index)?;
+        let before = (edge.token_in_idx, edge.token_out_idx);
+        if !realign_multi_token_edge(arena, state, edge) {
+            return None;
+        }
+        if (edge.token_in_idx, edge.token_out_idx) != before {
+            changed = true;
+        }
+    }
+    if changed {
+        Some(std::sync::Arc::new(owned))
+    } else {
+        Some(cycle)
+    }
 }
 
 #[must_use]
@@ -277,37 +526,37 @@ pub fn minimal_sim_failure(
         if !state.is_tradable() {
             return Some(MinimalSimFailure::NonTradable { hop });
         }
+        let mut edge = *edge;
         if matches!(
             edge.protocol,
-            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
-        ) && cl_hop_exceeds_shallow_cap(current, shallow_caps[hop])
+            ProtocolType::BalancerV2 | ProtocolType::Woofi
+        ) && !realign_multi_token_edge(arena, state, &mut edge)
         {
-            return Some(MinimalSimFailure::ShallowCl { hop });
+            return Some(MinimalSimFailure::TokenMismatch { hop });
         }
+        // Classify failures without double-running expensive CL/curve math.
         match (state, edge.protocol) {
-            (PoolState::V2(state), ProtocolType::UniswapV2)
-                if current >= v2_reserve_in(state, edge.zero_for_one) =>
+            (PoolState::V2(s), ProtocolType::UniswapV2)
+                if current >= v2_reserve_in(s, edge.zero_for_one) =>
             {
                 return Some(MinimalSimFailure::V2ReserveExhausted { hop });
             }
-            (PoolState::V3(state), ProtocolType::UniswapV3)
-            | (PoolState::V4(state), ProtocolType::UniswapV4)
-                if simulate_v3_swap(state, current, edge.zero_for_one, Some(edge.fee_bps))
-                    .shallow =>
+            (
+                PoolState::V3(_) | PoolState::V4(_),
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
+            ) if cl_hop_tickless(state)
+                && cl_hop_exceeds_shallow_cap(current, shallow_caps[hop]) =>
             {
-                return Some(MinimalSimFailure::ShallowCl { hop });
+                // Tickless is OK at spot-probe size; only fail when asking for more depth.
+                return Some(MinimalSimFailure::ClTickless { hop });
             }
-            (PoolState::Curve(state), ProtocolType::CurveStable | ProtocolType::CurveCrypto)
-                if curve_hop_amount_out(
-                    state,
-                    edge.protocol,
-                    current,
-                    edge.token_in_idx as usize,
-                    edge.token_out_idx as usize,
-                )
-                .is_none() =>
+            (
+                PoolState::V3(_) | PoolState::V4(_),
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
+            ) if !cl_hop_tickless(state)
+                && cl_hop_exceeds_shallow_cap(current, shallow_caps[hop]) =>
             {
-                return Some(MinimalSimFailure::Math { hop });
+                return Some(MinimalSimFailure::ClCapExceeded { hop });
             }
             (PoolState::V2(_), ProtocolType::UniswapV2)
             | (PoolState::V3(_), ProtocolType::UniswapV3)
@@ -316,17 +565,163 @@ pub fn minimal_sim_failure(
             | (PoolState::Balancer(_), ProtocolType::BalancerV2)
             | (PoolState::Dodo(_), ProtocolType::Dodo)
             | (PoolState::Woofi(_), ProtocolType::Woofi) => {}
-            _ => return Some(MinimalSimFailure::UnsupportedState { hop }),
+            _ => {
+                return Some(MinimalSimFailure::UnsupportedState {
+                    hop,
+                    expected: edge.protocol,
+                    actual: pool_state_kind(state),
+                });
+            }
         }
-        let Some(result) = simulate_hop(state, edge, current, shallow_caps[hop]) else {
+        let Some(result) = simulate_hop(state, &edge, current, shallow_caps[hop]) else {
+            // CL shallow is the common simulate_hop None; curve math also returns None.
+            if matches!(
+                edge.protocol,
+                ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ) {
+                // Cap/tickless already classified above; residual = in-swap shallow walk.
+                return Some(MinimalSimFailure::ShallowCl { hop });
+            }
             return Some(MinimalSimFailure::Math { hop });
         };
         if result.amount_out.is_zero() {
-            return Some(MinimalSimFailure::ZeroOutput { hop });
+            if let (PoolState::Balancer(s), ProtocolType::BalancerV2) = (state, edge.protocol) {
+                let bal = s
+                    .balances
+                    .get(edge.token_in_idx as usize)
+                    .copied()
+                    .unwrap_or(U256::ZERO);
+                if crate::core::math::balancer::exceeds_balancer_max_in_ratio(current, bal) {
+                    return Some(MinimalSimFailure::BalancerMaxInRatio { hop });
+                }
+            }
+            return Some(MinimalSimFailure::ZeroOutput {
+                hop,
+                protocol: edge.protocol,
+            });
         }
         current = result.amount_out;
     }
     None
+}
+
+/// Micro-probe sizes that already cannot walk never rank — prune at HF select
+/// so they do not crowd the probe window. Includes `ZeroOutput` / Balancer
+/// `MAX_IN`, CL shallow/cap-dead at dust, any-hop `V2ReserveExhausted`
+/// (hop-0 dust V2 is also caught earlier by `first_v2_hop_below_reserve`; this
+/// covers mid-route V2 that dies even at micro), and Balancer/Woofi
+/// `TokenMismatch` (amount-independent vault/meta index skew — live empty ranks
+/// were dominated by a sticky Balancer hop-0 mismatch after other dead probes
+/// cleared). Leave `ClTickless` alone — spot probe sizes can still rank those.
+#[must_use]
+pub fn micro_probe_liquidity_dead(
+    arena: &StateArena,
+    edges: &[Edge],
+    micro_probe: U256,
+) -> Option<MinimalSimFailure> {
+    match minimal_sim_failure(arena, edges, micro_probe) {
+        Some(fail @ MinimalSimFailure::ZeroOutput { .. })
+        | Some(fail @ MinimalSimFailure::BalancerMaxInRatio { .. })
+        | Some(fail @ MinimalSimFailure::ShallowCl { .. })
+        | Some(fail @ MinimalSimFailure::ClCapExceeded { .. })
+        | Some(fail @ MinimalSimFailure::V2ReserveExhausted { .. })
+        | Some(fail @ MinimalSimFailure::TokenMismatch { .. }) => Some(fail),
+        _ => None,
+    }
+}
+
+/// Probe walk with gross>0 that already trips insane ROI/MATIC caps is a phantom —
+/// live empty ranks still showed `sanity_why(matic=…)` after micro-only prune because
+/// economic-floor sizes exceed the 1 MATIC cap while micro stayed under it. Floor/pin
+/// rejects are left alone (other ladder sizes can still be sane).
+#[must_use]
+pub fn probe_insane_gross_phantom(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount: U256,
+    token_decimals: u8,
+    token_to_matic_rate: U256,
+) -> bool {
+    if amount.is_zero() {
+        return false;
+    }
+    let Some(sim) = simulate_route_minimal(arena, edges, amount) else {
+        return false;
+    };
+    if sim.profit.is_zero() {
+        return false;
+    }
+    matches!(
+        crate::pipeline::sim_sanity::check_sim_sanity(
+            crate::pipeline::sim_sanity::SimSanityInput {
+                amount_in: amount,
+                gross_profit: sim.profit,
+                search_low: U256::ZERO,
+                token_decimals,
+                token_to_matic_rate,
+            }
+        ),
+        Err(
+            crate::pipeline::sim_sanity::SimSanityReject::InsaneProfitRatio
+                | crate::pipeline::sim_sanity::SimSanityReject::InsaneProfitMatic
+        )
+    )
+}
+
+#[must_use]
+pub fn micro_probe_insane_gross_phantom(
+    arena: &StateArena,
+    edges: &[Edge],
+    micro_probe: U256,
+    token_decimals: u8,
+    token_to_matic_rate: U256,
+) -> bool {
+    probe_insane_gross_phantom(arena, edges, micro_probe, token_decimals, token_to_matic_rate)
+}
+
+/// Rank probe now starts at economic floor (except tickless CL spot-cap). Cycles
+/// that already fail amount-dependent liquidity there never `kept` — prune at HF
+/// select so micro-only survivors stop crowding empties as `v2_reserve` /
+/// `shallow_cl` / `bal_max_in` (live probefloor: v2_reserve=27, shallow_cl=9,
+/// bal_max_in=9 across probe_fail lines). Leave `ClTickless` / `TokenMismatch`
+/// alone (tickless can still rank at spot; mismatch is micro-pruned).
+#[must_use]
+pub fn economic_floor_liquidity_dead(
+    arena: &StateArena,
+    edges: &[Edge],
+    economic_floor: U256,
+) -> Option<MinimalSimFailure> {
+    if economic_floor.is_zero() {
+        return None;
+    }
+    match minimal_sim_failure(arena, edges, economic_floor) {
+        Some(fail @ MinimalSimFailure::ZeroOutput { .. })
+        | Some(fail @ MinimalSimFailure::BalancerMaxInRatio { .. })
+        | Some(fail @ MinimalSimFailure::ShallowCl { .. })
+        | Some(fail @ MinimalSimFailure::ClCapExceeded { .. })
+        | Some(fail @ MinimalSimFailure::V2ReserveExhausted { .. }) => Some(fail),
+        _ => None,
+    }
+}
+
+/// Balancer routes where even `economic_floor` trips vault `MAX_IN_RATIO` produce
+/// Brent `bal_bounds_fail` (live: 100% of `bounds_fail`). Prune before select.
+#[must_use]
+pub fn balancer_economic_floor_max_in_dead(
+    arena: &StateArena,
+    edges: &[Edge],
+    economic_floor: U256,
+) -> bool {
+    if !edges
+        .iter()
+        .any(|edge| edge.protocol == ProtocolType::BalancerV2)
+    {
+        return false;
+    }
+    matches!(
+        economic_floor_liquidity_dead(arena, edges, economic_floor),
+        Some(MinimalSimFailure::BalancerMaxInRatio { .. })
+    )
 }
 
 fn cl_hop_tickless(state: &PoolState) -> bool {
@@ -348,6 +743,70 @@ fn v2_reserve_in(state: &crate::core::types::V2PoolState, zero_for_one: bool) ->
     } else {
         state.reserve1
     }
+}
+
+/// Hop-0 V2 input reserve cannot cover `min_amount` (dead/dust pool).
+///
+/// Only the first hop is checked: `min_amount` is in cycle-start token units (micro/spot
+/// probe). Comparing later V2 hops' reserves to that amount false-rejects e.g. USDC-side
+/// pools when start is WMATIC (`1e9` USDC wei ≤ `1e12` WMATIC micro).
+#[must_use]
+pub fn first_v2_hop_below_reserve(
+    arena: &StateArena,
+    edges: &[Edge],
+    min_amount: U256,
+) -> Option<usize> {
+    if min_amount.is_zero() {
+        return None;
+    }
+    let edge = edges.first()?;
+    if edge.protocol != ProtocolType::UniswapV2 {
+        return None;
+    }
+    let Some(PoolState::V2(state)) = arena.pool_state(edge.pool_index) else {
+        return None;
+    };
+    if v2_reserve_in(state, edge.zero_for_one) <= min_amount {
+        return Some(0);
+    }
+    None
+}
+
+/// Whether arena `PoolState` variant matches the edge's declared protocol family.
+#[inline]
+#[must_use]
+pub fn pool_state_matches_protocol(state: &PoolState, protocol: ProtocolType) -> bool {
+    matches!(
+        (state, protocol),
+        (PoolState::V2(_), ProtocolType::UniswapV2)
+            | (PoolState::V3(_), ProtocolType::UniswapV3)
+            | (PoolState::V4(_), ProtocolType::UniswapV4)
+            | (
+                PoolState::Curve(_),
+                ProtocolType::CurveStable | ProtocolType::CurveCrypto
+            )
+            | (PoolState::Balancer(_), ProtocolType::BalancerV2)
+            | (PoolState::Dodo(_), ProtocolType::Dodo)
+            | (PoolState::Woofi(_), ProtocolType::Woofi)
+    )
+}
+
+/// First hop whose edge protocol disagrees with arena state (stale meta / bad hot overlay).
+/// Live probe `unsup_exp` was dominated by V2 edges against V3 state.
+#[must_use]
+pub fn first_protocol_state_mismatch(
+    arena: &StateArena,
+    edges: &[Edge],
+) -> Option<(usize, ProtocolType, UnsupportedStateKind)> {
+    for (hop, edge) in edges.iter().enumerate() {
+        let Some(state) = arena.pool_state(edge.pool_index) else {
+            continue;
+        };
+        if !pool_state_matches_protocol(state, edge.protocol) {
+            return Some((hop, edge.protocol, pool_state_kind(state)));
+        }
+    }
+    None
 }
 
 /// Max start-token input when the route has tickless CL hops (shallow sim only).
@@ -449,8 +908,9 @@ fn hop_amount_within_drift(baseline: U256, refreshed: U256, max_drift_bps: u64) 
     if baseline == refreshed {
         return true;
     }
-    if baseline.is_zero() {
-        return refreshed.is_zero();
+    // Either side zero with the other non-zero is infinite relative drift (and /0).
+    if baseline.is_zero() || refreshed.is_zero() {
+        return false;
     }
     let (lo, hi) = if baseline >= refreshed {
         (refreshed, baseline)
@@ -553,6 +1013,9 @@ pub fn route_hop_fidelity_reject_profiled(
             {
                 return Some(HopFidelityReject::ShallowCl(i));
             }
+            // After a successful walk, hop amounts already cleared simulate_hop.
+            // Re-simulating Balancer/Curve/etc. here is pure CPU on the HF hot path.
+            _ if cl_depth_already_verified => {}
             _ => {
                 if !amount_in.is_zero() && simulate_hop_amount_out(state, edge, amount_in).is_none()
                 {
@@ -611,10 +1074,12 @@ pub fn route_resim_fidelity_reject_profiled(
     for i in 0..baseline.hop_amounts.len() {
         let b = baseline.hop_amounts[i];
         let r = refreshed.hop_amounts[i];
-        if b != r && !b.is_zero() {
+        if b != r && !b.is_zero() && !r.is_zero() {
             let (lo, hi) = if b >= r { (r, b) } else { (b, r) };
             let drift = u256_to_bps_u64((hi - lo) * U256::from(10_000u64) / lo);
             profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(drift);
+        } else if b != r {
+            profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(10_000);
         }
         if !hop_amount_within_drift(b, r, RESIM_HOP_DRIFT_BPS) {
             return Some("hop amount drift");
@@ -660,8 +1125,16 @@ fn walk_route_hops(
         if !state.is_tradable() {
             return None;
         }
+        let mut edge = *edge;
+        if matches!(
+            edge.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi
+        ) && !realign_multi_token_edge(arena, state, &mut edge)
+        {
+            return None;
+        }
         let shallow_cap = shallow_caps[i];
-        let hop = simulate_hop(state, edge, current, shallow_cap)?;
+        let hop = simulate_hop(state, &edge, current, shallow_cap)?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
@@ -727,6 +1200,17 @@ pub fn simulate_route_detailed(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<RouteSimulationResult> {
+    simulate_route_detailed_with_caps(arena, edges, amount_in, None)
+}
+
+/// Like [`simulate_route_detailed`] with precomputed CL shallow caps (Brent/HF reuse).
+#[must_use]
+pub fn simulate_route_detailed_with_caps(
+    arena: &StateArena,
+    edges: &[Edge],
+    amount_in: U256,
+    precomputed_shallow_caps: Option<&[U256; HOP_CAP_USIZE]>,
+) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
     if !route_edges_simulatable(edges) {
         return None;
@@ -743,8 +1227,13 @@ pub fn simulate_route_detailed(
         });
     }
     let mut hop_amounts = hop_amounts_zeroed(hop_count);
-    let (amount_out, walked_gas) =
-        walk_route_hops(arena, edges, amount_in, Some(&mut hop_amounts), None)?;
+    let (amount_out, walked_gas) = walk_route_hops(
+        arena,
+        edges,
+        amount_in,
+        Some(&mut hop_amounts),
+        precomputed_shallow_caps,
+    )?;
     let profit = amount_out.saturating_sub(amount_in);
     let total_gas = finalize_route_total_gas(edges, walked_gas);
     Some(RouteSimulationResult {
@@ -763,6 +1252,169 @@ mod tests {
     use super::*;
     use crate::core::types::Edge;
     use alloy::primitives::Address;
+
+    #[test]
+    fn hop_drift_zero_refreshed_does_not_panic() {
+        // Regression: refreshed hop amount 0 with non-zero baseline used to /0.
+        assert!(!hop_amount_within_drift(U256::from(100u64), U256::ZERO, 200));
+        assert!(!hop_amount_within_drift(U256::ZERO, U256::from(100u64), 200));
+        assert!(hop_amount_within_drift(U256::from(100u64), U256::from(100u64), 200));
+        assert!(hop_amount_within_drift(
+            U256::from(10_000u64),
+            U256::from(9_900u64),
+            200
+        ));
+        assert!(!hop_amount_within_drift(
+            U256::from(10_000u64),
+            U256::from(9_000u64),
+            200
+        ));
+    }
+
+    #[test]
+    fn protocol_matches_pool_state_rejects_cross_family() {
+        // Live probe unsup was dominated by V2 edges on V3 arena slots.
+        assert!(!protocol_matches_pool_state(
+            ProtocolType::UniswapV2,
+            &PoolState::Invalid
+        ));
+        let v2 = PoolState::V2(crate::core::types::V2PoolState {
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(1_000_000u64),
+            fee: U256::from(3u64),
+            fee_denominator: U256::from(1000u64),
+            block_timestamp_last: 0,
+        });
+        assert!(protocol_matches_pool_state(ProtocolType::UniswapV2, &v2));
+        assert!(!protocol_matches_pool_state(ProtocolType::UniswapV3, &v2));
+        assert_eq!(
+            protocol_from_pool_state(&v2, ProtocolType::UniswapV3),
+            ProtocolType::UniswapV2
+        );
+    }
+
+    #[test]
+    fn balancer_token_mismatch_fails_closed_before_phantom_profit() {
+        use crate::core::math::fixed_point::ONE;
+        use crate::core::types::{BalancerPoolKind, BalancerPoolState};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let wrong = arena.register_token(Address::from([9u8; 20]));
+        let bal = U256::from(5u64) * ONE;
+        let w = ONE / U256::from(2u64);
+        let pool = arena.register_pool(
+            Address::from([15u8; 20]),
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: None,
+                tokens: vec![Address::from([1u8; 20]), Address::from([2u8; 20])],
+                balances: vec![bal, bal],
+                weights: vec![w, w],
+                scaling_factors: vec![ONE, ONE],
+                amp: U256::ZERO,
+                amp_precision: U256::ZERO,
+                fee: U256::ZERO,
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        let bad = Edge {
+            pool_index: pool,
+            token_in: wrong,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::BalancerV2,
+            fee_bps: 10,
+            zero_for_one: true,
+        };
+        let ok = Edge {
+            token_in: t0,
+            ..bad
+        };
+        let state = arena.pool_state(pool).unwrap();
+        assert!(!multi_token_edge_aligned(
+            state,
+            &bad,
+            Address::from([9u8; 20]),
+            Address::from([2u8; 20])
+        ));
+        assert!(multi_token_edge_aligned(
+            state,
+            &ok,
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20])
+        ));
+        assert_eq!(
+            minimal_sim_failure(&arena, &[bad], U256::from(1_000u64)),
+            Some(MinimalSimFailure::TokenMismatch { hop: 0 })
+        );
+        assert_ne!(
+            minimal_sim_failure(&arena, &[ok], ONE / U256::from(10u64)),
+            Some(MinimalSimFailure::TokenMismatch { hop: 0 })
+        );
+        assert!(simulate_route_minimal(&arena, &[ok], ONE / U256::from(10u64)).is_some());
+        assert_eq!(
+            micro_probe_liquidity_dead(&arena, &[bad], U256::from(1_000u64)),
+            Some(MinimalSimFailure::TokenMismatch { hop: 0 })
+        );
+        assert!(micro_probe_liquidity_dead(&arena, &[ok], U256::from(1_000u64)).is_none());
+
+        // Skewed idxs but both addresses present in vault → remap recovers the hop.
+        let mut skewed = Edge {
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 1,
+            token_out_idx: 0,
+            zero_for_one: false,
+            ..ok
+        };
+        let state = arena.pool_state(pool).unwrap();
+        assert!(realign_multi_token_edge(&arena, state, &mut skewed));
+        assert_eq!((skewed.token_in_idx, skewed.token_out_idx), (0, 1));
+        assert!(!matches!(
+            minimal_sim_failure(&arena, &[skewed], ONE / U256::from(10u64)),
+            Some(MinimalSimFailure::TokenMismatch { .. })
+        ));
+        assert!(simulate_route_minimal(&arena, &[skewed], ONE / U256::from(10u64)).is_some());
+    }
+
+    #[test]
+    fn resim_fidelity_zero_hop_is_drift_not_panic() {
+        let baseline = RouteSimulationResult {
+            amount_in: U256::from(100u64),
+            amount_out: U256::from(110u64),
+            profit: U256::from(10u64),
+            profitable: true,
+            hop_amounts: {
+                let mut h = hop_amounts_zeroed(1);
+                h[0] = U256::from(100u64);
+                h[1] = U256::from(110u64);
+                h
+            },
+            total_gas: 100_000,
+            hop_count: 1,
+        };
+        let mut refreshed = baseline.clone();
+        refreshed.hop_amounts[1] = U256::ZERO;
+        refreshed.amount_out = U256::ZERO;
+        refreshed.profit = U256::ZERO;
+        assert_eq!(
+            route_resim_fidelity_reject(&baseline, &refreshed),
+            Some("resim unprofitable")
+        );
+        refreshed.profit = U256::from(9u64);
+        refreshed.amount_out = U256::from(109u64);
+        assert_eq!(
+            route_resim_fidelity_reject(&baseline, &refreshed),
+            Some("hop amount drift")
+        );
+    }
 
     #[test]
     fn oversized_routes_fail_closed() {
@@ -818,6 +1470,28 @@ mod tests {
         let sim = simulate_route_minimal(&arena, &[edge], U256::ZERO).expect("zero sim");
         assert!(sim.profit.is_zero());
         assert!(sim.amount_out.is_zero());
+        // Matches simulate_hop: amount_in >= reserve_in is unusable.
+        assert_eq!(
+            first_v2_hop_below_reserve(&arena, &[edge], U256::from(1_000_000u64)),
+            Some(0)
+        );
+        assert_eq!(
+            first_v2_hop_below_reserve(&arena, &[edge], U256::from(999_999u64)),
+            None
+        );
+        // Intermediate V2: do not compare its reserve to start-token min_amount.
+        let v3_edge = Edge {
+            protocol: ProtocolType::UniswapV3,
+            ..edge
+        };
+        assert_eq!(
+            first_v2_hop_below_reserve(
+                &arena,
+                &[v3_edge, edge],
+                U256::from(1_000_000u64)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1036,6 +1710,13 @@ mod tests {
             minimal_sim_failure(&arena, &[edge], U256::from(1_000_000u64)),
             Some(MinimalSimFailure::V2ReserveExhausted { hop: 0 })
         );
+        // Micro walks; economic-sized start dies — select must prune (rank probe
+        // no longer keeps below-floor dust that would hide this).
+        assert!(micro_probe_liquidity_dead(&arena, &[edge], U256::from(1u64)).is_none());
+        assert_eq!(
+            economic_floor_liquidity_dead(&arena, &[edge], U256::from(1_000_000u64)),
+            Some(MinimalSimFailure::V2ReserveExhausted { hop: 0 })
+        );
     }
 
     #[test]
@@ -1132,17 +1813,62 @@ mod tests {
             },
         ];
         let mut probes = 0u32;
-        let caps = route_shallow_caps_with(&edges, |token: TokenIndex| {
-            probes += 1;
-            if token == token_a {
-                U256::from(111u64)
-            } else {
-                U256::from(222u64)
-            }
-        });
+        // Both pools are tickless in this fixture — probe cap applies and is reused.
+        let caps = route_shallow_caps_with(
+            &edges,
+            |token: TokenIndex| {
+                probes += 1;
+                if token == token_a {
+                    U256::from(111u64)
+                } else {
+                    U256::from(222u64)
+                }
+            },
+            |_, _| true,
+        );
         assert_eq!(probes, 1);
         assert_eq!(caps[0], U256::from(111u64));
         assert_eq!(caps[1], U256::from(111u64));
+    }
+
+    #[test]
+    fn shallow_caps_max_when_cl_ticks_present() {
+        use crate::core::types::{V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
+        );
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        let caps = route_shallow_caps(&arena, &edges);
+        assert_eq!(caps[0], U256::MAX);
     }
 
     #[test]
@@ -1381,6 +2107,15 @@ mod tests {
         assert_eq!(
             tickless_cl_start_input_cap(&arena, t0, &edges),
             Some(probe)
+        );
+        // Ranking may quote tickless at spot-probe size; execution fidelity still refuses.
+        assert!(
+            simulate_route_minimal(&arena, &edges, probe).is_some(),
+            "tickless CL must remain simulable at spot-probe size for ranking"
+        );
+        assert!(
+            simulate_route_minimal(&arena, &edges, probe + U256::ONE).is_none(),
+            "tickless CL must fail closed above spot-probe size"
         );
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = probe;

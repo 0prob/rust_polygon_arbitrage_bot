@@ -82,14 +82,16 @@ pub const MIN_TOKEN_TO_MATIC_RATE: U256 = U256::from_limbs([1_000_000, 0, 0, 0])
 /// Lowered to surface more marginal-but-positive routes that pass min_profit gate.
 pub const MIN_ECONOMIC_VALUE_MATIC_WEI: u128 = 10u128.pow(17);
 /// Reject simulations whose gross profit exceeds this ROI (bps of `amount_in`).
-/// Raised from 10_000 to 100_000 because probes at the economic floor (~0.001 token)
-/// can legitimately show >100% ROI on a real mispricing — the sanity gate should
-/// catch phantom-state artifact, not small-probe high-multiplier returns.
-pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 100_000;
-/// Reject simulated gross profit above this MATIC notional (phantom-state guard).
-/// Raised from 1 → 50 POL to accommodate small-cap probe returns that are still
-/// small relative to the configured USD flash loan cap ($3.75 vs $50k notional).
-pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 50u128 * 10u128.pow(18);
+/// Floor probes can show >100% ROI on real mispricings; 10× (100_000) let a V4
+/// phantom through (`input=1e5`, ~10× → ~3.9 MATIC net) that dry-ran ExternalCallFailed.
+/// 5× still allows aggressive dust edges while cutting full-range quote artifacts.
+pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 50_000;
+/// Reject simulated net/gross MATIC above this notional (phantom-state guard).
+/// 50 POL let multi-hop V4 quotes with modest token ROI through as 4–40 MATIC
+/// "profits" that dry-ran `ExternalCallFailed`. Even 2 POL still admitted a
+/// ~1.1 MATIC DODO→V4 phantom. Cap at 1 POL: above gas (~0.2) for real near-misses,
+/// below typical V4 local-sim artifacts.
+pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 1u128 * 10u128.pow(18);
 
 /// Per-hop gas seeds for route simulation (Polygon executor context).
 /// GasOracle.record_sim_observed calibrates global uplift; per-route

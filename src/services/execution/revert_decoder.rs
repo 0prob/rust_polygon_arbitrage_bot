@@ -219,14 +219,33 @@ fn decode_huff_external_call_failed_payload(payload: &[u8]) -> Option<DecodedRev
     let mut reason = String::new();
     if payload.len() >= 128 {
         let rd_size = usize::try_from(U256::from_be_slice(&payload[96..128])).unwrap_or(0);
-        if rd_size > 0 && payload.len() >= 128usize.saturating_add(rd_size) {
+        if rd_size == 0 {
+            // V4/router often reverts with empty returndata; surface that explicitly.
+            let trailing = payload.len().saturating_sub(128);
+            reason = if trailing > 0 {
+                format!(
+                    "empty nested revert (rd_size=0, trailing={}B 0x{})",
+                    trailing,
+                    hex_preview(&payload[128..], 32)
+                )
+            } else {
+                "empty nested revert (rd_size=0)".to_string()
+            };
+        } else if payload.len() >= 128usize.saturating_add(rd_size) {
             let rd = &payload[128..128 + rd_size];
             // Prefer Error(string) so ERC20 balance messages are not misread as
             // nested ExternalCallFailed (Huff layout collides with ABI string heads).
             reason = decode_error_string_prefer(rd)
                 .or_else(|| decode_revert(rd).map(|r| r.to_string()))
                 .unwrap_or_else(|| format!("0x{}", hex_preview(rd, 64)));
+        } else {
+            reason = format!(
+                "truncated nested revert (rd_size={rd_size}, payload={}B)",
+                payload.len()
+            );
         }
+    } else if payload.len() > 64 {
+        reason = format!("short huff payload ({}B)", payload.len());
     }
     sanitize_external_call_failed(index, target, reason)
 }
@@ -408,6 +427,27 @@ mod tests {
                 ..
             }) if decoded_target == target
         ));
+    }
+
+    #[test]
+    fn empty_nested_revert_is_labeled_when_rd_size_zero() {
+        let target = address!("c8024d73455853224df33bcda42b82502a964b9e");
+        let mut payload = [0u8; 128];
+        payload[31] = 1;
+        payload[44..64].copy_from_slice(target.as_slice());
+        let decoded = decode_external_call_failed(&payload).expect("decode");
+        match decoded {
+            DecodedRevert::ExternalCallFailed {
+                index,
+                target: t,
+                reason,
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(t, target);
+                assert_eq!(reason, "empty nested revert (rd_size=0)");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

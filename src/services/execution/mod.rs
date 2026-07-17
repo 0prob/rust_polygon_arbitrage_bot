@@ -32,7 +32,8 @@ pub mod rpc_errors {
 pub mod gas {
     pub use super::support::{
         FeeSnapshot, GAS_FALLBACK_BUFFER_BPS, GAS_LIMIT_BUFFER_BPS, PER_HOP_EXECUTOR_GAS_OVERHEAD,
-        ROUTE_EXECUTION_GAS_OVERHEAD, buffer_gas_limit, compute_conservative_gas_price,
+        ROUTE_EXECUTION_GAS_OVERHEAD, buffer_gas_limit, compute_assessment_gas_price,
+        compute_conservative_gas_price,
         estimate_route_gas_from_hops, estimate_route_gas_from_hops_evm, estimate_route_storage_gas,
         pick_buffered_gas_limit, pick_live_gas_limit, pick_live_gas_limit_with_buffer,
         profit_reassess_gas, scaled_simulated_gas, submit_gas_basis, u256_to_u128,
@@ -71,7 +72,7 @@ pub use flash_liquidity::{
     token_flash_liquidity_borrowable,
 };
 pub use flash_policy::{FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy};
-pub use gas::{FeeSnapshot, compute_conservative_gas_price};
+pub use gas::{FeeSnapshot, compute_assessment_gas_price, compute_conservative_gas_price};
 pub use gas_oracle::{GasOracle, ROUTE_GAS_CACHE_MIN_ROUTES, RouteGasLookup};
 pub use profit::{
     AssessProfitInput, AssessmentGas, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitError,

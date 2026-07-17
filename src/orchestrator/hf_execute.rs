@@ -2,9 +2,11 @@ use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use futures_util::{StreamExt, stream};
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::{FlashLoanSource, FoundCycle, PoolIndex, PoolState, V3Tick};
@@ -29,11 +31,12 @@ use crate::services::execution::flash_liquidity::{
 use crate::services::execution::gas_oracle::RouteGasLookup;
 
 use crate::services::execution::balancer_verify::{
-    BalancerBatchReject, BatchQueryOutcome, BatchQueryVerdict, evaluate_batch_query,
-    log_balancer_batch_filter_summary, log_balancer_prepare_gate_summary,
-    query_balancer_batch_profit, record_balancer_batch_reject, record_balancer_filter_accept,
-    record_balancer_filter_window, record_balancer_prepare_skip,
+    BalancerBatchReject, BatchQueryOutcome, BatchQueryVerdict,
+    confirm_direct_batch_realized_profit, evaluate_batch_query, log_balancer_batch_filter_summary,
+    log_balancer_prepare_gate_summary, query_balancer_batch_profit, record_balancer_batch_reject,
+    record_balancer_filter_accept, record_balancer_filter_window, record_balancer_prepare_skip,
 };
+use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
 use crate::services::execution::{
@@ -502,6 +505,9 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     };
 
     let hop_fidelity_caps = local_sim::precompute_route_shallow_caps(arena, &evaluated.cycle.edges);
+    // Keep HF assessment when sim profit is unchanged so prepare can skip a full reassess.
+    // Dropped after a successful refresh resim (profit/gas may move).
+    let mut prior_assessment = Some(evaluated.assessment.clone());
 
     let sim = if pools_refreshed {
         let amount_in = evaluated.sim.amount_in;
@@ -563,6 +569,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 hop_profile.cl_depth_sims,
             );
         }
+        // Resim changed the economics — force prepare to reassess with planned flash source.
+        prior_assessment = None;
         refreshed
     } else {
         evaluated.sim
@@ -581,6 +589,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         evaluated.assessment,
         route_slippage_bps,
     );
+    // prepare re-validates flash fee vs planned source before reuse.
     let log_prepare_skip = ctx.execution.should_log_prepare_skip(fp);
     let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
         evaluated: &evaluated,
@@ -603,7 +612,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         gas_oracle: &ctx.gas_oracle,
         search_low,
         risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
-        existing_assessment: None,
+        existing_assessment: prior_assessment,
         log_skips: log_prepare_skip,
     }) else {
         skipped.record("prepare_plan");
@@ -817,6 +826,323 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
     }
 }
 
+/// Cap tick RPC work so HF probe hydration cannot starve evaluation.
+const HF_PROBE_TICK_POOL_CAP: usize = 64;
+/// Skip re-fetching pools that just returned empty ticks (HF otherwise hammers the
+/// same dead TickLens/bitmap miss every ~200ms). Wide-empty pools rarely recover
+/// within seconds — 60s cuts refetch spam while still allowing occasional retry.
+const HF_TICK_MISS_COOLDOWN: Duration = Duration::from_secs(60);
+
+static HF_TICK_MISS_COOLDOWN_UNTIL: Mutex<Option<FxHashMap<Address, Instant>>> = Mutex::new(None);
+
+fn tick_miss_on_cooldown(addr: Address) -> bool {
+    let guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&addr).copied())
+        .is_some_and(|until| Instant::now() < until)
+}
+
+fn mark_tick_miss_cooldown(addrs: &[Address]) {
+    if addrs.is_empty() {
+        return;
+    }
+    let until = Instant::now() + HF_TICK_MISS_COOLDOWN;
+    let mut guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
+    let map = guard.get_or_insert_with(FxHashMap::default);
+    // Bound map growth — drop expired entries occasionally.
+    if map.len() > 512 {
+        let now = Instant::now();
+        map.retain(|_, exp| *exp > now);
+    }
+    for &addr in addrs {
+        map.insert(addr, until);
+    }
+}
+
+fn clear_tick_miss_cooldown(addrs: &[Address]) {
+    let mut guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
+    if let Some(map) = guard.as_mut() {
+        for addr in addrs {
+            map.remove(addr);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ProbeTickHydrateStats {
+    pub v3_total: usize,
+    pub v3_needed: usize,
+    pub v3_loaded: usize,
+    pub v3_empty: usize,
+    pub v3_incomplete: usize,
+    pub v3_algebra_loaded: usize,
+    pub v3_seeded: usize,
+    pub v4_total: usize,
+    pub v4_needed: usize,
+    pub v4_loaded: usize,
+    pub cycles_tickless_before: usize,
+    pub cycles_tickless_after: usize,
+}
+
+fn cycle_has_tickless_cl(arena: &StateArena, cycle: &FoundCycle) -> bool {
+    for edge in &cycle.edges {
+        match (arena.pool_state(edge.pool_index), edge.protocol) {
+            (Some(PoolState::V3(s)), crate::core::types::ProtocolType::UniswapV3)
+            | (Some(PoolState::V4(s)), crate::core::types::ProtocolType::UniswapV4)
+                if s.ticks.is_empty() =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn count_tickless_cl_cycles<C: AsRef<FoundCycle>>(arena: &StateArena, cycles: &[C]) -> usize {
+    cycles
+        .iter()
+        .filter(|c| cycle_has_tickless_cl(arena, c.as_ref()))
+        .count()
+}
+
+/// True when the cycle has tickless CL hops and every such pool is on tick-miss cooldown
+/// (wide fetch already failed recently — further HF eval is dust-only noise).
+pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+) -> bool {
+    let mut saw_tickless = false;
+    for edge in &cycle.edges {
+        let tickless = match (arena.pool_state(edge.pool_index), edge.protocol) {
+            (Some(PoolState::V3(s)), crate::core::types::ProtocolType::UniswapV3)
+            | (Some(PoolState::V4(s)), crate::core::types::ProtocolType::UniswapV4)
+                if s.ticks.is_empty() =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !tickless {
+            continue;
+        }
+        saw_tickless = true;
+        let Some(addr) = arena.pool_address(edge.pool_index) else {
+            return false;
+        };
+        if !tick_miss_on_cooldown(addr) {
+            return false;
+        }
+    }
+    saw_tickless
+}
+
+/// True when any V3/V4 hop's pool is on tick-miss cooldown.
+///
+/// Previously used at HF selection (over-pruned to `selected=0`); select now uses
+/// [`cycle_tickless_cl_all_on_miss_cooldown`]. Kept for unit tests / hydrate helpers.
+#[allow(dead_code)]
+pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+) -> bool {
+    for edge in &cycle.edges {
+        if !matches!(
+            edge.protocol,
+            crate::core::types::ProtocolType::UniswapV3
+                | crate::core::types::ProtocolType::UniswapV4
+        ) {
+            continue;
+        }
+        let Some(addr) = arena.pool_address(edge.pool_index) else {
+            continue;
+        };
+        if tick_miss_on_cooldown(addr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop cycles stuck on cooldown-empty CL ticks so probe/Brent budget goes to tradeable routes.
+/// Returns how many cycles were removed. No-op when that would empty the set.
+pub(crate) fn drain_cooldown_stuck_tickless_cycles(
+    arena: &StateArena,
+    cycles: &mut Vec<std::sync::Arc<FoundCycle>>,
+) -> usize {
+    if cycles.is_empty() {
+        return 0;
+    }
+    let before = cycles.len();
+    cycles.retain(|c| !cycle_tickless_cl_all_on_miss_cooldown(arena, c.as_ref()));
+    // Previously refused to drain when *every* cycle was stuck (kept.is_empty →
+    // return 0), which left HF evaluating only dust-only phantoms for the tick.
+    // Empty remaining is fine — the tick already handles cycles_considered=0.
+    before.saturating_sub(cycles.len())
+}
+
+/// Collect tickless V3 addresses in cycle order (active/high-priority cycles first).
+fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+    cap: usize,
+) -> (usize, Vec<Address>) {
+    let mut all = 0usize;
+    let mut out = Vec::with_capacity(cap.min(cycles.len()));
+    let mut seen: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
+    for cycle in cycles {
+        for edge in &cycle.as_ref().edges {
+            if edge.protocol != crate::core::types::ProtocolType::UniswapV3 {
+                continue;
+            }
+            let Some(addr) = arena.pool_address(edge.pool_index) else {
+                continue;
+            };
+            let tickless = match arena.pool_state(edge.pool_index) {
+                Some(PoolState::V3(st)) => st.ticks.is_empty(),
+                _ => false,
+            };
+            if !tickless || !seen.insert(addr) {
+                continue;
+            }
+            all += 1;
+            if out.len() < cap && !tick_miss_on_cooldown(addr) {
+                out.push(addr);
+            }
+        }
+    }
+    (all, out)
+}
+
+fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    cap: usize,
+) -> (usize, Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>) {
+    let mut all = collect_v4_tick_targets(cycles, pool_metas);
+    all.retain(|(idx, _)| match arena.pool_state(*idx) {
+        Some(PoolState::V4(st)) => st.ticks.is_empty(),
+        _ => false,
+    });
+    let total = all.len();
+    all.retain(|(idx, _)| {
+        arena
+            .pool_address(*idx)
+            .is_none_or(|addr| !tick_miss_on_cooldown(addr))
+    });
+    if all.len() > cap {
+        all.truncate(cap);
+    }
+    (total, all)
+}
+
+/// Hydrate empty V3/V4 tick arrays on selected HF cycles before probe ranking.
+/// Hot-cache refresh drops ticks when price/liquidity moves; without this, those
+/// routes classify as `cl_tickless` and never reach Brent/economics.
+pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
+    rpc: &RpcPool,
+    arena: &mut StateArena,
+    cycles: &[C],
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    word_range: i16,
+    block_number: Option<u64>,
+) -> ProbeTickHydrateStats {
+    let mut stats = ProbeTickHydrateStats {
+        cycles_tickless_before: count_tickless_cl_cycles(arena, cycles),
+        ..ProbeTickHydrateStats::default()
+    };
+    if cycles.is_empty() {
+        stats.cycles_tickless_after = stats.cycles_tickless_before;
+        return stats;
+    }
+    let (v3_total, v3) =
+        tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
+    let (v4_total, v4) =
+        tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
+    stats.v3_total = v3_total;
+    stats.v3_needed = v3.len();
+    stats.v4_total = v4_total;
+    stats.v4_needed = v4.len();
+    if stats.v3_needed == 0 && stats.v4_needed == 0 {
+        stats.cycles_tickless_after = stats.cycles_tickless_before;
+        return stats;
+    }
+    let (algebra_pools, algebra_integral_pools) =
+        crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
+    for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
+        let Ok(provider) = rpc.connect_state_at(url) else {
+            rpc.deprioritize_state_url(url);
+            continue;
+        };
+        // Only clear pools we are about to refetch (preserve already-hydrated ticks).
+        crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &v3);
+        crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4);
+        let v3_res = enrich_v3_ticks(
+            &provider,
+            arena,
+            &v3,
+            word_range,
+            &algebra_pools,
+            &algebra_integral_pools,
+            block_number,
+        )
+        .await;
+        let v4_res = enrich_v4_ticks(&provider, arena, &v4, word_range, block_number).await;
+        if !v3_res.rpc_failed && !v4_res.rpc_failed {
+            if url_index > 0 {
+                crate::info!(
+                    "hf probe-tick hydrate fallback ok (url_index={url_index}, v3_loaded={}, v4_loaded={})",
+                    v3_res.loaded,
+                    v4_res.loaded,
+                );
+            }
+            stats.v3_loaded = v3_res.loaded;
+            stats.v3_empty = v3_res.empty_pools;
+            stats.v3_incomplete = v3_res.incomplete_pools;
+            stats.v3_algebra_loaded = v3_res.algebra_loaded;
+            stats.v3_seeded = v3_res.seeded_pools;
+            stats.v4_loaded = v4_res.loaded;
+            // Cooldown pools that stayed tickless so HF does not re-RPC them every tick.
+            let mut still_miss = Vec::new();
+            let mut recovered = Vec::new();
+            for &addr in &v3 {
+                let Some(&idx) = arena.address_to_pool().get(&addr) else {
+                    continue;
+                };
+                match arena.pool_state(idx) {
+                    Some(PoolState::V3(s)) if s.ticks.is_empty() => still_miss.push(addr),
+                    Some(PoolState::V3(_)) => recovered.push(addr),
+                    _ => {}
+                }
+            }
+            for &(idx, _) in &v4 {
+                let Some(addr) = arena.pool_address(idx) else {
+                    continue;
+                };
+                match arena.pool_state(idx) {
+                    Some(PoolState::V4(s)) if s.ticks.is_empty() => still_miss.push(addr),
+                    Some(PoolState::V4(_)) => recovered.push(addr),
+                    _ => {}
+                }
+            }
+            mark_tick_miss_cooldown(&still_miss);
+            clear_tick_miss_cooldown(&recovered);
+            stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+            return stats;
+        }
+        rpc.deprioritize_state_url(url);
+        crate::warn!(
+            "hf probe-tick hydrate RPC failed — trying fallback (url_index={url_index}, v3_failed={}, v4_failed={})",
+            v3_res.rpc_failed,
+            v4_res.rpc_failed,
+        );
+    }
+    stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+    stats
+}
+
 async fn enrich_dispatch_cl_ticks(
     rpc: &RpcPool,
     arena: &mut StateArena,
@@ -1027,6 +1353,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
     candidates: Vec<HfEvalResult>,
     sim_provider: &P,
     executor: alloy::primitives::Address,
+    operator: alloy::primitives::Address,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     slippage_bps: u64,
     reassess: Arc<HfEvalInputOwned>,
@@ -1062,6 +1389,14 @@ pub(crate) async fn filter_balancer_onchain_verified<
             crate::debug!("balancer: batch_filter fp={fp} reject=missing_start_token");
             continue;
         };
+        if execution.is_direct_token_quarantined(start_token) {
+            execution.quarantine_batch_query_failure(fp);
+            record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
+            crate::debug!(
+                "balancer: batch_filter fp={fp} reject=direct_token_quarantined token={start_token}"
+            );
+            continue;
+        }
         let Some(hops) = build_calldata_hops(
             arena,
             &result.cycle.edges,
@@ -1115,6 +1450,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
                     job,
                     &sim_provider,
                     executor,
+                    operator,
                     &eval,
                     &route_gas,
                     state_block,
@@ -1141,6 +1477,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     job: BalancerVerifyJob,
     sim_provider: &P,
     executor: alloy::primitives::Address,
+    operator: alloy::primitives::Address,
     eval: &HfEvalInput<'_>,
     _route_gas: &RouteGasLookup,
     state_block: u64,
@@ -1176,7 +1513,49 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 );
                 return None;
             }
-            accepted.assessment = assessment;
+            let Some(min_profit) = on_chain_min_profit_from_assessment(&assessment) else {
+                execution.quarantine_batch_query_failure(fp);
+                record_balancer_batch_reject(BalancerBatchReject::BuildDecodeFailed);
+                return None;
+            };
+            let Some(realized) = confirm_direct_batch_realized_profit(
+                sim_provider,
+                executor,
+                operator,
+                &hops,
+                start_token,
+                accepted.sim.amount_in,
+                min_profit,
+                query_block,
+            )
+            .await
+            else {
+                execution.quarantine_batch_query_failure(fp);
+                execution.quarantine_direct_token_zero_realized(start_token);
+                record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
+                crate::info!(
+                    "balancer: batch_filter fp={fp} reject=zero_realized token={start_token} query_profit={on_chain_profit} min_profit={min_profit}"
+                );
+                return None;
+            };
+            // Prefer executor-realized profit over vault-query delta when they diverge.
+            if realized != on_chain_profit {
+                accepted.sim.profit = realized;
+                accepted.sim.amount_out = accepted.sim.amount_in.saturating_add(realized);
+                let reassessment =
+                    reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
+                if !reassessment.should_execute {
+                    execution.quarantine_batch_query_failure(fp);
+                    record_balancer_batch_reject(BalancerBatchReject::ReassessAfterOnChain);
+                    crate::debug!(
+                        "balancer: batch_filter fp={fp} reject=reassess_after_realized query={on_chain_profit} realized={realized}"
+                    );
+                    return None;
+                }
+                accepted.assessment = reassessment;
+            } else {
+                accepted.assessment = assessment;
+            }
             accepted.flash_source = FlashLoanSource::Direct;
             accepted.balancer_batch_verified = true;
             record_balancer_filter_accept();
@@ -1251,12 +1630,16 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         }
         BatchQueryOutcome::NonPositiveDelta(delta) => {
             execution.quarantine_batch_query_failure(fp);
-            log_phantom_balancer_diag(arena, result, &hops);
+            log_balancer_verify_diag(arena, result, &hops);
             crate::info!(
                 "hf near-miss-verify: fp={fp} route={route} phantom sim modeled={modeled} vault_delta={delta} quarantined",
             );
         }
         BatchQueryOutcome::RpcError(reason) => {
+            // BAL#521 TOKEN_NOT_REGISTERED and similar vault rejects need hop-level
+            // pool_id/token evidence; the bare RPC string alone cannot distinguish
+            // stale indices from a wrong pool_id.
+            log_balancer_verify_diag(arena, result, &hops);
             crate::info!(
                 "hf near-miss-verify: fp={fp} route={route} rpc_error={reason} modeled={modeled}"
             );
@@ -1272,7 +1655,7 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
     }
 }
 
-fn log_phantom_balancer_diag(
+fn log_balancer_verify_diag(
     arena: &StateArena,
     result: &HfEvalResult,
     hops: &[crate::services::execution::calldata::CalldataHop],
@@ -1284,6 +1667,9 @@ fn log_phantom_balancer_diag(
         let Some(addr) = arena.pool_address(edge.pool_index) else {
             continue;
         };
+        // Balancer V2 poolId specialization: first 20 bytes are the pool contract.
+        let pool_id_prefix = h.pool_id.map(|id| Address::from_slice(&id.as_slice()[..20]));
+        let pool_id_matches_addr = pool_id_prefix == Some(addr);
         let detail = match arena.pool_state(edge.pool_index) {
             Some(PoolState::Balancer(s)) => {
                 let tin = edge.token_in_idx as usize;
@@ -1295,18 +1681,34 @@ fn log_phantom_balancer_diag(
                 };
                 let sim_out =
                     crate::core::math::balancer::simulate_balancer_swap(s, h.amount_in, tin, tout);
+                let state_tin = s.tokens.get(tin).copied();
+                let state_tout = s.tokens.get(tout).copied();
+                let tin_registered = s.tokens.iter().any(|t| *t == h.token_in);
+                let tout_registered = s.tokens.iter().any(|t| *t == h.token_out);
+                let tin_idx_ok = state_tin == Some(h.token_in);
+                let tout_idx_ok = state_tout == Some(h.token_out);
+                let state_pool_id_prefix = s
+                    .pool_id
+                    .map(|id| Address::from_slice(&id.as_slice()[..20]));
                 format!(
-                    "pool={addr} kind={kind} tin={tin} tout={tout} bal_in={} bal_out={} amt_in={} sim_out={sim_out} bpt={:?}",
+                    "pool={addr} kind={kind} pool_id={:?} pool_id_prefix={pool_id_prefix:?} pool_id_ok={pool_id_matches_addr} state_pool_id_prefix={state_pool_id_prefix:?} tin={tin} tout={tout} hop_tin={} hop_tout={} state_tin={state_tin:?} state_tout={state_tout:?} tin_reg={tin_registered} tout_reg={tout_registered} tin_idx_ok={tin_idx_ok} tout_idx_ok={tout_idx_ok} state_tokens={:?} bal_in={} bal_out={} amt_in={} sim_out={sim_out} bpt={:?}",
+                    h.pool_id,
+                    h.token_in,
+                    h.token_out,
+                    s.tokens,
                     s.balances.get(tin).copied().unwrap_or_default(),
                     s.balances.get(tout).copied().unwrap_or_default(),
                     h.amount_in,
                     s.bpt_index,
                 )
             }
-            _ => "non_balancer_state".into(),
+            _ => format!(
+                "non_balancer_state pool={addr} pool_id={:?} pool_id_prefix={pool_id_prefix:?} pool_id_ok={pool_id_matches_addr} hop_tin={} hop_tout={}",
+                h.pool_id, h.token_in, h.token_out,
+            ),
         };
         crate::info!(
-            "hf phantom-hop[{i}]: fp={} route_amt={} {detail}",
+            "hf balancer-verify-hop[{i}]: fp={} route_amt={} {detail}",
             result.route_fingerprint,
             if i == 0 { result.sim.amount_in } else { hop },
         );
@@ -1421,5 +1823,93 @@ mod tests {
         };
         assert_eq!(state.ticks.len(), 1);
         assert_eq!(state.ticks[0].tick, -60);
+    }
+
+    #[test]
+    fn drain_removes_only_cooldown_stuck_tickless_cycles() {
+        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+        let addr_dead = Address::from([3u8; 20]);
+        let addr_live = Address::from([4u8; 20]);
+        let mut arena = StateArena::default();
+        let dead = arena.register_pool(
+            addr_dead,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![]),
+            })),
+        );
+        let live = arena.register_pool(
+            addr_live,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1,
+                    liquidity_net: 1,
+                }]),
+            })),
+        );
+        mark_tick_miss_cooldown(&[addr_dead]);
+        let edge = |pool| Edge {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV3,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            zero_for_one: true,
+            fee_bps: 30,
+            token_in_idx: 0,
+            token_out_idx: 1,
+        };
+        let mk = |pool, id| {
+            Arc::new(FoundCycle {
+                start_token: TokenIndex(id),
+                edges: CycleEdges::from_iter([edge(pool)]),
+                hop_count: 1,
+                log_weight: 0.0,
+                cumulative_fee_bps: 0,
+                score: 0.0,
+                cycle_ratio: U256::ZERO,
+            })
+        };
+        let mut cycles = vec![mk(dead, 1), mk(live, 2)];
+        let removed = drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles);
+        assert_eq!(removed, 1);
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].start_token, TokenIndex(2));
+
+        // All-stuck set must clear entirely (previously early-returned 0 and kept phantoms).
+        let mut all_stuck = vec![mk(dead, 3), mk(dead, 4)];
+        let removed_all = drain_cooldown_stuck_tickless_cycles(&arena, &mut all_stuck);
+        assert_eq!(removed_all, 2);
+        assert!(all_stuck.is_empty());
+
+        // Selection skip keys off cooldown membership even when LF still has ticks.
+        assert!(cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(dead, 5)
+        ));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(live, 6)
+        ));
+        clear_tick_miss_cooldown(&[addr_dead]);
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(dead, 7)
+        ));
     }
 }

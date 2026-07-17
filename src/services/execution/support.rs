@@ -302,6 +302,14 @@ pub fn compute_conservative_gas_price(snapshot: FeeSnapshot) -> U256 {
     snapshot.base_fee * U256::from(11_250u64) / U256::from(10_000u64) + snapshot.priority_fee
 }
 
+/// Spot effective gas price for HF probe/Brent/assess (no 12.5% base-fee buffer).
+/// Submit path keeps [`compute_conservative_gas_price`]; using the buffer in ranking
+/// was rejecting near-misses that could clear gas at the live tip.
+#[must_use]
+pub fn compute_assessment_gas_price(snapshot: FeeSnapshot) -> U256 {
+    snapshot.base_fee.saturating_add(snapshot.priority_fee)
+}
+
 // --- impact_slippage ---
 
 fn marginal_shortfall_bps(
@@ -404,6 +412,23 @@ mod tests {
     #[test]
     fn test_buffer_gas_limit_nonzero() {
         assert!(buffer_gas_limit(100_000).is_some());
+    }
+
+    #[test]
+    fn assessment_gas_price_omits_base_fee_buffer() {
+        let snap = FeeSnapshot {
+            base_fee: U256::from(200_000_000_000u64),
+            priority_fee: U256::from(30_000_000_000u64),
+        };
+        let spot = compute_assessment_gas_price(snap);
+        let conservative = compute_conservative_gas_price(snap);
+        assert_eq!(spot, U256::from(230_000_000_000u64));
+        assert!(conservative > spot);
+        assert_eq!(
+            conservative,
+            U256::from(200_000_000_000u64) * U256::from(11_250u64) / U256::from(10_000u64)
+                + U256::from(30_000_000_000u64)
+        );
     }
 
     #[test]

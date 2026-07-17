@@ -678,11 +678,15 @@ fn collect_cycles_dfs_single_start(
                 else {
                     continue;
                 };
-                let out_idx = out_leg as usize;
-                if out_idx >= meta.tokens.len() {
+                let Some(state) = arena.pool_state(pending.pool_index) else {
                     continue;
-                }
-                let token_out = meta.tokens[out_idx];
+                };
+                let out_idx = out_leg as usize;
+                let Some(token_out) =
+                    crate::pipeline::graph::routing_token_at_leg(arena, state, meta, out_idx)
+                else {
+                    continue;
+                };
                 let Some((edge, edge_log_w, ratio)) =
                     resolve_lazy_swap_edge(arena, pending, token_out, out_leg)
                 else {
