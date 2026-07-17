@@ -3,6 +3,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc::Sender;
 
+use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
 
 use super::app::Severity;
@@ -23,6 +24,7 @@ pub enum UiEvent {
         profitable_count: usize,
         best_profit_wei: String,
         elapsed_ms: u64,
+        candidates: Vec<HfCandidateUiRow>,
     },
     GasUpdate {
         gwei: f64,

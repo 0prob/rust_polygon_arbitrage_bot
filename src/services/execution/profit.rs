@@ -79,6 +79,7 @@ pub fn modeled_net_profit_tokens(
     hop_count: u32,
     flash_source: FlashLoanSource,
 ) -> Option<U256> {
+    // Callers pass **per-hop** config bps (calldata minOut); compound for the route haircut.
     let route_slippage = compound_slippage_bps(slippage_bps, hop_count);
     let amount_out = gross_profit.checked_add(amount_in)?;
     let adjusted_out = slippage_adjusted(amount_out, route_slippage)?;
@@ -202,6 +203,7 @@ pub struct AssessProfitInput {
     pub min_profit_matic_wei: U256,
     /// Minimum net ROI in basis points of `amount_in` (0 = disabled).
     pub min_profit_roi_bps: u64,
+    /// Route-level slippage haircut in bps (already compounded / depth-merged).
     pub slippage_bps: u64,
     pub flash_loan_source: FlashLoanSource,
     /// Net profit must exceed `gas_cost_matic * safety_multiplier_bps / 10_000`.
@@ -215,6 +217,7 @@ pub struct AssessProfitInput {
 pub struct ProfitEvalContext {
     pub gas_price: U256,
     pub flash_source: FlashLoanSource,
+    /// Route-level slippage bps for Brent / probe assess (same convention as [`AssessProfitInput`]).
     pub slippage_bps: u64,
     pub token_to_matic_rate: U256,
     pub token_decimals: u8,
@@ -472,8 +475,13 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         return rejected_arithmetic(input, "flash-loan fee overflow");
     };
 
-    // Slippage reduces output, never input. Compound per-hop tolerance to match calldata.
-    let route_slippage_bps = compound_slippage_bps(input.slippage_bps, input.hop_count);
+    // Slippage reduces output, never input.
+    // `slippage_bps` is **route-level** (see `effective_slippage_bps`): already compounded
+    // for per-hop config and/or carrying full-route depth impact — do not compound again.
+    if input.slippage_bps >= 10_000 {
+        return rejected_arithmetic(input, "invalid slippage or slippage arithmetic overflow");
+    }
+    let route_slippage_bps = input.slippage_bps;
     let amount_out = input.gross_profit.saturating_add(input.amount_in);
     let Some(adjusted_out) = slippage_adjusted(amount_out, route_slippage_bps) else {
         return rejected_arithmetic(input, "invalid slippage or slippage arithmetic overflow");
@@ -747,7 +755,22 @@ mod safety_tests {
     #[test]
     fn compound_slippage_matches_per_hop_product() {
         assert_eq!(compound_slippage_bps(50, 1), 50);
+        // 10000*(9950/10000)^4 with integer division → retained 9800 → 200 bps.
         assert_eq!(compound_slippage_bps(50, 4), 200);
+    }
+
+    #[test]
+    fn assess_profit_treats_slippage_as_route_level_not_recompounded() {
+        let mut i = input();
+        i.gross_profit = U256::from(100_000u64);
+        i.amount_in = U256::from(1_000_000u64);
+        i.hop_count = 4;
+        // Route-level 100 bps once (not compound(100,4) ≈ 400).
+        i.slippage_bps = 100;
+        i.safety_multiplier_bps = 0;
+        let result = assess_profit(&i);
+        assert_eq!(result.slippage_deduction, U256::from(11_000u64));
+        assert!(result.should_execute);
     }
 
     #[test]

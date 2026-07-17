@@ -9,6 +9,7 @@ use crate::core::types::FlashLoanSource;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_minimal;
 use crate::pipeline::types::MinimalSimResult;
+use crate::services::execution::profit::compound_slippage_bps;
 
 // --- flash_policy ---
 
@@ -377,9 +378,23 @@ pub fn depth_impact_slippage_bps_with_base(
     marginal_shortfall_bps(base_out, amount_in, probe.amount_out, probe_in)
 }
 
+/// Route-level slippage for profit assessment / Brent.
+///
+/// - `configured_per_hop_bps` is the per-hop floor used in calldata `minOut` → compound
+///   across `hop_count` so the profit haircut matches multi-hop execution.
+/// - `depth_route_bps` is already a **full-route** shortfall from the +5% size probe
+///   ([`depth_impact_slippage_bps_with_base`]) → applied once, never re-compounded.
+///
+/// Prior bug: `max(config, depth)` then `compound(…, hops)` treated depth as per-hop and
+/// roughly ×hops over-penalized multi-hop routes (e.g. 229 bps depth → ~672 bps on 3 hops).
 #[must_use]
-pub fn effective_slippage_bps(configured_bps: u64, depth_bps: u64) -> u64 {
-    configured_bps.max(depth_bps).min(9_999)
+pub fn effective_slippage_bps(
+    configured_per_hop_bps: u64,
+    hop_count: u32,
+    depth_route_bps: u64,
+) -> u64 {
+    let config_route = compound_slippage_bps(configured_per_hop_bps, hop_count);
+    config_route.max(depth_route_bps).min(9_999)
 }
 
 #[cfg(test)]
@@ -453,5 +468,16 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn effective_slippage_does_not_compound_route_depth() {
+        // Depth is already full-route (e.g. 229 bps). Compounding as per-hop would
+        // inflate ~3× on a 3-hop path; max(compound(config), depth) keeps 229.
+        assert_eq!(effective_slippage_bps(0, 3, 229), 229);
+        assert_eq!(effective_slippage_bps(50, 1, 10), 50);
+        // 50 bps × 4 hops compounds to 200 route bps; depth 10 stays under that.
+        assert_eq!(effective_slippage_bps(50, 4, 10), 200);
+        assert_eq!(effective_slippage_bps(50, 4, 500), 500);
     }
 }

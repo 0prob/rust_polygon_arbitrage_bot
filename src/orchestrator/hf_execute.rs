@@ -570,13 +570,16 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     evaluated.sim = sim;
 
     let liquidity = ctx.execution.flash_liquidity.snapshot(start_token_addr);
-    let slippage_bps = evaluated.effective_slippage_bps.max(base_slippage_bps);
+    // Route-level for profit/prepare; config per-hop for calldata minOut (do not push
+    // full-route depth haircut into every hop's minOut).
+    let route_slippage_bps = evaluated.effective_slippage_bps.max(base_slippage_bps);
+    let calldata_slippage_bps = base_slippage_bps;
     let search_low = evaluated.opt.search_low;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
         evaluated.cycle,
         evaluated.sim,
         evaluated.assessment,
-        slippage_bps,
+        route_slippage_bps,
     );
     let log_prepare_skip = ctx.execution.should_log_prepare_skip(fp);
     let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
@@ -590,7 +593,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         min_profit_matic,
         min_profit_roi_bps,
         gas_price,
-        slippage_bps,
+        slippage_bps: route_slippage_bps,
         max_flash_loan_usd,
         matic_usd,
         matic_usd_chainlink: ctx.price_oracle.fresh_matic_usd_chainlink_raw(),
@@ -679,7 +682,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         match evaluate_batch_query(
             outcome,
             prepared.evaluated.result.amount_in,
-            slippage_bps,
+            route_slippage_bps,
             prepared.evaluated.cycle.hop_count,
         ) {
             BatchQueryVerdict::Accepted(_) => {}
@@ -706,7 +709,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     let build_cfg = CandidateBuildConfig {
         executor_address: executor,
-        slippage_bps,
+        // Per-hop config for calldata minOut + on-chain minProfit compounding.
+        slippage_bps: calldata_slippage_bps,
         flash_loan_source: prepared.flash_source,
         deadline_secs_from_now: deadline_secs,
         min_profit_matic_wei: min_profit_matic,
@@ -723,7 +727,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         trust_prepared_flash: true,
     };
 
-    let candidate =
+    let mut candidate =
         match build_execution_candidate(arena, &prepared.evaluated, &build_cfg, pool_metas_by_pool)
         {
             Ok(c) => c,
@@ -733,6 +737,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 return None;
             }
         };
+    // Profit reassess uses route-level slip (config compounded + depth), not per-hop alone.
+    candidate.slippage_bps = route_slippage_bps;
 
     if ctx
         .execution
@@ -983,6 +989,7 @@ pub(crate) async fn refresh_and_resim_profitable(
                 return None;
             }
             result.assessment = assessment;
+            result.flash_source = flash_source;
             Some(result)
         })
         .collect();
@@ -1170,6 +1177,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 return None;
             }
             accepted.assessment = assessment;
+            accepted.flash_source = FlashLoanSource::Direct;
             accepted.balancer_batch_verified = true;
             record_balancer_filter_accept();
             Some(accepted)

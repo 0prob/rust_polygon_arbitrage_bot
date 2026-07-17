@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
     let (start, end) = layout::table_viewport(total, app.selected_index, visible_rows);
     let table_block = table_block.title(Line::from(format!(
-        "Opportunities [{} / {}] filter: {} | sort: {:?}",
+        "Opportunities · LF scout (soft gates) [{} / {}] filter: {} | sort: {:?}",
         if total == 0 { 0 } else { start + 1 },
         total,
         if app.search.is_empty() {
@@ -57,10 +57,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             Style::default().bg(theme::PANEL)
         };
+        let status = match route.status {
+            crate::tui::app::RouteStatus::New => "",
+            crate::tui::app::RouteStatus::Hot => " hot",
+            crate::tui::app::RouteStatus::Executed => " exec",
+            crate::tui::app::RouteStatus::Quarantined => " quar",
+            crate::tui::app::RouteStatus::Ignored => " ign",
+        };
         table_rows.push(
             Row::new(vec![
                 Cell::from(span_text(
-                    format!("{:x}", route.fingerprint),
+                    format!("{:x}{status}", route.fingerprint),
                     theme::muted(),
                 )),
                 Cell::from(span_text(route.hops.to_string(), theme::accent())),
@@ -114,11 +121,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     let detail = if let Some(route) = app.selected_route() {
-        vec![
+        let mut lines = vec![
             theme::label_value(
                 "fingerprint",
                 format!("{:x}", route.fingerprint),
                 crate::tui::app::Severity::Info,
+            ),
+            theme::label_value(
+                "status",
+                format!("{:?}", route.status),
+                match route.status {
+                    crate::tui::app::RouteStatus::Hot | crate::tui::app::RouteStatus::Executed => {
+                        crate::tui::app::Severity::Good
+                    }
+                    crate::tui::app::RouteStatus::Quarantined
+                    | crate::tui::app::RouteStatus::Ignored => crate::tui::app::Severity::Warn,
+                    crate::tui::app::RouteStatus::New => crate::tui::app::Severity::Info,
+                },
             ),
             theme::label_value(
                 "route",
@@ -148,7 +167,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 },
             ),
             theme::label_value(
-                "gross/net",
+                "gross/net (soft)",
                 format!(
                     "{:+.4} / {:+.4} MATIC  |  {:.2} USD",
                     route.profit_matic, route.net_profit_matic, route.profit_usd
@@ -171,7 +190,36 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     crate::tui::app::Severity::Info
                 },
             ),
-        ]
+            Line::from(Span::styled(
+                "Soft scout only: min-profit/ROI=0, flash=balancer, no HF verify/dispatch.",
+                theme::muted(),
+            )),
+        ];
+        if let Some(hf) = app.hf_candidate_for(route.fingerprint) {
+            lines.push(theme::label_value(
+                "HF gate",
+                format!(
+                    "flash={} should_execute={} slip={}bps reject={}",
+                    hf.flash,
+                    hf.should_execute,
+                    hf.slip_bps,
+                    hf.reject_reason.as_deref().unwrap_or("none")
+                ),
+                if hf.should_execute {
+                    crate::tui::app::Severity::Good
+                } else {
+                    crate::tui::app::Severity::Warn
+                },
+            ));
+            if let Some(outcome) = hf.outcome.as_ref() {
+                lines.push(theme::label_value(
+                    "HF outcome",
+                    outcome.clone(),
+                    hf.outcome_severity,
+                ));
+            }
+        }
+        lines
     } else {
         vec![Line::from("no route selected")]
     };

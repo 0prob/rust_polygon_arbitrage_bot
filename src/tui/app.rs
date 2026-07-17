@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, U256};
 use rustc_hash::FxHasher;
 
+use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +41,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Opportunities => "Opportunities",
             Tab::Graph => "Graph",
-            Tab::Simulations => "Simulations",
+            Tab::Simulations => "HF Pipeline",
             Tab::Trades => "Trades",
             Tab::Portfolio => "Portfolio",
             Tab::Diagnostics => "Diagnostics",
@@ -192,6 +193,51 @@ pub struct SimulationRow {
     pub note: String,
 }
 
+/// Execute-faithful HF pipeline row (from HF assess with real gates), not LF soft scout.
+#[derive(Debug, Clone)]
+pub struct HfPipelineRow {
+    pub fingerprint: u64,
+    pub hops: u32,
+    pub route: String,
+    pub amount_in: String,
+    pub amount_out: String,
+    pub gross_profit: String,
+    pub net_profit_matic: String,
+    pub gas: u32,
+    pub flash: String,
+    pub should_execute: bool,
+    pub reject_reason: Option<String>,
+    pub slip_bps: u64,
+    pub near_miss: bool,
+    /// Latest execution outcome label for this fingerprint (if any).
+    pub outcome: Option<String>,
+    pub outcome_severity: Severity,
+}
+
+impl HfPipelineRow {
+    fn from_hf_candidate(row: HfCandidateUiRow) -> Self {
+        // Net is already in MATIC wei from assess_profit.
+        let net_matic = crate::util::u256_to_f64(row.net_profit_matic_wei) / 1e18;
+        Self {
+            fingerprint: row.fingerprint,
+            hops: row.hops,
+            route: row.route,
+            amount_in: row.amount_in.to_string(),
+            amount_out: row.amount_out.to_string(),
+            gross_profit: row.gross_profit.to_string(),
+            net_profit_matic: format!("{net_matic:+.6}"),
+            gas: row.gas,
+            flash: row.flash.label().to_string(),
+            should_execute: row.should_execute,
+            reject_reason: row.reject_reason,
+            slip_bps: row.slip_bps,
+            near_miss: row.near_miss,
+            outcome: None,
+            outcome_severity: Severity::Info,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TradeRow {
     pub at: Instant,
@@ -248,6 +294,8 @@ pub struct App {
     pub last_cycles_considered: usize,
     pub last_profitable_count: usize,
     pub last_best_profit_wei: Option<String>,
+    /// Post-verify HF assess/dispatch rows from the latest HF tick (execute-faithful).
+    pub hf_candidates: Vec<HfPipelineRow>,
     pub should_quit: bool,
     pub snapshot_refresh_pending: bool,
     pub show_help: bool,
@@ -290,6 +338,7 @@ impl App {
             last_cycles_considered: 0,
             last_profitable_count: 0,
             last_best_profit_wei: None,
+            hf_candidates: Vec::new(),
             should_quit: false,
             snapshot_refresh_pending: false,
             show_help: false,
@@ -519,11 +568,7 @@ impl App {
         match self.tab {
             Tab::Trades => self.trade_history.len(),
             Tab::Opportunities => self.route_view_indices.len(),
-            Tab::Simulations => self
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.simulations.len())
-                .unwrap_or(0),
+            Tab::Simulations => self.hf_candidates.len(),
             Tab::Portfolio => self
                 .snapshot
                 .as_ref()
@@ -544,6 +589,15 @@ impl App {
     }
 
     pub fn register_trade_outcome(&mut self, outcome: ExecutionOutcome, route_fingerprint: u64) {
+        let route_status = match &outcome {
+            ExecutionOutcome::Confirmed { .. } => Some(RouteStatus::Executed),
+            ExecutionOutcome::SkippedQuarantined => Some(RouteStatus::Quarantined),
+            ExecutionOutcome::DryRunPassed { .. } => Some(RouteStatus::Hot),
+            ExecutionOutcome::DryRunFailed { .. }
+            | ExecutionOutcome::SkippedUnprofitablePreDryRun
+            | ExecutionOutcome::SkippedUnprofitableAfterDryRun => Some(RouteStatus::Ignored),
+            _ => None,
+        };
         let (severity, outcome_label, gas_used, tx_hash, profit_wei) = match outcome {
             ExecutionOutcome::DryRunPassed { gas_used } => (
                 Severity::Info,
@@ -658,8 +712,45 @@ impl App {
             profit_wei,
             severity,
         });
+        self.apply_outcome_to_routes(route_fingerprint, &outcome_label, severity, route_status);
         // ponytail: outcome_label only; fingerprint visible in Trade History panel
         self.push_activity(severity, outcome_label);
+    }
+
+    fn apply_outcome_to_routes(
+        &mut self,
+        fingerprint: u64,
+        outcome_label: &str,
+        severity: Severity,
+        route_status: Option<RouteStatus>,
+    ) {
+        for row in &mut self.hf_candidates {
+            if row.fingerprint == fingerprint {
+                row.outcome = Some(outcome_label.to_string());
+                row.outcome_severity = severity;
+            }
+        }
+        let Some(status) = route_status else {
+            return;
+        };
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            let snapshot = Arc::make_mut(snapshot);
+            if let Some(routes) = Arc::get_mut(&mut snapshot.opportunities) {
+                for route in routes.iter_mut() {
+                    if route.fingerprint == fingerprint {
+                        route.status = status;
+                    }
+                }
+            } else {
+                let mut routes = snapshot.opportunities.as_ref().clone();
+                for route in routes.iter_mut() {
+                    if route.fingerprint == fingerprint {
+                        route.status = status;
+                    }
+                }
+                snapshot.opportunities = Arc::new(routes);
+            }
+        }
     }
 
     pub fn apply_lf_sample(&mut self, cycles: usize, search_ms: u64, _discoveries: usize) {
@@ -681,11 +772,34 @@ impl App {
         profitable_count: usize,
         best_profit_wei: &str,
         elapsed_ms: u64,
+        candidates: Vec<HfCandidateUiRow>,
     ) {
         self.last_cycles_considered = cycles_considered;
         self.last_profitable_count = profitable_count;
         self.last_hf_ms = elapsed_ms;
         self.last_best_profit_wei = Some(best_profit_wei.to_string());
+        // Preserve outcomes already observed for the same fingerprints this session.
+        let prior_outcomes: rustc_hash::FxHashMap<u64, (Option<String>, Severity)> = self
+            .hf_candidates
+            .iter()
+            .filter_map(|r| {
+                r.outcome
+                    .as_ref()
+                    .map(|o| (r.fingerprint, (Some(o.clone()), r.outcome_severity)))
+            })
+            .collect();
+        self.hf_candidates = candidates
+            .into_iter()
+            .map(|c| {
+                let mut row = HfPipelineRow::from_hf_candidate(c);
+                if let Some((outcome, sev)) = prior_outcomes.get(&row.fingerprint) {
+                    row.outcome = outcome.clone();
+                    row.outcome_severity = *sev;
+                }
+                row
+            })
+            .collect();
+        self.overlay_opportunity_status_from_hf();
         if let Some(snapshot) = self.snapshot.as_mut() {
             let snapshot = Arc::make_mut(snapshot);
             snapshot.overview.profitable_routes = profitable_count;
@@ -693,6 +807,53 @@ impl App {
         }
         push_series(&mut self.chart_profitable, profitable_count as u64, 120);
         // ponytail: HF metrics on Yielding card + sparkline; activity would be redundant
+    }
+
+    fn overlay_opportunity_status_from_hf(&mut self) {
+        let hot: rustc_hash::FxHashSet<u64> = self
+            .hf_candidates
+            .iter()
+            .filter(|r| r.should_execute && !r.near_miss)
+            .map(|r| r.fingerprint)
+            .collect();
+        let near: rustc_hash::FxHashSet<u64> = self
+            .hf_candidates
+            .iter()
+            .filter(|r| r.near_miss)
+            .map(|r| r.fingerprint)
+            .collect();
+        if hot.is_empty() && near.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        let snapshot = Arc::make_mut(snapshot);
+        let mut routes = snapshot.opportunities.as_ref().clone();
+        for route in routes.iter_mut() {
+            if matches!(
+                route.status,
+                RouteStatus::Executed | RouteStatus::Quarantined | RouteStatus::Ignored
+            ) {
+                continue;
+            }
+            if hot.contains(&route.fingerprint) {
+                route.status = RouteStatus::Hot;
+            } else if near.contains(&route.fingerprint) {
+                route.status = RouteStatus::Ignored;
+            } else if route.status == RouteStatus::Hot {
+                // Previous tick's dispatch queue no longer active.
+                route.status = RouteStatus::New;
+            }
+        }
+        snapshot.opportunities = Arc::new(routes);
+    }
+
+    #[must_use]
+    pub fn hf_candidate_for(&self, fingerprint: u64) -> Option<&HfPipelineRow> {
+        self.hf_candidates
+            .iter()
+            .find(|r| r.fingerprint == fingerprint)
     }
 
     pub fn apply_gas_sample(&mut self, gwei: f64) {
@@ -892,7 +1053,7 @@ mod tests {
         );
         assert!(app.chart_profitable.is_empty());
 
-        app.apply_hf_sample(9, 3, "100", 7);
+        app.apply_hf_sample(9, 3, "100", 7, Vec::new());
         assert_eq!(app.last_cycle_count, 17);
         assert_eq!(app.last_cycles_considered, 9);
         assert_eq!(app.last_search_ms, 23);
@@ -913,6 +1074,114 @@ mod tests {
         assert_eq!(
             app.chart_search_ms.iter().copied().collect::<Vec<_>>(),
             [23]
+        );
+    }
+
+    #[test]
+    fn hf_candidates_drive_pipeline_tab_and_status_overlay() {
+        use crate::core::types::FlashLoanSource;
+        use crate::orchestrator::hf::HfCandidateUiRow;
+        use alloy::primitives::U256;
+
+        let mut app = App::new();
+        app.set_snapshot(Arc::new(DashboardSnapshot {
+            generation: 1,
+            captured_at: Instant::now(),
+            overview: OverviewSnapshot {
+                uptime: Duration::ZERO,
+                total_trades: 0,
+                total_losses: 0,
+                daily_pnl_wei: 0,
+                profitable_routes: 0,
+                discovered_pools: 0,
+                routable_pools: 0,
+                cycle_count: 0,
+                search_ms: 0,
+                hf_ms: 0,
+                gas_gwei: None,
+                win_rate: 0.0,
+                snapshot_age_ms: 0,
+                rates_age_ms: 0,
+            },
+            graph: GraphSnapshot {
+                health: GraphHealth {
+                    graph_generation: 0,
+                    token_count: 0,
+                    pool_count: 0,
+                    top_out_degree: 0,
+                    protocol_count: 0,
+                    indexer_lag_blocks: 0,
+                    hypersync_height: None,
+                    stale_indexer: false,
+                },
+                protocol_counts: Vec::new(),
+                hubs: Vec::new(),
+                recent_discoveries: Vec::new(),
+            },
+            opportunities: Arc::new(vec![RouteSummary {
+                fingerprint: 0xabc,
+                route: "a->b".into(),
+                route_detail: String::new(),
+                search_blob: "a->b".into(),
+                protocols: "V2".into(),
+                tokens: Vec::new(),
+                hops: 2,
+                raw_score: 1.0,
+                rescored: 1.0,
+                amount_in_token: "1".into(),
+                amount_in_matic: 1.0,
+                amount_out_token: "1".into(),
+                profit_matic: 0.1,
+                net_profit_matic: 0.05,
+                profit_usd: 0.0,
+                gas_estimate: 200_000,
+                risk_score: 10,
+                liquidity_score: 90,
+                long_tail: false,
+                status: RouteStatus::New,
+            }]),
+            simulations: Arc::new(Vec::new()),
+            portfolio: Vec::new(),
+            diagnostics: Vec::new(),
+            config: Vec::new(),
+        }));
+
+        app.apply_hf_sample(
+            4,
+            1,
+            "100",
+            12,
+            vec![HfCandidateUiRow {
+                fingerprint: 0xabc,
+                hops: 2,
+                route: "a->b".into(),
+                amount_in: U256::from(1u64),
+                amount_out: U256::from(2u64),
+                gross_profit: U256::from(1u64),
+                net_profit_matic_wei: U256::from(10u64).pow(U256::from(16u64)),
+                gas: 210_000,
+                flash: FlashLoanSource::AaveV3,
+                should_execute: true,
+                reject_reason: None,
+                slip_bps: 50,
+                near_miss: false,
+            }],
+        );
+        assert_eq!(app.hf_candidates.len(), 1);
+        assert_eq!(app.hf_candidates[0].flash, "aave");
+        assert!(app.hf_candidates[0].should_execute);
+        app.tab = Tab::Simulations;
+        assert_eq!(app.current_rows_len(), 1);
+        let status = app.snapshot.as_ref().unwrap().opportunities[0].status;
+        assert_eq!(status, RouteStatus::Hot);
+
+        app.register_trade_outcome(
+            ExecutionOutcome::DryRunPassed { gas_used: 200_000 },
+            0xabc,
+        );
+        assert_eq!(
+            app.hf_candidates[0].outcome.as_deref(),
+            Some("dry-run passed")
         );
     }
 }

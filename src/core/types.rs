@@ -403,6 +403,18 @@ pub enum FlashLoanSource {
     Direct,
 }
 
+impl FlashLoanSource {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Balancer => "balancer",
+            Self::AaveV3 => "aave",
+            Self::Dodo => "dodo",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProfitAssessment {
     pub should_execute: bool,

@@ -198,19 +198,39 @@ pub fn check_sim_sanity(input: SimSanityInput) -> Result<(), SimSanityReject> {
 
     // Brent pinned at the search floor with non-trivial profit → corrupt bounds/state.
     // Skip for tickless CL cap trades sized at the decimal-aware probe (below economic floor).
-    if !tickless_cap_trade {
-        let pin_tolerance = input.search_low / U256::from(50u64); // relaxed 2x for Balancer/Curve edge cases
-        let pin_ceiling = input
-            .search_low
-            .saturating_add(pin_tolerance.max(U256::from(1u8)));
-        if input.amount_in <= pin_ceiling
-            && input.gross_profit > input.amount_in / U256::from(20u64)
-        {
-            return Err(SimSanityReject::OptimizerPinnedAtFloor);
-        }
+    if !tickless_cap_trade && optimizer_pinned_at_floor(input) {
+        return Err(SimSanityReject::OptimizerPinnedAtFloor);
     }
 
     Ok(())
+}
+
+/// Upper bound of the "stuck at search_low" band used by [`optimizer_pinned_at_floor`].
+///
+/// Returns `None` when pin detection is disabled (`search_low == 0`, used by probe
+/// fallback and dispatch retry). Previously `search_low=0` still set ceiling to 1 wei
+/// and could reject micro-sized amounts — that defeated the disable signal.
+#[must_use]
+#[inline]
+pub fn optimizer_pin_ceiling(search_low: U256) -> Option<U256> {
+    if search_low.is_zero() {
+        return None;
+    }
+    // ±2% band above the floor (was 1% = /100; comment "relaxed 2×" → /50).
+    let tol = (search_low / U256::from(50u64)).max(U256::ONE);
+    Some(search_low.saturating_add(tol))
+}
+
+/// True when amount sits on the optimizer floor with ROI that looks like a stuck search
+/// rather than a deliberate size (profit > 5% of input).
+#[must_use]
+#[inline]
+pub fn optimizer_pinned_at_floor(input: SimSanityInput) -> bool {
+    let Some(pin_ceiling) = optimizer_pin_ceiling(input.search_low) else {
+        return false;
+    };
+    input.amount_in <= pin_ceiling
+        && input.gross_profit > input.amount_in / U256::from(20u64)
 }
 
 /// Dispatch/Brent final check: pinned-at-floor can be a real high-ROI arb on shallow pools.
@@ -341,6 +361,45 @@ mod tests {
             check_sim_sanity(dispatch_mismatch),
             Err(SimSanityReject::OptimizerPinnedAtFloor)
         ));
+    }
+
+    #[test]
+    fn zero_search_low_disables_pin_ceiling_entirely() {
+        // Probe fallback / dispatch retry set search_low=0 to clear the pin heuristic.
+        // Ceiling must not fall back to 1 wei and still fire on small amount_in.
+        let rate = U256::from(10u128.pow(18));
+        let economic = min_economic_amount_in(18, rate);
+        let amount_in = economic;
+        // High ROI at the floor — would trip pin if search_low were economic.
+        let profit = amount_in / U256::from(5u64);
+        let input = SimSanityInput {
+            amount_in,
+            gross_profit: profit,
+            search_low: U256::ZERO,
+            token_decimals: 18,
+            token_to_matic_rate: rate,
+        };
+        assert_eq!(optimizer_pin_ceiling(U256::ZERO), None);
+        assert!(!optimizer_pinned_at_floor(input));
+        assert!(
+            check_sim_sanity(input).is_ok(),
+            "search_low=0 must fully disable pin (not ceiling=1 wei)"
+        );
+        assert!(matches!(
+            check_sim_sanity(SimSanityInput {
+                search_low: economic,
+                ..input
+            }),
+            Err(SimSanityReject::OptimizerPinnedAtFloor)
+        ));
+    }
+
+    #[test]
+    fn pin_ceiling_is_two_percent_above_search_low() {
+        let low = U256::from(10_000u64);
+        let ceiling = optimizer_pin_ceiling(low).expect("enabled");
+        // low + low/50 = 10000 + 200
+        assert_eq!(ceiling, U256::from(10_200u64));
     }
 
     #[test]

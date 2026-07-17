@@ -341,24 +341,24 @@ fn compute_ternary_search_bounds(
         min_capacity = ONE * U256::from(100u8);
     }
 
+    // Search window: ~0.02%–10% of bottleneck hop capacity (start-token units).
+    // Former max_search_low/high clamps were dead (low always < max_low, high always < max_high).
     let mut low = min_capacity / U256::from(5000u16);
     let mut high = min_capacity / U256::from(10u8);
 
-    let max_search_low = min_capacity / U256::from(50u8);
-    let max_search_high = min_capacity / U256::from(5u8);
-    if low > max_search_low {
-        low = max_search_low;
-    }
-    if high > max_search_high {
-        high = max_search_high;
-    }
+    // Resolve flash USD ceiling once (was recomputed on every clamp site).
+    let flash_cap_wei = if start_rate.is_zero() {
+        None
+    } else {
+        flash_cap_params.cap_wei()
+    };
 
     if !start_rate.is_zero() {
         let min_economic = min_economic_amount_in(start_decimals, start_rate);
-        if min_economic <= max_search_low && low < min_economic {
+        if low < min_economic {
             low = min_economic;
         }
-        if let Some(max_wei) = flash_cap_params.cap_wei()
+        if let Some(max_wei) = flash_cap_wei
             && high > max_wei
         {
             record_ternary_flash_cap_clamp();
@@ -402,8 +402,7 @@ fn compute_ternary_search_bounds(
     if out_high < economic_floor {
         record_ternary_economic_high_raise();
         out_high = economic_floor.saturating_mul(U256::from(100u8));
-        if !start_rate.is_zero()
-            && let Some(max_wei) = flash_cap_params.cap_wei()
+        if let Some(max_wei) = flash_cap_wei
             && out_high > max_wei
         {
             record_ternary_flash_cap_clamp();

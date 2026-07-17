@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use crate::config::AppConfig;
 use crate::config::WalletSecrets;
 use crate::core::constants::BPS_SCALE;
-use crate::core::types::{FoundCycle, ProtocolType};
+use crate::core::types::{FlashLoanSource, FoundCycle, ProtocolType};
 use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
@@ -57,11 +57,86 @@ pub struct HfContext {
     pub inactive_rotation: parking_lot::Mutex<InactiveCycleRotation>,
 }
 
+/// Compact HF assess/dispatch row for the TUI (built only from already-evaluated results).
+#[derive(Debug, Clone)]
+pub struct HfCandidateUiRow {
+    pub fingerprint: u64,
+    pub hops: u32,
+    pub route: String,
+    pub amount_in: U256,
+    pub amount_out: U256,
+    pub gross_profit: U256,
+    pub net_profit_matic_wei: U256,
+    pub gas: u32,
+    pub flash: FlashLoanSource,
+    pub should_execute: bool,
+    pub reject_reason: Option<String>,
+    pub slip_bps: u64,
+    /// True when this row is a near-miss (positive net but gate rejected), not a dispatch queue entry.
+    pub near_miss: bool,
+}
+
 pub struct HfTickResult {
     pub cycles_considered: usize,
     pub profitable_count: usize,
     pub best_profit: U256,
     pub elapsed_ms: u64,
+    /// Dispatch queue (and optional single near-miss when queue empty). Cheap summaries only.
+    pub candidates: Vec<HfCandidateUiRow>,
+}
+
+impl Default for HfTickResult {
+    fn default() -> Self {
+        Self {
+            cycles_considered: 0,
+            profitable_count: 0,
+            best_profit: U256::ZERO,
+            elapsed_ms: 0,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+fn hf_eval_to_ui_row(
+    arena: &StateArena,
+    pool_metas: &[PoolMeta],
+    result: &HfEvalResult,
+    near_miss: bool,
+) -> HfCandidateUiRow {
+    HfCandidateUiRow {
+        fingerprint: result.route_fingerprint,
+        hops: result.cycle.hop_count,
+        route: near_miss_route_summary(arena, &result.cycle, pool_metas),
+        amount_in: result.sim.amount_in,
+        amount_out: result.sim.amount_out,
+        gross_profit: result.assessment.gross_profit,
+        net_profit_matic_wei: result.assessment.net_profit_after_gas_matic_wei,
+        gas: result.sim.total_gas,
+        flash: result.flash_source,
+        should_execute: result.assessment.should_execute,
+        reject_reason: result.assessment.reject_reason.clone(),
+        slip_bps: result.effective_slippage_bps,
+        near_miss,
+    }
+}
+
+/// Build TUI rows from the post-verify dispatch list (+ optional near-miss when empty).
+fn build_hf_candidate_ui_rows(
+    arena: &StateArena,
+    pool_metas: &[PoolMeta],
+    dispatch: &[HfEvalResult],
+    near_miss: Option<&HfEvalResult>,
+) -> Vec<HfCandidateUiRow> {
+    let mut out = Vec::with_capacity(dispatch.len().saturating_add(usize::from(near_miss.is_some())));
+    for result in dispatch {
+        out.push(hf_eval_to_ui_row(arena, pool_metas, result, false));
+    }
+    if out.is_empty()
+        && let Some(miss) = near_miss
+    {
+        out.push(hf_eval_to_ui_row(arena, pool_metas, miss, true));
+    }
+    out
 }
 
 const HF_ACTIVITY_WINDOW_MS: u64 = 300_000;
@@ -246,6 +321,7 @@ fn hf_reselect_from_snapshot(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: 0,
+            candidates: Vec::new(),
         });
     }
     let _ = selection_generation;
@@ -529,7 +605,8 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: 0,
-            });
+            candidates: Vec::new(),
+        });
         }
     }
 
@@ -545,6 +622,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
+            candidates: Vec::new(),
         });
     }
 
@@ -598,6 +676,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
+            candidates: Vec::new(),
         });
     }
     let mut hot_pools = hot_pools_arc_from_set(
@@ -614,6 +693,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
+            candidates: Vec::new(),
         });
     };
     let gas_price = compute_conservative_gas_price(gas_snapshot);
@@ -654,7 +734,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                });
+            candidates: Vec::new(),
+        });
             }
         }
     }
@@ -705,7 +786,8 @@ pub async fn run_hf_tick(
                             profitable_count: 0,
                             best_profit: U256::ZERO,
                             elapsed_ms: now_ms().saturating_sub(start),
-                        });
+            candidates: Vec::new(),
+        });
                     }
                 }
                 Ok(Err(e)) => {
@@ -715,7 +797,8 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                    });
+            candidates: Vec::new(),
+        });
                 }
                 Err(_) => {
                     crate::warn!(
@@ -727,7 +810,8 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                    });
+            candidates: Vec::new(),
+        });
                 }
             }
         } else if flushed > 0 {
@@ -811,7 +895,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                });
+            candidates: Vec::new(),
+        });
             }
         }
     }
@@ -861,7 +946,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                });
+            candidates: Vec::new(),
+        });
             }
             Err(_) => {
                 warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
@@ -870,7 +956,8 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                });
+            candidates: Vec::new(),
+        });
             }
         },
     };
@@ -919,7 +1006,8 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: now_ms().saturating_sub(start),
-            });
+            candidates: Vec::new(),
+        });
         }
     };
     ctx.inactive_rotation
@@ -1145,6 +1233,15 @@ pub async fn run_hf_tick(
         }
     }
 
+    // UI rows from already-evaluated results only (no extra sims). Built before
+    // dispatch moves `profitable`; cost is O(dispatch size) short strings.
+    let candidates = build_hf_candidate_ui_rows(
+        eval_arena.as_ref(),
+        pool_metas_for_dispatch.as_ref(),
+        &profitable,
+        best_near_miss.as_ref(),
+    );
+
     if profitable_count > 0 {
         dispatch_profitable_candidates(
             &ctx,
@@ -1169,6 +1266,7 @@ pub async fn run_hf_tick(
         profitable_count,
         best_profit: best_profit_matic,
         elapsed_ms,
+        candidates,
     };
 
     ctx.ui_hook.on_hf_tick(&tick_result, cycles_considered);

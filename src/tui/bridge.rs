@@ -127,6 +127,8 @@ impl PipelineUiHook for TuiBridgeHook {
             profitable_count: result.profitable_count,
             best_profit_wei: result.best_profit.to_string(),
             elapsed_ms: result.elapsed_ms,
+            // Clone is O(dispatch size); same payload already built on the HF tick.
+            candidates: result.candidates.clone(),
         });
     }
 

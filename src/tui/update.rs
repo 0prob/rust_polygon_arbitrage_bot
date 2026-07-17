@@ -52,12 +52,14 @@ pub fn apply_event(app: &mut App, event: UiEvent) {
             profitable_count,
             best_profit_wei,
             elapsed_ms,
+            candidates,
         } => {
             app.apply_hf_sample(
                 cycles_considered,
                 profitable_count,
                 &best_profit_wei,
                 elapsed_ms,
+                candidates,
             );
         }
         UiEvent::GasUpdate { gwei } => {
@@ -457,7 +459,11 @@ fn build_routes(
                 hop_count: cycle.hop_count,
                 min_profit_matic_wei: U256::ZERO,
                 min_profit_roi_bps: 0,
-                slippage_bps,
+                // assess_profit expects route-level slip (compound per-hop config).
+                slippage_bps: crate::services::execution::profit::compound_slippage_bps(
+                    slippage_bps,
+                    cycle.hop_count,
+                ),
                 flash_loan_source: FlashLoanSource::Balancer,
                 safety_multiplier_bps,
                 profit_priority_alpha_bps: 0,

@@ -246,6 +246,8 @@ pub struct HfEvalResult {
     pub sim: RouteSimulationResult,
     pub assessment: ProfitAssessment,
     pub effective_slippage_bps: u64,
+    /// Flash source used for the assessment (and intended dispatch path).
+    pub flash_source: FlashLoanSource,
     /// Set when `filter_balancer_onchain_verified` already ran `queryBatchSwap`.
     pub balancer_batch_verified: bool,
 }
@@ -526,7 +528,8 @@ fn rank_one_cycle_probe(
 
     let depth_bps =
         depth_impact_slippage_bps_with_base(arena, &cycle.edges, probe_amount, Some(&probe));
-    let effective_slip = effective_slippage_bps(slippage_bps, depth_bps);
+    let effective_slip =
+        effective_slippage_bps(slippage_bps, cycle.edges.len() as u32, depth_bps);
 
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
@@ -1137,13 +1140,14 @@ fn evaluate_one(
         inc(&stats.flash_source);
         return None;
     };
+    let hop_count = cycle.edges.len() as u32;
     let brent_slippage = probe_seed
         .map(|(amount, sim)| {
             let depth =
                 depth_impact_slippage_bps_with_base(input.arena, &cycle.edges, amount, Some(&sim));
-            effective_slippage_bps(input.slippage_bps, depth)
+            effective_slippage_bps(input.slippage_bps, hop_count, depth)
         })
-        .unwrap_or(base_slippage);
+        .unwrap_or_else(|| effective_slippage_bps(base_slippage, hop_count, 0));
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
@@ -1234,8 +1238,9 @@ fn evaluate_one(
             total_gas: sim.total_gas,
         }),
     );
-    let mut slippage_bps = effective_slippage_bps(input.slippage_bps, depth_bps);
-    let mut assessment = if slippage_bps > base_slippage {
+    let mut slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
+    let config_route_slip = effective_slippage_bps(base_slippage, hop_count, 0);
+    let mut assessment = if slippage_bps > config_route_slip {
         let depth_assessment =
             assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
         if depth_assessment.should_execute {
@@ -1285,7 +1290,7 @@ fn evaluate_one(
                         total_gas: sim.total_gas,
                     }),
                 );
-                slippage_bps = effective_slippage_bps(input.slippage_bps, depth_bps);
+                slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
             }
             assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
         }
@@ -1311,6 +1316,7 @@ fn evaluate_one(
         sim,
         assessment,
         effective_slippage_bps: slippage_bps,
+        flash_source,
         balancer_batch_verified: false,
     })
 }
@@ -1322,12 +1328,13 @@ pub fn reassess_hf_eval_result(
     input: &HfEvalInput<'_>,
     flash_source: FlashLoanSource,
 ) -> Option<ProfitAssessment> {
+    // `effective_slippage_bps` is already route-level (config compounded + depth).
     assess_route_for_cycle(
         input,
         &result.sim,
         &result.cycle,
         result.route_fingerprint,
-        result.effective_slippage_bps.max(input.slippage_bps),
+        result.effective_slippage_bps,
         flash_source,
     )
 }
