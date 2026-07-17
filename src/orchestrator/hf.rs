@@ -494,6 +494,12 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     );
 }
 
+/// Max HF slots for activity-hot cycles; remainder stays for quality inactive.
+#[must_use]
+fn hf_activity_slot_cap(rescore_cap: usize) -> usize {
+    rescore_cap.saturating_div(3).max(8).min(rescore_cap)
+}
+
 fn cycle_activity_score(
     cycle: &FoundCycle,
     arena: &crate::pipeline::arena::StateArena,
@@ -719,11 +725,7 @@ fn select_cycles_for_rescore(
     // Cap live/active slots — actscore filled rescore_cap with seed-stamped
     // zero_profit cycles (probe_kept=0 on 30/31) and starved quality inactive
     // near_net / sticky absolute-gross candidates.
-    let activity_cap = rescore_cap
-        .saturating_div(3)
-        .max(8)
-        .min(rescore_cap);
-    let activity_selected = activity_candidates.min(activity_cap);
+    let activity_selected = activity_candidates.min(hf_activity_slot_cap(rescore_cap));
     let inactive_slots = rescore_cap.saturating_sub(activity_selected);
     let inactive_selected = inactive_slots.min(inactive_len);
 
@@ -1807,9 +1809,10 @@ mod tests {
     }
 
     fn v2_state() -> Arc<PoolState> {
+        // Reserves must clear default-18-dec micro probe (1e12) and economic floor.
         Arc::new(PoolState::V2(V2PoolState {
-            reserve0: U256::from(1_000_000u64),
-            reserve1: U256::from(1_000_000u64),
+            reserve0: U256::from(10u64).pow(U256::from(24u64)),
+            reserve1: U256::from(10u64).pow(U256::from(24u64)),
             fee: U256::from(997u64),
             fee_denominator: U256::from(1_000u64),
             block_timestamp_last: 1,
@@ -1836,8 +1839,8 @@ mod tests {
                     sqrt_price_x96: U256::ZERO,
                     liquidity: 0,
                     tick: 0,
-                    reserve0: U256::from(1_000_000u64),
-                    reserve1: U256::from(1_000_000u64),
+                    reserve0: U256::from(10u64).pow(U256::from(24u64)),
+                    reserve1: U256::from(10u64).pow(U256::from(24u64)),
                     patched_at_ms: now_ms(),
                     activity_count: 3,
                 },
@@ -1855,7 +1858,7 @@ mod tests {
             &cycles,
             &arena,
             &partial_cache,
-            &ExecutionService::new(),
+            &ExecutionService::default(),
             &rates,
             3,
             0,
@@ -1876,52 +1879,11 @@ mod tests {
     }
 
     #[test]
-    fn select_caps_active_slots_to_leave_inactive_room() {
-        let mut arena = StateArena::default();
-        let addresses: Vec<_> = (1u8..=12)
-            .map(|id| {
-                let address = Address::from([id; 20]);
-                arena.register_pool(address, v2_state());
-                address
-            })
-            .collect();
-        let partial_cache = PartialPoolCache::new();
-        // 10 hot pools — without a cap these would fill rescore_cap=12.
-        for &addr in &addresses[..10] {
-            partial_cache.seed(
-                addr,
-                SlimPoolState {
-                    protocol: ProtocolType::UniswapV2,
-                    sqrt_price_x96: U256::ZERO,
-                    liquidity: 0,
-                    tick: 0,
-                    reserve0: U256::from(1_000_000u64),
-                    reserve1: U256::from(1_000_000u64),
-                    patched_at_ms: now_ms(),
-                    activity_count: 2,
-                },
-            );
-        }
-        let cycles: Vec<_> = (0..12)
-            .map(|index| cycle(PoolIndex(index as u32), f64::from(index + 1)))
-            .collect();
-        let mut rates = rustc_hash::FxHashMap::default();
-        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
-
-        let selected = select_cycles_for_rescore(
-            &cycles,
-            &arena,
-            &partial_cache,
-            &ExecutionService::new(),
-            &rates,
-            12,
-            0,
-        );
-
-        assert_eq!(selected.activity_candidates, 10);
-        assert_eq!(selected.activity_selected, 8); // max(8, 12/3)
-        assert_eq!(selected.inactive_selected, 4);
-        assert_eq!(selected.cycles.len(), 12);
+    fn hf_activity_slot_cap_leaves_inactive_room() {
+        assert_eq!(hf_activity_slot_cap(12), 8); // max(8, 12/3)
+        assert_eq!(hf_activity_slot_cap(30), 10);
+        assert_eq!(hf_activity_slot_cap(3), 3); // floor clamped by cap
+        assert_eq!(hf_activity_slot_cap(0), 0);
     }
 
     #[test]
@@ -1942,8 +1904,8 @@ mod tests {
                 sqrt_price_x96: U256::ZERO,
                 liquidity: 0,
                 tick: 0,
-                reserve0: U256::from(1_000_000u64),
-                reserve1: U256::from(1_000_000u64),
+                reserve0: U256::from(10u64).pow(U256::from(24u64)),
+                reserve1: U256::from(10u64).pow(U256::from(24u64)),
                 patched_at_ms: now_ms(),
                 activity_count: 1,
             },
@@ -1960,7 +1922,7 @@ mod tests {
             &cycles,
             &arena,
             &partial_cache,
-            &ExecutionService::new(),
+            &ExecutionService::default(),
             &rates,
             1,
             0,

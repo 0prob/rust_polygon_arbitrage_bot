@@ -1,5 +1,0 @@
-# cargo-audit configuration
-# capnp advisory is transitive via hypersync-client, not in our execution path.
-# Remove when hypersync-client upgrades to capnp >= 0.24.0
-[advisories]
-ignore = ["RUSTSEC-2025-0143"]

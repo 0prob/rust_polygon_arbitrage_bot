@@ -672,6 +672,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .collect()
     };
     let force_cycle_refind = !observed_pool_indices.is_empty();
+    // Keep a copy — post-CPU `finalize_enumerated_cycles` was dropping pinned
+    // live cycles (forceenum: pinned_cycles≤14 in CPU, cycles_touching=0 after).
+    let observed_pin = observed_pool_indices.clone();
     let cpu_work = LfCpuWork {
         graph_cache: Arc::clone(&ctx.graph_cache),
         cache: Arc::clone(&ctx.cache),
@@ -835,6 +838,25 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     let finalize_started = crate::util::now_ms();
     let mut capped = (*cycles_arc).clone();
+    // Hold topic-live cycles aside before post-hydrate dead prune — rescore was
+    // zeroing them out (repin: CPU pinned_cycles≤23, post-filter touching=0).
+    let observed_pin_set: rustc_hash::FxHashSet<PoolIndex> =
+        observed_pin.iter().copied().collect();
+    let mut live_held = Vec::new();
+    if !observed_pin_set.is_empty() {
+        capped.retain(|cycle| {
+            let touch = cycle
+                .edges
+                .iter()
+                .any(|edge| observed_pin_set.contains(&edge.pool_index));
+            if touch {
+                live_held.push(cycle.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
@@ -848,7 +870,38 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // (batch mints) can rotate/retain cycles on the same LF tick.
     // ponytail: rescore reorders by score and would undo enumeration-time protocol
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
-    capped = finalize_enumerated_cycles(capped, max_paths);
+    capped = finalize_enumerated_cycles(capped, max_paths.saturating_sub(live_held.len()));
+    if !live_held.is_empty() {
+        live_held.sort_by(crate::pipeline::types::compare_cycle_score);
+        live_held.truncate(32);
+        let mut seen: rustc_hash::FxHashSet<u64> = live_held
+            .iter()
+            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+            .collect();
+        let mut merged = live_held;
+        for cycle in capped {
+            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+            if seen.insert(key) {
+                merged.push(cycle);
+                if merged.len() >= max_paths {
+                    break;
+                }
+            }
+        }
+        crate::info!(
+            "stream observed-live: live_held={} snap_total={}",
+            merged
+                .iter()
+                .filter(|c| {
+                    c.edges
+                        .iter()
+                        .any(|e| observed_pin_set.contains(&e.pool_index))
+                })
+                .count(),
+            merged.len()
+        );
+        capped = merged;
+    }
     let finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
 
     let rates_started = crate::util::now_ms();
@@ -879,7 +932,58 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     };
     let rates = merge_token_rates(&prior_rates, &cycle_tokens_set, fresh_rates);
     let rates_built_at = std::time::Instant::now();
+    // Priced-start filter can drop live-held cycles whose start token is still
+    // warming — pull them aside, filter the rest, then restore priced live ones.
+    let mut live_for_rates = Vec::new();
+    if !observed_pin_set.is_empty() {
+        capped.retain(|cycle| {
+            let touch = cycle
+                .edges
+                .iter()
+                .any(|edge| observed_pin_set.contains(&edge.pool_index));
+            if touch {
+                live_for_rates.push(cycle.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
     retain_cycles_with_priced_start(&mut capped, rates.as_ref());
+    retain_cycles_with_priced_start(&mut live_for_rates, rates.as_ref());
+    if !live_for_rates.is_empty() {
+        let mut seen: rustc_hash::FxHashSet<u64> = live_for_rates
+            .iter()
+            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+            .collect();
+        let mut merged = live_for_rates;
+        for cycle in capped {
+            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+            if seen.insert(key) {
+                merged.push(cycle);
+                if merged.len() >= max_paths {
+                    break;
+                }
+            }
+        }
+        capped = merged;
+    }
+    if !observed_pin.is_empty() {
+        let touching = capped
+            .iter()
+            .filter(|cycle| {
+                cycle
+                    .edges
+                    .iter()
+                    .any(|edge| observed_pin_set.contains(&edge.pool_index))
+            })
+            .count();
+        crate::info!(
+            "stream observed-live: cycles_touching={touching}/{} observed_pools={}",
+            capped.len(),
+            observed_pin.len()
+        );
+    }
     if rates.len() > prior_rates.len() {
         let post_gate = GraphBuildGate {
             token_to_matic_rates: Arc::clone(&rates),
