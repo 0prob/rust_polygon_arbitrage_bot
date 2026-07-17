@@ -48,15 +48,24 @@ pub fn curve_uses_receiver(pool_type: Option<&str>) -> bool {
     pool_type.is_some_and(|t| ic(t, "stable_ng"))
 }
 
-// ponytail: lookup table if new protocol variants become frequent
+// ponytail: lookup table if new protocol variants become frequent.
+// Must stay aligned with sol/src ArbExecutor protocol IDs:
+//   1 Uni V3, 2 Sushi V3, 3 Algebra/Quick V3, 4 Algebra Integral/Quick V4, 6 Ramses.
 #[must_use]
 pub fn v3_callback_protocol_id(label: Option<&str>) -> u8 {
     let Some(l) = label else { return 1 };
     if ic(l, "sushiswap_v3") || ic(l, "sushi_v3") {
         2
-    } else if ic(l, "quickswap_v4") || ic(l, "quick_v4") {
+    } else if ic(l, "ramses") {
+        6
+    } else if crate::core::protocol::is_algebra_integral_protocol_label(l) {
+        // QuickSwap V4 / Algebra Integral → algebraSwapCallback id 4
         4
-    } else if ic(l, "quickswap_v3") || ic(l, "quick_v3") {
+    } else if crate::core::protocol::is_algebra_protocol_label(l) {
+        // Any Algebra (incl. bare "algebra", quickswap_v3) → id 3.
+        // Prior path only matched "quickswap_v3"/"quick_v3", so labels like
+        // "ALGEBRA" / "ALGEBRA_V3" silently used Uni V3 callback id 1 and would
+        // fail factory verification / algebraSwapCallback dispatch.
         3
     } else {
         1
@@ -73,5 +82,28 @@ pub fn v2_callback_protocol_id(label: Option<&str>) -> u8 {
         9
     } else {
         7
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn algebra_labels_use_algebra_callback_ids() {
+        assert_eq!(v3_callback_protocol_id(Some("ALGEBRA")), 3);
+        assert_eq!(v3_callback_protocol_id(Some("ALGEBRA_V3")), 3);
+        assert_eq!(v3_callback_protocol_id(Some("QUICKSWAP_V3")), 3);
+        assert_eq!(v3_callback_protocol_id(Some("quick_v3")), 3);
+        assert_eq!(v3_callback_protocol_id(Some("QUICKSWAP_V4")), 4);
+        assert_eq!(v3_callback_protocol_id(Some("quick_v4")), 4);
+    }
+
+    #[test]
+    fn uni_sushi_ramses_v3_callback_ids() {
+        assert_eq!(v3_callback_protocol_id(None), 1);
+        assert_eq!(v3_callback_protocol_id(Some("UNISWAP_V3")), 1);
+        assert_eq!(v3_callback_protocol_id(Some("SUSHISWAP_V3")), 2);
+        assert_eq!(v3_callback_protocol_id(Some("RAMSES_V3")), 6);
     }
 }

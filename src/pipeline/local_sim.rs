@@ -189,7 +189,11 @@ fn simulate_hop(
             })
         }
         (PoolState::Dodo(s), ProtocolType::Dodo) => {
-            let out = get_dodo_amount_out(s, amount_in, edge.zero_for_one);
+            // Arena meta is always [base, quote]; sellBase iff token_in_idx == 0.
+            // Do not key off zero_for_one alone — encode uses on-chain base/quote
+            // and the two only agree after DODO meta canonicalization.
+            let base_to_quote = edge.token_in_idx == 0;
+            let out = get_dodo_amount_out(s, amount_in, base_to_quote);
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_DODO_HOP,
@@ -1428,5 +1432,48 @@ mod tests {
         assert!(!cd.is_empty());
         assert_ne!(route_hash, alloy::primitives::B256::ZERO);
         assert!(!packed_route.is_empty());
+    }
+
+    #[test]
+    fn dodo_sell_direction_follows_token_in_idx_not_zero_for_one() {
+        use crate::core::math::fixed_point::ONE;
+        use crate::core::types::{DodoPoolState, DodoRState, PoolIndex, TokenIndex};
+
+        let base = Address::repeat_byte(0x0b);
+        let quote = Address::repeat_byte(0x0a);
+        let state = PoolState::Dodo(DodoPoolState {
+            base_reserve: U256::from(1_000u64) * ONE,
+            quote_reserve: U256::from(2_000u64) * ONE,
+            base_token: base,
+            quote_token: quote,
+            base_target: U256::from(1_000u64) * ONE,
+            quote_target: U256::from(2_000u64) * ONE,
+            r_state: DodoRState::One,
+            i: ONE,
+            k: U256::ZERO,
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        });
+        // sellQuote: token_in_idx=1 (quote), even if zero_for_one is wrongly true.
+        let edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(1),
+            token_out: TokenIndex(0),
+            token_in_idx: 1,
+            token_out_idx: 0,
+            protocol: ProtocolType::Dodo,
+            fee_bps: 0,
+            zero_for_one: true,
+        };
+        let amount = U256::from(10u64) * ONE;
+        let out = simulate_hop_amount_out(&state, &edge, amount).expect("sellQuote");
+        // k=0, i=1 ⇒ out = min(amount, base_reserve) for sellQuote.
+        assert_eq!(out, amount);
+        // sellBase would pay base into a 2000-quote pool at i=1 → 10 quote, same amount here;
+        // distinguish by exhausting quote capacity: sellQuote of 1500 base-units of quote
+        // is capped by base_reserve (1000) via the k=0 branch.
+        let big = U256::from(1_500u64) * ONE;
+        let out_big = simulate_hop_amount_out(&state, &edge, big).expect("capped sellQuote");
+        assert_eq!(out_big, U256::from(1_000u64) * ONE);
     }
 }

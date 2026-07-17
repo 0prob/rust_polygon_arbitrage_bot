@@ -366,10 +366,11 @@ impl StateArena {
             }
             // ponytail: borrow token addresses instead of cloning Vec — most
             // pools use the discovery order, and state-hydrated tokens (Balancer,
-            // Woofi) can be borrowed directly. Dodo canonicalization is the only
-            // case that allocates (rare — discovery order matches on-chain 99%+).
+            // Woofi) can be borrowed directly. Dodo always allocates: meta order
+            // must be [base, quote] so token_in_idx 0 ⇔ sellBase matches sim,
+            // capacity, and encode (indexer discovery order is not authoritative).
             let token_addrs: &[Address];
-            let dodo_owned; // extends lifetime of the rare Dodo canonicalization vec
+            let dodo_owned; // extends lifetime of the Dodo [base, quote] vec
             match state.as_ref() {
                 PoolState::Balancer(b) if !b.tokens.is_empty() => {
                     token_addrs = &b.tokens;
@@ -377,17 +378,9 @@ impl StateArena {
                 PoolState::Woofi(w) if !w.tokens.is_empty() => {
                     token_addrs = &w.tokens;
                 }
-                PoolState::Dodo(d)
-                    if pool.tokens.len() == 2
-                        && !d.base_token.is_zero()
-                        && !d.quote_token.is_zero() =>
-                {
-                    if pool.tokens[0] == d.quote_token {
-                        dodo_owned = vec![d.base_token, d.quote_token];
-                        token_addrs = &dodo_owned;
-                    } else {
-                        token_addrs = &pool.tokens;
-                    }
+                PoolState::Dodo(d) if !d.base_token.is_zero() && !d.quote_token.is_zero() => {
+                    dodo_owned = vec![d.base_token, d.quote_token];
+                    token_addrs = &dodo_owned;
                 }
                 _ => token_addrs = &pool.tokens,
             }
@@ -417,8 +410,8 @@ impl StateArena {
 mod tests {
     use super::*;
     use crate::core::types::{
-        CycleEdges, Edge, ProtocolType, TokenIndex, V2PoolState, WoofiBaseTokenState,
-        WoofiPoolState,
+        CycleEdges, DodoPoolState, DodoRState, Edge, ProtocolType, TokenIndex, V2PoolState,
+        WoofiBaseTokenState, WoofiPoolState,
     };
     use alloy::primitives::U256;
 
@@ -533,6 +526,59 @@ mod tests {
             created_block: 1,
         }];
 
+        let address_index = discovered
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect();
+        let mut arena = StateArena::default();
+        let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
+        assert_eq!(metas.len(), 1);
+        let addresses: Vec<_> = metas[0]
+            .tokens
+            .iter()
+            .filter_map(|index| arena.token_address(*index))
+            .collect();
+        assert_eq!(addresses, vec![base, quote]);
+    }
+
+    #[test]
+    fn dodo_meta_is_base_quote_even_when_discovery_order_is_reversed() {
+        let pool_address = Address::with_last_byte(11);
+        let base = Address::with_last_byte(0x0b);
+        let quote = Address::with_last_byte(0x0a); // address-sorted quote < base
+        let cache = StateCache::default();
+        cache.insert(
+            pool_address,
+            PoolState::Dodo(DodoPoolState {
+                base_reserve: MIN_HOP_TOKEN_BALANCE,
+                quote_reserve: MIN_HOP_TOKEN_BALANCE,
+                base_token: base,
+                quote_token: quote,
+                base_target: MIN_HOP_TOKEN_BALANCE,
+                quote_target: MIN_HOP_TOKEN_BALANCE,
+                r_state: DodoRState::One,
+                i: U256::from(1u64) << 18,
+                k: U256::ZERO,
+                lp_fee_rate: U256::ZERO,
+                mt_fee_rate: U256::ZERO,
+            }),
+        );
+        // Indexer listed quote before base — must not become meta order.
+        let discovered = [DiscoveredPool {
+            pool_key: pool_address.to_string(),
+            address: pool_address,
+            protocol: ProtocolType::Dodo,
+            protocol_label: "DODO_V2".into(),
+            tokens: vec![quote, base],
+            fee_bps: 0,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
         let address_index = discovered
             .iter()
             .enumerate()

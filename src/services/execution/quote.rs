@@ -24,9 +24,14 @@ pub fn resolve_v3_fee_pips_for_hop(arena: &StateArena, hop: &CalldataHop) -> u32
     }
 }
 
+/// On-chain token0/token1 for V2/V3/Algebra callback data — always address-sorted.
+///
+/// Do not derive from `zero_for_one`: that flag is the swap direction and can
+/// disagree with meta token index order. Callback token0/token1 must match the
+/// factory pair ordering (`token0 < token1`).
 #[must_use]
 pub fn pool_tokens_from_hop(hop: &CalldataHop) -> (Address, Address) {
-    if hop.edge.zero_for_one {
+    if hop.token_in < hop.token_out {
         (hop.token_in, hop.token_out)
     } else {
         (hop.token_out, hop.token_in)
@@ -79,7 +84,40 @@ pub fn derive_tight_v3_price_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
+    use crate::services::execution::calldata::CalldataHop;
     use std::sync::Arc;
+
+    #[test]
+    fn pool_tokens_sorted_by_address_not_zero_for_one() {
+        let low = Address::repeat_byte(0x01);
+        let high = Address::repeat_byte(0xff);
+        // zero_for_one=true would wrongly claim token_in is token0 if we keyed off the flag.
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(1),
+                token_out: TokenIndex(0),
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            pool_address: Address::repeat_byte(0xaa),
+            token_in: high,
+            token_out: low,
+            amount_in: U256::from(1u64),
+            amount_out: U256::from(1u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        };
+        let (t0, t1) = pool_tokens_from_hop(&hop);
+        assert_eq!((t0, t1), (low, high));
+    }
 
     #[test]
     fn price_limit_rejects_a_shallow_quote() {

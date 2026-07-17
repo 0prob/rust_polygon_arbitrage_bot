@@ -11,8 +11,10 @@ use crate::services::execution::calldata::approvals::encode_token_transfer;
 ///
 /// Returns:
 /// 1. Transfer `token_in` to the pool (exact or `transferAll`)
-/// 2. `sellBase` / `sellQuote` based on **on-chain base/quote tokens**, not
-///    `zero_for_one` / meta token index (indexer order can disagree with base).
+/// 2. `sellBase` / `sellQuote` from **on-chain base/quote tokens** when state is
+///    present. Without state, falls back to arena meta (`token_in_idx == 0` ⇒
+///    sellBase) which is always `[base, quote]` after sync canonicalization —
+///    never key off `zero_for_one` alone.
 ///
 /// DODO `flashLoan` is reentrancy-locked: never flash from a pool that also
 /// appears as a swap hop in the same route (gated in flash selection + encode).
@@ -62,8 +64,8 @@ fn dodo_sell_base(arena: &StateArena, hop: &CalldataHop) -> anyhow::Result<bool>
                 )
             }
         }
-        // Missing state: fall back to graph direction (token_in_idx 0 ⇒ base in meta order).
-        _ => Ok(hop.edge.zero_for_one),
+        // Missing state: meta is [base, quote] after arena canonicalization.
+        _ => Ok(hop.edge.token_in_idx == 0),
     }
 }
 

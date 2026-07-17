@@ -260,7 +260,8 @@ fn hop_capacity(arena: &StateArena, edge: &Edge) -> Option<U256> {
             Some(cap_or_default(cap, default_cap))
         }
         (PoolState::Dodo(s), ProtocolType::Dodo) => {
-            let cap = estimate_dodo_hop_capacity(s, edge.zero_for_one);
+            // Meta is [base, quote]; capacity of the sold leg uses token_in_idx.
+            let cap = estimate_dodo_hop_capacity(s, edge.token_in_idx == 0);
             Some(cap_or_default(cap, default_cap))
         }
         (PoolState::Woofi(s), ProtocolType::Woofi) => {

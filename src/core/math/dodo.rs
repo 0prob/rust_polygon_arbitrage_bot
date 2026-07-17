@@ -41,28 +41,49 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
     }
 
     if k == ONE {
-        let idelta = i * delta;
-        let temp = if idelta.is_zero() {
-            U256::ZERO
-        } else {
-            (idelta * v1) / (v0 * v0)
+        // DODOMath k==1 branch: temp = i·delta·V1 / (V0·V0); receive = V1·temp/(temp+1).
+        // Widen intermediates — SafeMath reverts on overflow; we fail closed to 0.
+        let idelta = U512::from(i) * U512::from(delta);
+        let v0_sq = U512::from(v0) * U512::from(v0);
+        if v0_sq.is_zero() {
+            return U256::ZERO;
+        }
+        let Some(temp) = u512_to_u256_checked(idelta * U512::from(v1) / v0_sq) else {
+            return U256::ZERO;
         };
-        return if temp.is_zero() {
-            U256::ZERO
-        } else {
-            (v1 * temp) / (temp + ONE)
-        };
+        if temp.is_zero() {
+            return U256::ZERO;
+        }
+        let denom = U512::from(temp) + ONE_U512;
+        return u512_to_u256_checked(U512::from(v1) * U512::from(temp) / denom)
+            .unwrap_or(U256::ZERO);
     }
 
+    // DODOMath._SolveQuadraticFunctionForTrade part2:
+    //   k.mul(V0).div(V1).mul(V0).add(i.mul(delta))
+    // Note: `i.mul(delta)` is the *raw product*, not DecimalMath.mulFloor.
+    // bAbs is divided by ONE later so both terms share 1e18-scaled amount units.
+    // A prior mul_floor(i, delta) understated the idelta term by 1e18 and
+    // systematically mispriced non-linear sellBase/sellQuote quotes.
     let part2 = {
-        // U512 for k*v0²/v1; then checked truncation since quotient can exceed U256::MAX
-        // for extreme k/v0/v1 combinations (k up to 1e18, v0 up to 1e30).
-        let k_v0_v0 = U512::from(k) * U512::from(v0) * U512::from(v0) / U512::from(v1);
-        let k_term = u512_to_u256_checked(k_v0_v0).unwrap_or(U256::MAX);
-        k_term + mul_floor(i, delta)
+        let k_v0 = U512::from(k) * U512::from(v0);
+        let k_div = k_v0 / U512::from(v1);
+        let Some(k_term) = u512_to_u256_checked(k_div * U512::from(v0)) else {
+            return U256::ZERO;
+        };
+        let Some(i_delta) = u512_to_u256_checked(U512::from(i) * U512::from(delta)) else {
+            return U256::ZERO;
+        };
+        let Some(sum) = k_term.checked_add(i_delta) else {
+            return U256::ZERO;
+        };
+        sum
     };
     let one_minus_k = ONE - k;
-    let mut b_abs = one_minus_k * v1;
+    // part1 = (1-k)·V1 — widen so large reserves do not wrap before the abs step.
+    let Some(mut b_abs) = u512_to_u256_checked(U512::from(one_minus_k) * U512::from(v1)) else {
+        return U256::ZERO;
+    };
     let mut b_sig = false;
     if b_abs >= part2 {
         b_abs -= part2;
@@ -72,11 +93,21 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
     }
     b_abs /= ONE;
 
-    let square_root_input = mul_floor(one_minus_k * U256::from(4), mul_floor(k, v0) * v0);
+    // squareRoot = 4·(1-k)·mulFloor(k,V0)·V0  (DecimalMath.mulFloor outer)
+    // Use U512 for mulFloor(k,V0)*V0 which is k·V0²/1e18.
+    let mfl_k_v0 = mul_floor(k, v0);
+    let Some(mfl_times_v0) = u512_to_u256_checked(U512::from(mfl_k_v0) * U512::from(v0)) else {
+        return U256::ZERO;
+    };
+    let square_root_input = mul_floor(one_minus_k * U256::from(4), mfl_times_v0);
     let square_root = if square_root_input.is_zero() {
         b_abs
     } else {
-        (b_abs * b_abs + square_root_input).root(2)
+        let radicand = U512::from(b_abs) * U512::from(b_abs) + U512::from(square_root_input);
+        let Some(rad_u256) = u512_to_u256_checked(radicand) else {
+            return U256::ZERO;
+        };
+        rad_u256.root(2)
     };
 
     let denominator = one_minus_k * U256::from(2);
@@ -90,7 +121,10 @@ fn solve_quadratic_function_for_trade(v0: U256, v1: U256, delta: U256, i: U256, 
         }
         square_root - b_abs
     } else {
-        b_abs + square_root
+        match b_abs.checked_add(square_root) {
+            Some(n) => n,
+            None => return U256::ZERO,
+        }
     };
 
     let v2 = div_ceil(numerator, denominator);
@@ -295,6 +329,61 @@ mod tests {
         assert!(gross > net);
         let expected = gross - (gross / U256::from(10u8)) - (gross / U256::from(20u8));
         assert_eq!(net, expected);
+    }
+
+    /// R=ONE sellBase with non-zero k exercises `_SolveQuadraticFunctionForTrade`.
+    /// DODOMath uses raw `i*delta` in part2 (not DecimalMath.mulFloor). A prior
+    /// mul_floor under-scaled that term by 1e18 and returned ~10 wei for a 10e18
+    /// trade — lock the on-chain result here.
+    #[test]
+    fn r_one_sell_base_quadratic_matches_dodo_math_hand() {
+        // V0=V1=Q0=1000e18, payBase=10e18, i=1e18, k=0.1e18
+        // part2 = k·V0/V1·V0 + i·delta (SafeMath, raw products) = 110e36
+        // part1 = (1-k)·V1 = 900e36; bAbs = (part1-part2)/1e18 = 790e18
+        // squareRoot = sqrt(bAbs² + mulFloor(4(1-k), mulFloor(k,V0)·V0))
+        // V2 = DecimalMath.divCeil(bAbs+sqrt, 2(1-k)); receive = V1 - V2
+        let state = DodoPoolState {
+            base_reserve: U256::from(1_000u64) * ONE,
+            quote_reserve: U256::from(1_000u64) * ONE,
+            base_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            base_target: U256::from(1_000u64) * ONE,
+            quote_target: U256::from(1_000u64) * ONE,
+            r_state: DodoRState::One,
+            i: ONE,
+            k: U256::from(100_000_000_000_000_000u64), // 0.1e18
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        };
+        let pay = U256::from(10u64) * ONE;
+        let out = get_dodo_gross_amount_out(&state, pay, true);
+        // With correct raw i*delta, quote out sits just under pay on a mild k curve.
+        assert!(out > U256::from(9u64) * ONE, "out={out}");
+        assert!(out < pay, "out={out}");
+        // Pin exact DODOMath result (mul_floor(i,delta) in part2 yields ~10 wei instead).
+        assert_eq!(out, U256::from(9_989_919_447_032_049_723u64));
+    }
+
+    #[test]
+    fn sell_quote_r_one_is_symmetric_at_i_one() {
+        let state = DodoPoolState {
+            base_reserve: U256::from(1_000u64) * ONE,
+            quote_reserve: U256::from(1_000u64) * ONE,
+            base_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            base_target: U256::from(1_000u64) * ONE,
+            quote_target: U256::from(1_000u64) * ONE,
+            r_state: DodoRState::One,
+            i: ONE,
+            k: U256::from(100_000_000_000_000_000u64),
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        };
+        let pay = U256::from(10u64) * ONE;
+        let sell_base = get_dodo_gross_amount_out(&state, pay, true);
+        let sell_quote = get_dodo_gross_amount_out(&state, pay, false);
+        // i=1 and equal targets ⇒ sellBase and sellQuote share the same curve.
+        assert_eq!(sell_base, sell_quote);
     }
 }
 

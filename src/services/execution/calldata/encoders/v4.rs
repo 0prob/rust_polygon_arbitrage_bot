@@ -46,7 +46,9 @@ pub fn encode_v4_hop(
 
     let (pool_key, zero_for_one) =
         build_v4_pool_key(hop.token_in, hop.token_out, fee, tick_spacing, hooks);
-    let amount_spec = I256::ZERO - I256::from(hop.amount_in);
+    let amount_pos = I256::try_from(hop.amount_in)
+        .map_err(|_| anyhow::anyhow!("v4 amount_in does not fit i256"))?;
+    let amount_spec = I256::ZERO - amount_pos;
 
     // ponytail: flat ABI words for unlockCallback, 256B payload at fixed offset
     let mut unlock_inner = Vec::with_capacity(32 + 256);
