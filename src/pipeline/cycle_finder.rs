@@ -1124,32 +1124,14 @@ pub fn find_cycles_multi_pass(
     find_cycles_multi_pass_with_prep(graph, arena, &pool_metas, &prep, passes)
 }
 
-/// Returns the most frequently used protocol in the cycle (primary protocol for diversity).
-#[must_use]
-pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
-    // ponytail: fixed-size [u32; 9] stack array avoids both O(n²) nested loop
-    // and HashMap alloc. ProtocolType has ≤ 8 variants so this is O(n) with
-    // a single pass and zero heap allocation.
-    let mut counts = [0u32; 9]; // ProtocolType has 8 variants + sentinel
-    for e in edges {
-        match e.protocol {
-            ProtocolType::UniswapV2 => counts[0] += 1,
-            ProtocolType::UniswapV3 => counts[1] += 1,
-            ProtocolType::UniswapV4 => counts[2] += 1,
-            ProtocolType::BalancerV2 => counts[3] += 1,
-            ProtocolType::CurveStable => counts[4] += 1,
-            ProtocolType::CurveCrypto => counts[5] += 1,
-            ProtocolType::Dodo => counts[6] += 1,
-            ProtocolType::Woofi => counts[7] += 1,
-        }
-    }
-    let mut best_idx = 0usize;
-    for i in 1..8 {
-        if counts[i] > counts[best_idx] {
-            best_idx = i;
-        }
-    }
-    match best_idx {
+#[inline]
+fn protocol_fetch_slot(protocol: ProtocolType) -> usize {
+    protocol.fetch_slot().unwrap_or(0)
+}
+
+#[inline]
+fn protocol_from_slot(slot: usize) -> ProtocolType {
+    match slot {
         0 => ProtocolType::UniswapV2,
         1 => ProtocolType::UniswapV3,
         2 => ProtocolType::UniswapV4,
@@ -1157,17 +1139,37 @@ pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
         4 => ProtocolType::CurveStable,
         5 => ProtocolType::CurveCrypto,
         6 => ProtocolType::Dodo,
-        7 => ProtocolType::Woofi,
-        _ => unreachable!(),
+        _ => ProtocolType::Woofi,
     }
+}
+
+/// Returns the most frequently used protocol in the cycle (primary protocol for diversity).
+/// Ties break toward the first hop's protocol (not a fixed V2 bias).
+#[must_use]
+pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
+    // Fixed [u32; 8] counts — O(hops), no heap.
+    let mut counts = [0u32; 8];
+    for e in edges {
+        counts[protocol_fetch_slot(e.protocol)] += 1;
+    }
+    let mut best_idx = edges
+        .first()
+        .map(|e| protocol_fetch_slot(e.protocol))
+        .unwrap_or(0);
+    let mut best_count = counts[best_idx];
+    for (i, &count) in counts.iter().enumerate() {
+        if count > best_count {
+            best_count = count;
+            best_idx = i;
+        }
+    }
+    protocol_from_slot(best_idx)
 }
 
 /// Selects up to `max_cycles` opportunities with better protocol distribution.
 /// For each protocol that appears, takes its best-scoring cycles in round-robin
 /// fashion so that if good opportunities exist in V2/V3/Curve/Dodo/Woofi/etc.
 /// they are not crowded out by high-degree Balancer subgraphs (common for 3-hop).
-/// Always applies a per-protocol ceiling so that no single protocol dominates even
-/// when total cycles are below max_cycles.
 #[must_use]
 pub fn apply_protocol_diverse_selection(
     cycles: Vec<FoundCycle>,
@@ -1177,59 +1179,65 @@ pub fn apply_protocol_diverse_selection(
         return vec![];
     }
 
-    let mut groups: rustc_hash::FxHashMap<ProtocolType, Vec<FoundCycle>> =
-        rustc_hash::FxHashMap::default();
-    groups.reserve(8);
+    // Fixed 8 protocol buckets — no HashMap. Slot order = FETCHABLE_PROTOCOLS walk order.
+    let mut groups: [Vec<FoundCycle>; 8] = std::array::from_fn(|_| Vec::new());
     for c in cycles {
-        let p = primary_protocol(&c.edges);
-        groups.entry(p).or_default().push(c);
+        let slot = protocol_fetch_slot(primary_protocol(&c.edges));
+        groups[slot].push(c);
     }
 
-    for g in groups.values_mut() {
-        g.sort_by(compare_cycle_score);
+    // Best-first sort, then reverse so `pop()` is O(1) best remaining.
+    for g in &mut groups {
+        if g.len() > 1 {
+            g.sort_by(compare_cycle_score);
+            g.reverse();
+        }
     }
 
-    let protos: Vec<ProtocolType> = groups.keys().copied().collect();
-
-    let total: usize = protos.iter().map(|p| groups[p].len()).sum();
+    let total: usize = groups.iter().map(Vec::len).sum();
     let cap = max_cycles.min(total);
-    // ponytail: per-protocol hard ceiling prevents Balancer multi-token pools
-    // (n tokens → n*(n-1) edges) from dominating the cycle set. When 2+ protocols
-    // have live candidates, no single protocol exceeds 40% of cap. When only one
-    // protocol exists, no ceiling applies (no alternative to diversify with).
-    let hard_ceiling = if protos.len() <= 1 {
-        cap
-    } else {
-        cap.saturating_mul(40) / 100
-    };
 
-    // ponytail: flat Vec<(cursor, count)> indexed by proto position replaces
-    // two HashMaps — eliminates hashing overhead on the hot round-robin path.
-    let mut proto_state: Vec<(usize, usize)> = vec![(0, 0); protos.len()];
+    // Compact active slot list so exhausted protocols are not scanned every pass.
+    let mut active = [0usize; 8];
+    let mut active_len = 0usize;
+    for (slot, g) in groups.iter().enumerate() {
+        if !g.is_empty() {
+            active[active_len] = slot;
+            active_len += 1;
+        }
+    }
+
     let mut selected: Vec<FoundCycle> = Vec::with_capacity(cap);
-    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+    let mut seen: rustc_hash::FxHashSet<u64> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default());
 
-    while selected.len() < cap {
+    while selected.len() < cap && active_len > 0 {
+        let mut i = 0;
         let mut progressed = false;
-        for (i, &p) in protos.iter().enumerate() {
+        while i < active_len {
             if selected.len() >= cap {
                 break;
             }
-            if proto_state[i].1 >= hard_ceiling {
-                continue;
-            }
-            if let Some(g) = groups.get_mut(&p) {
-                while proto_state[i].0 < g.len() {
-                    let key = crate::pipeline::cycle_filter::cycle_key(&g[proto_state[i].0].edges);
-                    if !seen.insert(key) {
-                        g.swap_remove(proto_state[i].0);
-                        continue;
-                    }
-                    proto_state[i].1 += 1;
-                    selected.push(g.swap_remove(proto_state[i].0));
-                    progressed = true;
-                    break;
+            let slot = active[i];
+            let g = &mut groups[slot];
+            let mut took = false;
+            while let Some(cycle) = g.pop() {
+                let key = cycle_key(&cycle.edges);
+                if !seen.insert(key) {
+                    continue; // duplicate edge set — drop, keep popping for a unique
                 }
+                selected.push(cycle);
+                took = true;
+                progressed = true;
+                break;
+            }
+            if g.is_empty() {
+                // Compact active list (order among remaining slots is stable enough).
+                active_len -= 1;
+                active[i] = active[active_len];
+            } else {
+                debug_assert!(took, "non-empty group must yield a unique cycle or empty");
+                i += 1;
             }
         }
         if !progressed {
@@ -1500,5 +1508,139 @@ mod tests {
         let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
         let cycles = collect_cycles_dfs_parallel(&graph, &arena, &metas, &prep, 2, 4, &budget);
         assert_eq!(cycles.len(), 3);
+    }
+
+    fn ranked_cycle(
+        pool: u32,
+        protocol: ProtocolType,
+        ratio: u64,
+        score: f64,
+    ) -> FoundCycle {
+        FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from([Edge {
+                pool_index: PoolIndex(pool),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .as_slice()),
+            hop_count: 1,
+            log_weight: score,
+            cumulative_fee_bps: 30,
+            score,
+            // Distinct non-zero ratios so compare_cycle_score ranks by ratio.
+            cycle_ratio: U256::from(1_000_000_000_000_000_000u64) + U256::from(ratio),
+        }
+    }
+
+    #[test]
+    fn protocol_diverse_selection_takes_best_per_protocol_not_worst() {
+        // Five V2 cycles ranked best→worst by cycle_ratio, two Balancer.
+        // Pure RR best-first: V2 best, Balancer best, V2 second-best — never V2 worst.
+        let cycles = vec![
+            ranked_cycle(1, ProtocolType::UniswapV2, 500, -5.0),
+            ranked_cycle(2, ProtocolType::UniswapV2, 400, -4.0),
+            ranked_cycle(3, ProtocolType::UniswapV2, 300, -3.0),
+            ranked_cycle(4, ProtocolType::UniswapV2, 200, -2.0),
+            ranked_cycle(5, ProtocolType::UniswapV2, 100, -1.0),
+            ranked_cycle(10, ProtocolType::BalancerV2, 450, -4.5),
+            ranked_cycle(11, ProtocolType::BalancerV2, 150, -1.5),
+        ];
+        let selected = apply_protocol_diverse_selection(cycles, 3);
+        assert_eq!(selected.len(), 3);
+        let pools: Vec<u32> = selected
+            .iter()
+            .map(|c| c.edges[0].pool_index.0)
+            .collect();
+        assert!(pools.contains(&1), "missing best V2: {pools:?}");
+        assert!(pools.contains(&10), "missing best Balancer: {pools:?}");
+        assert!(
+            pools.contains(&2),
+            "second V2 pick must be second-best, not worst: {pools:?}"
+        );
+        assert!(
+            !pools.contains(&5),
+            "worst V2 must not displace second-best: {pools:?}"
+        );
+    }
+
+    #[test]
+    fn primary_protocol_tie_breaks_to_first_hop() {
+        let v2_then_bal = [
+            Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 10,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: PoolIndex(1),
+                token_in: TokenIndex(1),
+                token_out: TokenIndex(0),
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: false,
+            },
+        ];
+        // 1-1 hop tie: first hop is Balancer → Balancer primary (not fixed V2 bias).
+        assert_eq!(primary_protocol(&v2_then_bal), ProtocolType::BalancerV2);
+
+        let two_v2_one_bal = [
+            v2_then_bal[0],
+            Edge {
+                pool_index: PoolIndex(2),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: PoolIndex(3),
+                token_in: TokenIndex(1),
+                token_out: TokenIndex(0),
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: false,
+            },
+        ];
+        assert_eq!(primary_protocol(&two_v2_one_bal), ProtocolType::UniswapV2);
+    }
+
+    #[test]
+    fn protocol_robin_fills_cap_when_one_protocol_exhausts_early() {
+        // One V3 cycle, many V2 — RR should not stall after V3 empties.
+        let mut cycles = vec![ranked_cycle(99, ProtocolType::UniswapV3, 900, -9.0)];
+        for i in 0..5u32 {
+            cycles.push(ranked_cycle(i, ProtocolType::UniswapV2, 500 - i as u64, -5.0));
+        }
+        let selected = apply_protocol_diverse_selection(cycles, 4);
+        assert_eq!(selected.len(), 4);
+        assert!(
+            selected
+                .iter()
+                .any(|c| c.edges[0].protocol == ProtocolType::UniswapV3),
+            "V3 must appear once"
+        );
+        let v2_count = selected
+            .iter()
+            .filter(|c| c.edges[0].protocol == ProtocolType::UniswapV2)
+            .count();
+        assert_eq!(v2_count, 3);
     }
 }

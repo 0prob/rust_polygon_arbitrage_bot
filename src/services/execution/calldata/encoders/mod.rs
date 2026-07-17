@@ -11,14 +11,20 @@ pub mod woofi;
 use alloy::primitives::Address;
 
 use crate::abis::ExecutorCall;
-use crate::core::types::ProtocolType;
+use crate::core::types::{FlashLoanSource, ProtocolType};
 use crate::pipeline::arena::StateArena;
-use crate::services::execution::profit::slippage_adjusted;
 
 use super::{CalldataHop, RouteEncodeConfig};
-use crate::core::types::FlashLoanSource;
 
 /// Dispatch to the protocol-specific encoder free function.
+///
+/// Protocol notes:
+/// - **V2**: pre-fund + `swap(..., data="")`. `transferAll` after flash / on later hops.
+/// - **V3/V4**: exact-in via pool/manager; callback pays input (no pre-fund).
+/// - **Balancer**: approve + vault `swap` (never under Balancer vault flash).
+/// - **Curve / WooFi**: approve + exact-in exchange (minOut carries slippage).
+/// - **DODO**: transfer + `sellBase`/`sellQuote` from on-chain base/quote; not under
+///   DODO flash on the same pool (`preventReentrant`).
 pub fn encode_hop_for_protocol(
     hop: &CalldataHop,
     recipient: Address,
@@ -29,18 +35,9 @@ pub fn encode_hop_for_protocol(
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     match hop.edge.protocol {
         ProtocolType::UniswapV2 => {
-            if is_first_hop {
-                // After vault/Aave/DODO flash, sweep the credited balance (exact `amount_in` can drift).
-                let use_transfer_all = flash_source != FlashLoanSource::Direct;
-                v2::encode_v2_hop(arena, hop, recipient, config.slippage_bps, use_transfer_all)
-            } else {
-                let mut h = hop.clone();
-                let slip = config.slippage_bps.saturating_add(100);
-                if let Some(adj) = slippage_adjusted(h.amount_in, slip) {
-                    h.amount_in = adj;
-                }
-                v2::encode_v2_hop(arena, &h, recipient, config.slippage_bps, true)
-            }
+            // After any flash, and on every intermediate hop, sweep the credited balance.
+            let use_transfer_all = !is_first_hop || flash_source != FlashLoanSource::Direct;
+            v2::encode_v2_hop(arena, hop, recipient, config.slippage_bps, use_transfer_all)
         }
         ProtocolType::UniswapV3 => v3::encode_v3_hop(hop, recipient, arena, config.slippage_bps),
         ProtocolType::UniswapV4 => v4::encode_v4_hop(hop, arena, config.slippage_bps),
@@ -54,7 +51,10 @@ pub fn encode_hop_for_protocol(
             config.slippage_bps,
             config.deadline,
         ),
-        ProtocolType::Dodo => dodo::encode_dodo_hop(hop, recipient, !is_first_hop),
+        ProtocolType::Dodo => {
+            let use_transfer_all = !is_first_hop || flash_source != FlashLoanSource::Direct;
+            dodo::encode_dodo_hop(arena, hop, recipient, use_transfer_all)
+        }
         ProtocolType::Woofi => woofi::encode_woofi_hop(hop, recipient, arena, config.slippage_bps),
     }
 }

@@ -109,11 +109,16 @@ pub fn decode_revert(data: &[u8]) -> Option<DecodedRevert> {
         SEL_INSUFFICIENT_PROFIT => decode_insufficient_profit(payload),
         SEL_TRANSFER_FAILED => decode_transfer_failed(payload),
         SEL_APPROVE_FAILED => decode_approve_failed(payload),
-        SEL_ERROR_STRING => Some(DecodedRevert::ExternalCallFailed {
-            index: 0,
-            target: Address::ZERO,
-            reason: decode_abi_string(payload, 0),
-        }),
+        SEL_ERROR_STRING => {
+            let str_off = word_u256(payload, 0)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(32);
+            Some(DecodedRevert::ExternalCallFailed {
+                index: 0,
+                target: Address::ZERO,
+                reason: decode_abi_string(payload, str_off),
+            })
+        }
         SEL_PANIC => {
             let code = U256::from_be_slice(payload.get(..32).unwrap_or(&[]));
             Some(DecodedRevert::ExternalCallFailed {
@@ -216,12 +221,28 @@ fn decode_huff_external_call_failed_payload(payload: &[u8]) -> Option<DecodedRev
         let rd_size = usize::try_from(U256::from_be_slice(&payload[96..128])).unwrap_or(0);
         if rd_size > 0 && payload.len() >= 128usize.saturating_add(rd_size) {
             let rd = &payload[128..128 + rd_size];
-            reason = decode_revert(rd)
-                .map(|r| r.to_string())
+            // Prefer Error(string) so ERC20 balance messages are not misread as
+            // nested ExternalCallFailed (Huff layout collides with ABI string heads).
+            reason = decode_error_string_prefer(rd)
+                .or_else(|| decode_revert(rd).map(|r| r.to_string()))
                 .unwrap_or_else(|| format!("0x{}", hex_preview(rd, 64)));
         }
     }
     sanitize_external_call_failed(index, target, reason)
+}
+
+/// Prefer Solidity `Error(string)` when nested reason bytes are a standard revert string.
+/// Prevents misreading `"ERC20: transfer amount exceeds balance"` as a nested ExternalCallFailed.
+fn decode_error_string_prefer(data: &[u8]) -> Option<String> {
+    const ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    if data.len() < 4 || data[0..4] != ERROR_STRING {
+        return None;
+    }
+    let payload = &data[4..];
+    // Error(string) ABI: word0 = offset to (len, bytes); decode_abi_string wants the len word.
+    let str_off = word_u256(payload, 0).and_then(|v| usize::try_from(v).ok())?;
+    let s = decode_abi_string(payload, str_off);
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn hex_preview(data: &[u8], max: usize) -> String {
@@ -387,5 +408,47 @@ mod tests {
                 ..
             }) if decoded_target == target
         ));
+    }
+
+    #[test]
+    fn nested_error_string_is_not_misread_as_external_call_failed() {
+        let token = address!("a571963278014b5b3a686778747fdf8ad4dfbb94");
+        let msg = b"ERC20: transfer amount exceeds balance";
+        // Error(string) ABI: selector + offset(32) + len(32) + padded string
+        let mut inner = Vec::with_capacity(4 + 64 + 64);
+        inner.extend_from_slice(&[0x08, 0xc3, 0x79, 0xa0]);
+        inner.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+        inner.extend_from_slice(&U256::from(msg.len() as u64).to_be_bytes::<32>());
+        inner.extend_from_slice(msg);
+        inner.resize(4 + 64 + ((msg.len() + 31) / 32) * 32, 0);
+
+        // Huff ExternalCallFailed body: index, target, offset(0x60), rd_size, rd
+        let mut payload = vec![0u8; 128 + inner.len()];
+        payload[31] = 0; // index 0
+        payload[44..64].copy_from_slice(token.as_slice());
+        payload[64..96].copy_from_slice(&U256::from(0x60u64).to_be_bytes::<32>());
+        payload[96..128].copy_from_slice(&U256::from(inner.len() as u64).to_be_bytes::<32>());
+        payload[128..].copy_from_slice(&inner);
+
+        let decoded = decode_external_call_failed(&payload).expect("decode");
+        match decoded {
+            DecodedRevert::ExternalCallFailed {
+                index,
+                target,
+                reason,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(target, token);
+                assert!(
+                    reason.contains("transfer amount exceeds balance"),
+                    "reason={reason}"
+                );
+                assert!(
+                    !reason.contains("ExternalCallFailed"),
+                    "must not nest phantom ExternalCallFailed: {reason}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -679,21 +679,40 @@ pub fn cycle_has_dodo_pool(arena: &StateArena, cycle: &FoundCycle) -> bool {
 
 /// Return a DODO pool that can lend the cycle start token through the executor's
 /// base-asset-only flash entrypoint.
+///
+/// DODO V2 `flashLoan` is `preventReentrant`. Calling `sellBase` / `sellQuote` on
+/// the **same** pool inside `DPPFlashLoanCall` / `DVMFlashLoanCall` always reverts.
+/// Cycle edges are swap hops, so a cycle-local DODO pool is never a viable flash
+/// source. Returning `None` fails closed at prepare instead of dry-run
+/// `transfer amount exceeds balance` / reentrancy after a false-positive HF pass.
+///
+/// External (non-route) DODO flash liquidity is not wired yet; when it is, return a
+/// base-compatible pool that is **not** a route swap hop ([`dodo_pool_is_route_swap_hop`]).
 #[must_use]
 pub fn dodo_base_flash_pool_for_cycle(arena: &StateArena, cycle: &FoundCycle) -> Option<Address> {
-    let start_token = arena.token_address(cycle.start_token)?;
-    cycle.edges.iter().find_map(|edge| {
-        let PoolState::Dodo(state) = arena.pool_state(edge.pool_index)? else {
-            return None;
-        };
-        (state.base_token == start_token)
-            .then(|| arena.pool_address(edge.pool_index))
-            .flatten()
+    // Keep start-token resolution so callers still fail closed on unknown tokens
+    // the same way they did before reentrancy gating.
+    let _start_token = arena.token_address(cycle.start_token)?;
+    let _ = cycle;
+    None
+}
+
+/// True when a DODO pool address is also a swap hop in the cycle (flash-incompatible).
+#[must_use]
+pub fn dodo_pool_is_route_swap_hop(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    pool: Address,
+) -> bool {
+    cycle.edges.iter().any(|edge| {
+        matches!(arena.pool_state(edge.pool_index), Some(PoolState::Dodo(_)))
+            && arena.pool_address(edge.pool_index) == Some(pool)
     })
 }
 
 /// Map eval-time flash plans onto sources the executor can actually dispatch.
-/// Mixed routes cannot use Balancer flash; when Aave is unavailable, fall back to Dodo.
+/// Mixed routes cannot use Balancer flash; DODO is only used when a non-swap-hop
+/// flash pool is available (`has_dodo` from [`dodo_base_flash_pool_for_cycle`]).
 #[must_use]
 pub fn align_flash_source_for_dispatch(
     source: FlashLoanSource,
@@ -708,6 +727,7 @@ pub fn align_flash_source_for_dispatch(
         if aave_viable {
             return Some(FlashLoanSource::AaveV3);
         }
+        // Cycle-local DODO pools are reentrancy-incompatible; has_dodo is false for them.
         if has_dodo {
             return Some(FlashLoanSource::Dodo);
         }
@@ -720,6 +740,12 @@ pub fn align_flash_source_for_dispatch(
     if source == FlashLoanSource::AaveV3 && !aave_viable {
         if has_dodo {
             return Some(FlashLoanSource::Dodo);
+        }
+        return None;
+    }
+    if source == FlashLoanSource::Dodo && !has_dodo {
+        if aave_viable {
+            return Some(FlashLoanSource::AaveV3);
         }
         return None;
     }
@@ -1648,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn dodo_flash_pool_requires_cycle_start_as_base() {
+    fn dodo_flash_pool_rejects_cycle_local_swap_hop() {
         let base = Address::repeat_byte(0x01);
         let quote = Address::repeat_byte(0x02);
         let pool_address = Address::repeat_byte(0x03);
@@ -1672,12 +1698,50 @@ mod tests {
             })),
         );
 
+        // Cycle-local DODO pools are swap hops; flashLoan reentrancy forbids
+        // sellBase/sellQuote on the same pool during the callback.
         assert_eq!(
             dodo_base_flash_pool_for_cycle(&arena, &dodo_cycle(base_index, pool_index)),
-            Some(pool_address)
+            None
         );
         assert_eq!(
             dodo_base_flash_pool_for_cycle(&arena, &dodo_cycle(quote_index, pool_index)),
+            None
+        );
+        assert!(dodo_pool_is_route_swap_hop(
+            &arena,
+            &dodo_cycle(base_index, pool_index),
+            pool_address
+        ));
+    }
+
+    #[test]
+    fn align_dispatch_rejects_dodo_when_cycle_has_no_external_flash_pool() {
+        let liquidity = TokenFlashLiquidity {
+            balancer: U256::from(10_000u64),
+            aave: U256::ZERO,
+            aave_listed: false,
+            dodo: U256::MAX,
+        };
+        // has_dodo=false: cycle-local only (reentrancy-incompatible).
+        assert_eq!(
+            align_flash_source_for_dispatch(
+                FlashLoanSource::Dodo,
+                &liquidity,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            align_flash_source_for_dispatch(
+                FlashLoanSource::Balancer,
+                &liquidity,
+                false,
+                false,
+                true
+            ),
             None
         );
     }

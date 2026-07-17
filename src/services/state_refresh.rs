@@ -727,13 +727,14 @@ impl StateRefreshService {
     pub async fn refresh_pool_states(&self, max_pools: usize) -> anyhow::Result<PoolRefreshResult> {
         let pools = self.discovered_pools();
         let hot = self.hot_addresses();
+        let address_index = self.discovery_state.read().address_index.clone();
         crate::debug!(
             "state refresh: {} pools, {} hot, max_pools={}",
             pools.len(),
             hot.len(),
             max_pools
         );
-        self.refresh_pools_impl(pools.as_ref(), max_pools, hot.as_ref())
+        self.refresh_pools_impl(pools.as_ref(), max_pools, hot.as_ref(), address_index)
             .await
     }
 
@@ -745,14 +746,14 @@ impl StateRefreshService {
         if addresses.is_empty() || max_pools == 0 {
             return Ok(PoolRefreshResult::default());
         }
-        let (addrs, selected_pools) = {
+        let (addrs, selected_pools, address_index) = {
             let state = self.discovery_state.read();
             let address_index = &state.address_index;
             // ponytail: sort+dedupe addresses once, then do direct discovery-index lookups.
             // That keeps targeted refresh bounded by requested addresses instead of
             // scanning the full discovery list on every call.
             let addrs = dedupe_sorted_addresses(addresses);
-            let mut selected_pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len().min(64));
+            let mut selected_pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len());
             for addr in &addrs {
                 let Some(&idx) = address_index.get(addr) else {
                     continue;
@@ -762,12 +763,16 @@ impl StateRefreshService {
                 };
                 selected_pools.push(pool.clone());
             }
-            (addrs, selected_pools)
+            (
+                addrs,
+                selected_pools,
+                state.address_index.clone(),
+            )
         };
         if selected_pools.is_empty() {
             return Ok(PoolRefreshResult::default());
         }
-        self.refresh_pools_impl(&selected_pools, max_pools, &addrs)
+        self.refresh_pools_impl(&selected_pools, max_pools, &addrs, address_index)
             .await
     }
 
@@ -776,6 +781,7 @@ impl StateRefreshService {
         pools: &[DiscoveredPool],
         max_pools: usize,
         hot: &[Address],
+        address_index: FxHashMap<Address, usize>,
     ) -> anyhow::Result<PoolRefreshResult> {
         let matched = pools.len();
         let candidates = self.rpc.state_url_candidates();
@@ -791,6 +797,8 @@ impl StateRefreshService {
             let cached = self.last_state_block();
             (cached > 0).then_some(cached)
         };
+        let prior_block = self.last_state_block.load(Ordering::Acquire);
+        let prior_hash = *self.last_state_hash.read();
 
         let mut total_updated = 0usize;
         let mut fetch_attempted = false;
@@ -799,8 +807,11 @@ impl StateRefreshService {
         let mut fetch_ms = 0u64;
         let mut hash_ms = 0u64;
         let mut rpc_attempts = 0usize;
-        let mut last_pinned_block = None;
-        let address_index = self.discovery_state.read().address_index.clone();
+        // Always resolve head on the first working URL so pool state is not pinned
+        // to a stale block. Fallback URLs re-query head. Skip block-hash RPC when
+        // the pinned block is unchanged and we already have a hash.
+        let mut last_pinned_block = cached_block;
+        let mut pinned_block: Option<u64> = None;
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,
@@ -812,9 +823,11 @@ impl StateRefreshService {
             };
             rpc_attempts += 1;
             let provider_for_hash = provider.clone();
-            let head_started = now_ms();
-            let pinned_block = provider.get_block_number().await.ok().or(cached_block);
-            rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
+            if pinned_block.is_none() || idx > 0 {
+                let head_started = now_ms();
+                pinned_block = provider.get_block_number().await.ok().or(cached_block);
+                rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
+            }
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
             let fetch_result = fetch_missing_pool_states_indexed(
@@ -838,20 +851,20 @@ impl StateRefreshService {
             if updated > 0 {
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
-                }
-                let hash_started = now_ms();
-                let pinned_hash = match pinned_block {
-                    Some(block) => provider_for_hash
-                        .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|b| b.header.hash),
-                    None => None,
-                };
-                hash_ms = hash_ms.saturating_add(now_ms().saturating_sub(hash_started));
-                if let Some(hash) = pinned_hash {
-                    *self.last_state_hash.write() = Some(hash);
+                    let need_hash = prior_hash.is_none() || block != prior_block;
+                    if need_hash {
+                        let hash_started = now_ms();
+                        let pinned_hash = provider_for_hash
+                            .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|b| b.header.hash);
+                        hash_ms = hash_ms.saturating_add(now_ms().saturating_sub(hash_started));
+                        if let Some(hash) = pinned_hash {
+                            *self.last_state_hash.write() = Some(hash);
+                        }
+                    }
                 }
                 if idx > 0 {
                     crate::info!(

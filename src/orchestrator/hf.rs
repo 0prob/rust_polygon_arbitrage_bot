@@ -414,8 +414,24 @@ fn select_cycles_for_rescore(
     rescore_cap: usize,
     inactive_offset: usize,
 ) -> RescoreSelection {
+    if rescore_cap == 0 {
+        return RescoreSelection {
+            cycles: Vec::new(),
+            hot_pools: FxHashSet::default(),
+            quarantine_skipped: 0,
+            rate_skipped: 0,
+            activity_candidates: 0,
+            activity_selected: 0,
+            inactive_len: 0,
+            inactive_selected: 0,
+        };
+    }
+
     let activity_now = now_ms();
-    let mut candidates: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len());
+    // Partition during the filter pass: actives (score>0) and inactives separately so we
+    // never full-sort the combined list. Hot routes are activity-first; cold routes rotate.
+    let mut active: Vec<(Arc<FoundCycle>, u64)> = Vec::with_capacity(snap_cycles.len().min(rescore_cap.saturating_mul(2)));
+    let mut inactive: Vec<Arc<FoundCycle>> = Vec::with_capacity(snap_cycles.len());
     let mut quarantine_skipped = 0usize;
     let mut rate_skipped = 0usize;
     for cycle in snap_cycles {
@@ -428,9 +444,17 @@ fn select_cycles_for_rescore(
             rate_skipped += 1;
             continue;
         };
-        candidates.push((ready, 0));
+        let score = cycle_activity_score(ready.as_ref(), arena, partial_cache, activity_now);
+        if score > 0 {
+            active.push((ready, score));
+        } else {
+            inactive.push(ready);
+        }
     }
-    if candidates.is_empty() {
+
+    let activity_candidates = active.len();
+    let inactive_len = inactive.len();
+    if activity_candidates == 0 && inactive_len == 0 {
         return RescoreSelection {
             cycles: Vec::new(),
             hot_pools: FxHashSet::default(),
@@ -443,31 +467,25 @@ fn select_cycles_for_rescore(
         };
     }
 
-    for (cycle, score) in &mut candidates {
-        *score = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now);
-    }
-    let activity_candidates = candidates.iter().filter(|(_, score)| *score > 0).count();
-    // ponytail: all candidates already passed has_reliable_matic_rate filter
-    // above, so sort by activity score then cycle score directly.
-    candidates.sort_by(|a, b| {
+    // Activity desc, then cycle quality. Only sort the active partition.
+    active.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| compare_cycle_score(a.0.as_ref(), b.0.as_ref()))
     });
+    // Inactive: quality order so rotation windows still prefer stronger cycle_ratio first.
+    inactive.sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
+
     let activity_selected = activity_candidates.min(rescore_cap);
-    let inactive_len = candidates.len().saturating_sub(activity_candidates);
     let inactive_slots = rescore_cap.saturating_sub(activity_selected);
     let inactive_selected = inactive_slots.min(inactive_len);
-    let mut selected = candidates[..activity_selected].to_vec();
-    selected.extend(
-        inactive_indices(inactive_offset, inactive_len, inactive_selected)
-            .into_iter()
-            .map(|index| candidates[activity_candidates + index].clone()),
+
+    let mut cycles = Vec::with_capacity(activity_selected + inactive_selected);
+    let mut hot_pools = FxHashSet::with_capacity_and_hasher(
+        (activity_selected + inactive_selected).saturating_mul(3),
+        Default::default(),
     );
 
-    let mut cycles = Vec::with_capacity(selected.len());
-    let mut hot_pools =
-        FxHashSet::with_capacity_and_hasher(selected.len().saturating_mul(3), Default::default());
-    for (cycle, _) in selected {
+    for (cycle, _) in active.into_iter().take(activity_selected) {
         for edge in &cycle.edges {
             if let Some(addr) = arena.pool_address(edge.pool_index) {
                 hot_pools.insert(addr);
@@ -475,6 +493,16 @@ fn select_cycles_for_rescore(
         }
         cycles.push(cycle);
     }
+    for index in inactive_indices(inactive_offset, inactive_len, inactive_selected) {
+        let cycle = Arc::clone(&inactive[index]);
+        for edge in &cycle.edges {
+            if let Some(addr) = arena.pool_address(edge.pool_index) {
+                hot_pools.insert(addr);
+            }
+        }
+        cycles.push(cycle);
+    }
+
     RescoreSelection {
         cycles,
         hot_pools,
@@ -1280,6 +1308,65 @@ mod tests {
             fee_denominator: U256::from(1_000u64),
             block_timestamp_last: 1,
         }))
+    }
+
+    #[test]
+    fn select_prefers_all_actives_before_inactive_rotation() {
+        let mut arena = StateArena::default();
+        let addresses: Vec<_> = (1u8..=4)
+            .map(|id| {
+                let address = Address::from([id; 20]);
+                arena.register_pool(address, v2_state());
+                address
+            })
+            .collect();
+        let partial_cache = PartialPoolCache::new();
+        // Pools 0 and 1 are hot; 2 and 3 are cold.
+        for &addr in &addresses[..2] {
+            partial_cache.seed(
+                addr,
+                SlimPoolState {
+                    protocol: ProtocolType::UniswapV2,
+                    sqrt_price_x96: U256::ZERO,
+                    liquidity: 0,
+                    tick: 0,
+                    reserve0: U256::from(1_000_000u64),
+                    reserve1: U256::from(1_000_000u64),
+                    patched_at_ms: now_ms(),
+                    activity_count: 3,
+                },
+            );
+        }
+        let cycles: Vec<_> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| cycle(PoolIndex(index as u32), score))
+            .collect();
+        let mut rates = rustc_hash::FxHashMap::default();
+        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+
+        let selected = select_cycles_for_rescore(
+            &cycles,
+            &arena,
+            &partial_cache,
+            &ExecutionService::new(),
+            &rates,
+            3,
+            0,
+        );
+
+        assert_eq!(selected.activity_candidates, 2);
+        assert_eq!(selected.activity_selected, 2);
+        assert_eq!(selected.inactive_selected, 1);
+        assert_eq!(selected.cycles.len(), 3);
+        // Two hot pools first (indices 0,1), then one inactive via rotation.
+        let selected_pools: Vec<u32> = selected
+            .cycles
+            .iter()
+            .map(|c| c.edges[0].pool_index.0)
+            .collect();
+        assert!(selected_pools[..2].contains(&0));
+        assert!(selected_pools[..2].contains(&1));
     }
 
     #[test]

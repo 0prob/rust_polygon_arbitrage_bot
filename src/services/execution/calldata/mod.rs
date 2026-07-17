@@ -87,6 +87,7 @@ pub fn encode_route(
     if executor == Address::ZERO {
         anyhow::bail!("executor address must not be zero");
     }
+    validate_flash_hop_compatibility(hops, flash_source)?;
     if flash_source == FlashLoanSource::Direct
         && hops_are_balancer_only(hops)
         && hops.len() <= crate::pipeline::route_calls::MAX_BALANCER_BATCH_HOPS
@@ -108,6 +109,44 @@ pub fn encode_route(
     Ok(calls)
 }
 
+/// Fail closed when flash-loan reentrancy forbids the encoded hop set.
+fn validate_flash_hop_compatibility(
+    hops: &[CalldataHop],
+    flash_source: FlashLoanSource,
+) -> anyhow::Result<()> {
+    match flash_source {
+        // Vault `flashLoan` → `receiveFlashLoan` rejects any Vault target in the route.
+        FlashLoanSource::Balancer => {
+            if hops
+                .iter()
+                .any(|h| h.edge.protocol == ProtocolType::BalancerV2)
+            {
+                anyhow::bail!(
+                    "Balancer vault flash cannot include Balancer vault swap hops (reentrancy)"
+                );
+            }
+        }
+        // DODO `flashLoan` is `preventReentrant` on the lending pool; sellBase/sellQuote
+        // on that pool inside the callback reverts. Until external DODO flash liquidity
+        // is wired with hop-level pool exclusion, any DODO swap hop is incompatible.
+        FlashLoanSource::Dodo => {
+            if hops.iter().any(|h| h.edge.protocol == ProtocolType::Dodo) {
+                anyhow::bail!(
+                    "DODO flash cannot include DODO swap hops on the flash pool (reentrancy)"
+                );
+            }
+        }
+        FlashLoanSource::AaveV3 | FlashLoanSource::Direct => {}
+    }
+    Ok(())
+}
+
+/// Re-quote the route for execution sizing.
+///
+/// - `amount_in` of hop 0 is preserved (flash/borrow size).
+/// - Each hop stores `amount_out` as the slippage floor (minOut for pull protocols).
+/// - The **next** hop's `amount_in` is the **full quote** (not the floor) so exact-in
+///   and V2 `amountOut` sizing match expected production, not a double haircut.
 fn conservative_execution_hops(
     arena: &StateArena,
     hops: &[CalldataHop],
@@ -125,7 +164,8 @@ fn conservative_execution_hops(
             .ok_or_else(|| anyhow::anyhow!("execution quote unavailable"))?;
         hop.amount_out = slippage_adjusted(quoted_out, slippage_bps)
             .ok_or_else(|| anyhow::anyhow!("execution hop min out is zero"))?;
-        amount_in = hop.amount_out;
+        // Chain full quote so intermediate exact-in hops are not systematically undersized.
+        amount_in = quoted_out;
         out.push(hop);
     }
     Ok(out)
@@ -339,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn downstream_hop_uses_predecessor_min_out() {
+    fn downstream_hop_chains_full_quote_and_stores_min_out() {
         let mut arena = StateArena::default();
         let t0 = arena.register_token(Address::from([1u8; 20]));
         let t1 = arena.register_token(Address::from([2u8; 20]));
@@ -354,8 +394,67 @@ mod tests {
             .expect("route should quote");
         let quoted = quote_hop_for_execution(&arena, &first).expect("first quote");
 
+        // amount_out is the slippage floor; next amount_in is the full quote.
         assert!(normalized[0].amount_out < quoted);
-        assert_eq!(normalized[1].amount_in, normalized[0].amount_out);
+        assert_eq!(normalized[1].amount_in, quoted);
+    }
+
+    #[test]
+    fn balancer_flash_rejects_vault_swap_hops() {
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            pool_address: Address::from([9u8; 20]),
+            token_in: Address::from([1u8; 20]),
+            token_out: Address::from([2u8; 20]),
+            amount_in: U256::from(1u64),
+            amount_out: U256::from(1u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        };
+        let err = validate_flash_hop_compatibility(&[hop], FlashLoanSource::Balancer)
+            .expect_err("vault hops under vault flash");
+        assert!(err.to_string().contains("reentrancy"));
+    }
+
+    #[test]
+    fn dodo_flash_rejects_dodo_swap_hops() {
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::Dodo,
+                fee_bps: 10,
+                zero_for_one: true,
+            },
+            pool_address: Address::from([9u8; 20]),
+            token_in: Address::from([1u8; 20]),
+            token_out: Address::from([2u8; 20]),
+            amount_in: U256::from(1u64),
+            amount_out: U256::from(1u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        };
+        let err = validate_flash_hop_compatibility(&[hop], FlashLoanSource::Dodo)
+            .expect_err("dodo hops under dodo flash");
+        assert!(err.to_string().contains("reentrancy"));
     }
 
     #[test]

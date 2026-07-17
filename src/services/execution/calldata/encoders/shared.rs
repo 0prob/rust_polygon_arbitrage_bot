@@ -7,14 +7,23 @@ use crate::services::execution::profit::slippage_adjusted;
 use crate::services::execution::quote::quote_hop_for_execution;
 use crate::services::execution::support::ic;
 
+pub fn compute_quoted_out(
+    arena: &StateArena,
+    hop: &CalldataHop,
+    label: &str,
+) -> anyhow::Result<U256> {
+    quote_hop_for_execution(arena, hop)
+        .filter(|q| !q.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("{label} hop execution quote unavailable"))
+}
+
 pub fn compute_min_out(
     arena: &StateArena,
     hop: &CalldataHop,
     slippage_bps: u64,
     label: &str,
 ) -> anyhow::Result<U256> {
-    let quoted = quote_hop_for_execution(arena, hop)
-        .ok_or_else(|| anyhow::anyhow!("{label} hop execution quote unavailable"))?;
+    let quoted = compute_quoted_out(arena, hop, label)?;
     slippage_adjusted(quoted, slippage_bps)
         .ok_or_else(|| anyhow::anyhow!("{label} hop min out is zero"))
 }
