@@ -1,7 +1,7 @@
 mod decode;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloy::primitives::{Address, B256, U256};
 use dashmap::DashMap;
@@ -117,6 +117,12 @@ impl StreamTrigger {
         let _ = self.tx.send(n);
     }
 
+    /// Non-destructive: true when at least one notify is waiting to be taken.
+    #[must_use]
+    pub fn stream_triggered_pending(&self) -> bool {
+        self.stream_tick.load(Ordering::Acquire) > 0
+    }
+
     #[must_use]
     pub fn take_stream_triggered(&self) -> bool {
         self.stream_tick.swap(0, Ordering::AcqRel) > 0
@@ -135,6 +141,12 @@ pub struct PartialPoolCache {
     patches: AtomicU64,
     trigger: StreamTrigger,
     dirty: parking_lot::Mutex<FxHashSet<Address>>,
+    /// Streamable pools currently in the arena — topic Sync/Swap on these wake HF
+    /// even when outside the smaller WSS interest top-N.
+    universe: DashMap<Address, (), FxBuildHasher>,
+    /// Topic-observed pools not yet in the universe — LF merges into hot refresh
+    /// so live Uni V3 venues enter the arena instead of staying wake_hf=false forever.
+    observed_live: DashMap<Address, (), FxBuildHasher>,
 }
 
 impl PartialPoolCache {
@@ -151,7 +163,72 @@ impl PartialPoolCache {
             patches: AtomicU64::new(0),
             trigger: StreamTrigger::new(),
             dirty: Mutex::new(FxHashSet::default()),
+            universe: DashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
+            observed_live: DashMap::with_capacity_and_hasher(64, FxBuildHasher),
         }
+    }
+
+    /// Replace the arena-known streamable universe used for HF wake gating.
+    pub fn set_stream_universe(&self, addrs: &[Address]) {
+        self.universe.clear();
+        for addr in addrs {
+            self.universe.insert(*addr, ());
+            self.observed_live.remove(addr);
+        }
+        crate::info!(
+            "stream universe: pools={} (topic Sync/Swap on these wake HF)",
+            addrs.len()
+        );
+    }
+
+    /// After topic-observed pools are refreshed into the arena/universe, wake HF
+    /// once — they often only traded before admission (live: wake_hf true stayed 0).
+    pub fn wake_for_admitted_observed(&self, observed: &[Address]) {
+        if observed.is_empty() {
+            return;
+        }
+        let now = crate::util::now_ms();
+        let mut woke = 0u32;
+        {
+            let mut dirty = self.dirty.lock();
+            for addr in observed {
+                if !self.universe.contains_key(addr) {
+                    continue;
+                }
+                dirty.insert(*addr);
+                // Stamp activity so HF `cycle_activity_score` can mark cycles
+                // containing this pool as active (seed-only states had count=0).
+                self.pools.entry(*addr).and_modify(|state| {
+                    state.patched_at_ms = now;
+                    state.activity_count = state.activity_count.max(1);
+                });
+                woke = woke.saturating_add(1);
+            }
+        }
+        if woke > 0 {
+            crate::info!("stream observed-live: synthetic wake for {woke} admitted pools");
+            self.trigger.notify();
+        }
+    }
+
+    #[must_use]
+    pub fn in_stream_universe(&self, addr: &Address) -> bool {
+        self.universe.contains_key(addr)
+    }
+
+    /// Record a topic-observed pool outside the current universe for LF hot refresh.
+    pub fn note_observed_live(&self, addr: Address) {
+        if !self.universe.contains_key(&addr) {
+            self.observed_live.insert(addr, ());
+        }
+    }
+
+    /// Drain topic-observed addresses for the next state-refresh hot set.
+    #[must_use]
+    pub fn take_observed_live(&self) -> Vec<Address> {
+        let addrs: Vec<Address> = self.observed_live.iter().map(|e| *e.key()).collect();
+        self.observed_live.clear();
+        addrs
     }
 
     pub fn trigger(&self) -> &StreamTrigger {
@@ -214,14 +291,32 @@ impl PartialPoolCache {
     }
 
     pub fn apply_log(&self, pool: Address, topic0: B256, data: &[u8], now_ms: u64) -> bool {
+        self.apply_log_notify(pool, topic0, data, now_ms, true)
+    }
+
+    /// Apply a decoded pool log. When `wake_hf` is false, state/activity still
+    /// update for stream-target ranking but HF is not notified (topic-wide
+    /// Sync/Swap spam outside the interest set was thrashing empty HF ticks).
+    pub fn apply_log_notify(
+        &self,
+        pool: Address,
+        topic0: B256,
+        data: &[u8],
+        now_ms: u64,
+        wake_hf: bool,
+    ) -> bool {
         let Some(patch) = decode_pool_log(topic0, data) else {
             return false;
         };
-        self.apply_patch(pool, patch, now_ms);
+        self.apply_patch_notify(pool, patch, now_ms, wake_hf);
         true
     }
 
     pub fn apply_patch(&self, pool: Address, patch: LogPatch, now_ms: u64) {
+        self.apply_patch_notify(pool, patch, now_ms, true);
+    }
+
+    pub fn apply_patch_notify(&self, pool: Address, patch: LogPatch, now_ms: u64, wake_hf: bool) {
         match patch {
             LogPatch::V2Reserves { reserve0, reserve1 } => {
                 self.pools
@@ -260,15 +355,19 @@ impl PartialPoolCache {
                     });
             }
         }
-        self.dirty.lock().insert(pool);
         let n = self.patches.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 50 == 0 {
-            crate::info!("WSS patch applied: n={n} pool={pool}");
+            crate::info!("WSS patch applied: n={n} pool={pool} wake_hf={wake_hf}");
         }
-        self.trigger.notify();
+        if wake_hf {
+            self.dirty.lock().insert(pool);
+            self.trigger.notify();
+        }
     }
 
     /// Drop stream snapshots for pools no longer in the active WSS target set.
+    /// Recently patched pools are retained so topic-wide Sync/Swap discovery can
+    /// promote live venues into the next stream target ranking.
     pub fn retain_tracked(&self, keep: &[Address]) {
         let mut dirty = self.dirty.lock();
         if keep.is_empty() {
@@ -279,8 +378,19 @@ impl PartialPoolCache {
         let mut keep_set =
             FxHashSet::with_capacity_and_hasher(keep.len(), rustc_hash::FxBuildHasher);
         keep_set.extend(keep.iter().copied());
-        self.pools.retain(|addr, _| keep_set.contains(addr));
-        dirty.retain(|addr| keep_set.contains(addr));
+        let now = crate::util::now_ms();
+        const KEEP_ACTIVE_MS: u64 = 300_000;
+        self.pools.retain(|addr, state| {
+            keep_set.contains(addr)
+                || now.saturating_sub(state.patched_at_ms) <= KEEP_ACTIVE_MS
+        });
+        dirty.retain(|addr| {
+            keep_set.contains(addr)
+                || self
+                    .pools
+                    .get(addr)
+                    .is_some_and(|s| now.saturating_sub(s.patched_at_ms) <= KEEP_ACTIVE_MS)
+        });
     }
 
     /// Merge slim snapshots into the shared `StateCache` for pools that already have full state.
@@ -323,6 +433,26 @@ impl PartialPoolCache {
     pub fn dirty_addresses(&self) -> Vec<Address> {
         self.dirty.lock().iter().copied().collect()
     }
+
+    /// Mark pools dirty and wake HF without waiting for another topic Swap.
+    /// Used after same-tick observed-live refresh admits venues into the arena.
+    pub fn wake_dirty_pools(&self, addrs: &[Address]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let now = crate::util::now_ms();
+        {
+            let mut dirty = self.dirty.lock();
+            for addr in addrs {
+                dirty.insert(*addr);
+                self.pools.entry(*addr).and_modify(|state| {
+                    state.patched_at_ms = now;
+                    state.activity_count = state.activity_count.max(1);
+                });
+            }
+        }
+        self.trigger.notify();
+    }
 }
 
 impl Default for PartialPoolCache {
@@ -360,9 +490,16 @@ fn apply_slim_to_pool_state(state: &mut PoolState, slim: &SlimPoolState) {
 pub struct StreamAddressSet {
     inner: Arc<RwLock<Vec<Address>>>,
     addr_tx: watch::Sender<Vec<Address>>,
-    /// Wall time of last accepted replace; used to freeze membership churn.
+    /// Wall time of last accepted replace; used to coalesce membership churn.
     last_replace_ms: Arc<AtomicU64>,
+    /// Set by WSS on log silence so the next LF tick can bypass hysteresis.
+    force_replace: Arc<AtomicBool>,
+    /// Bumped on silence-forced reselect to rotate centrality fill.
+    reselect_epoch: Arc<AtomicU64>,
 }
+
+/// Minimum gap between accepted replaces under normal hysteresis (not force).
+const STREAM_REPLACE_MIN_GAP_MS: u64 = 12_000;
 
 /// Symmetric difference size for two sorted, deduped address lists.
 fn sorted_symmetric_diff_len(a: &[Address], b: &[Address]) -> usize {
@@ -396,6 +533,8 @@ impl StreamAddressSet {
             inner: Arc::new(RwLock::new(Vec::new())),
             addr_tx,
             last_replace_ms: Arc::new(AtomicU64::new(0)),
+            force_replace: Arc::new(AtomicBool::new(false)),
+            reselect_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -403,23 +542,41 @@ impl StreamAddressSet {
         self.inner.read()
     }
 
+    /// Request that the next [`Self::replace`] bypass hysteresis (WSS log silence).
+    pub fn request_force_replace(&self) {
+        self.force_replace.store(true, Ordering::Relaxed);
+        self.reselect_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn force_replace_pending(&self) -> bool {
+        self.force_replace.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reselect_epoch(&self) -> u64 {
+        self.reselect_epoch.load(Ordering::Relaxed)
+    }
+
     /// Replace tracked addresses; returns true when the set changed enough to
     /// warrant a WSS resubscribe. Small top-N churn is ignored so LF score
     /// reshuffles do not tear down live Sync/Swap subscriptions every cycle.
+    /// Silence-forced replaces bypass the min-gap / sym-diff gates.
     #[must_use]
     pub fn replace(&self, mut addrs: Vec<Address>) -> bool {
         addrs.sort_unstable();
         addrs.dedup();
+        let force = self.force_replace.swap(false, Ordering::Relaxed);
         let mut guard = self.inner.write();
         if *guard == addrs {
             return false;
         }
-        if !guard.is_empty() && !addrs.is_empty() {
+        if !force && !guard.is_empty() && !addrs.is_empty() {
             let now = crate::util::now_ms();
             let last = self.last_replace_ms.load(Ordering::Relaxed);
-            // Keep WSS filters stable long enough for Sync/Swap to flow; LF
-            // bootstrap reshuffles top-N every cycle far above sym-diff hysteresis.
-            if last > 0 && now.saturating_sub(last) < 120_000 {
+            // Coalesce LF top-N churn; keep short enough that a cold bootstrap
+            // set can be replaced after WSS silence (was 120s — locked dead sets).
+            if last > 0 && now.saturating_sub(last) < STREAM_REPLACE_MIN_GAP_MS {
                 return false;
             }
             let diff = sorted_symmetric_diff_len(&guard, &addrs);
@@ -430,7 +587,8 @@ impl StreamAddressSet {
         }
         guard.clone_from(&addrs);
         let _ = self.addr_tx.send(addrs);
-        self.last_replace_ms.store(crate::util::now_ms(), Ordering::Relaxed);
+        self.last_replace_ms
+            .store(crate::util::now_ms(), Ordering::Relaxed);
         true
     }
 
@@ -446,8 +604,41 @@ impl Default for StreamAddressSet {
     }
 }
 
+/// Rough tradability weight for stream target ranking (0 = skip-prefer).
+fn stream_liquidity_score(state: &PoolState) -> u64 {
+    match state {
+        PoolState::V2(s) => {
+            let min = s.reserve0.min(s.reserve1);
+            if min.is_zero() {
+                0
+            } else {
+                // log2-ish depth — prefer funded pools over empty shells.
+                u64::from(256u32.saturating_sub(min.leading_zeros() as u32))
+            }
+        }
+        PoolState::V3(s) => {
+            if s.liquidity == 0 || s.sqrt_price_x96.is_zero() {
+                0
+            } else {
+                u64::from(128u32.saturating_sub(s.liquidity.leading_zeros())).saturating_mul(2)
+            }
+        }
+        PoolState::V4(s) => {
+            if s.liquidity == 0 || s.sqrt_price_x96.is_zero() {
+                0
+            } else {
+                u64::from(128u32.saturating_sub(s.liquidity.leading_zeros())).saturating_mul(2)
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Drop dust shells from WSS filters (V2 min-reserve ≳ 2^40, V3 liq ≳ 2^20).
+const MIN_STREAM_LIQ_SCORE: u64 = 48;
+
 /// Build the top-N streamable pool addresses ranked by cycle hot-set membership,
-/// graph edge centrality, and recent WSS patch activity.
+/// on-chain liquidity, graph edge centrality, and recent WSS patch activity.
 #[allow(clippy::too_many_arguments)]
 pub fn select_stream_targets(
     discovered: &[crate::services::discovery::DiscoveredPool],
@@ -459,6 +650,35 @@ pub fn select_stream_targets(
     cap: usize,
     now_ms: u64,
 ) -> Vec<Address> {
+    select_stream_targets_with_epoch(
+        discovered,
+        hot,
+        graph,
+        pool_metas,
+        arena,
+        partial_cache,
+        cap,
+        now_ms,
+        0,
+        &[],
+    )
+}
+
+/// Like [`select_stream_targets`], but `epoch` rotates the centrality fill and
+/// `demote` penalizes a prior silent watch set after WSS force-reselect.
+#[allow(clippy::too_many_arguments)]
+pub fn select_stream_targets_with_epoch(
+    discovered: &[crate::services::discovery::DiscoveredPool],
+    hot: &[Address],
+    graph: Option<&crate::pipeline::types::RoutingGraph>,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    arena: &crate::pipeline::arena::StateArena,
+    partial_cache: &PartialPoolCache,
+    cap: usize,
+    now_ms: u64,
+    epoch: u64,
+    demote: &[Address],
+) -> Vec<Address> {
     use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
     if cap == 0 {
@@ -466,6 +686,7 @@ pub fn select_stream_targets(
     }
 
     let hot_set: FxHashSet<Address> = hot.iter().copied().collect();
+    let demote_set: FxHashSet<Address> = demote.iter().copied().collect();
     let addr_to_pool = arena.address_to_pool();
 
     let mut edge_counts: FxHashMap<Address, u32> =
@@ -486,22 +707,63 @@ pub fn select_stream_targets(
     let mut scored: Vec<(u64, Address)> = discovered
         .iter()
         .filter(|p| is_streamable_protocol(p.protocol))
-        .map(|pool| {
+        .filter_map(|pool| {
+            let Some(&pool_idx) = addr_to_pool.get(&pool.address) else {
+                return None;
+            };
+            let liq = arena
+                .pool_state(pool_idx)
+                .map(stream_liquidity_score)
+                .unwrap_or(0);
+            // Dust / empty shells almost never emit Sync/Swap — keep them out
+            // of the WSS filter so the subscription covers live venues.
+            if liq < MIN_STREAM_LIQ_SCORE && !hot_set.contains(&pool.address) {
+                return None;
+            }
             let centrality = edge_counts.get(&pool.address).copied().unwrap_or(0) as u64;
-            let cycle_hot = u64::from(hot_set.contains(&pool.address)) * 10_000;
+            let cycle_hot = u64::from(hot_set.contains(&pool.address)) * 100_000;
             let (activity, activity_count) = partial_cache
                 .get(&pool.address)
                 .map_or((0, 0), |s| (s.patched_at_ms, s.activity_count.min(10_000)));
             let recency = activity.saturating_sub(now_ms.saturating_sub(300_000));
+            // Recently topic-patched venues jump the interest set so wake_hf can
+            // fire on the next Sync/Swap (live: interest∩chain was empty).
+            let live_boost = if activity > 0 && now_ms.saturating_sub(activity) < 120_000 {
+                250_000
+            } else {
+                0
+            };
+            // Keep cycle-hot pools eligible after silence; only rotate the fill.
+            let demote_penalty = u64::from(
+                demote_set.contains(&pool.address) && !hot_set.contains(&pool.address),
+            ) * 50_000;
             let score = cycle_hot
+                .saturating_add(live_boost)
+                .saturating_add(liq.saturating_mul(1_000))
                 .saturating_add(centrality.saturating_mul(100))
-                .saturating_add(activity_count.saturating_mul(25))
-                .saturating_add(recency / 1000);
-            (score, pool.address)
+                .saturating_add(activity_count.saturating_mul(250))
+                .saturating_add(recency / 1000)
+                .saturating_sub(demote_penalty);
+            Some((score, pool.address))
         })
         .collect();
 
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    // After silence-forced reselect, rotate the non-hot fill so we do not
+    // re-arm the same cold centrality block that produced zero logs.
+    if epoch > 0 && scored.len() > cap {
+        let hot_take = scored
+            .iter()
+            .take_while(|(s, _)| *s >= 100_000)
+            .count()
+            .min(cap);
+        let fill = scored.split_off(hot_take);
+        let rot = (epoch as usize).saturating_mul(cap / 4).min(fill.len());
+        let mut rotated = fill[rot..].to_vec();
+        rotated.extend_from_slice(&fill[..rot]);
+        scored.extend(rotated);
+    }
 
     let mut out = Vec::with_capacity(cap.min(scored.len()));
     let mut seen = FxHashSet::default();
@@ -621,5 +883,19 @@ mod tests {
             panic!("expected V2 state");
         };
         assert_eq!(state.reserve0, U256::from(20u8));
+    }
+
+    #[test]
+    fn stream_address_force_replace_bypasses_hysteresis() {
+        let set = StreamAddressSet::new();
+        let a: Vec<Address> = (1u8..=20).map(Address::with_last_byte).collect();
+        let b: Vec<Address> = (21u8..=40).map(Address::with_last_byte).collect();
+        assert!(set.replace(a));
+        // Immediate small-gap replace of a disjoint set would normally freeze.
+        assert!(!set.replace(b.clone()));
+        set.request_force_replace();
+        assert!(set.force_replace_pending());
+        assert!(set.replace(b));
+        assert!(!set.force_replace_pending());
     }
 }

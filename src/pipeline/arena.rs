@@ -46,12 +46,21 @@ fn sync_pool_graph_eligible(
         PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
         _ => pool.tokens.len(),
     };
+    // Missing decimal hints used to fail closed (`known_token_decimals?` → None)
+    // and permanently exclude live Uni V3 venues from the arena/universe. Fall
+    // back to 18 like the no-hints path; still reject unbounded metadata.
     let pair_input_decimals = pool.tokens.first().zip(pool.tokens.get(1)).and_then(
         |(a0, a1)| match decimal_hints {
-            Some(h) => Some((
-                crate::services::oracle::known_token_decimals(*a0, h)?,
-                crate::services::oracle::known_token_decimals(*a1, h)?,
-            )),
+            Some(h) => {
+                let d0 = h.get(a0).copied().unwrap_or(18);
+                let d1 = h.get(a1).copied().unwrap_or(18);
+                let max = crate::core::constants::MAX_SUPPORTED_TOKEN_DECIMALS;
+                if d0 > max || d1 > max {
+                    None
+                } else {
+                    Some((d0, d1))
+                }
+            }
             None => Some((18, 18)),
         },
     );

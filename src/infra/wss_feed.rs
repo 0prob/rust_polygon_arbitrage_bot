@@ -6,42 +6,32 @@ use std::time::{Duration, Instant};
 use crate::config::AppConfig;
 use crate::infra::rpc::rpc_host_label;
 use crate::services::partial_cache::{
-    PartialPoolCache, StreamAddressSet,
+    PartialPoolCache, StreamAddressSet, V2_SYNC_TOPIC, V3_SWAP_TOPIC,
 };
 use crate::util::now_ms;
 use crate::{info, warn};
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::pubsub::Subscription;
 use alloy::rpc::types::Filter;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-
-/// Max pool addresses per `eth_subscribe` filter (provider limits vary; 50 is conservative).
-const SUBSCRIBE_CHUNK: usize = 50;
-/// Parallel `subscribe_logs` fan-out — drpc returns error 15 "Too many requests"
-/// when all chunks are spawned at once (live: 500 pools → 10 concurrent subs).
-const SUBSCRIBE_CONCURRENCY: usize = 2;
-/// Pause between subscription batches to stay under provider rate limits.
-const SUBSCRIBE_BATCH_GAP: Duration = Duration::from_millis(150);
 
 /// Base reconnect delay (doubles on each failure, capped at MAX_RECONNECT_DELAY_MS).
 /// Reduced for HFT sensitivity — Polygon WSS endpoints typically reconnect in <200ms.
 const BASE_RECONNECT_DELAY_MS: u64 = 100;
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
-/// Silence timeout: if no log or ping succeeds within this window, reconnect.
+/// Silence timeout: if no Sync/Swap arrives within this window, reconnect.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// RPC ping interval — keeps the WS alive when subscribed pools are quiet.
+/// RPC ping interval — keeps the WS alive when the chain is quiet.
 const WSS_PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Per-endpoint connect + `eth_blockNumber` probe budget.
 const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Coalesce rapid LF stream-target updates before tearing down subscriptions.
-/// 400ms was too short — LF graph attach storms forced resubscribe → rate limits.
-const WSS_ADDR_DEBOUNCE: Duration = Duration::from_secs(3);
 const WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS: u64 = 60_000;
+/// No Sync/Swap after arm → force LF to rotate interest set / re-seed ranking.
+const WSS_LOG_SILENCE_FORCE: Duration = Duration::from_secs(20);
 
 /// Why a live subscription session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,66 +145,38 @@ impl PoolLogFeed {
         let ws = WsConnect::new(wss_url.to_string());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
 
-        let mut subs: Vec<Subscription<alloy::rpc::types::Log>> =
-            Vec::with_capacity(addresses.len().div_ceil(SUBSCRIBE_CHUNK));
-        let chunks: Vec<&[Address]> = addresses.chunks(SUBSCRIBE_CHUNK).collect();
-        let mut batches = chunks.chunks(SUBSCRIBE_CONCURRENCY).peekable();
-        while let Some(batch) = batches.next() {
-            let mut join_set = tokio::task::JoinSet::new();
-            for chunk in batch {
-                // Address-only filter: some providers (drpc/chainstack) accept
-                // combined address+topic eth_subscribe filters but never push logs.
-                // Topic match is enforced in handle_log / decode_pool_log.
-                let filter = Filter::new().address(chunk.to_vec());
-                let provider = provider.clone();
-                join_set.spawn(async move {
-                    timeout(Duration::from_secs(8), provider.subscribe_logs(&filter)).await
-                });
-            }
-            while let Some(result) = join_set.join_next().await {
-                // Keep error types explicit: `??` after map_err<anyhow> infers the
-                // outer `?` as RpcError and fails From<anyhow::Error>.
-                let sub = match result.map_err(|e| anyhow::anyhow!("subscribe join: {e}"))? {
-                    Ok(Ok(sub)) => sub,
-                    Ok(Err(e)) => {
-                        return Err(anyhow::anyhow!("subscribe_logs failed: {e}"));
-                    }
-                    Err(_elapsed) => {
-                        return Err(anyhow::anyhow!("subscribe_logs timed out"));
-                    }
-                };
-                subs.push(sub);
-            }
-            if batches.peek().is_some() {
-                tokio::time::sleep(SUBSCRIBE_BATCH_GAP).await;
-            }
-        }
+        // Topic-only Sync|Swap: address-filtered subs stayed armed but delivered
+        // ~0 logs because predicted top-N pools were deep-but-quiet. Topic-wide
+        // feeds ~10 logs/s on Polygon; client decode filters unknowns.
+        let filter = Filter::new().event_signature(vec![V2_SYNC_TOPIC, V3_SWAP_TOPIC]);
+        let sub = match timeout(Duration::from_secs(8), provider.subscribe_logs(&filter)).await {
+            Ok(Ok(sub)) => sub,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("subscribe_logs failed: {e}")),
+            Err(_elapsed) => return Err(anyhow::anyhow!("subscribe_logs timed out")),
+        };
 
-        let chunk_count = subs.len();
         let (log_tx, mut log_rx) = mpsc::channel(1024);
         let mut readers = JoinSet::new();
-        for mut sub in subs {
-            let log_tx = log_tx.clone();
-            readers.spawn(async move {
-                while let Ok(log) = sub.recv().await {
-                    if log_tx.send(log).await.is_err() {
-                        break;
-                    }
+        let mut sub = sub;
+        readers.spawn(async move {
+            while let Ok(log) = sub.recv().await {
+                if log_tx.send(log).await.is_err() {
+                    break;
                 }
-            });
-        }
-        drop(log_tx);
+            }
+        });
         info!(
-            "WSS subscriptions armed ({}, pools={}, chunks={})",
+            "WSS subscriptions armed ({}, mode=topic_sync_swap, interest_pools={})",
             rpc_host_label(wss_url),
-            addresses.len(),
-            chunk_count
+            addresses.len()
         );
 
-        // Debounce address churn without blocking log receive. The previous
-        // `sleep` inside the `addr_rx.changed` branch froze Sync/Swap handling
-        // for WSS_ADDR_DEBOUNCE on every LF target refresh.
-        let mut addr_deadline: Option<tokio::time::Instant> = None;
+        // Topic filter does not depend on address membership — ignore LF target
+        // churn for resubscribe (only consume watch updates so has_changed stays
+        // fresh). Prior address-chunk resubscribes starved log delivery.
+        let mut last_log_at = Instant::now();
+        let mut silence_forced = false;
+        let armed_at = Instant::now();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -223,31 +185,15 @@ impl PoolLogFeed {
                     }
                 }
                 _ = addr_rx.changed() => {
-                    addr_deadline = Some(tokio::time::Instant::now() + WSS_ADDR_DEBOUNCE);
-                }
-                () = async {
-                    match addr_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if addr_deadline.is_some() => {
-                    if addr_rx.has_changed().unwrap_or(false) {
-                        let _ = addr_rx.borrow_and_update();
-                        addr_deadline = Some(tokio::time::Instant::now() + WSS_ADDR_DEBOUNCE);
-                        continue;
-                    }
-                    let next = addr_rx.borrow().clone();
-                    addr_deadline = None;
-                    if next == addresses {
-                        continue;
-                    }
-                    return Ok(SubscriptionExit::AddressChange);
+                    let _ = addr_rx.borrow_and_update();
                 }
                 maybe_log = log_rx.recv() => {
                     let Some(log) = maybe_log else {
                         warn!("WSS feed disconnected ({}), reconnecting...", rpc_host_label(wss_url));
                         return Ok(SubscriptionExit::Unhealthy);
                     };
+                    last_log_at = Instant::now();
+                    silence_forced = false;
                     self.handle_log(&log);
                 }
                 () = tokio::time::sleep(WSS_PING_INTERVAL) => {
@@ -260,10 +206,25 @@ impl PoolLogFeed {
                         warn!("WSS ping failed ({}), reconnecting...", rpc_host_label(wss_url));
                         return Ok(SubscriptionExit::Unhealthy);
                     }
-                }
-                () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
-                    warn!("WSS feed idle timeout ({}), reconnecting...", rpc_host_label(wss_url));
-                    return Ok(SubscriptionExit::Unhealthy);
+                    if !silence_forced
+                        && armed_at.elapsed() >= WSS_LOG_SILENCE_FORCE
+                        && last_log_at.elapsed() >= WSS_LOG_SILENCE_FORCE
+                    {
+                        silence_forced = true;
+                        self.addresses.request_force_replace();
+                        warn!(
+                            "WSS log silence ({}): no Sync/Swap for {}s — forcing stream target reselect",
+                            rpc_host_label(wss_url),
+                            WSS_LOG_SILENCE_FORCE.as_secs()
+                        );
+                    }
+                    if last_log_at.elapsed() >= STREAM_IDLE_TIMEOUT {
+                        warn!(
+                            "WSS feed idle timeout ({}), reconnecting...",
+                            rpc_host_label(wss_url)
+                        );
+                        return Ok(SubscriptionExit::Unhealthy);
+                    }
                 }
             }
         }
@@ -283,7 +244,16 @@ impl PoolLogFeed {
                 data.len()
             );
         }
-        if !self.partial.apply_log(pool, topic0, data, ts) {
+        // Wake HF for interest top-N or any arena-known streamable pool.
+        // Pure topic spam outside the universe must not thrash empty ticks.
+        let wake_hf = {
+            let addrs = self.addresses.read();
+            addrs.binary_search(&pool).is_ok() || self.partial.in_stream_universe(&pool)
+        };
+        if !self
+            .partial
+            .apply_log_notify(pool, topic0, data, ts, wake_hf)
+        {
             let miss = MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if miss == 1 || miss % 50 == 0 {
                 warn!(
@@ -291,6 +261,12 @@ impl PoolLogFeed {
                     data.len()
                 );
             }
+            return;
+        }
+        if !wake_hf && topic0 == V3_SWAP_TOPIC {
+            // Uni V3 venue not in arena yet — LF hot-refreshes same tick.
+            // Skip V2 Sync: QS/Uni V2 are disabled in env and dominate topic spam.
+            self.partial.note_observed_live(pool);
         }
     }
 

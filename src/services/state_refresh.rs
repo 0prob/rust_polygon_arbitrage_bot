@@ -167,6 +167,34 @@ impl StateRefreshService {
         self.discovery_state.write().hot_addresses = Arc::new(addrs);
     }
 
+    /// Topic-observed addresses that are in the discovery index and still routable
+    /// (drops disabled QS/Uni V2 spam that can never enter the arena).
+    #[must_use]
+    pub fn filter_observed_live_routable(&self, observed: &[Address]) -> Vec<Address> {
+        let state = self.discovery_state.read();
+        let mut out = Vec::with_capacity(observed.len().min(64));
+        let mut seen = rustc_hash::FxHashSet::default();
+        for addr in observed {
+            if !seen.insert(*addr) {
+                continue;
+            }
+            let Some(&idx) = state.address_index.get(addr) else {
+                continue;
+            };
+            let Some(pool) = state.discovered.get(idx) else {
+                continue;
+            };
+            if !is_routable_pool(pool) {
+                continue;
+            }
+            if !crate::services::partial_cache::is_streamable_protocol(pool.protocol) {
+                continue;
+            }
+            out.push(*addr);
+        }
+        out
+    }
+
     pub fn discovered_pools(&self) -> Arc<Vec<DiscoveredPool>> {
         Arc::clone(&self.discovery_state.read().discovered)
     }

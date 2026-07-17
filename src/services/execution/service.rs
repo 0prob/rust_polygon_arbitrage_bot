@@ -52,6 +52,14 @@ const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 2;
 /// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
 /// at ~358 bps across captures while ge_1000 stayed 0).
 const CHRONIC_UNDERWATER_COVER_BPS: u64 = 2_000;
+/// Require repeated best-eval wins before 30m quarantine. Live uqfix: unblocking
+/// quarantine then one-shot-quarantined 74 distinct fps → selected=0 / kept max 1.
+const CHRONIC_UNDERWATER_STRIKES: u32 = 3;
+/// Reset strike count when best-eval gaps exceed this (one-shot diversions).
+const CHRONIC_UNDERWATER_STRIKE_WINDOW: Duration = Duration::from_secs(120);
+/// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
+/// into selected=0). Sticky V3 dust sits ~300–400 bps.
+const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 100;
 /// Sticky V3 dust (~355 bps) is static for hours — 120s let it re-burn the probe
 /// window each expiry. 30m matches direct-token quarantine scale.
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = Duration::from_secs(1800);
@@ -140,6 +148,8 @@ pub struct ExecutionService {
     route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
     /// Direct (`executeArbDirect`) start tokens that failed zero-realized confirm.
     direct_token_quarantine: RwLock<FxHashMap<Address, Instant>>,
+    /// Underwater best-eval strike counts: fp → (strikes, last_strike_at).
+    underwater_strikes: RwLock<FxHashMap<u64, (u32, Instant)>>,
     global_quarantine_until: Mutex<Option<Instant>>,
     fail_counts: RwLock<FxHashMap<u64, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
@@ -265,6 +275,7 @@ impl ExecutionService {
             quarantine: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
             direct_token_quarantine: RwLock::new(FxHashMap::default()),
+            underwater_strikes: RwLock::new(FxHashMap::default()),
             global_quarantine_until: parking_lot::Mutex::new(None),
             fail_counts: RwLock::new(FxHashMap::default()),
             nonce: RwLock::new(None),
@@ -604,17 +615,39 @@ impl ExecutionService {
     }
 
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
-    /// Returns true only when a *new* cooldown was applied (not on refresh).
+    /// Returns true only when a *new* cooldown was applied (not on refresh / first strike).
     pub fn quarantine_chronic_gas_underwater(&self, fingerprint: u64, gas_cover_bps: u64) -> bool {
-        if gas_cover_bps >= CHRONIC_UNDERWATER_COVER_BPS {
+        if gas_cover_bps >= CHRONIC_UNDERWATER_COVER_BPS
+            || gas_cover_bps < CHRONIC_UNDERWATER_MIN_COVER_BPS
+        {
             return false;
         }
-        let mut q = self.quarantine.write();
         let now = Instant::now();
-        if q.get(&fingerprint).is_some_and(|expiry| now < *expiry) {
+        if self
+            .quarantine
+            .read()
+            .get(&fingerprint)
+            .is_some_and(|expiry| now < *expiry)
+        {
             return false;
         }
-        q.insert(fingerprint, now + CHRONIC_UNDERWATER_QUARANTINE);
+        let strikes = {
+            let mut map = self.underwater_strikes.write();
+            let entry = map.entry(fingerprint).or_insert((0, now));
+            if now.saturating_duration_since(entry.1) > CHRONIC_UNDERWATER_STRIKE_WINDOW {
+                *entry = (0, now);
+            }
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = now;
+            entry.0
+        };
+        if strikes < CHRONIC_UNDERWATER_STRIKES {
+            return false;
+        }
+        self.underwater_strikes.write().remove(&fingerprint);
+        self.quarantine
+            .write()
+            .insert(fingerprint, now + CHRONIC_UNDERWATER_QUARANTINE);
         true
     }
 
@@ -1689,6 +1722,25 @@ fn required_operator_balance(
 mod safety_tests {
     use super::*;
     use crate::services::execution::candidate::CandidateExecution;
+
+    #[test]
+    fn chronic_underwater_quarantine_needs_repeated_strikes() {
+        let exec = ExecutionService::default();
+        let fp = 0xdead_beef_u64;
+        // Near-zero cover never strikes (cascade guard).
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10));
+        assert!(!exec.is_route_quarantined(fp));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(!exec.is_route_quarantined(fp));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(exec.is_route_quarantined(fp));
+        // Already quarantined — no re-apply signal.
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
+        // One-shot diversion (different fp) stays selectable.
+        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200));
+        assert!(!exec.is_route_quarantined(0xcafe_u64));
+    }
 
     #[test]
     fn required_private_submit_needs_verified_private_rpc_capability() {

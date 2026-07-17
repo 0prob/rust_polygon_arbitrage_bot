@@ -39,7 +39,9 @@ use crate::services::oracle::{
     enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
     merge_token_rates, resolvable_token_set,
 };
-use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet, select_stream_targets};
+use crate::services::partial_cache::{
+    PartialPoolCache, StreamAddressSet, select_stream_targets_with_epoch,
+};
 use crate::services::pipeline_survival::PipelineSurvival;
 use crate::services::state_cache::StateCache;
 use crate::services::state_refresh::StateRefreshService;
@@ -60,6 +62,11 @@ struct LfCpuWork {
     token_decimals: Arc<FxHashMap<Address, u8>>,
     gas_price_wei: Option<U256>,
     flash_liquidity: Arc<FlashLiquidityCache>,
+    /// Topic-observed pools just admitted — growth rebuilds keep the cycle cache,
+    /// so force an incremental refind or those venues never appear on HF cycles.
+    force_cycle_refind: bool,
+    /// Arena indices for `force_cycle_refind` — pinned through diversity selection.
+    observed_pool_indices: Vec<PoolIndex>,
 }
 
 struct LfCpuResult {
@@ -68,6 +75,57 @@ struct LfCpuResult {
     /// Cycle enumeration only (0 when graph cache reused).
     enumeration_ms: u64,
     enumerated_cycles: usize,
+}
+
+/// Keep cycles that touch freshly observed pools, then fill remaining slots with
+/// the normal protocol-diverse selection (so live WSS venues are not dropped).
+fn pin_cycles_touching_pools(
+    cycles: Vec<crate::core::types::FoundCycle>,
+    pin_pools: &[PoolIndex],
+    max_cycles: usize,
+) -> Vec<crate::core::types::FoundCycle> {
+    if max_cycles == 0 || cycles.is_empty() || pin_pools.is_empty() {
+        return finalize_enumerated_cycles(cycles, max_cycles);
+    }
+    let pin: rustc_hash::FxHashSet<PoolIndex> = pin_pools.iter().copied().collect();
+    let mut pinned = Vec::new();
+    let mut rest = Vec::with_capacity(cycles.len());
+    for cycle in cycles {
+        if cycle
+            .edges
+            .iter()
+            .any(|edge| pin.contains(&edge.pool_index))
+        {
+            pinned.push(cycle);
+        } else {
+            rest.push(cycle);
+        }
+    }
+    if pinned.is_empty() {
+        return finalize_enumerated_cycles(rest, max_cycles);
+    }
+    pinned.sort_by(crate::pipeline::types::compare_cycle_score);
+    pinned.truncate(max_cycles);
+    let pin_kept = pinned.len();
+    let mut seen: rustc_hash::FxHashSet<u64> = pinned
+        .iter()
+        .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+        .collect();
+    let fill = finalize_enumerated_cycles(rest, max_cycles.saturating_sub(pinned.len()));
+    for cycle in fill {
+        let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+        if seen.insert(key) {
+            pinned.push(cycle);
+            if pinned.len() >= max_cycles {
+                break;
+            }
+        }
+    }
+    crate::info!(
+        "stream observed-live: pinned_cycles={pin_kept} total={} (cap={max_cycles})",
+        pinned.len()
+    );
+    pinned
 }
 
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
@@ -334,6 +392,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         // Growth rebuilds no longer clear the cycle cache when indices stay valid.
         (needs_rebuild && !cycle_cache_valid)
             || missing_graph_pools > 0
+            || work.force_cycle_refind
             || gc.cycles().is_none()
             || cached_cycles.is_none()
             || gc.needs_cycle_refind(
@@ -344,11 +403,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 work.arena.pool_count(),
             )
     };
-    // Incremental: attach/growth only — full rebuild (interval/shrink/reorder) keeps 1s budget.
-    let incremental_refind = !needs_rebuild
-        && cycle_cache_valid
+    // Incremental: attach/observed-admit — full rebuild (interval/shrink/reorder) keeps 1s budget.
+    let incremental_refind = cycle_cache_valid
         && cached_cycles.as_ref().is_some_and(|c| !c.is_empty())
-        && (missing_graph_pools > 0 || connectivity_stale);
+        && (work.force_cycle_refind
+            || (!needs_rebuild && (missing_graph_pools > 0 || connectivity_stale)));
     let mut enumeration_ms = 0u64;
     let (cycles, enumerated_cycles) = if need_cycle_refind {
         crate::debug!(
@@ -417,7 +476,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         }
         enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
         let enumerated_cycles = result.len();
-        let diversified = finalize_enumerated_cycles(result, work.max_paths);
+        let diversified = if work.observed_pool_indices.is_empty() {
+            finalize_enumerated_cycles(result, work.max_paths)
+        } else {
+            pin_cycles_touching_pools(result, &work.observed_pool_indices, work.max_paths)
+        };
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
                 "cycle search diversity: cap={} post_diversity={}",
@@ -512,6 +575,40 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let discovery_started = crate::util::now_ms();
     let _ = ctx.refresh.maybe_discover().await?;
     let discovery_ms = crate::util::now_ms().saturating_sub(discovery_started);
+
+    // Promote topic-observed venues into this tick's refresh before arena sync.
+    // Filter to discovery-routable streamable pools — live wssobs was dominated by
+    // disabled QS/Uni V2 (`0x882df4…`) that can never match the index / arena.
+    let observed_raw = ctx.partial_cache.take_observed_live();
+    let observed = ctx.refresh.filter_observed_live_routable(&observed_raw);
+    if !observed_raw.is_empty() {
+        crate::info!(
+            "stream observed-live: topic_n={} routable={} skipped={}",
+            observed_raw.len(),
+            observed.len(),
+            observed_raw.len().saturating_sub(observed.len())
+        );
+    }
+    if !observed.is_empty() {
+        let mut hot = ctx.refresh.hot_addresses().as_ref().to_vec();
+        hot.extend(observed.iter().copied());
+        hot.sort_unstable();
+        hot.dedup();
+        ctx.refresh.set_hot_addresses(hot);
+        match ctx
+            .refresh
+            .refresh_pool_states_for(&observed, observed.len().min(64))
+            .await
+        {
+            Ok(result) => crate::info!(
+                "stream observed-live: refresh matched={} targeted_updated={}",
+                result.matched,
+                result.updated
+            ),
+            Err(e) => crate::warn!("stream observed-live targeted refresh failed: {e:#}"),
+        }
+    }
+
     let refresh_started = crate::util::now_ms();
     let refresh_result = ctx.refresh.refresh_pool_states(refresh_batch).await?;
     let refreshed_pools = refresh_result.updated;
@@ -567,6 +664,14 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     if gas_price_wei.is_none() && lf_pass <= 2 {
         crate::debug!("lf cycle prefilter: gas oracle not warm yet (no gas floor at enumeration)");
     }
+    let observed_pool_indices: Vec<PoolIndex> = {
+        let map = arena.address_to_pool();
+        observed
+            .iter()
+            .filter_map(|addr| map.get(addr).copied())
+            .collect()
+    };
+    let force_cycle_refind = !observed_pool_indices.is_empty();
     let cpu_work = LfCpuWork {
         graph_cache: Arc::clone(&ctx.graph_cache),
         cache: Arc::clone(&ctx.cache),
@@ -582,6 +687,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         token_decimals: Arc::clone(&decimals),
         gas_price_wei,
         flash_liquidity: Arc::clone(&ctx.flash_liquidity),
+        force_cycle_refind,
+        observed_pool_indices,
     };
     // ponytail: skip enrich_all_token_to_matic_rates — prior_rates from last tick
     // is sufficient for resolvable set computation. Cycle-token enrichment below
@@ -898,21 +1005,71 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     let stream_targets = ctx.config.pipeline.stream_enabled.then(|| {
-        select_stream_targets(
+        let force = ctx.stream_addresses.force_replace_pending();
+        let epoch = if force {
+            ctx.stream_addresses.reselect_epoch()
+        } else {
+            0
+        };
+        let demote: Vec<_> = if force {
+            ctx.stream_addresses.read().clone()
+        } else {
+            Vec::new()
+        };
+        let cap = ctx.config.pipeline.stream_max_pools;
+        let mut targets = select_stream_targets_with_epoch(
             &pools,
             &hot,
             Some(routing_graph.as_ref()),
             pool_metas.as_ref(),
             &arena,
             &ctx.partial_cache,
-            ctx.config.pipeline.stream_max_pools,
+            cap,
             crate::util::now_ms(),
-        )
+            epoch,
+            &demote,
+        );
+        // Pin topic-observed routable pools that made it into the arena this tick
+        // so the next Sync/Swap sets wake_hf=true (interest path).
+        if !observed.is_empty() {
+            let addr_to_pool = arena.address_to_pool();
+            for addr in &observed {
+                if targets.len() >= cap {
+                    break;
+                }
+                if addr_to_pool.contains_key(addr) && !targets.contains(addr) {
+                    targets.push(*addr);
+                }
+            }
+        }
+        targets
     });
 
     if *shutdown.borrow() {
         return Ok(());
     }
+
+    // Universe = streamable pools present in the arena (superset of interest).
+    let stream_universe: Option<Vec<_>> = ctx.config.pipeline.stream_enabled.then(|| {
+        pool_metas
+            .iter()
+            .filter(|m| crate::services::partial_cache::is_streamable_protocol(m.protocol))
+            .filter_map(|m| arena.pool_address(m.pool_index))
+            .collect()
+    });
+
+    // Topic-observed V3 pools admitted this tick — nudge HF after snapshot publish
+    // so we do not wait for a second Swap (live: wake_hf stayed 0 on one-shot venues).
+    let observed_in_arena: Vec<Address> = if observed.is_empty() {
+        Vec::new()
+    } else {
+        let map = arena.address_to_pool();
+        observed
+            .iter()
+            .filter(|addr| map.contains_key(*addr))
+            .copied()
+            .collect()
+    };
 
     *ctx.arena.lock() = arena.clone();
     let graph_active_by_protocol = Arc::new(
@@ -940,16 +1097,61 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     ctx.ui_hook
         .on_lf_complete(_cycle_count, cycle_search_ms, pools.len());
 
-    ctx.refresh.set_hot_addresses(hot);
+    // Keep topic-observed routable pools in the refresh hot set (cycle-only `hot`
+    // used to wipe them every LF tick).
+    let mut publish_hot = hot;
+    publish_hot.extend(observed.iter().copied());
+    publish_hot.sort_unstable();
+    publish_hot.dedup();
+    ctx.refresh.set_hot_addresses(publish_hot);
 
     if let Some(targets) = stream_targets {
         // Apply hysteresis first so retain/seed match the addresses WSS actually
         // watches (replace may keep the prior set on small top-N churn).
-        let _ = ctx.stream_addresses.replace(targets);
+        let force = ctx.stream_addresses.force_replace_pending();
+        // Log score-order sample before replace() sorts by address.
+        let sample_n = targets.len().min(5);
+        let score_sample: Vec<String> = targets
+            .iter()
+            .take(sample_n)
+            .map(|a| format!("{a}"))
+            .collect();
+        let replaced = ctx.stream_addresses.replace(targets);
+        if replaced {
+            crate::info!(
+                "stream targets updated: pools={} force={} epoch={} top=[{}]",
+                ctx.stream_addresses.read().len(),
+                force,
+                ctx.stream_addresses.reselect_epoch(),
+                score_sample.join(",")
+            );
+        }
         let tracked: Vec<_> = ctx.stream_addresses.read().clone();
+        if let Some(universe) = stream_universe {
+            ctx.partial_cache.set_stream_universe(&universe);
+        }
         ctx.partial_cache.retain_tracked(&tracked);
         ctx.partial_cache
             .seed_from_state_cache(&ctx.cache, &tracked, crate::util::now_ms());
+    }
+
+    // Same-tick HF nudge: do not wait for a second V3 Swap after arena admission.
+    let nudged = if !observed_in_arena.is_empty() {
+        ctx.partial_cache.wake_dirty_pools(&observed_in_arena);
+        true
+    } else if !observed.is_empty() {
+        ctx.partial_cache.wake_for_admitted_observed(&observed);
+        false
+    } else {
+        false
+    };
+    if !observed.is_empty() {
+        crate::info!(
+            "stream observed-live: arena_hit={}/{} nudged_hf={}",
+            observed_in_arena.len(),
+            observed.len(),
+            u8::from(nudged)
+        );
     }
 
     Ok(())

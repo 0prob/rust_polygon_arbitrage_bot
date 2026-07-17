@@ -302,7 +302,8 @@ fn default_cycle_refind_interval() -> u64 {
     crate::pipeline::graph_cache::default_cycle_refind_interval()
 }
 fn default_stream_max_pools() -> usize {
-    500
+    // Fewer high-quality venues beat 500 dust shells that never emit Sync/Swap.
+    200
 }
 fn default_indexer_max_lag_blocks() -> u64 {
     200

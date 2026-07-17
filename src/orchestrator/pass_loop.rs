@@ -437,11 +437,15 @@ impl HfScheduler {
     /// HF interval tick: attach stream-trigger if WSS patched since last stream HF.
     fn schedule_timer_tick(&mut self) {
         let pending = self.stream_pending.swap(false, Ordering::AcqRel);
+        // Peek only — do not take here. Consuming the latch before acquire made
+        // promote logs lie while HF stayed stream_triggered=false (inflight
+        // ticks stored hf_stream_pending, but a later schedule(false) could
+        // still win the race after completion drained it incorrectly).
         let patched = self
             .hf_ctx
             .partial_cache
             .trigger()
-            .take_stream_triggered();
+            .stream_triggered_pending();
         let stream_triggered = pending || patched;
         if stream_triggered {
             self.last_stream_hf_at = std::time::Instant::now();
@@ -715,13 +719,22 @@ fn schedule_hf_tick(
     let hf_inflight_acquire = Arc::clone(&hf_inflight);
     let Ok(permit) = hf_inflight_acquire.try_acquire_owned() else {
         hf_pending.store(true, Ordering::Release);
-        if stream_triggered {
+        if stream_triggered
+            || hf_ctx
+                .partial_cache
+                .trigger()
+                .stream_triggered_pending()
+        {
             hf_stream_pending.store(true, Ordering::Release);
         }
         return;
     };
     hf_pending.store(false, Ordering::Release);
-    let stream_triggered = next_hf_stream_trigger(stream_triggered, &hf_stream_pending);
+    // Take the WSS latch only once an HF permit is held so promote→eval cannot
+    // drop stream_triggered on inflight timer wakes.
+    let patched_now = hf_ctx.partial_cache.trigger().take_stream_triggered();
+    let stream_triggered =
+        next_hf_stream_trigger(stream_triggered || patched_now, &hf_stream_pending);
     let hf_ctx_run = Arc::clone(&hf_ctx);
     let hf_task_store = Arc::clone(hf_task);
     let hf_pending_task = Arc::clone(&hf_pending);
@@ -738,9 +751,6 @@ fn schedule_hf_tick(
                 &hf_stream_pending_task,
             ) {
                 return;
-            }
-            if stream_triggered {
-                let _ = hf_ctx_run.partial_cache.trigger().take_stream_triggered();
             }
             if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
                 crate::warn!("hf tick failed: {e:#}");
