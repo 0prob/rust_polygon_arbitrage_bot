@@ -49,18 +49,23 @@ impl GraphCache {
         self.lf_pass_count
     }
 
+    /// Pure membership growth is handled by `attach_missing` (coverage refreshed).
+    /// A full rebuild is reserved for interval recompute or shrink/reorder.
     fn pool_count_rebuild_due(&self, routable_pool_count: usize) -> bool {
         if self.graph.is_none() {
             return true;
         }
-        let delta = routable_pool_count.abs_diff(self.cached_pool_count);
-        let pct_threshold = self.cached_pool_count / 20;
-        let min_delta = if self.cached_pool_count >= WARM_POOL_THRESHOLD {
-            WARM_POOL_COUNT_REBUILD_DELTA
-        } else {
-            POOL_COUNT_REBUILD_DELTA
-        };
-        delta >= min_delta.max(pct_threshold)
+        // Shrink: discovery/prune dropped pools — indices may be invalid.
+        if routable_pool_count < self.cached_pool_count {
+            let lost = self.cached_pool_count - routable_pool_count;
+            let min_delta = if self.cached_pool_count >= WARM_POOL_THRESHOLD {
+                WARM_POOL_COUNT_REBUILD_DELTA
+            } else {
+                POOL_COUNT_REBUILD_DELTA
+            };
+            return lost >= min_delta.max(self.cached_pool_count / 20);
+        }
+        false
     }
 
     #[must_use]
@@ -80,13 +85,40 @@ impl GraphCache {
         }
         // Fingerprint change with same or fewer pools ⇒ reorder / drop / replace.
         // Pure growth (more pools, new fingerprint) is patched via attach_missing
-        // until the pool-count or eligible-count thresholds force a rebuild.
+        // on the interval, not a full rebuild every LF warmup tick.
         if self.cached_layout_fingerprint != layout_fingerprint
             && routable_pool_count <= self.cached_pool_count
         {
             return true;
         }
         false
+    }
+
+    /// True when cached cycles remain index-valid after this membership change.
+    /// Growth (append-only arena) keeps PoolIndex; shrink/reorder does not.
+    #[must_use]
+    pub fn cycle_cache_still_valid(
+        &self,
+        routable_pool_count: usize,
+        layout_fingerprint: u64,
+    ) -> bool {
+        if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
+            return false;
+        }
+        if routable_pool_count < self.cached_pool_count {
+            return false;
+        }
+        if self.cached_layout_fingerprint != layout_fingerprint
+            && routable_pool_count <= self.cached_pool_count
+        {
+            return false;
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn cached_pool_count(&self) -> usize {
+        self.cached_pool_count
     }
 
     #[must_use]
@@ -252,7 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn small_pool_count_delta_does_not_force_rebuild() {
+    fn pure_growth_does_not_force_rebuild() {
+        // Growth is attach_missing territory — full rebuild only on interval / shrink / reorder.
         let mut cache = GraphCache::with_rebuild_interval(60);
         cache.advance_pass();
         cache.store(
@@ -264,11 +297,13 @@ mod tests {
             800,
         );
         assert!(!cache.needs_connectivity_rebuild(1_050, 1));
+        assert!(!cache.needs_connectivity_rebuild(1_500, 99));
+        assert!(cache.cycle_cache_still_valid(1_500, 99));
         assert!(!cache.needs_cycle_refind(1_050, 1, 6, 0, 1_000));
     }
 
     #[test]
-    fn warm_graph_requires_larger_pool_delta_for_rebuild() {
+    fn large_shrink_forces_rebuild() {
         let mut cache = GraphCache::with_rebuild_interval(60);
         cache.advance_pass();
         cache.store(
@@ -279,9 +314,11 @@ mod tests {
             5,
             3_500,
         );
-        assert!(!cache.needs_connectivity_rebuild(4_100, 1));
-        assert!(!cache.needs_connectivity_rebuild(4_200, 1));
-        assert!(cache.needs_connectivity_rebuild(4_300, 1));
+        // Small shrink under warm threshold — keep cache path.
+        assert!(!cache.needs_connectivity_rebuild(3_900, 1));
+        // Large shrink — rebuild.
+        assert!(cache.needs_connectivity_rebuild(3_500, 1));
+        assert!(!cache.cycle_cache_still_valid(3_500, 1));
     }
 
     #[test]
@@ -336,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn large_pool_count_delta_triggers_rebuild_and_refind() {
+    fn large_pool_count_growth_uses_attach_not_rebuild() {
         let mut cache = GraphCache::with_rebuild_interval(60);
         cache.advance_pass();
         cache.store(
@@ -347,8 +384,10 @@ mod tests {
             5,
             800,
         );
-        assert!(cache.needs_connectivity_rebuild(1_100, 1));
-        assert!(cache.needs_cycle_refind(1_100, 1, 6, 0, 1_000));
+        assert!(!cache.needs_connectivity_rebuild(1_100, 1));
+        // Interval / empty cycles still force refind; growth alone does not.
+        assert!(!cache.needs_cycle_refind(1_100, 1, 6, 0, 1_000));
+        assert!(cache.cycle_cache_still_valid(1_100, 1));
     }
 
     #[test]

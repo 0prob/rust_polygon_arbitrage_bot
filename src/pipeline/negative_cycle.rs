@@ -7,6 +7,8 @@ use crate::pipeline::spot_price::{hop_penalty, min_profitable_cycle_ratio, mul_r
 use crate::pipeline::weighted_graph::WeightedEdge;
 use alloy::primitives::U256;
 
+/// Validate a closed simple cycle and return packed-call cost.
+/// Paths are short (≤ HOP_CAP); linear scans beat HashSet allocs on the hot path.
 fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     let len = edges.len();
     if len < 2 {
@@ -16,21 +18,26 @@ fn is_simple_cycle(edges: &[Edge]) -> Option<usize> {
     if edges.last().map(|e| e.token_out) != Some(start) {
         return None;
     }
-    let mut seen_pools: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
-    let mut seen_tokens: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
-    for (i, e) in edges.iter().enumerate() {
-        if !seen_pools.insert(e.pool_index.0) {
-            return None;
-        }
-        if i < len - 1 {
-            let mid = e.token_out;
-            if mid == start || !seen_tokens.insert(mid.0) {
+    for i in 0..len {
+        let pool = edges[i].pool_index.0;
+        for e in edges.iter().take(i) {
+            if e.pool_index.0 == pool {
                 return None;
             }
         }
+        if i < len - 1 {
+            let mid = edges[i].token_out;
+            if mid == start {
+                return None;
+            }
+            for e in edges.iter().take(i) {
+                if e.token_out == mid {
+                    return None;
+                }
+            }
+        }
     }
-    let route_calls = estimate_packed_route_calls(edges);
-    Some(route_calls)
+    Some(estimate_packed_route_calls(edges))
 }
 
 /// Extract negative cycles reachable from `source` after a bounded Bellman-Ford relaxation.
@@ -53,15 +60,21 @@ pub fn collect_negative_cycles_from_source(
     visited_gen: &mut u32,
     should_stop: &mut impl FnMut() -> bool,
 ) {
+    let n = dist.len();
+    let src = source.0 as usize;
+    if src >= n {
+        return;
+    }
+
     let mut touched = Vec::<usize>::new();
 
-    dist[source.0 as usize] = 0.0;
-    dist_ratio[source.0 as usize] = ONE;
-    touched.push(source.0 as usize);
+    dist[src] = 0.0;
+    dist_ratio[src] = ONE;
+    touched.push(src);
 
     active.clear();
     next_active.clear();
-    active.push(source.0 as usize);
+    active.push(src);
 
     fn bf_eps(old: f64) -> f64 {
         f64::EPSILON * old.abs().max(1.0) * 2.0
@@ -79,9 +92,14 @@ pub fn collect_negative_cycles_from_source(
         for &u_idx in active.iter() {
             let u_dist = dist[u_idx];
             let u_ratio = dist_ratio[u_idx];
-            for we in &adj[u_idx] {
+            let Some(edges) = adj.get(u_idx) else {
+                continue;
+            };
+            for we in edges {
                 let v = we.edge.token_out.0 as usize;
-                if we.ratio.is_zero() || we.ratio < ONE {
+                // Dead edges only — keep sub-ONE ratios so multi-hop arbs with
+                // lossy intermediate hops remain discoverable via product ratio.
+                if v >= n || we.ratio.is_zero() {
                     continue;
                 }
                 let new_dist = u_dist + we.weight;
@@ -106,7 +124,9 @@ pub fn collect_negative_cycles_from_source(
         std::mem::swap(active, next_active);
     }
 
-    'outer: for (u_idx, edges) in adj.iter().enumerate() {
+    // Only nodes reached from `source` can participate in a negative cycle here.
+    // Full-adj scans were O(V+E) per source and dominated BF time on large graphs.
+    'outer: for &u_idx in &touched {
         if should_stop() || cycles.len() >= max_cycles {
             break;
         }
@@ -114,17 +134,23 @@ pub fn collect_negative_cycles_from_source(
         if !u_dist.is_finite() {
             continue;
         }
+        let Some(edges) = adj.get(u_idx) else {
+            continue;
+        };
         for we in edges {
             if should_stop() || cycles.len() >= max_cycles {
                 break 'outer;
             }
-            if we.ratio.is_zero() || we.ratio < ONE {
+            if we.ratio.is_zero() {
                 continue;
             }
-            let v = we.edge.token_out;
-            let v_dist = dist[v.0 as usize];
+            let v_idx = we.edge.token_out.0 as usize;
+            if v_idx >= n {
+                continue;
+            }
+            let v_dist = dist[v_idx];
             let edge_ratio_at_v = mul_ratio_saturating(dist_ratio[u_idx], we.ratio);
-            let we_neg_via_ratio = edge_ratio_at_v > dist_ratio[v.0 as usize];
+            let we_neg_via_ratio = edge_ratio_at_v > dist_ratio[v_idx];
             if u_dist + we.weight >= v_dist - bf_eps(v_dist) && !we_neg_via_ratio {
                 continue;
             }
@@ -157,14 +183,18 @@ pub fn collect_negative_cycles_from_source(
             let mut product_ratio = ONE;
             let mut trace = Some(cycle_start);
             while let Some(t) = trace {
-                let Some(we_pred) = pred_edge[t.0 as usize] else {
+                let t_idx = t.0 as usize;
+                if t_idx >= pred_edge.len() {
+                    break;
+                }
+                let Some(we_pred) = pred_edge[t_idx] else {
                     break;
                 };
                 log_weight += we_pred.weight;
                 cum_fee = cum_fee.saturating_add(clamp_fee_bps(we_pred.edge.fee_bps));
                 product_ratio = mul_ratio_saturating(product_ratio, we_pred.ratio);
                 cycle_edges.push(we_pred.edge);
-                trace = pred_node[t.0 as usize];
+                trace = pred_node[t_idx];
                 if trace == Some(cycle_start) {
                     break;
                 }
@@ -207,5 +237,57 @@ pub fn collect_negative_cycles_from_source(
         pred_node[idx] = None;
         pred_edge[idx] = None;
         in_next[idx] = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType};
+    use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
+    use crate::pipeline::types::CycleSearchPass;
+
+    fn we(pool: u32, tin: u32, tout: u32, weight: f64, ratio: u64) -> WeightedEdge {
+        WeightedEdge {
+            edge: Edge {
+                pool_index: PoolIndex(pool),
+                token_in: TokenIndex(tin),
+                token_out: TokenIndex(tout),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            weight,
+            ratio: U256::from(ratio),
+        }
+    }
+
+    /// Classic 3-hop arb: two slightly lossy legs + one strong leg, product > 1.
+    /// Previously BF skipped ratio < ONE edges and could not find this cycle.
+    #[test]
+    fn bf_finds_mixed_ratio_triangle() {
+        // ratios: 0.99 * 0.99 * 1.05 ≈ 1.028
+        let r99 = 990_000_000_000_000_000u64;
+        let r105 = 1_050_000_000_000_000_000u64;
+        let adj = vec![
+            vec![we(1, 0, 1, 0.01, r99)],  // 0→1 lossy
+            vec![we(2, 1, 2, 0.01, r99)],  // 1→2 lossy
+            vec![we(3, 2, 0, -0.0488, r105)], // 2→0 strong
+        ];
+        let found = find_cycles_bellman_ford_multi_pass_with_adj(
+            &adj,
+            &[CycleSearchPass {
+                max_hops: 3,
+                max_cycles: 16,
+            }],
+        );
+        assert!(
+            !found.is_empty(),
+            "expected mixed-ratio triangle arb, got none"
+        );
+        assert!(found.iter().any(|c| c.hop_count == 3));
+        assert!(found.iter().all(|c| c.cycle_ratio > ONE));
     }
 }

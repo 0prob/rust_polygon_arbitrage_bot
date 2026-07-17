@@ -22,7 +22,9 @@ use crate::pipeline::types::{
 pub use crate::pipeline::spot_price::hop_penalty;
 
 const MAX_CYCLES_PER_PASS: usize = 50_000;
-const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(1000);
+pub const CYCLE_ENUM_TIME_BUDGET: Duration = Duration::from_millis(1000);
+/// Budget for patch-only refinds that merge into an existing cycle cache.
+pub const CYCLE_ENUM_PATCH_BUDGET: Duration = Duration::from_millis(300);
 /// Cap parallel DFS shards — unbounded hub enumeration burns the shared deadline.
 const DFS_MAX_START_SOURCES: usize = 32;
 /// Amortize elapsed-time checks during DFS enumeration.
@@ -732,6 +734,11 @@ fn collect_cycles_dfs_single_start(
             return;
         }
 
+        let curr_idx = curr_node as usize;
+        // Stale graphs can carry target_node / token ids past token_count.
+        if curr_idx >= used_tokens.len() {
+            return;
+        }
         let curr = TokenIndex(curr_node);
         if hops >= 2 && curr == start {
             if route_hop_budget_exceeded(path_hop_calls)
@@ -766,18 +773,18 @@ fn collect_cycles_dfs_single_start(
             return;
         }
 
-        if used_tokens[curr_node as usize] || hops >= hop_cap {
+        if used_tokens[curr_idx] || hops >= hop_cap {
             return;
         }
         if !can_still_find_profitable_cycle(log_w, product_ratio, hops, hop_cap, curr, prep) {
             return;
         }
-        let next_edges = match prep.adjacency.get(curr_node as usize) {
+        let next_edges = match prep.adjacency.get(curr_idx) {
             Some(e) if !e.is_empty() => e,
             _ => return,
         };
 
-        used_tokens[curr_node as usize] = true;
+        used_tokens[curr_idx] = true;
 
         for ge in next_edges {
             if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
@@ -873,9 +880,12 @@ fn collect_cycles_dfs_single_start(
             }
         }
 
-        used_tokens[curr_node as usize] = false;
+        used_tokens[curr_idx] = false;
     }
 
+    if start.0 as usize >= used_tokens.len() {
+        return cycles;
+    }
     let first_edges = match prep.adjacency.get(start.0 as usize) {
         Some(e) if !e.is_empty() => e,
         _ => return cycles,
@@ -1147,12 +1157,31 @@ pub fn find_cycles_multi_pass_with_prep(
     prep: &ActiveGraph,
     passes: &[CycleSearchPass],
 ) -> Vec<FoundCycle> {
+    find_cycles_multi_pass_with_prep_budget(
+        graph,
+        arena,
+        pool_metas,
+        prep,
+        passes,
+        CYCLE_ENUM_TIME_BUDGET,
+    )
+}
+
+#[must_use]
+pub fn find_cycles_multi_pass_with_prep_budget(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    pool_metas: &PoolMetaIndex<'_>,
+    prep: &ActiveGraph,
+    passes: &[CycleSearchPass],
+    enum_budget: Duration,
+) -> Vec<FoundCycle> {
     if passes.is_empty() || prep.start_tokens.is_empty() {
         return Vec::new();
     }
     // One deadline for all hop passes — each pass used to allocate a full budget
     // sequentially (~2s wall time for the default two-pass schedule).
-    let budget = SharedDeadlineGuard::new(CYCLE_ENUM_TIME_BUDGET);
+    let budget = SharedDeadlineGuard::new(enum_budget);
     let mut all = Vec::new();
     let pass_cap = passes.iter().map(|p| p.max_cycles).max().unwrap_or(0);
     let collect_bound = pass_cap

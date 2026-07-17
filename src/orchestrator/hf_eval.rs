@@ -9,7 +9,8 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::types::{
-    FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
+    FlashLoanSource, FoundCycle, PoolState, ProfitAssessment, ProtocolType, RouteSimulationResult,
+    TokenIndex,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
@@ -252,6 +253,23 @@ pub struct HfEvalResult {
     pub balancer_batch_verified: bool,
 }
 
+/// True when any V3/V4 hop still lacks hydrated ticks (cannot simulate depth).
+#[inline]
+fn cycle_has_empty_cl_ticks(arena: &StateArena, cycle: &FoundCycle) -> bool {
+    for edge in &cycle.edges {
+        match (arena.pool_state(edge.pool_index), edge.protocol) {
+            (Some(PoolState::V3(s)), ProtocolType::UniswapV3)
+            | (Some(PoolState::V4(s)), ProtocolType::UniswapV4)
+                if s.ticks.is_empty() =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Economic probe first, then decimal-aware spot probe for tickless CL routes.
 fn try_rank_probe_minimal(
     arena: &StateArena,
@@ -449,6 +467,16 @@ fn rank_one_cycle_probe(
     }
     if !cycle_tokens_have_known_decimals(&cycle, arena, token_decimals) {
         out.skip.missing_decimals = 1;
+        return out;
+    }
+    // Fail closed before multi-amount minimal sims when a CL hop has no ticks.
+    // Avoids repeated tickless depth work that always classifies as shallow_cl.
+    if cycle_has_empty_cl_ticks(arena, &cycle) {
+        out.skip.minimal_no_sim = 1;
+        out.minimal_sim_reasons.shallow_cl = 1;
+        if cycle.score < 0.0 {
+            out.rescue.push((fp, cycle.into_owned()));
+        }
         return out;
     }
     if !balancer_route_flash_feasible(&cycle, arena, flash, flash_ttl) {

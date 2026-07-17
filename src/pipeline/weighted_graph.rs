@@ -24,6 +24,10 @@ pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> 
             if ge.phase != GraphHopPhase::Direct || !is_live_graph_edge(ge) {
                 continue;
             }
+            // Guard stale/corrupt edges whose token_out is outside the token region.
+            if ge.edge.token_out.0 as usize >= token_slots {
+                continue;
+            }
             list.push(WeightedEdge {
                 edge: ge.edge,
                 weight: ge.log_weight,
@@ -92,5 +96,17 @@ mod tests {
         let adj = build_weighted_adjacency(&graph);
         assert_eq!(adj[0].len(), 1);
         assert!(adj[1].is_empty());
+    }
+
+    #[test]
+    fn weighted_adjacency_skips_token_out_past_token_count() {
+        let mut graph = RoutingGraph::new(2);
+        let mut live = graph_edge(-0.1);
+        live.ratio = U256::from(1_000_000_000_000_000_000u64);
+        live.edge.token_out = TokenIndex(1839);
+        live.target_node = 1839;
+        graph.add_edge(TokenIndex(0), live);
+        let adj = build_weighted_adjacency(&graph);
+        assert!(adj[0].is_empty());
     }
 }

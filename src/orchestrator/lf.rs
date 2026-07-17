@@ -16,7 +16,8 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{ProbeContext, retain_cycles_with_priced_start};
-use crate::pipeline::cycle_search::find_cycles_for_mode;
+use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
+use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
 use crate::pipeline::graph::{
     GraphBuildGate, attach_missing_eligible_pools_with_gate, build_graph_with_gate,
     count_graph_eligible_pools_with_gate, has_missing_eligible_pools_with_gate,
@@ -103,8 +104,20 @@ fn lf_graph_build_gate(work: &LfCpuWork) -> GraphBuildGate {
 
 /// Merge LF-tick dirty pools with any cache writes that landed while the CPU job was queued.
 fn merge_dirty_pool_indices(mut base: Vec<PoolIndex>, extra: Vec<PoolIndex>) -> Vec<PoolIndex> {
+    if extra.is_empty() {
+        return base;
+    }
+    if base.is_empty() {
+        return extra;
+    }
+    // O(n+m) vs Vec::contains O(n*m) when both sides are large.
+    let mut seen: rustc_hash::FxHashSet<u32> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(base.len() + extra.len(), Default::default());
+    for idx in &base {
+        seen.insert(idx.0);
+    }
     for idx in extra {
-        if !base.contains(&idx) {
+        if seen.insert(idx.0) {
             base.push(idx);
         }
     }
@@ -142,16 +155,25 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         count_graph_eligible_pools_with_gate(&work.arena, work.pool_metas.as_ref(), gate_ref);
 
     // Snapshot decisions without holding lock for duration of heavy work.
+    // Pure eligible-pool growth (`connectivity_stale`) is handled by attach_missing
+    // below — OR-ing it into needs_rebuild forced a full rebuild every LF warmup tick.
     let (needs_rebuild, connectivity_stale) = {
         let gc = work.graph_cache.lock();
-        let stale = gc.connectivity_stale(eligible_count);
         (
-            gc.needs_connectivity_rebuild(routable_count, layout_fp) || stale,
-            stale,
+            gc.needs_connectivity_rebuild(routable_count, layout_fp),
+            gc.connectivity_stale(eligible_count),
         )
     };
 
     let graph_action;
+    // Capture cycle-cache validity *before* rebuild store can replace graph meta.
+    let (cycle_cache_valid, prior_cycles) = {
+        let gc = work.graph_cache.lock();
+        (
+            gc.cycle_cache_still_valid(routable_count, layout_fp),
+            gc.cycles(),
+        )
+    };
     let mut graph = if needs_rebuild {
         graph_action = if connectivity_stale {
             "rebuild_eligible_growth"
@@ -186,9 +208,16 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             "graph build: ms={build_ms} eligible={eligible_count} unpriced_pools={unpriced_pools} routable_metas={routable_count}",
         );
         let mut gc = work.graph_cache.lock();
+        // Keep prior cycles when PoolIndex layout is still valid (growth). Clearing
+        // them here forced a full 1s DFS every warmup rebuild.
+        let keep_cycles = if cycle_cache_valid {
+            prior_cycles.clone()
+        } else {
+            None
+        };
         gc.store(
             Arc::clone(&g),
-            None,
+            keep_cycles,
             routable_count,
             layout_fp,
             work.state_generation,
@@ -278,9 +307,15 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         crate::info!(
             "lf graph patch: attached {missing_graph_pools} eligible pools missing from cached adjacency"
         );
+        // Preserve cycle cache through attach — short incremental DFS merges new routes.
+        let keep_cycles = if cycle_cache_valid {
+            prior_cycles.clone()
+        } else {
+            None
+        };
         work.graph_cache.lock().store(
             Arc::clone(&graph),
-            None,
+            keep_cycles,
             routable_count,
             layout_fp,
             work.state_generation,
@@ -288,12 +323,19 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         );
     }
 
+    let cached_cycles = {
+        let gc = work.graph_cache.lock();
+        gc.cycles()
+    }
+    .or(prior_cycles);
     let need_cycle_refind = {
         let gc = work.graph_cache.lock();
         // Newly attached pools are invisible to cached cycles until we re-enumerate.
-        needs_rebuild
+        // Growth rebuilds no longer clear the cycle cache when indices stay valid.
+        (needs_rebuild && !cycle_cache_valid)
             || missing_graph_pools > 0
             || gc.cycles().is_none()
+            || cached_cycles.is_none()
             || gc.needs_cycle_refind(
                 routable_count,
                 layout_fp,
@@ -302,13 +344,21 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 work.arena.pool_count(),
             )
     };
+    // Incremental: attach/growth only — full rebuild (interval/shrink/reorder) keeps 1s budget.
+    let incremental_refind = !needs_rebuild
+        && cycle_cache_valid
+        && cached_cycles.as_ref().is_some_and(|c| !c.is_empty())
+        && (missing_graph_pools > 0 || connectivity_stale);
     let mut enumeration_ms = 0u64;
     let (cycles, enumerated_cycles) = if need_cycle_refind {
         crate::debug!(
-            "lf cycle refind: pass={} dirty_pools={} state_gen={}",
+            "lf cycle refind: pass={} dirty_pools={} state_gen={} incremental={} attached={} rebuild={}",
             work.lf_pass,
             work.dirty_pools.len(),
-            work.state_generation
+            work.state_generation,
+            incremental_refind,
+            missing_graph_pools,
+            needs_rebuild
         );
         let passes = cycle_search_passes(work.max_hops, work.max_paths);
         let probe_ctx = ProbeContext {
@@ -316,18 +366,42 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             token_decimals: Some(work.token_decimals.as_ref()),
             gas_price_wei: work.gas_price_wei,
         };
+        // Arena tokens are append-only; a cached graph may lag. Grow token slots
+        // before DFS/BF so used_tokens / dist arrays cover every TokenIndex.
+        if work.arena.token_count() > graph.token_count {
+            Arc::make_mut(&mut graph).ensure_token_capacity(work.arena.token_count());
+        }
         let enum_started = crate::util::now_ms();
-        let outcome = find_cycles_for_mode(
-            work.cycle_finder,
-            &work.arena,
-            &graph,
-            work.pool_metas.as_ref(),
-            passes.as_slice(),
-            true,
-            Some(&probe_ctx),
-        );
+        let outcome = if incremental_refind {
+            find_cycles_for_mode_with_budget(
+                work.cycle_finder,
+                &work.arena,
+                &graph,
+                work.pool_metas.as_ref(),
+                passes.as_slice(),
+                true,
+                Some(&probe_ctx),
+                CYCLE_ENUM_PATCH_BUDGET,
+            )
+        } else {
+            find_cycles_for_mode(
+                work.cycle_finder,
+                &work.arena,
+                &graph,
+                work.pool_metas.as_ref(),
+                passes.as_slice(),
+                true,
+                Some(&probe_ctx),
+            )
+        };
         outcome.diag.log_summary();
-        let result = outcome.cycles;
+        let mut result = outcome.cycles;
+        if incremental_refind
+            && let Some(cached) = cached_cycles.as_ref()
+        {
+            result.reserve(cached.len());
+            result.extend(cached.iter().cloned());
+        }
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             let mut hop_hist = [0u32; HOP_CAP as usize + 1];
             for c in &result {
@@ -362,8 +436,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         );
         (cycles, enumerated_cycles)
     } else {
-        let gc = work.graph_cache.lock();
-        let cached = gc.cycles().unwrap_or_default();
+        let cached = cached_cycles.unwrap_or_default();
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
                 "lf cycle cache: pass={} cycles={}",
@@ -371,6 +444,15 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 cached.len()
             );
         }
+        // Keep cache metadata current even when cycles are reused.
+        work.graph_cache.lock().store(
+            Arc::clone(&graph),
+            Some(Arc::clone(&cached)),
+            routable_count,
+            layout_fp,
+            work.state_generation,
+            eligible_count,
+        );
         let enumerated_cycles = cached.len();
         (cached, enumerated_cycles)
     };
@@ -556,24 +638,52 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     if state_provider.is_some() {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
         let v4_tick_pools = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
-        v3_tick_targets = tick_pools.len();
-        v4_tick_targets = v4_tick_pools.len();
         let state_block = ctx.refresh.last_state_block();
         let pinned_block = (state_block > 0).then_some(state_block);
         let (algebra_pools, algebra_integral_pools) =
             crate::pipeline::tick_fetch::collect_algebra_pools(&arena, pool_metas.as_ref());
+        // Only hydrate pools missing ticks — arena sync now preserves CL ticks
+        // when sqrt_price/liquidity/tick are unchanged, so most LF passes skip RPC.
+        let tick_pools_needed: Vec<Address> = tick_pools
+            .iter()
+            .copied()
+            .filter(|addr| {
+                let Some(&idx) = arena.address_to_pool().get(addr) else {
+                    return false;
+                };
+                match arena.pool_state(idx) {
+                    Some(crate::core::types::PoolState::V3(s)) => s.ticks.is_empty(),
+                    _ => true,
+                }
+            })
+            .collect();
+        let v4_tick_pools_needed: Vec<_> = v4_tick_pools
+            .iter()
+            .copied()
+            .filter(|(idx, _)| {
+                match arena.pool_state(*idx) {
+                    Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
+                    _ => true,
+                }
+            })
+            .collect();
+        // Log how many cycle CL pools still need hydration (not the full set).
+        v3_tick_targets = tick_pools_needed.len();
+        v4_tick_targets = v4_tick_pools_needed.len();
+        if !tick_pools_needed.is_empty() || !v4_tick_pools_needed.is_empty() {
         for (url_index, url) in ctx.rpc.state_url_candidates().iter().enumerate() {
             let Ok(provider) = ctx.rpc.connect_state_at(url) else {
                 ctx.rpc.deprioritize_state_url(url);
                 continue;
             };
-            crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools);
-            crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools);
+            // Clear only the pools we are about to re-fetch (not the full set).
+            crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools_needed);
+            crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools_needed);
             let v3_ticks_started = crate::util::now_ms();
             let v3 = enrich_v3_ticks(
                 &provider,
                 &mut arena,
-                &tick_pools,
+                &tick_pools_needed,
                 ctx.config.oracle.tick_word_range,
                 &algebra_pools,
                 &algebra_integral_pools,
@@ -586,7 +696,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             let v4 = enrich_v4_ticks(
                 &provider,
                 &mut arena,
-                &v4_tick_pools,
+                &v4_tick_pools_needed,
                 ctx.config.oracle.tick_word_range,
                 pinned_block,
             )
@@ -612,6 +722,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 v4.rpc_failed
             );
         }
+        } // tick_pools_needed non-empty
     }
     let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);
 

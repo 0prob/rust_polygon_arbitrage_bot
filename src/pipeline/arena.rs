@@ -529,9 +529,13 @@ impl StateArena {
                 .get(i)
                 .is_some_and(|slot| Arc::ptr_eq(slot, state));
             if !same {
+                let prior = self.inner.pools.get(i).cloned();
                 let inner = Arc::make_mut(&mut self.inner);
                 if let Some(slot) = inner.pools.get_mut(i) {
-                    *slot = Arc::clone(state);
+                    // Cache states rarely carry CL ticks (LF hydrates them on the
+                    // arena). Preserve ticks when the price level is unchanged so
+                    // we skip a full TickLens multicall every LF pass.
+                    *slot = preserve_cl_ticks_on_replace(prior.as_deref(), Arc::clone(state));
                 }
             }
             self.clear_hot_slot(pool_index);
@@ -619,6 +623,41 @@ fn pool_meta_from_synced(
         }
     }
     meta
+}
+
+/// Keep LF-hydrated tick arrays when replacing a cache Arc that has no ticks.
+fn preserve_cl_ticks_on_replace(
+    prior: Option<&PoolState>,
+    incoming: Arc<PoolState>,
+) -> Arc<PoolState> {
+    let Some(prior) = prior else {
+        return incoming;
+    };
+    match (prior, incoming.as_ref()) {
+        (PoolState::V3(old), PoolState::V3(new))
+            if !old.ticks.is_empty()
+                && new.ticks.is_empty()
+                && old.tick == new.tick
+                && old.sqrt_price_x96 == new.sqrt_price_x96
+                && old.liquidity == new.liquidity =>
+        {
+            let mut merged = new.clone();
+            merged.ticks = Arc::clone(&old.ticks);
+            Arc::new(PoolState::V3(merged))
+        }
+        (PoolState::V4(old), PoolState::V4(new))
+            if !old.ticks.is_empty()
+                && new.ticks.is_empty()
+                && old.tick == new.tick
+                && old.sqrt_price_x96 == new.sqrt_price_x96
+                && old.liquidity == new.liquidity =>
+        {
+            let mut merged = new.clone();
+            merged.ticks = Arc::clone(&old.ticks);
+            Arc::new(PoolState::V4(merged))
+        }
+        _ => incoming,
+    }
 }
 
 #[cfg(test)]
@@ -1061,6 +1100,73 @@ mod tests {
         arena.apply_hot_cache(&cache, &[addr]);
         assert!(arena.hot_overlay[0].is_none());
         assert!(arena.pool_state(idx).is_some());
+    }
+
+    #[test]
+    fn sync_preserves_v3_ticks_when_price_level_unchanged() {
+        use crate::core::types::{V3PoolState, V3Tick};
+
+        let pool = Address::with_last_byte(90);
+        let token_a = Address::with_last_byte(91);
+        let token_b = Address::with_last_byte(92);
+        let funded = MIN_HOP_TOKEN_BALANCE;
+        let ticks: Arc<[V3Tick]> = Arc::from([
+            V3Tick {
+                tick: -60,
+                liquidity_gross: 1,
+                liquidity_net: 1,
+            },
+            V3Tick {
+                tick: 60,
+                liquidity_gross: 1,
+                liquidity_net: -1,
+            },
+        ]);
+        let mut with_ticks = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::clone(&ticks),
+        };
+        let cache = StateCache::default();
+        // First insert with ticks via direct arena register, then sync from
+        // cache (no ticks) with same price level.
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(pool, Arc::new(PoolState::V3(with_ticks.clone())));
+        with_ticks.ticks = Arc::from([]);
+        cache.insert(pool, PoolState::V3(with_ticks));
+        let discovered = [DiscoveredPool {
+            pool_key: pool.to_string(),
+            address: pool,
+            protocol: ProtocolType::UniswapV3,
+            protocol_label: "V3".into(),
+            tokens: vec![token_a, token_b],
+            fee_bps: 30,
+            tick_spacing: Some(60),
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }];
+        let index = discovered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.address, i))
+            .collect();
+        let metas = arena.sync_from_discovery(&cache, &discovered, &index, None);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].pool_index, idx);
+        let PoolState::V3(s) = arena.pool_state(idx).expect("state") else {
+            panic!("expected v3");
+        };
+        assert_eq!(s.ticks.len(), 2, "ticks should survive cache re-sync");
+        assert_eq!(s.ticks[0].tick, -60);
     }
 
     #[test]

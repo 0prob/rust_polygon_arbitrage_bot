@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use rayon::join;
 
@@ -11,7 +12,7 @@ use crate::pipeline::cycle_filter::{
     prefilter_cycles_by_atomic_sim_with_context_and_diag, retain_cycles_with_priced_start,
 };
 use crate::pipeline::cycle_finder::{
-    find_cycles_multi_pass, find_cycles_multi_pass_with_prep, index_pool_metas,
+    CYCLE_ENUM_TIME_BUDGET, find_cycles_multi_pass_with_prep_budget, index_pool_metas,
     prepare_active_graph,
 };
 use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
@@ -118,6 +119,31 @@ pub fn find_cycles_for_mode(
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
 ) -> CycleSearchOutcome {
+    find_cycles_for_mode_with_budget(
+        mode,
+        arena,
+        graph,
+        pool_metas,
+        passes,
+        atomic_prefilter,
+        probe_ctx,
+        CYCLE_ENUM_TIME_BUDGET,
+    )
+}
+
+/// Like [`find_cycles_for_mode`] with an explicit DFS wall-clock budget.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn find_cycles_for_mode_with_budget(
+    mode: CycleFinderMode,
+    arena: &StateArena,
+    graph: &RoutingGraph,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    passes: &[CycleSearchPass],
+    atomic_prefilter: bool,
+    probe_ctx: Option<&ProbeContext<'_>>,
+    enum_budget: Duration,
+) -> CycleSearchOutcome {
     if passes.is_empty() {
         return CycleSearchOutcome {
             cycles: Vec::new(),
@@ -143,10 +169,20 @@ pub fn find_cycles_for_mode(
             atomic_prefilter,
             probe_ctx,
             enum_started,
+            enum_budget,
             &mut diag,
         ),
         CycleFinderMode::Dfs => {
-            let raw = find_cycles_multi_pass(graph, arena, pool_metas, passes);
+            let prep = prepare_active_graph(graph);
+            let pool_index = index_pool_metas(pool_metas);
+            let raw = find_cycles_multi_pass_with_prep_budget(
+                graph,
+                arena,
+                &pool_index,
+                &prep,
+                passes,
+                enum_budget,
+            );
             diag.enumerate_ms = crate::util::now_ms().saturating_sub(enum_started);
             let finalize_started = crate::util::now_ms();
             let cycles =
@@ -177,6 +213,7 @@ fn find_cycles_hybrid_multi_pass(
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
     enum_started: u64,
+    enum_budget: Duration,
     diag: &mut CycleSearchDiagnostics,
 ) -> CycleSearchOutcome {
     if passes.is_empty() {
@@ -216,12 +253,13 @@ fn find_cycles_hybrid_multi_pass(
 
     let (mut dfs_cycles, mut bf_cycles) = join(
         || {
-            find_cycles_multi_pass_with_prep(
+            find_cycles_multi_pass_with_prep_budget(
                 graph,
                 arena,
                 &pool_index,
                 prep_dfs.as_ref(),
                 &dfs_budget,
+                enum_budget,
             )
         },
         || {

@@ -602,6 +602,9 @@ fn attach_pool_to_graph(
         return false;
     }
 
+    // Arena tokens are append-only; cached graphs may predate newer TokenIndex ids.
+    graph.ensure_token_capacity(arena.token_count());
+
     if uses_hub_spoke(meta) {
         attach_hub_spoke_pool(graph, meta, state);
     } else if meta.tokens.len() == 2 {
@@ -789,6 +792,9 @@ pub fn attach_missing_eligible_pools_with_gate(
     pools: &[PoolMeta],
     gate: Option<&GraphBuildGate>,
 ) -> GraphAttachReport {
+    // Grow once for the whole batch (attach_pool also ensures; this avoids
+    // repeated layout shifts when many late tokens arrive in one tick).
+    graph.ensure_token_capacity(arena.token_count());
     let mut attached_pools: Vec<PoolIndex> = Vec::new();
     for meta in pools {
         if graph.pool_has_live_edges(meta.pool_index) {
@@ -1707,6 +1713,81 @@ mod tests {
             attach_missing_eligible_pools(&arena, &mut graph, &[meta0, meta1]).attached_pools;
         assert_eq!(attached, 1);
         assert!(graph.pool_has_live_edges(pool1));
+        // New tokens must sit in the token region, not collide with the V4 hub slot.
+        assert_eq!(graph.token_count, arena.token_count());
+        assert!(graph.v4_singleton_hub.is_some_and(|h| h >= graph.token_count));
+        assert!(c.0 < graph.token_count && d.0 < graph.token_count);
+        assert!(
+            graph
+                .adjacency
+                .get(c.0 as usize)
+                .is_some_and(|adj| adj.iter().any(|ge| ge.phase == GraphHopPhase::EnterPool))
+        );
+    }
+
+    #[test]
+    fn ensure_token_capacity_shifts_hubs_and_accepts_new_token_edges() {
+        let mut graph = RoutingGraph::new(2);
+        // Hub lives at node 2 while token_count is 2.
+        graph.virtual_hubs.push(VirtualPoolHub {
+            pool_index: PoolIndex(9),
+            protocol: ProtocolType::BalancerV2,
+            exit_legs: smallvec::smallvec![0, 1],
+            v4_singleton: false,
+        });
+        graph.adjacency.push(vec![direct_ge(
+            9,
+            0,
+            0,
+            ProtocolType::BalancerV2,
+            1_000_000_000_000_000_000,
+        )]);
+        graph.adjacency[2][0].phase = GraphHopPhase::ExitPool;
+        graph.adjacency[2][0].target_node = 1;
+        graph.v4_singleton_hub = None;
+        graph.pool_edge_positions.resize(10, Vec::new());
+        graph.pool_edge_positions[9].push((2, 0));
+
+        graph.ensure_token_capacity(4);
+        assert_eq!(graph.token_count, 4);
+        assert_eq!(graph.adjacency.len(), 5); // 4 tokens + 1 hub
+        assert!(graph.adjacency[2].is_empty());
+        assert!(graph.adjacency[3].is_empty());
+        assert_eq!(graph.adjacency[4].len(), 1);
+        assert_eq!(graph.adjacency[4][0].target_node, 1); // token target unchanged
+        assert_eq!(graph.pool_edge_positions[9], vec![(4, 0)]);
+
+        // New direct edge token 0 → token 3 must stay inside the token region.
+        graph.push_edge_at(
+            0,
+            GraphEdge {
+                edge: Edge {
+                    pool_index: PoolIndex(1),
+                    token_in: TokenIndex(0),
+                    token_out: TokenIndex(3),
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                phase: GraphHopPhase::Direct,
+                target_node: 3,
+                log_weight: -0.01,
+                ratio: U256::from(1_100_000_000_000_000_000u64),
+            },
+        );
+        let adj = crate::pipeline::weighted_graph::build_weighted_adjacency(&graph);
+        assert_eq!(adj.len(), 4);
+        assert_eq!(adj[0].len(), 1);
+        assert_eq!(adj[0][0].edge.token_out.0, 3);
+        let _ = crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj(
+            &adj,
+            &[crate::pipeline::types::CycleSearchPass {
+                max_hops: 3,
+                max_cycles: 8,
+            }],
+        );
     }
 
     #[test]

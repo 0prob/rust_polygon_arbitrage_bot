@@ -114,6 +114,74 @@ impl RoutingGraph {
         self.adjacency.len() as u32
     }
 
+    /// Grow the token-node region so indices in `0..token_count` are token slots.
+    ///
+    /// Layout is always `[tokens | virtual hubs]`. When the arena registers new
+    /// tokens after a graph was built, attach paths must call this before writing
+    /// edges — otherwise new token ids collide with hub slots or land past
+    /// `token_count`, and Bellman–Ford panics indexing `dist[token_out]`.
+    pub fn ensure_token_capacity(&mut self, token_count: u32) {
+        if token_count <= self.token_count {
+            return;
+        }
+        let old_tc = self.token_count as usize;
+        let new_tc = token_count as usize;
+        let delta = new_tc - old_tc;
+        let hub_count = self.virtual_hubs.len();
+        let old_hub_end = old_tc + hub_count;
+
+        let mut old_adj = std::mem::take(&mut self.adjacency);
+        let mut new_adj = vec![Vec::new(); new_tc + hub_count];
+
+        for i in 0..old_tc.min(old_adj.len()) {
+            new_adj[i] = std::mem::take(&mut old_adj[i]);
+        }
+        for h in 0..hub_count {
+            let old_idx = old_tc + h;
+            if old_idx < old_adj.len() {
+                new_adj[new_tc + h] = std::mem::take(&mut old_adj[old_idx]);
+            }
+        }
+        // Rescue token lists that push_edge_at previously placed past hubs.
+        for idx in old_hub_end..old_adj.len() {
+            if idx < new_tc {
+                let list = std::mem::take(&mut old_adj[idx]);
+                if !list.is_empty() {
+                    new_adj[idx].extend(list);
+                }
+            }
+        }
+
+        let old_tc_u = old_tc as u32;
+        let old_hub_end_u = old_hub_end as u32;
+        let delta_u = delta as u32;
+        for adj in &mut new_adj {
+            for ge in adj {
+                if ge.target_node >= old_tc_u && ge.target_node < old_hub_end_u {
+                    ge.target_node += delta_u;
+                }
+            }
+        }
+        if let Some(hub) = self.v4_singleton_hub.as_mut()
+            && *hub >= old_tc_u
+            && *hub < old_hub_end_u
+        {
+            *hub += delta_u;
+        }
+        for positions in &mut self.pool_edge_positions {
+            for (node, _) in positions.iter_mut() {
+                if *node >= old_tc && *node < old_hub_end {
+                    *node += delta;
+                }
+            }
+        }
+
+        self.adjacency = new_adj;
+        self.token_count = token_count;
+        // Token/hub renumbering invalidates bridge coverage indices.
+        self.coverage = None;
+    }
+
     #[inline]
     #[must_use]
     pub fn is_virtual_node(&self, node: u32) -> bool {

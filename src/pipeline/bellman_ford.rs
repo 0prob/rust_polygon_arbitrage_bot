@@ -75,12 +75,45 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
     use crate::pipeline::weighted_graph::WeightedEdge;
+    use alloy::primitives::U256;
 
     #[test]
     fn test_empty_adj_returns_empty() {
         let adj: Vec<Vec<WeightedEdge>> = vec![];
         let r = find_cycles_bellman_ford_multi_pass_with_adj(&adj, &[]);
+        assert!(r.is_empty());
+    }
+
+    /// Regression: stale edges with token_out beyond adj.len() must not panic.
+    #[test]
+    fn bf_skips_out_of_bounds_token_out() {
+        let edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1839),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let adj = vec![
+            vec![WeightedEdge {
+                edge,
+                weight: -0.01,
+                ratio: U256::from(1_100_000_000_000_000_000u64),
+            }],
+            vec![],
+        ];
+        let r = find_cycles_bellman_ford_multi_pass_with_adj(
+            &adj,
+            &[CycleSearchPass {
+                max_hops: 3,
+                max_cycles: 8,
+            }],
+        );
         assert!(r.is_empty());
     }
 }
