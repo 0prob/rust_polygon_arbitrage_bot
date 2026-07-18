@@ -399,6 +399,43 @@ pub fn cycle_edges_match_arena_state(arena: &StateArena, edges: &[Edge]) -> bool
     })
 }
 
+/// V2/V3/V4 sim ignores pair membership — drop stale Direct edges before Brent.
+/// Compare **addresses** (TokenIndex is not unique; index-equality over-filtered
+/// stream snaps). Missing/short meta defers to calldata fail-closed.
+#[must_use]
+pub fn cycle_v2_edges_match_pool_meta(
+    arena: &StateArena,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    edges: &[Edge],
+) -> bool {
+    use crate::pipeline::types::pool_meta_at;
+    edges.iter().all(|edge| {
+        if !matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            return true;
+        }
+        let (Some(tin), Some(tout)) = (
+            arena.token_address(edge.token_in),
+            arena.token_address(edge.token_out),
+        ) else {
+            return false;
+        };
+        match pool_meta_at(pool_metas, edge.pool_index) {
+            Some(m) if m.tokens.len() >= 2 => {
+                m.tokens
+                    .iter()
+                    .any(|&t| arena.token_address(t) == Some(tin))
+                    && m.tokens
+                        .iter()
+                        .any(|&t| arena.token_address(t) == Some(tout))
+            }
+            _ => true,
+        }
+    })
+}
+
 /// Vault/oracle token order must match edge TokenIndex addresses at the pool-local indices.
 #[inline]
 #[must_use]
@@ -506,6 +543,52 @@ pub fn realign_multi_token_found_cycle(
         }
         if (edge.token_in_idx, edge.token_out_idx) != before {
             changed = true;
+        }
+    }
+    if changed {
+        Some(std::sync::Arc::new(owned))
+    } else {
+        Some(cycle)
+    }
+}
+
+/// Rewrite hop `protocol` to match arena `PoolState` family (cached cycles can keep
+/// V2 tags after hot-cache promotes the slot to V3 — live `proto_mismatch_skip`).
+/// Also realign Uni `zero_for_one` to address order (sim can profit with stale zfo;
+/// calldata encode rejects it).
+#[must_use]
+pub fn heal_cycle_edge_protocols(
+    arena: &StateArena,
+    cycle: std::sync::Arc<crate::core::types::FoundCycle>,
+) -> Option<std::sync::Arc<crate::core::types::FoundCycle>> {
+    let mut owned = (*cycle).clone();
+    let mut changed = false;
+    for edge in &mut owned.edges {
+        let state = arena.pool_state(edge.pool_index)?;
+        if matches!(state, PoolState::Invalid) {
+            return None;
+        }
+        if !protocol_matches_pool_state(edge.protocol, state) {
+            let corrected = protocol_from_pool_state(state, edge.protocol);
+            if corrected == edge.protocol {
+                return None;
+            }
+            edge.protocol = corrected;
+            changed = true;
+        }
+        // ponytail: same rule as graph::apply_cl_zero_for_one
+        if matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) && let (Some(a_in), Some(a_out)) = (
+            arena.token_address(edge.token_in),
+            arena.token_address(edge.token_out),
+        ) {
+            let zfo = a_in < a_out;
+            if edge.zero_for_one != zfo {
+                edge.zero_for_one = zfo;
+                changed = true;
+            }
         }
     }
     if changed {
@@ -1326,6 +1409,204 @@ mod tests {
             protocol_from_pool_state(&v2, ProtocolType::UniswapV3),
             ProtocolType::UniswapV2
         );
+    }
+
+    #[test]
+    fn heal_cycle_edge_protocols_rewrites_v2_tag_on_v3_state() {
+        use crate::core::types::{FoundCycle, V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000_000_000_000_000u128,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60_000,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
+        );
+        let cycle = Arc::new(FoundCycle {
+            start_token: t0,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2, // stale tag
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        assert!(!cycle_edges_match_arena_state(&arena, &cycle.edges));
+        let healed = heal_cycle_edge_protocols(&arena, cycle).expect("heal");
+        assert_eq!(healed.edges[0].protocol, ProtocolType::UniswapV3);
+        // t0=[1..] < t1=[2..] ⇒ zero_for_one must be true after heal
+        assert!(healed.edges[0].zero_for_one);
+        assert!(cycle_edges_match_arena_state(&arena, &healed.edges));
+    }
+
+    #[test]
+    fn heal_cycle_edge_protocols_realigns_stale_zfo() {
+        use crate::core::types::{FoundCycle, V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000_000_000_000_000u128,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60_000,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
+        );
+        let cycle = Arc::new(FoundCycle {
+            start_token: t0,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: false, // stale vs address order
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed = heal_cycle_edge_protocols(&arena, cycle).expect("heal");
+        assert!(healed.edges[0].zero_for_one);
+    }
+
+    #[test]
+    fn cycle_v2_edges_match_pool_meta_rejects_foreign_token() {
+        use crate::core::types::V2PoolState;
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let foreign = arena.register_token(Address::from([9u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(3u64),
+                fee_denominator: U256::from(1000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV2,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: foreign,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        assert!(!cycle_v2_edges_match_pool_meta(&arena, &[meta], &edges));
+        assert!(cycle_v2_edges_match_pool_meta(&arena, &[], &edges)); // defer when no meta
+    }
+
+    #[test]
+    fn cycle_v3_edges_match_pool_meta_rejects_foreign_token() {
+        use crate::core::types::V3PoolState;
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let foreign = arena.register_token(Address::from([9u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(Vec::new()),
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV3,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: foreign,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        assert!(!cycle_v2_edges_match_pool_meta(&arena, &[meta], &edges));
+        assert!(cycle_v2_edges_match_pool_meta(&arena, &[], &edges));
     }
 
     #[test]

@@ -272,6 +272,8 @@ fn direct_confirm_deadline() -> U256 {
 ///
 /// `queryBatchSwap` can report a positive vault delta while the executor balance delta is
 /// zero — those phantoms previously passed the batch filter and failed dry-run later.
+///
+/// Err is a short reject reason for logging (revert decode / zero / timeout).
 pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
     provider: &P,
     executor: Address,
@@ -281,9 +283,10 @@ pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
     amount_in: U256,
     min_profit: U256,
     block_number: Option<u64>,
-) -> Option<U256> {
+) -> Result<U256, String> {
     let deadline = direct_confirm_deadline();
-    let calls = encode_balancer_batch_route(hops, executor, deadline).ok()?;
+    let calls = encode_balancer_batch_route(hops, executor, deadline)
+        .map_err(|e| format!("encode_route:{e:#}"))?;
     let built = build_arb_calldata(
         executor,
         profit_token,
@@ -294,7 +297,7 @@ pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
         calls,
         ExecutorEntrypoint::Direct,
     )
-    .ok()?;
+    .map_err(|e| format!("build_calldata:{e:#}"))?;
     let tx = alloy::rpc::types::TransactionRequest::default()
         .to(built.to)
         .input(built.data.into())
@@ -307,10 +310,68 @@ pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
     }
     let output = match timeout(QUERY_TIMEOUT, eth_call).await {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) | Err(_) => return None,
+        Ok(Err(e)) => {
+            let raw = e.to_string();
+            let decoded = confirm_decode_revert(&raw);
+            return Err(decoded.unwrap_or_else(|| truncate_err(&raw, 160)));
+        }
+        Err(_) => return Err("confirm_timeout".into()),
     };
-    let realized = decode_u256_return(&output)?;
-    (!realized.is_zero()).then_some(realized)
+    let Some(realized) = decode_u256_return(&output) else {
+        return Err(format!("confirm_decode_fail len={}", output.len()));
+    };
+    if realized.is_zero() {
+        // Deployed EXECUTE_ARB_DIRECT inverted the profit LT branch (returns 0 on
+        // success). eth_call without revert means ASSERT_PROFIT already required
+        // final >= start + minProfit — use min_profit as a lower bound until redeploy.
+        if min_profit.is_zero() {
+            return Err("confirm_zero_return".into());
+        }
+        crate::warn!(
+            "balancer confirm: direct zero-return workaround min_profit={min_profit} (redeploy executor)"
+        );
+        return Ok(min_profit);
+    }
+    Ok(realized)
+}
+
+fn truncate_err(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+fn confirm_decode_revert(raw: &str) -> Option<String> {
+    use crate::services::execution::revert_decoder::decode_revert;
+    let bytes = confirm_extract_revert_bytes(raw)?;
+    decode_revert(&bytes).map(|d| d.to_string())
+}
+
+fn confirm_extract_revert_bytes(raw: &str) -> Option<Vec<u8>> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(data) = map.get("data").and_then(|v| v.as_str())
+    {
+        let hex = data.strip_prefix("0x").unwrap_or(data);
+        if let Ok(bytes) = alloy::hex::decode(hex) {
+            return Some(bytes);
+        }
+    }
+    if let Some(idx) = raw.find("0x") {
+        let mut hex = raw[idx..].trim_end_matches('"').trim_end_matches('\'');
+        if let Some(stripped) = hex.strip_prefix("0x") {
+            hex = stripped;
+        }
+        // stop at first non-hex
+        let end = hex
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(hex.len());
+        if let Ok(bytes) = alloy::hex::decode(&hex[..end]) {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

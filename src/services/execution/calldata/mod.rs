@@ -96,15 +96,60 @@ pub fn encode_route(
     }
     let hops = conservative_execution_hops(arena, hops, config.slippage_bps)?;
     let mut calls = Vec::with_capacity(hops.len().saturating_mul(2));
+    // Encoded V2 `amountOut` becomes the next hop's `amount_in` (V2 pair-chain or V3 exact-in).
+    let mut chain_in: Option<U256> = None;
     for (i, hop) in hops.iter().enumerate() {
+        let mut hop = hop.clone();
+        if let Some(ain) = chain_in.take() {
+            hop.amount_in = ain;
+        }
+        if hop.edge.protocol == ProtocolType::UniswapV2 {
+            // ponytail: V2→V2 chains via swap(to=next_pair); skip mid transferAll (live
+            // Huff still no-ops on zero → UniV2 IIA on the next swap).
+            let prev_v2 = i
+                .checked_sub(1)
+                .is_some_and(|j| hops[j].edge.protocol == ProtocolType::UniswapV2);
+            let next_v2 = hops
+                .get(i + 1)
+                .is_some_and(|h| h.edge.protocol == ProtocolType::UniswapV2);
+            let swap_to = if next_v2 {
+                hops[i + 1].pool_address
+            } else {
+                executor
+            };
+            let prefund = if prev_v2 {
+                encoders::v2::V2Prefund::Skipped
+            } else if i == 0 {
+                encoders::v2::V2Prefund::Exact
+            } else {
+                encoders::v2::V2Prefund::TransferAll
+            };
+            let (hop_calls, amount_out) = encoders::v2::encode_v2_hop(
+                arena,
+                &hop,
+                swap_to,
+                executor,
+                config.slippage_bps,
+                prefund,
+            )?;
+            calls.extend(hop_calls);
+            chain_in = Some(amount_out);
+            continue;
+        }
         calls.extend(encode_hop_for_protocol(
-            hop,
+            &hop,
             executor,
             arena,
             &config,
             i == 0,
             flash_source,
         )?);
+        // Feed conservative out into the next hop (e.g. V3→V2 TransferAll sizing).
+        if i + 1 < hops.len() {
+            if let Some(q) = quote_hop_for_execution(arena, &hop) {
+                chain_in = slippage_adjusted(q, config.slippage_bps);
+            }
+        }
     }
     Ok(calls)
 }
@@ -197,51 +242,115 @@ fn balancer_pool_id_from_arena(
     }
 }
 
-/// Build calldata hops from route edges, hop amounts, and pool metadata
-#[must_use]
+/// Build calldata hops from route edges, hop amounts, and pool metadata.
+/// Err string names the reject branch (dispatch was failing opaque `None`).
 pub fn build_calldata_hops(
     arena: &StateArena,
     edges: &[Edge],
     hop_amounts: &[U256],
     pool_metas_by_pool: &FxHashMap<PoolIndex, &PoolMeta>,
-) -> Option<Vec<CalldataHop>> {
-    if edges.is_empty()
-        || hop_amounts.len() != edges.len() + 1
-        || edges
-            .windows(2)
-            .any(|pair| pair[0].token_out != pair[1].token_in)
+) -> Result<Vec<CalldataHop>, String> {
+    if edges.is_empty() {
+        return Err("empty_edges".into());
+    }
+    if hop_amounts.len() != edges.len() + 1 {
+        return Err(format!(
+            "hop_amounts_len={} edges={}",
+            hop_amounts.len(),
+            edges.len()
+        ));
+    }
+    if edges
+        .windows(2)
+        .any(|pair| pair[0].token_out != pair[1].token_in)
     {
-        return None;
+        return Err("broken_token_chain".into());
     }
     let mut hops = Vec::with_capacity(edges.len());
     for (i, edge) in edges.iter().enumerate() {
-        let pool_address = arena.pool_address(edge.pool_index)?;
+        let Some(pool_address) = arena.pool_address(edge.pool_index) else {
+            return Err(format!("hop{i}: missing_pool_addr idx={}", edge.pool_index.0));
+        };
         if !crate::services::discovery::is_plausible_contract_address(pool_address) {
-            return None;
+            return Err(format!("hop{i}: implausible_pool {pool_address}"));
         }
-        let token_in = arena.token_address(edge.token_in)?;
-        let token_out = arena.token_address(edge.token_out)?;
+        let Some(token_in) = arena.token_address(edge.token_in) else {
+            return Err(format!("hop{i}: missing_token_in idx={}", edge.token_in.0));
+        };
+        let Some(token_out) = arena.token_address(edge.token_out) else {
+            return Err(format!("hop{i}: missing_token_out idx={}", edge.token_out.0));
+        };
         if !crate::services::discovery::is_plausible_contract_address(token_in)
             || !crate::services::discovery::is_plausible_contract_address(token_out)
         {
-            return None;
+            return Err(format!("hop{i}: implausible_tokens in={token_in} out={token_out}"));
         }
         if matches!(
             edge.protocol,
             ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
         ) && edge.zero_for_one != (token_in < token_out)
         {
-            return None;
+            return Err(format!(
+                "hop{i}: zfo_mismatch zfo={} expect={} proto={:?} pool={pool_address}",
+                edge.zero_for_one,
+                token_in < token_out,
+                edge.protocol
+            ));
         }
         let meta = pool_metas_by_pool.get(&edge.pool_index).copied();
-        if meta.is_some_and(|pool| pool.protocol != edge.protocol) {
-            return None;
+        if let Some(pool) = meta.filter(|p| p.protocol != edge.protocol) {
+            // Meta can lag healed edges; trust edge when arena state agrees.
+            let arena_ok = arena
+                .pool_state(edge.pool_index)
+                .is_some_and(|s| {
+                    crate::pipeline::local_sim::protocol_matches_pool_state(edge.protocol, s)
+                });
+            if !arena_ok {
+                return Err(format!(
+                    "hop{i}: meta_proto_mismatch meta={:?} edge={:?} pool={pool_address}",
+                    pool.protocol, edge.protocol
+                ));
+            }
         }
-        if meta
-            .and_then(|pool| pool.protocol_label.as_deref())
-            .is_some_and(|label| !crate::core::protocol::is_known_protocol_label(label))
+        // V2/V3/V4 sim ignores pair membership; stale TokenIndex on a live pool
+        // address → V2 INSUFFICIENT_INPUT / V3 InvalidPoolCaller (factory resolves
+        // a different pool from callback token0/token1/fee).
+        if matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            let tag = match edge.protocol {
+                ProtocolType::UniswapV3 => "v3",
+                ProtocolType::UniswapV4 => "v4",
+                _ => "v2",
+            };
+            match meta {
+                Some(m) if m.tokens.len() >= 2 => {
+                    // Address compare: TokenIndex is not unique per ERC-20.
+                    let meta_has = |addr| {
+                        m.tokens
+                            .iter()
+                            .any(|&t| arena.token_address(t) == Some(addr))
+                    };
+                    if !(meta_has(token_in) && meta_has(token_out)) {
+                        return Err(format!(
+                            "hop{i}: {tag}_token_not_in_pool in={token_in} out={token_out} pool={pool_address}"
+                        ));
+                    }
+                }
+                Some(_) => {
+                    return Err(format!("hop{i}: {tag}_meta_tokens_short pool={pool_address}"));
+                }
+                // Fail closed: missing meta cannot prove membership.
+                None => {
+                    return Err(format!("hop{i}: {tag}_no_meta pool={pool_address}"));
+                }
+            }
+        }
+        if let Some(label) = meta.and_then(|pool| pool.protocol_label.as_deref())
+            && !crate::core::protocol::is_known_protocol_label(label)
         {
-            return None;
+            return Err(format!("hop{i}: unknown_label {label} pool={pool_address}"));
         }
         let meta_pool_id = meta.and_then(|m| m.pool_id);
         let arena_pool_id = balancer_pool_id_from_arena(arena, edge.pool_index);
@@ -264,7 +373,7 @@ pub fn build_calldata_hops(
             hooks: meta.and_then(|m| m.hooks),
         });
     }
-    Some(hops)
+    Ok(hops)
 }
 
 /// Build arbitrage transaction from calldata hops
@@ -309,7 +418,8 @@ pub fn build_arb_calldata(
 
     let data_bytes: Vec<u8> = data;
     let mut hex_preview = String::with_capacity(200);
-    for b in data_bytes.iter().take(100) {
+    // Include flash_token + flash_amount words (ABI head + first 2 packed words).
+    for b in data_bytes.iter().take(140) {
         let _ = write!(hex_preview, "{b:02x}");
     }
     let call_targets: String = calls
@@ -317,8 +427,19 @@ pub fn build_arb_calldata(
         .map(|c| format!("{:#x}", c.target))
         .collect::<Vec<_>>()
         .join(",");
+    let call0_data = calls.first().map_or_else(
+        || "none".to_string(),
+        |c| {
+            let mut s = String::with_capacity(20 + c.data.len().saturating_mul(2));
+            let _ = write!(s, "{}b:0x", c.data.len());
+            for b in c.data.iter().take(68) {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        },
+    );
     crate::info!(
-        "calldata len={}, calls={}, preview=0x{}..., route_hash={}, entrypoint={entrypoint:?}, targets=[{call_targets}]",
+        "calldata len={}, calls={}, flash_token={flash_token:#x}, flash_amount={flash_amount}, preview=0x{}..., route_hash={}, entrypoint={entrypoint:?}, call0={call0_data}, targets=[{call_targets}]",
         data_bytes.len(),
         calls.len(),
         hex_preview,
@@ -474,14 +595,140 @@ mod tests {
             zero_for_one: true,
         }];
 
-        assert!(
-            build_calldata_hops(
-                &arena,
-                &edges,
-                &[U256::from(1u8), U256::from(1u8)],
-                &FxHashMap::default(),
-            )
-            .is_none()
+        let err = build_calldata_hops(
+            &arena,
+            &edges,
+            &[U256::from(1u8), U256::from(1u8)],
+            &FxHashMap::default(),
+        )
+        .expect_err("noncanonical zfo");
+        assert!(err.contains("zfo_mismatch"), "{err}");
+    }
+
+    #[test]
+    fn v2_hop_rejects_tokens_absent_from_pool_meta() {
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let foreign = arena.register_token(Address::from([9u8; 20]));
+        let pool = arena.register_pool(Address::from([3u8; 20]), v2_state());
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV2,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: Some("SUSHISWAP_V2".into()),
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: foreign,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: Address::from([9u8; 20]) < Address::from([2u8; 20]),
+        }];
+        let mut map = FxHashMap::default();
+        map.insert(pool, &meta);
+        let err = build_calldata_hops(
+            &arena,
+            &edges,
+            &[U256::from(1u8), U256::from(1u8)],
+            &map,
+        )
+        .expect_err("foreign token");
+        assert!(err.contains("v2_token_not_in_pool"), "{err}");
+    }
+
+    #[test]
+    fn v2_hop_rejects_missing_pool_meta() {
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(Address::from([3u8; 20]), v2_state());
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        let err = build_calldata_hops(
+            &arena,
+            &edges,
+            &[U256::from(1u8), U256::from(1u8)],
+            &FxHashMap::default(),
+        )
+        .expect_err("missing meta");
+        assert!(err.contains("v2_no_meta"), "{err}");
+    }
+
+    #[test]
+    fn v3_hop_rejects_tokens_absent_from_pool_meta() {
+        use crate::core::types::{V3PoolState, V3Tick};
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let foreign = arena.register_token(Address::from([9u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000_000_000_000_000u128,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60_000,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
         );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV3,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: Some("UNISWAP_V3".into()),
+            pool_type: None,
+            hooks: None,
+            tick_spacing: Some(60),
+        };
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: foreign,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: Address::from([9u8; 20]) < Address::from([2u8; 20]),
+        }];
+        let mut map = FxHashMap::default();
+        map.insert(pool, &meta);
+        let err = build_calldata_hops(
+            &arena,
+            &edges,
+            &[U256::from(1u8), U256::from(1u8)],
+            &map,
+        )
+        .expect_err("foreign token");
+        assert!(err.contains("v3_token_not_in_pool"), "{err}");
     }
 }

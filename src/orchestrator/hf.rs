@@ -309,6 +309,7 @@ fn hf_reselect_from_snapshot(
     let selected = select_cycles_for_rescore(
         &snap.cycles,
         arena_base,
+        snap.pool_metas.as_ref(),
         &ctx.partial_cache,
         &ctx.execution,
         token_to_matic_rates,
@@ -546,6 +547,7 @@ struct RescoreSelection {
 fn select_cycles_for_rescore(
     snap_cycles: &[Arc<FoundCycle>],
     arena: &crate::pipeline::arena::StateArena,
+    pool_metas: &[PoolMeta],
     partial_cache: &PartialPoolCache,
     execution: &ExecutionService,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
@@ -591,10 +593,6 @@ fn select_cycles_for_rescore(
             tickless_stuck_skipped += 1;
             continue;
         }
-        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &cycle.edges) {
-            protocol_mismatch_skipped += 1;
-            continue;
-        }
         let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
             rate_skipped += 1;
             continue;
@@ -606,6 +604,24 @@ fn select_cycles_for_rescore(
             micro_dead_skipped += 1;
             continue;
         };
+        // Cached-cycle protocol tags can lag hot-cache family flips (V2→V3).
+        let Some(ready) = crate::pipeline::local_sim::heal_cycle_edge_protocols(arena, ready) else {
+            protocol_mismatch_skipped += 1;
+            continue;
+        };
+        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &ready.edges) {
+            protocol_mismatch_skipped += 1;
+            continue;
+        }
+        // Stale V2/V3/V4 TokenIndex vs refreshed PoolMeta — sim invents profit.
+        if !crate::pipeline::local_sim::cycle_v2_edges_match_pool_meta(
+            arena,
+            pool_metas,
+            &ready.edges,
+        ) {
+            protocol_mismatch_skipped += 1;
+            continue;
+        }
         // Quarantine keys are assess/best-eval fingerprints (post start-rotation /
         // vault-idx remap). Check every hop-start rotation of remapped + raw edges.
         if cycle_edges_quarantined(execution, &ready.edges)
@@ -626,6 +642,23 @@ fn select_cycles_for_rescore(
         };
         let start_rate = resolve_token_to_matic_rate(ready.start_token, token_to_matic_rates);
         let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+        if score > 0 {
+            // Live WSS: skip insane-gross phantom only (stale sim can look "too good").
+            // Still drop micro-shallow/mismatch — they never rank after hydrate either and
+            // crowded the probe window (protoheal: shallow_cl/mismatch empty ranks).
+            if crate::pipeline::local_sim::micro_probe_liquidity_dead(
+                arena,
+                &ready.edges,
+                micro_probe,
+            )
+            .is_some()
+            {
+                micro_dead_skipped += 1;
+                continue;
+            }
+            active.push((ready, score));
+            continue;
+        }
         // Insane gross at micro or economic floor → probe `sanity` phantoms
         // (residual after micro-only prune was mostly InsaneProfitMatic).
         if crate::pipeline::local_sim::probe_insane_gross_phantom(
@@ -644,58 +677,54 @@ fn select_cycles_for_rescore(
             micro_dead_skipped += 1;
             continue;
         }
-        if score == 0 {
-            // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
-            // ranks were ~75% `v2_reserve` after unsupported cleared).
-            if crate::pipeline::local_sim::first_v2_hop_below_reserve(
-                arena,
-                &ready.edges,
-                micro_probe,
-            )
-            .is_some()
-            {
+        // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
+        // ranks were ~75% `v2_reserve` after unsupported cleared).
+        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
+            arena,
+            &ready.edges,
+            micro_probe,
+        )
+        .is_some()
+        {
+            v2_dead_skipped += 1;
+            continue;
+        }
+        if crate::pipeline::local_sim::micro_probe_liquidity_dead(
+            arena,
+            &ready.edges,
+            micro_probe,
+        )
+        .is_some()
+        {
+            micro_dead_skipped += 1;
+            continue;
+        }
+        // After rank probe skips below-floor dust, micro-only survivors fail as
+        // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
+        match crate::pipeline::local_sim::economic_floor_liquidity_dead(
+            arena,
+            &ready.edges,
+            economic_floor,
+        ) {
+            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio {
+                ..
+            }) => {
+                bal_floor_dead_skipped += 1;
+                continue;
+            }
+            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted {
+                ..
+            }) => {
                 v2_dead_skipped += 1;
                 continue;
             }
-            if crate::pipeline::local_sim::micro_probe_liquidity_dead(
-                arena,
-                &ready.edges,
-                micro_probe,
-            )
-            .is_some()
-            {
+            Some(_) => {
                 micro_dead_skipped += 1;
                 continue;
             }
-            // After rank probe skips below-floor dust, micro-only survivors fail as
-            // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
-            match crate::pipeline::local_sim::economic_floor_liquidity_dead(
-                arena,
-                &ready.edges,
-                economic_floor,
-            ) {
-                Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio {
-                    ..
-                }) => {
-                    bal_floor_dead_skipped += 1;
-                    continue;
-                }
-                Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted {
-                    ..
-                }) => {
-                    v2_dead_skipped += 1;
-                    continue;
-                }
-                Some(_) => {
-                    micro_dead_skipped += 1;
-                    continue;
-                }
-                None => {}
-            }
-            inactive.push(ready);
-        } else {
-            active.push((ready, score));
+            None => {}
         }
+        inactive.push(ready);
     }
 
     let activity_candidates = active.len();
@@ -828,6 +857,7 @@ pub async fn run_hf_tick(
     let selection = select_cycles_for_rescore(
         &snap.cycles,
         &arena_base,
+        pool_metas_for_dispatch.as_ref(),
         &ctx.partial_cache,
         &ctx.execution,
         &token_to_matic_rates,
@@ -1849,6 +1879,7 @@ mod tests {
         let selected = select_cycles_for_rescore(
             &cycles,
             &arena,
+            &[],
             &partial_cache,
             &ExecutionService::default(),
             &rates,
@@ -1913,6 +1944,7 @@ mod tests {
         let selected = select_cycles_for_rescore(
             &cycles,
             &arena,
+            &[],
             &partial_cache,
             &ExecutionService::default(),
             &rates,

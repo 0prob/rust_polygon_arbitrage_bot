@@ -658,16 +658,20 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         && route_is_balancer_only(&prepared.evaluated.cycle)
         && !balancer_batch_verified
     {
-        let Some(hops) = build_calldata_hops(
+        let hops = match build_calldata_hops(
             arena,
             &prepared.evaluated.cycle.edges,
             &prepared.evaluated.result.hop_amounts,
             pool_metas_by_pool,
-        ) else {
-            skipped.record("prepare_balancer");
-            record_balancer_prepare_skip();
-            record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
-            return None;
+        ) {
+            Ok(h) => h,
+            Err(reason) => {
+                crate::warn!("balancer prepare calldata_build_failed: fp={fp} {reason}");
+                skipped.record("prepare_balancer");
+                record_balancer_prepare_skip();
+                record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
+                return None;
+            }
         };
         if !crate::services::execution::balancer_verify::balancer_batch_within_max_in_ratio(
             arena, &hops,
@@ -747,6 +751,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             Err(e) => {
                 crate::warn!("dispatch build failed: fp={fp}: {e:#}");
                 skipped.record("build");
+                // Structural encode rejects (phantom V2 tokens, zfo, …) won't heal next tick.
+                ctx.execution.quarantine_batch_query_failure(fp);
                 return None;
             }
         };
@@ -1397,20 +1403,23 @@ pub(crate) async fn filter_balancer_onchain_verified<
             );
             continue;
         }
-        let Some(hops) = build_calldata_hops(
+        let hops = match build_calldata_hops(
             arena,
             &result.cycle.edges,
             &result.sim.hop_amounts,
             &pool_metas_by_pool,
-        ) else {
-            execution.quarantine_batch_query_failure(fp);
-            record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
-            crate::debug!(
-                "balancer: batch_filter fp={fp} reject=calldata_build modeled={} net_matic={}",
-                result.sim.profit,
-                result.assessment.net_profit_after_gas_matic_wei,
-            );
-            continue;
+        ) {
+            Ok(h) => h,
+            Err(reason) => {
+                execution.quarantine_batch_query_failure(fp);
+                record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
+                crate::debug!(
+                    "balancer: batch_filter fp={fp} reject=calldata_build reason={reason} modeled={} net_matic={}",
+                    result.sim.profit,
+                    result.assessment.net_profit_after_gas_matic_wei,
+                );
+                continue;
+            }
         };
         if !crate::services::execution::balancer_verify::balancer_batch_within_max_in_ratio(
             arena, &hops,
@@ -1518,7 +1527,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 record_balancer_batch_reject(BalancerBatchReject::BuildDecodeFailed);
                 return None;
             };
-            let Some(realized) = confirm_direct_batch_realized_profit(
+            let realized = match confirm_direct_batch_realized_profit(
                 sim_provider,
                 executor,
                 operator,
@@ -1529,14 +1538,17 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 query_block,
             )
             .await
-            else {
-                execution.quarantine_batch_query_failure(fp);
-                execution.quarantine_direct_token_zero_realized(start_token);
-                record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
-                crate::info!(
-                    "balancer: batch_filter fp={fp} reject=zero_realized token={start_token} query_profit={on_chain_profit} min_profit={min_profit}"
-                );
-                return None;
+            {
+                Ok(v) => v,
+                Err(reason) => {
+                    execution.quarantine_batch_query_failure(fp);
+                    execution.quarantine_direct_token_zero_realized(start_token);
+                    record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
+                    crate::info!(
+                        "balancer: batch_filter fp={fp} reject=zero_realized token={start_token} query_profit={on_chain_profit} min_profit={min_profit} reason={reason}"
+                    );
+                    return None;
+                }
             };
             // Prefer executor-realized profit over vault-query delta when they diverge.
             if realized != on_chain_profit {
@@ -1595,17 +1607,20 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
         crate::core::types::PoolIndex,
         &crate::pipeline::types::PoolMeta,
     > = pool_metas.iter().map(|m| (m.pool_index, m)).collect();
-    let Some(hops) = build_calldata_hops(
+    let hops = match build_calldata_hops(
         arena,
         &result.cycle.edges,
         &result.sim.hop_amounts,
         &pool_metas_by_pool,
-    ) else {
-        crate::info!(
-            "hf near-miss-verify: fp={fp} reject=calldata_build_failed modeled={}",
-            result.sim.profit
-        );
-        return;
+    ) {
+        Ok(h) => h,
+        Err(reason) => {
+            crate::info!(
+                "hf near-miss-verify: fp={fp} reject=calldata_build_failed reason={reason} modeled={}",
+                result.sim.profit
+            );
+            return;
+        }
     };
     let route = hops
         .iter()

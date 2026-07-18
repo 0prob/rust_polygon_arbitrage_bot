@@ -258,6 +258,28 @@ mod tests {
         assert!(out > U256::from(100_000_000_000_000u64), "out={out}");
         assert!(out < U256::from(120_000_000_000_000u64), "out={out}");
     }
+
+    #[test]
+    fn stable_ng_dai_pool_quote_near_onchain_get_dy_with_a_precise() {
+        // Live 0xd9e5… get_dy(1,0,1e17) ≈ 1.007e17. A()=1000 → A_precise=100000.
+        let state = CurvePoolState {
+            balances: vec![
+                U256::from(56_835_580_758_005_775_099u128),
+                U256::from(7_653_346_903_703_122_284u128),
+            ],
+            a: U256::from(100_000u64),
+            fee: U256::from(5_000_000u64),
+            rates: vec![ONE, ONE],
+            n_coins: 2,
+            gamma: None,
+            d: None,
+        };
+        let out = get_curve_stable_amount_out(&state, U256::from(100_000_000_000_000_000u64), 1, 0);
+        let onchain = U256::from(100_751_662_013_279_075u64);
+        let lo = onchain * U256::from(99u64) / U256::from(100u64);
+        let hi = onchain * U256::from(101u64) / U256::from(100u64);
+        assert!(out >= lo && out <= hi, "out={out} onchain={onchain}");
+    }
 }
 
 #[cfg(test)]

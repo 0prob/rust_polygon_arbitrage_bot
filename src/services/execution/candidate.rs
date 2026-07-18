@@ -175,7 +175,7 @@ pub fn build_execution_candidate(
         &evaluated.result.hop_amounts,
         pool_metas_by_pool,
     )
-    .ok_or_else(|| anyhow::anyhow!("failed to build calldata hops"))?;
+    .map_err(|reason| anyhow::anyhow!("failed to build calldata hops: {reason}"))?;
 
     let deadline = U256::from(
         std::time::SystemTime::now()
@@ -195,6 +195,21 @@ pub fn build_execution_candidate(
             config.has_dodo_pool,
         )?
     };
+    // Non-DODO flash credits `start_token`; hop0 must spend that same ERC-20.
+    // (DODO packs the lending pool address into the flash_token field.)
+    if entrypoint != ExecutorEntrypoint::DodoFlash
+        && hops
+            .first()
+            .is_none_or(|h| h.token_in != start_token)
+    {
+        anyhow::bail!(
+            "flash/hop0 token mismatch: start={start_token} hop0_in={}",
+            hops.first().map(|h| h.token_in).unwrap_or_default()
+        );
+    }
+    if evaluated.result.amount_in.is_zero() {
+        anyhow::bail!("flash amount_in is zero");
+    }
     let encode_cfg = RouteEncodeConfig {
         // Per-hop config only — hop minOut must not re-apply full-route depth haircut.
         slippage_bps: config.slippage_bps,

@@ -128,10 +128,13 @@ pub fn find_cycles_for_mode(
         atomic_prefilter,
         probe_ctx,
         CYCLE_ENUM_TIME_BUDGET,
+        &[],
     )
 }
 
 /// Like [`find_cycles_for_mode`] with an explicit DFS wall-clock budget.
+///
+/// `extra_start_tokens` are prepended to hub DFS starts (WSS-observed pool endpoints).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn find_cycles_for_mode_with_budget(
@@ -143,6 +146,7 @@ pub fn find_cycles_for_mode_with_budget(
     atomic_prefilter: bool,
     probe_ctx: Option<&ProbeContext<'_>>,
     enum_budget: Duration,
+    extra_start_tokens: &[crate::core::types::TokenIndex],
 ) -> CycleSearchOutcome {
     if passes.is_empty() {
         return CycleSearchOutcome {
@@ -170,10 +174,12 @@ pub fn find_cycles_for_mode_with_budget(
             probe_ctx,
             enum_started,
             enum_budget,
+            extra_start_tokens,
             &mut diag,
         ),
         CycleFinderMode::Dfs => {
-            let prep = prepare_active_graph(graph);
+            let mut prep = prepare_active_graph(graph);
+            prep.prefer_start_tokens(extra_start_tokens);
             let pool_index = index_pool_metas(pool_metas);
             let raw = find_cycles_multi_pass_with_prep_budget(
                 graph,
@@ -191,7 +197,8 @@ pub fn find_cycles_for_mode_with_budget(
             CycleSearchOutcome { cycles, diag }
         }
         CycleFinderMode::Johnson | CycleFinderMode::BellmanFord => {
-            let prep = prepare_active_graph(graph);
+            let mut prep = prepare_active_graph(graph);
+            prep.prefer_start_tokens(extra_start_tokens);
             diag.hub_heavy = prep.hub_heavy;
             diag.start_tokens = prep.start_token_count();
             // BF adjacency strips Enter/Exit legs; fall back to DFS on hub-spoke graphs.
@@ -230,6 +237,7 @@ fn find_cycles_hybrid_multi_pass(
     probe_ctx: Option<&ProbeContext<'_>>,
     enum_started: u64,
     enum_budget: Duration,
+    extra_start_tokens: &[crate::core::types::TokenIndex],
     diag: &mut CycleSearchDiagnostics,
 ) -> CycleSearchOutcome {
     if passes.is_empty() {
@@ -239,7 +247,9 @@ fn find_cycles_hybrid_multi_pass(
         };
     }
 
-    let prep = Arc::new(prepare_active_graph(graph));
+    let mut prep_mut = prepare_active_graph(graph);
+    prep_mut.prefer_start_tokens(extra_start_tokens);
+    let prep = Arc::new(prep_mut);
     diag.hub_heavy = prep.hub_heavy;
     diag.start_tokens = prep.start_token_count();
     let hub_heavy = prep.hub_heavy;

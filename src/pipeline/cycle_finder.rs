@@ -311,6 +311,32 @@ impl ActiveGraph {
     pub fn start_token_count(&self) -> usize {
         self.start_tokens.len()
     }
+
+    /// Prepend DFS start tokens (e.g. endpoints of WSS-observed pools) so patch
+    /// enumeration is not hub-blind for freshly admitted venues.
+    pub fn prefer_start_tokens(&mut self, extra: &[TokenIndex]) {
+        if extra.is_empty() {
+            return;
+        }
+        let extra_cap = extra.len().min(16);
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut out = Vec::with_capacity(DFS_MAX_START_SOURCES + extra_cap);
+        for &t in extra.iter().take(extra_cap) {
+            if seen.insert(t) {
+                out.push(t);
+            }
+        }
+        let hub_cap = DFS_MAX_START_SOURCES;
+        for &t in &self.start_tokens {
+            if out.len() >= hub_cap + extra_cap {
+                break;
+            }
+            if seen.insert(t) {
+                out.push(t);
+            }
+        }
+        self.start_tokens = out;
+    }
 }
 
 struct NodePrep {
@@ -1380,6 +1406,19 @@ mod tests {
             log_weight: -0.01,
             ratio: U256::from(1_000_000_000_000_000_000u64), // ONE
         }
+    }
+
+    #[test]
+    fn prefer_start_tokens_prepends_observed_endpoints() {
+        let hub = TokenIndex(0);
+        let spoke = TokenIndex(1);
+        let mut graph = RoutingGraph::new(2);
+        graph.add_edge(hub, graph_edge(0, hub, spoke));
+        graph.add_edge(spoke, graph_edge(1, spoke, hub));
+        let mut prep = prepare_active_graph(&graph);
+        assert!(prep.start_tokens.contains(&hub));
+        prep.prefer_start_tokens(&[spoke]);
+        assert_eq!(prep.start_tokens.first().copied(), Some(spoke));
     }
 
     #[test]

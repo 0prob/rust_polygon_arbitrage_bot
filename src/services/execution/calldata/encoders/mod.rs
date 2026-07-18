@@ -19,7 +19,7 @@ use super::{CalldataHop, RouteEncodeConfig};
 /// Dispatch to the protocol-specific encoder free function.
 ///
 /// Protocol notes:
-/// - **V2**: pre-fund + `swap(..., data="")`. `transferAll` after flash / on later hops.
+/// - **V2**: handled in [`super::encode_route`] (pair-chaining + prefund modes).
 /// - **V3/V4**: exact-in via pool/manager; callback pays input (no pre-fund).
 /// - **Balancer**: approve + vault `swap` (never under Balancer vault flash).
 /// - **Curve / WooFi**: approve + exact-in exchange (minOut carries slippage).
@@ -31,13 +31,25 @@ pub fn encode_hop_for_protocol(
     arena: &StateArena,
     config: &RouteEncodeConfig,
     is_first_hop: bool,
-    flash_source: FlashLoanSource,
+    _flash_source: FlashLoanSource,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     match hop.edge.protocol {
         ProtocolType::UniswapV2 => {
-            // After any flash, and on every intermediate hop, sweep the credited balance.
-            let use_transfer_all = !is_first_hop || flash_source != FlashLoanSource::Direct;
-            v2::encode_v2_hop(arena, hop, recipient, config.slippage_bps, use_transfer_all)
+            // Fallback path (tests): no pair-chaining — fund + swap back to executor.
+            let prefund = if is_first_hop {
+                v2::V2Prefund::Exact
+            } else {
+                v2::V2Prefund::TransferAll
+            };
+            v2::encode_v2_hop(
+                arena,
+                hop,
+                recipient,
+                recipient,
+                config.slippage_bps,
+                prefund,
+            )
+            .map(|(calls, _)| calls)
         }
         ProtocolType::UniswapV3 => v3::encode_v3_hop(hop, recipient, arena, config.slippage_bps),
         ProtocolType::UniswapV4 => v4::encode_v4_hop(hop, arena, config.slippage_bps),
@@ -52,7 +64,7 @@ pub fn encode_hop_for_protocol(
             config.deadline,
         ),
         ProtocolType::Dodo => {
-            let use_transfer_all = !is_first_hop || flash_source != FlashLoanSource::Direct;
+            let use_transfer_all = !is_first_hop;
             dodo::encode_dodo_hop(arena, hop, recipient, use_transfer_all)
         }
         ProtocolType::Woofi => woofi::encode_woofi_hop(hop, recipient, arena, config.slippage_bps),

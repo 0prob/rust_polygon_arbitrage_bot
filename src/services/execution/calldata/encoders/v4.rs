@@ -50,9 +50,12 @@ pub fn encode_v4_hop(
         .map_err(|_| anyhow::anyhow!("v4 amount_in does not fit i256"))?;
     let amount_spec = I256::ZERO - amount_pos;
 
-    // ponytail: flat ABI words for unlockCallback, 256B payload at fixed offset
-    let mut unlock_inner = Vec::with_capacity(32 + 256);
+    // Huff UNLOCK_CALLBACK reads PoolKey/swap params at unlock-data +0x100.
+    // Layout: [offset=256][224B pad][256B payload] — without pad, swap gets garbage
+    // and bare-reverts as empty nested revert on PoolManager.
+    let mut unlock_inner = Vec::with_capacity(512);
     unlock_inner.extend_from_slice(&U256::from(256u16).to_be_bytes::<32>());
+    unlock_inner.extend_from_slice(&[0u8; 224]);
     append_address(&mut unlock_inner, pool_key.currency0);
     append_address(&mut unlock_inner, pool_key.currency1);
     unlock_inner.extend_from_slice(&[0u8; 29]);
@@ -169,5 +172,61 @@ mod tests {
         };
 
         assert_eq!(v4_static_fields(&arena, &hop), (450, 9, Address::ZERO));
+    }
+
+    #[test]
+    fn unlock_inner_pads_payload_to_huff_offset_256() {
+        let mut arena = StateArena::default();
+        let t0 = Address::from([1u8; 20]);
+        let t1 = Address::from([2u8; 20]);
+        let pool_index = arena.register_pool(
+            Address::with_last_byte(9),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                tick: 0,
+                liquidity: 1_000_000_000_000u128,
+                fee: U256::from(3000u64),
+                tick_spacing: 60,
+                ticks: Arc::from([crate::core::types::V3Tick {
+                    tick: -887_220,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            })),
+        );
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                fee_bps: 30,
+                zero_for_one: true,
+                protocol: ProtocolType::UniswapV4,
+            },
+            pool_address: Address::with_last_byte(9),
+            token_in: t0,
+            token_out: t1,
+            amount_in: U256::from(1_000_000u64),
+            amount_out: U256::from(999_000u64),
+            pool_id: None,
+            protocol_label: Some("UNISWAP_V4".into()),
+            pool_type: None,
+            router: None,
+            hooks: Some(Address::ZERO),
+        };
+        let calls = encode_v4_hop(&hop, &arena, 20).expect("encode");
+        let unlock = &calls[1].data;
+        // unlock(bytes) ABI: selector + offset + length + inner
+        let inner_len = U256::from_be_slice(&unlock[36..68]).to::<usize>();
+        assert_eq!(inner_len, 512, "offset word + 224 pad + 256 payload");
+        let inner = &unlock[68..68 + inner_len];
+        assert_eq!(&inner[..32], &U256::from(256u16).to_be_bytes::<32>());
+        assert!(inner[32..256].iter().all(|&b| b == 0));
+        assert_ne!(inner[256..288], [0u8; 32]); // currency0 word present
     }
 }

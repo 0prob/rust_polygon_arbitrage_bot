@@ -713,9 +713,14 @@ impl AppConfig {
             self.execution.profit_priority_fee_alpha_bps <= 10_000,
             "PROFIT_PRIORITY_FEE_ALPHA_BPS must not exceed 10000"
         );
+        // Dry-run may use 0 (min-profit only) to exercise eth_call; live keeps ≥1.0× gas.
         ensure!(
-            (10_000..=100_000).contains(&self.execution.profit_safety_multiplier_bps),
-            "PROFIT_SAFETY_MULTIPLIER_BPS must be between 10000 and 100000"
+            if self.is_dry_run() {
+                self.execution.profit_safety_multiplier_bps <= 100_000
+            } else {
+                (10_000..=100_000).contains(&self.execution.profit_safety_multiplier_bps)
+            },
+            "PROFIT_SAFETY_MULTIPLIER_BPS must be between 10000 and 100000 (or 0..=100000 in dry-run)"
         );
         ensure!(
             self.execution.max_flash_loan_usd > 0,

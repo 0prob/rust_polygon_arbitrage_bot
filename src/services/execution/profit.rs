@@ -130,14 +130,13 @@ pub fn profit_priority_uplift_wei(
 }
 
 /// Safety floor in native MATIC wei (`revert_penalty × safety_bps / 10_000`).
+/// `safety_bps == 0` disables the ratio gate and gas gate (dry-run eth_call); default 25_000.
 #[must_use]
 pub fn safety_floor_matic_wei(revert_penalty_wei: U256, safety_bps: u64) -> U256 {
-    let bps = if safety_bps == 0 {
-        DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS
-    } else {
-        safety_bps
-    };
-    revert_penalty_wei.saturating_mul(U256::from(bps)) / BPS_SCALE
+    if safety_bps == 0 {
+        return U256::ZERO;
+    }
+    revert_penalty_wei.saturating_mul(U256::from(safety_bps)) / BPS_SCALE
 }
 
 #[must_use]
@@ -625,13 +624,28 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     );
     let net_after_priority = net_profit_after_gas_matic_wei.saturating_sub(priority_uplift);
 
-    let meets_absolute_min = net_after_priority >= input.min_profit_matic_wei;
-    let meets_safety_ratio = net_after_priority >= required_net_matic;
-    let meets_sane_matic_cap = net_after_priority <= U256::from(MAX_SANE_PROFIT_MATIC_WEI);
-    let roi_bps = if input.amount_in.is_zero() || net_profit_after_gas.is_zero() {
-        0u64
+    // ponytail: safety_bps==0 (dry-run) gates on pre-gas net so eth_call can run at high gas.
+    let ignore_gas = input.safety_multiplier_bps == 0;
+    let gate_net_tokens = if ignore_gas {
+        net_before_gas
     } else {
         net_profit_after_gas
+    };
+    let gate_net_matic = if ignore_gas {
+        gross_profit_matic_wei
+            .saturating_sub(flash_fee_matic_wei)
+            .saturating_sub(priority_uplift)
+    } else {
+        net_after_priority
+    };
+
+    let meets_absolute_min = gate_net_matic >= input.min_profit_matic_wei;
+    let meets_safety_ratio = gate_net_matic >= required_net_matic;
+    let meets_sane_matic_cap = gate_net_matic <= U256::from(MAX_SANE_PROFIT_MATIC_WEI);
+    let roi_bps = if input.amount_in.is_zero() || gate_net_tokens.is_zero() {
+        0u64
+    } else {
+        gate_net_tokens
             .checked_mul(BPS_SCALE)
             .and_then(|v| u64::try_from(v / input.amount_in).ok())
             .unwrap_or(0)
@@ -639,8 +653,8 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     let meets_roi = input.min_profit_roi_bps == 0 || roi_bps >= input.min_profit_roi_bps;
 
     let should_execute = rate_ok
-        && net_profit_after_gas > U256::ZERO
-        && net_after_priority > U256::ZERO
+        && gate_net_tokens > U256::ZERO
+        && gate_net_matic > U256::ZERO
         && meets_absolute_min
         && meets_safety_ratio
         && meets_sane_matic_cap
@@ -656,17 +670,17 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         None
     } else if !rate_ok {
         Some("token/MATIC rate too low or unavailable".into())
-    } else if net_after_priority.is_zero() || net_profit_after_gas.is_zero() {
+    } else if gate_net_matic.is_zero() || gate_net_tokens.is_zero() {
         Some("non-positive net profit after gas".into())
     } else if !meets_safety_ratio {
         Some(format!(
-            "net profit {net_after_priority} MATIC wei below safety floor {required_net_matic} (incl priority uplift {priority_uplift})"
+            "net profit {gate_net_matic} MATIC wei below safety floor {required_net_matic} (incl priority uplift {priority_uplift})"
         ))
     } else if !meets_absolute_min {
         Some("below min profit threshold".into())
     } else if !meets_sane_matic_cap {
         Some(format!(
-            "net profit {net_profit_after_gas_matic_wei} MATIC wei exceeds sane cap {}",
+            "net profit {gate_net_matic} MATIC wei exceeds sane cap {}",
             U256::from(MAX_SANE_PROFIT_MATIC_WEI)
         ))
     } else if !meets_roi {
@@ -992,6 +1006,21 @@ mod safety_tests {
         assert!(!result.slippage_deduction.is_zero());
         assert_eq!(result.slippage_deduction, U256::from(11_000u64));
         assert!(result.should_execute);
+    }
+
+    #[test]
+    fn safety_zero_ignores_gas_for_execute_gate() {
+        let mut i = input();
+        i.gross_profit = U256::from(10u128.pow(16)); // 0.01 token @ 1:1 rate
+        i.amount_in = U256::from(10u128.pow(17));
+        i.slippage_bps = 0;
+        i.gas_units = 700_000;
+        i.gas_price_wei = U256::from(300_000_000_000u64); // 300 gwei → gas >> gross
+        i.safety_multiplier_bps = 10_000;
+        i.min_profit_matic_wei = U256::ZERO;
+        assert!(!assess_profit(&i).should_execute);
+        i.safety_multiplier_bps = 0;
+        assert!(assess_profit(&i).should_execute);
     }
 
     #[test]

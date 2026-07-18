@@ -128,6 +128,30 @@ fn pin_cycles_touching_pools(
     pinned
 }
 
+/// Token endpoints of observed pools — seed incremental DFS (hub starts miss peripherals).
+fn observed_pool_start_tokens(
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    pools: &[PoolIndex],
+) -> Vec<TokenIndex> {
+    if pools.is_empty() {
+        return Vec::new();
+    }
+    let want: rustc_hash::FxHashSet<PoolIndex> = pools.iter().copied().collect();
+    let mut out = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    for meta in pool_metas {
+        if !want.contains(&meta.pool_index) {
+            continue;
+        }
+        for &t in &meta.tokens {
+            if seen.insert(t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
     let max_hops = max_hops.clamp(2, HOP_CAP);
     let mut passes: SmallVec<[CycleSearchPass; 2]> = SmallVec::new();
@@ -433,6 +457,18 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             Arc::make_mut(&mut graph).ensure_token_capacity(work.arena.token_count());
         }
         let enum_started = crate::util::now_ms();
+        let obs_starts = observed_pool_start_tokens(
+            work.pool_metas.as_ref(),
+            &work.observed_pool_indices,
+        );
+        if !obs_starts.is_empty() {
+            crate::info!(
+                "stream observed-live: dfs_seed tokens={} pools={} incremental={incremental_refind} lf_pass={}",
+                obs_starts.len(),
+                work.observed_pool_indices.len(),
+                work.lf_pass
+            );
+        }
         let outcome = if incremental_refind {
             find_cycles_for_mode_with_budget(
                 work.cycle_finder,
@@ -443,8 +479,9 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 true,
                 Some(&probe_ctx),
                 CYCLE_ENUM_PATCH_BUDGET,
+                &obs_starts,
             )
-        } else {
+        } else if obs_starts.is_empty() {
             find_cycles_for_mode(
                 work.cycle_finder,
                 &work.arena,
@@ -453,6 +490,19 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 passes.as_slice(),
                 true,
                 Some(&probe_ctx),
+            )
+        } else {
+            // Full refind still hub-seeds by default — inject observed endpoints.
+            find_cycles_for_mode_with_budget(
+                work.cycle_finder,
+                &work.arena,
+                &graph,
+                work.pool_metas.as_ref(),
+                passes.as_slice(),
+                true,
+                Some(&probe_ctx),
+                crate::pipeline::cycle_finder::CYCLE_ENUM_TIME_BUDGET,
+                &obs_starts,
             )
         };
         outcome.diag.log_summary();
@@ -839,6 +889,25 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // Hold topic-live cycles aside before post-hydrate dead prune — rescore was
     // zeroing them out (repin: CPU pinned_cycles≤23, post-filter touching=0).
     let observed_pin_set: rustc_hash::FxHashSet<PoolIndex> = observed_pin.iter().copied().collect();
+    let pre_hold_touching = if observed_pin_set.is_empty() {
+        0
+    } else {
+        capped
+            .iter()
+            .filter(|cycle| {
+                cycle
+                    .edges
+                    .iter()
+                    .any(|edge| observed_pin_set.contains(&edge.pool_index))
+            })
+            .count()
+    };
+    if !observed_pin.is_empty() {
+        crate::info!(
+            "stream observed-live: pre_hold_touching={pre_hold_touching}/{} lf_pass={lf_pass}",
+            capped.len()
+        );
+    }
     let mut live_held = Vec::new();
     if !observed_pin_set.is_empty() {
         capped.retain(|cycle| {
@@ -976,7 +1045,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             })
             .count();
         crate::info!(
-            "stream observed-live: cycles_touching={touching}/{} observed_pools={}",
+            "stream observed-live: cycles_touching={touching}/{} observed_pools={} lf_pass={lf_pass}",
             capped.len(),
             observed_pin.len()
         );

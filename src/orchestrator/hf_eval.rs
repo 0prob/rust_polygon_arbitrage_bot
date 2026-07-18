@@ -1624,9 +1624,9 @@ pub fn reassess_hf_eval_result(
     )
 }
 
-/// V4 local quoter still admits sub-1 POL phantoms that dry-run ExternalCallFailed.
-/// Tighter than global `MAX_SANE_PROFIT_MATIC_WEI` for any route touching Uniswap V4.
-const MAX_SANE_V4_ROUTE_MATIC_WEI: u128 = 25u128 * 10u128.pow(16); // 0.25 POL
+/// V4 local-sim fidelity cap. Was 0.25 POL (blocked pad-validation dry-runs at ~0.36);
+/// align with global until eth_call proves residual V4 phantoms again.
+const MAX_SANE_V4_ROUTE_MATIC_WEI: u128 = crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI;
 
 fn route_has_uniswap_v4(cycle: &FoundCycle) -> bool {
     cycle
@@ -1865,13 +1865,15 @@ mod tests {
     }
 
     #[test]
-    fn v4_fidelity_cap_is_tighter_than_global_matic_sane_cap() {
-        assert_eq!(MAX_SANE_V4_ROUTE_MATIC_WEI, 25 * 10u128.pow(16));
-        assert!(MAX_SANE_V4_ROUTE_MATIC_WEI < crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI);
+    fn v4_fidelity_cap_matches_global_matic_sane_cap() {
+        assert_eq!(
+            MAX_SANE_V4_ROUTE_MATIC_WEI,
+            crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI
+        );
     }
 
     #[test]
-    fn v4_fidelity_cap_rejects_only_v4_routes_above_quarter_pol() {
+    fn v4_fidelity_cap_rejects_only_v4_routes_above_global_matic_cap() {
         let under = U256::from(MAX_SANE_V4_ROUTE_MATIC_WEI);
         let over = under + U256::from(1u64);
         assert!(!v4_route_net_exceeds_fidelity_cap(true, under));

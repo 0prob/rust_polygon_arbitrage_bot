@@ -329,12 +329,16 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
-    let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
+    let a_raw = decode_u256(results.get(a_idx)?.as_ref()?)?;
     let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
     let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
-    if a.is_zero() {
+    if a_raw.is_zero() {
         return None;
     }
+    // Multicall fetches A(); StableSwap math (and our get_d/get_y) use A_precise = A * 100.
+    // Storing unscaled A under-amplifies ~100× → local dy ≫ get_dy (dry-run min_dy reverts).
+    const A_PRECISION: u64 = 100;
+    let a = a_raw.checked_mul(U256::from(A_PRECISION))?;
     Some(PoolState::Curve(CurvePoolState {
         balances,
         a,
