@@ -63,13 +63,14 @@ pub fn encode_v3_hop(
     ])
     .abi_encode();
 
-    // Exact-in: amountSpecified is negative. Fail closed if amount does not fit i256.
+    // V3 exact-in: amountSpecified is POSITIVE (negative means exact-output; the
+    // negative-exact-in convention is V4-only). Fail closed if amount does not fit i256.
     let amount_spec = I256::try_from(hop.amount_in)
         .map_err(|_| anyhow::anyhow!("v3 amount_in does not fit i256"))?;
     let swap = IUniswapV3Pool::swapCall {
         recipient,
         zeroForOne: hop.edge.zero_for_one,
-        amountSpecified: -amount_spec,
+        amountSpecified: amount_spec,
         sqrtPriceLimitX96: U160::from(sqrt_limit),
         data: callback.into(),
     };

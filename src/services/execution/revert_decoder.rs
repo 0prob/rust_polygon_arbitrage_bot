@@ -446,7 +446,7 @@ mod tests {
                 assert_eq!(t, target);
                 assert_eq!(reason, "empty nested revert (rd_size=0)");
             }
-            other => panic!("unexpected {other:?}"),
+            other => unreachable!("unexpected {other:?}"),
         }
     }
 
@@ -488,7 +488,7 @@ mod tests {
                     "must not nest phantom ExternalCallFailed: {reason}"
                 );
             }
-            other => panic!("unexpected {other:?}"),
+            other => unreachable!("unexpected {other:?}"),
         }
     }
 }

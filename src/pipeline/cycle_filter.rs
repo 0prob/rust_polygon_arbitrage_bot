@@ -407,6 +407,18 @@ mod tests {
         }
     }
 
+    fn v2_pool(reserve0: U256, reserve1: U256) -> std::sync::Arc<crate::core::types::PoolState> {
+        std::sync::Arc::new(crate::core::types::PoolState::V2(
+            crate::core::types::V2PoolState {
+                reserve0,
+                reserve1,
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            },
+        ))
+    }
+
     #[test]
     fn retain_cycles_drops_unpriced_and_keeps_priced_start() {
         use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
@@ -529,15 +541,17 @@ mod tests {
 
     #[test]
     fn prefilter_prunes_spot_flat_before_sim() {
+        // The arena-state gate runs before the spot-flat prune; PoolIndex(7) needs
+        // matching V2 state or the cycle dies as protocol_mismatch instead.
+        let mut arena = StateArena::default();
+        for id in 0u8..8 {
+            arena.register_pool(Address::from([id + 1; 20]), v2_pool(ONE, ONE));
+        }
         let mut flat = cycle(-0.1, false);
         flat.cycle_ratio = ONE;
         flat.score = 0.1;
-        let (_, diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
-            &crate::pipeline::arena::StateArena::default(),
-            vec![flat],
-            8,
-            None,
-        );
+        let (_, diag) =
+            prefilter_cycles_by_atomic_sim_with_context_and_diag(&arena, vec![flat], 8, None);
         assert_eq!(diag.pruned_spot_flat, 1);
         assert_eq!(diag.sim_window, 0);
     }
@@ -551,33 +565,13 @@ mod tests {
 
     #[test]
     fn spot_negative_cycles_fill_the_configured_route_budget() {
-        let mut arena = crate::pipeline::arena::StateArena::default();
+        let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([1u8; 20]));
         let b = arena.register_token(Address::from([2u8; 20]));
-        let pool = arena.register_pool(
-            Address::from([3u8; 20]),
-            std::sync::Arc::new(crate::core::types::PoolState::V2(
-                crate::core::types::V2PoolState {
-                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-                    fee: U256::from(997u64),
-                    fee_denominator: U256::from(1_000u64),
-                    block_timestamp_last: 0,
-                },
-            )),
-        );
-        let pool2 = arena.register_pool(
-            Address::from([4u8; 20]),
-            std::sync::Arc::new(crate::core::types::PoolState::V2(
-                crate::core::types::V2PoolState {
-                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-                    fee: U256::from(997u64),
-                    fee_denominator: U256::from(1_000u64),
-                    block_timestamp_last: 0,
-                },
-            )),
-        );
+        let deep = crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64);
+        let shallow = crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64);
+        let pool = arena.register_pool(Address::from([3u8; 20]), v2_pool(deep, shallow));
+        let pool2 = arena.register_pool(Address::from([4u8; 20]), v2_pool(shallow, deep));
         let graph_negative = FoundCycle {
             start_token: a,
             edges: CycleEdges::from_slice(&[

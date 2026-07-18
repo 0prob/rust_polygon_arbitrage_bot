@@ -1782,7 +1782,6 @@ fn prefer_near_miss_by_absolute_matic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
     use crate::core::types::{CycleEdges, Edge, PoolIndex, PoolState, TokenIndex, V2PoolState};
     use crate::services::partial_cache::SlimPoolState;
 
@@ -1841,9 +1840,39 @@ mod tests {
         }))
     }
 
+    /// Edge tokens must resolve to addresses or the pool-meta gate rejects the
+    /// cycle as protocol_mismatch. t0 < t1 keeps zero_for_one=true canonical.
+    fn arena_with_edge_tokens() -> StateArena {
+        let mut arena = StateArena::default();
+        arena.register_token(Address::from([0xaa; 20]));
+        arena.register_token(Address::from([0xbb; 20]));
+        arena
+    }
+
+    /// 1:1 MATIC rate keeps the economic floor (1e17) far below v2_state reserves
+    /// (1e24); the minimum rate would inflate the floor to 1e29 and cull as v2_dead.
+    fn one_to_one_rates() -> rustc_hash::FxHashMap<TokenIndex, U256> {
+        let mut rates = rustc_hash::FxHashMap::default();
+        rates.insert(TokenIndex(0), U256::from(10u64).pow(U256::from(18u64)));
+        rates
+    }
+
+    fn hot_slim_state(activity_count: u64) -> SlimPoolState {
+        SlimPoolState {
+            protocol: ProtocolType::UniswapV2,
+            sqrt_price_x96: U256::ZERO,
+            liquidity: 0,
+            tick: 0,
+            reserve0: U256::from(10u64).pow(U256::from(24u64)),
+            reserve1: U256::from(10u64).pow(U256::from(24u64)),
+            patched_at_ms: now_ms(),
+            activity_count,
+        }
+    }
+
     #[test]
     fn select_prefers_all_actives_before_inactive_rotation() {
-        let mut arena = StateArena::default();
+        let mut arena = arena_with_edge_tokens();
         let addresses: Vec<_> = (1u8..=4)
             .map(|id| {
                 let address = Address::from([id; 20]);
@@ -1854,27 +1883,14 @@ mod tests {
         let partial_cache = PartialPoolCache::new();
         // Pools 0 and 1 are hot; 2 and 3 are cold.
         for &addr in &addresses[..2] {
-            partial_cache.seed(
-                addr,
-                SlimPoolState {
-                    protocol: ProtocolType::UniswapV2,
-                    sqrt_price_x96: U256::ZERO,
-                    liquidity: 0,
-                    tick: 0,
-                    reserve0: U256::from(10u64).pow(U256::from(24u64)),
-                    reserve1: U256::from(10u64).pow(U256::from(24u64)),
-                    patched_at_ms: now_ms(),
-                    activity_count: 3,
-                },
-            );
+            partial_cache.seed(addr, hot_slim_state(3));
         }
         let cycles: Vec<_> = [1.0, 2.0, 3.0, 4.0]
             .into_iter()
             .enumerate()
             .map(|(index, score)| cycle(PoolIndex(index as u32), score))
             .collect();
-        let mut rates = rustc_hash::FxHashMap::default();
-        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+        let rates = one_to_one_rates();
 
         let selected = select_cycles_for_rescore(
             &cycles,
@@ -1911,7 +1927,7 @@ mod tests {
 
     #[test]
     fn activity_rank_considers_routes_outside_the_static_top_three() {
-        let mut arena = StateArena::default();
+        let mut arena = arena_with_edge_tokens();
         let addresses: Vec<_> = (1u8..=4)
             .map(|id| {
                 let address = Address::from([id; 20]);
@@ -1920,26 +1936,13 @@ mod tests {
             })
             .collect();
         let partial_cache = PartialPoolCache::new();
-        partial_cache.seed(
-            addresses[3],
-            SlimPoolState {
-                protocol: ProtocolType::UniswapV2,
-                sqrt_price_x96: U256::ZERO,
-                liquidity: 0,
-                tick: 0,
-                reserve0: U256::from(10u64).pow(U256::from(24u64)),
-                reserve1: U256::from(10u64).pow(U256::from(24u64)),
-                patched_at_ms: now_ms(),
-                activity_count: 1,
-            },
-        );
+        partial_cache.seed(addresses[3], hot_slim_state(1));
         let cycles: Vec<_> = [1.0, 2.0, 3.0, 4.0]
             .into_iter()
             .enumerate()
             .map(|(index, score)| cycle(PoolIndex(index as u32), score))
             .collect();
-        let mut rates = rustc_hash::FxHashMap::default();
-        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+        let rates = one_to_one_rates();
 
         let selected = select_cycles_for_rescore(
             &cycles,

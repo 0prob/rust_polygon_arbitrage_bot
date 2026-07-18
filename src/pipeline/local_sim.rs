@@ -1653,7 +1653,7 @@ mod tests {
             token_in: t0,
             ..bad
         };
-        let state = arena.pool_state(pool).unwrap();
+        let state = arena.pool_state(pool).expect("pool state registered");
         assert!(!multi_token_edge_aligned(
             state,
             &bad,
@@ -1690,7 +1690,7 @@ mod tests {
             zero_for_one: false,
             ..ok
         };
-        let state = arena.pool_state(pool).unwrap();
+        let state = arena.pool_state(pool).expect("pool state registered");
         assert!(realign_multi_token_edge(&arena, state, &mut skewed));
         assert_eq!((skewed.token_in_idx, skewed.token_out_idx), (0, 1));
         assert!(!matches!(

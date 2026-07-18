@@ -843,11 +843,12 @@ mod safety_tests {
             profit_priority_alpha_bps: 0,
         });
         assert!(assessment.net_profit > U256::ZERO);
-        let from_assessment = on_chain_min_profit_from_assessment(&assessment).unwrap();
+        let from_assessment =
+            on_chain_min_profit_from_assessment(&assessment).expect("assessment min profit");
         // Wrong path: treat base 50 as per-hop and compound (ignores depth 500).
         let from_per_hop =
             on_chain_min_profit_for_route(gross, amount_in, 50, 3, FlashLoanSource::Balancer)
-                .unwrap();
+                .expect("per-hop min profit");
         // Assessment uses higher slip → lower net → lower minProfit (matches on-chain reality).
         assert!(
             from_assessment < from_per_hop,

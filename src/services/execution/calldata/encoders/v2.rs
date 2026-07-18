@@ -161,7 +161,8 @@ mod tests {
         let amount1 = U256::from_be_slice(&swap_data[4 + 32..4 + 64]);
         assert!(!amount1.is_zero());
         let data_offset =
-            usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128])).unwrap();
+            usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128]))
+                .expect("data offset fits usize");
         let len_word_at = 4 + data_offset;
         let data_len = U256::from_be_slice(&swap_data[len_word_at..len_word_at + 32]);
         assert!(

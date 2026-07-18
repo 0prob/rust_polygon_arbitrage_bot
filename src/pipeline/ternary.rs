@@ -1104,7 +1104,8 @@ mod tests {
         let high = U256::from(1_000_000u64);
         let low = U256::from(1u8);
         let floor = U256::from(10u8);
-        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, &seeds).unwrap();
+        let clamped =
+            clamp_brent_high_to_probe_seeds(high, low, floor, &seeds).expect("seed clamp");
         assert_eq!(clamped, seed * U256::from(8u8));
         // Zero-profit seeds do not clamp.
         let dust = [(
