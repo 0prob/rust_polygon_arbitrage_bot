@@ -589,7 +589,7 @@ fn select_cycles_for_rescore(
         // Skip only when every tickless CL hop is on miss cooldown. Skipping any
         // CL pool on cooldown (even with LF ticks) wiped the HF window
         // (`selected=0`, tickless_stuck≫candidates) whenever a hub pool missed.
-        if cycle_tickless_cl_all_on_miss_cooldown(arena, cycle.as_ref()) {
+        if cycle_tickless_cl_all_on_miss_cooldown(arena, cycle.as_ref(), pool_metas) {
             tickless_stuck_skipped += 1;
             continue;
         }
@@ -1217,8 +1217,15 @@ pub async fn run_hf_tick(
     {
         Ok(stats) => stats,
         Err(_) => {
-            crate::debug!(
-                "hf probe-tick hydrate timed out after {}ms",
+            // Cool the attempted targets — without this the next tick re-burns
+            // the full budget on the same pools (median tick pinned at budget).
+            let cooled = crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
+                &arena,
+                &cycles,
+                pool_metas_for_dispatch.as_ref(),
+            );
+            crate::warn!(
+                "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools",
                 probe_tick_budget.as_millis()
             );
             crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
@@ -1248,7 +1255,8 @@ pub async fn run_hf_tick(
     }
     // After hydrate+cooldown mark, drop cycles whose CL hops are empty and already
     // known-dead this minute so probe/Brent budget is not spent on dust-only phantoms.
-    let stuck_tickless = drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles);
+    let stuck_tickless =
+        drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas_for_dispatch.as_ref());
     if stuck_tickless > 0 {
         crate::info!(
             "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} remaining={}",
@@ -1529,7 +1537,7 @@ pub async fn run_hf_tick(
         let log_summary = profitable_count > 0 || stream_triggered || should_log_hf_summary();
         if log_summary {
             crate::info!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
             );
             if profitable_count == 0 && eval_count > 0 {
                 crate::info!(

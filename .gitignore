@@ -38,6 +38,7 @@ wallet/
 /external_gateway/
 
 # Runtime data & journals
+sentinel/state.json
 .rpbot-*
 .debug-journal.md
 opportunities.jsonl

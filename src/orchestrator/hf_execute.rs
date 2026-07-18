@@ -2,11 +2,9 @@ use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use futures_util::{StreamExt, stream};
-use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::{FlashLoanSource, FoundCycle, PoolIndex, PoolState, V3Tick};
@@ -19,7 +17,10 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
 
 use crate::pipeline::tick_fetch::{
-    collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
+    collect_v3_pool_addresses,
+    collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks, is_cl_tick_on_hydrate_cooldown,
+    is_empty_tick_on_cooldown, mark_tick_hydrate_timeout_cooldown,
+    mark_v4_tick_hydrate_timeout_cooldown,
 };
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
@@ -838,45 +839,23 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
 
 /// Cap tick RPC work so HF probe hydration cannot starve evaluation.
 const HF_PROBE_TICK_POOL_CAP: usize = 64;
-/// Skip re-fetching pools that just returned empty ticks (HF otherwise hammers the
-/// same dead TickLens/bitmap miss every ~200ms). Wide-empty pools rarely recover
-/// within seconds — 60s cuts refetch spam while still allowing occasional retry.
-const HF_TICK_MISS_COOLDOWN: Duration = Duration::from_secs(60);
 
-static HF_TICK_MISS_COOLDOWN_UNTIL: Mutex<Option<FxHashMap<Address, Instant>>> = Mutex::new(None);
-
-fn tick_miss_on_cooldown(addr: Address) -> bool {
-    let guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
-    guard
-        .as_ref()
-        .and_then(|m| m.get(&addr).copied())
-        .is_some_and(|until| Instant::now() < until)
-}
-
-fn mark_tick_miss_cooldown(addrs: &[Address]) {
-    if addrs.is_empty() {
-        return;
-    }
-    let until = Instant::now() + HF_TICK_MISS_COOLDOWN;
-    let mut guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
-    let map = guard.get_or_insert_with(FxHashMap::default);
-    // Bound map growth — drop expired entries occasionally.
-    if map.len() > 512 {
-        let now = Instant::now();
-        map.retain(|_, exp| *exp > now);
-    }
-    for &addr in addrs {
-        map.insert(addr, until);
-    }
-}
-
-fn clear_tick_miss_cooldown(addrs: &[Address]) {
-    let mut guard = HF_TICK_MISS_COOLDOWN_UNTIL.lock();
-    if let Some(map) = guard.as_mut() {
-        for addr in addrs {
-            map.remove(addr);
-        }
-    }
+fn cl_pool_on_hydrate_cooldown(
+    arena: &StateArena,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    pool_index: PoolIndex,
+    protocol: crate::core::types::ProtocolType,
+) -> bool {
+    let Some(addr) = arena.pool_address(pool_index) else {
+        return false;
+    };
+    let v4_pool_id = (protocol == crate::core::types::ProtocolType::UniswapV4)
+        .then(|| {
+            crate::pipeline::types::pool_meta_at(pool_metas, pool_index)
+                .and_then(|meta| meta.pool_id)
+        })
+        .flatten();
+    is_cl_tick_on_hydrate_cooldown(addr, v4_pool_id)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -922,6 +901,7 @@ fn count_tickless_cl_cycles<C: AsRef<FoundCycle>>(arena: &StateArena, cycles: &[
 pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
     arena: &StateArena,
     cycle: &FoundCycle,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> bool {
     let mut saw_tickless = false;
     for edge in &cycle.edges {
@@ -938,10 +918,7 @@ pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
             continue;
         }
         saw_tickless = true;
-        let Some(addr) = arena.pool_address(edge.pool_index) else {
-            return false;
-        };
-        if !tick_miss_on_cooldown(addr) {
+        if !cl_pool_on_hydrate_cooldown(arena, pool_metas, edge.pool_index, edge.protocol) {
             return false;
         }
     }
@@ -953,7 +930,11 @@ pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
 /// Previously used at HF selection (over-pruned to `selected=0`); select now uses
 /// [`cycle_tickless_cl_all_on_miss_cooldown`]. Kept for unit tests / hydrate helpers.
 #[allow(dead_code)]
-pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(arena: &StateArena, cycle: &FoundCycle) -> bool {
+pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> bool {
     for edge in &cycle.edges {
         if !matches!(
             edge.protocol,
@@ -962,10 +943,7 @@ pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(arena: &StateArena, cycle: &Fou
         ) {
             continue;
         }
-        let Some(addr) = arena.pool_address(edge.pool_index) else {
-            continue;
-        };
-        if tick_miss_on_cooldown(addr) {
+        if cl_pool_on_hydrate_cooldown(arena, pool_metas, edge.pool_index, edge.protocol) {
             return true;
         }
     }
@@ -977,12 +955,13 @@ pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(arena: &StateArena, cycle: &Fou
 pub(crate) fn drain_cooldown_stuck_tickless_cycles(
     arena: &StateArena,
     cycles: &mut Vec<std::sync::Arc<FoundCycle>>,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> usize {
     if cycles.is_empty() {
         return 0;
     }
     let before = cycles.len();
-    cycles.retain(|c| !cycle_tickless_cl_all_on_miss_cooldown(arena, c.as_ref()));
+    cycles.retain(|c| !cycle_tickless_cl_all_on_miss_cooldown(arena, c.as_ref(), pool_metas));
     // Previously refused to drain when *every* cycle was stuck (kept.is_empty →
     // return 0), which left HF evaluating only dust-only phantoms for the tick.
     // Empty remaining is fine — the tick already handles cycles_considered=0.
@@ -1014,7 +993,7 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
                 continue;
             }
             all += 1;
-            if out.len() < cap && !tick_miss_on_cooldown(addr) {
+            if out.len() < cap && !is_empty_tick_on_cooldown(addr) {
                 out.push(addr);
             }
         }
@@ -1034,15 +1013,32 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
         _ => false,
     });
     let total = all.len();
-    all.retain(|(idx, _)| {
-        arena
-            .pool_address(*idx)
-            .is_none_or(|addr| !tick_miss_on_cooldown(addr))
+    all.retain(|(idx, pool_id)| {
+        let Some(addr) = arena.pool_address(*idx) else {
+            return true;
+        };
+        !is_cl_tick_on_hydrate_cooldown(addr, Some(*pool_id))
     });
     if all.len() > cap {
         all.truncate(cap);
     }
     (total, all)
+}
+
+/// On probe-tick hydrate timeout the enrich future is dropped before it can
+/// mark misses, so the next tick would re-burn the whole budget on the same
+/// pools. Briefly cooldown the targets it was about to fetch; live pools
+/// recover on the next completed attempt. Returns how many were cooled.
+pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> usize {
+    let (_, v3) = tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
+    let (_, v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
+    mark_tick_hydrate_timeout_cooldown(v3.iter().copied());
+    mark_v4_tick_hydrate_timeout_cooldown(v4.iter().map(|&(_, pool_id)| pool_id));
+    v3.len() + v4.len()
 }
 
 /// Hydrate empty V3/V4 tick arrays on selected HF cycles before probe ranking.
@@ -1110,31 +1106,6 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
             stats.v3_algebra_loaded = v3_res.algebra_loaded;
             stats.v3_seeded = v3_res.seeded_pools;
             stats.v4_loaded = v4_res.loaded;
-            // Cooldown pools that stayed tickless so HF does not re-RPC them every tick.
-            let mut still_miss = Vec::new();
-            let mut recovered = Vec::new();
-            for &addr in &v3 {
-                let Some(&idx) = arena.address_to_pool().get(&addr) else {
-                    continue;
-                };
-                match arena.pool_state(idx) {
-                    Some(PoolState::V3(s)) if s.ticks.is_empty() => still_miss.push(addr),
-                    Some(PoolState::V3(_)) => recovered.push(addr),
-                    _ => {}
-                }
-            }
-            for &(idx, _) in &v4 {
-                let Some(addr) = arena.pool_address(idx) else {
-                    continue;
-                };
-                match arena.pool_state(idx) {
-                    Some(PoolState::V4(s)) if s.ticks.is_empty() => still_miss.push(addr),
-                    Some(PoolState::V4(_)) => recovered.push(addr),
-                    _ => {}
-                }
-            }
-            mark_tick_miss_cooldown(&still_miss);
-            clear_tick_miss_cooldown(&recovered);
             stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
             return stats;
         }
@@ -1812,7 +1783,8 @@ mod tests {
                 }]),
             })),
         );
-        mark_tick_miss_cooldown(&[addr_dead]);
+        mark_tick_hydrate_timeout_cooldown([addr_dead]);
+        let pool_metas: &[crate::pipeline::types::PoolMeta] = &[];
         let edge = |pool| Edge {
             pool_index: pool,
             protocol: ProtocolType::UniswapV3,
@@ -1835,21 +1807,21 @@ mod tests {
             })
         };
         let mut cycles = vec![mk(dead, 1), mk(live, 2)];
-        let removed = drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles);
+        let removed = drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas);
         assert_eq!(removed, 1);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].start_token, TokenIndex(2));
 
         // All-stuck set must clear entirely (previously early-returned 0 and kept phantoms).
         let mut all_stuck = vec![mk(dead, 3), mk(dead, 4)];
-        let removed_all = drain_cooldown_stuck_tickless_cycles(&arena, &mut all_stuck);
+        let removed_all = drain_cooldown_stuck_tickless_cycles(&arena, &mut all_stuck, pool_metas);
         assert_eq!(removed_all, 2);
         assert!(all_stuck.is_empty());
 
         // Selection skip keys off cooldown membership even when LF still has ticks.
-        assert!(cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 5)));
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(live, 6)));
-        clear_tick_miss_cooldown(&[addr_dead]);
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 7)));
+        assert!(cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 5), pool_metas));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(live, 6), pool_metas));
+        crate::pipeline::tick_fetch::clear_tick_hydrate_cooldown(addr_dead);
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 7), pool_metas));
     }
 }

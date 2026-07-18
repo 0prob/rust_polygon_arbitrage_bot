@@ -1141,7 +1141,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
 
-    const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
+    const TEST_FUNDED_RESERVE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn direct_ge(pool: u32, tin: u32, tout: u32, protocol: ProtocolType, ratio: u64) -> GraphEdge {
         GraphEdge {
@@ -1269,7 +1269,7 @@ mod tests {
         let tokens: Vec<TokenIndex> = (0u8..8)
             .map(|i| arena.register_token(Address::from([i; 20])))
             .collect();
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let pool = arena.register_pool(
             Address::from([9u8; 20]),
             Arc::new(PoolState::Balancer(BalancerPoolState {
@@ -1341,7 +1341,7 @@ mod tests {
         let c = arena.register_token(Address::from([12u8; 20]));
         let d = arena.register_token(Address::from([13u8; 20]));
         let e = arena.register_token(Address::from([14u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let pool = arena.register_pool(
             Address::from([15u8; 20]),
@@ -1453,8 +1453,8 @@ mod tests {
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE + U256::from(1u64),
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -1480,8 +1480,8 @@ mod tests {
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE,
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE,
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -1501,8 +1501,8 @@ mod tests {
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE + U256::from(1u64),
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -1526,7 +1526,7 @@ mod tests {
         let a = arena.register_token(Address::from([10u8; 20]));
         let b = arena.register_token(Address::from([11u8; 20]));
         let c = arena.register_token(Address::from([12u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let routable_pool = arena.register_pool(
             Address::from([13u8; 20]),
@@ -1564,7 +1564,7 @@ mod tests {
         let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([20u8; 20]));
         let b = arena.register_token(Address::from([21u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let pool = arena.register_pool(
             Address::from([22u8; 20]),
@@ -1587,7 +1587,7 @@ mod tests {
         let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([30u8; 20]));
         let b = arena.register_token(Address::from([31u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let live_pool = arena.register_pool(
             Address::from([32u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[test]
     fn pool_state_graph_eligible_requires_routable_pair() {
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let one_sided = PoolState::V2(V2PoolState {
             reserve0: funded,
@@ -1668,7 +1668,7 @@ mod tests {
         let mut arena = StateArena::default();
         let hub = arena.register_token(Address::from([50u8; 20]));
         let leaf = arena.register_token(Address::from([51u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let live_pool = arena.register_pool(
             Address::from([52u8; 20]),
@@ -1721,7 +1721,7 @@ mod tests {
         let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([60u8; 20]));
         let b = arena.register_token(Address::from([61u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let pool = arena.register_pool(
             Address::from([62u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -1756,7 +1756,7 @@ mod tests {
         let a = arena.register_token(Address::from([40u8; 20]));
         let b = arena.register_token(Address::from([41u8; 20]));
         let c = arena.register_token(Address::from([42u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let pool0 = arena.register_pool(
             Address::from([43u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -1958,8 +1958,8 @@ mod tests {
         let pool = arena.register_pool(
             Address::from([6u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE + U256::from(1u64),
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -1983,7 +1983,7 @@ mod tests {
         let hub = arena.register_token(WMATIC);
         let tail_a = arena.register_token(Address::from([0xaau8; 20]));
         let tail_b = arena.register_token(Address::from([0xbbu8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let hub_pool = arena.register_pool(
             Address::from([0x01u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -2044,7 +2044,7 @@ mod tests {
         let priced_start = arena.register_token(Address::from([0x11u8; 20]));
         let intermediate = arena.register_token(WMATIC);
         let unpriced = arena.register_token(Address::from([0x22u8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let pool = arena.register_pool(
             Address::from([0x33u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -2083,7 +2083,7 @@ mod tests {
         let priced = arena.register_token(Address::from([0x11u8; 20]));
         let a = arena.register_token(Address::from([0xaau8; 20]));
         let b = arena.register_token(Address::from([0xbbu8; 20]));
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let pool = arena.register_pool(
             Address::from([0x33u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {

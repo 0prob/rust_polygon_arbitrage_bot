@@ -17,7 +17,7 @@ use crate::infra::json_rpc::{
 };
 use serde_json::Value;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const BLOXROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BLOXROUTE_API_URL: &str = "https://api.blxrbdn.com";
 
@@ -56,7 +56,7 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
     let client = &*HTTP;
     let chain_id_ok = match client
         .post(url)
-        .timeout(PROBE_TIMEOUT)
+        .timeout(BLOXROUTE_PROBE_TIMEOUT)
         .json(&JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
@@ -83,7 +83,7 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
 
     let (supports_private_rpc_method, private_method_error) = match client
         .post(url)
-        .timeout(PROBE_TIMEOUT)
+        .timeout(BLOXROUTE_PROBE_TIMEOUT)
         .json(&JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
@@ -137,7 +137,7 @@ pub async fn probe_bloxroute_auth(auth_header: &str) -> bool {
         method: "polygon_private_tx",
         params: BloxroutePrivateTxParams { transaction: "00" },
     };
-    let Ok(resp) = post_bloxroute(&body, auth_header, PROBE_TIMEOUT).await else {
+    let Ok(resp) = post_bloxroute(&body, auth_header, BLOXROUTE_PROBE_TIMEOUT).await else {
         return false;
     };
     if resp.status().as_u16() == 401 {

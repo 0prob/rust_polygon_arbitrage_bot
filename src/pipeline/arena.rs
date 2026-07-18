@@ -730,12 +730,12 @@ mod tests {
     };
     use alloy::primitives::U256;
 
-    const MIN_HOP_TOKEN_BALANCE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
+    const TEST_FUNDED_RESERVE: U256 = U256::from_limbs([1_000_000_000_000_000, 0, 0, 0]);
 
     fn v2_state() -> Arc<PoolState> {
         Arc::new(PoolState::V2(V2PoolState {
-            reserve0: MIN_HOP_TOKEN_BALANCE,
-            reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+            reserve0: TEST_FUNDED_RESERVE,
+            reserve1: TEST_FUNDED_RESERVE + U256::from(1u64),
             fee: U256::from(997u64),
             fee_denominator: U256::from(1_000u64),
             block_timestamp_last: 1,
@@ -810,12 +810,12 @@ mod tests {
             pool_address,
             PoolState::Woofi(WoofiPoolState {
                 tokens: vec![base, quote],
-                quote_reserve: MIN_HOP_TOKEN_BALANCE,
+                quote_reserve: TEST_FUNDED_RESERVE,
                 base_states: vec![WoofiBaseTokenState {
                     price: U256::from(1u8),
                     spread: U256::ZERO,
                     coeff: U256::ZERO,
-                    reserve: MIN_HOP_TOKEN_BALANCE,
+                    reserve: TEST_FUNDED_RESERVE,
                     base_dec: U256::from(1u8),
                     quote_dec: U256::from(1u8),
                     price_dec: U256::from(1u8),
@@ -866,12 +866,12 @@ mod tests {
         cache.insert(
             pool_address,
             PoolState::Dodo(DodoPoolState {
-                base_reserve: MIN_HOP_TOKEN_BALANCE,
-                quote_reserve: MIN_HOP_TOKEN_BALANCE,
+                base_reserve: TEST_FUNDED_RESERVE,
+                quote_reserve: TEST_FUNDED_RESERVE,
                 base_token: base,
                 quote_token: quote,
-                base_target: MIN_HOP_TOKEN_BALANCE,
-                quote_target: MIN_HOP_TOKEN_BALANCE,
+                base_target: TEST_FUNDED_RESERVE,
+                quote_target: TEST_FUNDED_RESERVE,
                 r_state: DodoRState::One,
                 i: U256::from(1u64) << 18,
                 k: U256::ZERO,
@@ -1045,7 +1045,7 @@ mod tests {
         let pool_address = Address::with_last_byte(21);
         let a = Address::with_last_byte(22);
         let b = Address::with_last_byte(23);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let dust = U256::ZERO;
         let cache = StateCache::default();
         cache.insert(
@@ -1091,8 +1091,8 @@ mod tests {
         cache.insert(
             pool_address,
             PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE + U256::from(1u64),
                 fee: U256::from(997u64),
                 fee_denominator: U256::from(1_000u64),
                 block_timestamp_last: 1,
@@ -1314,7 +1314,7 @@ mod tests {
         let pool_b = Address::with_last_byte(81);
         let token_a = Address::with_last_byte(82);
         let token_b = Address::with_last_byte(83);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let cache = StateCache::default();
         let v2 = |ts| {
             PoolState::V2(V2PoolState {
@@ -1387,7 +1387,7 @@ mod tests {
         let pool_b = Address::with_last_byte(71);
         let token_a = Address::with_last_byte(72);
         let token_b = Address::with_last_byte(73);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let cache = StateCache::default();
         cache.insert(
             pool_a,
@@ -1470,7 +1470,7 @@ mod tests {
         let pool_address = Address::with_last_byte(50);
         let token_a = Address::with_last_byte(51);
         let token_b = Address::with_last_byte(52);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let cache = StateCache::default();
         let v2 = PoolState::V2(V2PoolState {
             reserve0: funded,
@@ -1527,7 +1527,7 @@ mod tests {
         let pool_address = Address::with_last_byte(60);
         let token_a = Address::with_last_byte(61);
         let token_b = Address::with_last_byte(62);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let cache = StateCache::default();
         cache.insert(
             pool_address,
@@ -1589,7 +1589,7 @@ mod tests {
         let pool_b = Address::with_last_byte(31);
         let token_a = Address::with_last_byte(40);
         let token_b = Address::with_last_byte(41);
-        let funded = MIN_HOP_TOKEN_BALANCE;
+        let funded = TEST_FUNDED_RESERVE;
         let cache = StateCache::default();
         cache.insert(
             pool_a,

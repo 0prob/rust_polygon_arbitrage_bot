@@ -25,7 +25,7 @@ use crate::util::now_ms;
 
 const DEFAULT_RECEIPT_LOOKBACK: u64 = 50;
 const HEIGHT_CACHE_TTL_MS: u64 = 15_000;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const HYPERSYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Thin wrapper around [`hypersync_client::Client`] for the arb bot.
 pub struct HyperSyncService {
@@ -102,7 +102,7 @@ impl HyperSyncService {
     pub async fn probe_height(&self) -> Result<u64> {
         let height = self
             .client
-            .health_check(Some(PROBE_TIMEOUT))
+            .health_check(Some(HYPERSYNC_PROBE_TIMEOUT))
             .await
             .context("hypersync health_check failed")?;
         self.record_height(height);

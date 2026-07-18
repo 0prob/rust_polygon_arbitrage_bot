@@ -824,9 +824,15 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         let v4_tick_pools_needed: Vec<_> = v4_tick_pools
             .iter()
             .copied()
-            .filter(|(idx, _)| match arena.pool_state(*idx) {
-                Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
-                _ => true,
+            .filter(|(idx, pool_id)| {
+                // Skip pools that stayed empty after a recent full hydrate.
+                if crate::pipeline::tick_fetch::is_empty_v4_tick_on_cooldown(*pool_id) {
+                    return false;
+                }
+                match arena.pool_state(*idx) {
+                    Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
+                    _ => true,
+                }
             })
             .collect();
         // Log how many cycle CL pools still need hydration (not the full set).

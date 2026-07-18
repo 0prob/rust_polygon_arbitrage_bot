@@ -9,7 +9,9 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 
 /// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
 /// this deadline. Live LF was re-fetching ~30–40 empty pools every pass.
-const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
+pub const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
+/// Shorter cooldown when hydrate times out before marking misses (HF probe path).
+pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 10_000;
 /// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
 /// dominate LF under rate limits.
 const MAX_WIDE_TICK_POOLS: usize = 24;
@@ -27,18 +29,88 @@ pub fn is_empty_tick_on_cooldown(pool: Address) -> bool {
         .is_some_and(|&until| now < until)
 }
 
-fn mark_empty_tick_cooldown(pools: impl IntoIterator<Item = Address>) {
+fn mark_tick_cooldown_addresses(pools: impl IntoIterator<Item = Address>, cooldown_ms: u64) {
     let now = crate::util::now_ms();
-    let until = now.saturating_add(EMPTY_TICK_COOLDOWN_MS);
+    let until = now.saturating_add(cooldown_ms);
     let mut map = EMPTY_TICK_UNTIL_MS.lock();
     map.retain(|_, u| *u > now);
     for pool in pools {
-        map.insert(pool, until);
+        map.entry(pool)
+            .and_modify(|deadline| *deadline = (*deadline).max(until))
+            .or_insert(until);
     }
+}
+
+fn mark_empty_tick_cooldown(pools: impl IntoIterator<Item = Address>) {
+    mark_tick_cooldown_addresses(pools, EMPTY_TICK_COOLDOWN_MS);
+}
+
+/// Briefly suppress re-fetch after a hydrate timeout (fetch never completed).
+pub fn mark_tick_hydrate_timeout_cooldown(pools: impl IntoIterator<Item = Address>) {
+    mark_tick_cooldown_addresses(pools, TICK_HYDRATE_TIMEOUT_COOLDOWN_MS);
+}
+
+/// Clear address-keyed hydrate cooldown (e.g. after ticks load).
+pub fn clear_tick_hydrate_cooldown(pool: Address) {
+    clear_empty_tick_cooldown(pool);
 }
 
 fn clear_empty_tick_cooldown(pool: Address) {
     EMPTY_TICK_UNTIL_MS.lock().remove(&pool);
+}
+
+/// V4 pools are keyed by pool id (not address), so they get their own map.
+static EMPTY_V4_TICK_UNTIL_MS: LazyLock<Mutex<FxHashMap<FixedBytes<32>, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// True when this V4 pool recently stayed tickless after a full hydrate attempt.
+#[must_use]
+pub fn is_empty_v4_tick_on_cooldown(pool_id: FixedBytes<32>) -> bool {
+    let now = crate::util::now_ms();
+    EMPTY_V4_TICK_UNTIL_MS
+        .lock()
+        .get(&pool_id)
+        .is_some_and(|&until| now < until)
+}
+
+fn mark_v4_tick_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>, cooldown_ms: u64) {
+    let now = crate::util::now_ms();
+    let until = now.saturating_add(cooldown_ms);
+    let mut map = EMPTY_V4_TICK_UNTIL_MS.lock();
+    map.retain(|_, u| *u > now);
+    for pool_id in pool_ids {
+        map.entry(pool_id)
+            .and_modify(|deadline| *deadline = (*deadline).max(until))
+            .or_insert(until);
+    }
+}
+
+fn mark_empty_v4_tick_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>) {
+    mark_v4_tick_cooldown(pool_ids, EMPTY_TICK_COOLDOWN_MS);
+}
+
+/// Briefly suppress V4 re-fetch after a hydrate timeout.
+pub fn mark_v4_tick_hydrate_timeout_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>) {
+    mark_v4_tick_cooldown(pool_ids, TICK_HYDRATE_TIMEOUT_COOLDOWN_MS);
+}
+
+/// Clear V4 pool-id hydrate cooldown (e.g. after ticks load).
+pub fn clear_v4_tick_hydrate_cooldown(pool_id: FixedBytes<32>) {
+    clear_empty_v4_tick_cooldown(pool_id);
+}
+
+/// True when either address- or pool-id-keyed hydrate cooldown is active.
+#[must_use]
+pub fn is_cl_tick_on_hydrate_cooldown(
+    addr: Address,
+    v4_pool_id: Option<FixedBytes<32>>,
+) -> bool {
+    is_empty_tick_on_cooldown(addr)
+        || v4_pool_id.is_some_and(is_empty_v4_tick_on_cooldown)
+}
+
+fn clear_empty_v4_tick_cooldown(pool_id: FixedBytes<32>) {
+    EMPTY_V4_TICK_UNTIL_MS.lock().remove(&pool_id);
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -415,7 +487,9 @@ pub async fn enrich_v3_ticks<
             _ => {}
         }
     }
-    if !still_tickless.is_empty() {
+    // Only cooldown after a completed probe — an RPC failure means these pools
+    // were never actually checked, and suppressing them 45s hides live ticks.
+    if !still_tickless.is_empty() && !tick_lens_rpc_failed && !algebra.rpc_failed {
         mark_empty_tick_cooldown(still_tickless.iter().copied());
     }
 
@@ -769,6 +843,24 @@ pub async fn enrich_v4_ticks<
                 enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number).await;
             updated += wide_loaded;
         }
+    }
+
+    // Cooldown pools that remain empty after the full attempt; clear on success.
+    // (RPC failures return early above, so this only runs on completed probes.)
+    let mut still_tickless: Vec<FixedBytes<32>> = Vec::new();
+    for &(idx, pool_id) in targets {
+        match arena.pool_state(idx) {
+            Some(crate::core::types::PoolState::V4(s)) if !s.ticks.is_empty() => {
+                clear_empty_v4_tick_cooldown(pool_id);
+            }
+            Some(crate::core::types::PoolState::V4(s)) if s.ticks.is_empty() => {
+                still_tickless.push(pool_id);
+            }
+            _ => {}
+        }
+    }
+    if !still_tickless.is_empty() {
+        mark_empty_v4_tick_cooldown(still_tickless.iter().copied());
     }
 
     if empty_pools > 0 || wide_loaded > 0 || updated > 0 {
