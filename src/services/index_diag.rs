@@ -21,6 +21,7 @@ pub enum IndexRoutableSkip {
     V4Hooks,
     QuickswapV2Disabled,
     UniswapV2Disabled,
+    SushiswapV2Disabled,
 }
 
 static PARSE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
@@ -39,6 +40,7 @@ static SKIP_BAD_SHAPE: AtomicU32 = AtomicU32::new(0);
 static SKIP_V4_HOOKS: AtomicU32 = AtomicU32::new(0);
 static SKIP_QUICK_V2: AtomicU32 = AtomicU32::new(0);
 static SKIP_UNI_V2: AtomicU32 = AtomicU32::new(0);
+static SKIP_SUSHI_V2: AtomicU32 = AtomicU32::new(0);
 
 static PG_BOOTSTRAP_PAGES: AtomicU32 = AtomicU32::new(0);
 static PG_INCREMENTAL_ROWS: AtomicU32 = AtomicU32::new(0);
@@ -75,6 +77,7 @@ pub fn record_index_routable_skip(reason: IndexRoutableSkip) {
         IndexRoutableSkip::V4Hooks => &SKIP_V4_HOOKS,
         IndexRoutableSkip::QuickswapV2Disabled => &SKIP_QUICK_V2,
         IndexRoutableSkip::UniswapV2Disabled => &SKIP_UNI_V2,
+        IndexRoutableSkip::SushiswapV2Disabled => &SKIP_SUSHI_V2,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -108,15 +111,16 @@ pub fn log_index_summary() {
         + SKIP_BAD_SHAPE.load(Ordering::Relaxed)
         + SKIP_V4_HOOKS.load(Ordering::Relaxed)
         + SKIP_QUICK_V2.load(Ordering::Relaxed)
-        + SKIP_UNI_V2.load(Ordering::Relaxed);
+        + SKIP_UNI_V2.load(Ordering::Relaxed)
+        + SKIP_SUSHI_V2.load(Ordering::Relaxed);
     if attempts == 0 && routable_skips == 0 && PG_INCREMENTAL_ROWS.load(Ordering::Relaxed) == 0 {
         return;
     }
     crate::info!(
         "index: parse_ok={} parse_reject={} bad_token={} bad_id={} unknown_proto={} unresolved={} \
          bad_shape={} v4_fields={} balancer_type={} v4_hooks={} routable_skip={} skip_fetch={} \
-         skip_shape={} skip_v4_hooks={} skip_quick_v2={} skip_uni_v2={} pg_pages={} pg_incr_rows={} \
-         notify={} disc_skip_ticks={} stale_gated={}",
+         skip_shape={} skip_v4_hooks={} skip_quick_v2={} skip_uni_v2={} skip_sushi_v2={} \
+         pg_pages={} pg_incr_rows={} notify={} disc_skip_ticks={} stale_gated={}",
         PARSE_OK.load(Ordering::Relaxed),
         parse_rejects,
         REJ_BAD_TOKEN.load(Ordering::Relaxed),
@@ -133,6 +137,7 @@ pub fn log_index_summary() {
         SKIP_V4_HOOKS.load(Ordering::Relaxed),
         SKIP_QUICK_V2.load(Ordering::Relaxed),
         SKIP_UNI_V2.load(Ordering::Relaxed),
+        SKIP_SUSHI_V2.load(Ordering::Relaxed),
         PG_BOOTSTRAP_PAGES.load(Ordering::Relaxed),
         PG_INCREMENTAL_ROWS.load(Ordering::Relaxed),
         DISCOVERY_NOTIFY.load(Ordering::Relaxed),

@@ -99,6 +99,23 @@ fn is_uniswap_v2_label(label: &str) -> bool {
     b.windows(10).any(|w| w.eq_ignore_ascii_case(b"uniswap_v2"))
 }
 
+fn sushiswap_v2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SUSHISWAP_V2_ENABLED")
+            .ok()
+            .is_none_or(|v| v.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn is_sushiswap_v2_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    b.windows(12)
+        .any(|w| w.eq_ignore_ascii_case(b"sushiswap_v2"))
+        || b.windows(8).any(|w| w.eq_ignore_ascii_case(b"sushi_v2"))
+}
+
 #[must_use]
 pub fn routable_skip_reason(pool: &DiscoveredPool) -> Option<IndexRoutableSkip> {
     if !is_fetchable_protocol(pool.protocol) {
@@ -115,6 +132,9 @@ pub fn routable_skip_reason(pool: &DiscoveredPool) -> Option<IndexRoutableSkip> 
     }
     if !uniswap_v2_enabled() && is_uniswap_v2_label(&pool.protocol_label) {
         return Some(IndexRoutableSkip::UniswapV2Disabled);
+    }
+    if !sushiswap_v2_enabled() && is_sushiswap_v2_label(&pool.protocol_label) {
+        return Some(IndexRoutableSkip::SushiswapV2Disabled);
     }
     None
 }
@@ -476,6 +496,7 @@ mod tests {
     fn v2_protocol_toggles_default_on_when_env_missing() {
         assert!(quickswap_v2_enabled());
         assert!(uniswap_v2_enabled());
+        assert!(sushiswap_v2_enabled());
     }
 
     #[test]
@@ -715,6 +736,10 @@ mod tests {
         assert!(is_quickswap_v2_label("QUICKSWAP_V2"));
         assert!(is_uniswap_v2_label("UNISWAP_V2"));
         assert!(!is_uniswap_v2_label("UNISWAP_V3"));
+        assert!(is_sushiswap_v2_label("SUSHISWAP_V2"));
+        assert!(is_sushiswap_v2_label("SUSHI_V2"));
+        assert!(!is_sushiswap_v2_label("SUSHISWAP_V3"));
+        assert!(!is_uniswap_v2_label("SUSHISWAP_V2"));
     }
 
     #[test]
