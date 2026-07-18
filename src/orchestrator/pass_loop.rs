@@ -449,7 +449,9 @@ impl HfScheduler {
         let stream_triggered = pending || patched;
         if stream_triggered {
             self.last_stream_hf_at = std::time::Instant::now();
-            crate::info!(
+            // Debug only: with continuous WSS this fired every HF timer (~200ms)
+            // and dominated orchestrator.jsonl without changing control flow.
+            crate::debug!(
                 "hf stream promote: pending={pending} patched={patched} patches={}",
                 self.hf_ctx.partial_cache.patch_count()
             );

@@ -9,6 +9,7 @@ pub mod orchestrator;
 pub mod pipeline;
 pub mod services;
 pub mod shutdown;
+pub mod single_instance;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod util;

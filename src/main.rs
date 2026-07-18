@@ -10,6 +10,8 @@ async fn main() -> anyhow::Result<()> {
     }
     rpbot::config::load_dotenv();
     rpbot::log::init()?;
+    // Kill any other rpbot/tui (debug/release/bolt) before we open RPC/PG/WSS.
+    rpbot::single_instance::ensure_single_instance();
 
     #[cfg(feature = "tui")]
     let bootstrap_result = bootstrap(None, None).await;

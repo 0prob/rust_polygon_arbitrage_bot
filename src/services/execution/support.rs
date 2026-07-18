@@ -132,10 +132,17 @@ pub fn is_transient_receipt_error(err: &impl std::fmt::Display) -> bool {
 }
 
 /// True when the RPC rejected the request due to provider rate limiting.
+///
+/// Uses alternate `Display` (`{err:#}`) so anyhow `.context(...)` wrappers still
+/// expose the underlying RPC body. Plain `{}` only shows the outermost layer
+/// (e.g. `"chunk multicall failed"`), which previously made rate limits look
+/// like generic errors and triggered bisect storms that worsened 429s.
 #[must_use]
 pub fn is_rpc_rate_limited(err: &impl std::fmt::Display) -> bool {
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
     msg.contains("429")
+        // Ankr / some Polygon providers encode rate limits as code 15.
+        || msg.contains("error code 15")
         || ic(&msg, "rate limit")
         || ic(&msg, "usage limit")
         || ic(&msg, "too many request")

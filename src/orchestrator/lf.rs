@@ -808,6 +808,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .iter()
             .copied()
             .filter(|addr| {
+                // Skip pools that stayed empty after a recent full hydrate.
+                if crate::pipeline::tick_fetch::is_empty_tick_on_cooldown(*addr) {
+                    return false;
+                }
                 let Some(&idx) = arena.address_to_pool().get(addr) else {
                     return false;
                 };

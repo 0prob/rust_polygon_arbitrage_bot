@@ -1,10 +1,45 @@
 use alloy::primitives::{Address, FixedBytes};
-use rustc_hash::FxHashSet;
-use std::sync::Arc;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::{Arc, LazyLock};
 
 use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
 use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
+
+/// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
+/// this deadline. Live LF was re-fetching ~30–40 empty pools every pass.
+const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
+/// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
+/// dominate LF under rate limits.
+const MAX_WIDE_TICK_POOLS: usize = 24;
+
+static EMPTY_TICK_UNTIL_MS: LazyLock<Mutex<FxHashMap<Address, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// True when this pool recently stayed tickless after a full hydrate attempt.
+#[must_use]
+pub fn is_empty_tick_on_cooldown(pool: Address) -> bool {
+    let now = crate::util::now_ms();
+    EMPTY_TICK_UNTIL_MS
+        .lock()
+        .get(&pool)
+        .is_some_and(|&until| now < until)
+}
+
+fn mark_empty_tick_cooldown(pools: impl IntoIterator<Item = Address>) {
+    let now = crate::util::now_ms();
+    let until = now.saturating_add(EMPTY_TICK_COOLDOWN_MS);
+    let mut map = EMPTY_TICK_UNTIL_MS.lock();
+    map.retain(|_, u| *u > now);
+    for pool in pools {
+        map.insert(pool, until);
+    }
+}
+
+fn clear_empty_tick_cooldown(pool: Address) {
+    EMPTY_TICK_UNTIL_MS.lock().remove(&pool);
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TickEnrichment {
@@ -333,34 +368,60 @@ pub async fn enrich_v3_ticks<
 
     // One wider TickLens pass for pools still tickless. Quiet UniV3 pools often have
     // initialized ticks outside word_range=10 (Algebra-only widen misses them).
+    // Cap + liquidity-rank: full widen of 30+ empties dominates LF under rate limits.
     let mut wide_loaded = 0usize;
     if updated < pool_addresses.len() && word_range < 48 {
         let wide_range = word_range.saturating_mul(3).max(24).min(48);
-        let mut still_empty = Vec::new();
+        let mut still_empty: Vec<(Address, u128)> = Vec::new();
         let mut seen: FxHashSet<Address> = FxHashSet::default();
         for &pool in pool_addresses {
             let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
                 continue;
             };
-            let tickless = matches!(
-                arena.pool_state(idx),
-                Some(crate::core::types::PoolState::V3(s)) if s.ticks.is_empty()
-            );
-            if tickless && seen.insert(pool) {
-                still_empty.push(pool);
+            let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state(idx) else {
+                continue;
+            };
+            if s.ticks.is_empty() && seen.insert(pool) {
+                still_empty.push((pool, s.liquidity));
             }
         }
         if !still_empty.is_empty() {
+            still_empty.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            let wide_targets: Vec<Address> = still_empty
+                .into_iter()
+                .take(MAX_WIDE_TICK_POOLS)
+                .map(|(p, _)| p)
+                .collect();
             wide_loaded =
-                enrich_v3_tick_lens_only(provider, arena, &still_empty, wide_range, block_number)
+                enrich_v3_tick_lens_only(provider, arena, &wide_targets, wide_range, block_number)
                     .await;
             updated += wide_loaded;
         }
     }
 
+    // Cooldown pools that remain empty after the full attempt; clear on success.
+    let mut still_tickless = Vec::new();
+    for &pool in pool_addresses {
+        let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+            continue;
+        };
+        match arena.pool_state(idx) {
+            Some(crate::core::types::PoolState::V3(s)) if !s.ticks.is_empty() => {
+                clear_empty_tick_cooldown(pool);
+            }
+            Some(crate::core::types::PoolState::V3(s)) if s.ticks.is_empty() => {
+                still_tickless.push(pool);
+            }
+            _ => {}
+        }
+    }
+    if !still_tickless.is_empty() {
+        mark_empty_tick_cooldown(still_tickless.iter().copied());
+    }
+
     if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
         crate::info!(
-            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} wide_loaded={} loaded={}",
+            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} wide_loaded={} loaded={} still_empty={}",
             pool_addresses.len(),
             direct_loaded,
             empty_pools,
@@ -368,7 +429,8 @@ pub async fn enrich_v3_ticks<
             algebra_target_count,
             algebra.loaded,
             wide_loaded,
-            updated
+            updated,
+            still_tickless.len(),
         );
         // Sample the first still-tickless target for offline diagnosis.
         for &pool in pool_addresses {
@@ -682,20 +744,29 @@ pub async fn enrich_v4_ticks<
     }
 
     // Wider bitmap window for still-empty V4 (same sparse-tick pattern as V3).
+    // Liquidity-ranked cap mirrors V3 — full widen of 90+ V4 empties was ~2s p50.
     let mut wide_loaded = 0usize;
     if updated < targets.len() && word_range < 48 {
         let wide_range = word_range.saturating_mul(3).max(24).min(48);
-        let still: Vec<_> = targets
+        let mut still: Vec<(PoolIndex, FixedBytes<32>, u128)> = targets
             .iter()
             .copied()
-            .filter(|(idx, _)| match arena.pool_state(*idx) {
-                Some(crate::core::types::PoolState::V4(s)) => s.ticks.is_empty(),
-                _ => false,
+            .filter_map(|(idx, pool_id)| match arena.pool_state(idx) {
+                Some(crate::core::types::PoolState::V4(s)) if s.ticks.is_empty() => {
+                    Some((idx, pool_id, s.liquidity))
+                }
+                _ => None,
             })
             .collect();
         if !still.is_empty() {
+            still.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+            let wide_targets: Vec<_> = still
+                .into_iter()
+                .take(MAX_WIDE_TICK_POOLS)
+                .map(|(idx, pool_id, _)| (idx, pool_id))
+                .collect();
             wide_loaded =
-                enrich_v4_ticks_once(provider, arena, &still, wide_range, block_number).await;
+                enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number).await;
             updated += wide_loaded;
         }
     }

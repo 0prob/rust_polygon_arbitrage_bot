@@ -9,6 +9,8 @@ async fn main() -> anyhow::Result<()> {
     }
     rpbot::config::load_dotenv();
     rpbot::log::init()?;
+    // Kill any other rpbot/tui (debug/release/bolt) before we open RPC/PG/WSS.
+    rpbot::single_instance::ensure_single_instance();
     rpbot::log::set_stdout_enabled(false);
     if let Some(dir) = rpbot::log::run_dir() {
         rpbot::warn!("rpbot tui: logging to {}", dir.display());

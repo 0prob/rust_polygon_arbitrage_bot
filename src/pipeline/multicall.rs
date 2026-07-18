@@ -15,8 +15,10 @@ use crate::core::constants::MULTICALL3;
 /// Max `aggregate3` sub-calls per RPC round-trip (provider payload limits).
 pub const MULTICALL_CHUNK: usize = 200;
 /// Max concurrent chunk RPCs for batched multicalls. Parallelizes IO for large
-/// refreshes (e.g. 1000+ pools) while a semaphore prevents thundering herd.
-pub const MAX_CONCURRENT_CHUNKS: usize = 8;
+/// refreshes while a semaphore prevents thundering herd. 8×200-call chunks
+/// (1600-call plan batches) routinely tripped free-tier 1200 req/min limits;
+/// 4 keeps fan-out without the bisect storm under 429.
+pub const MAX_CONCURRENT_CHUNKS: usize = 4;
 
 static GLOBAL_MULTICALL_ADMISSION: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_CHUNKS));
@@ -49,23 +51,14 @@ fn is_rate_limited_rpc_error(e: &anyhow::Error) -> bool {
 }
 
 fn is_retryable_rpc_error(e: &anyhow::Error) -> bool {
+    // Rate limits must not retry or bisect — that amplifies 429s (see is_rpc_rate_limited).
     if is_rate_limited_rpc_error(e) {
         return false;
     }
-    let msg = e.to_string();
-    // Fast path: case-sensitive patterns (numbers, fixed codes) skip allocation.
-    if msg.contains("error code 15") {
-        return true;
-    }
-    // Case-insensitive patterns — scan bytes without allocating a lowered copy.
+    // Prefer alternate Display so nested anyhow contexts still match.
+    let msg = format!("{e:#}");
     let b = msg.as_bytes();
-    const PATTERNS: &[&[u8]] = &[
-        b"rate limit",
-        b"usage limit",
-        b"too many request",
-        b"unknown block",
-        b"header not found",
-    ];
+    const PATTERNS: &[&[u8]] = &[b"unknown block", b"header not found"];
     PATTERNS
         .iter()
         .any(|pat| b.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
@@ -287,7 +280,7 @@ mod tests {
 
     #[test]
     fn global_multicall_admission_matches_chunk_limit() {
-        assert_eq!(global_multicall_available_permits(), 8);
+        assert_eq!(global_multicall_available_permits(), 4);
     }
 
     #[test]
@@ -317,8 +310,8 @@ mod tests {
 
     #[test]
     fn plan_batch_budget_enables_parallel_chunks() {
-        assert_eq!(plan_batch_call_budget(200), 1_600);
-        assert_eq!(plan_batch_call_budget(0), 8);
+        assert_eq!(plan_batch_call_budget(200), 800);
+        assert_eq!(plan_batch_call_budget(0), 4);
     }
 
     #[test]
@@ -334,6 +327,20 @@ mod tests {
         let err = anyhow::anyhow!("429 Too Many Requests");
         assert!(super::is_rate_limited_rpc_error(&err));
         assert!(!is_retryable_rpc_error(&err));
+    }
+
+    #[test]
+    fn rate_limit_detected_through_anyhow_context_wrapper() {
+        // Live bug: chunked multicall wraps the RPC body with `.context(...)`,
+        // and plain Display only shows the outer layer — bisect storms followed.
+        let err = anyhow::anyhow!("error code 15: Too many request, try again later")
+            .context("chunk multicall failed");
+        assert!(super::is_rate_limited_rpc_error(&err));
+        assert!(!is_retryable_rpc_error(&err));
+        let err429 = anyhow::anyhow!("HTTP error 429 with body: Rate limit (1200rqs/60s) reached")
+            .context("chunk multicall failed");
+        assert!(super::is_rate_limited_rpc_error(&err429));
+        assert!(!is_retryable_rpc_error(&err429));
     }
 
     #[test]
