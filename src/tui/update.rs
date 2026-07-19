@@ -57,7 +57,7 @@ pub fn apply_event(app: &mut App, event: UiEvent) {
             app.apply_hf_sample(
                 cycles_considered,
                 profitable_count,
-                &best_profit_wei,
+                best_profit_wei,
                 elapsed_ms,
                 candidates,
             );
@@ -78,8 +78,8 @@ fn handle_input(app: &mut App, event: &Event) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, *key),
         Event::Paste(text) => handle_paste(app, text),
-        Event::Resize(_, _) => app.mark_route_view_dirty(),
-        Event::FocusGained | Event::FocusLost | Event::Key(_) | Event::Mouse(_) => {}
+        // Resize only needs a redraw; route filter/sort key is unchanged.
+        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Key(_) | Event::Mouse(_) => {}
     }
 }
 
@@ -907,39 +907,75 @@ mod tests {
     #[test]
     fn build_routes_populates_simulation_values_for_positive_score_cycles() {
         let mut arena = StateArena::default();
-        let token_in = arena.register_token(Address::from([1u8; 20]));
-        let token_out = arena.register_token(Address::from([2u8; 20]));
-        let pool = arena.register_pool(
+        let token_a = arena.register_token(Address::from([1u8; 20]));
+        let token_b = arena.register_token(Address::from([2u8; 20]));
+        let one = U256::from(10u64).pow(U256::from(18u64));
+        // Both pools ordered (A,B). Buy B cheap on ab, sell B expensive on ba.
+        let pool_ab = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: U256::from(1_000_000_000_000_000_000_000_000u128),
-                reserve1: U256::from(2_000_000_000_000_000_000_000_000u128),
-                fee: U256::from(30u64),
+                reserve0: one * U256::from(100u64),
+                reserve1: one * U256::from(1_000u64),
+                // Keep-multiplier (not fee bps): 9970/10000 ≈ 30 bps.
+                fee: U256::from(9970u64),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 0,
             })),
         );
-        let cycle = FoundCycle {
-            start_token: token_in,
-            edges: CycleEdges::from_slice(&[Edge {
-                pool_index: pool,
-                token_in,
-                token_out,
+        let pool_ba = arena.register_pool(
+            Address::from([4u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: one * U256::from(1_000u64),
+                reserve1: one * U256::from(100u64),
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edges = [
+            Edge {
+                pool_index: pool_ab,
+                token_in: token_a,
+                token_out: token_b,
                 token_in_idx: 0,
                 token_out_idx: 1,
                 protocol: ProtocolType::UniswapV2,
                 fee_bps: 30,
                 zero_for_one: true,
-            }]),
-            hop_count: 1,
+            },
+            Edge {
+                pool_index: pool_ba,
+                token_in: token_b,
+                token_out: token_a,
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: false,
+            },
+        ];
+        let probe = crate::pipeline::local_sim::simulate_route_minimal(
+            &arena,
+            &edges,
+            one / U256::from(10u64),
+        );
+        let profit = probe.as_ref().map(|s| s.profit).unwrap_or_default();
+        assert!(
+            !profit.is_zero(),
+            "fixture must be profitable for build_routes sim path (probe={probe:?})"
+        );
+        let cycle = FoundCycle {
+            start_token: token_a,
+            edges: CycleEdges::from_slice(&edges),
+            hop_count: 2,
             log_weight: 0.0,
-            cumulative_fee_bps: 30,
+            cumulative_fee_bps: 60,
             score: 1.0,
-            cycle_ratio: U256::ZERO,
+            cycle_ratio: U256::from(1_050_000_000_000_000_000u64),
         };
         let mut token_to_matic_rates = FxHashMap::default();
-        token_to_matic_rates.insert(token_in, U256::from(1_000_000_000_000_000_000u128));
-        token_to_matic_rates.insert(token_out, U256::from(1_000_000_000_000_000_000u128));
+        token_to_matic_rates.insert(token_a, one);
+        token_to_matic_rates.insert(token_b, one);
 
         let snapshot = HfSnapshot {
             arena: arena.clone(),

@@ -68,32 +68,21 @@ where
             _ = os_shutdown_rx.recv() => break,
             maybe_event = rx.recv() => {
                 let Some(event) = maybe_event else { break; };
-                let mut immediate_draw = matches!(
-                    &event,
-                    UiEvent::Input(crossterm::event::Event::Key(_))
-                        | UiEvent::Input(crossterm::event::Event::Resize(_, _))
-                );
+                let mut immediate_draw = wants_immediate_draw(&event);
                 apply_event(&mut app, event);
                 if app.should_quit {
                     break;
                 }
                 needs_redraw = true;
                 while let Ok(event) = rx.try_recv() {
-                    immediate_draw |= matches!(
-                        &event,
-                        UiEvent::Input(crossterm::event::Event::Key(_))
-                            | UiEvent::Input(crossterm::event::Event::Resize(_, _))
-                    );
+                    immediate_draw |= wants_immediate_draw(&event);
                     apply_event(&mut app, event);
                     if app.should_quit {
                         break;
                     }
                     needs_redraw = true;
                 }
-                for event in metrics_bridge.drain_coalesced_metrics() {
-                    apply_event(&mut app, event);
-                    needs_redraw = true;
-                }
+                apply_coalesced(&metrics_bridge, &mut app, &mut needs_redraw);
                 if app.should_quit {
                     break;
                 }
@@ -112,8 +101,11 @@ where
                     app.set_snapshot(snapshot);
                     needs_redraw = true;
                 }
+                apply_coalesced(&metrics_bridge, &mut app, &mut needs_redraw);
             }
             _ = redraw.tick(), if !app.should_quit => {
+                // Metrics can land only in coalesce slots while the live channel is quiet.
+                apply_coalesced(&metrics_bridge, &mut app, &mut needs_redraw);
                 if needs_redraw {
                     if app.route_view_is_dirty() {
                         app.rebuild_route_view();
@@ -135,6 +127,21 @@ where
     terminal.restore().ok();
 
     join_pass_loop_after_shutdown(pass_handle).await
+}
+
+fn apply_coalesced(bridge: &TuiBridge, app: &mut App, needs_redraw: &mut bool) {
+    for event in bridge.drain_coalesced_metrics() {
+        apply_event(app, event);
+        *needs_redraw = true;
+    }
+}
+
+fn wants_immediate_draw(event: &UiEvent) -> bool {
+    matches!(
+        event,
+        UiEvent::Input(crossterm::event::Event::Key(_))
+            | UiEvent::Input(crossterm::event::Event::Resize(_, _))
+    )
 }
 
 fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {

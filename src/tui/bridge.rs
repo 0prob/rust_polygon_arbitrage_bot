@@ -15,6 +15,16 @@ struct CoalescedUiMetrics {
     gas: Mutex<Option<UiEvent>>,
 }
 
+impl CoalescedUiMetrics {
+    fn take_all(&self) -> [Option<UiEvent>; 3] {
+        [
+            self.lf.lock().take(),
+            self.hf.lock().take(),
+            self.gas.lock().take(),
+        ]
+    }
+}
+
 use crate::orchestrator::hf::HfTickResult;
 use crate::orchestrator::ui_hook::PipelineUiHook;
 use crate::services::execution::service::ExecutionOutcome;
@@ -70,13 +80,7 @@ impl TuiBridge {
 
     /// Apply coalesced metric ticks after the UI drains the live channel.
     pub fn drain_coalesced_metrics(&self) -> impl Iterator<Item = UiEvent> + '_ {
-        [
-            self.coalesce.lf.lock().take(),
-            self.coalesce.hf.lock().take(),
-            self.coalesce.gas.lock().take(),
-        ]
-        .into_iter()
-        .flatten()
+        self.coalesce.take_all().into_iter().flatten()
     }
 }
 
@@ -88,27 +92,29 @@ pub struct TuiBridgeHook {
 }
 
 impl TuiBridgeHook {
-    fn stash_metric(&self, event: UiEvent) {
+    fn send_metric(&self, event: UiEvent) {
         let slot = match &event {
             UiEvent::LfTick { .. } => &self.coalesce.lf,
             UiEvent::HfTick { .. } => &self.coalesce.hf,
             UiEvent::GasUpdate { .. } => &self.coalesce.gas,
             _ => return,
         };
-        *slot.lock() = Some(event);
-    }
-
-    fn send_metric(&self, event: UiEvent) {
+        // Hold the slot across try_send so a Full-stash can't land after a newer Ok
+        // (drain applies channel then coalesce — a stale stash would regress the UI).
+        let mut guard = slot.lock();
         match self.tx.try_send(event) {
-            Err(TrySendError::Full(ev)) => self.stash_metric(ev),
-            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Ok(()) => {
+                *guard = None;
+            }
+            Err(TrySendError::Full(ev)) => {
+                *guard = Some(ev);
+            }
+            Err(TrySendError::Closed(_)) => {}
         }
     }
 
     fn clear_coalesced_metrics(&self) {
-        self.coalesce.lf.lock().take();
-        self.coalesce.hf.lock().take();
-        self.coalesce.gas.lock().take();
+        let _ = self.coalesce.take_all();
     }
 }
 
@@ -141,12 +147,26 @@ impl PipelineUiHook for TuiBridgeHook {
             outcome: outcome.clone(),
             route_fingerprint,
         };
-        if self.tx.try_send(event.clone()).is_ok() {
-            return;
-        }
-        self.clear_coalesced_metrics();
-        if self.tx.try_send(event.clone()).is_err() && self.tx.blocking_send(event).is_err() {
-            crate::warn!("tui event channel closed — execution outcome not shown");
+        match self.tx.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => {
+                crate::warn!("tui event channel closed — execution outcome not shown");
+            }
+            Err(TrySendError::Full(event)) => {
+                // Drop coalesced metrics to prefer a trade outcome over stale LF/HF/gas.
+                self.clear_coalesced_metrics();
+                match self.tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Closed(_)) => {
+                        crate::warn!("tui event channel closed — execution outcome not shown");
+                    }
+                    Err(TrySendError::Full(event)) => {
+                        if self.tx.blocking_send(event).is_err() {
+                            crate::warn!("tui event channel closed — execution outcome not shown");
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -186,6 +206,38 @@ mod tests {
             }
         } else {
             let _ = bridge.drain_coalesced_metrics().count();
+        }
+        assert!(matches!(
+            last_lf,
+            Some(UiEvent::LfTick {
+                search_ms: 99,
+                cycles: 9,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn successful_metric_send_clears_stale_coalesce_slot() {
+        let (bridge, mut rx, _) = TuiBridge::channel();
+        let hook = bridge.hook();
+        // Saturate the channel so the next LF tick is stashed.
+        for i in 0..2048 {
+            hook.on_lf_complete(i, i as u64, 1);
+        }
+        // Free one slot, then send a fresher sample that must win over the stash.
+        let _ = rx.try_recv();
+        hook.on_lf_complete(9, 99, 2);
+        let mut last_lf = None;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, UiEvent::LfTick { .. }) {
+                last_lf = Some(ev);
+            }
+        }
+        for ev in bridge.drain_coalesced_metrics() {
+            if matches!(ev, UiEvent::LfTick { .. }) {
+                last_lf = Some(ev);
+            }
         }
         assert!(matches!(
             last_lf,

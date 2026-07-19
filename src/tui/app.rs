@@ -301,11 +301,22 @@ pub struct App {
     pub show_help: bool,
     pub last_input_at: Option<Instant>,
     search_lower: String,
-    route_view_key: u64,
+    route_view_key: Option<RouteViewKey>,
     route_view_indices: Vec<usize>,
-    route_sort_key: Option<(u64, SortMode)>,
+    /// `(opportunities Arc ptr, sort_mode)` — generation alone is wrong: gas refreshes
+    /// rebuild routes under the same HF generation.
+    route_sort_key: Option<(usize, SortMode)>,
     route_sort_indices: Vec<usize>,
     route_view_dirty: bool,
+}
+
+/// Cache identity for the filtered route table (Eq beats hashing fields into one `u64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteViewKey {
+    search_hash: u64,
+    sort_mode: SortMode,
+    /// `Arc::as_ptr` of `DashboardSnapshot::opportunities`.
+    opportunities: usize,
 }
 
 impl Default for App {
@@ -344,7 +355,7 @@ impl App {
             show_help: false,
             last_input_at: None,
             search_lower: String::new(),
-            route_view_key: 0,
+            route_view_key: None,
             route_view_indices: Vec::new(),
             route_sort_key: None,
             route_sort_indices: Vec::new(),
@@ -353,16 +364,9 @@ impl App {
     }
 
     #[must_use]
-    pub fn active_rows(&self) -> usize {
-        self.current_rows_len()
-    }
-
-    #[must_use]
     pub fn selected_route(&self) -> Option<&RouteSummary> {
         let snapshot = self.snapshot.as_ref()?;
-        if self.route_view_dirty {
-            return None;
-        }
+        // Serve last built indices while dirty — avoids "no selection" flashes mid-keystroke.
         self.route_view_indices
             .get(self.selected_index)
             .and_then(|&idx| snapshot.opportunities.get(idx))
@@ -381,9 +385,7 @@ impl App {
     #[must_use]
     pub fn route_view(&self) -> Option<(&DashboardSnapshot, &[usize])> {
         let snapshot = self.snapshot.as_ref()?;
-        if self.route_view_dirty {
-            return None;
-        }
+        // Stale-while-dirty: rebuild runs before paint; don't blank the table on mark.
         Some((snapshot.as_ref(), self.route_view_indices.as_slice()))
     }
 
@@ -421,34 +423,24 @@ impl App {
         self.snapshot = Some(snapshot);
         self.route_view_dirty = true;
         self.rebuild_route_view();
-        let row_count = self.current_rows_len();
-        if row_count == 0 {
-            self.selected_index = 0;
-            self.scroll = 0;
-        } else {
-            self.selected_index = self.selected_index.min(row_count.saturating_sub(1));
-            self.scroll = self.scroll.min(self.selected_index);
-        }
     }
 
     pub fn rebuild_route_view(&mut self) {
         let key = self.route_view_cache_key();
-        if self.route_view_dirty {
-            self.route_view_key = 0;
-        }
-        if key == self.route_view_key {
-            self.route_view_dirty = false;
-            self.normalize_route_selection();
+        // Same HF generation can still ship a new opportunities Arc (gas-driven rebuild).
+        if self.route_view_key == Some(key) {
+            self.finish_route_view_rebuild();
             return;
         }
-        self.route_view_key = key;
+        self.route_view_key = Some(key);
         self.route_view_indices.clear();
 
         let Some(snapshot) = self.snapshot.as_ref() else {
+            self.finish_route_view_rebuild();
             return;
         };
         let rows = snapshot.opportunities.as_ref();
-        let sort_key = (snapshot.generation, self.sort_mode);
+        let sort_key = (key.opportunities, self.sort_mode);
         if self.route_sort_key != Some(sort_key) {
             self.route_sort_indices.clear();
             self.route_sort_indices.extend(0..rows.len());
@@ -461,11 +453,13 @@ impl App {
                     .sort_by(|a, b| rows[*b].profit_matic.total_cmp(&rows[*a].profit_matic)),
                 SortMode::Risk => self
                     .route_sort_indices
-                    .sort_by_key(|idx| rows[*idx].risk_score),
-                SortMode::Hops => self.route_sort_indices.sort_by_key(|idx| rows[*idx].hops),
+                    .sort_unstable_by_key(|idx| rows[*idx].risk_score),
+                SortMode::Hops => self
+                    .route_sort_indices
+                    .sort_unstable_by_key(|idx| rows[*idx].hops),
                 SortMode::Freshness => self
                     .route_sort_indices
-                    .sort_by_key(|idx| std::cmp::Reverse(rows[*idx].fingerprint)),
+                    .sort_unstable_by_key(|idx| std::cmp::Reverse(rows[*idx].fingerprint)),
             }
             self.route_sort_key = Some(sort_key);
         }
@@ -476,18 +470,42 @@ impl App {
                 .copied()
                 .filter(|&idx| needle.is_empty() || rows[idx].search_blob.contains(needle)),
         );
-        self.route_view_dirty = false;
-        self.normalize_route_selection();
+        self.finish_route_view_rebuild();
     }
 
-    fn route_view_cache_key(&self) -> u64 {
+    fn finish_route_view_rebuild(&mut self) {
+        self.route_view_dirty = false;
+        self.normalize_selection();
+    }
+
+    fn route_view_cache_key(&self) -> RouteViewKey {
         let mut hasher = FxHasher::default();
         self.search_lower.hash(&mut hasher);
-        (self.sort_mode as u8).hash(&mut hasher);
-        if let Some(snapshot) = &self.snapshot {
-            snapshot.generation.hash(&mut hasher);
+        RouteViewKey {
+            search_hash: hasher.finish(),
+            sort_mode: self.sort_mode,
+            opportunities: self
+                .snapshot
+                .as_ref()
+                .map(|s| opportunities_identity(&s.opportunities))
+                .unwrap_or(0),
         }
-        hasher.finish()
+    }
+
+    /// Status overlays COW the opportunities `Arc`; keep cache keys on the new pointer so the
+    /// next rebuild does not re-sort/re-filter identical rows.
+    fn retarget_opportunities_identity(&mut self) {
+        let id = self
+            .snapshot
+            .as_ref()
+            .map(|s| opportunities_identity(&s.opportunities))
+            .unwrap_or(0);
+        if let Some(key) = self.route_view_key.as_mut() {
+            key.opportunities = id;
+        }
+        if let Some((_, mode)) = self.route_sort_key {
+            self.route_sort_key = Some((id, mode));
+        }
     }
 
     pub fn mark_route_view_dirty(&mut self) {
@@ -521,11 +539,8 @@ impl App {
         self.scroll = self.selected_index.saturating_sub(10);
     }
 
-    fn normalize_route_selection(&mut self) {
-        if self.tab != Tab::Opportunities {
-            return;
-        }
-        let len = self.route_view_indices.len();
+    fn normalize_selection(&mut self) {
+        let len = self.current_rows_len();
         if len == 0 {
             self.selected_index = 0;
             self.scroll = 0;
@@ -562,9 +577,6 @@ impl App {
 
     #[must_use]
     pub fn current_rows_len(&self) -> usize {
-        if self.route_view_dirty && matches!(self.tab, Tab::Opportunities) {
-            return 0;
-        }
         match self.tab {
             Tab::Trades => self.trade_history.len(),
             Tab::Opportunities => self.route_view_indices.len(),
@@ -733,24 +745,18 @@ impl App {
         let Some(status) = route_status else {
             return;
         };
-        if let Some(snapshot) = self.snapshot.as_mut() {
+        {
+            let Some(snapshot) = self.snapshot.as_mut() else {
+                return;
+            };
             let snapshot = Arc::make_mut(snapshot);
-            if let Some(routes) = Arc::get_mut(&mut snapshot.opportunities) {
-                for route in routes.iter_mut() {
-                    if route.fingerprint == fingerprint {
-                        route.status = status;
-                    }
+            for route in Arc::make_mut(&mut snapshot.opportunities) {
+                if route.fingerprint == fingerprint {
+                    route.status = status;
                 }
-            } else {
-                let mut routes = snapshot.opportunities.as_ref().clone();
-                for route in routes.iter_mut() {
-                    if route.fingerprint == fingerprint {
-                        route.status = status;
-                    }
-                }
-                snapshot.opportunities = Arc::new(routes);
             }
         }
+        self.retarget_opportunities_identity();
     }
 
     pub fn apply_lf_sample(&mut self, cycles: usize, search_ms: u64, _discoveries: usize) {
@@ -770,22 +776,22 @@ impl App {
         &mut self,
         cycles_considered: usize,
         profitable_count: usize,
-        best_profit_wei: &str,
+        best_profit_wei: String,
         elapsed_ms: u64,
         candidates: Vec<HfCandidateUiRow>,
     ) {
         self.last_cycles_considered = cycles_considered;
         self.last_profitable_count = profitable_count;
         self.last_hf_ms = elapsed_ms;
-        self.last_best_profit_wei = Some(best_profit_wei.to_string());
+        self.last_best_profit_wei = Some(best_profit_wei);
         // Preserve outcomes already observed for the same fingerprints this session.
-        let prior_outcomes: rustc_hash::FxHashMap<u64, (Option<String>, Severity)> = self
+        let prior_outcomes: rustc_hash::FxHashMap<u64, (String, Severity)> = self
             .hf_candidates
             .iter()
             .filter_map(|r| {
                 r.outcome
                     .as_ref()
-                    .map(|o| (r.fingerprint, (Some(o.clone()), r.outcome_severity)))
+                    .map(|o| (r.fingerprint, (o.clone(), r.outcome_severity)))
             })
             .collect();
         self.hf_candidates = candidates
@@ -793,7 +799,7 @@ impl App {
             .map(|c| {
                 let mut row = HfPipelineRow::from_hf_candidate(c);
                 if let Some((outcome, sev)) = prior_outcomes.get(&row.fingerprint) {
-                    row.outcome = outcome.clone();
+                    row.outcome = Some(outcome.clone());
                     row.outcome_severity = *sev;
                 }
                 row
@@ -825,28 +831,29 @@ impl App {
         if hot.is_empty() && near.is_empty() {
             return;
         }
-        let Some(snapshot) = self.snapshot.as_mut() else {
-            return;
-        };
-        let snapshot = Arc::make_mut(snapshot);
-        let mut routes = snapshot.opportunities.as_ref().clone();
-        for route in routes.iter_mut() {
-            if matches!(
-                route.status,
-                RouteStatus::Executed | RouteStatus::Quarantined | RouteStatus::Ignored
-            ) {
-                continue;
-            }
-            if hot.contains(&route.fingerprint) {
-                route.status = RouteStatus::Hot;
-            } else if near.contains(&route.fingerprint) {
-                route.status = RouteStatus::Ignored;
-            } else if route.status == RouteStatus::Hot {
-                // Previous tick's dispatch queue no longer active.
-                route.status = RouteStatus::New;
+        {
+            let Some(snapshot) = self.snapshot.as_mut() else {
+                return;
+            };
+            let snapshot = Arc::make_mut(snapshot);
+            for route in Arc::make_mut(&mut snapshot.opportunities) {
+                if matches!(
+                    route.status,
+                    RouteStatus::Executed | RouteStatus::Quarantined | RouteStatus::Ignored
+                ) {
+                    continue;
+                }
+                if hot.contains(&route.fingerprint) {
+                    route.status = RouteStatus::Hot;
+                } else if near.contains(&route.fingerprint) {
+                    route.status = RouteStatus::Ignored;
+                } else if route.status == RouteStatus::Hot {
+                    // Previous tick's dispatch queue no longer active.
+                    route.status = RouteStatus::New;
+                }
             }
         }
-        snapshot.opportunities = Arc::new(routes);
+        self.retarget_opportunities_identity();
     }
 
     #[must_use]
@@ -864,6 +871,10 @@ impl App {
     }
 }
 
+fn opportunities_identity(opportunities: &Arc<Vec<RouteSummary>>) -> usize {
+    Arc::as_ptr(opportunities) as usize
+}
+
 fn push_series(series: &mut VecDeque<u64>, value: u64, cap: usize) {
     if series.len() >= cap {
         series.pop_front();
@@ -875,120 +886,34 @@ fn push_series(series: &mut VecDeque<u64>, value: u64, cap: usize) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn route_view_respects_search_filter() {
-        let mut app = App::new();
-        app.set_snapshot(Arc::new(DashboardSnapshot {
-            generation: 1,
-            captured_at: Instant::now(),
-            overview: OverviewSnapshot {
-                uptime: Duration::ZERO,
-                total_trades: 0,
-                total_losses: 0,
-                daily_pnl_wei: 0,
-                profitable_routes: 0,
-                discovered_pools: 0,
-                routable_pools: 0,
-                cycle_count: 0,
-                search_ms: 0,
-                hf_ms: 0,
-                gas_gwei: None,
-                win_rate: 0.0,
-                snapshot_age_ms: 0,
-                rates_age_ms: 0,
-            },
-            graph: GraphSnapshot {
-                health: GraphHealth {
-                    graph_generation: 1,
-                    token_count: 0,
-                    pool_count: 0,
-                    top_out_degree: 0,
-                    protocol_count: 0,
-                    indexer_lag_blocks: 0,
-                    hypersync_height: None,
-                    stale_indexer: false,
-                },
-                protocol_counts: Vec::new(),
-                hubs: Vec::new(),
-                recent_discoveries: Vec::new(),
-            },
-            opportunities: Arc::new(vec![
-                RouteSummary {
-                    fingerprint: 1,
-                    route: "WMATIC route".to_string(),
-                    route_detail: String::new(),
-                    search_blob: "wmatic route".to_string(),
-                    protocols: String::new(),
-                    tokens: Vec::new(),
-                    hops: 2,
-                    raw_score: 1.0,
-                    rescored: 1.0,
-                    amount_in_token: String::new(),
-                    amount_in_matic: 0.0,
-                    amount_out_token: String::new(),
-                    profit_matic: 0.0,
-                    net_profit_matic: 0.0,
-                    profit_usd: 0.0,
-                    gas_estimate: 0,
-                    risk_score: 0,
-                    liquidity_score: 0,
-                    long_tail: false,
-                    status: RouteStatus::New,
-                },
-                RouteSummary {
-                    fingerprint: 2,
-                    route: "USDC route".to_string(),
-                    route_detail: String::new(),
-                    search_blob: "usdc route".to_string(),
-                    protocols: String::new(),
-                    tokens: Vec::new(),
-                    hops: 2,
-                    raw_score: 2.0,
-                    rescored: 2.0,
-                    amount_in_token: String::new(),
-                    amount_in_matic: 0.0,
-                    amount_out_token: String::new(),
-                    profit_matic: 0.0,
-                    net_profit_matic: 0.0,
-                    profit_usd: 0.0,
-                    gas_estimate: 0,
-                    risk_score: 0,
-                    liquidity_score: 0,
-                    long_tail: false,
-                    status: RouteStatus::New,
-                },
-            ]),
-            simulations: Arc::new(Vec::new()),
-            portfolio: Vec::new(),
-            diagnostics: Vec::new(),
-            config: Vec::new(),
-        }));
-
-        assert_eq!(app.route_view().expect("view").1.len(), 2);
-        app.search = "wmatic".to_string();
-        app.sync_search_lower();
-        app.rebuild_route_view();
-        let (_, indices) = app.route_view().expect("view");
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0], 0);
-        assert_eq!(app.route_sort_indices, vec![1, 0]);
+    fn test_route(fingerprint: u64, route: &str) -> RouteSummary {
+        RouteSummary {
+            fingerprint,
+            route: route.into(),
+            route_detail: String::new(),
+            search_blob: route.to_ascii_lowercase(),
+            protocols: String::new(),
+            tokens: Vec::new(),
+            hops: 2,
+            raw_score: fingerprint as f64,
+            rescored: fingerprint as f64,
+            amount_in_token: String::new(),
+            amount_in_matic: 0.0,
+            amount_out_token: String::new(),
+            profit_matic: 0.0,
+            net_profit_matic: 0.0,
+            profit_usd: 0.0,
+            gas_estimate: 0,
+            risk_score: 0,
+            liquidity_score: 0,
+            long_tail: false,
+            status: RouteStatus::New,
+        }
     }
 
-    #[test]
-    fn non_navigable_tabs_report_zero_rows() {
-        let app = App::new();
-        assert_eq!(app.current_rows_len(), 0);
-    }
-
-    #[test]
-    fn snapshot_does_not_erase_live_pipeline_metrics() {
-        let mut app = App::new();
-        app.last_search_ms = 37;
-        app.last_hf_ms = 11;
-        app.last_profitable_count = 4;
-
-        let snapshot = DashboardSnapshot {
-            generation: 1,
+    fn test_snapshot(generation: u64, opportunities: Vec<RouteSummary>) -> DashboardSnapshot {
+        DashboardSnapshot {
+            generation,
             captured_at: Instant::now(),
             overview: OverviewSnapshot {
                 uptime: Duration::ZERO,
@@ -1021,13 +946,100 @@ mod tests {
                 hubs: Vec::new(),
                 recent_discoveries: Vec::new(),
             },
-            opportunities: Arc::new(Vec::new()),
+            opportunities: Arc::new(opportunities),
             simulations: Arc::new(Vec::new()),
             portfolio: Vec::new(),
             diagnostics: Vec::new(),
             config: Vec::new(),
-        };
-        app.set_snapshot(Arc::new(snapshot));
+        }
+    }
+
+    #[test]
+    fn route_view_respects_search_filter() {
+        let mut app = App::new();
+        app.set_snapshot(Arc::new(test_snapshot(
+            1,
+            vec![
+                test_route(1, "WMATIC route"),
+                test_route(2, "USDC route"),
+            ],
+        )));
+
+        assert_eq!(app.route_view().expect("view").1.len(), 2);
+        app.search = "wmatic".to_string();
+        app.sync_search_lower();
+        app.rebuild_route_view();
+        let (_, indices) = app.route_view().expect("view");
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], 0);
+        assert_eq!(app.route_sort_indices, vec![1, 0]);
+    }
+
+    #[test]
+    fn same_generation_snapshot_reuses_route_view_cache() {
+        let mut app = App::new();
+        let snapshot = Arc::new(test_snapshot(7, vec![test_route(1, "WMATIC")]));
+        app.set_snapshot(Arc::clone(&snapshot));
+        let ptr = app.route_view_indices.as_ptr();
+        app.mark_route_view_dirty();
+        app.set_snapshot(snapshot);
+        assert!(!app.route_view_is_dirty());
+        assert_eq!(app.route_view_indices.as_ptr(), ptr);
+        assert_eq!(app.route_view().expect("view").1.len(), 1);
+    }
+
+    #[test]
+    fn same_generation_new_opportunities_arc_rebuilds_route_view() {
+        let mut app = App::new();
+        let route = test_route(1, "WMATIC");
+        app.set_snapshot(Arc::new(test_snapshot(
+            7,
+            vec![route.clone(), route],
+        )));
+        assert_eq!(app.route_view().expect("view").1.len(), 2);
+        // Gas-driven republish keeps HF generation but replaces the opportunities Arc.
+        app.set_snapshot(Arc::new(test_snapshot(7, Vec::new())));
+        assert_eq!(app.route_view().expect("view").1.len(), 0);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn status_cow_retargets_route_view_cache_without_resort() {
+        let mut app = App::new();
+        // Shared Arc so make_mut clones (publisher + UI).
+        let opportunities = Arc::new(vec![test_route(1, "A"), test_route(2, "B")]);
+        let mut snap = test_snapshot(1, Vec::new());
+        snap.opportunities = Arc::clone(&opportunities);
+        app.set_snapshot(Arc::new(snap));
+        let sort_ptr = app.route_sort_indices.as_ptr();
+        let view_ptr = app.route_view_indices.as_ptr();
+        app.apply_outcome_to_routes(1, "ok", Severity::Good, Some(RouteStatus::Executed));
+        app.mark_route_view_dirty();
+        app.rebuild_route_view();
+        assert_eq!(app.route_sort_indices.as_ptr(), sort_ptr);
+        assert_eq!(app.route_view_indices.as_ptr(), view_ptr);
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().opportunities[0].status,
+            RouteStatus::Executed
+        );
+        // Keep the shared Arc alive so make_mut actually COW'd.
+        assert!(Arc::strong_count(&opportunities) >= 1);
+    }
+
+    #[test]
+    fn non_navigable_tabs_report_zero_rows() {
+        let app = App::new();
+        assert_eq!(app.current_rows_len(), 0);
+    }
+
+    #[test]
+    fn snapshot_does_not_erase_live_pipeline_metrics() {
+        let mut app = App::new();
+        app.last_search_ms = 37;
+        app.last_hf_ms = 11;
+        app.last_profitable_count = 4;
+
+        app.set_snapshot(Arc::new(test_snapshot(1, Vec::new())));
 
         let overview = &app
             .snapshot
@@ -1053,7 +1065,7 @@ mod tests {
         );
         assert!(app.chart_profitable.is_empty());
 
-        app.apply_hf_sample(9, 3, "100", 7, Vec::new());
+        app.apply_hf_sample(9, 3, "100".into(), 7, Vec::new());
         assert_eq!(app.last_cycle_count, 17);
         assert_eq!(app.last_cycles_considered, 9);
         assert_eq!(app.last_search_ms, 23);
@@ -1084,72 +1096,22 @@ mod tests {
         use alloy::primitives::U256;
 
         let mut app = App::new();
-        app.set_snapshot(Arc::new(DashboardSnapshot {
-            generation: 1,
-            captured_at: Instant::now(),
-            overview: OverviewSnapshot {
-                uptime: Duration::ZERO,
-                total_trades: 0,
-                total_losses: 0,
-                daily_pnl_wei: 0,
-                profitable_routes: 0,
-                discovered_pools: 0,
-                routable_pools: 0,
-                cycle_count: 0,
-                search_ms: 0,
-                hf_ms: 0,
-                gas_gwei: None,
-                win_rate: 0.0,
-                snapshot_age_ms: 0,
-                rates_age_ms: 0,
-            },
-            graph: GraphSnapshot {
-                health: GraphHealth {
-                    graph_generation: 0,
-                    token_count: 0,
-                    pool_count: 0,
-                    top_out_degree: 0,
-                    protocol_count: 0,
-                    indexer_lag_blocks: 0,
-                    hypersync_height: None,
-                    stale_indexer: false,
-                },
-                protocol_counts: Vec::new(),
-                hubs: Vec::new(),
-                recent_discoveries: Vec::new(),
-            },
-            opportunities: Arc::new(vec![RouteSummary {
-                fingerprint: 0xabc,
-                route: "a->b".into(),
-                route_detail: String::new(),
-                search_blob: "a->b".into(),
-                protocols: "V2".into(),
-                tokens: Vec::new(),
-                hops: 2,
-                raw_score: 1.0,
-                rescored: 1.0,
-                amount_in_token: "1".into(),
-                amount_in_matic: 1.0,
-                amount_out_token: "1".into(),
-                profit_matic: 0.1,
-                net_profit_matic: 0.05,
-                profit_usd: 0.0,
-                gas_estimate: 200_000,
-                risk_score: 10,
-                liquidity_score: 90,
-                long_tail: false,
-                status: RouteStatus::New,
-            }]),
-            simulations: Arc::new(Vec::new()),
-            portfolio: Vec::new(),
-            diagnostics: Vec::new(),
-            config: Vec::new(),
-        }));
+        let mut route = test_route(0xabc, "a->b");
+        route.protocols = "V2".into();
+        route.amount_in_token = "1".into();
+        route.amount_in_matic = 1.0;
+        route.amount_out_token = "1".into();
+        route.profit_matic = 0.1;
+        route.net_profit_matic = 0.05;
+        route.gas_estimate = 200_000;
+        route.risk_score = 10;
+        route.liquidity_score = 90;
+        app.set_snapshot(Arc::new(test_snapshot(1, vec![route])));
 
         app.apply_hf_sample(
             4,
             1,
-            "100",
+            "100".into(),
             12,
             vec![HfCandidateUiRow {
                 fingerprint: 0xabc,

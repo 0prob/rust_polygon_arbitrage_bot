@@ -51,7 +51,7 @@ fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 theme::severity_style(crate::tui::app::Severity::Good),
             ),
             ratatui::text::Span::raw("  "),
-            ratatui::text::Span::styled(route.route.clone(), theme::title()),
+            ratatui::text::Span::styled(route.route.as_str(), theme::title()),
             ratatui::text::Span::raw("  "),
             ratatui::text::Span::styled(
                 format!("net {:+.4} MATIC", route.net_profit_matic),

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
@@ -69,13 +69,18 @@ fn input_thread_main(tx: Sender<UiEvent>) {
 /// Read every buffered event after [`event::poll`] returned true.
 ///
 /// Crossterm may coalesce multiple events (e.g. resize); draining avoids stale input.
+/// Returns `false` only when the UI channel is closed (caller should exit the thread).
 fn drain_available(tx: &Sender<UiEvent>) -> bool {
     loop {
         let Ok(ev) = event::read() else {
             return true;
         };
-        if should_forward(&ev) && tx.try_send(UiEvent::Input(ev)).is_err() {
-            return false;
+        if should_forward(&ev) {
+            match tx.try_send(UiEvent::Input(ev)) {
+                // ponytail: drop overflow keys; killing the thread on Full made input die forever
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => return false,
+            }
         }
         if !event::poll(Duration::ZERO).unwrap_or(false) {
             return true;
