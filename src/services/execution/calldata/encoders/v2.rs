@@ -21,7 +21,7 @@ pub enum V2Prefund {
 ///
 /// Prefund + `swap(..., data="")`. Empty `data` avoids `uniswapV2Call` re-entry.
 /// Consecutive V2 hops chain with `swap(to=next_pair)` and skip the intermediate
-/// transfer — live Huff `transferAll` still no-ops on zero, which became IIA on hop1.
+/// transfer — `transferAll` would see a zero executor balance and revert.
 /// Returns `(calls, amount_out)` — `amount_out` is what `swap` sends to `swap_to`
 /// (feed into the next V2 hop's `amount_in` when chaining).
 pub fn encode_v2_hop(
@@ -36,9 +36,8 @@ pub fn encode_v2_hop(
         anyhow::bail!("v2 zero_for_one must match sorted token0 (token_in < token_out)");
     }
     // Reserve drift between multicall and eth_call → UniswapV2: K on exact quote.
-    // 1 bps still K'd on ~0.078 GHST Sushi hop (v3meta2); match Curve's 50 bps floor.
-    const V2_MIN_SLIPPAGE_BPS: u64 = 50;
-    let bps = slippage_bps.max(V2_MIN_SLIPPAGE_BPS);
+    // Shared floor with assess (`effective_slippage_bps`) so minProfit tracks encode.
+    let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
     let amount_out = super::shared::compute_min_out(arena, hop, bps, "v2")?;
     if amount_out.is_zero() {
         anyhow::bail!("v2 hop quoted amountOut is zero");

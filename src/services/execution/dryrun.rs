@@ -8,7 +8,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use tokio::time::timeout;
 
-use crate::core::types::FlashLoanSource;
 use crate::services::execution::candidate::CandidateExecution;
 use crate::services::execution::revert_decoder::decode_revert;
 
@@ -62,24 +61,6 @@ impl DryRunResult {
             return "dry-run failed without RPC error detail".into();
         }
         "dry-run failed without RPC error detail".into()
-    }
-}
-
-/// Deployed `executeArbDirect` returns 0 on profitable routes (inverted LT). When
-/// eth_call succeeded, ASSERT_PROFIT already enforced minProfit — use gross.
-fn direct_zero_return_workaround(
-    candidate: &CandidateExecution,
-    realized: Option<U256>,
-) -> Option<U256> {
-    match (candidate.flash_loan_source, realized, candidate.gross_profit) {
-        (FlashLoanSource::Direct, Some(p), gross) if p.is_zero() && !gross.is_zero() => {
-            crate::warn!(
-                "dry-run direct zero-return workaround: fp={} using gross_profit (redeploy executor)",
-                candidate.route_fingerprint
-            );
-            Some(gross)
-        }
-        (_, profit, _) => profit,
     }
 }
 
@@ -257,8 +238,7 @@ async fn dry_run_after_call_gas_overflow<P: Provider<Ethereum>>(
     .await
     {
         Ok(output) => {
-            let realized_profit =
-                direct_zero_return_workaround(candidate, decode_realized_profit(&output));
+            let realized_profit = decode_realized_profit(&output);
             if realized_profit.filter(|p| !p.is_zero()).is_none() {
                 return DryRunResult {
                     semantic_success: false,
@@ -380,8 +360,6 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
             };
         }
     };
-
-    let realized_profit = direct_zero_return_workaround(candidate, realized_profit);
 
     // Fail closed on empty/zero profit before a second RPC (estimate_gas). Most dry-runs
     // that "succeed" eth_call but return zero profit were paying an extra RTT for nothing.

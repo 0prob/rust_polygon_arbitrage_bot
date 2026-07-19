@@ -50,12 +50,9 @@ pub fn encode_v4_hop(
         .map_err(|_| anyhow::anyhow!("v4 amount_in does not fit i256"))?;
     let amount_spec = I256::ZERO - amount_pos;
 
-    // Huff UNLOCK_CALLBACK reads PoolKey/swap params at unlock-data +0x100.
-    // Layout: [offset=256][224B pad][256B payload] — without pad, swap gets garbage
-    // and bare-reverts as empty nested revert on PoolManager.
-    let mut unlock_inner = Vec::with_capacity(512);
-    unlock_inner.extend_from_slice(&U256::from(256u16).to_be_bytes::<32>());
-    unlock_inner.extend_from_slice(&[0u8; 224]);
+    // Huff UNLOCK_CALLBACK copies 0x100 bytes from the start of unlock `data`
+    // (= abi.encode(PoolKey, SwapParams): 5 key words + 3 param words).
+    let mut unlock_inner = Vec::with_capacity(256);
     append_address(&mut unlock_inner, pool_key.currency0);
     append_address(&mut unlock_inner, pool_key.currency1);
     unlock_inner.extend_from_slice(&[0u8; 29]);
@@ -175,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn unlock_inner_pads_payload_to_huff_offset_256() {
+    fn unlock_inner_is_flat_poolkey_swapparams() {
         let mut arena = StateArena::default();
         let t0 = Address::from([1u8; 20]);
         let t1 = Address::from([2u8; 20]);
@@ -223,10 +220,10 @@ mod tests {
         let unlock = &calls[1].data;
         // unlock(bytes) ABI: selector + offset + length + inner
         let inner_len = U256::from_be_slice(&unlock[36..68]).to::<usize>();
-        assert_eq!(inner_len, 512, "offset word + 224 pad + 256 payload");
+        assert_eq!(inner_len, 256, "8-word abi.encode(PoolKey, SwapParams)");
         let inner = &unlock[68..68 + inner_len];
-        assert_eq!(&inner[..32], &U256::from(256u16).to_be_bytes::<32>());
-        assert!(inner[32..256].iter().all(|&b| b == 0));
-        assert_ne!(inner[256..288], [0u8; 32]); // currency0 word present
+        assert_eq!(&inner[12..32], t0.as_slice()); // currency0
+        assert_eq!(&inner[44..64], t1.as_slice()); // currency1
+        assert_eq!(inner[191], 1u8); // zeroForOne (word 5, last byte)
     }
 }

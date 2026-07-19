@@ -28,8 +28,7 @@ pub fn encode_curve_hop(
     // Local Curve math / get_dy sits above exchange(); with SLIPPAGE_BPS=0,
     // min_dy == quote → "Exchange resulted in fewer coins than expected".
     // curveslip: 10 bps still reverted on stable_ng dust hops; 50 bps << depth haircuts.
-    const CURVE_MIN_SLIPPAGE_BPS: u64 = 50;
-    let bps = slippage_bps.max(CURVE_MIN_SLIPPAGE_BPS);
+    let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
     let min_dy = compute_min_out(arena, hop, bps, "curve")?;
 
     let i = hop.edge.token_in_idx as i128;

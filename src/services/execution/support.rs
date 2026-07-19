@@ -397,6 +397,8 @@ pub fn depth_impact_slippage_bps_with_base(
 ///
 /// - `configured_per_hop_bps` is the per-hop floor used in calldata `minOut` → compound
 ///   across `hop_count` so the profit haircut matches multi-hop execution.
+/// - Floored at [`EXECUTION_MIN_SLIPPAGE_BPS`] so default config `0` still matches
+///   V2/Curve/Balancer encode haircuts (else `minProfit` exceeds on-chain final).
 /// - `depth_route_bps` is already a **full-route** shortfall from the +5% size probe
 ///   ([`depth_impact_slippage_bps_with_base`]) → applied once, never re-compounded.
 ///
@@ -408,7 +410,9 @@ pub fn effective_slippage_bps(
     hop_count: u32,
     depth_route_bps: u64,
 ) -> u64 {
-    let config_route = compound_slippage_bps(configured_per_hop_bps, hop_count);
+    use crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS;
+    let per_hop = configured_per_hop_bps.max(EXECUTION_MIN_SLIPPAGE_BPS);
+    let config_route = compound_slippage_bps(per_hop, hop_count);
     config_route.max(depth_route_bps).min(9_999)
 }
 
@@ -511,5 +515,8 @@ mod tests {
         // 50 bps × 4 hops compounds to 200 route bps; depth 10 stays under that.
         assert_eq!(effective_slippage_bps(50, 4, 10), 200);
         assert_eq!(effective_slippage_bps(50, 4, 500), 500);
+        // Config 0 still floors to encode min (50) so 2-hop → ~100 route bps.
+        assert_eq!(effective_slippage_bps(0, 2, 0), 100);
+        assert_eq!(effective_slippage_bps(0, 1, 0), 50);
     }
 }

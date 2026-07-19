@@ -93,6 +93,12 @@ pub const MAX_SANE_PROFIT_RATIO_BPS: u64 = 50_000;
 /// below typical V4 local-sim artifacts.
 pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 10u128.pow(18);
 
+/// Per-hop minOut / amountOut haircut floor shared by V2, Curve, and Balancer
+/// encoders. Assessment must compound this via `effective_slippage_bps` so
+/// on-chain `minProfit` is not set above what encode can realize (default
+/// config slippage is 0).
+pub const EXECUTION_MIN_SLIPPAGE_BPS: u64 = 50;
+
 /// Per-hop gas seeds for route simulation (Polygon executor context).
 /// GasOracle.record_sim_observed calibrates global uplift; per-route
 /// fingerprint cache overrides from dry-run / receipts. Re-tune here when

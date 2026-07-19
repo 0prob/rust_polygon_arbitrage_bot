@@ -104,8 +104,8 @@ pub fn encode_route(
             hop.amount_in = ain;
         }
         if hop.edge.protocol == ProtocolType::UniswapV2 {
-            // ponytail: V2→V2 chains via swap(to=next_pair); skip mid transferAll (live
-            // Huff still no-ops on zero → UniV2 IIA on the next swap).
+            // ponytail: V2→V2 chains via swap(to=next_pair); skip mid transferAll
+            // (tokens already at next pair; transferAll would revert on zero balance).
             let prev_v2 = i
                 .checked_sub(1)
                 .is_some_and(|j| hops[j].edge.protocol == ProtocolType::UniswapV2);
@@ -144,11 +144,10 @@ pub fn encode_route(
             i == 0,
             flash_source,
         )?);
-        // Feed conservative out into the next hop (e.g. V3→V2 TransferAll sizing).
+        // Feed this hop's execution minOut into the next hop. Re-quoting here can
+        // exceed the encoded Balancer/Curve limit and IIA the following V3 exact-in.
         if i + 1 < hops.len() {
-            if let Some(q) = quote_hop_for_execution(arena, &hop) {
-                chain_in = slippage_adjusted(q, config.slippage_bps);
-            }
+            chain_in = Some(hop.amount_out);
         }
     }
     Ok(calls)

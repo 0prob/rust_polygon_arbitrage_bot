@@ -321,16 +321,7 @@ pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
         return Err(format!("confirm_decode_fail len={}", output.len()));
     };
     if realized.is_zero() {
-        // Deployed EXECUTE_ARB_DIRECT inverted the profit LT branch (returns 0 on
-        // success). eth_call without revert means ASSERT_PROFIT already required
-        // final >= start + minProfit — use min_profit as a lower bound until redeploy.
-        if min_profit.is_zero() {
-            return Err("confirm_zero_return".into());
-        }
-        crate::warn!(
-            "balancer confirm: direct zero-return workaround min_profit={min_profit} (redeploy executor)"
-        );
-        return Ok(min_profit);
+        return Err("confirm_zero_return".into());
     }
     Ok(realized)
 }

@@ -584,9 +584,10 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     let liquidity = ctx.execution.flash_liquidity.snapshot(start_token_addr);
     // Route-level for profit/prepare; config per-hop for calldata minOut (do not push
-    // full-route depth haircut into every hop's minOut).
+    // full-route depth haircut into every hop's minOut). Floor matches encode mins.
     let route_slippage_bps = evaluated.effective_slippage_bps.max(base_slippage_bps);
-    let calldata_slippage_bps = base_slippage_bps;
+    let calldata_slippage_bps =
+        base_slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
     let search_low = evaluated.opt.search_low;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
         evaluated.cycle,

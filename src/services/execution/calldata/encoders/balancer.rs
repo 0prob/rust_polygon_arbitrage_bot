@@ -28,9 +28,8 @@ pub fn encode_balancer_hop(
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     let pool_id = resolve_balancer_pool_id(hop.pool_address, hop.pool_id)?;
     // Weighted multi-token single swaps overquote vs vault by >50 bps on some
-    // pools (BAL#507 = SWAP_LIMIT). Floor matches V2/Curve encode haircuts.
-    const BALANCER_MIN_SLIPPAGE_BPS: u64 = 50;
-    let bps = slippage_bps.max(BALANCER_MIN_SLIPPAGE_BPS);
+    // pools (BAL#507 = SWAP_LIMIT). Shared floor with assess / V2 / Curve.
+    let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
     let limit = super::shared::compute_min_out(arena, hop, bps, "balancer")?;
 
     let swap = IBalancerVault::swapCall {
