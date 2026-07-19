@@ -138,9 +138,7 @@ fn instance_label(pid: u32) -> Option<String> {
 
 fn label_if_instance(path: &Path) -> Option<String> {
     let raw = path.to_string_lossy();
-    let stripped = raw
-        .strip_suffix(" (deleted)")
-        .unwrap_or(raw.as_ref());
+    let stripped = raw.strip_suffix(" (deleted)").unwrap_or(raw.as_ref());
     let base = Path::new(stripped)
         .file_name()
         .and_then(|s| s.to_str())
@@ -156,10 +154,7 @@ fn label_if_instance(path: &Path) -> Option<String> {
 }
 
 fn is_instance_basename(base: &str) -> bool {
-    base == "rpbot"
-        || base == "tui"
-        || base.starts_with("tui-bolt")
-        || base.starts_with("rpbot-")
+    base == "rpbot" || base == "tui" || base.starts_with("tui-bolt") || base.starts_with("rpbot-")
 }
 
 fn is_project_tui_path(path: &str) -> bool {
@@ -202,10 +197,7 @@ mod tests {
             Some("rpbot")
         );
         assert_eq!(
-            label_if_instance(Path::new(
-                "/home/x/arb/c/target/release/rpbot (deleted)"
-            ))
-            .as_deref(),
+            label_if_instance(Path::new("/home/x/arb/c/target/release/rpbot (deleted)")).as_deref(),
             Some("rpbot")
         );
     }

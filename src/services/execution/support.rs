@@ -510,13 +510,17 @@ mod tests {
     fn effective_slippage_does_not_compound_route_depth() {
         // Depth is already full-route (e.g. 229 bps). Compounding as per-hop would
         // inflate ~3× on a 3-hop path; max(compound(config), depth) keeps 229.
-        assert_eq!(effective_slippage_bps(0, 3, 229), 229);
-        assert_eq!(effective_slippage_bps(50, 1, 10), 50);
-        // 50 bps × 4 hops compounds to 200 route bps; depth 10 stays under that.
-        assert_eq!(effective_slippage_bps(50, 4, 10), 200);
+        // Depth is full-route; floor compound(100,3)=298 beats depth 229, but
+        // depth still wins when larger (not re-compounded × hops).
+        assert_eq!(effective_slippage_bps(0, 3, 229), 298);
+        assert_eq!(effective_slippage_bps(0, 3, 500), 500);
+        // Config below EXECUTION_MIN_SLIPPAGE_BPS floors to 100.
+        assert_eq!(effective_slippage_bps(50, 1, 10), 100);
+        // 100 bps × 4 hops compounds to 394 route bps; depth 10 stays under that.
+        assert_eq!(effective_slippage_bps(50, 4, 10), 394);
         assert_eq!(effective_slippage_bps(50, 4, 500), 500);
-        // Config 0 still floors to encode min (50) so 2-hop → ~100 route bps.
-        assert_eq!(effective_slippage_bps(0, 2, 0), 100);
-        assert_eq!(effective_slippage_bps(0, 1, 0), 50);
+        // Config 0 floors to encode min (100) so 2-hop → 199 route bps.
+        assert_eq!(effective_slippage_bps(0, 2, 0), 199);
+        assert_eq!(effective_slippage_bps(0, 1, 0), 100);
     }
 }

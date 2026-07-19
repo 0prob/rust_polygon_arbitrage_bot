@@ -101,12 +101,8 @@ pub fn clear_v4_tick_hydrate_cooldown(pool_id: FixedBytes<32>) {
 
 /// True when either address- or pool-id-keyed hydrate cooldown is active.
 #[must_use]
-pub fn is_cl_tick_on_hydrate_cooldown(
-    addr: Address,
-    v4_pool_id: Option<FixedBytes<32>>,
-) -> bool {
-    is_empty_tick_on_cooldown(addr)
-        || v4_pool_id.is_some_and(is_empty_v4_tick_on_cooldown)
+pub fn is_cl_tick_on_hydrate_cooldown(addr: Address, v4_pool_id: Option<FixedBytes<32>>) -> bool {
+    is_empty_tick_on_cooldown(addr) || v4_pool_id.is_some_and(is_empty_v4_tick_on_cooldown)
 }
 
 fn clear_empty_v4_tick_cooldown(pool_id: FixedBytes<32>) {
@@ -840,7 +836,8 @@ pub async fn enrich_v4_ticks<
                 .map(|(idx, pool_id, _)| (idx, pool_id))
                 .collect();
             wide_loaded =
-                enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number).await;
+                enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number)
+                    .await;
             updated += wide_loaded;
         }
     }

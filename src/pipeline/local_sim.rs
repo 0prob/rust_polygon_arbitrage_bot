@@ -46,13 +46,17 @@ fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
     if hop_count == 0 {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
     }
+    // Direct batchSwap is one vault call; seed is all-in (do not pile ROUTE_EXECUTION_* × edges).
+    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+        return GAS_BALANCER_DIRECT_BATCH;
+    }
     let hop_budget = route_hop_gas_budget(edges);
     let static_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
         hop_budget,
         hop_count,
         hop_count as u32,
     );
-    if walked_hop_gas == 0 || crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+    if walked_hop_gas == 0 {
         return static_gas;
     }
     let dynamic =
@@ -69,6 +73,9 @@ fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
 pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     if edges.is_empty() {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
+    }
+    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+        return GAS_BALANCER_DIRECT_BATCH;
     }
     let hop_gas = route_hop_gas_budget(edges);
     let cold_slots = edges.len() as u32;
@@ -1928,7 +1935,8 @@ mod tests {
         let batch = estimate_route_gas(&edges);
         let per_hop = estimate_route_gas_from_hops_evm(GAS_BALANCER_HOP * 2, 2, 2);
         assert_eq!(route_hop_gas_budget(&edges), GAS_BALANCER_DIRECT_BATCH);
-        assert!(batch < per_hop / 2);
+        assert_eq!(batch, GAS_BALANCER_DIRECT_BATCH);
+        assert!(batch < per_hop);
     }
 
     #[test]

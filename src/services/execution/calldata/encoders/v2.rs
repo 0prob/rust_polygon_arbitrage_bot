@@ -144,24 +144,16 @@ mod tests {
             hooks: None,
         };
         let executor = Address::repeat_byte(0xee);
-        let (calls, aout) = encode_v2_hop(
-            &arena,
-            &hop,
-            executor,
-            executor,
-            50,
-            V2Prefund::Exact,
-        )
-        .expect("encode");
+        let (calls, aout) =
+            encode_v2_hop(&arena, &hop, executor, executor, 50, V2Prefund::Exact).expect("encode");
         assert_eq!(calls.len(), 2);
         assert!(!aout.is_zero());
         let swap_data = calls[1].data.as_ref();
         assert!(swap_data.len() > 4 + 32 * 4);
         let amount1 = U256::from_be_slice(&swap_data[4 + 32..4 + 64]);
         assert!(!amount1.is_zero());
-        let data_offset =
-            usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128]))
-                .expect("data offset fits usize");
+        let data_offset = usize::try_from(U256::from_be_slice(&swap_data[4 + 96..4 + 128]))
+            .expect("data offset fits usize");
         let len_word_at = 4 + data_offset;
         let data_len = U256::from_be_slice(&swap_data[len_word_at..len_word_at + 32]);
         assert!(

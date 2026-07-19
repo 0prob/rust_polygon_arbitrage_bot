@@ -457,10 +457,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             Arc::make_mut(&mut graph).ensure_token_capacity(work.arena.token_count());
         }
         let enum_started = crate::util::now_ms();
-        let obs_starts = observed_pool_start_tokens(
-            work.pool_metas.as_ref(),
-            &work.observed_pool_indices,
-        );
+        let obs_starts =
+            observed_pool_start_tokens(work.pool_metas.as_ref(), &work.observed_pool_indices);
         if !obs_starts.is_empty() {
             crate::info!(
                 "stream observed-live: dfs_seed tokens={} pools={} incremental={incremental_refind} lf_pass={}",

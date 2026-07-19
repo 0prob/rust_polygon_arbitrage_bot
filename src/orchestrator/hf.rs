@@ -605,7 +605,8 @@ fn select_cycles_for_rescore(
             continue;
         };
         // Cached-cycle protocol tags can lag hot-cache family flips (V2→V3).
-        let Some(ready) = crate::pipeline::local_sim::heal_cycle_edge_protocols(arena, ready) else {
+        let Some(ready) = crate::pipeline::local_sim::heal_cycle_edge_protocols(arena, ready)
+        else {
             protocol_mismatch_skipped += 1;
             continue;
         };
@@ -679,22 +680,14 @@ fn select_cycles_for_rescore(
         }
         // Drop hop-0 dust V2 before they crowd the HF probe window (live empty
         // ranks were ~75% `v2_reserve` after unsupported cleared).
-        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
-            arena,
-            &ready.edges,
-            micro_probe,
-        )
-        .is_some()
+        if crate::pipeline::local_sim::first_v2_hop_below_reserve(arena, &ready.edges, micro_probe)
+            .is_some()
         {
             v2_dead_skipped += 1;
             continue;
         }
-        if crate::pipeline::local_sim::micro_probe_liquidity_dead(
-            arena,
-            &ready.edges,
-            micro_probe,
-        )
-        .is_some()
+        if crate::pipeline::local_sim::micro_probe_liquidity_dead(arena, &ready.edges, micro_probe)
+            .is_some()
         {
             micro_dead_skipped += 1;
             continue;
@@ -706,15 +699,11 @@ fn select_cycles_for_rescore(
             &ready.edges,
             economic_floor,
         ) {
-            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio {
-                ..
-            }) => {
+            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
                 bal_floor_dead_skipped += 1;
                 continue;
             }
-            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted {
-                ..
-            }) => {
+            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
                 v2_dead_skipped += 1;
                 continue;
             }

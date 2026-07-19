@@ -17,9 +17,8 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
 
 use crate::pipeline::tick_fetch::{
-    collect_v3_pool_addresses,
-    collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks, is_cl_tick_on_hydrate_cooldown,
-    is_empty_tick_on_cooldown, mark_tick_hydrate_timeout_cooldown,
+    collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
+    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, mark_tick_hydrate_timeout_cooldown,
     mark_v4_tick_hydrate_timeout_cooldown,
 };
 use crate::services::execution::aave::{
@@ -1036,7 +1035,8 @@ pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> usize {
     let (_, v3) = tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
-    let (_, v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
+    let (_, v4) =
+        tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
     mark_tick_hydrate_timeout_cooldown(v3.iter().copied());
     mark_v4_tick_hydrate_timeout_cooldown(v4.iter().map(|&(_, pool_id)| pool_id));
     v3.len() + v4.len()
@@ -1820,9 +1820,21 @@ mod tests {
         assert!(all_stuck.is_empty());
 
         // Selection skip keys off cooldown membership even when LF still has ticks.
-        assert!(cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 5), pool_metas));
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(live, 6), pool_metas));
+        assert!(cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(dead, 5),
+            pool_metas
+        ));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(live, 6),
+            pool_metas
+        ));
         crate::pipeline::tick_fetch::clear_tick_hydrate_cooldown(addr_dead);
-        assert!(!cycle_has_cl_pool_on_miss_cooldown(&arena, &mk(dead, 7), pool_metas));
+        assert!(!cycle_has_cl_pool_on_miss_cooldown(
+            &arena,
+            &mk(dead, 7),
+            pool_metas
+        ));
     }
 }

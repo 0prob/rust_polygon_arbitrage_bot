@@ -101,6 +101,12 @@ pub fn encode_route(
     for (i, hop) in hops.iter().enumerate() {
         let mut hop = hop.clone();
         if let Some(ain) = chain_in.take() {
+            crate::info!(
+                "chain_in apply: hop={i} proto={:?} ain_was={} ain_now={ain} aout={}",
+                hop.edge.protocol,
+                hop.amount_in,
+                hop.amount_out,
+            );
             hop.amount_in = ain;
         }
         if hop.edge.protocol == ProtocolType::UniswapV2 {
@@ -136,6 +142,23 @@ pub fn encode_route(
             chain_in = Some(amount_out);
             continue;
         }
+        // Refresh amount_out for the (possibly chained) ain before encode + chain_in.
+        // Stale conservative_execution_hops floors were sized for the pre-chain ain and
+        // can exceed what Balancer/Curve will deliver → next hop transfer/IIA fails.
+        let bps = config
+            .slippage_bps
+            .max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
+        if let Ok(min_out) = encoders::shared::compute_min_out(arena, &hop, bps, "chain_in") {
+            if min_out != hop.amount_out {
+                crate::info!(
+                    "chain_in refresh_aout: hop={i} proto={:?} ain={} aout_was={} aout_now={min_out}",
+                    hop.edge.protocol,
+                    hop.amount_in,
+                    hop.amount_out,
+                );
+            }
+            hop.amount_out = min_out;
+        }
         calls.extend(encode_hop_for_protocol(
             &hop,
             executor,
@@ -144,8 +167,6 @@ pub fn encode_route(
             i == 0,
             flash_source,
         )?);
-        // Feed this hop's execution minOut into the next hop. Re-quoting here can
-        // exceed the encoded Balancer/Curve limit and IIA the following V3 exact-in.
         if i + 1 < hops.len() {
             chain_in = Some(hop.amount_out);
         }
@@ -268,7 +289,10 @@ pub fn build_calldata_hops(
     let mut hops = Vec::with_capacity(edges.len());
     for (i, edge) in edges.iter().enumerate() {
         let Some(pool_address) = arena.pool_address(edge.pool_index) else {
-            return Err(format!("hop{i}: missing_pool_addr idx={}", edge.pool_index.0));
+            return Err(format!(
+                "hop{i}: missing_pool_addr idx={}",
+                edge.pool_index.0
+            ));
         };
         if !crate::services::discovery::is_plausible_contract_address(pool_address) {
             return Err(format!("hop{i}: implausible_pool {pool_address}"));
@@ -277,12 +301,17 @@ pub fn build_calldata_hops(
             return Err(format!("hop{i}: missing_token_in idx={}", edge.token_in.0));
         };
         let Some(token_out) = arena.token_address(edge.token_out) else {
-            return Err(format!("hop{i}: missing_token_out idx={}", edge.token_out.0));
+            return Err(format!(
+                "hop{i}: missing_token_out idx={}",
+                edge.token_out.0
+            ));
         };
         if !crate::services::discovery::is_plausible_contract_address(token_in)
             || !crate::services::discovery::is_plausible_contract_address(token_out)
         {
-            return Err(format!("hop{i}: implausible_tokens in={token_in} out={token_out}"));
+            return Err(format!(
+                "hop{i}: implausible_tokens in={token_in} out={token_out}"
+            ));
         }
         if matches!(
             edge.protocol,
@@ -299,11 +328,9 @@ pub fn build_calldata_hops(
         let meta = pool_metas_by_pool.get(&edge.pool_index).copied();
         if let Some(pool) = meta.filter(|p| p.protocol != edge.protocol) {
             // Meta can lag healed edges; trust edge when arena state agrees.
-            let arena_ok = arena
-                .pool_state(edge.pool_index)
-                .is_some_and(|s| {
-                    crate::pipeline::local_sim::protocol_matches_pool_state(edge.protocol, s)
-                });
+            let arena_ok = arena.pool_state(edge.pool_index).is_some_and(|s| {
+                crate::pipeline::local_sim::protocol_matches_pool_state(edge.protocol, s)
+            });
             if !arena_ok {
                 return Err(format!(
                     "hop{i}: meta_proto_mismatch meta={:?} edge={:?} pool={pool_address}",
@@ -338,7 +365,9 @@ pub fn build_calldata_hops(
                     }
                 }
                 Some(_) => {
-                    return Err(format!("hop{i}: {tag}_meta_tokens_short pool={pool_address}"));
+                    return Err(format!(
+                        "hop{i}: {tag}_meta_tokens_short pool={pool_address}"
+                    ));
                 }
                 // Fail closed: missing meta cannot prove membership.
                 None => {
@@ -635,13 +664,8 @@ mod tests {
         }];
         let mut map = FxHashMap::default();
         map.insert(pool, &meta);
-        let err = build_calldata_hops(
-            &arena,
-            &edges,
-            &[U256::from(1u8), U256::from(1u8)],
-            &map,
-        )
-        .expect_err("foreign token");
+        let err = build_calldata_hops(&arena, &edges, &[U256::from(1u8), U256::from(1u8)], &map)
+            .expect_err("foreign token");
         assert!(err.contains("v2_token_not_in_pool"), "{err}");
     }
 
@@ -721,13 +745,8 @@ mod tests {
         }];
         let mut map = FxHashMap::default();
         map.insert(pool, &meta);
-        let err = build_calldata_hops(
-            &arena,
-            &edges,
-            &[U256::from(1u8), U256::from(1u8)],
-            &map,
-        )
-        .expect_err("foreign token");
+        let err = build_calldata_hops(&arena, &edges, &[U256::from(1u8), U256::from(1u8)], &map)
+            .expect_err("foreign token");
         assert!(err.contains("v3_token_not_in_pool"), "{err}");
     }
 }

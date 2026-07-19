@@ -198,9 +198,7 @@ pub fn build_execution_candidate(
     // Non-DODO flash credits `start_token`; hop0 must spend that same ERC-20.
     // (DODO packs the lending pool address into the flash_token field.)
     if entrypoint != ExecutorEntrypoint::DodoFlash
-        && hops
-            .first()
-            .is_none_or(|h| h.token_in != start_token)
+        && hops.first().is_none_or(|h| h.token_in != start_token)
     {
         anyhow::bail!(
             "flash/hop0 token mismatch: start={start_token} hop0_in={}",

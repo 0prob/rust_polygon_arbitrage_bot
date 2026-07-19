@@ -97,7 +97,9 @@ pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 10u128.pow(18);
 /// encoders. Assessment must compound this via `effective_slippage_bps` so
 /// on-chain `minProfit` is not set above what encode can realize (default
 /// config slippage is 0).
-pub const EXECUTION_MIN_SLIPPAGE_BPS: u64 = 50;
+/// 100 bps: 50 cleared Direct V2×2 but Balancer-flash V2→V2 hop1 still hit
+/// `UniswapV2: K` under reserve drift (parity3). Assess uses the same floor.
+pub const EXECUTION_MIN_SLIPPAGE_BPS: u64 = 100;
 
 /// Per-hop gas seeds for route simulation (Polygon executor context).
 /// GasOracle.record_sim_observed calibrates global uplift; per-route
@@ -109,9 +111,11 @@ pub const GAS_V3_BASE: u32 = 200_000;
 pub const GAS_V4_BASE: u32 = 220_000;
 pub const GAS_CURVE_HOP: u32 = 270_000;
 /// Per-hop seed for mixed/Aave-flash Balancer vault swaps (each hop is a separate call).
-pub const GAS_BALANCER_HOP: u32 = 1_000_000;
-/// Single vault `batchSwap` for `executeArbDirect` (≤4 hops collapse to one call).
-/// Calibrated ~720k sim / 1.87M live on Polygon; HF ranking uses this + overhead (~800k for 2-hop).
+/// parity5 dry-run Aave+BAL×2+Woofi: sim 2.41M vs gas_used 942k — 1M/hop was ~2.5× hot.
+pub const GAS_BALANCER_HOP: u32 = 450_000;
+/// All-in gas for Direct vault `batchSwap` (`executeArbDirect`, ≤4 hops → one call).
+/// Not passed through per-edge ROUTE_EXECUTION_* overhead (that double-counted hops).
+/// Live Direct BAL×3 ~244k; 580k is ~2.4×. Pre-Direct 1.87M revert is gas-limit buffer territory.
 pub const GAS_BALANCER_DIRECT_BATCH: u32 = 580_000;
 pub const GAS_DODO_HOP: u32 = 200_000;
 pub const GAS_WOOFI_HOP: u32 = 160_000;
