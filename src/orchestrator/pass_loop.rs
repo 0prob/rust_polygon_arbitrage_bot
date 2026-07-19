@@ -186,7 +186,7 @@ pub async fn run_pass_loop(
     info!("pass loop started");
 
     let sidecar_started = crate::util::now_ms();
-    let sidecars = spawn_pass_loop_sidecars(&ctx, &shutdown);
+    let sidecars = spawn_pass_loop_sidecars(&ctx, &shutdown).await;
     let sidecar_ms = crate::util::now_ms().saturating_sub(sidecar_started);
 
     let lf_ctx = Arc::new(ctx.lf_context());
@@ -474,7 +474,7 @@ impl HfScheduler {
     }
 }
 
-fn spawn_pass_loop_sidecars(
+async fn spawn_pass_loop_sidecars(
     ctx: &Arc<RuntimeContext>,
     shutdown: &watch::Receiver<bool>,
 ) -> PassLoopSidecars {
@@ -499,15 +499,19 @@ fn spawn_pass_loop_sidecars(
         shutdown.clone(),
     );
 
+    // Rank state RPCs before the first LF tick so multicall hits the fastest URL.
+    const RANK_TIMEOUT: Duration = Duration::from_secs(2);
+    if tokio::time::timeout(RANK_TIMEOUT, ctx.rpc.probe_and_rank_state_urls())
+        .await
+        .is_err()
+    {
+        crate::warn!(
+            "state RPC rank timed out after {RANK_TIMEOUT:?} — first LF may use config order"
+        );
+    }
+
     ctx.rpc
         .spawn_periodic_probe(shutdown.clone(), Duration::from_secs(600));
-
-    {
-        let rpc = Arc::clone(&ctx.rpc);
-        tokio::spawn(async move {
-            rpc.probe_and_rank_state_urls().await;
-        });
-    }
 
     let daily_loss_guard = spawn_daily_loss_guard(ctx, shutdown);
 

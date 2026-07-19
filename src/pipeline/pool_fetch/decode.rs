@@ -464,8 +464,17 @@ fn classify_balancer_pool(
     }
 }
 
+fn plan_result<'a>(
+    plan: &PoolFetchPlan,
+    results: &'a [Option<Bytes>],
+    kind: CallKind,
+) -> Option<&'a Bytes> {
+    let idx = plan.kinds.iter().position(|k| *k == kind)?;
+    results.get(idx)?.as_ref()
+}
+
 fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let tokens_bytes = results.first()?.as_ref()?;
+    let tokens_bytes = plan_result(plan, results, CallKind::BalancerTokens)?;
     let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes).ok()?;
     let last_change_block = tokens.lastChangeBlock.as_limbs()[0];
     let balances: Vec<U256> = tokens.balances.iter().map(|&b| U256::from(b)).collect();
@@ -473,22 +482,16 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         return None;
     }
     let n = balances.len();
-    let swap_fee = results
-        .get(1)
-        .and_then(|b| b.as_ref())
+    let swap_fee = plan_result(plan, results, CallKind::BalancerSwapFee)
         .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
         .map_or_else(
             || balancer_swap_fee_from_pool_meta_fee(plan.pool.fee_bps as u64),
             U256::from,
         );
-    let decoded_weights = results
-        .get(2)
-        .and_then(|b| b.as_ref())
+    let decoded_weights = plan_result(plan, results, CallKind::BalancerWeights)
         .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok())
         .map(|w| w.iter().map(|&x| U256::from(x)).collect::<Vec<_>>());
-    let amp_from_chain = results
-        .get(3)
-        .and_then(|b| b.as_ref())
+    let amp_from_chain = plan_result(plan, results, CallKind::BalancerAmp)
         .and_then(|b| IBalancerPool::getAmplificationParameterCall::abi_decode_returns(b).ok());
     let (amp, amp_precision, has_onchain_amp, is_updating) = match amp_from_chain {
         Some(t) => (
@@ -499,18 +502,18 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         ),
         None => (U256::ZERO, U256::ZERO, false, false),
     };
-    let scaling_factors = results
-        .get(4)
-        .and_then(|b| b.as_ref())
+    let scaling_factors = plan_result(plan, results, CallKind::BalancerScalingFactors)
         .and_then(|b| IBalancerPool::getScalingFactorsCall::abi_decode_returns(b).ok())
         .map(|sf| sf.iter().map(|&x| U256::from(x)).collect::<Vec<_>>())?;
     if scaling_factors.len() != n || scaling_factors.iter().any(U256::is_zero) {
         return None;
     }
-    let probe_linear = plan.pool.pool_type.as_deref() == Some("linear")
-        || (plan.pool.pool_type.is_none() && n >= 3);
-    let linear = if probe_linear {
-        decode_balancer_linear(&tokens.tokens, results.get(5..))
+    let linear_start = plan
+        .kinds
+        .iter()
+        .position(|k| *k == CallKind::BalancerLinearMainToken);
+    let linear = if let Some(start) = linear_start {
+        decode_balancer_linear(&tokens.tokens, results.get(start..))
     } else {
         None
     };

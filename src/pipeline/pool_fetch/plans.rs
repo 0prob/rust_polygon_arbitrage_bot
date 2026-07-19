@@ -219,6 +219,7 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
         return false;
     };
     let vault = BALANCER_VAULT;
+    let addr = plan.pool.address;
     push_call(
         plan,
         vault,
@@ -227,52 +228,50 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
     );
     push_call(
         plan,
-        plan.pool.address,
+        addr,
         BALANCER_SWAP_FEE.clone(),
         CallKind::BalancerSwapFee,
     );
+    // Known family: skip probes that always revert (weighted has no amp, etc.).
+    let known = plan.pool.pool_type.as_deref();
+    let need_weights = matches!(known, Some("weighted") | None);
+    let need_amp = matches!(known, Some("stable") | None);
+    let need_linear =
+        known == Some("linear") || (known.is_none() && plan.pool.tokens.len() >= 3);
+    if need_weights {
+        push_call(plan, addr, BALANCER_WEIGHTS.clone(), CallKind::BalancerWeights);
+    }
+    if need_amp {
+        push_call(plan, addr, BALANCER_AMP.clone(), CallKind::BalancerAmp);
+    }
     push_call(
         plan,
-        plan.pool.address,
-        BALANCER_WEIGHTS.clone(),
-        CallKind::BalancerWeights,
-    );
-    push_call(
-        plan,
-        plan.pool.address,
-        BALANCER_AMP.clone(),
-        CallKind::BalancerAmp,
-    );
-    push_call(
-        plan,
-        plan.pool.address,
+        addr,
         BALANCER_SCALING.clone(),
         CallKind::BalancerScalingFactors,
     );
-    if plan.pool.pool_type.as_deref() == Some("linear")
-        || (plan.pool.pool_type.is_none() && plan.pool.tokens.len() >= 3)
-    {
+    if need_linear {
         push_call(
             plan,
-            plan.pool.address,
+            addr,
             BALANCER_LINEAR_MAIN.clone(),
             CallKind::BalancerLinearMainToken,
         );
         push_call(
             plan,
-            plan.pool.address,
+            addr,
             BALANCER_LINEAR_WRAPPED.clone(),
             CallKind::BalancerLinearWrappedToken,
         );
         push_call(
             plan,
-            plan.pool.address,
+            addr,
             BALANCER_LINEAR_TARGETS.clone(),
             CallKind::BalancerLinearTargets,
         );
         push_call(
             plan,
-            plan.pool.address,
+            addr,
             BALANCER_LINEAR_RATE.clone(),
             CallKind::BalancerLinearRate,
         );
@@ -311,4 +310,54 @@ pub(super) fn build_plan_with_pool_id(
         ProtocolType::Woofi => return None,
     }
     Some(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, FixedBytes};
+
+    fn balancer_pool(pool_type: Option<&str>) -> DiscoveredPool {
+        DiscoveredPool {
+            pool_key: "0x0000000000000000000000000000010000000003".into(),
+            address: Address::from([3u8; 20]),
+            protocol: ProtocolType::BalancerV2,
+            protocol_label: "BALANCER_V2".into(),
+            tokens: vec![Address::from([1u8; 20]), Address::from([2u8; 20])],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: Some(FixedBytes::from([0x11; 32])),
+            pool_id_verified: true,
+            hooks: None,
+            pool_type: pool_type.map(str::to_string),
+            created_block: 1,
+        }
+    }
+
+    #[test]
+    fn known_weighted_balancer_skips_amp_and_linear_probes() {
+        let pool = balancer_pool(Some("weighted"));
+        let plan = build_plan_with_pool_id(&pool, pool.pool_id).expect("plan");
+        assert!(plan.kinds.contains(&CallKind::BalancerWeights));
+        assert!(!plan.kinds.contains(&CallKind::BalancerAmp));
+        assert!(!plan.kinds.contains(&CallKind::BalancerLinearMainToken));
+        assert!(plan.kinds.contains(&CallKind::BalancerScalingFactors));
+    }
+
+    #[test]
+    fn known_stable_balancer_skips_weights_and_linear_probes() {
+        let pool = balancer_pool(Some("stable"));
+        let plan = build_plan_with_pool_id(&pool, pool.pool_id).expect("plan");
+        assert!(plan.kinds.contains(&CallKind::BalancerAmp));
+        assert!(!plan.kinds.contains(&CallKind::BalancerWeights));
+        assert!(!plan.kinds.contains(&CallKind::BalancerLinearMainToken));
+    }
+
+    #[test]
+    fn unknown_balancer_probes_weights_and_amp() {
+        let pool = balancer_pool(None);
+        let plan = build_plan_with_pool_id(&pool, pool.pool_id).expect("plan");
+        assert!(plan.kinds.contains(&CallKind::BalancerWeights));
+        assert!(plan.kinds.contains(&CallKind::BalancerAmp));
+    }
 }

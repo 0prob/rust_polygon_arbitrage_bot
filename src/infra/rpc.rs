@@ -159,6 +159,8 @@ impl RpcPool {
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Startup already ranks before first LF — don't double-probe immediately.
+            timer.tick().await;
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {

@@ -376,12 +376,22 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         }
     };
 
-    let missing_graph_pools = if has_missing_eligible_pools_with_gate(
-        &work.arena,
-        work.pool_metas.as_ref(),
-        graph.as_ref(),
-        gate_ref,
-    ) {
+    // Quiet ticks: no rebuild, no eligibility growth, no dirty state — skip O(n) scan.
+    let cached_eligible = {
+        let gc = work.graph_cache.lock();
+        gc.cached_eligible_pool_count()
+    };
+    let scan_missing = needs_rebuild
+        || connectivity_stale
+        || !work.dirty_pools.is_empty()
+        || eligible_count > cached_eligible;
+    let missing_graph_pools = if scan_missing
+        && has_missing_eligible_pools_with_gate(
+            &work.arena,
+            work.pool_metas.as_ref(),
+            graph.as_ref(),
+            gate_ref,
+        ) {
         let g = Arc::make_mut(&mut graph);
         attach_missing_eligible_pools_with_gate(&work.arena, g, work.pool_metas.as_ref(), gate_ref)
             .attached_pools
