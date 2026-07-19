@@ -414,9 +414,11 @@ pub fn depth_impact_slippage_bps_with_base(
         base.amount_out
     };
 
-    let probe_in = amount_in.saturating_mul(U256::from(10_500u64)) / BPS_SCALE;
-    if probe_in == amount_in {
-        return 0;
+    // +5% may collapse to the same integer on dust sizes; step by 1 so depth is
+    // still measured instead of optimistically reporting 0 impact.
+    let mut probe_in = amount_in.saturating_mul(U256::from(10_500u64)) / BPS_SCALE;
+    if probe_in <= amount_in {
+        probe_in = amount_in.saturating_add(U256::ONE);
     }
     let Some(probe) = simulate_route_minimal(arena, edges, probe_in) else {
         // Probe failure means unknown depth impact — do not report 0 slippage.
@@ -572,5 +574,48 @@ mod tests {
         // Config 0 floors to encode min (100) so 2-hop → 199 route bps.
         assert_eq!(effective_slippage_bps(0, 2, 0), 199);
         assert_eq!(effective_slippage_bps(0, 1, 0), 100);
+    }
+
+    #[test]
+    fn depth_dust_probe_steps_instead_of_zero() {
+        use crate::core::types::{PoolState, ProtocolType, V2PoolState};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::repeat_byte(0x01));
+        let t1 = arena.register_token(Address::repeat_byte(0x02));
+        let pool = arena.register_pool(
+            Address::repeat_byte(0xaa),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(100u64),
+                reserve1: U256::from(100u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let base = MinimalSimResult {
+            profit: U256::ONE,
+            amount_out: U256::from(20u64),
+            total_gas: 1,
+        };
+        // amount=10 → +5% collapses to 10; new path probes 11 instead of returning 0.
+        let bps = depth_impact_slippage_bps_with_base(
+            &arena,
+            &[edge],
+            U256::from(10u64),
+            Some(&base),
+        );
+        assert!(bps > 0, "dust probe must measure depth, not short-circuit to 0");
     }
 }

@@ -29,6 +29,7 @@ pub fn encode_v3_hop(
 
     let quoted_out = quote_hop_for_execution(arena, hop)
         .ok_or_else(|| anyhow::anyhow!("v3 execution quote unavailable"))?;
+    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
     let sqrt_limit = derive_tight_v3_price_limit(
         &v3,
         hop.amount_in,
@@ -36,14 +37,13 @@ pub fn encode_v3_hop(
         hop.edge.zero_for_one,
         hop.edge.fee_bps,
         slippage_bps,
-        None,
+        Some(fee_pips),
         false,
     )?;
 
     let (token0, token1) = pool_tokens_from_hop(hop);
     let proto_id = v3_callback_protocol_id(hop.protocol_label.as_deref());
     let fourth = resolve_v3_callback_fourth_field(arena, hop);
-    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
     // Surface callback verify inputs — dry-run InvalidPoolCaller(expected=fee)
     // means factory getPool did not return msg.sender (fee word leaked as expected).
     crate::debug!(

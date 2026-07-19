@@ -9,7 +9,9 @@ use crate::pipeline::arena::StateArena;
 use crate::services::execution::calldata::CalldataHop;
 use crate::services::execution::calldata::approvals::encode_approve_if_needed;
 use crate::services::execution::calldata::encoders::shared::to_v3_state;
-use crate::services::execution::quote::{derive_tight_v3_price_limit, quote_hop_for_execution};
+use crate::services::execution::quote::{
+    derive_tight_v3_price_limit, quote_hop_for_execution, resolve_v3_fee_pips_for_hop,
+};
 
 /// Encode a Uniswap V4 hop into executor calls.
 pub fn encode_v4_hop(
@@ -34,6 +36,7 @@ pub fn encode_v4_hop(
 
     let quoted_out = quote_hop_for_execution(arena, hop)
         .ok_or_else(|| anyhow::anyhow!("v4 execution quote unavailable"))?;
+    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
     let sqrt_limit = derive_tight_v3_price_limit(
         &v3,
         hop.amount_in,
@@ -41,7 +44,7 @@ pub fn encode_v4_hop(
         hop.edge.zero_for_one,
         hop.edge.fee_bps,
         slippage_bps,
-        None,
+        Some(fee_pips),
         true,
     )?;
 

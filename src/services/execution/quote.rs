@@ -53,7 +53,7 @@ pub fn derive_tight_v3_price_limit(
     explicit_fee_pips: Option<u32>,
     allow_zero_pool_fee: bool,
 ) -> anyhow::Result<U256> {
-    use crate::core::math::tick_math::{MAX_SQRT_RATIO, MIN_SQRT_RATIO};
+    use crate::core::math::tick_math::{MAX_SQRT_RATIO, MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
 
     let sim = if let Some(pips) = explicit_fee_pips {
         let mut tmp = state.clone();
@@ -69,6 +69,15 @@ pub fn derive_tight_v3_price_limit(
         )
     };
     if sim.shallow {
+        // Tickless pools are accepted by local_sim within the probe cap; cannot tighten
+        // from incomplete coverage — use the same protocol extremes as simulate_v3_swap.
+        if state.ticks.is_empty() && !quoted_out.is_zero() {
+            return Ok(if zero_for_one {
+                MIN_SQRT_RATIO + U256::ONE
+            } else {
+                MAX_SQRT_RATIO_EXCLUSIVE
+            });
+        }
         anyhow::bail!("v3 price limit: incomplete tick coverage");
     }
     if sim.sqrt_price_x96_after < MIN_SQRT_RATIO || sim.sqrt_price_x96_after >= MAX_SQRT_RATIO {
@@ -132,7 +141,9 @@ mod tests {
     }
 
     #[test]
-    fn price_limit_rejects_a_shallow_quote() {
+    fn price_limit_tickless_falls_back_to_protocol_extremes() {
+        use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
+
         let state = V3PoolState {
             sqrt_price_x96: U256::from(1u128 << 96),
             liquidity: 1_000_000,
@@ -143,6 +154,54 @@ mod tests {
             fee_protocol: 0,
             observation_cardinality: 1,
             ticks: Arc::from(Vec::new()),
+        };
+
+        let zfo = derive_tight_v3_price_limit(
+            &state,
+            U256::from(100u64),
+            U256::from(1u64),
+            true,
+            30,
+            0,
+            None,
+            false,
+        )
+        .expect("tickless zero_for_one should encode");
+        assert_eq!(zfo, MIN_SQRT_RATIO + U256::ONE);
+
+        let one_for_zero = derive_tight_v3_price_limit(
+            &state,
+            U256::from(100u64),
+            U256::from(1u64),
+            false,
+            30,
+            0,
+            None,
+            false,
+        )
+        .expect("tickless one_for_zero should encode");
+        assert_eq!(one_for_zero, MAX_SQRT_RATIO_EXCLUSIVE);
+    }
+
+    #[test]
+    fn price_limit_rejects_exhausted_tick_coverage() {
+        use crate::core::types::V3Tick;
+
+        // Tick only above spot; zero_for_one search finds nothing → exhausted shallow.
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(vec![V3Tick {
+                tick: 60,
+                liquidity_gross: 1_000_000,
+                liquidity_net: 1_000_000,
+            }]),
         };
 
         assert!(
