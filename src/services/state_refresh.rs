@@ -16,7 +16,9 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::fetch_missing_pool_states_indexed;
+use crate::pipeline::fetcher::{
+    fetch_missing_pool_states, fetch_missing_pool_states_indexed,
+};
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -839,6 +841,9 @@ impl StateRefreshService {
         // the pinned block is unchanged and we already have a hash.
         let mut last_pinned_block = cached_block;
         let mut pinned_block: Option<u64> = None;
+        // After a partial/rate-limited attempt, retry only still-needed addresses
+        // from that batch — do not re-select a fresh max_pools window.
+        let mut retry_addrs: Option<Vec<Address>> = None;
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,
@@ -857,20 +862,48 @@ impl StateRefreshService {
             }
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
-            let fetch_result = fetch_missing_pool_states_indexed(
-                provider,
-                Arc::clone(&self.cache),
-                pools,
-                &address_index,
-                &self.fetch_never_scan_offset,
-                max_pools,
-                self.config.max_multicall_calls as usize,
-                self.config.rpc.batch_pace_ms,
-                hot,
-                pinned_block,
-                &self.pool_meta_cache,
-            )
-            .await;
+            let fetch_result = if let Some(ref addrs) = retry_addrs {
+                let retry_pools = {
+                    let state = self.discovery_state.read();
+                    addrs
+                        .iter()
+                        .filter_map(|addr| {
+                            let &idx = state.address_index.get(addr)?;
+                            state.discovered.get(idx).cloned()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if retry_pools.is_empty() {
+                    break;
+                }
+                fetch_missing_pool_states(
+                    provider,
+                    Arc::clone(&self.cache),
+                    &retry_pools,
+                    retry_pools.len(),
+                    self.config.max_multicall_calls as usize,
+                    self.config.rpc.batch_pace_ms,
+                    addrs,
+                    pinned_block,
+                    &self.pool_meta_cache,
+                )
+                .await
+            } else {
+                fetch_missing_pool_states_indexed(
+                    provider,
+                    Arc::clone(&self.cache),
+                    pools,
+                    &address_index,
+                    &self.fetch_never_scan_offset,
+                    max_pools,
+                    self.config.max_multicall_calls as usize,
+                    self.config.rpc.batch_pace_ms,
+                    hot,
+                    pinned_block,
+                    &self.pool_meta_cache,
+                )
+                .await
+            };
             fetch_ms = fetch_ms.saturating_add(now_ms().saturating_sub(fetch_started));
             let updated = fetch_result.updated;
             total_updated = total_updated.saturating_add(updated);
@@ -907,15 +940,33 @@ impl StateRefreshService {
             }
             self.rpc.deprioritize_state_url(url);
             if idx + 1 < candidates.len() {
+                // Within-call URL fallback: retry Invalid/missing too.
+                // `needs_fetch` alone skips fresh Invalid (invalid_retry_ttl) and
+                // would abort fallback with remaining=0 after a failed primary URL.
+                let remaining: Vec<Address> = fetch_result
+                    .targeted
+                    .iter()
+                    .copied()
+                    .filter(|addr| match self.cache.get(addr) {
+                        Some(state) if state.is_tradable() => self.cache.needs_fetch(addr),
+                        _ => true,
+                    })
+                    .collect();
                 if fetch_result.rate_limited {
                     crate::warn!(
-                        "state RPC rate limited after partial refresh — trying fallback (url_index={idx}, updated={updated})"
+                        "state RPC rate limited after partial refresh — trying fallback (url_index={idx}, updated={updated}, remaining={})",
+                        remaining.len()
                     );
                 } else {
                     crate::warn!(
-                        "state RPC returned no pool updates — trying fallback (url_index={idx})"
+                        "state RPC returned no pool updates — trying fallback (url_index={idx}, remaining={})",
+                        remaining.len()
                     );
                 }
+                if remaining.is_empty() {
+                    break;
+                }
+                retry_addrs = Some(remaining);
             }
         }
         let refresh_ms = now_ms().saturating_sub(refresh_started);

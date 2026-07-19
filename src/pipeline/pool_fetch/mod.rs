@@ -415,41 +415,39 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     }
 
     let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
-    // Stagger spawns do not pace in-flight RPC when batches run in parallel — serialize when pacing is on.
-    if batch_pace_ms > 0 {
-        let mut result = PoolFetchResult::default();
-        for (i, batch) in batches.into_iter().enumerate() {
-            if i > 0 {
-                tokio::time::sleep(pacing).await;
-            }
-            result = result.combine(
-                execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size)
-                    .await,
-            );
-            if result.rate_limited {
-                break;
+    let max_inflight = MAX_PARALLEL_PLAN_BATCHES.min(batches.len());
+    // Pace spawn starts (not full serialize): keep up to `max_inflight` RPCs in
+    // flight, stop spawning once any batch reports rate-limited.
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut result = PoolFetchResult::default();
+    for (i, batch) in batches.into_iter().enumerate() {
+        if result.rate_limited {
+            break;
+        }
+        if batch_pace_ms > 0 && i > 0 {
+            tokio::time::sleep(pacing).await;
+        }
+        while tasks.len() >= max_inflight {
+            match tasks.join_next().await {
+                Some(Ok(batch_result)) => {
+                    result = result.combine(batch_result);
+                    if result.rate_limited {
+                        break;
+                    }
+                }
+                Some(Err(e)) => crate::warn!("plan batch task failed: {e:#}"),
+                None => break,
             }
         }
-        return result;
-    }
-
-    let sem = Arc::new(tokio::sync::Semaphore::new(
-        MAX_PARALLEL_PLAN_BATCHES.min(batches.len()),
-    ));
-    let mut tasks = tokio::task::JoinSet::new();
-    for batch in batches {
+        if result.rate_limited {
+            break;
+        }
         let provider = provider.clone();
         let cache = Arc::clone(&cache);
-        let sem = Arc::clone(&sem);
         tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire().await else {
-                crate::warn!("plan batch skipped: fetch semaphore closed");
-                return PoolFetchResult::default();
-            };
             execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
         });
     }
-    let mut result = PoolFetchResult::default();
     while let Some(res) = tasks.join_next().await {
         match res {
             Ok(batch_result) => result = result.combine(batch_result),

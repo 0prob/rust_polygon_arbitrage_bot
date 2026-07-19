@@ -278,6 +278,19 @@ impl StateCache {
         self.lookup_pool_state(address).is_some()
     }
 
+    /// True when a tradable, unexpired entry was updated within `max_age`.
+    /// Fresh `Invalid` is intentionally false — dispatch must not skip re-fetch on it.
+    #[must_use]
+    pub fn is_fresh_within(&self, address: &Address, max_age: std::time::Duration) -> bool {
+        self.inner.read().get(address).is_some_and(|entry| {
+            if !entry.state.is_tradable() {
+                return false;
+            }
+            let age = entry.updated_at.elapsed();
+            age <= max_age && age <= self.ttl
+        })
+    }
+
     /// Apply an in-place mutation when a full pool entry already exists.
     pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState)) -> bool {
         let mut guard = self.inner.write();
@@ -391,6 +404,16 @@ impl StateCache {
         }
     }
 
+    /// True when `address` is missing or classified stale/invalid for fetch.
+    #[must_use]
+    pub fn needs_fetch(&self, address: &Address) -> bool {
+        let guard = self.inner.read();
+        match guard.get(address) {
+            None => true,
+            Some(entry) => self.fetch_class_for_entry(entry).is_some(),
+        }
+    }
+
     /// Single read-lock pass over pools that need fetch (1=never, 2=invalid, 3=stale).
     pub fn for_each_fetch_candidate<'a>(
         &self,
@@ -483,6 +506,50 @@ mod tests {
         cache.insert(addr, PoolState::Invalid);
         let got = cache.get(&addr);
         assert!(got.is_some());
+    }
+
+    #[test]
+    fn is_fresh_within_requires_tradable_and_respects_max_age() {
+        use alloy::primitives::U256;
+
+        let cache = StateCache::default();
+        let addr = Address::with_last_byte(9);
+        assert!(!cache.is_fresh_within(&addr, Duration::from_secs(1)));
+        cache.insert(addr, PoolState::Invalid);
+        assert!(!cache.is_fresh_within(&addr, Duration::from_secs(1)));
+        cache.insert(
+            addr,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(3u64),
+                fee_denominator: U256::from(1000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        assert!(cache.is_fresh_within(&addr, Duration::from_secs(1)));
+        assert!(!cache.is_fresh_within(&addr, Duration::ZERO));
+    }
+
+    #[test]
+    fn needs_fetch_true_for_missing_false_for_fresh_tradable() {
+        use alloy::primitives::U256;
+
+        let cache = StateCache::default();
+        let missing = Address::with_last_byte(1);
+        let fresh = Address::with_last_byte(2);
+        assert!(cache.needs_fetch(&missing));
+        cache.insert(
+            fresh,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(3u64),
+                fee_denominator: U256::from(1000u64),
+                block_timestamp_last: 1,
+            }),
+        );
+        assert!(!cache.needs_fetch(&fresh));
     }
 
     #[test]

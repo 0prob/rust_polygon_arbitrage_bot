@@ -233,9 +233,13 @@ impl GasOracle {
     }
 
     pub async fn refresh_once<P: Provider<Ethereum>>(&self, provider: &P) -> anyhow::Result<()> {
-        let block = provider
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await?
+        // One RTT instead of two sequential — tip fetch does not depend on the block body.
+        let (block_res, tip_res) = tokio::join!(
+            provider.get_block_by_number(BlockNumberOrTag::Latest),
+            provider.get_max_priority_fee_per_gas(),
+        );
+
+        let block = block_res?
             .ok_or_else(|| anyhow::anyhow!("latest block unavailable"))?;
 
         let base_fee = block
@@ -244,17 +248,16 @@ impl GasOracle {
             .map(U256::from)
             .ok_or_else(|| anyhow::anyhow!("block header missing base_fee_per_gas"))?;
 
-        let (mut priority_fee, mut priority_fee_source) =
-            match provider.get_max_priority_fee_per_gas().await {
-                Ok(v) => (U256::from(v), "rpc"),
-                Err(_e) => (
-                    self.snapshot
-                        .load()
-                        .as_deref()
-                        .map_or(U256::ZERO, |snap| snap.priority_fee),
-                    "previous_snapshot",
-                ),
-            };
+        let (mut priority_fee, mut priority_fee_source) = match tip_res {
+            Ok(v) => (U256::from(v), "rpc"),
+            Err(_e) => (
+                self.snapshot
+                    .load()
+                    .as_deref()
+                    .map_or(U256::ZERO, |snap| snap.priority_fee),
+                "previous_snapshot",
+            ),
+        };
         if priority_fee.is_zero() {
             priority_fee = MIN_PRIORITY_FEE_PER_GAS;
             priority_fee_source = "fallback_min_priority";

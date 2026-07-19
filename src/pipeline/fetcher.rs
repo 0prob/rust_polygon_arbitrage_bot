@@ -24,16 +24,18 @@ const V4_FETCH_BIAS: usize = 4;
 /// Discovery rows scanned per LF pass for never-fetched pools (full list is ~260k).
 const NEVER_FETCH_SCAN_CHUNK: usize = 12_288;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchTargetsResult {
     pub updated: usize,
     pub attempted: bool,
     pub rate_limited: bool,
+    /// Addresses selected for this attempt (for incremental URL fallback).
+    pub targeted: Vec<Address>,
 }
 
 impl FetchTargetsResult {
     #[must_use]
-    pub fn requires_provider_fallback(self) -> bool {
+    pub fn requires_provider_fallback(&self) -> bool {
         self.attempted && (self.updated == 0 || self.rate_limited)
     }
 }
@@ -235,6 +237,7 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
         updated: updated_v2.saturating_add(updated_other),
         attempted: true,
         rate_limited: v2_fetch.rate_limited || other_fetch.rate_limited,
+        targeted: targets.iter().map(|t| t.address).collect(),
     }
 }
 
@@ -447,6 +450,7 @@ mod tests {
             updated: 3,
             attempted: true,
             rate_limited: true,
+            ..FetchTargetsResult::default()
         };
 
         assert!(result.requires_provider_fallback());
@@ -458,6 +462,7 @@ mod tests {
             updated: 3,
             attempted: true,
             rate_limited: false,
+            ..FetchTargetsResult::default()
         };
 
         assert!(!result.requires_provider_fallback());

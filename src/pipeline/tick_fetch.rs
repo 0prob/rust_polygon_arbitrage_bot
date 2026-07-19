@@ -112,6 +112,8 @@ fn clear_empty_v4_tick_cooldown(pool_id: FixedBytes<32>) {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TickEnrichment {
     pub loaded: usize,
+    /// True when still-empty targets should retry on another state URL
+    /// (hard RPC failure, or incomplete multicall left empties).
     pub rpc_failed: bool,
     /// TickLens/bitmap returned complete words but zero populated ticks.
     pub empty_pools: usize,
@@ -164,6 +166,42 @@ pub fn clear_v4_pool_ticks(arena: &mut StateArena, targets: &[(PoolIndex, FixedB
             state.ticks = Arc::from([]);
         }
     }
+}
+
+/// Addresses among `pools` whose V3 state is still tickless.
+#[must_use]
+pub fn still_tickless_v3(arena: &StateArena, pools: &[Address]) -> Vec<Address> {
+    pools
+        .iter()
+        .copied()
+        .filter(|addr| {
+            let Some(&idx) = arena.address_to_pool().get(addr) else {
+                return false;
+            };
+            matches!(
+                arena.pool_state(idx),
+                Some(crate::core::types::PoolState::V3(s)) if s.ticks.is_empty()
+            )
+        })
+        .collect()
+}
+
+/// V4 targets among `targets` whose state is still tickless.
+#[must_use]
+pub fn still_tickless_v4(
+    arena: &StateArena,
+    targets: &[(PoolIndex, FixedBytes<32>)],
+) -> Vec<(PoolIndex, FixedBytes<32>)> {
+    targets
+        .iter()
+        .copied()
+        .filter(|(idx, _)| {
+            matches!(
+                arena.pool_state(*idx),
+                Some(crate::core::types::PoolState::V4(s)) if s.ticks.is_empty()
+            )
+        })
+        .collect()
 }
 
 /// Compressed tick index (`floor(tick / spacing)`) matching Uniswap V3 tick bitmap math.
@@ -483,9 +521,11 @@ pub async fn enrich_v3_ticks<
             _ => {}
         }
     }
-    // Only cooldown after a completed probe — an RPC failure means these pools
-    // were never actually checked, and suppressing them 45s hides live ticks.
-    if !still_tickless.is_empty() && !tick_lens_rpc_failed && !algebra.rpc_failed {
+    // URL fallback when empties remain after hard RPC fail or incomplete words.
+    // Genuinely empty (complete probe) gets cooldown instead — not another URL.
+    let needs_url_fallback = !still_tickless.is_empty()
+        && (tick_lens_rpc_failed || algebra.rpc_failed || incomplete_pools > 0);
+    if !still_tickless.is_empty() && !needs_url_fallback {
         mark_empty_tick_cooldown(still_tickless.iter().copied());
     }
 
@@ -530,11 +570,12 @@ pub async fn enrich_v3_ticks<
     }
     TickEnrichment {
         loaded: updated,
-        // Fail closed only when both TickLens and Algebra produced nothing.
-        rpc_failed: (tick_lens_rpc_failed || algebra.rpc_failed) && updated == 0,
+        rpc_failed: needs_url_fallback,
         empty_pools,
         incomplete_pools,
-        algebra_loaded: algebra.loaded.saturating_add(wide_loaded),
+        // Wide TickLens pass counts toward hydrated pools; keep separate from
+        // algebra_loaded for diagnostics (was previously summed into this field).
+        algebra_loaded: algebra.loaded,
         ..TickEnrichment::default()
     }
 }
@@ -842,8 +883,8 @@ pub async fn enrich_v4_ticks<
         }
     }
 
-    // Cooldown pools that remain empty after the full attempt; clear on success.
-    // (RPC failures return early above, so this only runs on completed probes.)
+    // Cooldown pools that remain empty after a completed probe; clear on success.
+    // (Hard RPC failures return early above. Incomplete/capped → URL fallback.)
     let mut still_tickless: Vec<FixedBytes<32>> = Vec::new();
     for &(idx, pool_id) in targets {
         match arena.pool_state(idx) {
@@ -856,7 +897,9 @@ pub async fn enrich_v4_ticks<
             _ => {}
         }
     }
-    if !still_tickless.is_empty() {
+    let incomplete_count = incomplete_pools.len();
+    let needs_url_fallback = !still_tickless.is_empty() && (incomplete_count > 0 || capped);
+    if !still_tickless.is_empty() && !needs_url_fallback {
         mark_empty_v4_tick_cooldown(still_tickless.iter().copied());
     }
 
@@ -880,8 +923,9 @@ pub async fn enrich_v4_ticks<
 
     TickEnrichment {
         loaded: updated,
+        rpc_failed: needs_url_fallback,
         empty_pools,
-        incomplete_pools: incomplete_pools.len(),
+        incomplete_pools: incomplete_count,
         ..TickEnrichment::default()
     }
 }
@@ -1202,5 +1246,50 @@ mod tests {
 
         assert_eq!(result.loaded, 5);
         assert!(result.rpc_failed);
+    }
+
+    #[test]
+    fn still_tickless_v3_filters_hydrated_pools() {
+        use crate::core::types::{PoolState, V3PoolState, V3Tick};
+        use alloy::primitives::{Address, U256};
+        use std::sync::Arc;
+
+        let empty_addr = Address::from([1u8; 20]);
+        let hydrated_addr = Address::from([2u8; 20]);
+        let mut arena = StateArena::default();
+        arena.register_pool(
+            empty_addr,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from([]),
+            })),
+        );
+        arena.register_pool(
+            hydrated_addr,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from([V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1,
+                    liquidity_net: 1,
+                }]),
+            })),
+        );
+        let still = still_tickless_v3(&arena, &[empty_addr, hydrated_addr]);
+        assert_eq!(still, vec![empty_addr]);
     }
 }

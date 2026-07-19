@@ -82,7 +82,8 @@ impl SnapshotStore {
 
     /// Latest merged token/MATIC rates from the published LF snapshot.
     pub fn token_to_matic_rates(&self) -> Arc<FxHashMap<TokenIndex, U256>> {
-        Arc::clone(&self.read().token_to_matic_rates)
+        // `load()` avoids cloning the whole snapshot Arc just to grab rates.
+        Arc::clone(&self.inner.load().token_to_matic_rates)
     }
 
     pub fn publish(&self, mut snapshot: HfSnapshot) {

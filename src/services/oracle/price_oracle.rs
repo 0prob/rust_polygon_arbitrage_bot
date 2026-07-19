@@ -666,10 +666,17 @@ impl PriceOracle {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let chunks: Vec<&[&str]> = ids.chunks(PYTH_FETCH_CHUNK).collect();
+        if chunks.len() == 1 {
+            return self.fetch_pyth_chunk(chunks[0]).await;
+        }
+        // Parallel Hermes GETs — cold LF enrich often has 2+ chunks of feed ids.
+        let results =
+            futures_util::future::join_all(chunks.iter().map(|chunk| self.fetch_pyth_chunk(chunk)))
+                .await;
         let mut out = HashMap::with_capacity(ids.len());
-        for chunk in ids.chunks(PYTH_FETCH_CHUNK) {
-            let batch = self.fetch_pyth_chunk(chunk).await?;
-            out.extend(batch);
+        for batch in results {
+            out.extend(batch?);
         }
         Ok(out)
     }

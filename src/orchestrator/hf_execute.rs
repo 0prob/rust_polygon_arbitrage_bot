@@ -19,7 +19,7 @@ use crate::pipeline::local_sim::{self, simulate_route_detailed};
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
     is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, mark_tick_hydrate_timeout_cooldown,
-    mark_v4_tick_hydrate_timeout_cooldown,
+    mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
 };
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
@@ -74,8 +74,14 @@ async fn refresh_route_pools_into_arena(
         return Ok((false, cache.generation()));
     }
     let pool_count = pools.len();
+    // Keep tradable entries fresher than ~1.5s (same HF tick / prefetch). Blind
+    // remove + 429 left dispatch with tickless arena and aborted the candidate.
+    // Fresh Invalid is not kept — `is_fresh_within` requires tradable.
+    const DISPATCH_CACHE_FRESH: std::time::Duration = std::time::Duration::from_millis(1_500);
     for pool in pools {
-        cache.remove(pool);
+        if !cache.is_fresh_within(pool, DISPATCH_CACHE_FRESH) {
+            cache.remove(pool);
+        }
     }
     let result = refresh
         .refresh_pool_states_for(pools, pool_count)
@@ -829,9 +835,12 @@ fn dispatch_cl_tick_snapshot(
 }
 
 fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, Arc<[V3Tick]>)>) {
+    // Only restore pools that are still empty — keep any family that hydrated.
     for (index, ticks) in snapshots {
         match arena.pool_state_mut(index) {
-            Some(PoolState::V3(state)) | Some(PoolState::V4(state)) => state.ticks = ticks,
+            Some(PoolState::V3(state)) | Some(PoolState::V4(state)) if state.ticks.is_empty() => {
+                state.ticks = ticks;
+            }
             _ => {}
         }
     }
@@ -1074,47 +1083,63 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     }
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
+    // Clear once — URL retry must not wipe a family that already hydrated.
+    crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &v3);
+    crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4);
+    let mut v3_pending = !v3.is_empty();
+    let mut v4_pending = !v4.is_empty();
     for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
         let Ok(provider) = rpc.connect_state_at(url) else {
             rpc.deprioritize_state_url(url);
             continue;
         };
-        // Only clear pools we are about to refetch (preserve already-hydrated ticks).
-        crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &v3);
-        crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4);
-        let v3_res = enrich_v3_ticks(
-            &provider,
-            arena,
-            &v3,
-            word_range,
-            &algebra_pools,
-            &algebra_integral_pools,
-            block_number,
-        )
-        .await;
-        let v4_res = enrich_v4_ticks(&provider, arena, &v4, word_range, block_number).await;
-        if !v3_res.rpc_failed && !v4_res.rpc_failed {
+        if v3_pending {
+            let needed = still_tickless_v3(arena, &v3);
+            if needed.is_empty() {
+                v3_pending = false;
+            } else {
+                let res = enrich_v3_ticks(
+                    &provider,
+                    arena,
+                    &needed,
+                    word_range,
+                    &algebra_pools,
+                    &algebra_integral_pools,
+                    block_number,
+                )
+                .await;
+                stats.v3_loaded = stats.v3_loaded.saturating_add(res.loaded);
+                stats.v3_empty = res.empty_pools;
+                stats.v3_incomplete = res.incomplete_pools;
+                stats.v3_algebra_loaded = stats.v3_algebra_loaded.saturating_add(res.algebra_loaded);
+                stats.v3_seeded = res.seeded_pools;
+                v3_pending = res.rpc_failed;
+            }
+        }
+        if v4_pending {
+            let needed = still_tickless_v4(arena, &v4);
+            if needed.is_empty() {
+                v4_pending = false;
+            } else {
+                let res = enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
+                stats.v4_loaded = stats.v4_loaded.saturating_add(res.loaded);
+                v4_pending = res.rpc_failed;
+            }
+        }
+        if !v3_pending && !v4_pending {
             if url_index > 0 {
                 crate::info!(
                     "hf probe-tick hydrate fallback ok (url_index={url_index}, v3_loaded={}, v4_loaded={})",
-                    v3_res.loaded,
-                    v4_res.loaded,
+                    stats.v3_loaded,
+                    stats.v4_loaded,
                 );
             }
-            stats.v3_loaded = v3_res.loaded;
-            stats.v3_empty = v3_res.empty_pools;
-            stats.v3_incomplete = v3_res.incomplete_pools;
-            stats.v3_algebra_loaded = v3_res.algebra_loaded;
-            stats.v3_seeded = v3_res.seeded_pools;
-            stats.v4_loaded = v4_res.loaded;
             stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
             return stats;
         }
         rpc.deprioritize_state_url(url);
         crate::warn!(
-            "hf probe-tick hydrate RPC failed — trying fallback (url_index={url_index}, v3_failed={}, v4_failed={})",
-            v3_res.rpc_failed,
-            v4_res.rpc_failed,
+            "hf probe-tick hydrate RPC failed — trying fallback (url_index={url_index}, v3_pending={v3_pending}, v4_pending={v4_pending})"
         );
     }
     stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
@@ -1132,52 +1157,71 @@ async fn enrich_dispatch_cl_ticks(
     if cycles.is_empty() {
         return;
     }
-    let tick_pools = collect_v3_pool_addresses(arena, cycles);
-    let v4_targets = collect_v4_tick_targets(cycles, pool_metas);
+    // Mirror LF: only hydrate pools that are still tickless after route refresh.
+    let tick_pools = still_tickless_v3(arena, &collect_v3_pool_addresses(arena, cycles));
+    let v4_targets = still_tickless_v4(arena, &collect_v4_tick_targets(cycles, pool_metas));
     if tick_pools.is_empty() && v4_targets.is_empty() {
         return;
     }
     let snapshots = dispatch_cl_tick_snapshot(arena, &tick_pools, &v4_targets);
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
+    crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
+    crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
+    let mut v3_pending = !tick_pools.is_empty();
+    let mut v4_pending = !v4_targets.is_empty();
+    let mut v3_loaded = 0usize;
+    let mut v4_loaded = 0usize;
     for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
         let Ok(provider) = rpc.connect_state_at(url) else {
             rpc.deprioritize_state_url(url);
             continue;
         };
-        crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
-        crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
-        let v3_loaded = enrich_v3_ticks(
-            &provider,
-            arena,
-            &tick_pools,
-            word_range,
-            &algebra_pools,
-            &algebra_integral_pools,
-            block_number,
-        )
-        .await;
-        let v4_loaded =
-            enrich_v4_ticks(&provider, arena, &v4_targets, word_range, block_number).await;
-        if !v3_loaded.rpc_failed && !v4_loaded.rpc_failed {
+        if v3_pending {
+            let needed = still_tickless_v3(arena, &tick_pools);
+            if needed.is_empty() {
+                v3_pending = false;
+            } else {
+                let res = enrich_v3_ticks(
+                    &provider,
+                    arena,
+                    &needed,
+                    word_range,
+                    &algebra_pools,
+                    &algebra_integral_pools,
+                    block_number,
+                )
+                .await;
+                v3_loaded = v3_loaded.saturating_add(res.loaded);
+                v3_pending = res.rpc_failed;
+            }
+        }
+        if v4_pending {
+            let needed = still_tickless_v4(arena, &v4_targets);
+            if needed.is_empty() {
+                v4_pending = false;
+            } else {
+                let res =
+                    enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
+                v4_loaded = v4_loaded.saturating_add(res.loaded);
+                v4_pending = res.rpc_failed;
+            }
+        }
+        if !v3_pending && !v4_pending {
             if url_index > 0 {
                 crate::info!(
-                    "dispatch tick hydration fallback succeeded (url_index={url_index}, v3_loaded={}, v4_loaded={})",
-                    v3_loaded.loaded,
-                    v4_loaded.loaded,
+                    "dispatch tick hydration fallback succeeded (url_index={url_index}, v3_loaded={v3_loaded}, v4_loaded={v4_loaded})",
                 );
             }
             return;
         }
         rpc.deprioritize_state_url(url);
         crate::warn!(
-            "dispatch tick hydration RPC failed — trying fallback (url_index={url_index}, v3_failed={}, v4_failed={})",
-            v3_loaded.rpc_failed,
-            v4_loaded.rpc_failed,
+            "dispatch tick hydration RPC failed — trying fallback (url_index={url_index}, v3_pending={v3_pending}, v4_pending={v4_pending})"
         );
     }
     restore_dispatch_cl_ticks(arena, snapshots);
-    crate::warn!("dispatch tick hydration failed on all state RPCs — retained prior ticks");
+    crate::warn!("dispatch tick hydration failed on all state RPCs — retained prior ticks for still-empty pools");
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
@@ -1744,6 +1788,45 @@ mod tests {
         };
         assert_eq!(state.ticks.len(), 1);
         assert_eq!(state.ticks[0].tick, -60);
+    }
+
+    #[test]
+    fn restore_dispatch_cl_ticks_keeps_hydrated_ticks() {
+        let address = alloy::primitives::Address::from([3u8; 20]);
+        let mut arena = StateArena::default();
+        let pool = arena.register_pool(
+            address,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60,
+                    liquidity_gross: 1_000_000,
+                    liquidity_net: 1_000_000,
+                }]),
+            })),
+        );
+        let snapshots = dispatch_cl_tick_snapshot(&arena, &[address], &[]);
+        // Simulate successful hydrate with a different tick set.
+        if let Some(PoolState::V3(state)) = arena.pool_state_mut(pool) {
+            state.ticks = Arc::from(vec![V3Tick {
+                tick: 60,
+                liquidity_gross: 2_000_000,
+                liquidity_net: -2_000_000,
+            }]);
+        }
+        restore_dispatch_cl_ticks(&mut arena, snapshots);
+        let Some(PoolState::V3(state)) = arena.pool_state(pool) else {
+            panic!("registered pool must retain V3 state");
+        };
+        assert_eq!(state.ticks.len(), 1);
+        assert_eq!(state.ticks[0].tick, 60);
     }
 
     #[test]
