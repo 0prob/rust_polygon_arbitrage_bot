@@ -111,7 +111,9 @@ pub fn log(level: &'static str, module: &'static str, mut message: String) {
     };
     match logger.sender.try_send(Command::Event(event)) {
         Err(TrySendError::Full(Command::Event(event))) => {
-            if log_level_rank(event.level) <= LEVEL_DEBUG {
+            // Silently discard DEBUG/TRACE under backpressure; count INFO+ so the
+            // writer can emit a saturation warning (inverted `<=` used to hide ERROR).
+            if log_level_rank(event.level) >= LEVEL_DEBUG {
                 return;
             }
             DROPPED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -278,5 +280,20 @@ mod tests {
     fn terminal_line_is_concise_and_sanitized() {
         let line = render_terminal("WARN", "execution", "failed\n\u{1b}[2J", "", "");
         assert_eq!(line, "WARN  execution    failed\\n\\u{1b}[2J\n");
+    }
+
+    #[test]
+    fn queue_full_counts_info_plus_not_debug_trace() {
+        use super::{LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank};
+        // INFO+ must be countable under saturation; DEBUG/TRACE are silent drops.
+        assert!(log_level_rank("ERROR") < LEVEL_DEBUG);
+        assert!(log_level_rank("WARN") < LEVEL_DEBUG);
+        assert!(log_level_rank("INFO") < LEVEL_DEBUG);
+        assert!(log_level_rank("DEBUG") >= LEVEL_DEBUG);
+        assert!(log_level_rank("TRACE") >= LEVEL_DEBUG);
+        assert_eq!(log_level_rank("ERROR"), LEVEL_ERROR);
+        assert_eq!(log_level_rank("WARN"), LEVEL_WARN);
+        assert_eq!(log_level_rank("INFO"), LEVEL_INFO);
+        assert_eq!(log_level_rank("TRACE"), LEVEL_TRACE);
     }
 }

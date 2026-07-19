@@ -122,7 +122,7 @@ fn pin_cycles_touching_pools(
             }
         }
     }
-    crate::info!(
+    crate::debug!(
         "stream observed-live: pinned_cycles={pin_kept} total={} (cap={max_cycles})",
         pinned.len()
     );
@@ -416,7 +416,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
     if missing_graph_pools > 0 {
         let stats = crate::pipeline::graph::topology_stats(graph.as_ref());
         stats.log_summary("patch_attach");
-        crate::info!(
+        crate::debug!(
             "lf graph patch: attached {missing_graph_pools} eligible pools missing from cached adjacency"
         );
         // Preserve cycle cache through attach — short incremental DFS merges new routes.
@@ -489,7 +489,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         let obs_starts =
             observed_pool_start_tokens(work.pool_metas.as_ref(), &work.observed_pool_indices);
         if !obs_starts.is_empty() {
-            crate::info!(
+            crate::debug!(
                 "stream observed-live: dfs_seed tokens={} pools={} incremental={incremental_refind} lf_pass={}",
                 obs_starts.len(),
                 work.observed_pool_indices.len(),
@@ -659,7 +659,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let observed_raw = ctx.partial_cache.take_observed_live();
     let observed = ctx.refresh.filter_observed_live_routable(&observed_raw);
     if !observed_raw.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: topic_n={} routable={} skipped={}",
             observed_raw.len(),
             observed.len(),
@@ -677,7 +677,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .refresh_pool_states_for(&observed, observed.len().min(64))
             .await
         {
-            Ok(result) => crate::info!(
+            Ok(result) => crate::debug!(
                 "stream observed-live: refresh matched={} targeted_updated={}",
                 result.matched,
                 result.updated
@@ -958,7 +958,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .count()
     };
     if !observed_pin.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: pre_hold_touching={pre_hold_touching}/{} lf_pass={lf_pass}",
             capped.len()
         );
@@ -1012,7 +1012,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 }
             }
         }
-        crate::info!(
+        crate::debug!(
             "stream observed-live: live_held={} snap_total={}",
             merged
                 .iter()
@@ -1241,7 +1241,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     .any(|edge| observed_pin_set.contains(&edge.pool_index))
             })
             .count();
-        crate::info!(
+        crate::debug!(
             "stream observed-live: cycles_touching={touching}/{} observed_pools={} lf_pass={lf_pass}",
             capped.len(),
             observed_pin.len()
@@ -1291,7 +1291,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         pools.len(),
         resolvable_count
     );
-    crate::info!(
+    crate::debug!(
         "lf latency: total_ms={} discovery_ms={} refresh_ms={} arena_sync_ms={} cpu_ms={} post_cpu_ms={} ticks_ms={} v3_tick_targets={} v3_ticks_loaded={} v3_ticks_ms={} v4_tick_targets={} v4_ticks_loaded={} v4_ticks_ms={} finalize_ms={} cycle_and_rates_ms={} rates_ms={} refreshed_pools={} cycle_search_ms={}",
         crate::util::now_ms().saturating_sub(lf_started),
         discovery_ms,
@@ -1474,7 +1474,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         false
     };
     if !observed.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: arena_hit={}/{} nudged_hf={}",
             observed_in_arena.len(),
             observed.len(),

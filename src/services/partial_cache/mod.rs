@@ -214,7 +214,7 @@ impl PartialPoolCache {
             }
         }
         if woke > 0 {
-            crate::info!("stream observed-live: synthetic wake for {woke} admitted pools");
+            crate::debug!("stream observed-live: synthetic wake for {woke} admitted pools");
             self.trigger.notify();
         }
     }

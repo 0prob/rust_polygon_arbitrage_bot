@@ -181,18 +181,6 @@ pub struct RouteSummary {
     pub status: RouteStatus,
 }
 
-#[derive(Debug, Clone)]
-pub struct SimulationRow {
-    pub fingerprint: u64,
-    pub route: String,
-    pub amount_in: String,
-    pub amount_out: String,
-    pub gross_profit: String,
-    pub net_profit: String,
-    pub gas: u32,
-    pub note: String,
-}
-
 /// Execute-faithful HF pipeline row (from HF assess with real gates), not LF soft scout.
 #[derive(Debug, Clone)]
 pub struct HfPipelineRow {
@@ -266,7 +254,6 @@ pub struct DashboardSnapshot {
     pub overview: OverviewSnapshot,
     pub graph: GraphSnapshot,
     pub opportunities: Arc<Vec<RouteSummary>>,
-    pub simulations: Arc<Vec<SimulationRow>>,
     pub portfolio: Vec<PortfolioRow>,
     pub diagnostics: Vec<KeyValueRow>,
     pub config: Vec<KeyValueRow>,
@@ -279,7 +266,6 @@ pub struct App {
     pub search: String,
     pub sort_mode: SortMode,
     pub selected_index: usize,
-    pub scroll: usize,
     pub snapshot: Option<Arc<DashboardSnapshot>>,
     pub activity: VecDeque<ActivityItem>,
     pub trade_history: VecDeque<TradeRow>,
@@ -293,7 +279,6 @@ pub struct App {
     pub last_hf_ms: u64,
     pub last_cycles_considered: usize,
     pub last_profitable_count: usize,
-    pub last_best_profit_wei: Option<String>,
     /// Post-verify HF assess/dispatch rows from the latest HF tick (execute-faithful).
     pub hf_candidates: Vec<HfPipelineRow>,
     pub should_quit: bool,
@@ -334,7 +319,6 @@ impl App {
             search: String::new(),
             sort_mode: SortMode::Score,
             selected_index: 0,
-            scroll: 0,
             snapshot: None,
             activity: VecDeque::with_capacity(128),
             trade_history: VecDeque::with_capacity(128),
@@ -348,7 +332,6 @@ impl App {
             last_hf_ms: 0,
             last_cycles_considered: 0,
             last_profitable_count: 0,
-            last_best_profit_wei: None,
             hf_candidates: Vec::new(),
             should_quit: false,
             snapshot_refresh_pending: false,
@@ -520,34 +503,28 @@ impl App {
     pub fn select_next(&mut self) {
         let len = self.current_rows_len().max(1);
         self.selected_index = (self.selected_index + 1).min(len.saturating_sub(1));
-        self.scroll = self.scroll.min(self.selected_index);
     }
 
     pub fn select_prev(&mut self) {
         self.selected_index = self.selected_index.saturating_sub(1);
-        self.scroll = self.scroll.min(self.selected_index);
     }
 
     pub fn select_top(&mut self) {
         self.selected_index = 0;
-        self.scroll = 0;
     }
 
     pub fn select_bottom(&mut self) {
         let len = self.current_rows_len();
         self.selected_index = len.saturating_sub(1);
-        self.scroll = self.selected_index.saturating_sub(10);
     }
 
     fn normalize_selection(&mut self) {
         let len = self.current_rows_len();
         if len == 0 {
             self.selected_index = 0;
-            self.scroll = 0;
             return;
         }
         self.selected_index = self.selected_index.min(len - 1);
-        self.scroll = self.scroll.min(self.selected_index);
     }
 
     pub fn cycle_tab(&mut self, step: isize) {
@@ -776,14 +753,12 @@ impl App {
         &mut self,
         cycles_considered: usize,
         profitable_count: usize,
-        best_profit_wei: String,
         elapsed_ms: u64,
         candidates: Vec<HfCandidateUiRow>,
     ) {
         self.last_cycles_considered = cycles_considered;
         self.last_profitable_count = profitable_count;
         self.last_hf_ms = elapsed_ms;
-        self.last_best_profit_wei = Some(best_profit_wei);
         // Preserve outcomes already observed for the same fingerprints this session.
         let prior_outcomes: rustc_hash::FxHashMap<u64, (String, Severity)> = self
             .hf_candidates
@@ -947,7 +922,6 @@ mod tests {
                 recent_discoveries: Vec::new(),
             },
             opportunities: Arc::new(opportunities),
-            simulations: Arc::new(Vec::new()),
             portfolio: Vec::new(),
             diagnostics: Vec::new(),
             config: Vec::new(),
@@ -1065,7 +1039,7 @@ mod tests {
         );
         assert!(app.chart_profitable.is_empty());
 
-        app.apply_hf_sample(9, 3, "100".into(), 7, Vec::new());
+        app.apply_hf_sample(9, 3, 7, Vec::new());
         assert_eq!(app.last_cycle_count, 17);
         assert_eq!(app.last_cycles_considered, 9);
         assert_eq!(app.last_search_ms, 23);
@@ -1111,7 +1085,6 @@ mod tests {
         app.apply_hf_sample(
             4,
             1,
-            "100".into(),
             12,
             vec![HfCandidateUiRow {
                 fingerprint: 0xabc,

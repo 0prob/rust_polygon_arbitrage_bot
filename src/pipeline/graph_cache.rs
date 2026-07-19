@@ -221,7 +221,7 @@ impl GraphCache {
             );
         }
         if let Some(mode) = rescore_report.mode {
-            crate::info!(
+            crate::debug!(
                 "graph rescore: mode={mode:?} dirty_pools={} edges_touched={}",
                 rescore_report.dirty_pools,
                 rescore_report.edges_touched,

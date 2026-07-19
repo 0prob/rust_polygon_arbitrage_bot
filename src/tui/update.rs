@@ -27,8 +27,7 @@ use crate::util::{ten_pow_u256_cached as ten_pow_u256, truncate_str, u256_to_f64
 
 use super::app::{
     App, DashboardSnapshot, GraphHealth, GraphHubRow, GraphSnapshot, InputMode, KeyValueRow,
-    OverviewSnapshot, PortfolioRow, RouteStatus, RouteSummary, Severity, SimulationRow, SortMode,
-    TradeRow,
+    OverviewSnapshot, PortfolioRow, RouteStatus, RouteSummary, Severity, SortMode,
 };
 use super::events::UiEvent;
 use super::route_viz::{protocol_tag, route_fingerprint, short_address};
@@ -50,17 +49,10 @@ pub fn apply_event(app: &mut App, event: UiEvent) {
         UiEvent::HfTick {
             cycles_considered,
             profitable_count,
-            best_profit_wei,
             elapsed_ms,
             candidates,
         } => {
-            app.apply_hf_sample(
-                cycles_considered,
-                profitable_count,
-                best_profit_wei,
-                elapsed_ms,
-                candidates,
-            );
+            app.apply_hf_sample(cycles_considered, profitable_count, elapsed_ms, candidates);
         }
         UiEvent::GasUpdate { gwei } => {
             app.apply_gas_sample(gwei);
@@ -171,20 +163,12 @@ pub struct RuntimeSnapshotInput {
     pub execution_trades: u64,
     pub execution_losses: u64,
     pub daily_pnl_wei: i128,
-    pub total_profit_wei: i128,
-    pub total_trade_count: u64,
     pub gas_gwei: Option<f64>,
     pub hypersync_height: Option<u64>,
     pub matic_usd: f64,
     pub portfolio_rows: Vec<PortfolioRow>,
     pub diagnostics: Vec<KeyValueRow>,
     pub config_rows: Vec<KeyValueRow>,
-    pub history: Vec<TradeRow>,
-    pub last_search_ms: u64,
-    pub last_hf_ms: u64,
-    pub last_profitable: usize,
-    pub last_cycles_considered: usize,
-    pub last_best_profit_wei: Option<String>,
     pub route_cache: Option<RouteBuildCache>,
 }
 
@@ -193,21 +177,22 @@ pub struct RouteBuildCache {
     pub generation: u64,
     pub gas_gwei: Option<f64>,
     pub opportunities: Arc<Vec<RouteSummary>>,
-    pub simulations: Arc<Vec<SimulationRow>>,
 }
 
 pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
+    // LF/HF timings and profitable_routes are filled in by App::set_snapshot from the
+    // live event stream — poller placeholders would otherwise clobber them.
     let overview = OverviewSnapshot {
         uptime: input.started_at.elapsed(),
         total_trades: input.execution_trades,
         total_losses: input.execution_losses,
         daily_pnl_wei: input.daily_pnl_wei,
-        profitable_routes: input.last_profitable,
+        profitable_routes: 0,
         discovered_pools: input.snapshot.discovered_pools.len(),
         routable_pools: input.snapshot.pool_metas.len(),
         cycle_count: input.snapshot.cycles.len(),
-        search_ms: input.last_search_ms,
-        hf_ms: input.last_hf_ms,
+        search_ms: 0,
+        hf_ms: 0,
         gas_gwei: input.gas_gwei,
         win_rate: if input.execution_trades + input.execution_losses > 0 {
             input.execution_trades as f64 / (input.execution_trades + input.execution_losses) as f64
@@ -228,13 +213,10 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
         input.refresh.is_indexer_stale(),
     );
 
-    let (opportunities, simulations) = if let Some(cache) = input.route_cache {
-        (
-            Arc::clone(&cache.opportunities),
-            Arc::clone(&cache.simulations),
-        )
+    let opportunities = if let Some(cache) = input.route_cache {
+        Arc::clone(&cache.opportunities)
     } else {
-        let opportunities = build_routes(
+        Arc::new(build_routes(
             &input.snapshot,
             &input.arena,
             input.matic_usd,
@@ -242,9 +224,7 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             input.config.execution.slippage_bps,
             input.config.execution.profit_safety_multiplier_bps,
             48,
-        );
-        let simulations = build_simulations(&opportunities);
-        (Arc::new(opportunities), Arc::new(simulations))
+        ))
     };
 
     DashboardSnapshot {
@@ -253,7 +233,6 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
         overview,
         graph,
         opportunities,
-        simulations,
         portfolio: input.portfolio_rows,
         diagnostics: input.diagnostics,
         config: input.config_rows,
@@ -541,34 +520,11 @@ pub fn build_route_cache(
         safety_multiplier_bps,
         48,
     );
-    let simulations = build_simulations(&opportunities);
     RouteBuildCache {
         generation: snapshot.generation,
         gas_gwei,
         opportunities: Arc::new(opportunities),
-        simulations: Arc::new(simulations),
     }
-}
-
-fn build_simulations(routes: &[RouteSummary]) -> Vec<SimulationRow> {
-    routes
-        .iter()
-        .take(12)
-        .map(|route| {
-            let amount_in = route.amount_in_token.clone();
-            let amount_out = route.amount_out_token.clone();
-            SimulationRow {
-                fingerprint: route.fingerprint,
-                route: route.route.clone(),
-                amount_in,
-                amount_out,
-                gross_profit: format!("{:.4} MATIC", route.profit_matic),
-                net_profit: format!("{:.4} MATIC", route.net_profit_matic),
-                gas: route.gas_estimate,
-                note: format!("{} hops, score {:.4}", route.hops, route.rescored),
-            }
-        })
-        .collect()
 }
 
 fn build_route_row_parts(

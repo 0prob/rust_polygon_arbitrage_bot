@@ -48,7 +48,6 @@ pub fn spawn_snapshot_publisher(
             generation: 0,
             gas_gwei: None,
             opportunities: Arc::new(Vec::new()),
-            simulations: Arc::new(Vec::new()),
         };
 
         loop {
@@ -238,8 +237,7 @@ async fn build_ui_snapshot(
         .execution
         .total_losses
         .load(std::sync::atomic::Ordering::Relaxed);
-    let (total_profit_wei, daily_pnl_wei) = ctx.execution.pnl_snapshot();
-    let total_trade_count = execution_trades + execution_losses;
+    let (_, daily_pnl_wei) = ctx.execution.pnl_snapshot();
     let runtime_input = RuntimeSnapshotInput {
         started_at,
         snapshot: Arc::clone(&snap),
@@ -249,20 +247,12 @@ async fn build_ui_snapshot(
         execution_trades,
         execution_losses,
         daily_pnl_wei,
-        total_profit_wei,
-        total_trade_count,
         gas_gwei,
         hypersync_height,
         matic_usd,
         portfolio_rows: portfolio_rows.clone(),
         diagnostics,
         config_rows,
-        history: Vec::new(),
-        last_search_ms: 0,
-        last_hf_ms: 0,
-        last_profitable: 0,
-        last_cycles_considered: snap.cycles.len(),
-        last_best_profit_wei: None,
         route_cache: Some(route_cache.clone()),
     };
 

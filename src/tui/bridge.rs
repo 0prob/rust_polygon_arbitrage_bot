@@ -61,7 +61,7 @@ impl TuiBridge {
     }
 
     #[must_use]
-    pub fn hook(&self) -> SharedTuiHook {
+    pub fn hook(&self) -> Arc<dyn PipelineUiHook> {
         Arc::new(TuiBridgeHook {
             tx: self.tx.clone(),
             coalesce: Arc::clone(&self.coalesce),
@@ -84,9 +84,7 @@ impl TuiBridge {
     }
 }
 
-pub type SharedTuiHook = Arc<dyn PipelineUiHook>;
-
-pub struct TuiBridgeHook {
+struct TuiBridgeHook {
     tx: Sender<UiEvent>,
     coalesce: Arc<CoalescedUiMetrics>,
 }
@@ -131,7 +129,6 @@ impl PipelineUiHook for TuiBridgeHook {
         self.send_metric(UiEvent::HfTick {
             cycles_considered,
             profitable_count: result.profitable_count,
-            best_profit_wei: result.best_profit.to_string(),
             elapsed_ms: result.elapsed_ms,
             // Clone is O(dispatch size); same payload already built on the HF tick.
             candidates: result.candidates.clone(),

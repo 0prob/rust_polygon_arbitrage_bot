@@ -49,7 +49,7 @@ pub struct CycleSearchDiagnostics {
 
 impl CycleSearchDiagnostics {
     pub fn log_summary(&self) {
-        crate::info!(
+        crate::debug!(
             "cycle search: mode={:?} raw={} dedupe={} prefilter={} dfs={} bf={} hub_heavy={} starts={} enum_ms={} finalize_ms={}",
             self.mode,
             self.raw_collected,

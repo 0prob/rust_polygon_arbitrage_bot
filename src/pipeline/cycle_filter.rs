@@ -131,7 +131,7 @@ impl PrefilterDiagnostics {
         if self.merged_in == 0 {
             return;
         }
-        crate::info!(
+        crate::debug!(
             "cycle prefilter: in={} pruned_sim={} pruned_proto={} pruned_spot={} pruned_executor={} simulable={} window={} \
              keep={} gas_rescue={} spot_rescue={} rescue_cap_drop={} out={}",
             self.merged_in,

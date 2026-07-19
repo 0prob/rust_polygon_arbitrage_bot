@@ -10,5 +10,5 @@ pub mod update;
 pub mod widgets;
 
 pub use app::{App, DashboardSnapshot, Tab};
-pub use bridge::{TuiBridge, TuiBridgeHook};
+pub use bridge::TuiBridge;
 pub use run::run_tui;

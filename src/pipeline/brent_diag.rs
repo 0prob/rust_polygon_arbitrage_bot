@@ -333,7 +333,8 @@ pub fn log_brent_summary() {
     if attempts == 0 {
         return;
     }
-    crate::info!(
+    // ponytail: diagnostic dump — DEBUG so default INFO isn't flooded every HF eval.
+    crate::debug!(
         "brent: attempts={attempts} ok={ok} bounds_fail={} bal_bounds_fail={} cl_cap_fail={} floor_fail={} zero_profit={} sanity_fail={} \
          eval_sim={} eval_reject={} (sim_none={} zero={} sanity={}) \
          sim_none_sample(v2={} shallow={} tickless={} zero_out={} unsupported={} token_mismatch={} other={}) \

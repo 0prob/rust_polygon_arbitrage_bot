@@ -880,10 +880,17 @@ pub async fn run_hf_tick(
     let mut snap_state_block = snap.state_block;
     let mut snap_state_hash = snap.state_hash;
     drop(snap);
-    let log_hf_summary = should_log_hf_summary() || stream_triggered;
+    // Throttle only — stream_triggered used to bypass and spam INFO every wssobs tick.
+    let log_hf_summary = should_log_hf_summary();
     if log_hf_summary {
         crate::info!(
             "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} tickless_stuck_skip={tickless_stuck_skipped} proto_mismatch_skip={protocol_mismatch_skipped} v2_dead_skip={v2_dead_skipped} micro_dead_skip={micro_dead_skipped} bal_floor_dead_skip={bal_floor_dead_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
+            cycles.len(),
+            hot_pools_set.len(),
+        );
+    } else if stream_triggered {
+        crate::debug!(
+            "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 hot_pools={}",
             cycles.len(),
             hot_pools_set.len(),
         );
@@ -892,6 +899,10 @@ pub async fn run_hf_tick(
         if log_hf_summary {
             crate::info!(
                 "hf tick: 0 cycles after filter (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped}, stream_triggered={stream_triggered})"
+            );
+        } else if stream_triggered {
+            crate::debug!(
+                "hf tick: 0 cycles after filter (snap={snap_cycle_count}, stream_triggered=1)"
             );
         }
         // Do not re-notify here — that looped promote storms with selected=0
@@ -1535,16 +1546,21 @@ pub async fn run_hf_tick(
     let elapsed_ms = now_ms().saturating_sub(start);
 
     if cycles_considered > 0 {
-        let log_summary = profitable_count > 0 || stream_triggered || should_log_hf_summary();
+        // Reuse the early throttle flag — a second should_log_hf_summary() would miss.
+        let log_summary = profitable_count > 0 || log_hf_summary;
         if log_summary {
             crate::info!(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
             );
-            if profitable_count == 0 && eval_count > 0 {
-                crate::info!(
-                    "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
-                );
-            }
+        } else if stream_triggered {
+            crate::debug!(
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, stream_triggered=1)"
+            );
+        }
+        if profitable_count == 0 && eval_count > 0 && (log_summary || stream_triggered) {
+            crate::debug!(
+                "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
+            );
         }
         if eval_count == 0 {
             crate::debug!(

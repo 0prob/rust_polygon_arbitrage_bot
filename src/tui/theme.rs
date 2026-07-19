@@ -4,7 +4,6 @@ use ratatui::widgets::Block;
 
 use crate::tui::app::Severity;
 
-pub const BG: Color = Color::Rgb(10, 12, 20);
 pub const PANEL: Color = Color::Rgb(18, 22, 34);
 pub const PANEL_ALT: Color = Color::Rgb(24, 29, 44);
 pub const TEXT: Color = Color::Rgb(226, 231, 240);
@@ -13,7 +12,6 @@ pub const ACCENT: Color = Color::Rgb(105, 171, 255);
 pub const GOOD: Color = Color::Rgb(78, 201, 176);
 pub const WARN: Color = Color::Rgb(255, 184, 108);
 pub const BAD: Color = Color::Rgb(255, 96, 117);
-pub const HIGHLIGHT: Color = Color::Rgb(247, 198, 68);
 pub const TAB_BG: Color = Color::Rgb(14, 17, 27);
 
 #[must_use]
@@ -61,18 +59,6 @@ pub fn panel_block(label: &'static str) -> Block<'static> {
     Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(muted())
-        .style(Style::default().bg(PANEL))
-        .title(Line::from(vec![
-            Span::styled(" ", muted()),
-            Span::styled(label, title()),
-        ]))
-}
-
-#[must_use]
-pub fn panel_block_accent(label: &'static str) -> Block<'static> {
-    Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_style(accent())
         .style(Style::default().bg(PANEL))
         .title(Line::from(vec![
             Span::styled(" ", muted()),

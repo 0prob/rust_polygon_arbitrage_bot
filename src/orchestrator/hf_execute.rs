@@ -937,8 +937,8 @@ pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
 /// True when any V3/V4 hop's pool is on tick-miss cooldown.
 ///
 /// Previously used at HF selection (over-pruned to `selected=0`); select now uses
-/// [`cycle_tickless_cl_all_on_miss_cooldown`]. Kept for unit tests / hydrate helpers.
-#[allow(dead_code)]
+/// [`cycle_tickless_cl_all_on_miss_cooldown`].
+#[cfg(test)]
 pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
     arena: &StateArena,
     cycle: &FoundCycle,

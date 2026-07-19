@@ -987,7 +987,8 @@ impl EvalFailStats {
         if in_count == 0 {
             return;
         }
-        crate::info!(
+        // ponytail: per-eval diagnostic — DEBUG; default INFO already has throttled hf tick.
+        crate::debug!(
             "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} missing_decimals={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
             load(&self.quarantine),
             load(&self.executor_budget),

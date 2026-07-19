@@ -22,7 +22,6 @@ pub enum UiEvent {
     HfTick {
         cycles_considered: usize,
         profitable_count: usize,
-        best_profit_wei: String,
         elapsed_ms: u64,
         candidates: Vec<HfCandidateUiRow>,
     },

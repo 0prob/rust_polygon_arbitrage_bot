@@ -36,12 +36,6 @@ pub fn try_parse_flash_policy(raw: &str) -> Option<FlashLoanPolicy> {
     }
 }
 
-#[must_use]
-pub fn parse_flash_policy(raw: &str) -> FlashLoanPolicy {
-    // Legacy helper: prefer `try_parse_flash_policy` at config boundaries.
-    try_parse_flash_policy(raw).unwrap_or(FlashLoanPolicy::BalancerOnly)
-}
-
 #[cfg(test)]
 mod flash_policy_tests {
     use super::*;
@@ -381,11 +375,6 @@ fn marginal_shortfall_bps(
     let bps =
         (shortfall * BPS_SCALE / base_rate.max(U256::from(1u8))).min(BPS_SCALE - U256::from(1u8));
     u64::try_from(bps).unwrap_or(10_000)
-}
-
-#[must_use]
-pub fn depth_impact_slippage_bps(arena: &StateArena, edges: &[Edge], amount_in: U256) -> u64 {
-    depth_impact_slippage_bps_with_base(arena, edges, amount_in, None)
 }
 
 #[must_use]
