@@ -170,6 +170,8 @@ pub struct FeeSnapshot {
 
 pub const ROUTE_EXECUTION_GAS_OVERHEAD: u32 = 150_000;
 pub const PER_HOP_EXECUTOR_GAS_OVERHEAD: u32 = 30_000;
+/// Floor tip for assess + submit (Polygon MEV); shared so ranking matches live fees.
+pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([30_000_000_000, 0, 0, 0]);
 /// Raised post-revert (actual 1.87M vs sim 720k on BAL-ish ~2.6x); 25% buffer + fallback 50% for headroom w/o inflating sim gas used in net calc.
 pub const GAS_LIMIT_BUFFER_BPS: u64 = 2500;
 /// Extra headroom when RPC cannot return `estimate_gas` (Balancer batchSwap overflow).
@@ -306,7 +308,8 @@ pub fn estimate_route_gas_from_hops_evm(
 
 #[must_use]
 pub fn compute_conservative_gas_price(snapshot: FeeSnapshot) -> U256 {
-    snapshot.base_fee * U256::from(11_250u64) / U256::from(10_000u64) + snapshot.priority_fee
+    let priority = snapshot.priority_fee.max(MIN_PRIORITY_FEE_PER_GAS);
+    snapshot.base_fee * U256::from(11_250u64) / U256::from(10_000u64) + priority
 }
 
 /// Spot effective gas price for HF probe/Brent/assess (no 12.5% base-fee buffer).
@@ -314,7 +317,9 @@ pub fn compute_conservative_gas_price(snapshot: FeeSnapshot) -> U256 {
 /// was rejecting near-misses that could clear gas at the live tip.
 #[must_use]
 pub fn compute_assessment_gas_price(snapshot: FeeSnapshot) -> U256 {
-    snapshot.base_fee.saturating_add(snapshot.priority_fee)
+    snapshot
+        .base_fee
+        .saturating_add(snapshot.priority_fee.max(MIN_PRIORITY_FEE_PER_GAS))
 }
 
 // --- impact_slippage ---
@@ -439,6 +444,23 @@ mod tests {
             conservative,
             U256::from(200_000_000_000u64) * U256::from(11_250u64) / U256::from(10_000u64)
                 + U256::from(30_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn gas_price_helpers_floor_priority_to_min_tip() {
+        let snap = FeeSnapshot {
+            base_fee: U256::from(200_000_000_000u64),
+            priority_fee: U256::from(1u64),
+        };
+        assert_eq!(
+            compute_assessment_gas_price(snap),
+            U256::from(200_000_000_000u64) + MIN_PRIORITY_FEE_PER_GAS
+        );
+        assert_eq!(
+            compute_conservative_gas_price(snap),
+            U256::from(200_000_000_000u64) * U256::from(11_250u64) / U256::from(10_000u64)
+                + MIN_PRIORITY_FEE_PER_GAS
         );
     }
 

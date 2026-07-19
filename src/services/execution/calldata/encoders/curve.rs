@@ -33,7 +33,7 @@ pub fn encode_curve_hop(
 
     let i = hop.edge.token_in_idx as i128;
     let j = hop.edge.token_out_idx as i128;
-    crate::info!(
+    crate::debug!(
         "curve encode: pool={:#x} i={i} j={j} dx={} min_dy={min_dy} slip_bps={bps} in={:#x} out={:#x} type={:?}",
         hop.pool_address,
         hop.amount_in,

@@ -1608,7 +1608,7 @@ fn reassess_route(
     }))
 }
 
-/// Reuse HF assessment when sim profit + flash fee still match the planned source.
+/// Reuse HF assessment when sim profit + flash fee + gas model still match the planned source.
 fn reuse_or_reassess(
     input: &PrepareDispatchInput<'_>,
     source: FlashLoanSource,
@@ -1621,6 +1621,8 @@ fn reuse_or_reassess(
         && existing.should_execute
         && existing.gross_profit == input.evaluated.result.profit
         && assessment_flash_fee_matches(existing, source, input.evaluated.result.amount_in)
+        // Direct vs Balancer both have 0 flash fee but different gas seeds — require gas match.
+        && assessment_gas_matches(existing, input.evaluated.result.total_gas, input.gas_price)
     {
         return Some(existing.clone());
     }
@@ -1639,6 +1641,15 @@ fn assessment_flash_fee_matches(
         .map(|v| v / crate::core::constants::BPS_SCALE)
         .unwrap_or(U256::MAX);
     assessment.flash_loan_fee == expected
+}
+
+#[inline]
+fn assessment_gas_matches(assessment: &ProfitAssessment, simulated_gas: u32, gas_price: U256) -> bool {
+    // ponytail: gas_cost_wei = units × price; mismatch ⇒ flash/gas model drifted since HF eval.
+    match U256::from(simulated_gas).checked_mul(gas_price) {
+        Some(expected) => assessment.gas_cost_wei == expected,
+        None => false,
+    }
 }
 
 fn push_flash_token(

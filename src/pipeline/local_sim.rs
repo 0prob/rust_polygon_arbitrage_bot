@@ -223,6 +223,10 @@ fn simulate_hop(
                 edge.token_in_idx as usize,
                 edge.token_out_idx as usize,
             );
+            // Fail closed like Curve — Some(0) looked like a quote to hop callers.
+            if out.is_zero() {
+                return None;
+            }
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_BALANCER_HOP,
@@ -234,6 +238,9 @@ fn simulate_hop(
             // and the two only agree after DODO meta canonicalization.
             let base_to_quote = edge.token_in_idx == 0;
             let out = get_dodo_amount_out(s, amount_in, base_to_quote);
+            if out.is_zero() {
+                return None;
+            }
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_DODO_HOP,
@@ -255,6 +262,9 @@ fn simulate_hop(
             };
             let out =
                 get_woofi_amount_out(s, amount_in, in_is_quote, out_is_quote, base_in, base_out);
+            if out.is_zero() {
+                return None;
+            }
             Some(HopResult {
                 amount_out: out,
                 gas: GAS_WOOFI_HOP,
@@ -678,7 +688,8 @@ pub fn minimal_sim_failure(
             }
         }
         let Some(result) = simulate_hop(state, &edge, current, shallow_caps[hop]) else {
-            // CL shallow is the common simulate_hop None; curve math also returns None.
+            // CL shallow is the common simulate_hop None; curve / bal / dodo / woofi
+            // also return None on math or zero-out.
             if matches!(
                 edge.protocol,
                 ProtocolType::UniswapV3 | ProtocolType::UniswapV4
@@ -686,9 +697,6 @@ pub fn minimal_sim_failure(
                 // Cap/tickless already classified above; residual = in-swap shallow walk.
                 return Some(MinimalSimFailure::ShallowCl { hop });
             }
-            return Some(MinimalSimFailure::Math { hop });
-        };
-        if result.amount_out.is_zero() {
             if let (PoolState::Balancer(s), ProtocolType::BalancerV2) = (state, edge.protocol) {
                 let bal = s
                     .balances
@@ -698,7 +706,22 @@ pub fn minimal_sim_failure(
                 if crate::core::math::balancer::exceeds_balancer_max_in_ratio(current, bal) {
                     return Some(MinimalSimFailure::BalancerMaxInRatio { hop });
                 }
+                return Some(MinimalSimFailure::ZeroOutput {
+                    hop,
+                    protocol: ProtocolType::BalancerV2,
+                });
             }
+            if matches!(edge.protocol, ProtocolType::Dodo | ProtocolType::Woofi) {
+                return Some(MinimalSimFailure::ZeroOutput {
+                    hop,
+                    protocol: edge.protocol,
+                });
+            }
+            // Curve (and residual) math failures stay Math — not always size-monotonic.
+            return Some(MinimalSimFailure::Math { hop });
+        };
+        if result.amount_out.is_zero() {
+            // V2 can still surface Some(0) for dust; Balancer/Dodo/Woofi fail closed above.
             return Some(MinimalSimFailure::ZeroOutput {
                 hop,
                 protocol: edge.protocol,

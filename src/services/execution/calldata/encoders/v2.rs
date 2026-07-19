@@ -42,7 +42,7 @@ pub fn encode_v2_hop(
     if amount_out.is_zero() {
         anyhow::bail!("v2 hop quoted amountOut is zero");
     }
-    crate::info!(
+    crate::debug!(
         "v2 encode: pool={:#x} zfo={} ain={} aout={amount_out} slip_bps={bps} prefund={prefund:?} swap_to={swap_to:#x}",
         hop.pool_address,
         hop.edge.zero_for_one,

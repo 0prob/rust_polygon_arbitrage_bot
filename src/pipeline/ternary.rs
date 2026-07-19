@@ -48,6 +48,22 @@ const BRENT_CACHE_SLOTS: usize = BRENT_SEED_CACHE_SLOTS;
 const GOLDEN_RATIO: u128 = 382;
 const CONVERGENCE_DIVISOR: u128 = 1000;
 const DEFAULT_BRENT_ITERATIONS: u32 = 16;
+
+/// Depth/cap failures grow with size; meta/state mismatches do not.
+#[inline]
+fn sim_failure_is_size_monotonic(failure: Option<MinimalSimFailure>) -> bool {
+    matches!(
+        failure,
+        Some(
+            MinimalSimFailure::V2ReserveExhausted { .. }
+                | MinimalSimFailure::ClCapExceeded { .. }
+                | MinimalSimFailure::ShallowCl { .. }
+                | MinimalSimFailure::ClTickless { .. }
+                | MinimalSimFailure::BalancerMaxInRatio { .. }
+                | MinimalSimFailure::ZeroOutput { .. }
+        )
+    )
+}
 const DEFAULT_MAX_FLASH_LOAN_USD: u64 = 50_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -846,9 +862,11 @@ pub fn optimize_cycle(
     // re-sims the dead upper band thousands of times per tick (SimNone ~80%).
     let mut first_infeasible = high.saturating_add(U256::from(1u8));
     let evaluate = |amount: U256| -> U256 {
-        if amount < economic_floor || amount >= first_infeasible {
+        if amount < economic_floor {
             return U256::ZERO;
         }
+        // Cache/seeds before the infeasible wall — a spurious SimNone must not
+        // shadow a warm probe that already simulated above that amount.
         if let Some(sim) = sim_cache.get(&amount) {
             record_brent_cache_local();
             return brent_score_matic_from_sim(sim, amount, profit_ctx);
@@ -861,6 +879,9 @@ pub fn optimize_cycle(
                 sim_cache.insert(amount, cached);
             }
             return brent_score_matic_from_sim(&cached, amount, profit_ctx);
+        }
+        if amount >= first_infeasible {
+            return U256::ZERO;
         }
         record_brent_eval_sim();
         match simulate_route_minimal_with_caps(arena, edges, amount, brent_shallow_caps.as_ref()) {
@@ -898,10 +919,16 @@ pub fn optimize_cycle(
                 score
             }
             None => {
+                // Depth failures are monotonic — wall the upper band. Sampled
+                // non-monotonic kinds (UnsupportedState / TokenMismatch / Math)
+                // undo the wall so Brent can still search.
                 first_infeasible = amount;
                 record_brent_eval_reject(BrentEvalReject::SimNone);
                 if should_sample_brent_sim_none() {
                     let failure = minimal_sim_failure(arena, edges, amount);
+                    if !sim_failure_is_size_monotonic(failure) {
+                        first_infeasible = high.saturating_add(U256::from(1u8));
+                    }
                     let kind = match failure {
                         Some(MinimalSimFailure::V2ReserveExhausted { .. }) => {
                             BrentSimNoneKind::V2Reserve

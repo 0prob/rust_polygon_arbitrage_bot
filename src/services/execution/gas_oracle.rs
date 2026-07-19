@@ -15,7 +15,9 @@ use tokio::time::MissedTickBehavior;
 
 use crate::infra::rpc::RpcPool;
 
-use super::gas::{FeeSnapshot, compute_conservative_gas_price, scaled_simulated_gas};
+use super::gas::{
+    FeeSnapshot, MIN_PRIORITY_FEE_PER_GAS, compute_conservative_gas_price, scaled_simulated_gas,
+};
 
 const ROUTE_GAS_HISTORY: usize = 256;
 /// Cap sim→observed uplift so one outlier receipt cannot dominate Brent ranking.
@@ -254,9 +256,11 @@ impl GasOracle {
                 ),
             };
         if priority_fee.is_zero() {
-            priority_fee = U256::from(25_000_000_000u64);
-            priority_fee_source = "fallback_25gwei";
+            priority_fee = MIN_PRIORITY_FEE_PER_GAS;
+            priority_fee_source = "fallback_min_priority";
         }
+        // Clamp so assess/rank and submit share the same tip floor.
+        priority_fee = priority_fee.max(MIN_PRIORITY_FEE_PER_GAS);
 
         let snapshot = FeeSnapshot {
             base_fee,
@@ -265,8 +269,11 @@ impl GasOracle {
         let previous = self.loaded_snapshot();
         let is_initial_snapshot = previous.is_none();
         self.snapshot.store(Some(Arc::new(snapshot)));
-        self.snapshot_updated_at_ms
-            .store(crate::util::now_ms(), Ordering::Relaxed);
+        // ponytail: stale tip must not refresh the live-submit age clock.
+        if priority_fee_source != "previous_snapshot" || is_initial_snapshot {
+            self.snapshot_updated_at_ms
+                .store(crate::util::now_ms(), Ordering::Relaxed);
+        }
         if is_initial_snapshot {
             crate::info!(
                 "gas oracle initialized: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
@@ -494,6 +501,33 @@ mod tests {
         );
         assert!(!oracle.fees_ready_for_live_submit());
         assert!(oracle.conservative_gas_price_for_live_submit().is_none());
+    }
+
+    #[test]
+    fn stale_priority_reuse_does_not_refresh_live_submit_age() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(100u64),
+            priority_fee: MIN_PRIORITY_FEE_PER_GAS,
+        });
+        let aged = crate::util::now_ms().saturating_sub(60_000);
+        oracle
+            .snapshot_updated_at_ms
+            .store(aged, Ordering::Relaxed);
+        assert!(!oracle.fees_ready_for_live_submit());
+
+        // Simulate refresh_once path that keeps previous tip (RPC tip miss).
+        let previous = oracle.loaded_snapshot().expect("snapshot");
+        let snapshot = FeeSnapshot {
+            base_fee: U256::from(110u64),
+            priority_fee: previous.priority_fee.max(MIN_PRIORITY_FEE_PER_GAS),
+        };
+        oracle.snapshot.store(Some(Arc::new(snapshot)));
+        // Age clock intentionally not bumped when tip source is previous_snapshot.
+        assert_eq!(oracle.snapshot_updated_at_ms.load(Ordering::Relaxed), aged);
+        assert!(!oracle.fees_ready_for_live_submit());
+        let loaded = oracle.loaded_snapshot().expect("updated base");
+        assert_eq!(loaded.base_fee, U256::from(110u64));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::rpc_errors::{SubmitAction, classify_submit_error, extract_tx_hash_fro
 /// ponytail: 15% fee bump on resubmit. Standard EIP-1559 bump.
 pub const FEE_BUMP_BPS: u64 = 1500;
 const MAX_SUBMIT_ATTEMPTS: u32 = 3;
-pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([30_000_000_000, 0, 0, 0]);
+pub use super::gas::MIN_PRIORITY_FEE_PER_GAS;
 /// ponytail: cap profit-derived priority fee boost at 200 gwei.
 /// 100 gwei was too conservative during Polygon MEV competition.
 use crate::services::execution::profit::profit_priority_uplift_wei;

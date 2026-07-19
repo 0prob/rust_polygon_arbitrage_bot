@@ -755,9 +755,14 @@ impl PriceOracle {
         let Some(matic_raw) = raw.get(&WMATIC).copied() else {
             return FxHashMap::default();
         };
+        // Snapshot USD cache once — avoids per-addr `token_usd` re-locks on LF enrich.
+        let token_usd = self.token_usd.read();
         let mut out = FxHashMap::with_capacity_and_hasher(addrs.len(), rustc_hash::FxBuildHasher);
         for addr in addrs {
-            if !self.usd_quote_fresh_for_token(addr) {
+            let fresh = token_usd
+                .get(addr)
+                .is_some_and(|e| self.fresh(e) && e.value > 0.0);
+            if !fresh {
                 continue;
             }
             let Some(token_raw) = raw.get(addr).copied() else {

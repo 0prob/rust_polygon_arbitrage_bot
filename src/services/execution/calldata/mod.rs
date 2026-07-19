@@ -101,7 +101,7 @@ pub fn encode_route(
     for (i, hop) in hops.iter().enumerate() {
         let mut hop = hop.clone();
         if let Some(ain) = chain_in.take() {
-            crate::info!(
+            crate::debug!(
                 "chain_in apply: hop={i} proto={:?} ain_was={} ain_now={ain} aout={}",
                 hop.edge.protocol,
                 hop.amount_in,
@@ -150,7 +150,7 @@ pub fn encode_route(
             .max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
         if let Ok(min_out) = encoders::shared::compute_min_out(arena, &hop, bps, "chain_in") {
             if min_out != hop.amount_out {
-                crate::info!(
+                crate::debug!(
                     "chain_in refresh_aout: hop={i} proto={:?} ain={} aout_was={} aout_now={min_out}",
                     hop.edge.protocol,
                     hop.amount_in,
@@ -466,7 +466,7 @@ pub fn build_arb_calldata(
             s
         },
     );
-    crate::info!(
+    crate::debug!(
         "calldata len={}, calls={}, flash_token={flash_token:#x}, flash_amount={flash_amount}, preview=0x{}..., route_hash={}, entrypoint={entrypoint:?}, call0={call0_data}, targets=[{call_targets}]",
         data_bytes.len(),
         calls.len(),

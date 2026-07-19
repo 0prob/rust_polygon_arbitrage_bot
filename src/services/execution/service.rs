@@ -1282,14 +1282,14 @@ impl ExecutionService {
             return outcome;
         }
 
-        // Dry-run eth_call already validated against live chain state; a newer
-        // local cache generation must not block submit after a passing simulation.
+        // Gate on head lag since dry-run started (`chain_head`), not the pinned
+        // `simulation_block` (LF/HF provenance can already be 2+ behind live head).
         match sim_provider.get_block_number().await {
-            Ok(head) if head <= simulation_block.saturating_add(1) => {}
+            Ok(head) if head <= chain_head.saturating_add(1) => {}
             Ok(head) => {
                 return ExecutionOutcome::SubmitFailed {
                     reason: format!(
-                        "candidate stale: simulated at block {simulation_block}, head is {head}"
+                        "candidate stale: dry-run head {chain_head} (sim block {simulation_block}), now {head}"
                     ),
                 };
             }

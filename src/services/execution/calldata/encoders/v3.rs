@@ -45,7 +45,7 @@ pub fn encode_v3_hop(
     let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
     // Surface callback verify inputs — dry-run InvalidPoolCaller(expected=fee)
     // means factory getPool did not return msg.sender (fee word leaked as expected).
-    crate::info!(
+    crate::debug!(
         "v3 encode: pool={} proto_id={proto_id} fee_pips={fee_pips} edge_fee_bps={} ain={} aout={} zfo={} sqrt_limit={sqrt_limit} in={} out={} token0={token0} token1={token1} label={:?}",
         hop.pool_address,
         hop.edge.fee_bps,

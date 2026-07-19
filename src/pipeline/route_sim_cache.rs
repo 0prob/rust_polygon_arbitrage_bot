@@ -81,11 +81,21 @@ impl RouteSimCache {
         amount: U256,
         sim: MinimalSimResult,
     ) {
-        if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY
-            && let Some(victim) = self.entries.iter().next().map(|entry| *entry.key())
-        {
-            self.entries.remove(&victim);
-            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+            // ponytail: DashMap iter().next() victim was arbitrary + racy under
+            // parallel Brent. Drop stale revisions first; hard-clear if still full.
+            let before = self.entries.len();
+            self.entries
+                .retain(|k, _| k.route_state_revision == route_state_revision);
+            if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+                self.entries.clear();
+            }
+            let removed = before.saturating_sub(self.entries.len());
+            if removed > 0 {
+                self.stats
+                    .evictions
+                    .fetch_add(removed as u64, Ordering::Relaxed);
+            }
         }
         self.entries.insert(
             RouteSimKey {
@@ -173,5 +183,24 @@ mod tests {
         assert!(cache.should_log_traffic(1));
         assert!(!cache.should_log_traffic(9_999));
         assert!(cache.should_log_traffic(10_001));
+    }
+
+    #[test]
+    fn insert_at_capacity_prefers_dropping_stale_revisions() {
+        let cache = RouteSimCache::new();
+        let sim = MinimalSimResult {
+            profit: U256::ONE,
+            amount_out: U256::ONE,
+            total_gas: 1,
+        };
+        for i in 0..ROUTE_SIM_CACHE_CAPACITY {
+            cache.insert(1, i as u64, U256::from(i as u64), sim);
+        }
+        assert_eq!(cache.entry_count(), ROUTE_SIM_CACHE_CAPACITY);
+        cache.insert(2, 0, U256::from(0u8), sim);
+        // Stale revision-1 entries dropped; new revision-2 entry present.
+        assert!(cache.get(2, 0, U256::from(0u8)).is_some());
+        assert!(cache.get(1, 0, U256::from(0u64)).is_none());
+        assert!(cache.entry_count() < ROUTE_SIM_CACHE_CAPACITY);
     }
 }
