@@ -54,6 +54,26 @@ static CACHE_ROUTE: AtomicU32 = AtomicU32::new(0);
 static WARM_SEED: AtomicU32 = AtomicU32::new(0);
 static SEED_HIGH_CLAMP: AtomicU32 = AtomicU32::new(0);
 static CL_DEPTH_CLAMP: AtomicU32 = AtomicU32::new(0);
+static BAL_HIGH_CLAMP: AtomicU32 = AtomicU32::new(0);
+
+// Search-bounds diagnostics (former ternary_diag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundsReject {
+    HopCapacity,
+    FlashCapUnavailable,
+    InvalidRange,
+}
+
+static BOUNDS_CALLS: AtomicU32 = AtomicU32::new(0);
+static BOUNDS_OK: AtomicU32 = AtomicU32::new(0);
+static HOP_CAPACITY_FAIL: AtomicU32 = AtomicU32::new(0);
+static FLASH_CAP_UNAVAILABLE: AtomicU32 = AtomicU32::new(0);
+static INVALID_RANGE: AtomicU32 = AtomicU32::new(0);
+static RATE_FALLBACK: AtomicU32 = AtomicU32::new(0);
+static LIQUIDITY_CAP_CLAMP: AtomicU32 = AtomicU32::new(0);
+static FLASH_CAP_CLAMP: AtomicU32 = AtomicU32::new(0);
+static ECONOMIC_HIGH_RAISE: AtomicU32 = AtomicU32::new(0);
+static GOLDEN_ZERO_EXIT: AtomicU32 = AtomicU32::new(0);
 /// Sampled ShallowCl / ClCapExceeded hop index buckets.
 static SHALLOW_HOP_0: AtomicU32 = AtomicU32::new(0);
 static SHALLOW_HOP_1: AtomicU32 = AtomicU32::new(0);
@@ -246,6 +266,52 @@ pub fn record_brent_cl_depth_clamp() {
     CL_DEPTH_CLAMP.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn record_brent_bal_high_clamp() {
+    BAL_HIGH_CLAMP.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_call() {
+    BOUNDS_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_ok() {
+    BOUNDS_OK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_reject(reason: BoundsReject) {
+    match reason {
+        BoundsReject::HopCapacity => {
+            HOP_CAPACITY_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+        BoundsReject::FlashCapUnavailable => {
+            FLASH_CAP_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+        }
+        BoundsReject::InvalidRange => {
+            INVALID_RANGE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn record_bounds_rate_fallback() {
+    RATE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_liquidity_cap_clamp() {
+    LIQUIDITY_CAP_CLAMP.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_flash_cap_clamp() {
+    FLASH_CAP_CLAMP.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_economic_high_raise() {
+    ECONOMIC_HIGH_RAISE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_bounds_golden_zero_exit() {
+    GOLDEN_ZERO_EXIT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Hop index of a sampled Brent shallow / CL-cap SimNone.
 pub fn record_brent_shallow_hop(hop: usize) {
     match hop {
@@ -275,7 +341,9 @@ pub fn log_brent_summary() {
          zero_out_proto(v2={} v3={} v4={} bal={} other={}) \
          bal_zo(max_in={} other={}) \
          unsup_proto(v2={} v3={} v4={} bal={} crv={} dodo={} woofi={}) \
-         cache_local={} cache_route={} warm_seed={} seed_high_clamp={} cl_depth_clamp={}",
+         cache_local={} cache_route={} warm_seed={} seed_high_clamp={} cl_depth_clamp={} bal_high_clamp={} \
+         search_bounds(calls={} ok={} hop_fail={} flash_cap_unavail={} invalid_range={} rate_fallback={} \
+         liq_cap={} flash_cap={} economic_high={} golden_zero={})",
         BOUNDS_FAIL.load(Ordering::Relaxed),
         BAL_BOUNDS_FAIL.load(Ordering::Relaxed),
         CL_CAP_FAIL.load(Ordering::Relaxed),
@@ -316,5 +384,16 @@ pub fn log_brent_summary() {
         WARM_SEED.load(Ordering::Relaxed),
         SEED_HIGH_CLAMP.load(Ordering::Relaxed),
         CL_DEPTH_CLAMP.load(Ordering::Relaxed),
+        BAL_HIGH_CLAMP.load(Ordering::Relaxed),
+        BOUNDS_CALLS.load(Ordering::Relaxed),
+        BOUNDS_OK.load(Ordering::Relaxed),
+        HOP_CAPACITY_FAIL.load(Ordering::Relaxed),
+        FLASH_CAP_UNAVAILABLE.load(Ordering::Relaxed),
+        INVALID_RANGE.load(Ordering::Relaxed),
+        RATE_FALLBACK.load(Ordering::Relaxed),
+        LIQUIDITY_CAP_CLAMP.load(Ordering::Relaxed),
+        FLASH_CAP_CLAMP.load(Ordering::Relaxed),
+        ECONOMIC_HIGH_RAISE.load(Ordering::Relaxed),
+        GOLDEN_ZERO_EXIT.load(Ordering::Relaxed),
     );
 }

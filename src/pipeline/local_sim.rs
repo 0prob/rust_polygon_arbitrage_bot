@@ -460,6 +460,98 @@ pub fn cycle_v2_edges_match_pool_meta(
     })
 }
 
+/// Remap V2/V3/V4 `token_in`/`token_out` from `PoolMeta.tokens[leg_idx]`.
+/// Cached cycles can keep stale TokenIndex after meta token refresh; indices stay valid.
+/// Fails closed when remap breaks hop continuity.
+#[must_use]
+pub fn realign_uni_cycle_from_pool_meta(
+    arena: &StateArena,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    cycle: std::sync::Arc<crate::core::types::FoundCycle>,
+) -> Option<std::sync::Arc<crate::core::types::FoundCycle>> {
+    use crate::pipeline::types::pool_meta_at;
+    let mut owned = (*cycle).clone();
+    let mut changed = false;
+    for edge in &mut owned.edges {
+        let Some(m) = pool_meta_at(pool_metas, edge.pool_index) else {
+            continue;
+        };
+        if m.tokens.len() < 2 {
+            continue;
+        }
+        // Curve: TokenIndex is source of truth — remap stale coin i/j from meta order.
+        if matches!(
+            edge.protocol,
+            ProtocolType::CurveStable | ProtocolType::CurveCrypto
+        ) {
+            let Some(in_pos) = m.tokens.iter().position(|&t| t == edge.token_in) else {
+                return None;
+            };
+            let Some(out_pos) = m.tokens.iter().position(|&t| t == edge.token_out) else {
+                return None;
+            };
+            if let Some(PoolState::Curve(s)) = arena.pool_state(edge.pool_index)
+                && (in_pos >= s.balances.len() || out_pos >= s.balances.len() || in_pos == out_pos)
+            {
+                return None;
+            }
+            let Ok(in_idx) = u8::try_from(in_pos) else {
+                return None;
+            };
+            let Ok(out_idx) = u8::try_from(out_pos) else {
+                return None;
+            };
+            if edge.token_in_idx != in_idx || edge.token_out_idx != out_idx {
+                edge.token_in_idx = in_idx;
+                edge.token_out_idx = out_idx;
+                edge.zero_for_one = in_idx < out_idx;
+                changed = true;
+            }
+            continue;
+        }
+        if !matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            continue;
+        }
+        let Some(&tin) = m.tokens.get(edge.token_in_idx as usize) else {
+            return None;
+        };
+        let Some(&tout) = m.tokens.get(edge.token_out_idx as usize) else {
+            return None;
+        };
+        if edge.token_in != tin || edge.token_out != tout {
+            edge.token_in = tin;
+            edge.token_out = tout;
+            changed = true;
+        }
+        if let (Some(a_in), Some(a_out)) = (arena.token_address(tin), arena.token_address(tout)) {
+            let zfo = a_in < a_out;
+            if edge.zero_for_one != zfo {
+                edge.zero_for_one = zfo;
+                changed = true;
+            }
+        }
+    }
+    if !owned
+        .edges
+        .windows(2)
+        .all(|pair| pair[0].token_out == pair[1].token_in)
+    {
+        return None;
+    }
+    if !owned.edges.is_empty() && !owned.edges.iter().any(|e| e.token_in == owned.start_token) {
+        owned.start_token = owned.edges[0].token_in;
+        changed = true;
+    }
+    if changed {
+        Some(std::sync::Arc::new(owned))
+    } else {
+        Some(cycle)
+    }
+}
+
 /// Vault/oracle token order must match edge TokenIndex addresses at the pool-local indices.
 #[inline]
 #[must_use]
@@ -576,6 +668,38 @@ pub fn realign_multi_token_found_cycle(
     }
 }
 
+/// Align `edge.fee_bps` with live pool fee when the arena has a usable on-chain fee.
+#[inline]
+pub fn sync_edge_fee_bps_from_state(edge: &mut Edge, state: &PoolState) {
+    match state {
+        PoolState::V2(v2) => {
+            if let Some(bps) = crate::core::math::uniswap_v2::v2_fee_bps_from_pool(v2) {
+                edge.fee_bps = bps;
+            }
+        }
+        PoolState::V3(cl) => {
+            let pips = cl.fee.as_limbs()[0] as u32;
+            // V3/Algebra: 0 usually means unset decode — keep discovery fee_bps.
+            if (1..0x800000).contains(&pips) {
+                edge.fee_bps = (pips / 100).min(9_999);
+            }
+        }
+        PoolState::V4(cl) => {
+            let pips = cl.fee.as_limbs()[0] as u32;
+            // V4 lpFee=0 is valid (zero-fee / dynamic-fee pools); must clear stale bps.
+            if pips < 0x800000 {
+                edge.fee_bps = (pips / 100).min(9_999);
+            }
+        }
+        PoolState::Curve(c) => {
+            if let Some(bps) = crate::core::math::curve::curve_fee_bps_from_pool(c.fee) {
+                edge.fee_bps = bps;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Rewrite hop `protocol` to match arena `PoolState` family (cached cycles can keep
 /// V2 tags after hot-cache promotes the slot to V3 — live `proto_mismatch_skip`).
 /// Also realign Uni `zero_for_one` to address order (sim can profit with stale zfo;
@@ -598,13 +722,11 @@ pub fn heal_cycle_edge_protocols(
                 return None;
             }
             edge.protocol = corrected;
-            // Keep fee_bps in family units when on-chain fee is present (V2→V3 heal).
-            if let PoolState::V3(v3) = state {
-                let pips = v3.fee.as_limbs()[0] as u32;
-                if (1..0x800000).contains(&pips) {
-                    edge.fee_bps = (pips / 100).min(9_999);
-                }
-            }
+            changed = true;
+        }
+        let fee_before = edge.fee_bps;
+        sync_edge_fee_bps_from_state(edge, state);
+        if edge.fee_bps != fee_before {
             changed = true;
         }
         // ponytail: same rule as graph::apply_cl_zero_for_one
@@ -623,6 +745,10 @@ pub fn heal_cycle_edge_protocols(
         }
     }
     if changed {
+        owned.cumulative_fee_bps = owned
+            .edges
+            .iter()
+            .fold(0u32, |acc, e| acc.saturating_add(e.fee_bps));
         Some(std::sync::Arc::new(owned))
     } else {
         Some(cycle)
@@ -996,7 +1122,7 @@ pub fn cl_amount_cap(arena: &StateArena, edges: &[Edge]) -> Option<U256> {
 
 /// Max gross-profit erosion (bps) tolerated between eval and post-refresh resim.
 const RESIM_PROFIT_DRIFT_BPS: u64 = 1000;
-/// Max per-hop amount drift (bps) tolerated between eval and post-refresh resim.
+/// Max per-hop output erosion (bps) tolerated between eval and post-refresh resim.
 const RESIM_HOP_DRIFT_BPS: u64 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1062,20 +1188,17 @@ fn u256_to_bps_u64(v: U256) -> u64 {
     }
 }
 
+/// One-sided hop erosion (matches profit drift): improvements always pass.
 fn hop_amount_within_drift(baseline: U256, refreshed: U256, max_drift_bps: u64) -> bool {
-    if baseline == refreshed {
+    if refreshed >= baseline {
         return true;
     }
-    // Either side zero with the other non-zero is infinite relative drift (and /0).
-    if baseline.is_zero() || refreshed.is_zero() {
+    // refreshed < baseline ⇒ baseline > 0; zero refreshed is infinite erosion.
+    if refreshed.is_zero() {
         return false;
     }
-    let (lo, hi) = if baseline >= refreshed {
-        (refreshed, baseline)
-    } else {
-        (baseline, refreshed)
-    };
-    let drift_bps = (hi - lo) * U256::from(10_000u64) / lo;
+    let lost = baseline - refreshed;
+    let drift_bps = lost * U256::from(10_000u64) / baseline;
     drift_bps <= U256::from(max_drift_bps)
 }
 
@@ -1147,7 +1270,10 @@ pub fn route_hop_fidelity_reject_profiled(
                 PoolState::V3(_) | PoolState::V4(_),
                 ProtocolType::UniswapV3 | ProtocolType::UniswapV4,
             ) if cl_hop_tickless(state) => {
-                return Some(HopFidelityReject::ShallowCl(i));
+                // Same policy as simulate_hop: tickless OK within spot-probe cap.
+                if cl_hop_exceeds_shallow_cap(amount_in, hop_probes[i]) {
+                    return Some(HopFidelityReject::ShallowCl(i));
+                }
             }
             (
                 PoolState::V3(_) | PoolState::V4(_),
@@ -1185,7 +1311,7 @@ pub fn route_hop_fidelity_reject_profiled(
     None
 }
 
-/// Post-refresh resim must stay profitable and keep hop amounts aligned with eval.
+/// Post-refresh resim must stay profitable; hop outputs may improve but not erode past the cap.
 #[must_use]
 pub fn route_resim_fidelity_ok(
     baseline: &RouteSimulationResult,
@@ -1229,15 +1355,17 @@ pub fn route_resim_fidelity_reject_profiled(
             return Some("profit drift");
         }
     }
-    for i in 0..baseline.hop_amounts.len() {
+    // Slot 0 is amount_in (fixed across resim); only post-hop outputs can erode.
+    for i in 1..baseline.hop_amounts.len() {
         let b = baseline.hop_amounts[i];
         let r = refreshed.hop_amounts[i];
-        if b != r && !b.is_zero() && !r.is_zero() {
-            let (lo, hi) = if b >= r { (r, b) } else { (b, r) };
-            let drift = u256_to_bps_u64((hi - lo) * U256::from(10_000u64) / lo);
-            profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(drift);
-        } else if b != r {
-            profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(10_000);
+        if r < b && !b.is_zero() {
+            if r.is_zero() {
+                profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(10_000);
+            } else {
+                let drift = u256_to_bps_u64((b - r) * U256::from(10_000u64) / b);
+                profile.max_hop_drift_bps = profile.max_hop_drift_bps.max(drift);
+            }
         }
         if !hop_amount_within_drift(b, r, RESIM_HOP_DRIFT_BPS) {
             return Some("hop amount drift");
@@ -1419,9 +1547,11 @@ mod tests {
             U256::ZERO,
             200
         ));
-        assert!(!hop_amount_within_drift(
-            U256::ZERO,
+        // Improvements (incl. 0 → positive) always pass — gate is erosion-only.
+        assert!(hop_amount_within_drift(U256::ZERO, U256::from(100u64), 200));
+        assert!(hop_amount_within_drift(
             U256::from(100u64),
+            U256::from(130u64),
             200
         ));
         assert!(hop_amount_within_drift(
@@ -1431,7 +1561,7 @@ mod tests {
         ));
         assert!(hop_amount_within_drift(
             U256::from(10_000u64),
-            U256::from(9_900u64),
+            U256::from(9_800u64),
             200
         ));
         assert!(!hop_amount_within_drift(
@@ -1439,6 +1569,30 @@ mod tests {
             U256::from(9_000u64),
             200
         ));
+    }
+
+    #[test]
+    fn resim_fidelity_allows_improved_hop_amounts() {
+        let baseline = RouteSimulationResult {
+            amount_in: U256::from(100u64),
+            amount_out: U256::from(110u64),
+            profit: U256::from(10u64),
+            profitable: true,
+            hop_amounts: {
+                let mut h = hop_amounts_zeroed(1);
+                h[0] = U256::from(100u64);
+                h[1] = U256::from(110u64);
+                h
+            },
+            total_gas: 100_000,
+            hop_count: 1,
+        };
+        let mut refreshed = baseline.clone();
+        // Better fill after refresh — old symmetric gate rejected this as hop drift.
+        refreshed.hop_amounts[1] = U256::from(120u64);
+        refreshed.amount_out = U256::from(120u64);
+        refreshed.profit = U256::from(20u64);
+        assert_eq!(route_resim_fidelity_reject(&baseline, &refreshed), None);
     }
 
     #[test]
@@ -1515,6 +1669,84 @@ mod tests {
         // t0=[1..] < t1=[2..] ⇒ zero_for_one must be true after heal
         assert!(healed.edges[0].zero_for_one);
         assert!(cycle_edges_match_arena_state(&arena, &healed.edges));
+    }
+
+    #[test]
+    fn sync_clears_stale_fee_bps_on_v4_zero_lp_fee() {
+        use crate::core::types::V4PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::ZERO,
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(Vec::new()),
+            })),
+        );
+        let mut edge = Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV4,
+            fee_bps: 30, // stale discovery
+            zero_for_one: true,
+        };
+        sync_edge_fee_bps_from_state(&mut edge, arena.pool_state(pool).unwrap());
+        assert_eq!(edge.fee_bps, 0);
+    }
+
+    #[test]
+    fn heal_syncs_stale_v2_fee_bps_from_live_state() {
+        use crate::core::types::{FoundCycle, V2PoolState};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let cycle = Arc::new(FoundCycle {
+            start_token: t0,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 5, // stale discovery
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 5,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed = heal_cycle_edge_protocols(&arena, cycle).expect("heal");
+        assert_eq!(healed.edges[0].fee_bps, 30);
+        assert_eq!(healed.cumulative_fee_bps, 30);
     }
 
     #[test]
@@ -1610,6 +1842,136 @@ mod tests {
         }];
         assert!(!cycle_v2_edges_match_pool_meta(&arena, &[meta], &edges));
         assert!(cycle_v2_edges_match_pool_meta(&arena, &[], &edges)); // defer when no meta
+    }
+
+    #[test]
+    fn realign_uni_cycle_recovers_stale_token_index_from_meta() {
+        use crate::core::types::{FoundCycle, V2PoolState};
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let foreign = arena.register_token(Address::from([9u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV2,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        let cycle = Arc::new(FoundCycle {
+            start_token: foreign,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: foreign, // stale vs meta.tokens[0]
+                token_out: t1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let metas = [meta];
+        assert!(!cycle_v2_edges_match_pool_meta(
+            &arena,
+            &metas,
+            &cycle.edges
+        ));
+        let healed = realign_uni_cycle_from_pool_meta(&arena, &metas, cycle).expect("realign");
+        assert_eq!(healed.edges[0].token_in, t0);
+        assert_eq!(healed.edges[0].token_out, t1);
+        assert_eq!(healed.start_token, t0);
+        assert!(cycle_v2_edges_match_pool_meta(
+            &arena,
+            &metas,
+            &healed.edges
+        ));
+    }
+
+    #[test]
+    fn realign_curve_cycle_recovers_stale_coin_indices_from_meta() {
+        use crate::core::types::{CurvePoolState, FoundCycle};
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::Curve(CurvePoolState {
+                balances: vec![U256::from(1_000_000u64), U256::from(1_000_000u64)],
+                a: U256::from(100_000u64),
+                fee: U256::from(5_000_000u64),
+                rates: vec![],
+                n_coins: 2,
+                gamma: None,
+                d: None,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::CurveStable,
+            tokens: vec![t0, t1],
+            fee_bps: 4, // stale discovery
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: Some("stable_ng".into()),
+            hooks: None,
+            tick_spacing: None,
+        };
+        let cycle = Arc::new(FoundCycle {
+            start_token: t0,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 1, // swapped vs meta order
+                token_out_idx: 0,
+                protocol: ProtocolType::CurveStable,
+                fee_bps: 4,
+                zero_for_one: false,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 4,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed =
+            realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign curve");
+        assert_eq!(healed.edges[0].token_in_idx, 0);
+        assert_eq!(healed.edges[0].token_out_idx, 1);
+        assert!(healed.edges[0].zero_for_one);
+        let mut edge = healed.edges[0];
+        sync_edge_fee_bps_from_state(&mut edge, arena.pool_state(pool).unwrap());
+        assert_eq!(edge.fee_bps, 5);
     }
 
     #[test]
@@ -2335,17 +2697,67 @@ mod tests {
                 zero_for_one: true,
             },
         ];
-        let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
-        let mut first_only = hop_amounts_zeroed(edges.len());
-        first_only[0] = probe;
-        assert!(!route_hop_fidelity_ok(&arena, &edges, &first_only));
+        let probe_t0 = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
+        let probe_t1 = crate::pipeline::spot_price::spot_probe_for_token(&arena, t1);
+        // Tickless V3 within its token_in probe cap — must match simulate_hop.
+        let mut within_cap = hop_amounts_zeroed(edges.len());
+        within_cap[0] = probe_t0;
+        within_cap[1] = probe_t1;
+        assert!(route_hop_fidelity_ok(&arena, &edges, &within_cap));
+        assert!(route_hop_fidelity_ok_after_walk(
+            &arena,
+            &edges,
+            &within_cap
+        ));
+        // Oversized intermediate into tickless CL still fails.
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
-        hop_amounts[0] = probe;
+        hop_amounts[0] = probe_t0;
         hop_amounts[1] = U256::from(10u128.pow(18));
         assert_eq!(
             route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             Some(HopFidelityReject::ShallowCl(1))
         );
+    }
+
+    #[test]
+    fn hop_fidelity_after_walk_keeps_tickless_within_probe() {
+        use crate::core::types::V3PoolState;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000_000_000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 0,
+                ticks: Arc::from(Vec::new()),
+            })),
+        );
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
+        let sim = simulate_route_detailed(&arena, &edges, probe).expect("tickless within probe");
+        assert!(route_hop_fidelity_ok_after_walk(
+            &arena,
+            &edges,
+            &sim.hop_amounts
+        ));
     }
 
     #[test]
@@ -2471,7 +2883,7 @@ mod tests {
         assert_eq!(cl_amount_cap(&arena, &edges), Some(U256::ZERO));
         let probe = crate::pipeline::spot_price::spot_probe_for_token(&arena, t0);
         assert_eq!(tickless_cl_start_input_cap(&arena, t0, &edges), Some(probe));
-        // Ranking may quote tickless at spot-probe size; execution fidelity still refuses.
+        // Ranking + fidelity share the spot-probe cap (hard-reject was a dispatch false positive).
         assert!(
             simulate_route_minimal(&arena, &edges, probe).is_some(),
             "tickless CL must remain simulable at spot-probe size for ranking"
@@ -2482,6 +2894,11 @@ mod tests {
         );
         let mut hop_amounts = hop_amounts_zeroed(edges.len());
         hop_amounts[0] = probe;
+        assert_eq!(
+            route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
+            None
+        );
+        hop_amounts[0] = probe + U256::ONE;
         assert_eq!(
             route_hop_fidelity_reject(&arena, &edges, &hop_amounts),
             Some(HopFidelityReject::ShallowCl(0))

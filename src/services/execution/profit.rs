@@ -30,8 +30,26 @@ pub fn aave_flash_loan_fee_bps_cached() -> u64 {
     AAVE_FLASH_LOAN_FEE_BPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Balancer V2 ProtocolFeesCollector flash fee as 1e18 FixedPoint (0 on Polygon today).
+/// Refetch via `fetch_and_cache_balancer_flash_loan_fee_pct`.
+static BALANCER_FLASH_LOAN_FEE_PCT_1E18: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_balancer_flash_loan_fee_pct(pct_1e18: u64) {
+    BALANCER_FLASH_LOAN_FEE_PCT_1E18.store(pct_1e18, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn balancer_flash_loan_fee_pct_cached() -> u64 {
+    BALANCER_FLASH_LOAN_FEE_PCT_1E18.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FixedPoint.ONE — Balancer fee percentage denominator.
+const BALANCER_FP_ONE: u128 = 1_000_000_000_000_000_000;
+
 // ponytail: DODO flash loan fee = pool swap fee. Most DODO pools use 0.1% = 10 bps.
 const DODO_FLASH_LOAN_FEE_BPS: u64 = 10;
+/// External (non-route) DODO flash lenders are not wired — keep false until hop-excluded pools exist.
+pub const DODO_EXTERNAL_FLASH_ENABLED: bool = false;
 /// Cap profit-derived priority fee boost at 200 gwei (matches submit.rs).
 pub const MAX_PROFIT_PRIORITY_FEE_WEI: u128 = 200_000_000_000;
 
@@ -47,12 +65,83 @@ pub enum ProfitError {
 
 pub fn flash_loan_fee_bps(source: FlashLoanSource) -> u64 {
     match source {
-        FlashLoanSource::Balancer | FlashLoanSource::Direct => 0,
+        // batchSwap flash-swap pays no Vault flashLoan fee.
+        FlashLoanSource::Direct => 0,
+        FlashLoanSource::Balancer => balancer_flash_fee_pct_to_bps(balancer_flash_loan_fee_pct_cached()),
         FlashLoanSource::AaveV3 => {
             AAVE_FLASH_LOAN_FEE_BPS.load(std::sync::atomic::Ordering::Relaxed)
         }
-        FlashLoanSource::Dodo => DODO_FLASH_LOAN_FEE_BPS,
+        FlashLoanSource::Dodo => {
+            if DODO_EXTERNAL_FLASH_ENABLED {
+                DODO_FLASH_LOAN_FEE_BPS
+            } else {
+                0
+            }
+        }
     }
+}
+
+/// Convert Balancer 1e18 FixedPoint fee % → bps (ceil) for coarse callers.
+#[must_use]
+pub fn balancer_flash_fee_pct_to_bps(pct_1e18: u64) -> u64 {
+    if pct_1e18 == 0 {
+        return 0;
+    }
+    let num = (pct_1e18 as u128).saturating_mul(10_000);
+    ((num + BALANCER_FP_ONE - 1) / BALANCER_FP_ONE) as u64
+}
+
+/// Flash premium in token units.
+/// Aave: PercentageMath.percentMul (half-up). Balancer vault flash: FixedPoint.mulUp.
+#[must_use]
+pub fn flash_loan_fee_amount(source: FlashLoanSource, amount: U256) -> Option<U256> {
+    match source {
+        FlashLoanSource::Direct => Some(U256::ZERO),
+        FlashLoanSource::Balancer => {
+            balancer_mul_up(amount, U256::from(balancer_flash_loan_fee_pct_cached()))
+        }
+        FlashLoanSource::AaveV3 => {
+            let bps = flash_loan_fee_bps(source);
+            if bps == 0 {
+                return Some(U256::ZERO);
+            }
+            aave_percent_mul(amount, bps)
+        }
+        FlashLoanSource::Dodo => {
+            if !DODO_EXTERNAL_FLASH_ENABLED {
+                return Some(U256::ZERO);
+            }
+            let bps = DODO_FLASH_LOAN_FEE_BPS;
+            amount
+                .checked_mul(U256::from(bps))
+                .map(|v| v / BPS_SCALE)
+        }
+    }
+}
+
+/// balancer-v2 FixedPoint.mulUp(amount, feePercentage).
+#[inline]
+#[must_use]
+pub fn balancer_mul_up(amount: U256, pct_1e18: U256) -> Option<U256> {
+    if amount.is_zero() || pct_1e18.is_zero() {
+        return Some(U256::ZERO);
+    }
+    let product = amount.checked_mul(pct_1e18)?;
+    let one = U256::from(BALANCER_FP_ONE);
+    Some(((product - U256::from(1u8)) / one) + U256::from(1u8))
+}
+
+/// aave-v3-core PercentageMath.percentMul: (value * bps + 5000) / 10000.
+#[inline]
+#[must_use]
+pub fn aave_percent_mul(value: U256, bps: u64) -> Option<U256> {
+    if bps == 0 {
+        return Some(U256::ZERO);
+    }
+    value
+        .checked_mul(U256::from(bps))?
+        .checked_add(U256::from(5_000u64))
+        .map(|v| v / BPS_SCALE)
 }
 
 #[must_use]
@@ -84,8 +173,7 @@ pub fn modeled_net_profit_tokens(
     let amount_out = gross_profit.checked_add(amount_in)?;
     let adjusted_out = slippage_adjusted(amount_out, route_slippage)?;
     let adjusted_gross = adjusted_out.saturating_sub(amount_in);
-    let flash_fee =
-        amount_in.checked_mul(U256::from(flash_loan_fee_bps(flash_source)))? / BPS_SCALE;
+    let flash_fee = flash_loan_fee_amount(flash_source, amount_in)?;
     Some(adjusted_gross.saturating_sub(flash_fee))
 }
 
@@ -480,11 +568,7 @@ fn probe_matic_parts(
     ctx: &ProfitEvalContext,
 ) -> Option<ProbeMaticParts> {
     let input = probe_assess_input(sim, amount_in, ctx);
-    let flash_fee_bps = flash_loan_fee_bps(input.flash_loan_source);
-    let flash_loan_fee = input
-        .amount_in
-        .checked_mul(U256::from(flash_fee_bps))
-        .map(|v| v / BPS_SCALE)?;
+    let flash_loan_fee = flash_loan_fee_amount(input.flash_loan_source, input.amount_in)?;
     if input.slippage_bps >= 10_000 {
         return None;
     }
@@ -550,11 +634,7 @@ pub fn brent_score_matic_from_sim(
 
 #[must_use]
 pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
-    let flash_fee_bps = flash_loan_fee_bps(input.flash_loan_source);
-    let Some(flash_loan_fee) = input
-        .amount_in
-        .checked_mul(U256::from(flash_fee_bps))
-        .map(|v| v / BPS_SCALE)
+    let Some(flash_loan_fee) = flash_loan_fee_amount(input.flash_loan_source, input.amount_in)
     else {
         return rejected_arithmetic(input, "flash-loan fee overflow");
     };
@@ -1033,6 +1113,35 @@ mod safety_tests {
         assert_eq!(
             result.net_profit,
             result.gross_profit.saturating_sub(result.flash_loan_fee)
+        );
+    }
+
+    #[test]
+    fn aave_flash_fee_matches_percent_mul_half_up() {
+        // aave-v3-core: (value * bps + 5000) / 10000 — differs from floor at small sizes.
+        set_aave_flash_loan_fee_bps(5);
+        let amount = U256::from(1_000u64);
+        let fee = flash_loan_fee_amount(FlashLoanSource::AaveV3, amount).unwrap();
+        assert_eq!(fee, U256::from(1u64)); // floor would be 0
+        assert_eq!(aave_percent_mul(U256::from(10_000u64), 5), Some(U256::from(5u64)));
+    }
+
+    #[test]
+    fn balancer_flash_fee_uses_fixed_point_mul_up() {
+        set_balancer_flash_loan_fee_pct(0);
+        assert_eq!(
+            flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64)),
+            Some(U256::ZERO)
+        );
+        // 1 bps = 1e14 in 1e18 FixedPoint
+        set_balancer_flash_loan_fee_pct(100_000_000_000_000);
+        let fee = flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64)).unwrap();
+        assert_eq!(fee, U256::from(100u64));
+        assert_eq!(balancer_flash_fee_pct_to_bps(100_000_000_000_000), 1);
+        assert!(!DODO_EXTERNAL_FLASH_ENABLED);
+        assert_eq!(
+            flash_loan_fee_amount(FlashLoanSource::Dodo, U256::from(1_000_000u64)),
+            Some(U256::ZERO)
         );
     }
 

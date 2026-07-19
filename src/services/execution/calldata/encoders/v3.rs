@@ -43,7 +43,6 @@ pub fn encode_v3_hop(
 
     let (token0, token1) = pool_tokens_from_hop(hop);
     let proto_id = v3_callback_protocol_id(hop.protocol_label.as_deref());
-    let fourth = resolve_v3_callback_fourth_field(arena, hop);
     // Surface callback verify inputs — dry-run InvalidPoolCaller(expected=fee)
     // means factory getPool did not return msg.sender (fee word leaked as expected).
     crate::debug!(
@@ -65,7 +64,7 @@ pub fn encode_v3_hop(
         DynSolValue::Uint(U256::from(proto_id), 8),
         DynSolValue::Address(token0),
         DynSolValue::Address(token1),
-        fourth,
+        DynSolValue::Uint(U256::from(fee_pips), 24),
     ])
     .abi_encode();
 
@@ -86,9 +85,4 @@ pub fn encode_v3_hop(
         value: U256::ZERO,
         data: swap.abi_encode().into(),
     }])
-}
-
-fn resolve_v3_callback_fourth_field(arena: &StateArena, hop: &CalldataHop) -> DynSolValue {
-    let fee = resolve_v3_fee_pips_for_hop(arena, hop);
-    DynSolValue::Uint(U256::from(fee), 24)
 }

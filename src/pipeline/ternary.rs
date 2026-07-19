@@ -1,3 +1,4 @@
+//! Input size search (golden-section). Historical module name `ternary`.
 use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
 
@@ -6,7 +7,10 @@ use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::brent_diag::{
-    BrentEvalReject, BrentOptimizeReject, BrentSimNoneKind, record_brent_attempt,
+    BoundsReject, BrentEvalReject, BrentOptimizeReject, BrentSimNoneKind, record_bounds_call,
+    record_bounds_economic_high_raise, record_bounds_flash_cap_clamp, record_bounds_golden_zero_exit,
+    record_bounds_liquidity_cap_clamp, record_bounds_ok, record_bounds_rate_fallback,
+    record_bounds_reject, record_brent_attempt, record_brent_bal_high_clamp,
     record_brent_bal_zero_other, record_brent_cache_local, record_brent_cache_route,
     record_brent_cl_depth_clamp, record_brent_eval_reject, record_brent_eval_sim, record_brent_ok,
     record_brent_reject, record_brent_seed_high_clamp, record_brent_shallow_hop,
@@ -21,13 +25,6 @@ use crate::pipeline::route_sim_cache::RouteSimCache;
 use crate::pipeline::sim_sanity::{
     FlashBorrowCapParams, SimSanityInput, check_sim_sanity, check_sim_sanity_fast,
     check_sim_sanity_for_dispatch, min_economic_amount_in,
-};
-use crate::pipeline::ternary_diag::{
-    TernaryBoundsReject, record_ternary_bal_high_clamp, record_ternary_bounds_call,
-    record_ternary_bounds_ok, record_ternary_bounds_reject, record_ternary_cl_depth_clamp,
-    record_ternary_economic_high_raise, record_ternary_flash_cap_clamp,
-    record_ternary_golden_zero_exit, record_ternary_liquidity_cap_clamp,
-    record_ternary_rate_fallback, record_ternary_seed_high_clamp,
 };
 use crate::pipeline::types::OptimizationResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -220,7 +217,7 @@ where
                         continue;
                     }
                 }
-                record_ternary_golden_zero_exit();
+                record_bounds_golden_zero_exit();
                 break;
             }
         } else {
@@ -342,7 +339,7 @@ fn compute_ternary_search_bounds(
     matic_usd_chainlink: Option<alloy::primitives::I256>,
     liquidity_cap: Option<U256>,
 ) -> Option<TernarySearchBounds> {
-    record_ternary_bounds_call();
+    record_bounds_call();
     let flash_cap_params = FlashBorrowCapParams {
         max_flash_loan_usd,
         token_decimals: start_decimals,
@@ -351,7 +348,7 @@ fn compute_ternary_search_bounds(
         matic_usd_chainlink,
     };
     if flash_cap_params.cap_enforced_but_unresolved() {
-        record_ternary_bounds_reject(TernaryBoundsReject::FlashCapUnavailable);
+        record_bounds_reject(BoundsReject::FlashCapUnavailable);
         crate::trace!("ternary: bounds flash_cap_unavailable");
         return None;
     }
@@ -362,7 +359,7 @@ fn compute_ternary_search_bounds(
 
     for edge in &cycle.edges {
         let Some(mut capacity) = hop_capacity(arena, edge) else {
-            record_ternary_bounds_reject(TernaryBoundsReject::HopCapacity);
+            record_bounds_reject(BoundsReject::HopCapacity);
             crate::trace!("ternary: bounds hop_capacity_fail");
             return None;
         };
@@ -403,12 +400,12 @@ fn compute_ternary_search_bounds(
     }
 
     if !saw_start_unit_capacity || min_capacity.is_zero() || min_capacity == U256::MAX {
-        record_ternary_rate_fallback();
+        record_bounds_rate_fallback();
         min_capacity = ONE * U256::from(100u8);
     } else if !can_normalize_all {
         // Partial FX: keep start-unit bottleneck (incl. Balancer soft cap on
         // start hop) instead of replacing with the unbounded 100*ONE default.
-        record_ternary_rate_fallback();
+        record_bounds_rate_fallback();
     }
 
     // Search window: ~0.02%–10% of bottleneck hop capacity (start-token units).
@@ -431,7 +428,7 @@ fn compute_ternary_search_bounds(
         if let Some(max_wei) = flash_cap_wei
             && high > max_wei
         {
-            record_ternary_flash_cap_clamp();
+            record_bounds_flash_cap_clamp();
             high = max_wei;
         }
     }
@@ -456,7 +453,7 @@ fn compute_ternary_search_bounds(
     let (mut out_low, mut out_high) = (final_low, final_high);
     // ponytail: single liquidity-cap clamping step (was triple-redundant).
     if let Some(cap) = liquidity_cap.filter(|c| !c.is_zero()) {
-        record_ternary_liquidity_cap_clamp();
+        record_bounds_liquidity_cap_clamp();
         out_high = out_high.min(cap);
         if out_low >= out_high {
             out_low = out_high
@@ -470,12 +467,12 @@ fn compute_ternary_search_bounds(
         out_low = economic_floor;
     }
     if out_high < economic_floor {
-        record_ternary_economic_high_raise();
+        record_bounds_economic_high_raise();
         out_high = economic_floor.saturating_mul(U256::from(100u8));
         if let Some(max_wei) = flash_cap_wei
             && out_high > max_wei
         {
-            record_ternary_flash_cap_clamp();
+            record_bounds_flash_cap_clamp();
             out_high = max_wei;
         }
     }
@@ -486,10 +483,10 @@ fn compute_ternary_search_bounds(
         out_high = out_low.saturating_add(U256::from(1u8));
     }
     if out_high <= out_low || out_high < economic_floor {
-        record_ternary_bounds_reject(TernaryBoundsReject::InvalidRange);
+        record_bounds_reject(BoundsReject::InvalidRange);
         return None;
     }
-    record_ternary_bounds_ok();
+    record_bounds_ok();
     Some(TernarySearchBounds {
         low: out_low,
         high: out_high,
@@ -769,7 +766,6 @@ pub fn optimize_cycle(
     if let Some(seeds) = seed_sims
         && let Some(clamped) = clamp_brent_high_to_probe_seeds(high, low, economic_floor, seeds)
     {
-        record_ternary_seed_high_clamp();
         record_brent_seed_high_clamp();
         high = clamped;
     }
@@ -789,7 +785,7 @@ pub fn optimize_cycle(
             low: new_low,
             high: new_high,
         }) => {
-            record_ternary_bal_high_clamp();
+            record_brent_bal_high_clamp();
             low = new_low;
             high = new_high;
             if high <= low {
@@ -820,7 +816,6 @@ pub fn optimize_cycle(
             return None;
         }
         ClDepthHighClamp::Clamped(clamped) => {
-            record_ternary_cl_depth_clamp();
             record_brent_cl_depth_clamp();
             high = clamped;
             if high <= low {

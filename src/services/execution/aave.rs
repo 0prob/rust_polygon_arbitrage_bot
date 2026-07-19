@@ -33,6 +33,7 @@ pub async fn fetch_and_cache_aave_flash_loan_fee_bps<P: Provider<Ethereum>>(
 
 /// Aave V3 `ReserveConfigurationMap` bit positions (Pool.sol / ReserveConfiguration.sol).
 const AAVE_CFG_ACTIVE_BIT: u32 = 56;
+#[allow(dead_code)] // documented bit; flash eligibility ignores frozen (validateFlashloanSimple)
 const AAVE_CFG_FROZEN_BIT: u32 = 57;
 const AAVE_CFG_PAUSED_BIT: u32 = 60;
 const AAVE_CFG_FLASH_BIT: u32 = 63;
@@ -43,7 +44,6 @@ pub enum AaveReserveStatus {
     RpcError,
     NoAToken,
     Inactive,
-    Frozen,
     Paused,
     FlashDisabled,
 }
@@ -54,7 +54,6 @@ pub struct AaveRefreshStats {
     pub rpc_error: u32,
     pub no_atoken: u32,
     pub inactive: u32,
-    pub frozen: u32,
     pub paused: u32,
     pub flash_disabled: u32,
     pub pinned_inactive: u32,
@@ -71,7 +70,6 @@ impl AaveRefreshStats {
             AaveReserveStatus::RpcError => self.rpc_error += 1,
             AaveReserveStatus::NoAToken => self.no_atoken += 1,
             AaveReserveStatus::Inactive => self.inactive += 1,
-            AaveReserveStatus::Frozen => self.frozen += 1,
             AaveReserveStatus::Paused => self.paused += 1,
             AaveReserveStatus::FlashDisabled => self.flash_disabled += 1,
         }
@@ -83,7 +81,6 @@ impl AaveRefreshStats {
         }
         let ineligible = self.no_atoken
             + self.inactive
-            + self.frozen
             + self.paused
             + self.flash_disabled
             + self.pinned_inactive
@@ -93,13 +90,12 @@ impl AaveRefreshStats {
         }
         crate::info!(
             "aave: refresh tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
-             (rpc_err={} no_atoken={} inactive={} frozen={} paused={} flash_off={} pinned={}) fee_bps={}",
+             (rpc_err={} no_atoken={} inactive={} paused={} flash_off={} pinned={}) fee_bps={}",
             self.listed_viable,
             ineligible,
             self.rpc_error,
             self.no_atoken,
             self.inactive,
-            self.frozen,
             self.paused,
             self.flash_disabled,
             self.pinned_inactive,
@@ -157,9 +153,7 @@ pub fn reserve_status_from_config(configuration: U256, has_a_token: bool) -> Aav
     if !aave_cfg_bit_set(configuration, AAVE_CFG_ACTIVE_BIT) {
         return AaveReserveStatus::Inactive;
     }
-    if aave_cfg_bit_set(configuration, AAVE_CFG_FROZEN_BIT) {
-        return AaveReserveStatus::Frozen;
-    }
+    // ponytail: validateFlashloanSimple checks paused/active/flashLoanEnabled only — not frozen.
     if aave_cfg_bit_set(configuration, AAVE_CFG_PAUSED_BIT) {
         return AaveReserveStatus::Paused;
     }
@@ -226,10 +220,16 @@ mod tests {
             reserve_status_from_config(active_flash, false),
             AaveReserveStatus::NoAToken
         );
+        // Frozen is not a flash-loan gate in aave-v3-core ValidationLogic.
         let frozen = active_flash | U256::from(1u128 << AAVE_CFG_FROZEN_BIT);
         assert_eq!(
             reserve_status_from_config(frozen, true),
-            AaveReserveStatus::Frozen
+            AaveReserveStatus::Viable
+        );
+        let paused = active_flash | U256::from(1u128 << AAVE_CFG_PAUSED_BIT);
+        assert_eq!(
+            reserve_status_from_config(paused, true),
+            AaveReserveStatus::Paused
         );
     }
 

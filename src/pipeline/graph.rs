@@ -8,7 +8,7 @@ use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT;
-use crate::pipeline::local_sim::protocol_matches_pool_state;
+use crate::pipeline::local_sim::{protocol_matches_pool_state, sync_edge_fee_bps_from_state};
 use crate::pipeline::spot_price::spot_price_from_state;
 use crate::pipeline::spot_price::{compute_edge_log_weight, compute_edge_ratio};
 use crate::pipeline::types::{GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, VirtualPoolHub};
@@ -577,7 +577,10 @@ fn pool_has_admissible_edges(
     // Hub-spoke connectivity (no fake rates): admit pools that touch the expanded set.
     gate.spoke_connectivity.as_ref().is_some_and(|conn| {
         meta.tokens.iter().enumerate().any(|(i, &token)| {
-            bpt_index != Some(i) && arena.token_address(token).is_some_and(|a| conn.contains(&a))
+            bpt_index != Some(i)
+                && arena
+                    .token_address(token)
+                    .is_some_and(|a| conn.contains(&a))
         })
     })
 }
@@ -1117,14 +1120,11 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
             return 1;
         }
         ge.edge.protocol = corrected;
-        // Same V2→V3 fee_bps sync as local_sim::heal_cycle_edge_protocols.
-        if let PoolState::V3(v3) = state {
-            let pips = v3.fee.as_limbs()[0] as u32;
-            if (1..0x800000).contains(&pips) {
-                ge.edge.fee_bps = (pips / 100).min(9_999);
-            }
-        }
     }
+    // Keep edge fee_bps aligned with live pool fee (discovery lag / V2→V3 heal).
+    sync_edge_fee_bps_from_state(&mut ge.edge, state);
+    // Stale zfo flips V2/CL spot ratio — heal before compute_edge_ratio.
+    apply_cl_zero_for_one(arena, &mut ge.edge);
     let tin = ge.edge.token_in_idx as usize;
     let tout = ge.edge.token_out_idx as usize;
     if !state.hop_pair_routable(tin, tout) {

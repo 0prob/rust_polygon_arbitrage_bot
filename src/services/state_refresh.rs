@@ -401,15 +401,23 @@ impl StateRefreshService {
 
         let balancer_started = now_ms();
         if let Some(endpoint) = self.config.pipeline.balancer_backend_url.as_deref() {
-            let needs_ids = result.pools.iter().any(|p| {
-                p.protocol == crate::core::types::ProtocolType::BalancerV2 && p.pool_id.is_none()
-            });
-            if needs_ids {
+            let has_balancer = result
+                .pools
+                .iter()
+                .any(|p| p.protocol == crate::core::types::ProtocolType::BalancerV2);
+            if has_balancer {
                 match enrich_polygon_balancer_pool_ids(endpoint, &mut result.pools).await {
-                    Ok(count) if count > 0 => {
-                        crate::info!("Balancer backend enriched {count} Polygon pool IDs");
+                    Ok((enriched, filtered)) => {
+                        if enriched > 0 {
+                            crate::info!("Balancer backend enriched {enriched} Polygon pool IDs");
+                        }
+                        if filtered > 0 {
+                            crate::info!(
+                                "Balancer backend filtered {filtered} non-tradable Polygon pools \
+                                 (swap disabled or recovery mode)"
+                            );
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => crate::warn!(
                         "Balancer backend enrichment failed; using on-chain fallback: {error:#}"
                     ),

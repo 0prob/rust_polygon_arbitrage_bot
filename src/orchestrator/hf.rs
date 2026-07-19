@@ -612,6 +612,13 @@ fn select_cycles_for_rescore(
             protocol_mismatch_skipped += 1;
             continue;
         };
+        // Remap stale Uni TokenIndex endpoints from PoolMeta legs before reject.
+        let Some(ready) =
+            crate::pipeline::local_sim::realign_uni_cycle_from_pool_meta(arena, pool_metas, ready)
+        else {
+            protocol_mismatch_skipped += 1;
+            continue;
+        };
         if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &ready.edges) {
             protocol_mismatch_skipped += 1;
             continue;
@@ -1267,7 +1274,7 @@ pub async fn run_hf_tick(
         token_decimals,
         gas_oracle: Arc::clone(&ctx.gas_oracle),
         state_generation: evaluation_state_generation,
-        brent_iters: ctx.config.routing.ternary_search_iterations,
+        brent_iters: ctx.config.routing.brent_search_iterations,
         min_profit_matic: ctx.config.min_profit_matic,
         min_profit_roi_bps: ctx.config.execution.min_profit_roi_bps,
         gas_price,

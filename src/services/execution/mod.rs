@@ -1,6 +1,7 @@
 mod support;
 
 pub mod aave;
+pub mod balancer_fee;
 pub mod balancer_verify;
 pub mod calldata;
 pub mod candidate;
@@ -53,6 +54,9 @@ pub use aave::{
     aave_reserve_flash_eligible, fetch_and_cache_aave_flash_loan_fee_bps, log_aave_gate_summary,
     record_aave_mark_inactive, record_aave_prepare_skip_inactive,
     refresh_aave_flash_fee_with_fallback,
+};
+pub use balancer_fee::{
+    fetch_and_cache_balancer_flash_loan_fee_pct, refresh_balancer_flash_fee_with_fallback,
 };
 pub use balancer_verify::{
     BalancerBatchReject, BatchQueryOutcome, BatchQueryVerdict, balancer_batch_within_max_in_ratio,

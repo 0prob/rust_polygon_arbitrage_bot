@@ -27,9 +27,17 @@ pub fn encode_curve_hop(
 
     // Local Curve math / get_dy sits above exchange(); with SLIPPAGE_BPS=0,
     // min_dy == quote → "Exchange resulted in fewer coins than expected".
-    // curveslip: 10 bps still reverted on stable_ng dust hops; 50 bps << depth haircuts.
+    // Floor matches assess (`EXECUTION_MIN_SLIPPAGE_BPS`); take the tighter of
+    // re-quote vs conservative_execution_hops amount_out when both exist.
     let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
-    let min_dy = compute_min_out(arena, hop, bps, "curve")?;
+    let min_dy = {
+        let quoted = compute_min_out(arena, hop, bps, "curve")?;
+        if hop.amount_out.is_zero() {
+            quoted
+        } else {
+            hop.amount_out.min(quoted)
+        }
+    };
 
     let i = hop.edge.token_in_idx as i128;
     let j = hop.edge.token_out_idx as i128;

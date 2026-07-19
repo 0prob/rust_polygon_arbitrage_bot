@@ -44,8 +44,8 @@ pub enum CycleFinderMode {
     #[default]
     Hybrid,
     Dfs,
-    Johnson,
-    #[serde(alias = "bellman_ford", alias = "bellmanford")]
+    /// Negative-cycle search on Direct-edge adjacency (no separate Johnson impl).
+    #[serde(alias = "bellman_ford", alias = "bellmanford", alias = "johnson")]
     BellmanFord,
 }
 
@@ -53,8 +53,12 @@ pub enum CycleFinderMode {
 pub struct RoutingConfig {
     #[serde(default = "default_max_hops")]
     pub max_hops: u32,
-    #[serde(default = "default_ternary_search_iterations")]
-    pub ternary_search_iterations: u32,
+    /// Golden-section / Brent size-search iterations (env: `BRENT_SEARCH_ITERATIONS`).
+    #[serde(
+        default = "default_brent_search_iterations",
+        alias = "ternary_search_iterations"
+    )]
+    pub brent_search_iterations: u32,
     #[serde(default = "default_enumeration_max_paths")]
     pub enumeration_max_paths: u32,
     #[serde(default = "default_cycle_finder")]
@@ -223,7 +227,7 @@ fn default_rpc_batch_pace_ms() -> u64 {
 fn default_max_hops() -> u32 {
     5
 }
-fn default_ternary_search_iterations() -> u32 {
+fn default_brent_search_iterations() -> u32 {
     12
 }
 fn default_enumeration_max_paths() -> u32 {
@@ -342,7 +346,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             max_hops: default_max_hops(),
-            ternary_search_iterations: default_ternary_search_iterations(),
+            brent_search_iterations: default_brent_search_iterations(),
             enumeration_max_paths: default_enumeration_max_paths(),
             cycle_finder: default_cycle_finder(),
         }
@@ -531,8 +535,10 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("pool_meta_cache_path") => "pipeline.pool_meta_cache_path",
         k if k.eq_ignore_ascii_case("balancer_backend_url") => "pipeline.balancer_backend_url",
         k if k.eq_ignore_ascii_case("routing_max_hops") => "routing.max_hops",
-        k if k.eq_ignore_ascii_case("ternary_search_iterations") => {
-            "routing.ternary_search_iterations"
+        k if k.eq_ignore_ascii_case("brent_search_iterations")
+            || k.eq_ignore_ascii_case("ternary_search_iterations") =>
+        {
+            "routing.brent_search_iterations"
         }
         k if k.eq_ignore_ascii_case("routing_enumeration_max_paths") => {
             "routing.enumeration_max_paths"
@@ -888,11 +894,10 @@ mod tests {
                 Ok(Self::Hybrid)
             } else if raw.eq_ignore_ascii_case("dfs") {
                 Ok(Self::Dfs)
-            } else if raw.eq_ignore_ascii_case("johnson") {
-                Ok(Self::Johnson)
             } else if raw.eq_ignore_ascii_case("bellman-ford")
                 || raw.eq_ignore_ascii_case("bellman_ford")
                 || raw.eq_ignore_ascii_case("bellmanford")
+                || raw.eq_ignore_ascii_case("johnson")
             {
                 Ok(Self::BellmanFord)
             } else {

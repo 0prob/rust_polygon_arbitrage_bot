@@ -413,6 +413,13 @@ impl FlashLiquidityCache {
                         {
                             crate::warn!("background aave fee refresh failed: {e:#}");
                         }
+                        if let Err(e) = crate::services::execution::balancer_fee::refresh_balancer_flash_fee_with_fallback(
+                            &rpc,
+                        )
+                        .await
+                        {
+                            crate::warn!("background balancer fee refresh failed: {e:#}");
+                        }
                         let tokens = self.hot_token_list();
                         if tokens.is_empty() {
                             continue;
@@ -694,6 +701,10 @@ pub fn dodo_base_flash_pool_for_cycle(arena: &StateArena, cycle: &FoundCycle) ->
     // the same way they did before reentrancy gating.
     let _start_token = arena.token_address(cycle.start_token)?;
     let _ = cycle;
+    // ponytail: external DODO flash lenders not wired — reentrancy-safe pools only.
+    if !crate::services::execution::profit::DODO_EXTERNAL_FLASH_ENABLED {
+        return None;
+    }
     None
 }
 
@@ -1635,10 +1646,7 @@ fn assessment_flash_fee_matches(
     source: FlashLoanSource,
     amount_in: U256,
 ) -> bool {
-    let fee_bps = crate::services::execution::profit::flash_loan_fee_bps(source);
-    let expected = amount_in
-        .checked_mul(U256::from(fee_bps))
-        .map(|v| v / crate::core::constants::BPS_SCALE)
+    let expected = crate::services::execution::profit::flash_loan_fee_amount(source, amount_in)
         .unwrap_or(U256::MAX);
     assessment.flash_loan_fee == expected
 }

@@ -18,8 +18,8 @@ pub mod route_calls;
 pub mod route_sim_cache;
 pub mod sim_sanity;
 pub mod spot_price;
+/// Size search (golden-section / Brent). Module name is historical.
 pub mod ternary;
-pub mod ternary_diag;
 pub mod tick_fetch;
 pub mod types;
 pub mod weighted_graph;

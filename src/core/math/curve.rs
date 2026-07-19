@@ -10,11 +10,44 @@ const A_PRECISION: U256 = U256::from_limbs([100, 0, 0, 0]);
 const ONE_U256: U256 = U256::from_limbs([1, 0, 0, 0]);
 const TWO_U256: U256 = U256::from_limbs([2, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 128;
-/// Safety buffer applied to Curve output (0x186a0 = 100_000 = 0.001% of fee precision).
-/// Accounts for state drift between multicall read and eth_call execution.
-/// Curve pools are susceptible to frontrunning that shifts reserves by 1-2 wei,
-/// causing the "fewer coins than expected" revert.
-pub(crate) const CURVE_OUTPUT_BUFFER: U256 = U256::from_limbs([0x186a0, 0, 0, 0]);
+/// Safety buffer on Curve dy (5e6 / 1e10 = 0.05%).
+/// Covers multicall→exec drift after NG `_dynamic_fee` (2e10 offpeg default).
+pub(crate) const CURVE_OUTPUT_BUFFER: U256 = U256::from_limbs([5_000_000, 0, 0, 0]);
+/// Stable-NG example `offpeg_fee_multiplier` (2e10). Used when `stored_rates` are present.
+const DEFAULT_OFFPEG_FEE_MULTIPLIER: U256 = U256::from_limbs([20_000_000_000, 0, 0, 0]);
+
+/// Convert Curve `fee()` (1e10 denom) to edge `fee_bps`.
+#[must_use]
+pub fn curve_fee_bps_from_pool(fee: U256) -> Option<u32> {
+    if fee.is_zero() || fee >= CURVE_FEE_DENOMINATOR {
+        return None;
+    }
+    let bps = (fee * U256::from(10_000u64)) / CURVE_FEE_DENOMINATOR;
+    Some(bps.min(U256::from(9_999u64)).to::<u32>())
+}
+
+/// CurveStableSwapNGViews `_dynamic_fee(xpi, xpj, fee, offpeg_fee_multiplier)`.
+#[must_use]
+fn dynamic_fee(xpi: U256, xpj: U256, fee: U256, offpeg_mult: U256) -> U256 {
+    if offpeg_mult <= CURVE_FEE_DENOMINATOR || xpi.is_zero() || xpj.is_zero() {
+        return fee;
+    }
+    let sum = xpi + xpj;
+    let xps2 = sum.saturating_mul(sum);
+    if xps2.is_zero() {
+        return fee;
+    }
+    // (_offpeg * fee) / ((_offpeg - FEE_DENOM) * 4 * xpi * xpj / xps2 + FEE_DENOM)
+    let numerator = offpeg_mult.saturating_mul(fee);
+    let prod = xpi.saturating_mul(xpj).saturating_mul(U256::from(4u8));
+    let imbalance = ((offpeg_mult - CURVE_FEE_DENOMINATOR).saturating_mul(prod)) / xps2;
+    let denom = imbalance.saturating_add(CURVE_FEE_DENOMINATOR);
+    if denom.is_zero() {
+        return fee;
+    }
+    numerator / denom
+}
+
 type CurveXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
 
 fn get_d(xp: &[U256], a: U256) -> Option<U256> {
@@ -173,7 +206,15 @@ pub fn try_curve_stable_amount_out(
     if dy.is_zero() {
         return Err(CurveStableReject::ZeroOut);
     }
-    let fee_amount = (dy * state.fee) / CURVE_FEE_DENOMINATOR;
+    // NG get_dy: fee from average xp; plain StableSwap keeps static fee (no rates).
+    let fee = if state.rates.is_empty() {
+        state.fee
+    } else {
+        let xpi_avg = (xp[token_in_idx] + x) / TWO_U256;
+        let xpj_avg = (xp[token_out_idx] + y) / TWO_U256;
+        dynamic_fee(xpi_avg, xpj_avg, state.fee, DEFAULT_OFFPEG_FEE_MULTIPLIER)
+    };
+    let fee_amount = (dy * fee) / CURVE_FEE_DENOMINATOR;
     let dy_after_fee = dy.saturating_sub(fee_amount);
     let dy_buffered =
         dy_after_fee.saturating_sub((dy_after_fee * CURVE_OUTPUT_BUFFER) / CURVE_FEE_DENOMINATOR);
@@ -202,6 +243,29 @@ pub fn get_curve_stable_amount_out(
 mod tests {
     use super::*;
     use crate::core::math::fixed_point::ONE;
+
+    #[test]
+    fn curve_fee_bps_from_1e10_denom() {
+        assert_eq!(curve_fee_bps_from_pool(U256::from(5_000_000u64)), Some(5));
+        assert_eq!(curve_fee_bps_from_pool(U256::ZERO), None);
+        assert_eq!(curve_fee_bps_from_pool(CURVE_FEE_DENOMINATOR), None);
+    }
+
+    #[test]
+    fn dynamic_fee_doubles_when_one_side_dust() {
+        let fee = U256::from(5_000_000u64);
+        let balanced = dynamic_fee(ONE, ONE, fee, DEFAULT_OFFPEG_FEE_MULTIPLIER);
+        // At equal xp, 4*x*y/(x+y)^2 = 1 → denom = offpeg → fee unchanged.
+        assert_eq!(balanced, fee);
+        let skewed = dynamic_fee(
+            ONE,
+            ONE * U256::from(1_000_000u64),
+            fee,
+            DEFAULT_OFFPEG_FEE_MULTIPLIER,
+        );
+        assert!(skewed > fee, "skewed={skewed} fee={fee}");
+        assert!(skewed <= fee * U256::from(2u8), "skewed={skewed}");
+    }
 
     #[test]
     fn test_zero_amount_returns_zero() {

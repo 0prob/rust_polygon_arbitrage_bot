@@ -12,7 +12,7 @@ pub struct WeightedEdge {
     pub ratio: U256,
 }
 
-/// Build Johnson/Bellman-Ford adjacency from graph edge weights (already rescored).
+/// Build Bellman-Ford adjacency from graph edge weights (already rescored).
 /// Only token nodes are included — virtual hub slots carry Enter/Exit legs, not Direct swaps.
 #[must_use]
 pub fn build_weighted_adjacency(graph: &RoutingGraph) -> Vec<Vec<WeightedEdge>> {

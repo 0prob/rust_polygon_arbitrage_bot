@@ -1313,7 +1313,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         cycle_search_ms,
     );
 
-    if lf_pass <= 3 || lf_pass.is_multiple_of(10) {
+    // ponytail: funnel logger off by default — enable with RPBOT_PIPELINE_SURVIVAL=1.
+    if std::env::var_os("RPBOT_PIPELINE_SURVIVAL").is_some_and(|v| v != "0")
+        && (lf_pass <= 3 || lf_pass.is_multiple_of(10))
+    {
         let mut survival = PipelineSurvival::from_lf_tick(
             &pools,
             &ctx.cache,
@@ -1324,6 +1327,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             survival = survival.with_index_stats(&stats);
         }
         survival.log_summary(lf_pass);
+    }
+    if lf_pass <= 3 || lf_pass.is_multiple_of(10) {
         crate::services::index_diag::log_index_summary();
     }
 

@@ -307,7 +307,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         crate::warn!("dispatch skipped: gas fee snapshot missing or stale (age_ms={age:?})");
         return;
     };
-    let brent_iters = ctx.config.routing.ternary_search_iterations;
+    let brent_iters = ctx.config.routing.brent_search_iterations;
     let base_slippage_bps = ctx.config.execution.slippage_bps;
     let min_profit_roi_bps = ctx.config.execution.min_profit_roi_bps;
     let max_flash_loan_usd = ctx.config.execution.max_flash_loan_usd;

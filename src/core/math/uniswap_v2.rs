@@ -40,18 +40,32 @@ pub fn get_amount_out(
     u512_to_u256(result)
 }
 
+/// Convert live V2 fee fraction to edge `fee_bps` (None when state fee is unusable).
+#[must_use]
+pub fn v2_fee_bps_from_pool(state: &V2PoolState) -> Option<u32> {
+    if state.fee.is_zero() || state.fee_denominator.is_zero() || state.fee >= state.fee_denominator
+    {
+        return None;
+    }
+    let fee_part = state.fee_denominator - state.fee;
+    let bps = (fee_part * U256::from(10_000u64)) / state.fee_denominator;
+    let bps = bps.min(U256::from(9_999u64)).to::<u32>();
+    (bps > 0).then_some(bps)
+}
+
 #[must_use]
 pub fn resolve_v2_fee_with_edge(state: &V2PoolState, edge_fee_bps: Option<u32>) -> (U256, U256) {
+    // Prefer live pool fee — discovery/edge bps can lag factory fee changes.
+    if !state.fee.is_zero() && !state.fee_denominator.is_zero() && state.fee < state.fee_denominator
+    {
+        return (state.fee, state.fee_denominator);
+    }
     if let Some(bps) = edge_fee_bps
         && bps > 0
         && bps < 10000
     {
         let num = U256::from(10_000u64 - u64::from(bps));
         return (num, U256::from(10_000u64));
-    }
-    if !state.fee.is_zero() && !state.fee_denominator.is_zero() && state.fee < state.fee_denominator
-    {
-        return (state.fee, state.fee_denominator);
     }
     (DEFAULT_FEE_NUMERATOR, FEE_DENOMINATOR)
 }
@@ -93,6 +107,22 @@ mod tests {
         let (num, den) = resolve_v2_fee_with_edge(&state, Some(5));
         assert_eq!(num, U256::from(9995u64));
         assert_eq!(den, U256::from(10_000u64));
+    }
+
+    #[test]
+    fn live_pool_fee_beats_stale_edge_bps() {
+        let state = V2PoolState {
+            reserve0: U256::from(1u64),
+            reserve1: U256::from(1u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        };
+        // Stale discovery said 5 bps; live pair is 30 bps.
+        let (num, den) = resolve_v2_fee_with_edge(&state, Some(5));
+        assert_eq!(num, U256::from(9970u64));
+        assert_eq!(den, U256::from(10_000u64));
+        assert_eq!(v2_fee_bps_from_pool(&state), Some(30));
     }
 
     #[test]

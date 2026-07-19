@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::types::{
-    FlashLoanSource, FoundCycle, ProfitAssessment, ProtocolType, RouteSimulationResult, TokenIndex,
+    FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
     hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
@@ -1044,7 +1044,6 @@ pub fn evaluate_cycles_parallel(
     // these and hide shallow/cl_depth_clamp (live cldepth capture had attempts>0
     // but no `brent:` line).
     crate::pipeline::brent_diag::log_brent_summary();
-    crate::pipeline::ternary_diag::log_ternary_summary();
     results
 }
 
@@ -1450,10 +1449,10 @@ fn evaluate_one(
     let brent_seeds =
         build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
     let brent_seed_slice = (!brent_seeds.is_empty()).then_some(brent_seeds.as_slice());
-    // Shared CL shallow caps for post-Brent detailed walks (and depth reopt).
+    // Shared CL shallow caps for post-Brent detailed walks.
     let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
 
-    let (mut opt, mut sim, probe_only) = match optimize_cycle(
+    let (opt, sim, probe_only) = match optimize_cycle(
         input.arena,
         cycle,
         input.token_to_matic_rates,
@@ -1514,7 +1513,8 @@ fn evaluate_one(
         inc(&stats.flash_source);
         return None;
     };
-    let mut depth_bps = depth_impact_slippage_bps_with_base(
+    // ponytail: single assess with depth-aware slip — no second Brent reopt.
+    let depth_bps = depth_impact_slippage_bps_with_base(
         input.arena,
         &cycle.edges,
         opt.optimal_input,
@@ -1524,70 +1524,9 @@ fn evaluate_one(
             total_gas: sim.total_gas,
         }),
     );
-    let mut slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
-    let config_route_slip = effective_slippage_bps(base_slippage, hop_count, 0);
-    let mut assessment = if slippage_bps > config_route_slip {
-        let depth_assessment =
-            assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
-        if depth_assessment.should_execute {
-            depth_assessment
-        } else {
-            let mut depth_ctx = ProfitEvalContext::with_safety_multiplier(
-                cycle.start_token,
-                input.arena,
-                input.token_to_matic_rates,
-                input.token_decimals,
-                input.gas_price,
-                slippage_bps,
-                flash_source,
-                input.safety_multiplier_bps,
-            );
-            depth_ctx.gas_scale_bps = 10_000;
-            depth_ctx.hop_count = cycle.edge_hops();
-            depth_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
-            if let Some(reopt) = optimize_cycle(
-                input.arena,
-                cycle,
-                input.token_to_matic_rates,
-                input.token_decimals,
-                Some(input.max_flash_loan_usd),
-                input.matic_usd,
-                input.matic_usd_chainlink,
-                Some(input.brent_iters),
-                None,
-                &depth_ctx,
-                None,
-                Some(route_gas_costing),
-                route_state_revision
-                    .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
-            ) {
-                opt = reopt;
-                sim = simulate_route_detailed_with_caps(
-                    input.arena,
-                    &cycle.edges,
-                    opt.optimal_input,
-                    route_shallow_caps.as_ref(),
-                )?;
-                if !validate_optimized_sim(input, cycle, &sim, opt.optimal_input, opt.search_low) {
-                    return None;
-                }
-                depth_bps = depth_impact_slippage_bps_with_base(
-                    input.arena,
-                    &cycle.edges,
-                    opt.optimal_input,
-                    Some(&MinimalSimResult {
-                        profit: sim.profit,
-                        amount_out: sim.amount_out,
-                        total_gas: sim.total_gas,
-                    }),
-                );
-                slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
-            }
-            assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
-        }
-    } else {
-        assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?
-    };
+    let slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
+    let mut assessment =
+        assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
     if probe_only && !assessment.should_execute {
         assessment.reject_reason = assessment
             .reject_reason
@@ -1630,23 +1569,6 @@ pub fn reassess_hf_eval_result(
     )
 }
 
-/// V4 local-sim fidelity cap. Was 0.25 POL (blocked pad-validation dry-runs at ~0.36);
-/// align with global until eth_call proves residual V4 phantoms again.
-const MAX_SANE_V4_ROUTE_MATIC_WEI: u128 = crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI;
-
-fn route_has_uniswap_v4(cycle: &FoundCycle) -> bool {
-    cycle
-        .edges
-        .iter()
-        .any(|e| e.protocol == ProtocolType::UniswapV4)
-}
-
-/// Gate phantom V4 local-sim profits that pass the global 1 POL MATIC cap.
-#[must_use]
-fn v4_route_net_exceeds_fidelity_cap(has_v4: bool, net_matic_wei: U256) -> bool {
-    has_v4 && net_matic_wei > U256::from(MAX_SANE_V4_ROUTE_MATIC_WEI)
-}
-
 fn assess_route_for_cycle(
     input: &HfEvalInput<'_>,
     sim: &RouteSimulationResult,
@@ -1663,7 +1585,8 @@ fn assess_route_for_cycle(
         input.profit_priority_alpha_bps,
         risk_bps,
     );
-    let mut assessment = assess_route_from_sim(&RouteAssessRequest {
+    // Global MAX_SANE_PROFIT_MATIC_WEI already applied in assess_route_from_sim.
+    Some(assess_route_from_sim(&RouteAssessRequest {
         cycle_start: cycle.start_token,
         arena: input.arena,
         gross_profit: sim.profit,
@@ -1681,20 +1604,7 @@ fn assess_route_for_cycle(
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
-    });
-    if assessment.should_execute
-        && v4_route_net_exceeds_fidelity_cap(
-            route_has_uniswap_v4(cycle),
-            assessment.net_profit_after_gas_matic_wei,
-        )
-    {
-        assessment.should_execute = false;
-        assessment.reject_reason = Some(format!(
-            "V4 route net {} MATIC wei exceeds sane cap {}",
-            assessment.net_profit_after_gas_matic_wei, MAX_SANE_V4_ROUTE_MATIC_WEI
-        ));
-    }
-    Some(assessment)
+    }))
 }
 
 fn flash_cap_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> FlashBorrowCapParams {
@@ -1870,20 +1780,4 @@ mod tests {
         assert_eq!(aggregate.probe(), 2);
     }
 
-    #[test]
-    fn v4_fidelity_cap_matches_global_matic_sane_cap() {
-        assert_eq!(
-            MAX_SANE_V4_ROUTE_MATIC_WEI,
-            crate::core::constants::MAX_SANE_PROFIT_MATIC_WEI
-        );
-    }
-
-    #[test]
-    fn v4_fidelity_cap_rejects_only_v4_routes_above_global_matic_cap() {
-        let under = U256::from(MAX_SANE_V4_ROUTE_MATIC_WEI);
-        let over = under + U256::from(1u64);
-        assert!(!v4_route_net_exceeds_fidelity_cap(true, under));
-        assert!(v4_route_net_exceeds_fidelity_cap(true, over));
-        assert!(!v4_route_net_exceeds_fidelity_cap(false, over));
-    }
 }

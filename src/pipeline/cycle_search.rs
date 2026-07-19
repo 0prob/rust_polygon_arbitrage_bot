@@ -196,7 +196,7 @@ pub fn find_cycles_for_mode_with_budget(
             diag.finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
             CycleSearchOutcome { cycles, diag }
         }
-        CycleFinderMode::Johnson | CycleFinderMode::BellmanFord => {
+        CycleFinderMode::BellmanFord => {
             let mut prep = prepare_active_graph(graph);
             prep.prefer_start_tokens(extra_start_tokens);
             diag.hub_heavy = prep.hub_heavy;

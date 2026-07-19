@@ -22,6 +22,7 @@ name = "oracle_feeds"
 path = "src/bin/oracle_feeds.rs"
 
 [features]
+# Production path is headless (`default = []`). Enable only for the optional `tui` bin.
 default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:libc"]
 

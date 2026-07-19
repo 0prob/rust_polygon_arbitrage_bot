@@ -1,4 +1,3 @@
-use crate::core::constants::BPS_SCALE;
 use crate::core::math::fixed_point::{ONE, ONE_U512, edge_log_weight_from_ratio};
 use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
@@ -11,7 +10,6 @@ use crate::pipeline::cycle_finder::clamp_fee_bps;
 use crate::pipeline::local_sim::simulate_hop_amount_out_with_cap;
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::types::RoutingGraph;
-use crate::services::execution::profit::flash_loan_fee_bps;
 use crate::util::{ten_pow_u256_cached, u256_to_f64, u512_to_u256_checked};
 use alloy::primitives::{Address, U256, U512};
 use rustc_hash::FxHashMap;
@@ -409,7 +407,8 @@ pub fn gas_log_penalty_for_cycle(
     let mut drag_wei = gas_cost_wei;
     if let Some(source) = flash_source {
         let probe = min_economic_amount_in(start_token_decimals, rate);
-        let flash_fee = (probe * U256::from(flash_loan_fee_bps(source))) / BPS_SCALE;
+        let flash_fee = crate::services::execution::profit::flash_loan_fee_amount(source, probe)
+            .unwrap_or(U256::ZERO);
         let scale = crate::util::ten_pow_u256(start_token_decimals);
         drag_wei = drag_wei.saturating_add((flash_fee * rate) / scale);
     }

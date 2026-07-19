@@ -529,12 +529,20 @@ async fn spawn_pass_loop_sidecars(
     {
         let rpc = Arc::clone(&ctx.rpc);
         tokio::spawn(async move {
-            if let Ok(p) = rpc.connect_state()
-                && let Err(e) =
+            if let Ok(p) = rpc.connect_state() {
+                if let Err(e) =
                     crate::services::execution::aave::fetch_and_cache_aave_flash_loan_fee_bps(&p)
                         .await
-            {
-                crate::warn!("aave: startup flash_fee fetch failed: {e}");
+                {
+                    crate::warn!("aave: startup flash_fee fetch failed: {e}");
+                }
+                if let Err(e) = crate::services::execution::balancer_fee::fetch_and_cache_balancer_flash_loan_fee_pct(
+                    &p,
+                )
+                .await
+                {
+                    crate::warn!("balancer: startup flash_fee fetch failed: {e}");
+                }
             }
         });
     }

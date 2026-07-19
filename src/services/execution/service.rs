@@ -47,12 +47,12 @@ use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
 const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
-const PREPARE_SKIP_QUARANTINE_AFTER: u32 = 2;
+// ponytail: prepare-skip only counts for logs — quarantine was starving selected=0.
 /// Best-eval cover below this (bps of gas cost) is chronic dust — soft-quarantine
 /// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
 /// at ~358 bps across captures while ge_1000 stayed 0).
 const CHRONIC_UNDERWATER_COVER_BPS: u64 = 2_000;
-/// Require repeated best-eval wins before 30m quarantine. Live uqfix: unblocking
+/// Require repeated best-eval wins before soft quarantine. Live uqfix: unblocking
 /// quarantine then one-shot-quarantined 74 distinct fps → selected=0 / kept max 1.
 const CHRONIC_UNDERWATER_STRIKES: u32 = 3;
 /// Reset strike count when best-eval gaps exceed this (one-shot diversions).
@@ -60,14 +60,13 @@ const CHRONIC_UNDERWATER_STRIKE_WINDOW: Duration = Duration::from_secs(120);
 /// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
 /// into selected=0). Sticky V3 dust sits ~300–400 bps.
 const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 100;
-/// Sticky V3 dust (~355 bps) is static for hours — 120s let it re-burn the probe
-/// window each expiry. 30m matches direct-token quarantine scale.
-const CHRONIC_UNDERWATER_QUARANTINE: Duration = Duration::from_secs(1800);
 const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 /// Start-token cooldown when vault query profit does not appear in executor balance
 /// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
 const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800);
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
+/// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
+const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -578,18 +577,11 @@ impl ExecutionService {
         q.get(&token).is_some_and(|expiry| now < *expiry)
     }
 
-    /// Cool down routes that repeatedly fail dispatch prepare after HF marked profitable.
+    /// Count prepare skips for diagnostics (does not quarantine — soft quarantine
+    /// after 2 skips starved the HF window).
     pub fn record_prepare_skip(&self, fingerprint: u64) {
-        let count = {
-            let mut counts = self.prepare_skip_counts.write();
-            let count = counts.entry(fingerprint).or_insert(0);
-            *count += 1;
-            *count
-        };
-        if count >= PREPARE_SKIP_QUARANTINE_AFTER {
-            self.quarantine_route_soft(fingerprint, Instant::now());
-            self.prepare_skip_counts.write().remove(&fingerprint);
-        }
+        let mut counts = self.prepare_skip_counts.write();
+        *counts.entry(fingerprint).or_insert(0) += 1;
     }
 
     fn quarantine_route(&self, fp: u64, now: Instant, kind: RouteFailureKind) {
