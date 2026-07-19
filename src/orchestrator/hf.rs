@@ -109,7 +109,7 @@ fn hf_eval_to_ui_row(
 ) -> HfCandidateUiRow {
     HfCandidateUiRow {
         fingerprint: result.route_fingerprint,
-        hops: result.cycle.hop_count,
+        hops: result.cycle.edge_hops(),
         route: near_miss_route_summary(arena, &result.cycle, pool_metas),
         amount_in: result.sim.amount_in,
         amount_out: result.sim.amount_out,
@@ -1389,7 +1389,7 @@ pub async fn run_hf_tick(
             let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
-                hops: result.cycle.hop_count,
+                hops: result.cycle.edge_hops(),
                 route: near_miss_route_summary(
                     eval_arena.as_ref(),
                     &result.cycle,
@@ -1742,7 +1742,7 @@ fn log_near_miss_diagnostic(
     crate::info!(
         "hf near-miss: fp={} hops={} score={:.4} route={} input={} gross={} net_matic={} safety_floor={} gap={} min_profit={} roi_bps={} gas_cost_wei={} slippage={} flash_fee={} reject={}",
         result.route_fingerprint,
-        result.cycle.hop_count,
+        result.cycle.edge_hops(),
         result.cycle.score,
         near_miss_route_summary(arena, &result.cycle, pool_metas),
         result.opt.optimal_input,

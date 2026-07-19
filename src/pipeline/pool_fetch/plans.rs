@@ -8,7 +8,8 @@ use crate::pipeline::abi_cache::{
     BALANCER_LINEAR_TARGETS, BALANCER_LINEAR_WRAPPED, BALANCER_SCALING, BALANCER_SWAP_FEE,
     BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_CRYPTO_PRECISIONS, CURVE_CRYPTO_PRICE_SCALE,
     CURVE_FEE, CURVE_GAMMA, CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K,
-    DODO_LP_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE,
+    DODO_LP_FEE, DODO_MT_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES,
+    V3_FEE,
     V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
@@ -30,6 +31,7 @@ pub(super) enum CallKind {
     DodoI,
     DodoK,
     DodoLpFee,
+    DodoMtFee,
     DodoPmmState,
     CurveBalance(usize),
     CurveA,
@@ -158,6 +160,7 @@ fn build_dodo_plan(plan: &mut PoolFetchPlan) {
     push_call(plan, addr, DODO_I.clone(), CallKind::DodoI);
     push_call(plan, addr, DODO_K.clone(), CallKind::DodoK);
     push_call(plan, addr, DODO_LP_FEE.clone(), CallKind::DodoLpFee);
+    push_call(plan, addr, DODO_MT_FEE.clone(), CallKind::DodoMtFee);
     push_call(plan, addr, DODO_PMM_STATE.clone(), CallKind::DodoPmmState);
 }
 

@@ -307,6 +307,10 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
     for pool in &unverified {
         if let Some(id) = meta_cache.balancer_pool_id(&pool.address) {
             out.insert(pool.address, id);
+        } else if let Some(id) = pool.pool_id {
+            // Discovery already has an ID (PG) — seed cache, skip getPoolId RPC.
+            meta_cache.set_balancer_pool_id(&pool.address, id);
+            out.insert(pool.address, id);
         } else {
             needs_rpc.push(pool);
         }
@@ -468,9 +472,9 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
 ) -> PoolFetchResult {
     let chunk_size = max_multicall_calls.max(1);
     let plan_batch_calls = plan_batch_call_budget(chunk_size);
-    let needs_balancer_hydrate = pools
-        .iter()
-        .any(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified);
+    let needs_balancer_hydrate = pools.iter().any(|p| {
+        p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified && p.pool_id.is_none()
+    });
     let hydrate_started = crate::util::now_ms();
     let balancer_ids = if needs_balancer_hydrate {
         hydrate_balancer_pool_ids(&provider, pools, block_number, meta_cache).await

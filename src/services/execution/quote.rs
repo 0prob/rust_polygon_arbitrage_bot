@@ -19,11 +19,12 @@ pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<
 #[must_use]
 pub fn resolve_v3_fee_pips_for_hop(arena: &StateArena, hop: &CalldataHop) -> u32 {
     match arena.pool_state(hop.edge.pool_index) {
-        Some(PoolState::V3(s) | PoolState::V4(s)) => {
-            resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
-                .min(U256::from(0xffffffu32))
-                .to::<u32>()
-        }
+        Some(PoolState::V3(s)) => resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps), false)
+            .min(U256::from(0xffffffu32))
+            .to::<u32>(),
+        Some(PoolState::V4(s)) => resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps), true)
+            .min(U256::from(0xffffffu32))
+            .to::<u32>(),
         _ => hop.edge.fee_bps.min(0xffffff),
     }
 }
@@ -50,15 +51,22 @@ pub fn derive_tight_v3_price_limit(
     edge_fee_bps: u32,
     slippage_bps: u64,
     explicit_fee_pips: Option<u32>,
+    allow_zero_pool_fee: bool,
 ) -> anyhow::Result<U256> {
     use crate::core::math::tick_math::{MAX_SQRT_RATIO, MIN_SQRT_RATIO};
 
     let sim = if let Some(pips) = explicit_fee_pips {
         let mut tmp = state.clone();
         tmp.fee = U256::from(pips);
-        simulate_v3_swap(&tmp, amount_in, zero_for_one, None)
+        simulate_v3_swap(&tmp, amount_in, zero_for_one, None, allow_zero_pool_fee)
     } else {
-        simulate_v3_swap(state, amount_in, zero_for_one, Some(edge_fee_bps))
+        simulate_v3_swap(
+            state,
+            amount_in,
+            zero_for_one,
+            Some(edge_fee_bps),
+            allow_zero_pool_fee,
+        )
     };
     if sim.shallow {
         anyhow::bail!("v3 price limit: incomplete tick coverage");
@@ -146,6 +154,7 @@ mod tests {
                 30,
                 0,
                 None,
+                false,
             )
             .is_err()
         );

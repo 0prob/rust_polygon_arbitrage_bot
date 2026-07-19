@@ -8,7 +8,7 @@ use alloy::primitives::U256;
 
 use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
-use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -600,20 +600,10 @@ fn can_still_find_profitable_cycle(
 fn hub_exit_legs(
     graph: &RoutingGraph,
     hub_node: u32,
-    pending: PendingHubSwap,
-    pool_metas: &PoolMetaIndex<'_>,
-    arena: &StateArena,
+    meta: &PoolMeta,
+    state: &PoolState,
 ) -> smallvec::SmallVec<[u8; 8]> {
     if graph.v4_singleton_hub == Some(hub_node) {
-        let Some(meta) = pool_metas
-            .get(pending.pool_index.0 as usize)
-            .and_then(Option::as_ref)
-        else {
-            return smallvec::SmallVec::new();
-        };
-        let Some(state) = arena.pool_state(pending.pool_index) else {
-            return smallvec::SmallVec::new();
-        };
         return crate::pipeline::graph::funded_token_indices(state, meta);
     }
     let Some(idx) = graph.virtual_hub_index(hub_node) else {
@@ -690,7 +680,19 @@ fn collect_cycles_dfs_single_start(
             if !pool_mark(used_pools, pool_id) {
                 return;
             }
-            let exit_legs = hub_exit_legs(graph, curr_node, pending, pool_metas, arena);
+            // Hoist meta/state once — exit-leg loop used to re-fetch every iteration.
+            let Some(meta) = pool_metas
+                .get(pending.pool_index.0 as usize)
+                .and_then(Option::as_ref)
+            else {
+                pool_unmark(used_pools, pool_id);
+                return;
+            };
+            let Some(state) = arena.pool_state(pending.pool_index) else {
+                pool_unmark(used_pools, pool_id);
+                return;
+            };
+            let exit_legs = hub_exit_legs(graph, curr_node, meta, state);
             for out_leg in exit_legs {
                 if out_leg == pending.token_in_idx {
                     continue;
@@ -698,15 +700,6 @@ fn collect_cycles_dfs_single_start(
                 if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                     break;
                 }
-                let Some(meta) = pool_metas
-                    .get(pending.pool_index.0 as usize)
-                    .and_then(Option::as_ref)
-                else {
-                    continue;
-                };
-                let Some(state) = arena.pool_state(pending.pool_index) else {
-                    continue;
-                };
                 let out_idx = out_leg as usize;
                 let Some(token_out) =
                     crate::pipeline::graph::routing_token_at_leg(arena, state, meta, out_idx)

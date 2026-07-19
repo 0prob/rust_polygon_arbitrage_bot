@@ -427,9 +427,6 @@ impl StateRefreshService {
                         result.cursor.last_block
                     );
                 }
-                if !self.token_metadata_loaded.load(Ordering::Acquire) {
-                    self.refresh_token_metas().await;
-                }
                 return Ok(0);
             }
             let mut state = self.discovery_state.write();
@@ -440,12 +437,10 @@ impl StateRefreshService {
             let mut address_index = std::mem::take(&mut state.address_index);
             {
                 // Then make_mut on discovered; its borrow lives only inside this block.
+                // Pools already passed retain_routable_pool in bootstrap/incremental.
                 let discovered = Arc::make_mut(&mut state.discovered);
                 let address_index = Arc::make_mut(&mut address_index);
                 for pool in result.pools {
-                    if !is_routable_pool(&pool) {
-                        continue;
-                    }
                     if let Some(&idx) = index.get(&pool.pool_key) {
                         discovered[idx] = pool;
                         address_index.insert(discovered[idx].address, idx);
@@ -487,9 +482,6 @@ impl StateRefreshService {
             log_index_summary();
         }
 
-        if !self.token_metadata_loaded.load(Ordering::Acquire) {
-            self.refresh_token_metas().await;
-        }
         self.routable_pool_count_generation
             .store(0, Ordering::Release);
 

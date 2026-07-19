@@ -176,7 +176,8 @@ fn cl_edge_ratio_u256(
     if probe.is_zero() {
         return cl_spot_u256(state, edge);
     }
-    let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps));
+    let allow_zero = edge.protocol == ProtocolType::UniswapV4;
+    let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps), allow_zero);
     if r.shallow {
         return None;
     }
@@ -247,9 +248,18 @@ pub fn hop_penalty(hops: u32) -> f64 {
         .unwrap_or(hops as f64 * 0.15)
 }
 
+/// Fee-only fallback weight when spot ratio is missing/non-finite.
+/// Assumes neutral spot=1 after fee → `-ln(1 - fee)` (not `ln(1 + fee)`).
 #[must_use]
 pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
-    (fee_bps as f64 / 10_000.0).ln_1p()
+    if fee_bps == 0 {
+        return 0.0;
+    }
+    if fee_bps >= 10_000 {
+        return f64::INFINITY;
+    }
+    let keep = 1.0 - (fee_bps as f64 / 10_000.0);
+    -keep.ln()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,10 +439,8 @@ fn rescore_one_cycle(
     token_decimals: Option<&FxHashMap<Address, u8>>,
     flash_source: Option<FlashLoanSource>,
 ) {
-    let edge_hops = u32::try_from(cycle.edges.len()).unwrap_or(cycle.hop_count);
-    if edge_hops != cycle.hop_count {
-        cycle.hop_count = edge_hops;
-    }
+    let edge_hops = cycle.edge_hops();
+    cycle.hop_count = edge_hops;
     let start_decimals = token_decimals.map_or(18, |m| {
         crate::services::oracle::resolve_token_decimals_for_index(cycle.start_token, arena, m)
     });
@@ -476,7 +484,7 @@ fn rescore_one_cycle(
             flash_source,
         )
     });
-    log_weight += hop_penalty(cycle.hop_count) + gas_penalty;
+    log_weight += hop_penalty(edge_hops) + gas_penalty;
     cycle.log_weight = log_weight;
     cycle.score = log_weight;
     cycle.cumulative_fee_bps = cum_fee;
@@ -537,6 +545,15 @@ pub fn finalize_enumerated_cycles(cycles: Vec<FoundCycle>, max_cycles: usize) ->
 mod tests {
     use super::*;
     use crate::core::types::PoolIndex;
+
+    #[test]
+    fn fee_only_log_weight_is_minus_ln_one_minus_fee() {
+        let w = compute_edge_log_weight(30);
+        let expected = -(1.0 - 0.003_f64).ln();
+        assert!((w - expected).abs() < 1e-12, "w={w} expected={expected}");
+        assert!(compute_edge_log_weight(0).abs() < 1e-15);
+        assert!(compute_edge_log_weight(10_000).is_infinite());
+    }
 
     fn edge_with_indices(pool: u32, tin: u8, tout: u8, zero_for_one: bool) -> Edge {
         Edge {

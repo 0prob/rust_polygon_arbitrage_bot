@@ -772,7 +772,7 @@ pub fn rotate_cycle_to_start(cycle: &FoundCycle, new_start: TokenIndex) -> Optio
         Some(FoundCycle {
             start_token: new_start,
             edges,
-            hop_count: cycle.hop_count,
+            hop_count: cycle.edge_hops(),
             log_weight: cycle.log_weight,
             cumulative_fee_bps: cycle.cumulative_fee_bps,
             score: cycle.score,
@@ -1440,7 +1440,7 @@ fn reoptimize_capped(
         input.safety_multiplier_bps,
     );
     profit_ctx.gas_scale_bps = 10_000;
-    profit_ctx.hop_count = input.evaluated.cycle.hop_count;
+    profit_ctx.hop_count = input.evaluated.cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
         input.gas_oracle,
@@ -1481,7 +1481,7 @@ fn reoptimize_capped(
         gross_profit: sim.profit,
         amount_in: sim.amount_in,
         simulated_gas: sim.total_gas,
-        hop_count: input.evaluated.cycle.hop_count,
+        hop_count: input.evaluated.cycle.edge_hops(),
         slippage_bps: input.slippage_bps,
         flash_source: source,
         gas: AssessmentGas::Route {
@@ -1594,7 +1594,7 @@ fn reassess_route(
         gross_profit: input.evaluated.result.profit,
         amount_in: input.evaluated.result.amount_in,
         simulated_gas: input.evaluated.result.total_gas,
-        hop_count: input.evaluated.cycle.hop_count,
+        hop_count: input.evaluated.cycle.edge_hops(),
         slippage_bps: input.slippage_bps,
         flash_source: source,
         gas: AssessmentGas::Route {

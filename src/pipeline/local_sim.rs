@@ -186,7 +186,14 @@ fn simulate_hop(
         }
         (PoolState::V3(s), ProtocolType::UniswapV3)
         | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            let r = simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps));
+            let allow_zero = edge.protocol == ProtocolType::UniswapV4;
+            let r = simulate_v3_swap(
+                s,
+                amount_in,
+                edge.zero_for_one,
+                Some(edge.fee_bps),
+                allow_zero,
+            );
             if r.shallow {
                 // Tickless pools always mark shallow, but the no-tick step path can
                 // still quote within the spot-probe cap. Accept that; refuse larger.
@@ -1025,7 +1032,15 @@ fn cl_hop_shallow_at_amount(
     }
     match state {
         PoolState::V3(s) | PoolState::V4(s) => {
-            simulate_v3_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps)).shallow
+            let allow_zero = edge.protocol == ProtocolType::UniswapV4;
+            simulate_v3_swap(
+                s,
+                amount_in,
+                edge.zero_for_one,
+                Some(edge.fee_bps),
+                allow_zero,
+            )
+            .shallow
         }
         _ => false,
     }

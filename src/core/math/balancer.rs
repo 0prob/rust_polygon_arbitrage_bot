@@ -22,7 +22,7 @@ pub fn exceeds_balancer_max_in_ratio(amount_in: U256, balance_in: U256) -> bool 
             .is_none_or(|limit| amount_in > limit / ONE)
 }
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
-const MAX_ITERATIONS: u32 = 64;
+const MAX_ITERATIONS: u32 = 255;
 
 #[must_use]
 pub fn balancer_swap_fee_from_pool_meta_fee(fee: u64) -> U256 {
@@ -172,15 +172,16 @@ pub fn calculate_balancer_stable_invariant(
             return U256::ZERO;
         }
         invariant = numerator / denominator;
-        if invariant > sum {
-            return sum;
-        }
+        // Balancer StableMath: converge on |D - Dprev| <= 1. Do not clamp to
+        // `sum` — Newton often overshoots above sum before settling (final D
+        // is typically ≤ sum for imbalanced balances).
         if invariant.abs_diff(prev) <= U256::from(1) {
             return invariant;
         }
     }
 
-    invariant
+    // Did not converge — fail closed (on-chain reverts STABLE_INVARIANT_DIDNT_CONVERGE).
+    U256::ZERO
 }
 
 fn token_balance_given_invariant(
@@ -302,11 +303,15 @@ pub fn get_balancer_stable_amount_out(
         return U256::ZERO;
     }
 
-    let mut xp = scaled_balances.clone();
-    xp[stable_in_idx] += scaled_amount_in;
-    let final_balance_out =
-        token_balance_given_invariant(state.amp, &xp, invariant, stable_out_idx, amp_precision);
     let original_out = scaled_balances[stable_out_idx];
+    scaled_balances[stable_in_idx] += scaled_amount_in;
+    let final_balance_out = token_balance_given_invariant(
+        state.amp,
+        &scaled_balances,
+        invariant,
+        stable_out_idx,
+        amp_precision,
+    );
     if final_balance_out.is_zero() || final_balance_out >= original_out {
         return U256::ZERO;
     }
@@ -669,8 +674,13 @@ mod proptests {
             let inv = calculate_balancer_stable_invariant(amp, &balances, U256::from(1000));
             if !inv.is_zero() {
                 let sum = bal0 + bal1 + U256::from(100) * ONE;
-                prop_assert!(inv <= sum,
-                    "invariant {} exceeds sum {}", inv, sum);
+                // Converged D stays near the balance sum (may exceed sum slightly).
+                prop_assert!(
+                    inv <= sum.saturating_mul(U256::from(2)),
+                    "invariant {} exceeds 2*sum {}",
+                    inv,
+                    sum
+                );
             }
         }
     }

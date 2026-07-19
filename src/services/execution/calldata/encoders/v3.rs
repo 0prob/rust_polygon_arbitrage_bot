@@ -37,6 +37,7 @@ pub fn encode_v3_hop(
         hop.edge.fee_bps,
         slippage_bps,
         None,
+        false,
     )?;
 
     let (token0, token1) = pool_tokens_from_hop(hop);

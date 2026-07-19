@@ -278,7 +278,7 @@ pub fn build_execution_candidate(
         flash_loan_source: dispatch_flash_source,
         min_profit_matic_wei: config.min_profit_matic_wei,
         min_profit_roi_bps: config.min_profit_roi_bps,
-        hop_count: evaluated.cycle.hop_count,
+        hop_count: evaluated.cycle.edge_hops(),
         safety_multiplier_bps: config.safety_multiplier_bps,
         state_generation: config.state_generation,
         state_block: config.state_block,

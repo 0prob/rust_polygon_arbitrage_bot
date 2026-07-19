@@ -601,7 +601,7 @@ fn rank_one_cycle_probe(
 
     let depth_bps =
         depth_impact_slippage_bps_with_base(arena, &cycle.edges, probe_amount, Some(&probe));
-    let effective_slip = effective_slippage_bps(slippage_bps, cycle.edges.len() as u32, depth_bps);
+    let effective_slip = effective_slippage_bps(slippage_bps, cycle.edge_hops(), depth_bps);
 
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
@@ -614,7 +614,7 @@ fn rank_one_cycle_probe(
         safety_multiplier_bps,
     );
     ctx.gas_scale_bps = 10_000;
-    ctx.hop_count = cycle.edges.len() as u32;
+    ctx.hop_count = cycle.edge_hops();
     ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
     let mut ranked_probe = probe;
     ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
@@ -1165,12 +1165,12 @@ fn probe_fallback_opt(
         input.token_to_matic_rates,
         input.token_decimals,
         input.gas_price,
-        effective_slippage_bps(input.slippage_bps, cycle.hop_count, 0),
+        effective_slippage_bps(input.slippage_bps, cycle.edge_hops(), 0),
         flash_source,
         input.safety_multiplier_bps,
     );
     profit_ctx.gas_scale_bps = 10_000;
-    profit_ctx.hop_count = cycle.hop_count;
+    profit_ctx.hop_count = cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let (mut psn, mut pzp, mut pf, mut ps) = (0u32, 0u32, 0u32, 0u32);
     let mut best: Option<(OptimizationResult, RouteSimulationResult, U256)> = None;
@@ -1213,7 +1213,7 @@ fn probe_fallback_opt(
                 profitable: true,
                 hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
                 total_gas: m.total_gas,
-                hop_count: cycle.edges.len() as u32,
+                hop_count: cycle.edge_hops(),
             })
         }) else {
             psn += 1;
@@ -1246,7 +1246,7 @@ fn probe_fallback_opt(
             crate::debug!(
                 "probe fallback sanity reject: fp={_fp:#x} start_token={} hops={} pool_addrs={:?} edges={:?} amount={amount} profit={} rate={rate} dec={decimals} reason={reason:?}",
                 cycle.start_token.0,
-                cycle.hop_count,
+                cycle.edge_hops(),
                 cycle
                     .edges
                     .iter()
@@ -1305,7 +1305,7 @@ fn probe_fallback_opt(
             profitable: true,
             hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
             total_gas: seed.total_gas,
-            hop_count: cycle.edges.len() as u32,
+            hop_count: cycle.edge_hops(),
         };
         let score = brent_score_matic_from_sim(&seed, amount, &profit_ctx);
         best = Some((
@@ -1414,7 +1414,7 @@ fn evaluate_one(
         inc(&stats.flash_source);
         return None;
     };
-    let hop_count = cycle.edges.len() as u32;
+    let hop_count = cycle.edge_hops();
     let brent_slippage = probe_seed
         .map(|(amount, sim)| {
             let depth =
@@ -1434,7 +1434,7 @@ fn evaluate_one(
     );
     // Match probe ranking: pre-resolve route gas, do not scale twice in Brent.
     profit_ctx.gas_scale_bps = 10_000;
-    profit_ctx.hop_count = cycle.edges.len() as u32;
+    profit_ctx.hop_count = cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     let route_gas_costing = RouteGasCosting {
         lookup: input.route_gas,
@@ -1537,7 +1537,7 @@ fn evaluate_one(
                 input.safety_multiplier_bps,
             );
             depth_ctx.gas_scale_bps = 10_000;
-            depth_ctx.hop_count = cycle.edges.len() as u32;
+            depth_ctx.hop_count = cycle.edge_hops();
             depth_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
             if let Some(reopt) = optimize_cycle(
                 input.arena,
@@ -1663,7 +1663,7 @@ fn assess_route_for_cycle(
         gross_profit: sim.profit,
         amount_in: sim.amount_in,
         simulated_gas: sim.total_gas,
-        hop_count: cycle.hop_count,
+        hop_count: cycle.edge_hops(),
         slippage_bps,
         flash_source,
         gas: AssessmentGas::TickRoute {

@@ -101,8 +101,8 @@ pub struct ConcentratedLiquidityPoolState {
     pub ticks: Arc<[V3Tick]>,
     /// False = pool is paused (slot0.unlocked == 0).
     pub unlocked: bool,
-    /// Protocol fee share in hundredths of a bip (0 = no protocol fee).
-    pub fee_protocol: u8,
+    /// V3: unused (always 0). V4: packed directional protocol fee from slot0 (`uint24`).
+    pub fee_protocol: u32,
     /// Cardinality of oracle observations (0 = never observed, pool likely dead).
     pub observation_cardinality: u16,
 }
@@ -170,7 +170,7 @@ pub struct DodoPoolState {
     pub i: U256,
     pub k: U256,
     pub lp_fee_rate: U256,
-    /// Maintainer fee on gross PMM output (1e18 scale); derived from indexer total fee.
+    /// Maintainer fee on gross PMM output (1e18 scale); from on-chain `_MT_FEE_RATE_()`.
     pub mt_fee_rate: U256,
 }
 
@@ -218,6 +218,7 @@ pub enum PoolState {
 
 impl PoolState {
     /// Token leg has enough inventory for a single-hop swap (protocol dust guard).
+    #[inline]
     #[must_use]
     pub fn hop_token_funded(&self, token_idx: usize) -> bool {
         match self {
@@ -265,6 +266,7 @@ impl PoolState {
     }
 
     /// Directed swap is structurally valid and both legs are funded.
+    #[inline]
     #[must_use]
     pub fn hop_pair_routable(&self, token_in_idx: usize, token_out_idx: usize) -> bool {
         if token_in_idx == token_out_idx {
@@ -298,6 +300,7 @@ impl PoolState {
         false
     }
 
+    #[inline]
     #[must_use]
     pub fn is_tradable(&self) -> bool {
         match self {
@@ -378,6 +381,15 @@ pub struct FoundCycle {
     /// Used for precision-critical profitability checks; eliminates f64 rounding in
     /// the final profit decision.
     pub cycle_ratio: U256,
+}
+
+impl FoundCycle {
+    /// Canonical hop count from `edges` (source of truth over cached `hop_count`).
+    #[inline]
+    #[must_use]
+    pub fn edge_hops(&self) -> u32 {
+        u32::try_from(self.edges.len()).unwrap_or(self.hop_count)
+    }
 }
 
 #[derive(Debug, Clone)]

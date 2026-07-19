@@ -513,7 +513,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             let mut hop_hist = [0u32; HOP_CAP as usize + 1];
             for c in &result {
-                let h = c.hop_count.min(HOP_CAP) as usize;
+                let h = c.edge_hops().min(HOP_CAP) as usize;
                 hop_hist[h] = hop_hist[h].saturating_add(1);
             }
             crate::debug!(

@@ -85,6 +85,7 @@ cached_view_call!(DODO_QUOTE_TOKEN, IDodoPoolState::_QUOTE_TOKEN_Call {});
 cached_view_call!(DODO_I, IDodoPoolState::_I_Call {});
 cached_view_call!(DODO_K, IDodoPoolState::_K_Call {});
 cached_view_call!(DODO_LP_FEE, IDodoPoolState::_LP_FEE_RATE_Call {});
+cached_view_call!(DODO_MT_FEE, IDodoPoolState::_MT_FEE_RATE_Call {});
 cached_view_call!(DODO_PMM_STATE, IDodoPoolState::getPMMStateForCallCall {});
 cached_view_call!(CURVE_A, ICurvePool::ACall {});
 cached_view_call!(CURVE_FEE, ICurvePool::feeCall {});

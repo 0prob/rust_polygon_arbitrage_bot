@@ -236,6 +236,7 @@ sol! {
         function _BASE_RESERVE_() external view returns (uint256);
         function _QUOTE_RESERVE_() external view returns (uint256);
         function _LP_FEE_RATE_() external view returns (uint256);
+        function _MT_FEE_RATE_() external view returns (uint256);
         function _BASE_TOKEN_() external view returns (address);
         function _QUOTE_TOKEN_() external view returns (address);
         function getPMMStateForCall() external view returns (

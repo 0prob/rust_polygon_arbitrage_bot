@@ -21,7 +21,7 @@ pub struct DiscoveredPool {
     pub fee_bps: u32,
     pub tick_spacing: Option<i32>,
     pub pool_id: Option<FixedBytes<32>>,
-    /// True when `pool_id` came from Balancer's backend or an on-chain call.
+    /// True when `pool_id` is trusted (PostgreSQL, Balancer backend, or on-chain).
     pub pool_id_verified: bool,
     pub hooks: Option<Address>,
     /// PostgreSQL `poolType` hint (`crypto` / `stable` for Curve, `weighted` / `stable` for Balancer).
@@ -161,18 +161,13 @@ fn has_supported_token_shape(protocol: ProtocolType, tokens: &[Address]) -> bool
     {
         return false;
     }
-    if tokens.len() > 1 {
-        let mut seen = [None; 8];
-        let mut seen_len = 0usize;
-        for &token in tokens {
-            if seen[..seen_len].contains(&Some(token)) {
-                return false;
-            }
-            if seen_len < seen.len() {
-                seen[seen_len] = Some(token);
-                seen_len += 1;
-            }
-        }
+    // ponytail: O(n²) fine — Balancer/Woofi cap at 257 tokens
+    if tokens
+        .iter()
+        .enumerate()
+        .any(|(i, token)| tokens[..i].contains(token))
+    {
+        return false;
     }
     match protocol {
         ProtocolType::UniswapV2
@@ -370,7 +365,6 @@ fn parse_pool_meta_impl(
             record_index_parse_reject(IndexParseReject::V4Fields);
             return None;
         }
-        let pool_id = pool_id.or_else(|| resolve_v4_pool_id_from_key(&pool_key));
         if hooks.is_none() {
             hooks = Some(Address::ZERO);
         }
@@ -395,6 +389,7 @@ fn parse_pool_meta_impl(
         });
     }
 
+    let pool_id_verified = proto == ProtocolType::BalancerV2 && pool_id.is_some();
     crate::services::index_diag::record_index_parse_ok();
     Some(DiscoveredPool {
         pool_key,
@@ -405,7 +400,7 @@ fn parse_pool_meta_impl(
         fee_bps,
         tick_spacing,
         pool_id,
-        pool_id_verified: false,
+        pool_id_verified,
         hooks,
         pool_type,
         created_block: created_block.unwrap_or(0).max(0) as u64,
@@ -849,6 +844,31 @@ mod tests {
             )
             .expect("supported Balancer pool");
             assert_eq!(pool.pool_type.as_deref(), expected);
+            assert!(pool.pool_id_verified, "PG Balancer pool_id must skip hydrate RPC");
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_tokens_beyond_eight() {
+        let mut tokens: Vec<String> = (1u8..=9)
+            .map(|i| format!("0x00000000000000000000000000000100000000{i:02x}"))
+            .collect();
+        // Duplicate past the old fixed 8-slot tracker.
+        tokens.push(tokens[0].clone());
+        assert!(
+            parse_pool_meta_row(
+                "0x00000000000000000000000000000100000000bb",
+                "balancer_v2",
+                &tokens,
+                Some(30),
+                None,
+                Some(&format!("0x{}", "22".repeat(32))),
+                None,
+                Some("WeightedPool"),
+                Some(1),
+                None,
+            )
+            .is_none()
+        );
     }
 }

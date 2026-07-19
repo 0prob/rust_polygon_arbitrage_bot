@@ -50,9 +50,15 @@ fn default_no_tick_step(tick_spacing: i32) -> i32 {
     (tick_spacing * 2).max(1)
 }
 
+/// Resolve CL fee in pips. When `allow_zero_pool_fee` is set (Uniswap V4 slot0),
+/// `pool_fee == 0` is kept — it is a valid zero-LP-fee pool, not "missing fee".
 #[must_use]
-pub fn resolve_v3_fee_pips(pool_fee: U256, edge_fee_bps: Option<u32>) -> U256 {
-    if !pool_fee.is_zero() {
+pub fn resolve_v3_fee_pips(
+    pool_fee: U256,
+    edge_fee_bps: Option<u32>,
+    allow_zero_pool_fee: bool,
+) -> U256 {
+    if allow_zero_pool_fee || !pool_fee.is_zero() {
         return pool_fee;
     }
     if let Some(bps) = edge_fee_bps.filter(|bps| *bps < 10_000) {
@@ -68,9 +74,19 @@ pub fn simulate_v3_swap(
     amount_in: U256,
     zero_for_one: bool,
     edge_fee_bps: Option<u32>,
+    allow_zero_pool_fee: bool,
 ) -> V3SwapResult {
     let fallback_tick = state.tick;
-    let fee_pips = resolve_v3_fee_pips(state.fee, edge_fee_bps);
+    let mut fee_pips = resolve_v3_fee_pips(state.fee, edge_fee_bps, allow_zero_pool_fee);
+    // V4 packs directional protocol fee into `fee_protocol`; V3 leaves it 0.
+    if state.fee_protocol != 0 {
+        let proto = crate::core::v4_storage::v4_direction_protocol_fee_pips(
+            state.fee_protocol,
+            zero_for_one,
+        );
+        let lp = fee_pips.to::<u32>();
+        fee_pips = U256::from(crate::core::v4_storage::v4_combined_swap_fee_pips(proto, lp));
+    }
 
     if amount_in.is_zero()
         || !state.unlocked
@@ -236,19 +252,26 @@ mod tests {
 
     #[test]
     fn test_resolve_v3_fee_pips_default() {
-        let fee = resolve_v3_fee_pips(U256::ZERO, None);
+        let fee = resolve_v3_fee_pips(U256::ZERO, None, false);
         assert_eq!(fee, U256::from(DEFAULT_V3_FEE_PIPS));
     }
 
     #[test]
     fn exact_pool_fee_precedes_rounded_edge_fee() {
-        let fee = resolve_v3_fee_pips(U256::from(5_000u32), Some(25));
+        let fee = resolve_v3_fee_pips(U256::from(5_000u32), Some(25), false);
         assert_eq!(fee, U256::from(5_000u32));
     }
 
     #[test]
     fn explicit_zero_edge_fee_remains_zero() {
-        let fee = resolve_v3_fee_pips(U256::ZERO, Some(0));
+        let fee = resolve_v3_fee_pips(U256::ZERO, Some(0), false);
+        assert_eq!(fee, U256::ZERO);
+    }
+
+    #[test]
+    fn v4_zero_pool_fee_is_authoritative() {
+        // Stale edge fee must not override slot0 lpFee=0.
+        let fee = resolve_v3_fee_pips(U256::ZERO, Some(30), true);
         assert_eq!(fee, U256::ZERO);
     }
 
@@ -265,7 +288,7 @@ mod tests {
             observation_cardinality: 1,
             ticks: Arc::from(Vec::new()),
         };
-        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30));
+        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30), false);
         assert!(r.amount_out.is_zero());
         assert!(!r.shallow);
     }
@@ -283,10 +306,11 @@ mod tests {
             observation_cardinality: 1,
             ticks: Arc::from(Vec::new()),
         };
-        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30));
+        let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30), false);
         assert!(r.shallow);
         assert!(r.amount_out > U256::ZERO);
     }
+
 }
 
 #[cfg(test)]

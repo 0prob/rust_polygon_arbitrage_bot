@@ -456,13 +456,13 @@ fn build_routes(
                 gas_price_wei: gas_price,
                 token_to_matic_rate: rate,
                 token_decimals: decimals,
-                hop_count: cycle.hop_count,
+                hop_count: cycle.edge_hops(),
                 min_profit_matic_wei: U256::ZERO,
                 min_profit_roi_bps: 0,
                 // assess_profit expects route-level slip (compound per-hop config).
                 slippage_bps: crate::services::execution::profit::compound_slippage_bps(
                     slippage_bps,
-                    cycle.hop_count,
+                    cycle.edge_hops(),
                 ),
                 flash_loan_source: FlashLoanSource::Balancer,
                 safety_multiplier_bps,
@@ -499,7 +499,7 @@ fn build_routes(
             search_blob,
             protocols,
             tokens,
-            hops: cycle.hop_count as usize,
+            hops: cycle.edge_hops() as usize,
             raw_score,
             rescored,
             amount_in_token: format_amount(amount_in, decimals),
@@ -515,7 +515,7 @@ fn build_routes(
             gas_estimate,
             risk_score,
             liquidity_score,
-            long_tail: cycle.hop_count > 4 || risk_score >= 60,
+            long_tail: cycle.edge_hops() > 4 || risk_score >= 60,
             status: RouteStatus::New,
         });
     }
@@ -586,7 +586,7 @@ fn build_route_row_parts(
     let mut protocols = String::new();
     let mut tokens = Vec::with_capacity(cycle.edges.len().saturating_mul(2));
     let mut liquidity_score = 100u8;
-    let mut risk_score = (cycle.hop_count as u8).saturating_mul(10);
+    let mut risk_score = (cycle.edge_hops() as u8).saturating_mul(10);
 
     if rate.is_zero() {
         liquidity_score = liquidity_score.saturating_sub(35);
@@ -655,7 +655,7 @@ fn build_route_row_parts(
         });
     }
 
-    let _ = write!(detail, "hops {} score {:.4}", cycle.hop_count, cycle.score);
+    let _ = write!(detail, "hops {} score {:.4}", cycle.edge_hops(), cycle.score);
 
     (
         route_parts.join(" -> "),

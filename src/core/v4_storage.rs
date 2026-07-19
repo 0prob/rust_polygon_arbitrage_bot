@@ -40,6 +40,30 @@ pub fn decode_v4_slot0(raw: U256) -> DecodedV4Slot0 {
     }
 }
 
+/// Directional protocol fee pips from packed V4 `protocol_fee` (`uint24`).
+#[inline]
+#[must_use]
+pub fn v4_direction_protocol_fee_pips(protocol_fee: u32, zero_for_one: bool) -> u32 {
+    if zero_for_one {
+        protocol_fee & 0xfff
+    } else {
+        (protocol_fee >> 12) & 0xfff
+    }
+}
+
+/// Uniswap V4 `ProtocolFeeLibrary.calculateSwapFee`:
+/// `protocolFee + lpFee - (protocolFee * lpFee / 1_000_000)`.
+#[inline]
+#[must_use]
+pub fn v4_combined_swap_fee_pips(protocol_fee_pips: u32, lp_fee_pips: u32) -> u32 {
+    if protocol_fee_pips == 0 {
+        return lp_fee_pips;
+    }
+    let proto = u64::from(protocol_fee_pips);
+    let lp = u64::from(lp_fee_pips);
+    (proto + lp - (proto * lp) / 1_000_000) as u32
+}
+
 #[must_use]
 pub fn decode_v4_liquidity(raw: U256) -> u128 {
     (raw & U256::from(u128::MAX)).to::<u128>()
@@ -108,5 +132,14 @@ mod tests {
         let a = compute_v4_tick_info_slot(&pool_id, -60);
         let b = compute_v4_tick_info_slot(&pool_id, 60);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn v4_combined_fee_matches_protocol_fee_library() {
+        // protocol=50, lp=3000 → 50 + 3000 - floor(150000/1e6) = 3050
+        assert_eq!(v4_combined_swap_fee_pips(50, 3000), 3050);
+        assert_eq!(v4_combined_swap_fee_pips(0, 3000), 3000);
+        assert_eq!(v4_direction_protocol_fee_pips(0x123_050, true), 0x050);
+        assert_eq!(v4_direction_protocol_fee_pips(0x123_050, false), 0x123);
     }
 }

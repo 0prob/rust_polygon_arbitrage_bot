@@ -281,7 +281,7 @@ pub fn compare_cycle_score(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering
     b.cycle_ratio
         .cmp(&a.cycle_ratio)
         .then_with(|| a.score.total_cmp(&b.score))
-        .then_with(|| a.hop_count.cmp(&b.hop_count))
+        .then_with(|| a.edge_hops().cmp(&b.edge_hops()))
         .then_with(|| a.start_token.0.cmp(&b.start_token.0))
         .then_with(|| {
             a.edges

@@ -707,7 +707,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             outcome,
             prepared.evaluated.result.amount_in,
             route_slippage_bps,
-            prepared.evaluated.cycle.hop_count,
+            prepared.evaluated.cycle.edge_hops(),
         ) {
             BatchQueryVerdict::Accepted(_) => {}
             BatchQueryVerdict::Rejected(reason) => {
@@ -1521,7 +1521,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
         outcome,
         result.sim.amount_in,
         slippage,
-        result.cycle.hop_count,
+        result.cycle.edge_hops(),
     ) {
         BatchQueryVerdict::Accepted(on_chain_profit) => {
             let mut accepted = result;

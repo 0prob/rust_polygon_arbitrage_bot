@@ -119,7 +119,9 @@ pub fn fee_to_bps(protocol_label: &str, raw_fee: Option<u32>) -> u32 {
         || contains_ignore_case(protocol_label, "elastic")
         || is_algebra_protocol_label(protocol_label);
     let raw = raw_fee.unwrap_or(if is_pips_style { 3000 } else { 30 });
-    if contains_ignore_case(protocol_label, "v4") && raw_fee == Some(0) {
+    // Uniswap V4 may legitimately have fee=0. Algebra "QUICKSWAP_V4" is not V4 —
+    // substring "v4" must not grant the zero-fee exception (falls through to 30 bps).
+    if normalize_protocol(protocol_label) == Some(ProtocolType::UniswapV4) && raw_fee == Some(0) {
         return 0;
     }
     if raw == 0 || raw >= 0x800000 {
@@ -201,6 +203,7 @@ mod tests {
         assert_eq!(fee_to_bps("QUICKSWAP_ELASTIC", Some(3000)), 30);
         assert_eq!(fee_to_bps("ALGEBRA", Some(500)), 5);
         assert_eq!(fee_to_bps("QUICKSWAP_V4", Some(3000)), 30);
+        assert_eq!(fee_to_bps("QUICKSWAP_V4", Some(0)), 30);
         assert_eq!(fee_to_bps("UNISWAP_V4", Some(0)), 0);
         assert_eq!(fee_to_bps("UNISWAP_V3", Some(3000)), 30);
         assert_eq!(fee_to_bps("UNISWAP_V2", Some(30)), 30);

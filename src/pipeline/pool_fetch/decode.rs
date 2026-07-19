@@ -185,11 +185,9 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
     if decoded.sqrt_price_x96.is_zero() || liquidity == 0 {
         return None;
     }
-    let fee = if decoded.lp_fee > 0 {
-        U256::from(decoded.lp_fee)
-    } else {
-        U256::from(plan.pool.fee_bps) * U256::from(100u32)
-    };
+    // slot0 packs lpFee; 0 is a valid V4 zero-fee / dynamic-fee pool — do not
+    // fall back to indexer fee_bps (that overcharges and kills real arbs).
+    let fee = U256::from(decoded.lp_fee);
     Some(PoolState::V4(V4PoolState {
         sqrt_price_x96: decoded.sqrt_price_x96,
         tick: decoded.tick,
@@ -198,21 +196,34 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
         tick_spacing: plan.pool.tick_spacing.unwrap_or(60),
         ticks: Arc::from([] as [crate::core::types::V3Tick; 0]),
         unlocked: true,
-        fee_protocol: 0,
+        fee_protocol: decoded.protocol_fee,
         observation_cardinality: 1,
     }))
 }
 
-fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let base = decode_u256(results.first()?.as_ref()?)?;
-    let quote = decode_u256(results.get(1)?.as_ref()?)?;
-    let base_token = decode_address(results.get(2)?.as_ref()?)?;
-    let quote_token = decode_address(results.get(3)?.as_ref()?)?;
-    let i = decode_u256(results.get(4)?.as_ref()?)?;
-    let k = decode_u256(results.get(5)?.as_ref()?)?;
-    let lp_fee_rate = decode_u256(results.get(6)?.as_ref()?)?;
-    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(results.get(7)?.as_ref()?)
-        .ok()?;
+fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+    let by_kind = |kind: CallKind| -> Option<&Bytes> {
+        let idx = plan.kinds.iter().position(|k| *k == kind)?;
+        results.get(idx)?.as_ref()
+    };
+    let base = decode_u256(by_kind(CallKind::DodoBase)?)?;
+    let quote = decode_u256(by_kind(CallKind::DodoQuote)?)?;
+    let base_token = decode_address(by_kind(CallKind::DodoBaseToken)?)?;
+    let quote_token = decode_address(by_kind(CallKind::DodoQuoteToken)?)?;
+    let i = decode_u256(by_kind(CallKind::DodoI)?)?;
+    let k = decode_u256(by_kind(CallKind::DodoK)?)?;
+    let lp_fee_rate = decode_u256(by_kind(CallKind::DodoLpFee)?)?;
+    // Production plans always include DodoMtFee — require a successful decode.
+    // Legacy fixtures without the call keep mt=0.
+    let mt_fee_rate = if plan.kinds.iter().any(|k| *k == CallKind::DodoMtFee) {
+        decode_u256(by_kind(CallKind::DodoMtFee)?)?
+    } else {
+        U256::ZERO
+    };
+    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(
+        by_kind(CallKind::DodoPmmState)?,
+    )
+    .ok()?;
     let pmm_i = U256::from(pmm.i);
     let pmm_k = U256::from(pmm.K);
     let r_state = match pmm.R {
@@ -228,6 +239,8 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
         || pmm_i.is_zero()
         || pmm_k > ONE
         || lp_fee_rate >= ONE
+        || mt_fee_rate >= ONE
+        || lp_fee_rate.saturating_add(mt_fee_rate) >= ONE
         || i != pmm_i
         || k != pmm_k
         || U256::from(pmm.B) != base
@@ -248,7 +261,7 @@ fn decode_dodo(_plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolS
         i: pmm_i,
         k: pmm_k,
         lp_fee_rate,
-        mt_fee_rate: U256::ZERO,
+        mt_fee_rate,
     }))
 }
 
@@ -616,6 +629,88 @@ mod tests {
     }
 
     #[test]
+    fn decode_v4_keeps_zero_lp_fee_from_slot0() {
+        // sqrt=2^96, tick=0, protocol=0, lpFee=0 — indexer fee_bps must not win.
+        let slot0 = U256::from(1u128 << 96);
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::UniswapV4,
+                tokens: Vec::new(),
+                fee_bps: 30,
+                tick_spacing: Some(60),
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![CallKind::V4Slot0, CallKind::V4Liquidity],
+        };
+        let results = vec![
+            Some(Bytes::copy_from_slice(&slot0.to_be_bytes::<32>())),
+            Some(Bytes::copy_from_slice(&abi_word(1_000_000))),
+        ];
+        let Some(PoolState::V4(state)) = decode_plan(&plan, &results) else {
+            panic!("V4 zero-fee pool should decode");
+        };
+        assert!(state.fee.is_zero());
+        assert_eq!(state.fee_protocol, 0);
+    }
+
+    #[test]
+    fn dodo_decode_rejects_missing_mt_fee_when_planned() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::Dodo,
+                tokens: Vec::new(),
+                fee_bps: 1_000,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::DodoBase,
+                CallKind::DodoQuote,
+                CallKind::DodoBaseToken,
+                CallKind::DodoQuoteToken,
+                CallKind::DodoI,
+                CallKind::DodoK,
+                CallKind::DodoLpFee,
+                CallKind::DodoMtFee,
+                CallKind::DodoPmmState,
+            ],
+        };
+        let values = [
+            2_040_000_000_000_000u64,
+            5_000_000_000_000_000,
+            2_628_567_256_663,
+            12_288_863_768,
+            2_764_216_862_899,
+            12_012_067_168,
+            1,
+        ];
+        let mut pmm = Vec::with_capacity(32 * values.len());
+        for value in values {
+            pmm.extend_from_slice(&abi_word(value));
+        }
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(values[2]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[3]))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(2))),
+            Some(Bytes::copy_from_slice(&abi_word(values[0]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[1]))),
+            Some(Bytes::copy_from_slice(&abi_word(10_000_000_000_000_000))),
+            None, // planned MT fee call failed
+            Some(Bytes::from(pmm)),
+        ];
+        assert!(decode_plan(&plan, &results).is_none());
+    }
+
+    #[test]
     fn balancer_classification_requires_family_specific_state() {
         assert_eq!(
             classify_balancer_pool(Some("linear"), true, false, false),
@@ -786,11 +881,73 @@ mod tests {
         let Some(PoolState::Dodo(state)) = decode_plan(&plan, &results) else {
             panic!("DODO snapshot should decode");
         };
+        assert!(state.mt_fee_rate.is_zero());
 
         assert_eq!(
             crate::core::math::dodo::get_dodo_amount_out(&state, U256::from(474_425u64), true),
             U256::from(959u64),
         );
+    }
+
+    #[test]
+    fn dodo_decode_applies_on_chain_mt_fee_rate() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::Dodo,
+                tokens: Vec::new(),
+                fee_bps: 1_000,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::DodoBase,
+                CallKind::DodoQuote,
+                CallKind::DodoBaseToken,
+                CallKind::DodoQuoteToken,
+                CallKind::DodoI,
+                CallKind::DodoK,
+                CallKind::DodoLpFee,
+                CallKind::DodoMtFee,
+                CallKind::DodoPmmState,
+            ],
+        };
+        let values = [
+            2_040_000_000_000_000u64,
+            5_000_000_000_000_000,
+            2_628_567_256_663,
+            12_288_863_768,
+            2_764_216_862_899,
+            12_012_067_168,
+            1,
+        ];
+        let mut pmm = Vec::with_capacity(32 * values.len());
+        for value in values {
+            pmm.extend_from_slice(&abi_word(value));
+        }
+        let mt = 10_000_000_000_000_000u64; // 1%
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(values[2]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[3]))),
+            Some(Bytes::copy_from_slice(&abi_word(1))),
+            Some(Bytes::copy_from_slice(&abi_word(2))),
+            Some(Bytes::copy_from_slice(&abi_word(values[0]))),
+            Some(Bytes::copy_from_slice(&abi_word(values[1]))),
+            Some(Bytes::copy_from_slice(&abi_word(10_000_000_000_000_000))), // 1% LP
+            Some(Bytes::copy_from_slice(&abi_word(mt))),
+            Some(Bytes::from(pmm)),
+        ];
+        let Some(PoolState::Dodo(state)) = decode_plan(&plan, &results) else {
+            panic!("DODO snapshot should decode with MT fee");
+        };
+        assert_eq!(state.mt_fee_rate, U256::from(mt));
+        let with_mt =
+            crate::core::math::dodo::get_dodo_amount_out(&state, U256::from(474_425u64), true);
+        assert!(with_mt < U256::from(959u64));
+        assert!(!with_mt.is_zero());
     }
 
     #[test]

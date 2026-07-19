@@ -698,11 +698,21 @@ fn attach_pool_to_graph(
     if uses_hub_spoke(meta) {
         attach_hub_spoke_pool(graph, arena, meta, state);
     } else if meta.tokens.len() == 2 {
+        // Prefer vault/oracle token order (Balancer/Woofi) over discovery meta order.
+        let Some(token0) = routing_token_at_leg(arena, state, meta, 0) else {
+            return false;
+        };
+        let Some(token1) = routing_token_at_leg(arena, state, meta, 1) else {
+            return false;
+        };
+        if token0 == token1 {
+            return false;
+        }
         for mut edge in edges_for_pair(
             meta.pool_index,
             meta.protocol,
-            meta.tokens[0],
-            meta.tokens[1],
+            token0,
+            token1,
             meta.fee_bps,
             Some(state),
         ) {
@@ -1191,6 +1201,47 @@ mod tests {
             None,
         );
         assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn two_token_balancer_direct_edges_follow_vault_order() {
+        let mut arena = StateArena::default();
+        let addr_a = Address::from([10u8; 20]);
+        let addr_b = Address::from([20u8; 20]);
+        let token_a = arena.register_token(addr_a);
+        let token_b = arena.register_token(addr_b);
+        let one = crate::core::math::fixed_point::ONE;
+        let bal = U256::from(100u64) * one;
+        let pool = arena.register_pool(
+            Address::from([30u8; 20]),
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: None,
+                tokens: vec![addr_a, addr_b],
+                balances: vec![bal, bal + U256::from(1u64)],
+                weights: vec![one / U256::from(2u64), one / U256::from(2u64)],
+                scaling_factors: vec![one, one],
+                amp: U256::ZERO,
+                amp_precision: U256::from(1_000u64),
+                fee: U256::from(1_000_000_000_000_000u64), // 0.1%
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        // Discovery meta reversed vs vault order — edges must still use vault indices.
+        let meta = pool_meta_from_pair(pool, ProtocolType::BalancerV2, token_b, token_a, 10);
+        let graph = build_graph(&arena, std::slice::from_ref(&meta));
+        let from_a: Vec<&GraphEdge> = graph.adjacency[token_a.0 as usize]
+            .iter()
+            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .collect();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0].edge.token_in, token_a);
+        assert_eq!(from_a[0].edge.token_out, token_b);
+        assert_eq!(from_a[0].edge.token_in_idx, 0);
+        assert_eq!(from_a[0].edge.token_out_idx, 1);
     }
 
     #[test]

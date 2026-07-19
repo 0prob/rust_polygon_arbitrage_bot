@@ -42,6 +42,7 @@ pub fn encode_v4_hop(
         hop.edge.fee_bps,
         slippage_bps,
         None,
+        true,
     )?;
 
     let (pool_key, zero_for_one) =
@@ -113,7 +114,7 @@ fn v4_static_fields(arena: &StateArena, hop: &CalldataHop) -> (u32, i32, Address
     let hooks = hop.hooks.unwrap_or(Address::ZERO);
     match arena.pool_state(hop.edge.pool_index) {
         Some(PoolState::V4(s)) => {
-            let fee = resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps))
+            let fee = resolve_v3_fee_pips(s.fee, Some(hop.edge.fee_bps), true)
                 .min(U256::from(0xffffffu32))
                 .to::<u32>();
             (fee, s.tick_spacing, hooks)

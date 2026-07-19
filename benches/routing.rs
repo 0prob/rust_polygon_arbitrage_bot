@@ -54,7 +54,9 @@ fn bench_v3_swap(c: &mut Criterion) {
     };
     let amount = U256::from(10u128.pow(15));
     c.bench_function("simulate_v3_swap_ticks", |b| {
-        b.iter(|| simulate_v3_swap(black_box(&state), black_box(amount), true, Some(30)));
+        b.iter(|| {
+            simulate_v3_swap(black_box(&state), black_box(amount), true, Some(30), false)
+        });
     });
 }
 
