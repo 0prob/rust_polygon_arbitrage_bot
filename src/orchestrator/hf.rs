@@ -86,7 +86,7 @@ pub struct HfTickResult {
     pub best_profit: U256,
     pub elapsed_ms: u64,
     /// Dispatch queue (and optional single near-miss when queue empty). Cheap summaries only.
-    pub candidates: Vec<HfCandidateUiRow>,
+    pub candidates: Arc<Vec<HfCandidateUiRow>>,
 }
 
 impl Default for HfTickResult {
@@ -96,7 +96,7 @@ impl Default for HfTickResult {
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: 0,
-            candidates: Vec::new(),
+            candidates: Arc::new(Vec::new()),
         }
     }
 }
@@ -334,7 +334,7 @@ fn hf_reselect_from_snapshot(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: 0,
-            candidates: Vec::new(),
+            candidates: Arc::new(Vec::new()),
         });
     }
     let _ = selection_generation;
@@ -376,6 +376,8 @@ fn cycle_with_reliable_start(
 /// True when any start-rotation of `edges` is quarantined. Assess may Aave-rotate
 /// after select; `cycle_key` includes hop order + vault idxs so a single fp miss
 /// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
+///
+/// Batches all rotation fingerprints into one quarantine map read.
 fn cycle_edges_quarantined(
     execution: &ExecutionService,
     edges: &[crate::core::types::Edge],
@@ -386,13 +388,12 @@ fn cycle_edges_quarantined(
     }
     let mut rotated: smallvec::SmallVec<[crate::core::types::Edge; 8]> =
         edges.iter().copied().collect();
+    let mut fps: smallvec::SmallVec<[u64; 8]> = smallvec::SmallVec::with_capacity(n);
     for _ in 0..n {
-        if execution.is_route_quarantined(hash_cycle_edges(&rotated)) {
-            return true;
-        }
+        fps.push(hash_cycle_edges(&rotated));
         rotated.rotate_left(1);
     }
-    false
+    execution.any_quarantined(&fps)
 }
 
 fn warn_hf_oracle_skip(message: &str) {
@@ -595,6 +596,12 @@ fn select_cycles_for_rescore(
             tickless_stuck_skipped += 1;
             continue;
         }
+        // Cheap reject before remap/heal — raw fingerprint still covers cooldowns
+        // stamped before vault-idx realign. Remapped fps checked after heal.
+        if cycle_edges_quarantined(execution, &cycle.edges) {
+            quarantine_skipped += 1;
+            continue;
+        }
         let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
             rate_skipped += 1;
             continue;
@@ -633,10 +640,8 @@ fn select_cycles_for_rescore(
             continue;
         }
         // Quarantine keys are assess/best-eval fingerprints (post start-rotation /
-        // vault-idx remap). Check every hop-start rotation of remapped + raw edges.
-        if cycle_edges_quarantined(execution, &ready.edges)
-            || cycle_edges_quarantined(execution, &cycle.edges)
-        {
+        // vault-idx remap). Raw already checked; only remapped rotations remain.
+        if cycle_edges_quarantined(execution, &ready.edges) {
             quarantine_skipped += 1;
             continue;
         }
@@ -821,7 +826,7 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: 0,
-                candidates: Vec::new(),
+                candidates: Arc::new(Vec::new()),
             });
         }
     }
@@ -838,7 +843,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
+            candidates: Arc::new(Vec::new()),
         });
     }
 
@@ -912,7 +917,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
+            candidates: Arc::new(Vec::new()),
         });
     }
     let mut hot_pools = hot_pools_arc_from_set(
@@ -929,7 +934,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Vec::new(),
+            candidates: Arc::new(Vec::new()),
         });
     };
     // Spot tip for ranking/assess; submit still uses compute_conservative_gas_price.
@@ -976,7 +981,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Vec::new(),
+                    candidates: Arc::new(Vec::new()),
                 });
             }
         }
@@ -1027,7 +1032,7 @@ pub async fn run_hf_tick(
                             profitable_count: 0,
                             best_profit: U256::ZERO,
                             elapsed_ms: now_ms().saturating_sub(start),
-                            candidates: Vec::new(),
+                            candidates: Arc::new(Vec::new()),
                         });
                     }
                 }
@@ -1038,7 +1043,7 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Vec::new(),
+                        candidates: Arc::new(Vec::new()),
                     });
                 }
                 Err(_) => {
@@ -1051,7 +1056,7 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Vec::new(),
+                        candidates: Arc::new(Vec::new()),
                     });
                 }
             }
@@ -1138,7 +1143,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Vec::new(),
+                    candidates: Arc::new(Vec::new()),
                 });
             }
         }
@@ -1189,7 +1194,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Vec::new(),
+                    candidates: Arc::new(Vec::new()),
                 });
             }
             Err(_) => {
@@ -1199,7 +1204,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Vec::new(),
+                    candidates: Arc::new(Vec::new()),
                 });
             }
         },
@@ -1319,7 +1324,7 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: now_ms().saturating_sub(start),
-                candidates: Vec::new(),
+                candidates: Arc::new(Vec::new()),
             });
         }
     };
@@ -1654,12 +1659,12 @@ pub async fn run_hf_tick(
 
     // UI rows from already-evaluated results only (no extra sims). Built before
     // dispatch moves `profitable`; cost is O(dispatch size) short strings.
-    let candidates = build_hf_candidate_ui_rows(
+    let candidates = Arc::new(build_hf_candidate_ui_rows(
         eval_arena.as_ref(),
         pool_metas_for_dispatch.as_ref(),
         &profitable,
         best_near_miss.as_ref(),
-    );
+    ));
 
     if profitable_count > 0 {
         dispatch_profitable_candidates(

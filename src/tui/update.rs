@@ -170,6 +170,8 @@ pub struct RuntimeSnapshotInput {
     pub diagnostics: Vec<KeyValueRow>,
     pub config_rows: Vec<KeyValueRow>,
     pub route_cache: Option<RouteBuildCache>,
+    /// Prebuilt / COW graph view (poller skips full rebuild when generation matches).
+    pub graph: GraphSnapshot,
 }
 
 #[derive(Clone)]
@@ -177,6 +179,44 @@ pub struct RouteBuildCache {
     pub generation: u64,
     pub gas_gwei: Option<f64>,
     pub opportunities: Arc<Vec<RouteSummary>>,
+    /// Cached graph body keyed by `graph_generation` (indexer fields patched each poll).
+    pub graph_generation: u64,
+    pub graph: Option<GraphSnapshot>,
+}
+
+impl Default for RouteBuildCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            gas_gwei: None,
+            opportunities: Arc::new(Vec::new()),
+            graph_generation: 0,
+            graph: None,
+        }
+    }
+}
+
+/// Reuse cached graph rows when LF generation is unchanged; refresh indexer health only.
+pub fn graph_snapshot_for_poll(
+    cache: &mut RouteBuildCache,
+    snap: &HfSnapshot,
+    hypersync_height: Option<u64>,
+    indexer_lag_blocks: u64,
+    stale_indexer: bool,
+) -> GraphSnapshot {
+    if cache.graph_generation == snap.generation
+        && let Some(cached) = cache.graph.as_ref()
+    {
+        let mut graph = cached.clone();
+        graph.health.indexer_lag_blocks = indexer_lag_blocks;
+        graph.health.hypersync_height = hypersync_height;
+        graph.health.stale_indexer = stale_indexer;
+        return graph;
+    }
+    let graph = build_graph_snapshot(snap, hypersync_height, indexer_lag_blocks, stale_indexer);
+    cache.graph_generation = snap.generation;
+    cache.graph = Some(graph.clone());
+    graph
 }
 
 pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
@@ -206,13 +246,6 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
             .map_or(u64::MAX, |t| t.elapsed().as_millis() as u64),
     };
 
-    let graph = build_graph_snapshot(
-        &input.snapshot,
-        input.hypersync_height,
-        input.refresh.indexer_lag_blocks(),
-        input.refresh.is_indexer_stale(),
-    );
-
     let opportunities = if let Some(cache) = input.route_cache {
         Arc::clone(&cache.opportunities)
     } else {
@@ -231,7 +264,7 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
         generation: input.snapshot.generation,
         captured_at: Instant::now(),
         overview,
-        graph,
+        graph: input.graph,
         opportunities,
         portfolio: input.portfolio_rows,
         diagnostics: input.diagnostics,
@@ -524,6 +557,8 @@ pub fn build_route_cache(
         generation: snapshot.generation,
         gas_gwei,
         opportunities: Arc::new(opportunities),
+        graph_generation: 0,
+        graph: None,
     }
 }
 

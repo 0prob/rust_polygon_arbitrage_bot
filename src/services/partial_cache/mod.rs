@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloy::primitives::{Address, B256, U256};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use tokio::sync::watch;
 
 pub use decode::{
@@ -147,6 +147,8 @@ pub struct PartialPoolCache {
     /// Topic-observed pools not yet in the universe — LF merges into hot refresh
     /// so live Uni V3 venues enter the arena instead of staying wake_hf=false forever.
     observed_live: DashMap<Address, (), FxBuildHasher>,
+    /// Live-edge centrality per pool, keyed by layout⊕state generation.
+    edge_centrality: Mutex<Option<(u64, Arc<FxHashMap<Address, u32>>)>>,
 }
 
 impl PartialPoolCache {
@@ -165,7 +167,43 @@ impl PartialPoolCache {
             dirty: Mutex::new(FxHashSet::default()),
             universe: DashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
             observed_live: DashMap::with_capacity_and_hasher(64, FxBuildHasher),
+            edge_centrality: Mutex::new(None),
         }
+    }
+
+    /// Cached live-edge counts for stream ranking. `cache_key == 0` always rebuilds.
+    fn live_edge_centrality(
+        &self,
+        cache_key: u64,
+        graph: &crate::pipeline::types::RoutingGraph,
+        arena: &crate::pipeline::arena::StateArena,
+        capacity_hint: usize,
+    ) -> Arc<FxHashMap<Address, u32>> {
+        if cache_key != 0 {
+            let guard = self.edge_centrality.lock();
+            if let Some((key, map)) = guard.as_ref()
+                && *key == cache_key
+            {
+                return Arc::clone(map);
+            }
+        }
+        let mut edge_counts =
+            FxHashMap::with_capacity_and_hasher(capacity_hint, FxBuildHasher);
+        for edges in &graph.adjacency {
+            for ge in edges {
+                if !crate::pipeline::cycle_finder::is_live_graph_edge(ge) {
+                    continue;
+                }
+                if let Some(addr) = arena.pool_address(ge.edge.pool_index) {
+                    *edge_counts.entry(addr).or_default() += 1;
+                }
+            }
+        }
+        let map = Arc::new(edge_counts);
+        if cache_key != 0 {
+            *self.edge_centrality.lock() = Some((cache_key, Arc::clone(&map)));
+        }
+        map
     }
 
     /// Replace the arena-known streamable universe used for HF wake gating.
@@ -678,11 +716,15 @@ pub fn select_stream_targets(
         now_ms,
         0,
         &[],
+        0,
     )
 }
 
 /// Like [`select_stream_targets`], but `epoch` rotates the centrality fill and
 /// `demote` penalizes a prior silent watch set after WSS force-reselect.
+///
+/// `centrality_cache_key` should mix layout fingerprint ⊕ state generation so
+/// live-edge counts rebuild after connectivity or rescore changes (`0` = no cache).
 #[allow(clippy::too_many_arguments)]
 pub fn select_stream_targets_with_epoch(
     discovered: &[crate::services::discovery::DiscoveredPool],
@@ -695,9 +737,8 @@ pub fn select_stream_targets_with_epoch(
     now_ms: u64,
     epoch: u64,
     demote: &[Address],
+    centrality_cache_key: u64,
 ) -> Vec<Address> {
-    use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-
     if cap == 0 {
         return Vec::new();
     }
@@ -706,20 +747,14 @@ pub fn select_stream_targets_with_epoch(
     let demote_set: FxHashSet<Address> = demote.iter().copied().collect();
     let addr_to_pool = arena.address_to_pool();
 
-    let mut edge_counts: FxHashMap<Address, u32> =
-        FxHashMap::with_capacity_and_hasher(pool_metas.len(), FxBuildHasher);
-    if let Some(graph) = graph {
-        for edges in &graph.adjacency {
-            for ge in edges {
-                if !crate::pipeline::cycle_finder::is_live_graph_edge(ge) {
-                    continue;
-                }
-                if let Some(addr) = arena.pool_address(ge.edge.pool_index) {
-                    *edge_counts.entry(addr).or_default() += 1;
-                }
-            }
-        }
-    }
+    let edge_counts = graph.map_or_else(Arc::default, |graph| {
+        partial_cache.live_edge_centrality(
+            centrality_cache_key,
+            graph,
+            arena,
+            pool_metas.len(),
+        )
+    });
 
     let mut scored: Vec<(u64, Address)> = discovered
         .iter()
@@ -765,7 +800,15 @@ pub fn select_stream_targets_with_epoch(
         })
         .collect();
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // Keep a bounded sorted prefix for rotation; drop the cold tail early.
+    let sort_keep = scored.len().min(cap.saturating_mul(2).max(cap));
+    if scored.len() > sort_keep {
+        scored.select_nth_unstable_by(sort_keep - 1, |a, b| {
+            b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+        });
+        scored.truncate(sort_keep);
+    }
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     // After silence-forced reselect, rotate the non-hot fill so we do not
     // re-arm the same cold centrality block that produced zero logs.

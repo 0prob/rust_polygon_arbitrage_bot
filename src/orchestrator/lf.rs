@@ -940,7 +940,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);
 
     let finalize_started = crate::util::now_ms();
-    let mut capped = (*cycles_arc).clone();
+    // Unique owner after CPU worker → mutate in place (no deep copy).
+    let capped = Arc::unwrap_or_clone(cycles_arc);
     // Hold topic-live cycles aside before post-hydrate dead prune — rescore was
     // zeroing them out (repin: CPU pinned_cycles≤23, post-filter touching=0).
     let observed_pin_set: rustc_hash::FxHashSet<PoolIndex> = observed_pin.iter().copied().collect();
@@ -963,21 +964,16 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             capped.len()
         );
     }
-    let mut live_held = Vec::new();
-    if !observed_pin_set.is_empty() {
-        capped.retain(|cycle| {
-            let touch = cycle
+    let (mut live_held, mut capped) = if observed_pin_set.is_empty() {
+        (Vec::new(), capped)
+    } else {
+        capped.into_iter().partition(|cycle| {
+            cycle
                 .edges
                 .iter()
-                .any(|edge| observed_pin_set.contains(&edge.pool_index));
-            if touch {
-                live_held.push(cycle.clone());
-                false
-            } else {
-                true
-            }
-        });
-    }
+                .any(|edge| observed_pin_set.contains(&edge.pool_index))
+        })
+    };
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
     rescore_cycles_with_table(&arena, &mut table, &mut capped);
@@ -1251,7 +1247,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         &ctx.price_oracle,
         &arena,
         pool_metas.as_ref(),
-        cycles_arc.as_ref(),
+        &capped,
     );
     crate::services::oracle::log_ranked_unmapped_demand(&ctx.price_oracle, lf_pass, &rate_stats);
     if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
@@ -1345,6 +1341,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             Vec::new()
         };
         let cap = ctx.config.pipeline.stream_max_pools;
+        let centrality_key = arena
+            .routing_layout_fingerprint()
+            ^ ctx.cache.generation().rotate_left(17);
         let mut targets = select_stream_targets_with_epoch(
             &pools,
             &hot,
@@ -1356,6 +1355,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             crate::util::now_ms(),
             epoch,
             &demote,
+            centrality_key,
         );
         // Pin topic-observed routable pools that made it into the arena this tick
         // so the next Sync/Swap sets wake_hf=true (interest path).

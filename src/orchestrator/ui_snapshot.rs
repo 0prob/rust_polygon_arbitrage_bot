@@ -20,7 +20,7 @@ use crate::tui::bridge::publish_snapshot;
 #[cfg(feature = "tui")]
 use crate::tui::update::{
     RouteBuildCache, RuntimeSnapshotInput, build_config_rows, build_diagnostics,
-    build_portfolio_rows, build_route_cache, build_snapshot,
+    build_portfolio_rows, build_route_cache, build_snapshot, graph_snapshot_for_poll,
 };
 #[cfg(feature = "tui")]
 use crate::util::u256_to_f64;
@@ -44,11 +44,7 @@ pub fn spawn_snapshot_publisher(
         let mut last_oracle_refresh = Instant::now();
         let mut last_portfolio_refresh = Instant::now();
         let mut portfolio_rows = Vec::new();
-        let mut route_cache = RouteBuildCache {
-            generation: 0,
-            gas_gwei: None,
-            opportunities: Arc::new(Vec::new()),
-        };
+        let mut route_cache = RouteBuildCache::default();
 
         loop {
             tokio::select! {
@@ -194,16 +190,20 @@ async fn build_ui_snapshot(
         .snapshot()
         .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
 
-    let hot_pools = hot_pool_addresses(&snap);
-    let mut display_arena = snap.arena.clone();
-    display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
-
-    if snap.generation != route_cache.generation || route_cache.gas_gwei != gas_gwei {
+    // Hot-cache + route sims only when generation/gas change; otherwise reuse cache.
+    let display_arena = if snap.generation != route_cache.generation
+        || route_cache.gas_gwei != gas_gwei
+    {
+        let hot_pools = hot_pool_addresses(&snap);
+        let mut display_arena = snap.arena.clone();
+        display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
         let arena = display_arena.clone();
         let snap_arc = Arc::clone(&snap);
         let slippage_bps = ctx.config.execution.slippage_bps;
         let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
         let matic = matic_usd;
+        let prev_graph_generation = route_cache.graph_generation;
+        let prev_graph = route_cache.graph.take();
         *route_cache = tokio::task::spawn_blocking(move || {
             build_route_cache(
                 &snap_arc,
@@ -216,9 +216,22 @@ async fn build_ui_snapshot(
         })
         .await
         .context("route cache build task failed")?;
-    }
+        // Route rebuild must not drop the graph COW cache.
+        route_cache.graph_generation = prev_graph_generation;
+        route_cache.graph = prev_graph;
+        display_arena
+    } else {
+        snap.arena.clone()
+    };
 
     let hypersync_height = ctx.hypersync.as_ref().and_then(|hs| hs.latest_height());
+    let graph = graph_snapshot_for_poll(
+        route_cache,
+        &snap,
+        hypersync_height,
+        ctx.refresh.indexer_lag_blocks(),
+        ctx.refresh.is_indexer_stale(),
+    );
 
     let diagnostics = build_diagnostics(
         &ctx.config,
@@ -254,6 +267,7 @@ async fn build_ui_snapshot(
         diagnostics,
         config_rows,
         route_cache: Some(route_cache.clone()),
+        graph,
     };
 
     Ok((build_snapshot(runtime_input).await, portfolio_rows))

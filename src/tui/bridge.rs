@@ -130,8 +130,8 @@ impl PipelineUiHook for TuiBridgeHook {
             cycles_considered,
             profitable_count: result.profitable_count,
             elapsed_ms: result.elapsed_ms,
-            // Clone is O(dispatch size); same payload already built on the HF tick.
-            candidates: result.candidates.clone(),
+            // Arc clone — pointer only; rows built once on the HF tick.
+            candidates: Arc::clone(&result.candidates),
         });
     }
 

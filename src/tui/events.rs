@@ -23,7 +23,7 @@ pub enum UiEvent {
         cycles_considered: usize,
         profitable_count: usize,
         elapsed_ms: u64,
-        candidates: Vec<HfCandidateUiRow>,
+        candidates: std::sync::Arc<Vec<HfCandidateUiRow>>,
     },
     GasUpdate {
         gwei: f64,

@@ -245,11 +245,16 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         return (Vec::new(), diag);
     }
 
-    simulable.sort_unstable_by(compare_cycle_score);
     let rescue_cap = max_keep;
     let sim_window = simulable.len().min(max_keep.saturating_add(rescue_cap));
     diag.sim_window = sim_window;
-    let candidates: Vec<FoundCycle> = simulable.into_iter().take(sim_window).collect();
+    // Partial select then sort only the sim window — avoid O(n log n) on the tail.
+    if simulable.len() > sim_window {
+        simulable.select_nth_unstable_by(sim_window - 1, compare_cycle_score);
+        simulable.truncate(sim_window);
+    }
+    simulable.sort_unstable_by(compare_cycle_score);
+    let candidates = simulable;
     let verdicts: Vec<PrefilterVerdict> = if crate::util::should_use_rayon(candidates.len()) {
         candidates
             .par_iter()

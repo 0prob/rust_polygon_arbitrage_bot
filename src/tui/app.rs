@@ -754,7 +754,7 @@ impl App {
         cycles_considered: usize,
         profitable_count: usize,
         elapsed_ms: u64,
-        candidates: Vec<HfCandidateUiRow>,
+        candidates: std::sync::Arc<Vec<HfCandidateUiRow>>,
     ) {
         self.last_cycles_considered = cycles_considered;
         self.last_profitable_count = profitable_count;
@@ -770,7 +770,8 @@ impl App {
             })
             .collect();
         self.hf_candidates = candidates
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|c| {
                 let mut row = HfPipelineRow::from_hf_candidate(c);
                 if let Some((outcome, sev)) = prior_outcomes.get(&row.fingerprint) {
@@ -1039,7 +1040,7 @@ mod tests {
         );
         assert!(app.chart_profitable.is_empty());
 
-        app.apply_hf_sample(9, 3, 7, Vec::new());
+        app.apply_hf_sample(9, 3, 7, Arc::new(Vec::new()));
         assert_eq!(app.last_cycle_count, 17);
         assert_eq!(app.last_cycles_considered, 9);
         assert_eq!(app.last_search_ms, 23);
@@ -1086,7 +1087,7 @@ mod tests {
             4,
             1,
             12,
-            vec![HfCandidateUiRow {
+            Arc::new(vec![HfCandidateUiRow {
                 fingerprint: 0xabc,
                 hops: 2,
                 route: "a->b".into(),
@@ -1100,7 +1101,7 @@ mod tests {
                 reject_reason: None,
                 slip_bps: 50,
                 near_miss: false,
-            }],
+            }]),
         );
         assert_eq!(app.hf_candidates.len(), 1);
         assert_eq!(app.hf_candidates[0].flash, "aave");
