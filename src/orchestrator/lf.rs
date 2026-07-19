@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use anyhow::Context;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -15,7 +15,7 @@ use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::{ProbeContext, retain_cycles_with_priced_start};
+use crate::pipeline::cycle_filter::{ProbeContext, cycle_key, retain_cycles_with_priced_start};
 use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
 use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
 use crate::pipeline::graph::{
@@ -38,7 +38,7 @@ use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
     HubPathRateParams, RateEnrichContext, arena_tokens_without_decimal_hints,
     enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
-    merge_token_rates, resolvable_token_set,
+    has_reliable_matic_rate, hub_path_matic_rates_batch, merge_token_rates, resolvable_token_set,
 };
 use crate::services::partial_cache::{
     PartialPoolCache, StreamAddressSet, select_stream_targets_with_epoch,
@@ -177,11 +177,26 @@ fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearch
     passes
 }
 
+fn spoke_connectivity_set(
+    rates: &FxHashMap<TokenIndex, U256>,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    arena: &StateArena,
+) -> Arc<FxHashSet<Address>> {
+    let mut resolvable = resolvable_token_set(rates, arena);
+    expand_hub_spoke_resolvable(&mut resolvable, pool_metas, arena);
+    Arc::new(resolvable)
+}
+
 fn lf_graph_build_gate(work: &LfCpuWork) -> GraphBuildGate {
     GraphBuildGate {
         token_to_matic_rates: Arc::clone(&work.prior_rates),
         flash: work.flash_liquidity.load(),
         flash_ttl: work.flash_liquidity.ttl(),
+        spoke_connectivity: Some(spoke_connectivity_set(
+            work.prior_rates.as_ref(),
+            work.pool_metas.as_ref(),
+            &work.arena,
+        )),
     }
 }
 
@@ -766,9 +781,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         return Ok(());
     }
 
-    let mut resolvable = resolvable_token_set(&prior_rates, &arena);
-    expand_hub_spoke_resolvable(&mut resolvable, pool_metas.as_ref(), &arena);
-    let resolvable_count = resolvable.len();
+    let resolvable_count =
+        spoke_connectivity_set(prior_rates.as_ref(), pool_metas.as_ref(), &arena).len();
 
     let cycles_arc = cpu.cycles;
     let mut routing_graph = cpu.graph;
@@ -1021,6 +1035,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             enabled: ctx.config.oracle.hub_path_rates,
             max_hops: ctx.config.oracle.hub_path_max_hops.max(1),
         },
+        token_decimals: Some(decimals.as_ref()),
+        pool_metas: Some(pool_metas.as_ref()),
     };
     let (fresh_rates, rate_stats) = if let Some(ref provider) = state_provider {
         enrich_token_to_matic_rates(
@@ -1040,8 +1056,145 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         )
         .await
     };
-    let rates = merge_token_rates(&prior_rates, &cycle_tokens_set, fresh_rates);
+    // Fail-closed: drop non-refreshed priors when the previous snapshot aged past oracle TTL.
+    let retain_stale_prior = ctx.snapshots.read().rates_built_at.is_some_and(|t| {
+        t.elapsed() <= Duration::from_millis(ctx.config.oracle.cache_ttl_ms)
+    });
+    let mut rates = merge_token_rates(
+        &prior_rates,
+        &cycle_tokens_set,
+        fresh_rates,
+        retain_stale_prior,
+    );
     let rates_built_at = std::time::Instant::now();
+    // Trigger on content change (Arc identity), not map length — swap-in/out rated
+    // tokens can keep the same len while eligibility changes. Run before priced-start
+    // filter so same-tick hub rates can keep cycles.
+    if !Arc::ptr_eq(&rates, &prior_rates) {
+        let post_gate = GraphBuildGate {
+            token_to_matic_rates: Arc::clone(&rates),
+            flash: ctx.flash_liquidity.load(),
+            flash_ttl: ctx.flash_liquidity.ttl(),
+            spoke_connectivity: Some(spoke_connectivity_set(
+                rates.as_ref(),
+                pool_metas.as_ref(),
+                &arena,
+            )),
+        };
+        if post_gate.active()
+            && has_missing_eligible_pools_with_gate(
+                &arena,
+                pool_metas.as_ref(),
+                routing_graph.as_ref(),
+                Some(&post_gate),
+            )
+        {
+            let layout_fp = arena.routing_layout_fingerprint();
+            let routable_count = pool_metas.len();
+            let eligible =
+                count_graph_eligible_pools_with_gate(&arena, pool_metas.as_ref(), Some(&post_gate));
+            let state_generation = ctx.cache.generation();
+            let g = Arc::make_mut(&mut routing_graph);
+            let report = attach_missing_eligible_pools_with_gate(
+                &arena,
+                g,
+                pool_metas.as_ref(),
+                Some(&post_gate),
+            );
+            if report.attached_pools > 0 {
+                ctx.graph_cache.lock().store(
+                    Arc::clone(&routing_graph),
+                    None,
+                    routable_count,
+                    layout_fp,
+                    state_generation,
+                    eligible,
+                );
+                crate::info!(
+                    "lf graph post-rate patch: attached={} merged_rates={} prior_rates={}",
+                    report.attached_pools,
+                    rates.len(),
+                    prior_rates.len()
+                );
+                // Same-tick hub recompute for tokens that only became reachable after attach.
+                if ctx.config.oracle.hub_path_rates {
+                    let unresolved: Vec<TokenIndex> = cycle_tokens
+                        .iter()
+                        .copied()
+                        .filter(|t| !has_reliable_matic_rate(*t, rates.as_ref()))
+                        .collect();
+                    if !unresolved.is_empty() {
+                        let hub_more = hub_path_matic_rates_batch(
+                            &arena,
+                            routing_graph.as_ref(),
+                            &unresolved,
+                            HubPathRateParams {
+                                enabled: true,
+                                max_hops: ctx.config.oracle.hub_path_max_hops.max(1),
+                            },
+                            Some(decimals.as_ref()),
+                            Some(pool_metas.as_ref()),
+                        );
+                        let mut added = 0usize;
+                        {
+                            let map = Arc::make_mut(&mut rates);
+                            for token in unresolved {
+                                if let Some(&rate) = hub_more.get(&token) {
+                                    map.insert(token, rate);
+                                    added += 1;
+                                }
+                            }
+                        }
+                        if added > 0 {
+                            crate::info!("lf hub post-attach: added_rates={added}");
+                        }
+                    }
+                }
+                // Bounded refind so newly attached pools can contribute cycles this tick.
+                if arena.token_count() > routing_graph.token_count {
+                    Arc::make_mut(&mut routing_graph).ensure_token_capacity(arena.token_count());
+                }
+                let passes = cycle_search_passes(max_hops, max_paths);
+                let probe_ctx = ProbeContext {
+                    token_to_matic_rates: Some(rates.as_ref()),
+                    token_decimals: Some(decimals.as_ref()),
+                    gas_price_wei,
+                };
+                let outcome = find_cycles_for_mode_with_budget(
+                    ctx.config.routing.cycle_finder,
+                    &arena,
+                    routing_graph.as_ref(),
+                    pool_metas.as_ref(),
+                    passes.as_slice(),
+                    true,
+                    Some(&probe_ctx),
+                    CYCLE_ENUM_PATCH_BUDGET,
+                    &[],
+                );
+                if !outcome.cycles.is_empty() {
+                    let mut seen: FxHashSet<u64> =
+                        capped.iter().map(|c| cycle_key(&c.edges)).collect();
+                    let before = capped.len();
+                    for cycle in outcome.cycles {
+                        if !seen.insert(cycle_key(&cycle.edges)) {
+                            continue;
+                        }
+                        capped.push(cycle);
+                        if capped.len() >= max_paths {
+                            break;
+                        }
+                    }
+                    let added = capped.len().saturating_sub(before);
+                    if added > 0 {
+                        crate::info!(
+                            "lf post-rate cycle refind: added={added} total={}",
+                            capped.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Priced-start filter can drop live-held cycles whose start token is still
     // warming — pull them aside, filter the rest, then restore priced live ones.
     let mut live_for_rates = Vec::new();
@@ -1093,50 +1246,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             capped.len(),
             observed_pin.len()
         );
-    }
-    if rates.len() > prior_rates.len() {
-        let post_gate = GraphBuildGate {
-            token_to_matic_rates: Arc::clone(&rates),
-            flash: ctx.flash_liquidity.load(),
-            flash_ttl: ctx.flash_liquidity.ttl(),
-        };
-        if post_gate.active()
-            && has_missing_eligible_pools_with_gate(
-                &arena,
-                pool_metas.as_ref(),
-                routing_graph.as_ref(),
-                Some(&post_gate),
-            )
-        {
-            let layout_fp = arena.routing_layout_fingerprint();
-            let routable_count = pool_metas.len();
-            let eligible =
-                count_graph_eligible_pools_with_gate(&arena, pool_metas.as_ref(), Some(&post_gate));
-            let state_generation = ctx.cache.generation();
-            let g = Arc::make_mut(&mut routing_graph);
-            let report = attach_missing_eligible_pools_with_gate(
-                &arena,
-                g,
-                pool_metas.as_ref(),
-                Some(&post_gate),
-            );
-            if report.attached_pools > 0 {
-                ctx.graph_cache.lock().store(
-                    Arc::clone(&routing_graph),
-                    None,
-                    routable_count,
-                    layout_fp,
-                    state_generation,
-                    eligible,
-                );
-                crate::info!(
-                    "lf graph post-rate patch: attached={} merged_rates={} prior_rates={}",
-                    report.attached_pools,
-                    rates.len(),
-                    prior_rates.len()
-                );
-            }
-        }
     }
     crate::services::oracle::record_unmapped_token_demand(
         &ctx.price_oracle,

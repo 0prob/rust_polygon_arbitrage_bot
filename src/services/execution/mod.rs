@@ -18,7 +18,9 @@ pub mod service;
 pub mod submit;
 
 pub mod flash_policy {
-    pub use super::support::{FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy};
+    pub use super::support::{
+        FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy, try_parse_flash_policy,
+    };
 }
 pub mod profit_logs {
     pub use super::support::parse_transfer_profit;
@@ -71,7 +73,9 @@ pub use flash_liquidity::{
     token_eligible_for_flash_borrow_graph, token_flash_borrow_proven_unviable,
     token_flash_liquidity_borrowable,
 };
-pub use flash_policy::{FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy};
+pub use flash_policy::{
+    FlashLoanPolicy, hf_eval_flash_source, parse_flash_policy, try_parse_flash_policy,
+};
 pub use gas::{FeeSnapshot, compute_assessment_gas_price, compute_conservative_gas_price};
 pub use gas_oracle::{GasOracle, ROUTE_GAS_CACHE_MIN_ROUTES, RouteGasLookup};
 pub use profit::{

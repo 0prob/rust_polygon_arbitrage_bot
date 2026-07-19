@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
@@ -16,7 +16,7 @@ use crate::services::execution::flash_liquidity::{
     FlashLiquiditySnapshot, token_eligible_for_flash_borrow_graph,
 };
 use crate::services::oracle::has_reliable_matic_rate;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
@@ -28,6 +28,8 @@ pub struct GraphBuildGate {
     pub token_to_matic_rates: Arc<FxHashMap<TokenIndex, U256>>,
     pub flash: Arc<FlashLiquiditySnapshot>,
     pub flash_ttl: Duration,
+    /// Spoke tokens reachable from priced/hub tokens via shared pools (connectivity only).
+    pub spoke_connectivity: Option<Arc<FxHashSet<Address>>>,
 }
 
 impl GraphBuildGate {
@@ -564,11 +566,19 @@ fn pool_has_admissible_edges(
     if has_priced_token {
         return true;
     }
-    meta.tokens.iter().enumerate().any(|(i, &token)| {
+    if meta.tokens.iter().enumerate().any(|(i, &token)| {
         bpt_index != Some(i)
             && arena.token_address(token).is_some_and(|addr| {
                 token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl)
             })
+    }) {
+        return true;
+    }
+    // Hub-spoke connectivity (no fake rates): admit pools that touch the expanded set.
+    gate.spoke_connectivity.as_ref().is_some_and(|conn| {
+        meta.tokens.iter().enumerate().any(|(i, &token)| {
+            bpt_index != Some(i) && arena.token_address(token).is_some_and(|a| conn.contains(&a))
+        })
     })
 }
 
@@ -2143,6 +2153,7 @@ mod tests {
             token_to_matic_rates: Arc::new(rates),
             flash: Arc::new(FlashLiquiditySnapshot::default()),
             flash_ttl: Duration::from_secs(60),
+            spoke_connectivity: None,
         };
 
         let gated = build_graph_with_gate(&arena, &[hub_meta, tail_meta, close_meta], Some(&gate));
@@ -2179,6 +2190,7 @@ mod tests {
             token_to_matic_rates: Arc::new(rates),
             flash: Arc::new(FlashLiquiditySnapshot::default()),
             flash_ttl: Duration::from_secs(60),
+            spoke_connectivity: None,
         };
 
         let metas = [meta];
@@ -2218,6 +2230,7 @@ mod tests {
             token_to_matic_rates: Arc::new(rates),
             flash: Arc::new(FlashLiquiditySnapshot::default()),
             flash_ttl: Duration::from_secs(60),
+            spoke_connectivity: None,
         };
 
         let metas = [meta];

@@ -1159,13 +1159,19 @@ fn probe_fallback_opt(
         min_economic_amount_in(decimals, rate),
     )
     .unwrap_or(FlashLoanSource::Balancer);
+    let fallback_depth = probe_seed
+        .as_ref()
+        .map(|(amount, sim)| {
+            depth_impact_slippage_bps_with_base(input.arena, &cycle.edges, *amount, Some(sim))
+        })
+        .unwrap_or(0);
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
         input.token_to_matic_rates,
         input.token_decimals,
         input.gas_price,
-        effective_slippage_bps(input.slippage_bps, cycle.edge_hops(), 0),
+        effective_slippage_bps(input.slippage_bps, cycle.edge_hops(), fallback_depth),
         flash_source,
         input.safety_multiplier_bps,
     );

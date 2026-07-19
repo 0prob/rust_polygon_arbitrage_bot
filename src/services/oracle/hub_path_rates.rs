@@ -1,20 +1,24 @@
 //! Pipeline 2 (base-price): token → WPOL/MATIC rates from the same arena used for hop sim.
 //!
-//! Shortest direct-edge paths on the routing graph; amounts via `simulate_route_minimal`.
-//! Fail-closed below [`MIN_TOKEN_TO_MATIC_RATE`]. Configured oracle feeds win in enrich.
+//! Shortest live paths on the routing graph (Direct + resolved hub Enter/Exit legs);
+//! amounts via `simulate_route_minimal`. Fail-closed below [`MIN_TOKEN_TO_MATIC_RATE`].
+//! Configured oracle feeds win in enrich.
 
-use alloy::primitives::U256;
-use rustc_hash::{FxHashMap, FxHashSet};
+use alloy::primitives::{Address, U256};
+use rustc_hash::FxHashMap;
 
 use crate::core::constants::{
     MAX_SUPPORTED_TOKEN_DECIMALS, MIN_TOKEN_TO_MATIC_RATE, RATE_PRECISION, WMATIC,
 };
 use crate::core::types::{Edge, TokenIndex};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_finder::is_live_graph_edge;
+use crate::pipeline::cycle_finder::{index_pool_metas, is_live_graph_edge};
+use crate::pipeline::graph::{
+    PendingHubSwap, funded_token_indices, resolve_lazy_swap_edge, routing_token_at_leg,
+};
 use crate::pipeline::local_sim::simulate_route_minimal;
-use crate::pipeline::spot_price::spot_probe_for_token;
-use crate::pipeline::types::{GraphHopPhase, RoutingGraph};
+use crate::pipeline::spot_price::{spot_probe_for_decimals, spot_probe_for_token};
+use crate::pipeline::types::{GraphHopPhase, PoolMeta, RoutingGraph};
 use crate::util::ten_pow_u256_cached;
 
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +31,7 @@ impl Default for HubPathRateParams {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_hops: 4,
+            max_hops: crate::core::constants::DEFAULT_HUB_PATH_MAX_HOPS,
         }
     }
 }
@@ -39,14 +43,30 @@ pub fn matic_rate_from_probe_sim(
     token: TokenIndex,
     edges: &[Edge],
 ) -> Option<U256> {
+    matic_rate_from_probe_sim_with_decimals(arena, token, edges, None)
+}
+
+#[must_use]
+fn matic_rate_from_probe_sim_with_decimals(
+    arena: &StateArena,
+    token: TokenIndex,
+    edges: &[Edge],
+    token_decimals: Option<&FxHashMap<Address, u8>>,
+) -> Option<U256> {
     if edges.is_empty() {
         return None;
     }
-    let decimals = arena.token_decimals(token);
+    let decimals = match token_decimals {
+        Some(hints) => crate::services::oracle::resolve_token_decimals_for_index(token, arena, hints),
+        None => arena.token_decimals(token),
+    };
     if decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
         return None;
     }
-    let probe = spot_probe_for_token(arena, token);
+    let probe = match token_decimals {
+        Some(_) => spot_probe_for_decimals(decimals),
+        None => spot_probe_for_token(arena, token),
+    };
     if probe.is_zero() {
         return None;
     }
@@ -63,61 +83,167 @@ pub fn matic_rate_from_probe_sim(
     (rate >= MIN_TOKEN_TO_MATIC_RATE).then_some(rate)
 }
 
+#[inline]
 fn resolve_wmatic_index(arena: &StateArena) -> Option<TokenIndex> {
-    for i in 0..arena.token_count() {
-        let idx = TokenIndex(i);
-        if arena.token_address(idx) == Some(WMATIC) {
-            return Some(idx);
-        }
-    }
-    None
+    arena.address_to_token().get(&WMATIC).copied()
 }
 
-/// Unweighted shortest path using live **direct** graph edges only (no virtual hub legs).
-fn shortest_direct_path_to_wmatic(
+/// Reverse adjacency entry: forward edge `from → toward_wmatic`.
+type RevHop = (TokenIndex, Edge);
+
+/// Build reverse Direct + resolved hub-spoke edges for one reverse-BFS from WMATIC.
+///
+/// When `pool_metas` is provided, V4 Enter-only hubs resolve exits via funded legs
+/// (same as cycle DFS); without metas those legs stay unreachable for hub rates.
+fn build_reverse_hops(
+    arena: &StateArena,
     graph: &RoutingGraph,
-    from: TokenIndex,
+    pool_metas: Option<&[PoolMeta]>,
+) -> Vec<Vec<RevHop>> {
+    let token_slots = graph.token_count as usize;
+    let meta_index = pool_metas.map(index_pool_metas);
+    let mut rev = vec![Vec::new(); token_slots];
+    for (src_idx, adj) in graph.adjacency.iter().enumerate().take(token_slots) {
+        let src = TokenIndex(src_idx as u32);
+        for ge in adj {
+            match ge.phase {
+                GraphHopPhase::Direct => {
+                    if !is_live_graph_edge(ge) {
+                        continue;
+                    }
+                    let dst = ge.edge.token_out.0 as usize;
+                    if dst < token_slots {
+                        rev[dst].push((src, ge.edge));
+                    }
+                }
+                GraphHopPhase::EnterPool => {
+                    // Pair Enter→Exit into one swap hop (Balancer/Curve/WooFi hubs).
+                    // V4 is Enter-only; fall back to funded legs from pool_metas.
+                    let hub = ge.target_node as usize;
+                    let Some(hub_adj) = graph.adjacency.get(hub) else {
+                        continue;
+                    };
+                    let pending = PendingHubSwap {
+                        pool_index: ge.edge.pool_index,
+                        token_in: src,
+                        token_in_idx: ge.edge.token_in_idx,
+                        protocol: ge.edge.protocol,
+                        fee_bps: ge.edge.fee_bps,
+                    };
+                    let mut paired = false;
+                    for exit in hub_adj {
+                        if exit.phase != GraphHopPhase::ExitPool {
+                            continue;
+                        }
+                        if exit.edge.pool_index != ge.edge.pool_index {
+                            continue;
+                        }
+                        let out = TokenIndex(exit.target_node);
+                        let out_idx = out.0 as usize;
+                        if out_idx >= token_slots || out == src {
+                            continue;
+                        }
+                        let Some((edge, _, _)) =
+                            resolve_lazy_swap_edge(arena, pending, out, exit.edge.token_out_idx)
+                        else {
+                            continue;
+                        };
+                        rev[out_idx].push((src, edge));
+                        paired = true;
+                    }
+                    if paired {
+                        continue;
+                    }
+                    let Some(index) = meta_index.as_ref() else {
+                        continue;
+                    };
+                    let Some(meta) = index
+                        .get(pending.pool_index.0 as usize)
+                        .and_then(|m| *m)
+                    else {
+                        continue;
+                    };
+                    let Some(state) = arena.pool_state(pending.pool_index) else {
+                        continue;
+                    };
+                    for out_leg in funded_token_indices(state, meta) {
+                        if out_leg == pending.token_in_idx {
+                            continue;
+                        }
+                        let Some(token_out) =
+                            routing_token_at_leg(arena, state, meta, out_leg as usize)
+                        else {
+                            continue;
+                        };
+                        let out_idx = token_out.0 as usize;
+                        if out_idx >= token_slots || token_out == src {
+                            continue;
+                        }
+                        let Some((edge, _, _)) =
+                            resolve_lazy_swap_edge(arena, pending, token_out, out_leg)
+                        else {
+                            continue;
+                        };
+                        rev[out_idx].push((src, edge));
+                    }
+                }
+                GraphHopPhase::ExitPool => {}
+            }
+        }
+    }
+    rev
+}
+
+/// One reverse BFS from WMATIC: `parent[token] = (next_toward_wmatic, edge token→next)`.
+fn reverse_bfs_parents(
+    rev: &[Vec<RevHop>],
     wmatic: TokenIndex,
     max_hops: u32,
-) -> Option<Vec<Edge>> {
+) -> Vec<Option<RevHop>> {
+    let token_slots = rev.len();
+    let mut parent = vec![None; token_slots];
+    let mut depth = vec![u32::MAX; token_slots];
+    let w = wmatic.0 as usize;
+    if w >= token_slots {
+        return parent;
+    }
+    depth[w] = 0;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(wmatic);
+    let max_hops = max_hops.max(1);
+
+    while let Some(curr) = queue.pop_front() {
+        let d = depth[curr.0 as usize];
+        if d >= max_hops {
+            continue;
+        }
+        for &(prev, edge) in &rev[curr.0 as usize] {
+            let pi = prev.0 as usize;
+            if pi >= token_slots || depth[pi] != u32::MAX {
+                continue;
+            }
+            depth[pi] = d + 1;
+            parent[pi] = Some((curr, edge));
+            queue.push_back(prev);
+        }
+    }
+    parent
+}
+
+fn reconstruct_path(parent: &[Option<RevHop>], from: TokenIndex, wmatic: TokenIndex) -> Option<Vec<Edge>> {
     if from == wmatic {
         return Some(Vec::new());
     }
-    let token_slots = graph.token_count as usize;
-    if from.0 as usize >= token_slots || wmatic.0 as usize >= token_slots {
-        return None;
-    }
-    let max_hops = max_hops.max(1);
-    let mut visited = FxHashSet::default();
-    visited.insert(from);
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((from, Vec::<Edge>::new()));
-
-    while let Some((node, path)) = queue.pop_front() {
-        if path.len() as u32 >= max_hops {
-            continue;
+    let mut path = Vec::new();
+    let mut cur = from;
+    // ponytail: hop cap already enforced in BFS; bound walk to parent len.
+    for _ in 0..parent.len() {
+        if cur == wmatic {
+            return Some(path);
         }
-        let node_usize = node.0 as usize;
-        if node_usize >= graph.adjacency.len() {
-            continue;
-        }
-        for ge in &graph.adjacency[node_usize] {
-            if ge.phase != GraphHopPhase::Direct || !is_live_graph_edge(ge) {
-                continue;
-            }
-            let next = ge.edge.token_out;
-            if next == wmatic {
-                let mut full = path;
-                full.push(ge.edge);
-                return Some(full);
-            }
-            if next.0 as usize >= token_slots || !visited.insert(next) {
-                continue;
-            }
-            let mut next_path = path.clone();
-            next_path.push(ge.edge);
-            queue.push_back((next, next_path));
-        }
+        let (next, edge) = parent.get(cur.0 as usize).copied().flatten()?;
+        path.push(edge);
+        cur = next;
     }
     None
 }
@@ -129,6 +255,8 @@ pub fn hub_path_matic_rates_batch(
     graph: &RoutingGraph,
     tokens: &[TokenIndex],
     params: HubPathRateParams,
+    token_decimals: Option<&FxHashMap<Address, u8>>,
+    pool_metas: Option<&[PoolMeta]>,
 ) -> FxHashMap<TokenIndex, U256> {
     let mut out = FxHashMap::default();
     if !params.enabled {
@@ -138,15 +266,33 @@ pub fn hub_path_matic_rates_batch(
         return out;
     };
     out.insert(wmatic, RATE_PRECISION);
-    for &token in tokens {
-        if token == wmatic || out.contains_key(&token) {
+
+    let need: Vec<TokenIndex> = tokens
+        .iter()
+        .copied()
+        .filter(|t| *t != wmatic && !out.contains_key(t))
+        .collect();
+    if need.is_empty() {
+        return out;
+    }
+
+    // One reverse BFS for the whole batch (was per-token forward BFS + path.clone).
+    let rev = build_reverse_hops(arena, graph, pool_metas);
+    let parent = reverse_bfs_parents(&rev, wmatic, params.max_hops);
+
+    for token in need {
+        if out.contains_key(&token) {
             continue;
         }
-        let Some(path) = shortest_direct_path_to_wmatic(graph, token, wmatic, params.max_hops)
-        else {
+        let Some(path) = reconstruct_path(&parent, token, wmatic) else {
             continue;
         };
-        let Some(rate) = matic_rate_from_probe_sim(arena, token, &path) else {
+        if path.is_empty() {
+            continue;
+        }
+        let Some(rate) =
+            matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals)
+        else {
             continue;
         };
         out.insert(token, rate);
@@ -204,9 +350,11 @@ mod tests {
         let tail = arena.register_token(Address::from([0x22u8; 20]));
         let p1 = arena.register_pool(Address::from([0xa1u8; 20]), v2_pool());
         let p2 = arena.register_pool(Address::from([0xa2u8; 20]), v2_pool());
-        let m1 = pool_meta_from_pair(p1, ProtocolType::UniswapV2, wmatic, mid, 30);
-        let m2 = pool_meta_from_pair(p2, ProtocolType::UniswapV2, mid, tail, 30);
-        let graph = build_graph(&arena, &[m1, m2]);
+        let metas = [
+            pool_meta_from_pair(p1, ProtocolType::UniswapV2, wmatic, mid, 30),
+            pool_meta_from_pair(p2, ProtocolType::UniswapV2, mid, tail, 30),
+        ];
+        let graph = build_graph(&arena, &metas);
         let rates = hub_path_matic_rates_batch(
             &arena,
             &graph,
@@ -215,6 +363,8 @@ mod tests {
                 enabled: true,
                 max_hops: 4,
             },
+            None,
+            Some(&metas),
         );
         let rate = rates.get(&tail).copied().expect("tail rate");
         assert!(rate >= MIN_TOKEN_TO_MATIC_RATE);
@@ -226,8 +376,39 @@ mod tests {
         let mut arena = StateArena::default();
         let wmatic = arena.register_token(WMATIC);
         let graph = RoutingGraph::new(1);
-        let rates =
-            hub_path_matic_rates_batch(&arena, &graph, &[wmatic], HubPathRateParams::default());
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[wmatic],
+            HubPathRateParams::default(),
+            None,
+            None,
+        );
         assert_eq!(rates.get(&wmatic), Some(&RATE_PRECISION));
+    }
+
+    #[test]
+    fn batch_rates_share_one_bfs_for_siblings() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let a = arena.register_token(Address::from([0x11u8; 20]));
+        let b = arena.register_token(Address::from([0x22u8; 20]));
+        let p1 = arena.register_pool(Address::from([0xa1u8; 20]), v2_pool());
+        let p2 = arena.register_pool(Address::from([0xa2u8; 20]), v2_pool());
+        let metas = [
+            pool_meta_from_pair(p1, ProtocolType::UniswapV2, wmatic, a, 30),
+            pool_meta_from_pair(p2, ProtocolType::UniswapV2, wmatic, b, 30),
+        ];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[a, b],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        assert!(rates.contains_key(&a));
+        assert!(rates.contains_key(&b));
     }
 }

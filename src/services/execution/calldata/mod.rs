@@ -145,20 +145,24 @@ pub fn encode_route(
         // Refresh amount_out for the (possibly chained) ain before encode + chain_in.
         // Stale conservative_execution_hops floors were sized for the pre-chain ain and
         // can exceed what Balancer/Curve will deliver → next hop transfer/IIA fails.
+        // Chain the **full quote** into the next hop (same as conservative_execution_hops);
+        // minOut is the floor only — chaining it double-haircuts mixed non-V2 routes.
         let bps = config
             .slippage_bps
             .max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
-        if let Ok(min_out) = encoders::shared::compute_min_out(arena, &hop, bps, "chain_in") {
-            if min_out != hop.amount_out {
-                crate::debug!(
-                    "chain_in refresh_aout: hop={i} proto={:?} ain={} aout_was={} aout_now={min_out}",
-                    hop.edge.protocol,
-                    hop.amount_in,
-                    hop.amount_out,
-                );
-            }
-            hop.amount_out = min_out;
+        let quoted_out = quote_hop_for_execution(arena, &hop)
+            .ok_or_else(|| anyhow::anyhow!("chain_in hop execution quote unavailable"))?;
+        let min_out = slippage_adjusted(quoted_out, bps)
+            .ok_or_else(|| anyhow::anyhow!("chain_in hop min out is zero"))?;
+        if min_out != hop.amount_out {
+            crate::debug!(
+                "chain_in refresh_aout: hop={i} proto={:?} ain={} aout_was={} aout_now={min_out} quoted={quoted_out}",
+                hop.edge.protocol,
+                hop.amount_in,
+                hop.amount_out,
+            );
         }
+        hop.amount_out = min_out;
         calls.extend(encode_hop_for_protocol(
             &hop,
             executor,
@@ -168,7 +172,7 @@ pub fn encode_route(
             flash_source,
         )?);
         if i + 1 < hops.len() {
-            chain_in = Some(hop.amount_out);
+            chain_in = Some(quoted_out);
         }
     }
     Ok(calls)

@@ -405,21 +405,25 @@ pub fn evaluate_batch_query(
 /// The floor must be derived from on-chain gross, not local sim — Balancer batch sim
 /// routinely overstates profit vs `queryBatchSwap`, which caused viable Direct routes
 /// to be filtered while only overstated mixed AaveFlash routes reached dispatch.
+///
+/// `slippage_bps` is **route-level** (same as assess / `effective_slippage_bps`). Callers
+/// already pass compounded+depth slip — do not re-compound via `hop_count`.
 #[must_use]
 pub fn batch_profit_covers_min(
     on_chain_profit: U256,
     amount_in: U256,
     slippage_bps: u64,
-    hop_count: u32,
+    _hop_count: u32,
 ) -> bool {
     if on_chain_profit.is_zero() {
         return false;
     }
+    // hop_count=1: slippage is already route-level (see candidate minProfit path).
     let Some(min_profit) = on_chain_min_profit_for_route(
         on_chain_profit,
         amount_in,
         slippage_bps,
-        hop_count,
+        1,
         FlashLoanSource::Direct,
     ) else {
         return false;
@@ -450,11 +454,41 @@ mod tests {
         let on_chain = U256::from(111_906_298_841_187_462u128);
         let modeled = U256::from(296_685_017_513_143_239u128);
         let amount_in = U256::from(7_978_784_081_956_178u128);
+        // 476 is route-level (HF effective_slippage); hop_count must not re-compound.
         assert!(batch_profit_covers_min(on_chain, amount_in, 476, 2));
         let modeled_floor =
-            on_chain_min_profit_for_route(modeled, amount_in, 476, 2, FlashLoanSource::Direct)
+            on_chain_min_profit_for_route(modeled, amount_in, 476, 1, FlashLoanSource::Direct)
                 .expect("modeled floor");
         assert!(on_chain < modeled_floor);
+    }
+
+    #[test]
+    fn batch_profit_covers_min_does_not_recompound_route_slip() {
+        let on_chain = U256::from(100_000u64);
+        let amount_in = U256::from(1_000_000u64);
+        let route_slip = 500u64;
+        let floor_once = on_chain_min_profit_for_route(
+            on_chain,
+            amount_in,
+            route_slip,
+            1,
+            FlashLoanSource::Direct,
+        )
+        .expect("floor");
+        let floor_recompounded = on_chain_min_profit_for_route(
+            on_chain,
+            amount_in,
+            route_slip,
+            3,
+            FlashLoanSource::Direct,
+        )
+        .expect("recompounded");
+        assert!(floor_once > floor_recompounded);
+        // hop_count arg must not loosen the floor vs once-applied route slip.
+        assert_eq!(
+            batch_profit_covers_min(on_chain, amount_in, route_slip, 3),
+            on_chain >= floor_once
+        );
     }
 
     #[test]

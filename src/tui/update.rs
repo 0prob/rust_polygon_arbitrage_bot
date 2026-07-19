@@ -459,10 +459,11 @@ fn build_routes(
                 hop_count: cycle.edge_hops(),
                 min_profit_matic_wei: U256::ZERO,
                 min_profit_roi_bps: 0,
-                // assess_profit expects route-level slip (compound per-hop config).
-                slippage_bps: crate::services::execution::profit::compound_slippage_bps(
+                // assess_profit expects route-level slip (min floor + compound).
+                slippage_bps: crate::services::execution::impact_slippage::effective_slippage_bps(
                     slippage_bps,
                     cycle.edge_hops(),
+                    0,
                 ),
                 flash_loan_source: FlashLoanSource::Balancer,
                 safety_multiplier_bps,
@@ -866,7 +867,14 @@ pub fn build_config_rows(config: &AppConfig) -> Vec<KeyValueRow> {
         ),
         kv(
             "slippage",
-            format!("{} bps", config.execution.slippage_bps),
+            format!(
+                "{} bps (eff ≥ {}/hop)",
+                config.execution.slippage_bps,
+                config
+                    .execution
+                    .slippage_bps
+                    .max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS)
+            ),
             Severity::Info,
         ),
     ]

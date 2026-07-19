@@ -200,9 +200,10 @@ pub fn resolvable_token_set(
         .collect()
 }
 
-/// Extend graph resolvability to tokens that share a tradable pool with a hub or
-/// already-priced token. Keeps profit conversion on oracle rates; this only grows
-/// routing connectivity for long-tail spokes.
+/// Spoke expansion: tokens sharing a pool with a hub or already-priced token.
+///
+/// Connectivity only — does not invent MATIC rates. Wired into
+/// [`crate::pipeline::graph::GraphBuildGate::spoke_connectivity`] for graph admission.
 pub fn expand_hub_spoke_resolvable(
     resolvable: &mut FxHashSet<Address>,
     pool_metas: &[crate::pipeline::types::PoolMeta],
@@ -247,15 +248,22 @@ pub fn expand_hub_spoke_resolvable(
 
 /// Replace rates for tokens refreshed this LF pass and retain unrelated cached rates.
 ///
+/// Soft cap on retained non-refreshed prior rates (unbounded growth otherwise).
+const MERGED_RATES_SOFT_CAP: usize = 2_048;
+
 /// A requested token absent from `fresh` failed its current freshness check, so its
 /// old rate must be removed to keep HF pricing fail-closed.
+///
+/// When `retain_stale_prior` is false (prior snapshot older than oracle cache TTL),
+/// only `fresh` is kept — fail-closed on stale merge.
 #[must_use]
 pub fn merge_token_rates(
     prior: &Arc<FxHashMap<TokenIndex, U256>>,
     refreshed_tokens: &FxHashSet<TokenIndex>,
     fresh: FxHashMap<TokenIndex, U256>,
+    retain_stale_prior: bool,
 ) -> Arc<FxHashMap<TokenIndex, U256>> {
-    if prior.is_empty() {
+    if !retain_stale_prior || prior.is_empty() {
         return Arc::new(fresh);
     }
     let needs_merge = refreshed_tokens
@@ -276,6 +284,20 @@ pub fn merge_token_rates(
             .map(|(&token, &rate)| (token, rate)),
     );
     merged.extend(fresh);
+    // ponytail: drop excess stale priors (not in this refresh). Prefer keeping
+    // tokens touched this tick; age gate is `retain_stale_prior` above.
+    if merged.len() > MERGED_RATES_SOFT_CAP {
+        let overflow = merged.len() - MERGED_RATES_SOFT_CAP;
+        let drop_keys: Vec<TokenIndex> = merged
+            .keys()
+            .copied()
+            .filter(|t| !refreshed_tokens.contains(t))
+            .take(overflow)
+            .collect();
+        for k in drop_keys {
+            merged.remove(&k);
+        }
+    }
     Arc::new(merged)
 }
 
@@ -294,6 +316,10 @@ pub struct RateEnrichStats {
 pub struct RateEnrichContext<'a> {
     pub graph: Option<&'a RoutingGraph>,
     pub hub_path: HubPathRateParams,
+    /// Discovery/on-chain decimals for hub probe scaling (avoids arena default-18 skew).
+    pub token_decimals: Option<&'a FxHashMap<Address, u8>>,
+    /// Pool metas for V4 lazy hub-exit resolution in hub-path rates.
+    pub pool_metas: Option<&'a [crate::pipeline::types::PoolMeta]>,
 }
 
 pub async fn enrich_token_to_matic_rates<P, I>(
@@ -308,7 +334,14 @@ where
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens = dedupe_token_indices(tokens);
-    let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
+    let hub_rates = hub_rates_for_tokens(
+        arena,
+        ctx.graph,
+        &tokens,
+        ctx.hub_path,
+        ctx.token_decimals,
+        ctx.pool_metas,
+    );
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd(&addrs, provider).await;
     let matic_usd = matic_usd_raw_for_lf_enrich(oracle, provider, true).await;
@@ -326,7 +359,14 @@ where
     I: IntoIterator<Item = TokenIndex>,
 {
     let tokens = dedupe_token_indices(tokens);
-    let hub_rates = hub_rates_for_tokens(arena, ctx.graph, &tokens, ctx.hub_path);
+    let hub_rates = hub_rates_for_tokens(
+        arena,
+        ctx.graph,
+        &tokens,
+        ctx.hub_path,
+        ctx.token_decimals,
+        ctx.pool_metas,
+    );
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd_offline(&addrs).await;
     let matic_usd = matic_usd_raw_for_lf_enrich_offline(oracle).await;
@@ -362,9 +402,13 @@ fn hub_rates_for_tokens(
     graph: Option<&RoutingGraph>,
     tokens: &[TokenIndex],
     params: HubPathRateParams,
+    token_decimals: Option<&FxHashMap<Address, u8>>,
+    pool_metas: Option<&[crate::pipeline::types::PoolMeta]>,
 ) -> FxHashMap<TokenIndex, U256> {
     match graph {
-        Some(g) => hub_path_matic_rates_batch(arena, g, tokens, params),
+        Some(g) => {
+            hub_path_matic_rates_batch(arena, g, tokens, params, token_decimals, pool_metas)
+        }
         None => FxHashMap::default(),
     }
 }
@@ -458,6 +502,17 @@ fn insert_missing_wmatic_self_rates(
     }
 }
 
+/// Relative divergence in bps: `|a - b| * 10_000 / max(a, b)`.
+#[must_use]
+fn rates_diverge_bps(a: U256, b: U256) -> u64 {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    if hi.is_zero() {
+        return 0;
+    }
+    let delta = hi - lo;
+    u64::try_from((delta * U256::from(10_000u64) / hi).min(U256::from(10_000u64))).unwrap_or(10_000)
+}
+
 fn build_token_to_matic_rates(
     oracle: &PriceOracle,
     arena: &StateArena,
@@ -486,27 +541,41 @@ fn build_token_to_matic_rates(
         };
         if addr == wmatic {
             stats.resolved += 1;
-            stats.hub_path += 1;
             out.insert(*idx, rate_one);
             continue;
         }
-        if let Some(rate) = integer_by_addr
+        let hub = hub_rates
+            .get(idx)
+            .copied()
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
+        let chainlink = integer_by_addr
             .get(&addr)
             .copied()
-            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE)
-        {
-            stats.chainlink += 1;
-            stats.resolved += 1;
-            out.insert(*idx, rate);
-            continue;
-        }
-        // Arena hub-path sim reflects executable pool basis; prefer it over
-        // float oracle leverage (token/USD × MATIC/USD) for configured feeds.
-        if let Some(&rate) = hub_rates.get(idx) {
-            stats.resolved += 1;
-            stats.hub_path += 1;
-            out.insert(*idx, rate);
-            continue;
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
+        match (chainlink, hub) {
+            (Some(cl), Some(hub_rate))
+                if !crate::core::constants::is_polygon_hub_token(addr)
+                    && rates_diverge_bps(cl, hub_rate) > 2_000 =>
+            {
+                // Long-tail: executable pool basis when Chainlink diverges >20%.
+                stats.hub_path += 1;
+                stats.resolved += 1;
+                out.insert(*idx, hub_rate);
+                continue;
+            }
+            (Some(cl), _) => {
+                stats.chainlink += 1;
+                stats.resolved += 1;
+                out.insert(*idx, cl);
+                continue;
+            }
+            (None, Some(hub_rate)) => {
+                stats.hub_path += 1;
+                stats.resolved += 1;
+                out.insert(*idx, hub_rate);
+                continue;
+            }
+            (None, None) => {}
         }
         let float_oracle_rate = oracle.has_configured_feed(&addr).then(|| {
             if matic_usd > 0.0 {
@@ -657,12 +726,14 @@ mod tests {
             &prior,
             &refreshed,
             FxHashMap::from_iter([(TokenIndex(0), U256::from(1_000u64))]),
+            true,
         );
         assert!(Arc::ptr_eq(&prior, &merged));
         let changed = merge_token_rates(
             &prior,
             &refreshed,
             FxHashMap::from_iter([(TokenIndex(0), U256::from(9_000u64))]),
+            true,
         );
         assert!(!Arc::ptr_eq(&prior, &changed));
         assert_eq!(
@@ -683,13 +754,42 @@ mod tests {
         ]));
         let refreshed = FxHashSet::from_iter([TokenIndex(0)]);
 
-        let merged = merge_token_rates(&prior, &refreshed, FxHashMap::default());
+        let merged = merge_token_rates(&prior, &refreshed, FxHashMap::default(), true);
 
         assert!(!merged.contains_key(&TokenIndex(0)));
         assert_eq!(
             merged.get(&TokenIndex(1)).copied(),
             Some(U256::from(2_000u64))
         );
+    }
+
+    #[test]
+    fn merge_token_rates_drops_prior_when_stale() {
+        let prior = Arc::new(FxHashMap::from_iter([(
+            TokenIndex(1),
+            U256::from(2_000u64),
+        )]));
+        let refreshed = FxHashSet::from_iter([TokenIndex(0)]);
+        let merged = merge_token_rates(
+            &prior,
+            &refreshed,
+            FxHashMap::from_iter([(TokenIndex(0), U256::from(1_000u64))]),
+            false,
+        );
+        assert_eq!(
+            merged.get(&TokenIndex(0)).copied(),
+            Some(U256::from(1_000u64))
+        );
+        assert!(!merged.contains_key(&TokenIndex(1)));
+    }
+
+    #[test]
+    fn rates_diverge_bps_is_relative_to_larger() {
+        assert_eq!(
+            rates_diverge_bps(U256::from(100u64), U256::from(80u64)),
+            2_000
+        );
+        assert_eq!(rates_diverge_bps(U256::from(100u64), U256::from(100u64)), 0);
     }
 
     #[test]

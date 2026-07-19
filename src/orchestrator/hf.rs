@@ -313,6 +313,7 @@ fn hf_reselect_from_snapshot(
         &ctx.partial_cache,
         &ctx.execution,
         token_to_matic_rates,
+        token_decimals,
         rescore_cap,
         inactive_offset,
     );
@@ -418,7 +419,7 @@ fn near_miss_verify_provider(
     rpc: &RpcPool,
     execution_mode: &str,
 ) -> anyhow::Result<alloy::providers::DynProvider> {
-    if execution_mode.eq_ignore_ascii_case("dry-run") {
+    if crate::config::is_dry_run_mode(execution_mode) {
         rpc.connect_state().or_else(|_| rpc.connect_simulation())
     } else {
         rpc.connect_simulation()
@@ -551,6 +552,7 @@ fn select_cycles_for_rescore(
     partial_cache: &PartialPoolCache,
     execution: &ExecutionService,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+    token_decimals: &rustc_hash::FxHashMap<Address, u8>,
     rescore_cap: usize,
     inactive_offset: usize,
 ) -> RescoreSelection {
@@ -635,7 +637,8 @@ fn select_cycles_for_rescore(
         // score (livehold: cycles_touching=22 → selected=4 active=0). Fresh WSS
         // moves can look shallow on stale local sim — still probe them.
         let score = cycle_activity_score(ready.as_ref(), arena, partial_cache, activity_now);
-        let start_decimals = arena.token_decimals(ready.start_token);
+        let start_decimals =
+            resolve_token_decimals_for_index(ready.start_token, arena, token_decimals);
         let micro_probe = if start_decimals >= 6 {
             crate::util::ten_pow_u256_cached(start_decimals - 6)
         } else {
@@ -850,6 +853,7 @@ pub async fn run_hf_tick(
         &ctx.partial_cache,
         &ctx.execution,
         &token_to_matic_rates,
+        &token_decimals,
         rescore_cap,
         inactive_offset,
     );
@@ -1186,8 +1190,9 @@ pub async fn run_hf_tick(
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
+    // Same budget as pool prefetch — the old 900ms hard cap ignored HF_PREFETCH_BUDGET_MS.
     let probe_tick_budget =
-        Duration::from_millis(ctx.config.pipeline.hf_prefetch_budget_ms.min(900).max(200));
+        Duration::from_millis(ctx.config.pipeline.hf_prefetch_budget_ms.max(200));
     let probe_tick_started = now_ms();
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
@@ -1889,6 +1894,7 @@ mod tests {
             .collect();
         let rates = one_to_one_rates();
 
+        let decimals = FxHashMap::default();
         let selected = select_cycles_for_rescore(
             &cycles,
             &arena,
@@ -1896,6 +1902,7 @@ mod tests {
             &partial_cache,
             &ExecutionService::default(),
             &rates,
+            &decimals,
             3,
             0,
         );
@@ -1941,6 +1948,7 @@ mod tests {
             .collect();
         let rates = one_to_one_rates();
 
+        let decimals = FxHashMap::default();
         let selected = select_cycles_for_rescore(
             &cycles,
             &arena,
@@ -1948,6 +1956,7 @@ mod tests {
             &partial_cache,
             &ExecutionService::default(),
             &rates,
+            &decimals,
             1,
             0,
         );

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::services::execution::flash_policy::{FlashLoanPolicy, parse_flash_policy};
+use crate::services::execution::flash_policy::{FlashLoanPolicy, try_parse_flash_policy};
 use crate::services::oracle::price_oracle::DEFAULT_CACHE_TTL_MS;
 use alloy::primitives::Address;
 use alloy::primitives::U256;
@@ -121,6 +121,7 @@ pub struct PipelineConfig {
     pub hf_sim_cap: usize,
     #[serde(default = "default_hf_max_dispatch")]
     pub hf_max_dispatch: usize,
+    /// Connectivity rebuild cadence in **LF passes** (not wall-clock seconds).
     #[serde(default = "default_graph_rebuild_interval")]
     pub graph_rebuild_interval: u64,
     #[serde(default = "default_cycle_refind_interval")]
@@ -192,7 +193,7 @@ fn default_hub_path_rates() -> bool {
     true
 }
 fn default_hub_path_max_hops() -> u32 {
-    4
+    crate::core::constants::DEFAULT_HUB_PATH_MAX_HOPS
 }
 
 fn default_pg_url() -> String {
@@ -453,7 +454,13 @@ pub fn load_dotenv() {
         if key.is_empty() || std::env::var(key).is_ok() {
             continue;
         }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let value = value.trim();
+        // Strip unquoted inline comments (`KEY=val # note`); quoted values keep `#`.
+        let value = if value.starts_with('"') || value.starts_with('\'') {
+            value.trim_matches('"').trim_matches('\'')
+        } else {
+            value.split('#').next().unwrap_or(value).trim()
+        };
         // ponytail: ignore set_var errors (e.g. key contains '=')
         // ponytail: Rust 2024 marks set_var unsafe — dotenv loader only
         unsafe {
@@ -464,6 +471,15 @@ pub fn load_dotenv() {
 
 pub(crate) fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// True for `dry-run` / `dry_run` / `dryrun` (case-insensitive).
+#[must_use]
+pub fn is_dry_run_mode(mode: &str) -> bool {
+    let m = mode.trim();
+    m.eq_ignore_ascii_case("dry-run")
+        || m.eq_ignore_ascii_case("dry_run")
+        || m.eq_ignore_ascii_case("dryrun")
 }
 
 /// Map an env var name to a figment key path (see `Env::filter_map` docs).
@@ -527,6 +543,8 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("oracle_cache_ttl_ms") => "oracle.cache_ttl_ms",
         k if k.eq_ignore_ascii_case("oracle_pyth_feeds") => "oracle.pyth_feeds",
         k if k.eq_ignore_ascii_case("oracle_chainlink_feeds") => "oracle.chainlink_feeds",
+        k if k.eq_ignore_ascii_case("oracle_hub_path_rates") => "oracle.hub_path_rates",
+        k if k.eq_ignore_ascii_case("oracle_hub_path_max_hops") => "oracle.hub_path_max_hops",
         k if k.eq_ignore_ascii_case("rpc_batch_pace_ms") => "rpc.batch_pace_ms",
         k if k.eq_ignore_ascii_case("request_timeout_ms") => "rpc.request_timeout_ms",
         k if k.eq_ignore_ascii_case("rpc_request_timeout_ms") => "rpc.request_timeout_ms",
@@ -606,9 +624,19 @@ impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
         load_dotenv();
 
-        let mut config: AppConfig = Self::figment()
-            .extract_lossy()
-            .map_err(|e| anyhow::anyhow!("config: {e}"))?;
+        let figment = Self::figment();
+        // Prefer strict extract; fall back to lossy with a warn so bad env types aren't silent.
+        let mut config: AppConfig = match figment.extract() {
+            Ok(c) => c,
+            Err(strict_err) => {
+                crate::warn!(
+                    "config: strict extract failed ({strict_err}); retrying with lossy coercion"
+                );
+                figment
+                    .extract_lossy()
+                    .map_err(|e| anyhow::anyhow!("config: {e}"))?
+            }
+        };
         apply_conditional_env_overrides(&mut config)?;
         config.normalize();
 
@@ -622,7 +650,13 @@ impl AppConfig {
                     config.execution.min_profit_matic_wei
                 )
             })?;
-        config.flash_policy = parse_flash_policy(&config.execution.flash_loan_source);
+        config.flash_policy = try_parse_flash_policy(&config.execution.flash_loan_source)
+            .with_context(|| {
+                format!(
+                    "invalid FLASH_LOAN_SOURCE {:?} (use auto|aave|aave_v3|balancer)",
+                    config.execution.flash_loan_source
+                )
+            })?;
 
         Ok(config)
     }
@@ -639,6 +673,21 @@ impl AppConfig {
         self.max_multicall_calls = self.max_multicall_calls.max(1);
         self.rpc.request_timeout_ms = self.rpc.request_timeout_ms.max(1);
         self.rpc.batch_pace_ms = self.rpc.batch_pace_ms.min(60_000);
+        self.execution.receipt_poll_ms = self.execution.receipt_poll_ms.max(50);
+        self.execution.receipt_timeout_ms = self.execution.receipt_timeout_ms.max(1);
+        self.pipeline.indexer_max_lag_blocks = self.pipeline.indexer_max_lag_blocks.max(1);
+        self.pipeline.graph_rebuild_interval = self.pipeline.graph_rebuild_interval.max(1);
+        self.pipeline.cycle_refind_interval = self.pipeline.cycle_refind_interval.max(1);
+        self.pipeline.hf_prefetch_budget_ms = self.pipeline.hf_prefetch_budget_ms.max(1);
+        self.oracle.cache_ttl_ms = self.oracle.cache_ttl_ms.max(1);
+        // TickLens words per side; 0 is useless, >48 blows RPC (wide-pass cap).
+        self.oracle.tick_word_range = self.oracle.tick_word_range.clamp(1, 48);
+        let hub_hop_cap = self
+            .routing
+            .max_hops
+            .min(crate::core::constants::HOP_CAP)
+            .max(1);
+        self.oracle.hub_path_max_hops = self.oracle.hub_path_max_hops.clamp(1, hub_hop_cap);
 
         if self.pipeline.hf_score_cap < self.pipeline.hf_sim_cap {
             self.pipeline.hf_score_cap = self.pipeline.hf_sim_cap;
@@ -792,7 +841,7 @@ impl AppConfig {
 
     #[must_use]
     pub fn is_dry_run(&self) -> bool {
-        self.execution.mode.eq_ignore_ascii_case("dry-run")
+        is_dry_run_mode(&self.execution.mode)
     }
 
     /// Ordered state-read endpoints used for multicall pool refresh (matches [`RpcPool`]).
@@ -861,6 +910,27 @@ mod tests {
     #[test]
     fn default_config_uses_no_static_slippage_allowance() {
         assert_eq!(AppConfig::default().execution.slippage_bps, 0);
+    }
+
+    #[test]
+    fn dry_run_mode_accepts_common_aliases() {
+        assert!(is_dry_run_mode("dry-run"));
+        assert!(is_dry_run_mode("DRY_RUN"));
+        assert!(is_dry_run_mode("dryrun"));
+        assert!(!is_dry_run_mode("live"));
+    }
+
+    #[test]
+    fn normalize_clamps_receipt_poll_and_hub_hops() {
+        let mut config = AppConfig::default();
+        config.execution.receipt_poll_ms = 0;
+        config.oracle.hub_path_max_hops = 99;
+        config.routing.max_hops = 3;
+        config.oracle.tick_word_range = 0;
+        config.normalize();
+        assert_eq!(config.execution.receipt_poll_ms, 50);
+        assert_eq!(config.oracle.hub_path_max_hops, 3);
+        assert_eq!(config.oracle.tick_word_range, 1);
     }
 
     #[test]

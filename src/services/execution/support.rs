@@ -21,15 +21,43 @@ pub enum FlashLoanPolicy {
     AaveOnly,
 }
 
+/// Parse flash policy; unknown values return `None` (callers must fail closed).
 #[must_use]
-pub fn parse_flash_policy(raw: &str) -> FlashLoanPolicy {
+pub fn try_parse_flash_policy(raw: &str) -> Option<FlashLoanPolicy> {
     let s = raw.trim();
     if s.eq_ignore_ascii_case("auto") {
-        FlashLoanPolicy::Auto
+        Some(FlashLoanPolicy::Auto)
     } else if s.eq_ignore_ascii_case("aave") || s.eq_ignore_ascii_case("aave_v3") {
-        FlashLoanPolicy::AaveOnly
+        Some(FlashLoanPolicy::AaveOnly)
+    } else if s.eq_ignore_ascii_case("balancer") || s.eq_ignore_ascii_case("balancer_only") {
+        Some(FlashLoanPolicy::BalancerOnly)
     } else {
-        FlashLoanPolicy::BalancerOnly
+        None
+    }
+}
+
+#[must_use]
+pub fn parse_flash_policy(raw: &str) -> FlashLoanPolicy {
+    // Legacy helper: prefer `try_parse_flash_policy` at config boundaries.
+    try_parse_flash_policy(raw).unwrap_or(FlashLoanPolicy::BalancerOnly)
+}
+
+#[cfg(test)]
+mod flash_policy_tests {
+    use super::*;
+
+    #[test]
+    fn try_parse_flash_policy_accepts_known_values() {
+        assert_eq!(try_parse_flash_policy("auto"), Some(FlashLoanPolicy::Auto));
+        assert_eq!(
+            try_parse_flash_policy("balancer"),
+            Some(FlashLoanPolicy::BalancerOnly)
+        );
+        assert_eq!(
+            try_parse_flash_policy("aave_v3"),
+            Some(FlashLoanPolicy::AaveOnly)
+        );
+        assert_eq!(try_parse_flash_policy("typo"), None);
     }
 }
 

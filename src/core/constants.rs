@@ -4,6 +4,8 @@ use alloy::primitives::{Address, address};
 /// Hard cap on hop count during cycle search (independent of config `max_hops`).
 pub const HOP_CAP: u32 = 8;
 pub const HOP_CAP_USIZE: usize = HOP_CAP as usize;
+/// Default max hops for hub-path token→WMATIC base rates (`OracleConfig`).
+pub const DEFAULT_HUB_PATH_MAX_HOPS: u32 = 4;
 /// Maximum tokens per pool metadata row (Curve/Balancer upper bound in this bot).
 pub const MAX_POOL_TOKENS: usize = 8;
 

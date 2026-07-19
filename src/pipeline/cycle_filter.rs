@@ -98,9 +98,14 @@ fn probe_context_for_cycle(
     };
     if let Some(c) = ctx
         && let Some(rate_map) = c.token_to_matic_rates
-        && let Some(&r) = rate_map.get(&cycle.start_token)
     {
-        rate = r;
+        // Same MIN floor as has_reliable_matic_rate — sub-dust entries must not
+        // inflate min_economic_amount_in in the LF prefilter.
+        rate = crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap(
+            cycle.start_token,
+            rate_map,
+        )
+        .unwrap_or(U256::ZERO);
     }
     (min_economic_amount_in(decimals, rate), rate, decimals)
 }
