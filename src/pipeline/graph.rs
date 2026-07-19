@@ -539,11 +539,10 @@ fn pool_has_admissible_edges(
         PoolState::Balancer(b) => b.bpt_index,
         _ => None,
     });
-    let pair_input_decimals = meta
-        .tokens
-        .first()
-        .zip(meta.tokens.get(1))
-        .map(|(&t0, &t1)| (arena.token_decimals(t0), arena.token_decimals(t1)));
+    // Vault/oracle order for Balancer/Woofi — discovery meta order can be reversed.
+    let pair_input_decimals = routing_token_at_leg(arena, state, meta, 0)
+        .zip(routing_token_at_leg(arena, state, meta, 1))
+        .map(|(t0, t1)| (arena.token_decimals(t0), arena.token_decimals(t1)));
     if !pool_state_graph_eligible(
         Some(arena),
         state,
@@ -1098,10 +1097,23 @@ fn rescore_graph_edge(arena: &StateArena, ge: &mut GraphEdge) -> usize {
         ge.ratio = U256::ZERO;
         return 1;
     };
+    // Heal stale edge tags (discovery V2 on arena V3) instead of killing until rebuild.
     if !protocol_matches_pool_state(ge.edge.protocol, state) {
-        ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
-        ge.ratio = U256::ZERO;
-        return 1;
+        let corrected =
+            crate::pipeline::local_sim::protocol_from_pool_state(state, ge.edge.protocol);
+        if corrected == ge.edge.protocol || !protocol_matches_pool_state(corrected, state) {
+            ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+            ge.ratio = U256::ZERO;
+            return 1;
+        }
+        ge.edge.protocol = corrected;
+        // Same V2→V3 fee_bps sync as local_sim::heal_cycle_edge_protocols.
+        if let PoolState::V3(v3) = state {
+            let pips = v3.fee.as_limbs()[0] as u32;
+            if (1..0x800000).contains(&pips) {
+                ge.edge.fee_bps = (pips / 100).min(9_999);
+            }
+        }
     }
     let tin = ge.edge.token_in_idx as usize;
     let tout = ge.edge.token_out_idx as usize;
@@ -1147,7 +1159,9 @@ pub fn pool_meta_from_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{BalancerPoolKind, BalancerPoolState, PoolState, V2PoolState};
+    use crate::core::types::{
+        BalancerPoolKind, BalancerPoolState, PoolState, V2PoolState, V3PoolState, V3Tick,
+    };
     use alloy::primitives::{Address, U256};
     use std::sync::Arc;
 
@@ -1799,6 +1813,57 @@ mod tests {
         rescore_pools_in_place(&arena, &mut graph, &[pool]);
         let coverage_after = graph.coverage.as_ref().expect("coverage");
         assert_eq!(std::sync::Arc::as_ptr(coverage_after), coverage_ptr);
+    }
+
+    #[test]
+    fn rescore_heals_stale_v2_edge_on_v3_state() {
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([60u8; 20]));
+        let b = arena.register_token(Address::from([61u8; 20]));
+        let funded = TEST_FUNDED_RESERVE;
+        let pool = arena.register_pool(
+            Address::from([62u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let metas = [pool_meta_from_pair(pool, ProtocolType::UniswapV2, a, b, 30)];
+        let mut graph = build_graph(&arena, &metas);
+        assert_eq!(
+            graph.adjacency[a.0 as usize][0].edge.protocol,
+            ProtocolType::UniswapV2
+        );
+        // Arena flips to V3 (discovery mislabel) — rescore must heal, not DEAD.
+        arena.register_pool(
+            Address::from([62u8; 20]),
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000_000_000_000_000u128,
+                tick: 0,
+                fee: U256::from(5000u32), // 50 bps — distinct from discovery 30
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60_000,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
+        );
+        rescore_pools_in_place(&arena, &mut graph, &[pool]);
+        let ge = &graph.adjacency[a.0 as usize][0];
+        assert_eq!(ge.edge.protocol, ProtocolType::UniswapV3);
+        assert_eq!(ge.edge.fee_bps, 50); // synced from 5000 pips
+        assert!(
+            ge.log_weight < DEAD_EDGE_LOG_WEIGHT && !ge.ratio.is_zero(),
+            "healed edge must stay live"
+        );
     }
 
     #[test]

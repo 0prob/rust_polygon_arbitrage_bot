@@ -335,9 +335,7 @@ impl StateRefreshService {
     }
 
     pub async fn maybe_discover(&self) -> anyhow::Result<usize> {
-        self.maybe_refresh_indexer_health().await;
-
-        let (cursor, is_bootstrap) = {
+        let (cursor, is_bootstrap, notify_pending) = {
             let state = self.discovery_state.read();
             let elapsed = now_ms().saturating_sub(state.last_discovery_ms);
             let cursor = state.discovery_cursor.clone();
@@ -361,16 +359,42 @@ impl StateRefreshService {
                 }
                 return Ok(0);
             }
-            (cursor, is_bootstrap)
+            (cursor, is_bootstrap, notify_pending)
         };
+
+        // Indexer lag is irrelevant until pools exist — skip the serial PG/RPC hit
+        // on the critical first-bootstrap path.
+        if !is_bootstrap {
+            self.maybe_refresh_indexer_health().await;
+        }
 
         let tick_started = now_ms();
         let pg_started = now_ms();
-        let mut result = if is_bootstrap {
+        // Empty discovery + notify: re-keyset so pools with historical createdBlock land.
+        let force_bootstrap =
+            is_bootstrap || (notify_pending && self.discovered_pool_count() == 0);
+        let mut result = if force_bootstrap {
             crate::info!("starting postgres pool bootstrap");
-            self.discover_bootstrap().await?
+            match self.discover_bootstrap().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Restore wake so LISTEN is not lost on transient PG errors.
+                    if notify_pending {
+                        self.pg_notify_pending.store(true, Ordering::Release);
+                    }
+                    return Err(e);
+                }
+            }
         } else {
-            self.discover_incremental(&cursor).await?
+            match self.discover_incremental(&cursor).await {
+                Ok(r) => r,
+                Err(e) => {
+                    if notify_pending {
+                        self.pg_notify_pending.store(true, Ordering::Release);
+                    }
+                    return Err(e);
+                }
+            }
         };
         let pg_ms = now_ms().saturating_sub(pg_started);
         let batch_pools = result.pools.len();
@@ -499,10 +523,12 @@ impl StateRefreshService {
             record_index_bootstrap_page();
             all_pools.extend(page.into_iter().filter_map(retain_routable_pool));
             merge_parse_stats(&mut parse_stats, &page_stats);
+            // Always advance — previously only updated when has_more, so a single-page
+            // (or final page) left last_block=0 and re-bootstrapped every LF tick.
+            keyset = next;
             if !has_more {
                 break;
             }
-            keyset = next;
             crate::debug!(
                 "pg bootstrap page (batch={batch}, total={}, max_block={})",
                 all_pools.len(),
@@ -511,8 +537,12 @@ impl StateRefreshService {
         }
         log_index_parse_stats(&parse_stats);
         log_index_summary();
-        // SQL returns ORDER BY "createdBlock", id — last pool's block is max
-        let max_block = keyset.created_block.max(0) as u64;
+        let max_from_pools = all_pools
+            .iter()
+            .map(|p| p.created_block)
+            .max()
+            .unwrap_or(0);
+        let max_block = bootstrap_cursor_block(keyset.created_block, max_from_pools);
         crate::info!(
             "pg bootstrap loaded {} pools (max_block={max_block})",
             all_pools.len()
@@ -1037,6 +1067,15 @@ fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
     }
 }
 
+/// Watermark after a completed keyset bootstrap. Always ≥1 so `last_block == 0`
+/// (still bootstrapping) clears even when PoolMeta is empty.
+#[must_use]
+fn bootstrap_cursor_block(keyset_created: i32, pool_created_max: u64) -> u64 {
+    (keyset_created.max(0) as u64)
+        .max(pool_created_max)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dedupe_sorted_addresses, refresh_batch_for};
@@ -1087,5 +1126,13 @@ mod tests {
         let b = Address::with_last_byte(2);
         let deduped = dedupe_sorted_addresses(&[b, a, b, a, b]);
         assert_eq!(deduped, vec![a, b]);
+    }
+
+    #[test]
+    fn bootstrap_cursor_leaves_bootstrapping_mode() {
+        // Empty table / single-page default keyset must not stick at 0.
+        assert_eq!(super::bootstrap_cursor_block(0, 0), 1);
+        assert_eq!(super::bootstrap_cursor_block(12_345, 0), 12_345);
+        assert_eq!(super::bootstrap_cursor_block(100, 999), 999);
     }
 }

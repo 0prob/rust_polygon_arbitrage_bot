@@ -673,6 +673,8 @@ fn spawn_matic_usd_oracle_background(
         static MATIC_USD_FAILS: AtomicU32 = AtomicU32::new(0);
         let mut ticker = interval(Duration::from_millis(period_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Dedicated warm spawn already refreshed — skip the immediate first tick.
+        ticker.tick().await;
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {

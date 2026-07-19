@@ -341,9 +341,10 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             )
             .or_else(|| gc.graph())
             .unwrap_or_else(|| {
-                let gg = Arc::new(crate::pipeline::graph::build_graph(
+                let gg = Arc::new(build_graph_with_gate(
                     &work.arena,
                     work.pool_metas.as_ref(),
+                    gate_ref,
                 ));
                 gc.store(
                     Arc::clone(&gg),
@@ -357,9 +358,10 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             })
         } else {
             gc.graph().unwrap_or_else(|| {
-                let gg = Arc::new(crate::pipeline::graph::build_graph(
+                let gg = Arc::new(build_graph_with_gate(
                     &work.arena,
                     work.pool_metas.as_ref(),
+                    gate_ref,
                 ));
                 gc.store(
                     Arc::clone(&gg),
@@ -430,11 +432,12 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 work.arena.pool_count(),
             )
     };
-    // Incremental: attach/observed-admit — full rebuild (interval/shrink/reorder) keeps 1s budget.
-    let incremental_refind = cycle_cache_valid
+    // Incremental: attach/observed-admit on a cached graph. Full rebuild keeps the 1s budget
+    // even when WSS pins fire — patch DFS under-explores new topology.
+    let incremental_refind = !needs_rebuild
+        && cycle_cache_valid
         && cached_cycles.as_ref().is_some_and(|c| !c.is_empty())
-        && (work.force_cycle_refind
-            || (!needs_rebuild && (missing_graph_pools > 0 || connectivity_stale)));
+        && (work.force_cycle_refind || missing_graph_pools > 0 || connectivity_stale);
     let mut enumeration_ms = 0u64;
     let (cycles, enumerated_cycles) = if need_cycle_refind {
         crate::debug!(
@@ -966,6 +969,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
     capped = finalize_enumerated_cycles(capped, max_paths.saturating_sub(live_held.len()));
     if !live_held.is_empty() {
+        // Rescore held pins with post-hydrate weights; still skip dead-prune so WSS
+        // topic-live cycles survive a transient zero after tick hydrate.
+        rescore_cycles_with_table(&arena, &mut table, &mut live_held);
         live_held.sort_by(crate::pipeline::types::compare_cycle_score);
         live_held.truncate(32);
         let mut seen: rustc_hash::FxHashSet<u64> = live_held
@@ -1364,6 +1370,8 @@ pub fn spawn_lf_background(
     tokio::spawn(async move {
         let mut timer = interval(Duration::from_millis(lf_interval_ms.max(1)));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // interval fires immediately — discard so startup warm LF isn't doubled.
+        timer.tick().await;
 
         loop {
             tokio::select! {

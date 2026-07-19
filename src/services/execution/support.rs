@@ -538,8 +538,8 @@ mod tests {
         assert_eq!(effective_slippage_bps(0, 3, 500), 500);
         // Config below EXECUTION_MIN_SLIPPAGE_BPS floors to 100.
         assert_eq!(effective_slippage_bps(50, 1, 10), 100);
-        // 100 bps × 4 hops compounds to 394 route bps; depth 10 stays under that.
-        assert_eq!(effective_slippage_bps(50, 4, 10), 394);
+        // 100 bps × 4 hops: retained 9604 → 396 route bps; depth 10 stays under that.
+        assert_eq!(effective_slippage_bps(50, 4, 10), 396);
         assert_eq!(effective_slippage_bps(50, 4, 500), 500);
         // Config 0 floors to encode min (100) so 2-hop → 199 route bps.
         assert_eq!(effective_slippage_bps(0, 2, 0), 199);

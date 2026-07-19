@@ -130,9 +130,9 @@ impl GraphCache {
         dirty_pool_count: usize,
         arena_pool_count: usize,
     ) -> bool {
-        if self.needs_connectivity_rebuild(routable_pool_count, layout_fingerprint) {
-            return true;
-        }
+        let _ = (routable_pool_count, layout_fingerprint);
+        // Connectivity rebuild is handled by LF via `(needs_rebuild && !cycle_cache_valid)`.
+        // Coupling rebuild→refind here defeated keep_cycles on growth/interval rebuilds.
         if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
             return true;
         }
@@ -303,6 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn interval_rebuild_pass_does_not_force_cycle_refind() {
+        // keep_cycles relies on this: rebuild interval alone must not imply full DFS.
+        let mut cache = GraphCache::with_intervals(4, 8);
+        for _ in 0..3 {
+            cache.advance_pass();
+        }
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            1_000,
+            1,
+            5,
+            800,
+        );
+        cache.advance_pass(); // pass 4 — rebuild due, cycle refind interval not yet
+        assert!(cache.needs_connectivity_rebuild(1_000, 1));
+        assert!(cache.cycle_cache_still_valid(1_000, 1));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
+    }
+
+    #[test]
     fn large_shrink_forces_rebuild() {
         let mut cache = GraphCache::with_rebuild_interval(60);
         cache.advance_pass();
@@ -404,7 +425,9 @@ mod tests {
         );
         assert!(!cache.needs_connectivity_rebuild(10, 1));
         assert!(cache.needs_connectivity_rebuild(10, 2));
-        assert!(cache.needs_cycle_refind(10, 2, 0, 0, 10));
+        // Rebuild alone does not force refind — LF uses cycle_cache_still_valid.
+        assert!(!cache.cycle_cache_still_valid(10, 2));
+        assert!(!cache.needs_cycle_refind(10, 2, 0, 0, 10));
     }
 
     #[test]
@@ -442,7 +465,8 @@ mod tests {
         );
         assert!(!cache.needs_connectivity_rebuild(1_000, 11));
         assert!(cache.needs_connectivity_rebuild(1_000, 12));
-        assert!(cache.needs_cycle_refind(1_000, 12, 6, 0, 1_000));
+        assert!(!cache.cycle_cache_still_valid(1_000, 12));
+        assert!(!cache.needs_cycle_refind(1_000, 12, 6, 0, 1_000));
     }
 
     #[test]

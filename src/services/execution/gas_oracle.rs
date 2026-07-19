@@ -352,6 +352,8 @@ impl GasOracle {
             }
             let mut ticker = tokio::time::interval(poll);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // interval fires immediately — discard so we don't double-hit after initial refresh.
+            ticker.tick().await;
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {

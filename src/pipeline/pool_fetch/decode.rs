@@ -103,13 +103,10 @@ fn decode_v3_head(
     prefer_algebra: bool,
 ) -> Option<(U256, i32, bool, Option<U256>, u16)> {
     if prefer_algebra {
+        // Do not fall back to Uni slot0 on the same globalState bytes — a ≥224B
+        // Algebra payload can look like a plausible slot0 and skip the real slot0 result.
         return decode_algebra_global_state(bytes)
-            .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0u16))
-            .or_else(|| {
-                decode_v3_slot0(bytes).map(|(sqrt, tick, unlocked, _, obs_card)| {
-                    (sqrt, tick, unlocked, None, obs_card)
-                })
-            });
+            .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0u16));
     }
     decode_v3_slot0(bytes)
         .map(|(sqrt, tick, unlocked, _, obs_card)| (sqrt, tick, unlocked, None, obs_card))
@@ -602,6 +599,14 @@ mod tests {
         assert!(unlocked);
         assert_eq!(fee_proto, 6);
         assert_eq!(obs_card, 17);
+    }
+
+    #[test]
+    fn algebra_prefer_path_does_not_decode_short_payload_as_slot0() {
+        // globalState shorter than Uni slot0 — must fail closed so caller can use
+        // the dedicated V3Slot0 multicall result instead of a garbage head.
+        let short = Bytes::from(vec![0u8; 160]);
+        assert!(decode_v3_head(&short, true).is_none());
     }
 
     #[test]

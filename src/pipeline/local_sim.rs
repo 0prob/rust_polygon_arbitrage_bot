@@ -598,6 +598,13 @@ pub fn heal_cycle_edge_protocols(
                 return None;
             }
             edge.protocol = corrected;
+            // Keep fee_bps in family units when on-chain fee is present (V2→V3 heal).
+            if let PoolState::V3(v3) = state {
+                let pips = v3.fee.as_limbs()[0] as u32;
+                if (1..0x800000).contains(&pips) {
+                    edge.fee_bps = (pips / 100).min(9_999);
+                }
+            }
             changed = true;
         }
         // ponytail: same rule as graph::apply_cl_zero_for_one
@@ -1504,6 +1511,7 @@ mod tests {
         assert!(!cycle_edges_match_arena_state(&arena, &cycle.edges));
         let healed = heal_cycle_edge_protocols(&arena, cycle).expect("heal");
         assert_eq!(healed.edges[0].protocol, ProtocolType::UniswapV3);
+        assert_eq!(healed.edges[0].fee_bps, 30); // 3000 pips
         // t0=[1..] < t1=[2..] ⇒ zero_for_one must be true after heal
         assert!(healed.edges[0].zero_for_one);
         assert!(cycle_edges_match_arena_state(&arena, &healed.edges));

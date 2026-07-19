@@ -603,8 +603,10 @@ fn hub_exit_legs(
     meta: &PoolMeta,
     state: &PoolState,
 ) -> smallvec::SmallVec<[u8; 8]> {
-    if graph.v4_singleton_hub == Some(hub_node) {
-        return crate::pipeline::graph::funded_token_indices(state, meta);
+    // Prefer live funded legs so newly funded Balancer/Woofi tokens appear mid-cache.
+    let live = crate::pipeline::graph::funded_token_indices(state, meta);
+    if !live.is_empty() {
+        return live;
     }
     let Some(idx) = graph.virtual_hub_index(hub_node) else {
         return smallvec::SmallVec::new();

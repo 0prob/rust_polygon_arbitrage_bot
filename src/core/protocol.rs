@@ -124,11 +124,16 @@ pub fn fee_to_bps(protocol_label: &str, raw_fee: Option<u32>) -> u32 {
     if normalize_protocol(protocol_label) == Some(ProtocolType::UniswapV4) && raw_fee == Some(0) {
         return 0;
     }
+    // Curve fees are 1e6-scaled and often exceed the Uni dynamic-fee flag (0x800000)
+    // before conversion — e.g. 1% = 10_000_000 → 10 bps, not the 30 bps clamp.
+    if is_curve {
+        if raw == 0 {
+            return 30;
+        }
+        return (raw / 1_000_000).min(9_999);
+    }
     if raw == 0 || raw >= 0x800000 {
         return 30;
-    }
-    if is_curve {
-        return (raw / 1_000_000).min(9_999);
     }
     (raw / if is_pips_style { 100 } else { 1 }).min(9_999)
 }
@@ -196,6 +201,9 @@ mod tests {
     fn curve_fee_units_are_converted_to_basis_points() {
         assert_eq!(fee_to_bps("CURVE_STABLE", Some(4_000_000)), 4);
         assert_eq!(fee_to_bps("CURVE_CRYPTO", Some(5_000_000)), 5);
+        // Above Uni dynamic-fee flag — must convert, not clamp to 30.
+        assert_eq!(fee_to_bps("CURVE_STABLE", Some(10_000_000)), 10);
+        assert_eq!(fee_to_bps("CURVE_STABLE", Some(0)), 30);
     }
 
     #[test]
