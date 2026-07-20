@@ -165,23 +165,32 @@ async fn build_ui_snapshot(
         None
     };
 
-    if let Some(task) = oracle_task {
-        match tokio::time::timeout(Duration::from_secs(6), task).await {
+    if let Some(mut task) = oracle_task {
+        match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(Ok(refreshed)) => {
                 if let Some(usd) = matic_usd_for_flash_cap(refreshed) {
                     matic_usd = usd;
                 }
             }
             Ok(Err(e)) => crate::debug!("snapshot oracle refresh failed: {e:#}"),
-            Err(_) => crate::debug!("snapshot oracle refresh timed out"),
+            Err(_) => {
+                // Dropping a JoinHandle detaches the task (tokio docs); abort+await.
+                task.abort();
+                let _ = task.await;
+                crate::debug!("snapshot oracle refresh timed out");
+            }
         }
     }
 
-    if let Some(task) = portfolio_task {
-        match tokio::time::timeout(Duration::from_secs(6), task).await {
+    if let Some(mut task) = portfolio_task {
+        match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
             Ok(Ok(rows)) => portfolio_rows = rows,
             Ok(Err(e)) => crate::debug!("snapshot portfolio refresh failed: {e:#}"),
-            Err(_) => crate::debug!("snapshot portfolio refresh timed out"),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                crate::debug!("snapshot portfolio refresh timed out");
+            }
         }
     }
 
@@ -191,38 +200,38 @@ async fn build_ui_snapshot(
         .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
 
     // Hot-cache + route sims only when generation/gas change; otherwise reuse cache.
-    let display_arena = if snap.generation != route_cache.generation
-        || route_cache.gas_gwei != gas_gwei
-    {
-        let hot_pools = hot_pool_addresses(&snap);
-        let mut display_arena = snap.arena.clone();
-        display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
-        let arena = display_arena.clone();
-        let snap_arc = Arc::clone(&snap);
-        let slippage_bps = ctx.config.execution.slippage_bps;
-        let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
-        let matic = matic_usd;
-        let prev_graph_generation = route_cache.graph_generation;
-        let prev_graph = route_cache.graph.take();
-        *route_cache = tokio::task::spawn_blocking(move || {
-            build_route_cache(
-                &snap_arc,
-                &arena,
-                matic,
-                gas_gwei,
-                slippage_bps,
-                safety_multiplier_bps,
-            )
-        })
-        .await
-        .context("route cache build task failed")?;
-        // Route rebuild must not drop the graph COW cache.
-        route_cache.graph_generation = prev_graph_generation;
-        route_cache.graph = prev_graph;
-        display_arena
-    } else {
-        snap.arena.clone()
-    };
+    let display_arena =
+        if snap.generation != route_cache.generation || route_cache.gas_gwei != gas_gwei {
+            let hot_pools = hot_pool_addresses(&snap);
+            let mut display_arena = snap.arena.clone();
+            display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
+            let arena = display_arena.clone();
+            let snap_arc = Arc::clone(&snap);
+            let slippage_bps = ctx.config.execution.slippage_bps;
+            let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
+            let matic = matic_usd;
+            let prev_graph_generation = route_cache.graph_generation;
+            let prev_graph = route_cache.graph.take();
+            // CPU-bound route sims — rayon pool, not tokio spawn_blocking (tokio docs).
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::util::cpu_pool().spawn(move || {
+                let _ = tx.send(build_route_cache(
+                    &snap_arc,
+                    &arena,
+                    matic,
+                    gas_gwei,
+                    slippage_bps,
+                    safety_multiplier_bps,
+                ));
+            });
+            *route_cache = rx.await.context("route cache build task failed")?;
+            // Route rebuild must not drop the graph COW cache.
+            route_cache.graph_generation = prev_graph_generation;
+            route_cache.graph = prev_graph;
+            display_arena
+        } else {
+            snap.arena.clone()
+        };
 
     let hypersync_height = ctx.hypersync.as_ref().and_then(|hs| hs.latest_height());
     let graph = graph_snapshot_for_poll(

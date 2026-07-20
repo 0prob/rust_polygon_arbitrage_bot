@@ -347,22 +347,18 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
+    use crate::core::math::proptest_util::u256_nonzero;
     use proptest::prelude::*;
-
-    fn non_zero() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX).prop_map(U256::from)
-    }
 
     proptest! {
         #[test]
         fn output_bounded_by_reserve(
-            amount_in in non_zero(),
+            amount_in in u256_nonzero(),
             a in (1u64..1_000_000u64).prop_map(U256::from),
-            balance0 in non_zero(),
-            balance1 in non_zero(),
+            balance0 in u256_nonzero(),
+            balance1 in u256_nonzero(),
         ) {
             let state = CurvePoolState {
                 balances: vec![balance0, balance1],
@@ -376,16 +372,19 @@ mod proptests {
 
             let out = get_curve_stable_amount_out(&state, amount_in, 0, 1);
             if !out.is_zero() {
-                prop_assert!(out <= state.balances[1],
-                    "out={} exceeds balance={}", out, state.balances[1]);
+                prop_assert!(
+                    out <= state.balances[1],
+                    "out={out} exceeds balance={}",
+                    state.balances[1]
+                );
             }
         }
 
         #[test]
         fn identical_tokens_return_zero(
-            amount_in in non_zero(),
+            amount_in in u256_nonzero(),
             a in (1u64..1_000_000u64).prop_map(U256::from),
-            balance in non_zero(),
+            balance in u256_nonzero(),
         ) {
             let state = CurvePoolState {
                 balances: vec![balance, balance],

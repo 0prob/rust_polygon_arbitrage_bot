@@ -29,7 +29,6 @@ pub use rates::{
 };
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use alloy::network::Ethereum;
 use alloy::primitives::Address;
@@ -406,9 +405,7 @@ fn hub_rates_for_tokens(
     pool_metas: Option<&[crate::pipeline::types::PoolMeta]>,
 ) -> FxHashMap<TokenIndex, U256> {
     match graph {
-        Some(g) => {
-            hub_path_matic_rates_batch(arena, g, tokens, params, token_decimals, pool_metas)
-        }
+        Some(g) => hub_path_matic_rates_batch(arena, g, tokens, params, token_decimals, pool_metas),
         None => FxHashMap::default(),
     }
 }
@@ -605,9 +602,6 @@ fn build_token_to_matic_rates(
                 out.insert(*idx, rate_one);
             }
         }
-    }
-    if !out.is_empty() {
-        *oracle.rates_updated_at.write() = Some(Instant::now());
     }
     if stats.requested > 0 {
         crate::debug!(

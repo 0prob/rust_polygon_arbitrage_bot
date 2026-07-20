@@ -137,11 +137,11 @@ fn apply_coalesced(bridge: &TuiBridge, app: &mut App, needs_redraw: &mut bool) {
 }
 
 fn wants_immediate_draw(event: &UiEvent) -> bool {
-    matches!(
-        event,
-        UiEvent::Input(crossterm::event::Event::Key(_))
-            | UiEvent::Input(crossterm::event::Event::Resize(_, _))
-    )
+    match event {
+        // Input thread already drops release/repeat/mouse/focus; treat remaining as interactive.
+        UiEvent::Input(ev) => ev.is_key_press() || ev.is_resize() || ev.is_paste(),
+        _ => false,
+    }
 }
 
 fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {

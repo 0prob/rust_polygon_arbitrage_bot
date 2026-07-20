@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event};
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 use crate::orchestrator::hf::HfCandidateUiRow;
@@ -23,7 +23,7 @@ pub enum UiEvent {
         cycles_considered: usize,
         profitable_count: usize,
         elapsed_ms: u64,
-        candidates: std::sync::Arc<Vec<HfCandidateUiRow>>,
+        candidates: std::sync::Arc<[HfCandidateUiRow]>,
     },
     GasUpdate {
         gwei: f64,
@@ -88,9 +88,6 @@ fn drain_available(tx: &Sender<UiEvent>) -> bool {
 }
 
 fn should_forward(ev: &Event) -> bool {
-    match ev {
-        Event::Key(key) => key.kind == KeyEventKind::Press,
-        Event::Resize(_, _) | Event::Paste(_) => true,
-        Event::FocusGained | Event::FocusLost | Event::Mouse(_) => false,
-    }
+    // Crossterm 0.29 helpers: drop key release/repeat (Windows) and mouse/focus noise.
+    ev.is_key_press() || ev.is_resize() || ev.is_paste()
 }

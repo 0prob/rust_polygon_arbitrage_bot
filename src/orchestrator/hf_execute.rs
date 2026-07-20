@@ -1,10 +1,10 @@
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use futures_util::{StreamExt, stream};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::task::JoinSet;
 
 use crate::core::constants::AAVE_V3_POOL;
 use crate::core::types::{FlashLoanSource, FoundCycle, PoolIndex, PoolState, V3Tick};
@@ -1111,7 +1111,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
                 stats.v3_loaded = stats.v3_loaded.saturating_add(res.loaded);
                 stats.v3_empty = res.empty_pools;
                 stats.v3_incomplete = res.incomplete_pools;
-                stats.v3_algebra_loaded = stats.v3_algebra_loaded.saturating_add(res.algebra_loaded);
+                stats.v3_algebra_loaded =
+                    stats.v3_algebra_loaded.saturating_add(res.algebra_loaded);
                 stats.v3_seeded = res.seeded_pools;
                 v3_pending = res.rpc_failed;
             }
@@ -1121,7 +1122,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
             if needed.is_empty() {
                 v4_pending = false;
             } else {
-                let res = enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
+                let res =
+                    enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
                 stats.v4_loaded = stats.v4_loaded.saturating_add(res.loaded);
                 v4_pending = res.rpc_failed;
             }
@@ -1221,7 +1223,9 @@ async fn enrich_dispatch_cl_ticks(
         );
     }
     restore_dispatch_cl_ticks(arena, snapshots);
-    crate::warn!("dispatch tick hydration failed on all state RPCs — retained prior ticks for still-empty pools");
+    crate::warn!(
+        "dispatch tick hydration failed on all state RPCs — retained prior ticks for still-empty pools"
+    );
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).
@@ -1462,13 +1466,20 @@ pub(crate) async fn filter_balancer_onchain_verified<
         reassess.gas_oracle.as_ref(),
         jobs.iter().map(|job| job.result.route_fingerprint),
     );
-    let verified_balancer = stream::iter(jobs)
-        .map(|job| {
+    // JoinSet matches pool_fetch/rpc concurrency — true runtime tasks, not local Stream poll.
+    let mut tasks = JoinSet::new();
+    let mut job_iter = jobs.into_iter();
+    let mut verified_balancer = Vec::new();
+    loop {
+        while tasks.len() < BATCH_VERIFY_CONCURRENCY {
+            let Some(job) = job_iter.next() else {
+                break;
+            };
             let sim_provider = sim_provider.clone();
             let execution = Arc::clone(&execution);
             let reassess = Arc::clone(&reassess);
             let route_gas = route_gas.clone();
-            async move {
+            tasks.spawn(async move {
                 let eval = reassess.as_eval_input(&route_gas);
                 verify_balancer_batch_job(
                     execution.as_ref(),
@@ -1481,12 +1492,17 @@ pub(crate) async fn filter_balancer_onchain_verified<
                     state_block,
                 )
                 .await
-            }
-        })
-        .buffer_unordered(BATCH_VERIFY_CONCURRENCY)
-        .filter_map(|result| async move { result })
-        .collect::<Vec<_>>()
-        .await;
+            });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        match joined {
+            Ok(Some(result)) => verified_balancer.push(result),
+            Ok(None) => {}
+            Err(e) => crate::warn!("balancer batch verify task failed: {e}"),
+        }
+    }
 
     record_balancer_filter_window(jobs_n, skip_verified_n, passthrough_n);
     log_balancer_batch_filter_summary();

@@ -139,48 +139,49 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
+    use crate::core::math::proptest_util::u256_nonzero;
     use proptest::prelude::*;
 
     proptest! {
         #[test]
         fn output_bounded_by_reserve(
-            amount_in in 1u128..=u128::MAX,
-            reserve_in in 1u128..=u128::MAX,
-            reserve_out in 1u128..=u128::MAX,
-            fee_num in 1u64..10000u64,
+            amount_in in u256_nonzero(),
+            reserve_in in u256_nonzero(),
+            reserve_out in u256_nonzero(),
+            // Keep fee strictly below 10000 so the case is never rejected.
+            fee_num in 1u64..10_000u64,
         ) {
-            let amount_in = U256::from(amount_in);
-            let reserve_in = U256::from(reserve_in);
-            let reserve_out = U256::from(reserve_out);
             let fee_numerator = U256::from(fee_num);
-            let fee_denominator = U256::from(10000u64);
-
-            if fee_numerator >= fee_denominator {
-                return Ok(());
-            }
-
-            let out = get_amount_out(amount_in, reserve_in, reserve_out, fee_numerator, fee_denominator);
+            let fee_denominator = U256::from(10_000u64);
+            let out = get_amount_out(
+                amount_in,
+                reserve_in,
+                reserve_out,
+                fee_numerator,
+                fee_denominator,
+            );
             if !out.is_zero() {
-                prop_assert!(out <= reserve_out,
-                    "output {} exceeds reserve {}", out, reserve_out);
+                prop_assert!(
+                    out <= reserve_out,
+                    "output {out} exceeds reserve {reserve_out}"
+                );
             }
         }
 
         #[test]
         fn zero_in_returns_zero(
-            reserve_in in 1u128..=u128::MAX,
-            reserve_out in 1u128..=u128::MAX,
-            fee_num in 1u64..10000u64,
+            reserve_in in u256_nonzero(),
+            reserve_out in u256_nonzero(),
+            fee_num in 1u64..10_000u64,
         ) {
             let out = get_amount_out(
                 U256::ZERO,
-                U256::from(reserve_in),
-                U256::from(reserve_out),
+                reserve_in,
+                reserve_out,
                 U256::from(fee_num),
-                U256::from(10000u64),
+                U256::from(10_000u64),
             );
             prop_assert!(out.is_zero());
         }

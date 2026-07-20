@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
@@ -15,10 +15,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(12), Constraint::Length(8)])
-        .split(area);
+    let [table_area, note_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(8)]).areas(area);
 
     let rows = snapshot
         .config
@@ -37,7 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Row::new(vec![Cell::from("key"), Cell::from("value")]).style(theme::table_header()),
             )
             .block(theme::table_block("Config")),
-        chunks[0],
+        table_area,
     );
 
     let help = vec![
@@ -47,6 +45,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
     frame.render_widget(
         Paragraph::new(help).block(theme::panel_block("Controls")),
-        chunks[1],
+        note_area,
     );
 }

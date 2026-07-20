@@ -328,7 +328,10 @@ impl RpcPool {
             return Ok(provider.clone());
         }
         let endpoint = rpc_host_label(url);
+        // Read-only: skip RecommendedFillers (gas/nonce/chain-id) — eth_call only.
+        // https://alloy.rs/guides/fillers/
         let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
             .connect_reqwest(
                 self.http.clone(),
                 url.parse()
@@ -416,6 +419,7 @@ impl RpcPool {
         }
         let wallet = EthereumWallet::from(signer.clone());
         let endpoint = rpc_host_label(&url);
+        // Submit path: RecommendedFillers fill missing chain_id / from; caller sets nonce+fees.
         let provider = ProviderBuilder::new()
             .wallet(wallet)
             .connect_reqwest(

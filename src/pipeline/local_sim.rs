@@ -696,6 +696,11 @@ pub fn sync_edge_fee_bps_from_state(edge: &mut Edge, state: &PoolState) {
                 edge.fee_bps = bps;
             }
         }
+        PoolState::Balancer(b) => {
+            if let Some(bps) = crate::core::math::balancer::balancer_fee_bps_from_pool(b.fee) {
+                edge.fee_bps = bps;
+            }
+        }
         _ => {}
     }
 }
@@ -838,11 +843,12 @@ pub fn minimal_sim_failure(
                 return Some(MinimalSimFailure::ShallowCl { hop });
             }
             if let (PoolState::Balancer(s), ProtocolType::BalancerV2) = (state, edge.protocol) {
-                let bal = s
-                    .balances
-                    .get(edge.token_in_idx as usize)
-                    .copied()
-                    .unwrap_or(U256::ZERO);
+                // Vault address lookup — same as `balancer_batch_within_max_in_ratio`.
+                let bal = crate::core::math::balancer::balancer_balance_in(
+                    s,
+                    edge.token_in_idx as usize,
+                    arena.token_address(edge.token_in),
+                );
                 if crate::core::math::balancer::exceeds_balancer_max_in_ratio(current, bal) {
                     return Some(MinimalSimFailure::BalancerMaxInRatio { hop });
                 }

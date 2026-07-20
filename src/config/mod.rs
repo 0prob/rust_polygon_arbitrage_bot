@@ -130,7 +130,7 @@ pub struct PipelineConfig {
     pub graph_rebuild_interval: u64,
     #[serde(default = "default_cycle_refind_interval")]
     pub cycle_refind_interval: u64,
-    #[serde(default)]
+    #[serde(default = "default_pool_meta_cache_path")]
     pub pool_meta_cache_path: String,
     #[serde(default)]
     pub stream_enabled: bool,
@@ -306,6 +306,9 @@ fn default_graph_rebuild_interval() -> u64 {
 fn default_cycle_refind_interval() -> u64 {
     crate::pipeline::graph_cache::default_cycle_refind_interval()
 }
+fn default_pool_meta_cache_path() -> String {
+    ".rpbot-pool-meta.json".to_string()
+}
 fn default_stream_max_pools() -> usize {
     // Fewer high-quality venues beat 500 dust shells that never emit Sync/Swap.
     200
@@ -392,7 +395,7 @@ impl Default for PipelineConfig {
             hf_max_dispatch: default_hf_max_dispatch(),
             graph_rebuild_interval: default_graph_rebuild_interval(),
             cycle_refind_interval: default_cycle_refind_interval(),
-            pool_meta_cache_path: ".rpbot-pool-meta.json".to_string(),
+            pool_meta_cache_path: default_pool_meta_cache_path(),
             stream_enabled: false,
             stream_max_pools: default_stream_max_pools(),
             indexer_max_lag_blocks: default_indexer_max_lag_blocks(),
@@ -557,9 +560,12 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("execution_rpc") => "rpc.execution_rpc_url",
         k if k.eq_ignore_ascii_case("execution_rpc_url") => "rpc.execution_rpc_url",
         k if k.eq_ignore_ascii_case("executor_address") => "execution.executor_address",
+        k if k.eq_ignore_ascii_case("private_key") => "execution.private_key",
         k if k.eq_ignore_ascii_case("hyper_sync_url") => "rpc.hyper_sync_url",
         k if k.eq_ignore_ascii_case("wss_url") => "rpc.wss_url",
-        // POLYGON_RPC_URLS / POLYGON_WSS_URLS are comma-split in apply_conditional_env_overrides.
+        k if k.eq_ignore_ascii_case("polygon_wss_url") => "rpc.wss_url",
+        // POLYGON_*_URLS / POLYGON_RPC_URL: CSV → Vec. *_MATIC_WEI: keep as String
+        // (Env parse-value would coerce to int and break U256-sized strings).
         k if k.eq_ignore_ascii_case("private_rpc_url") => "rpc.private_rpc_url",
         k if k.eq_ignore_ascii_case("state_rpc_url") => "rpc.state_rpc_url",
         _ => return None,
@@ -586,22 +592,11 @@ fn split_rpc_urls(raw: &str) -> Vec<String> {
     urls
 }
 
-/// Env overrides that need comma-split lists or aliases not covered by figment paths.
-fn apply_conditional_env_overrides(config: &mut AppConfig) -> anyhow::Result<()> {
-    if let Some(url) = env_var("POLYGON_WSS_URL") {
-        config.rpc.wss_url = Some(url);
-    }
+/// Env overrides Figment cannot express cleanly: CSV → Vec, and wei strings that
+/// Env `parse-value` would coerce to integers (breaking U256-sized decimal strings).
+fn apply_conditional_env_overrides(config: &mut AppConfig) {
     if let Some(urls) = env_var("POLYGON_WSS_URLS") {
         config.rpc.polygon_wss_urls = split_rpc_urls(&urls);
-    }
-    if let Some(url) = env_var("EXECUTION_RPC_URL").or_else(|| env_var("EXECUTION_RPC")) {
-        config.rpc.execution_rpc_url = url;
-    }
-    if let Some(addr) = env_var("EXECUTOR_ADDRESS") {
-        config.execution.executor_address = Some(addr.parse()?);
-    }
-    if let Some(key) = env_var("PRIVATE_KEY") {
-        config.execution.private_key = Some(key);
     }
     if let Some(wei) = env_var("MIN_PROFIT_MATIC_WEI") {
         config.execution.min_profit_matic_wei = wei;
@@ -617,7 +612,6 @@ fn apply_conditional_env_overrides(config: &mut AppConfig) -> anyhow::Result<()>
     } else if let Some(url) = env_var("POLYGON_RPC_URL") {
         config.rpc.polygon_rpc_urls = vec![url];
     }
-    Ok(())
 }
 
 impl AppConfig {
@@ -630,20 +624,10 @@ impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
         load_dotenv();
 
-        let figment = Self::figment();
-        // Prefer strict extract; fall back to lossy with a warn so bad env types aren't silent.
-        let mut config: AppConfig = match figment.extract() {
-            Ok(c) => c,
-            Err(strict_err) => {
-                crate::warn!(
-                    "config: strict extract failed ({strict_err}); retrying with lossy coercion"
-                );
-                figment
-                    .extract_lossy()
-                    .map_err(|e| anyhow::anyhow!("config: {e}"))?
-            }
-        };
-        apply_conditional_env_overrides(&mut config)?;
+        // extract_lossy: Env already coerces numbers/bools; lossy also accepts "yes"/"1"/"on".
+        // Matches Figment Application Authors guidance and our Jail tests.
+        let mut config: AppConfig = Self::figment().extract_lossy().context("config")?;
+        apply_conditional_env_overrides(&mut config);
         config.normalize();
 
         config.min_profit_matic = config
@@ -1092,8 +1076,7 @@ mod tests {
                 "https://env-a.example,https://env-b.example",
             );
             let mut config: AppConfig = AppConfig::figment().extract_lossy()?;
-            apply_conditional_env_overrides(&mut config)
-                .expect("conditional env overrides should succeed");
+            apply_conditional_env_overrides(&mut config);
             config.normalize();
             assert_eq!(
                 config.state_read_urls(),
@@ -1113,8 +1096,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("POLYGON_WSS_URLS", "wss://a.example,wss://b.example");
             let mut config: AppConfig = AppConfig::figment().extract_lossy()?;
-            apply_conditional_env_overrides(&mut config)
-                .expect("conditional env overrides should succeed");
+            apply_conditional_env_overrides(&mut config);
             assert_eq!(
                 config.rpc.polygon_wss_urls,
                 vec!["wss://a.example".to_string(), "wss://b.example".to_string()]

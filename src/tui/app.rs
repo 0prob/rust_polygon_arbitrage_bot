@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
-use rustc_hash::FxHasher;
+use rustc_hash::FxBuildHasher;
 
 use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
@@ -203,13 +203,13 @@ pub struct HfPipelineRow {
 }
 
 impl HfPipelineRow {
-    fn from_hf_candidate(row: HfCandidateUiRow) -> Self {
+    fn from_hf_candidate(row: &HfCandidateUiRow) -> Self {
         // Net is already in MATIC wei from assess_profit.
         let net_matic = crate::util::u256_to_f64(row.net_profit_matic_wei) / 1e18;
         Self {
             fingerprint: row.fingerprint,
             hops: row.hops,
-            route: row.route,
+            route: row.route.clone(),
             amount_in: row.amount_in.to_string(),
             amount_out: row.amount_out.to_string(),
             gross_profit: row.gross_profit.to_string(),
@@ -217,7 +217,7 @@ impl HfPipelineRow {
             gas: row.gas,
             flash: row.flash.label().to_string(),
             should_execute: row.should_execute,
-            reject_reason: row.reject_reason,
+            reject_reason: row.reject_reason.clone(),
             slip_bps: row.slip_bps,
             near_miss: row.near_miss,
             outcome: None,
@@ -252,7 +252,8 @@ pub struct DashboardSnapshot {
     pub generation: u64,
     pub captured_at: Instant,
     pub overview: OverviewSnapshot,
-    pub graph: GraphSnapshot,
+    pub graph: Arc<GraphSnapshot>,
+    /// `Arc<Vec<_>>` (not `Arc<[_]>`) so status overlays can `Arc::make_mut`.
     pub opportunities: Arc<Vec<RouteSummary>>,
     pub portfolio: Vec<PortfolioRow>,
     pub diagnostics: Vec<KeyValueRow>,
@@ -462,10 +463,8 @@ impl App {
     }
 
     fn route_view_cache_key(&self) -> RouteViewKey {
-        let mut hasher = FxHasher::default();
-        self.search_lower.hash(&mut hasher);
         RouteViewKey {
-            search_hash: hasher.finish(),
+            search_hash: FxBuildHasher.hash_one(&self.search_lower),
             sort_mode: self.sort_mode,
             opportunities: self
                 .snapshot
@@ -754,7 +753,7 @@ impl App {
         cycles_considered: usize,
         profitable_count: usize,
         elapsed_ms: u64,
-        candidates: std::sync::Arc<Vec<HfCandidateUiRow>>,
+        candidates: std::sync::Arc<[HfCandidateUiRow]>,
     ) {
         self.last_cycles_considered = cycles_considered;
         self.last_profitable_count = profitable_count;
@@ -771,7 +770,6 @@ impl App {
             .collect();
         self.hf_candidates = candidates
             .iter()
-            .cloned()
             .map(|c| {
                 let mut row = HfPipelineRow::from_hf_candidate(c);
                 if let Some((outcome, sev)) = prior_outcomes.get(&row.fingerprint) {
@@ -907,7 +905,7 @@ mod tests {
                 snapshot_age_ms: 0,
                 rates_age_ms: 0,
             },
-            graph: GraphSnapshot {
+            graph: Arc::new(GraphSnapshot {
                 health: GraphHealth {
                     graph_generation: 0,
                     token_count: 0,
@@ -921,7 +919,7 @@ mod tests {
                 protocol_counts: Vec::new(),
                 hubs: Vec::new(),
                 recent_discoveries: Vec::new(),
-            },
+            }),
             opportunities: Arc::new(opportunities),
             portfolio: Vec::new(),
             diagnostics: Vec::new(),
@@ -934,10 +932,7 @@ mod tests {
         let mut app = App::new();
         app.set_snapshot(Arc::new(test_snapshot(
             1,
-            vec![
-                test_route(1, "WMATIC route"),
-                test_route(2, "USDC route"),
-            ],
+            vec![test_route(1, "WMATIC route"), test_route(2, "USDC route")],
         )));
 
         assert_eq!(app.route_view().expect("view").1.len(), 2);
@@ -967,10 +962,7 @@ mod tests {
     fn same_generation_new_opportunities_arc_rebuilds_route_view() {
         let mut app = App::new();
         let route = test_route(1, "WMATIC");
-        app.set_snapshot(Arc::new(test_snapshot(
-            7,
-            vec![route.clone(), route],
-        )));
+        app.set_snapshot(Arc::new(test_snapshot(7, vec![route.clone(), route])));
         assert_eq!(app.route_view().expect("view").1.len(), 2);
         // Gas-driven republish keeps HF generation but replaces the opportunities Arc.
         app.set_snapshot(Arc::new(test_snapshot(7, Vec::new())));
@@ -1040,7 +1032,7 @@ mod tests {
         );
         assert!(app.chart_profitable.is_empty());
 
-        app.apply_hf_sample(9, 3, 7, Arc::new(Vec::new()));
+        app.apply_hf_sample(9, 3, 7, Arc::from([]));
         assert_eq!(app.last_cycle_count, 17);
         assert_eq!(app.last_cycles_considered, 9);
         assert_eq!(app.last_search_ms, 23);
@@ -1087,7 +1079,7 @@ mod tests {
             4,
             1,
             12,
-            Arc::new(vec![HfCandidateUiRow {
+            Arc::from([HfCandidateUiRow {
                 fingerprint: 0xabc,
                 hops: 2,
                 route: "a->b".into(),

@@ -8,7 +8,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
 use arc_swap::ArcSwapOption;
-use dashmap::DashMap;
+use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -79,7 +79,7 @@ impl RouteGasLookup {
         self.observed.get(&route_fp).copied()
     }
 
-    /// Prefer prefetched observed gas; otherwise scaled heuristic (no DashMap on preload path).
+    /// Prefer prefetched observed gas; otherwise scaled heuristic (no map lock on preload path).
     pub fn route_gas_or_heuristic(&self, oracle: &GasOracle, route_fp: u64, heuristic: u32) -> u32 {
         if let Some(&gas) = self.observed.get(&route_fp) {
             return gas;
@@ -91,15 +91,21 @@ impl RouteGasLookup {
     }
 }
 
+/// Bounded route-fp → observed gas with FIFO eviction (≤[`ROUTE_GAS_HISTORY`]).
+/// One mutex — 256 entries do not need DashMap sharding (docs warn on `iter`/`len`).
+#[derive(Debug)]
+struct RouteGasHistory {
+    map: FxHashMap<u64, u32>,
+    order: VecDeque<u64>,
+}
+
 #[derive(Debug)]
 pub struct GasOracle {
     snapshot: ArcSwapOption<FeeSnapshot>,
     /// Millis from [`crate::util::now_ms`] at last successful [`GasOracle::refresh_once`].
     snapshot_updated_at_ms: AtomicU64,
     poll_interval: Duration,
-    route_gas: DashMap<u64, u32, FxBuildHasher>,
-    /// FIFO eviction order — avoids `iter`/`len` on DashMap (deadlock-prone per docs).
-    route_gas_order: parking_lot::Mutex<VecDeque<u64>>,
+    route_gas: Mutex<RouteGasHistory>,
     /// Latest observed/simulated ratio in bps (10_000 = 1.0×) for heuristic uplift.
     sim_scale_bps: AtomicU32,
 }
@@ -117,14 +123,16 @@ impl GasOracle {
             snapshot: ArcSwapOption::empty(),
             snapshot_updated_at_ms: AtomicU64::new(0),
             poll_interval,
-            route_gas: DashMap::with_capacity_and_hasher(ROUTE_GAS_HISTORY, FxBuildHasher),
-            route_gas_order: parking_lot::Mutex::new(VecDeque::with_capacity(ROUTE_GAS_HISTORY)),
+            route_gas: Mutex::new(RouteGasHistory {
+                map: FxHashMap::with_capacity_and_hasher(ROUTE_GAS_HISTORY, FxBuildHasher),
+                order: VecDeque::with_capacity(ROUTE_GAS_HISTORY),
+            }),
             sim_scale_bps: AtomicU32::new(10_000),
         }
     }
 
     pub fn observed_route_gas(&self, route_fp: u64) -> Option<u32> {
-        self.route_gas.get(&route_fp).map(|entry| *entry)
+        self.route_gas.lock().map.get(&route_fp).copied()
     }
 
     /// Prefer dry-run / on-chain gas for this route fingerprint, else scaled heuristic.
@@ -146,24 +154,24 @@ impl GasOracle {
         if gas == 0 {
             return;
         }
-        if let Some(mut entry) = self.route_gas.get_mut(&route_fp) {
+        let mut hist = self.route_gas.lock();
+        if let Some(entry) = hist.map.get_mut(&route_fp) {
             *entry = gas;
             return;
         }
-        let mut order = self.route_gas_order.lock();
-        while order.len() >= ROUTE_GAS_HISTORY {
-            let Some(old) = order.pop_front() else {
+        while hist.order.len() >= ROUTE_GAS_HISTORY {
+            let Some(old) = hist.order.pop_front() else {
                 break;
             };
-            self.route_gas.remove(&old);
+            hist.map.remove(&old);
         }
-        self.route_gas.insert(route_fp, gas);
-        order.push_back(route_fp);
+        hist.map.insert(route_fp, gas);
+        hist.order.push_back(route_fp);
     }
 
     #[cfg(test)]
     fn route_gas_tracked(&self) -> usize {
-        self.route_gas_order.lock().len()
+        self.route_gas.lock().order.len()
     }
 
     /// Calibrate heuristic gas from estimate_gas / dry-run observations.
@@ -197,10 +205,12 @@ impl GasOracle {
     /// Conservative gas price only when the fee snapshot is fresh enough for live submit.
     #[must_use]
     pub fn conservative_gas_price_for_live_submit(&self) -> Option<U256> {
-        if !self.fees_ready_for_live_submit() {
-            return None;
-        }
-        self.conservative_gas_price()
+        // One ArcSwap load — age check is a separate atomic, not a second snapshot read.
+        let fees = self.loaded_snapshot()?;
+        let age_ok = self
+            .snapshot_age_ms()
+            .is_some_and(|age| age <= self.live_snapshot_max_age_ms());
+        age_ok.then(|| compute_conservative_gas_price(fees))
     }
 
     #[must_use]
@@ -239,8 +249,7 @@ impl GasOracle {
             provider.get_max_priority_fee_per_gas(),
         );
 
-        let block = block_res?
-            .ok_or_else(|| anyhow::anyhow!("latest block unavailable"))?;
+        let block = block_res?.ok_or_else(|| anyhow::anyhow!("latest block unavailable"))?;
 
         let base_fee = block
             .header
@@ -248,13 +257,12 @@ impl GasOracle {
             .map(U256::from)
             .ok_or_else(|| anyhow::anyhow!("block header missing base_fee_per_gas"))?;
 
+        // Single load for tip fallback + change detection (consistent snapshot pattern).
+        let previous = self.loaded_snapshot();
         let (mut priority_fee, mut priority_fee_source) = match tip_res {
             Ok(v) => (U256::from(v), "rpc"),
             Err(_e) => (
-                self.snapshot
-                    .load()
-                    .as_deref()
-                    .map_or(U256::ZERO, |snap| snap.priority_fee),
+                previous.map_or(U256::ZERO, |snap| snap.priority_fee),
                 "previous_snapshot",
             ),
         };
@@ -269,7 +277,6 @@ impl GasOracle {
             base_fee,
             priority_fee,
         };
-        let previous = self.loaded_snapshot();
         let is_initial_snapshot = previous.is_none();
         self.snapshot.store(Some(Arc::new(snapshot)));
         // ponytail: stale tip must not refresh the live-submit age clock.
@@ -456,14 +463,11 @@ mod tests {
         }
         assert_eq!(oracle.route_gas_tracked(), ROUTE_GAS_HISTORY);
         oracle.record_route_gas(0, 9_999);
-        assert_eq!(oracle.route_gas.get(&0).map(|v| *v), Some(9_999));
+        assert_eq!(oracle.observed_route_gas(0), Some(9_999));
         oracle.record_route_gas(ROUTE_GAS_HISTORY as u64, 42);
         assert!(oracle.route_gas_tracked() <= ROUTE_GAS_HISTORY);
         assert_eq!(
-            oracle
-                .route_gas
-                .get(&(ROUTE_GAS_HISTORY as u64))
-                .map(|v| *v),
+            oracle.observed_route_gas(ROUTE_GAS_HISTORY as u64),
             Some(42)
         );
     }
@@ -516,9 +520,7 @@ mod tests {
             priority_fee: MIN_PRIORITY_FEE_PER_GAS,
         });
         let aged = crate::util::now_ms().saturating_sub(60_000);
-        oracle
-            .snapshot_updated_at_ms
-            .store(aged, Ordering::Relaxed);
+        oracle.snapshot_updated_at_ms.store(aged, Ordering::Relaxed);
         assert!(!oracle.fees_ready_for_live_submit());
 
         // Simulate refresh_once path that keeps previous tip (RPC tip miss).

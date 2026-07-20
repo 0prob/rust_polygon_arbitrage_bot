@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use anyhow::Context;
 use parking_lot::Mutex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -209,10 +209,8 @@ fn merge_dirty_pool_indices(mut base: Vec<PoolIndex>, extra: Vec<PoolIndex>) -> 
         return extra;
     }
     // O(n+m) vs Vec::contains O(n*m) when both sides are large.
-    let mut seen: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::with_capacity_and_hasher(
-        base.len() + extra.len(),
-        Default::default(),
-    );
+    let mut seen: FxHashSet<u32> =
+        FxHashSet::with_capacity_and_hasher(base.len() + extra.len(), FxBuildHasher);
     for idx in &base {
         seen.insert(idx.0);
     }
@@ -614,9 +612,9 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
 
 async fn run_lf_cpu_async(work: LfCpuWork) -> anyhow::Result<LfCpuResult> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // spawn alone binds pool TLS for nested par_iter/join (no nested install).
     crate::util::lf_cpu_pool().spawn(move || {
-        let result = crate::util::run_lf_cpu(|| run_lf_cpu_work(work));
-        let _ = tx.send(result);
+        let _ = tx.send(run_lf_cpu_work(work));
     });
     rx.await.context("lf cpu worker dropped")
 }
@@ -632,7 +630,7 @@ pub struct LfContext {
     pub gas_oracle: Arc<GasOracle>,
     pub rpc: Arc<RpcPool>,
     pub graph_cache: Arc<Mutex<GraphCache>>,
-    pub arena: Arc<parking_lot::Mutex<StateArena>>,
+    pub arena: Arc<Mutex<StateArena>>,
     pub tick_lock: Arc<AsyncMutex<()>>,
     pub ui_hook: SharedUiHook,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
@@ -1053,9 +1051,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         .await
     };
     // Fail-closed: drop non-refreshed priors when the previous snapshot aged past oracle TTL.
-    let retain_stale_prior = ctx.snapshots.read().rates_built_at.is_some_and(|t| {
-        t.elapsed() <= Duration::from_millis(ctx.config.oracle.cache_ttl_ms)
-    });
+    let retain_stale_prior = ctx
+        .snapshots
+        .read()
+        .rates_built_at
+        .is_some_and(|t| t.elapsed() <= Duration::from_millis(ctx.config.oracle.cache_ttl_ms));
     let mut rates = merge_token_rates(
         &prior_rates,
         &cycle_tokens_set,
@@ -1341,9 +1341,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             Vec::new()
         };
         let cap = ctx.config.pipeline.stream_max_pools;
-        let centrality_key = arena
-            .routing_layout_fingerprint()
-            ^ ctx.cache.generation().rotate_left(17);
+        let centrality_key =
+            arena.routing_layout_fingerprint() ^ ctx.cache.generation().rotate_left(17);
         let mut targets = select_stream_targets_with_epoch(
             &pools,
             &hot,
@@ -1361,11 +1360,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         // so the next Sync/Swap sets wake_hf=true (interest path).
         if !observed.is_empty() {
             let addr_to_pool = arena.address_to_pool();
+            let mut seen: rustc_hash::FxHashSet<Address> = targets.iter().copied().collect();
             for addr in &observed {
                 if targets.len() >= cap {
                     break;
                 }
-                if addr_to_pool.contains_key(addr) && !targets.contains(addr) {
+                if addr_to_pool.contains_key(addr) && seen.insert(*addr) {
                     targets.push(*addr);
                 }
             }

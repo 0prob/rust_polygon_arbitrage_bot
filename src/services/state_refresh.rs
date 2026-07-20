@@ -9,6 +9,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::BlockId;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::config::AppConfig;
@@ -16,9 +17,7 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::{
-    fetch_missing_pool_states, fetch_missing_pool_states_indexed,
-};
+use crate::pipeline::fetcher::{fetch_missing_pool_states, fetch_missing_pool_states_indexed};
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -90,7 +89,7 @@ pub struct StateRefreshService {
     cache: Arc<StateCache>,
     rpc: Arc<RpcPool>,
     pool_meta_cache: Arc<PoolMetaCache>,
-    discovery_state: parking_lot::RwLock<DiscoveryState>,
+    discovery_state: RwLock<DiscoveryState>,
     discovery_count: AtomicU64,
     token_metadata_loaded: AtomicBool,
     discovery_skipped_ticks: AtomicU64,
@@ -99,7 +98,7 @@ pub struct StateRefreshService {
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
     last_state_block: AtomicU64,
-    last_state_hash: parking_lot::RwLock<Option<B256>>,
+    last_state_hash: RwLock<Option<B256>>,
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
     fetch_never_scan_offset: AtomicUsize,
@@ -115,7 +114,7 @@ impl StateRefreshService {
         rpc: Arc<RpcPool>,
     ) -> anyhow::Result<Self> {
         let pg = PgClient::new(config.pg_url.clone())
-            .with_context(|| "failed to connect to PostgreSQL")?;
+            .context("failed to connect to PostgreSQL")?;
         let pool_meta_cache = Arc::new(PoolMetaCache::new(PathBuf::from(
             &config.pipeline.pool_meta_cache_path,
         )));
@@ -125,7 +124,7 @@ impl StateRefreshService {
             cache,
             rpc,
             pool_meta_cache,
-            discovery_state: parking_lot::RwLock::new(DiscoveryState::default()),
+            discovery_state: RwLock::new(DiscoveryState::default()),
             discovery_count: AtomicU64::new(0),
             token_metadata_loaded: AtomicBool::new(false),
             discovery_skipped_ticks: AtomicU64::new(0),
@@ -134,7 +133,7 @@ impl StateRefreshService {
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
             last_state_block: AtomicU64::new(0),
-            last_state_hash: parking_lot::RwLock::new(None),
+            last_state_hash: RwLock::new(None),
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
             fetch_never_scan_offset: AtomicUsize::new(0),
@@ -371,8 +370,7 @@ impl StateRefreshService {
         let tick_started = now_ms();
         let pg_started = now_ms();
         // Empty discovery + notify: re-keyset so pools with historical createdBlock land.
-        let force_bootstrap =
-            is_bootstrap || (notify_pending && self.discovered_pool_count() == 0);
+        let force_bootstrap = is_bootstrap || (notify_pending && self.discovered_pool_count() == 0);
         let mut result = if force_bootstrap {
             crate::info!("starting postgres pool bootstrap");
             match self.discover_bootstrap().await {
@@ -545,11 +543,7 @@ impl StateRefreshService {
         }
         log_index_parse_stats(&parse_stats);
         log_index_summary();
-        let max_from_pools = all_pools
-            .iter()
-            .map(|p| p.created_block)
-            .max()
-            .unwrap_or(0);
+        let max_from_pools = all_pools.iter().map(|p| p.created_block).max().unwrap_or(0);
         let max_block = bootstrap_cursor_block(keyset.created_block, max_from_pools);
         crate::info!(
             "pg bootstrap loaded {} pools (max_block={max_block})",
@@ -1079,9 +1073,7 @@ fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
 /// (still bootstrapping) clears even when PoolMeta is empty.
 #[must_use]
 fn bootstrap_cursor_block(keyset_created: i32, pool_created_max: u64) -> u64 {
-    (keyset_created.max(0) as u64)
-        .max(pool_created_max)
-        .max(1)
+    (keyset_created.max(0) as u64).max(pool_created_max).max(1)
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use anyhow::Context;
 
 use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 use crate::services::oracle::price_oracle::PriceOracle;
@@ -32,7 +33,7 @@ pub fn parse_proposed_pyth_feed_lines(text: &str) -> anyhow::Result<Vec<Proposed
         let token: Address = token_str
             .trim()
             .parse()
-            .map_err(|e| anyhow::anyhow!("line {}: bad token address: {e}", line_no + 1))?;
+            .with_context(|| format!("line {}: bad token address", line_no + 1))?;
         let feed_id = feed_id.trim().to_string();
         if feed_id.is_empty() {
             anyhow::bail!("line {}: empty feed id", line_no + 1);

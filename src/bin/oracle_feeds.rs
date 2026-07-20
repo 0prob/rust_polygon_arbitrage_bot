@@ -24,7 +24,9 @@ fn cli_stderr(s: &str) {
 
 use alloy::primitives::Address;
 use anyhow::Context;
+use reqwest::Client;
 use rpbot::config::AppConfig;
+use rpbot::infra::http::{HttpClientOpts, build};
 use rpbot::infra::pg::PgClient;
 use rpbot::services::oracle::CURATED_POLYGON_TOKEN_HINTS;
 use rpbot::services::oracle::price_oracle::PriceOracle;
@@ -51,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
     let include_non_usd = args.iter().any(|a| a == "--include-non-usd");
 
     let config = AppConfig::load()?;
-    let oracle = build_oracle(&config);
+    let http = build_http();
+    let oracle = build_oracle(&config, http.clone());
     register_configured_feeds(&oracle, &config.oracle);
 
     match cmd {
@@ -71,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
             run_propose(
                 &config,
                 &oracle,
+                &http,
                 top,
                 out_path.as_deref(),
                 verify,
@@ -108,11 +112,16 @@ fn print_usage() {
     }
 }
 
-fn build_oracle(config: &AppConfig) -> PriceOracle {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("http client");
+fn build_http() -> Client {
+    build(HttpClientOpts {
+        timeout: std::time::Duration::from_secs(15),
+        pool_max_idle_per_host: 4,
+        max_redirects: 5,
+    })
+    .expect("http client")
+}
+
+fn build_oracle(config: &AppConfig, http: Client) -> PriceOracle {
     PriceOracle::new(
         http,
         config.oracle.pyth_hermes_url.clone(),
@@ -205,16 +214,16 @@ async fn run_audit(
 async fn run_propose(
     config: &AppConfig,
     oracle: &PriceOracle,
+    http: &Client,
     top: usize,
     out: Option<&std::path::Path>,
     verify: bool,
     curated_only: bool,
     include_non_usd: bool,
 ) -> anyhow::Result<()> {
-    let http = reqwest::Client::new();
     let proposals = if curated_only {
         propose_curated_unmapped_pyth_feeds(
-            &http,
+            http,
             &config.oracle.pyth_hermes_url,
             oracle,
             include_non_usd,
@@ -226,7 +235,7 @@ async fn run_propose(
         let report = build_audit_report(oracle, &freq, &runtime);
         let rows: Vec<_> = report.rows.into_iter().take(top).collect();
         propose_pyth_feed_lines(
-            &http,
+            http,
             &config.oracle.pyth_hermes_url,
             &rows,
             include_non_usd,

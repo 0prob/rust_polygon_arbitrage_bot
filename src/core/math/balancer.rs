@@ -21,6 +21,32 @@ pub fn exceeds_balancer_max_in_ratio(amount_in: U256, balance_in: U256) -> bool 
             .checked_mul(MAX_IN_RATIO)
             .is_none_or(|limit| amount_in > limit / ONE)
 }
+
+/// Prefer vault token address for the in-leg balance (edge idxs can lag `getPoolTokens`).
+#[inline]
+#[must_use]
+pub fn balancer_balance_in(
+    state: &BalancerPoolState,
+    token_in_idx: usize,
+    token_in: Option<alloy::primitives::Address>,
+) -> U256 {
+    let idx = token_in
+        .and_then(|addr| state.tokens.iter().position(|&t| t == addr))
+        .unwrap_or(token_in_idx);
+    state.balances.get(idx).copied().unwrap_or(U256::ZERO)
+}
+
+/// Convert live `getSwapFeePercentage` (1e18) to edge `fee_bps`.
+#[must_use]
+pub fn balancer_fee_bps_from_pool(fee: U256) -> Option<u32> {
+    if fee.is_zero() || fee >= ONE {
+        return None;
+    }
+    // fee * 10_000 / 1e18
+    let bps = (fee * U256::from(10_000u64)) / ONE;
+    Some(bps.min(U256::from(9_999u64)).to::<u32>())
+}
+
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 255;
 
@@ -447,10 +473,52 @@ pub fn simulate_balancer_swap(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::types::BalancerLinearState;
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::core::types::BalancerLinearState;
+        use alloy::primitives::Address;
+
+        #[test]
+        fn balancer_fee_bps_from_1e18() {
+            // 0.04% = 4 bps → 4e14
+            assert_eq!(
+                balancer_fee_bps_from_pool(U256::from(400_000_000_000_000u64)),
+                Some(4)
+            );
+            assert_eq!(balancer_fee_bps_from_pool(U256::ZERO), None);
+            assert_eq!(balancer_fee_bps_from_pool(ONE), None);
+        }
+
+        #[test]
+        fn balancer_balance_in_prefers_vault_address() {
+            let t0 = Address::from([1u8; 20]);
+            let t1 = Address::from([2u8; 20]);
+            let state = BalancerPoolState {
+                pool_id: None,
+                tokens: vec![t0, t1],
+                balances: vec![U256::from(100u64), U256::from(999_999u64)],
+                weights: vec![ONE / U256::from(2u64); 2],
+                scaling_factors: vec![ONE; 2],
+                amp: U256::ZERO,
+                amp_precision: U256::ZERO,
+                fee: U256::from(400_000_000_000_000u64),
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            };
+            // Stale idx 0 but token_in is t1 → use vault order.
+            assert_eq!(
+                balancer_balance_in(&state, 0, Some(t1)),
+                U256::from(999_999u64)
+            );
+            assert_eq!(
+                balancer_balance_in(&state, 0, None),
+                U256::from(100u64)
+            );
+        }
 
     fn linear_state(main_balance: U256, fee: U256, rate: U256) -> BalancerPoolState {
         BalancerPoolState {
@@ -602,33 +670,21 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
     use crate::core::math::fixed_point::{MAX_POW_RELATIVE_ERROR, mul_up};
+    use crate::core::math::proptest_util::{U256_AMT_MAX, u256_fp18, u256_nonzero};
     use proptest::prelude::*;
-
-    fn u128_nonzero() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX).prop_map(U256::from)
-    }
-
-    fn weight() -> impl Strategy<Value = U256> {
-        (1u128..=1_000_000_000_000_000_000u128).prop_map(U256::from)
-    }
 
     proptest! {
         #[test]
         fn weighted_output_bounded(
-            amount_in in u128_nonzero(),
-            bal_in in u128_nonzero(),
-            bal_out in u128_nonzero(),
-            w_in in weight(),
-            w_out in weight(),
+            amount_in in u256_nonzero(),
+            bal_in in u256_nonzero(),
+            bal_out in u256_nonzero(),
+            w_in in u256_fp18(),
+            w_out in u256_fp18(),
         ) {
-            let w_in = w_in % ONE;
-            let w_out = w_out % ONE;
-            if w_in.is_zero() || w_out.is_zero() { return Ok(()); }
-
             let state = BalancerPoolState {
                 pool_id: None,
                 tokens: vec![],
@@ -645,30 +701,32 @@ mod proptests {
                 last_change_block: 0,
             };
             let out = get_balancer_weighted_amount_out(&state, amount_in, 0, 1);
+            // Safety property: when a quote exists it must not exceed the out-balance.
             if !out.is_zero() {
-                prop_assert!(out <= state.balances[1],
-                    "weighted out={} exceeds balance={}", out, state.balances[1]);
+                prop_assert!(
+                    out <= state.balances[1],
+                    "weighted out={out} exceeds balance={}",
+                    state.balances[1]
+                );
             }
         }
 
         #[test]
-        fn pow_down_identity(
-            x in (1u128..=u128::MAX).prop_map(U256::from),
-        ) {
-            let x = x % ONE;
-            if x.is_zero() { return Ok(()); }
+        fn pow_down_identity(x in u256_fp18()) {
             let result = pow_down(x, ONE);
             let max_error = mul_up(result, MAX_POW_RELATIVE_ERROR) + U256::from(1);
             let diff = if x > result { x - result } else { result - x };
-            prop_assert!(diff <= max_error,
-                "pow_down(x, 1) should be ≈ x: x={}, got={}", x, result);
+            prop_assert!(
+                diff <= max_error,
+                "pow_down(x, 1) should be ≈ x: x={x}, got={result}"
+            );
         }
 
         #[test]
         fn stable_invariant_sane(
             amp in (1u64..100_000u64).prop_map(U256::from),
-            bal0 in (1000u128..=u128::MAX).prop_map(U256::from),
-            bal1 in (1000u128..=u128::MAX).prop_map(U256::from),
+            bal0 in (1000u128..=U256_AMT_MAX).prop_map(U256::from),
+            bal1 in (1000u128..=U256_AMT_MAX).prop_map(U256::from),
         ) {
             let balances = vec![bal0, bal1, U256::from(100) * ONE];
             let inv = calculate_balancer_stable_invariant(amp, &balances, U256::from(1000));
@@ -677,9 +735,7 @@ mod proptests {
                 // Converged D stays near the balance sum (may exceed sum slightly).
                 prop_assert!(
                     inv <= sum.saturating_mul(U256::from(2)),
-                    "invariant {} exceeds 2*sum {}",
-                    inv,
-                    sum
+                    "invariant {inv} exceeds 2*sum {sum}"
                 );
             }
         }

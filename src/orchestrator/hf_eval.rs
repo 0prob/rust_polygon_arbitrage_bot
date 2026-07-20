@@ -824,12 +824,15 @@ pub fn rank_cycles_by_probe_net(
         }
         if had_net_ranked || near_net_count > 0 {
             crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} minimal_sim={} reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
+                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
                 skip.probe(),
                 skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
                 minimal_sim_reasons.invalid_route,
                 minimal_sim_reasons.missing_pool,
                 minimal_sim_reasons.non_tradable,
@@ -871,12 +874,15 @@ pub fn rank_cycles_by_probe_net(
                 .is_ok()
         {
             crate::info!(
-                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} rescue={rescue_len} sample={sample}",
+                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} rescue={rescue_len} sample={sample}",
                 scanned.len(),
                 skip.rate,
                 skip.flash,
                 skip.probe(),
                 skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
                 minimal_sim_reasons.invalid_route,
                 minimal_sim_reasons.missing_pool,
                 minimal_sim_reasons.non_tradable,
@@ -930,13 +936,16 @@ pub fn rank_cycles_by_probe_net(
                 .is_ok()
         {
             crate::info!(
-                "route probe rank: kept={} scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={}",
+                "route probe rank: kept={} scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={}",
                 kept.len(),
                 scanned.len(),
                 skip.rate,
                 skip.flash,
                 skip.probe(),
                 skip.minimal_sim(),
+                skip.minimal_no_sim,
+                skip.minimal_zero_profit,
+                skip.minimal_sanity,
                 minimal_sim_reasons.invalid_route,
                 minimal_sim_reasons.missing_pool,
                 minimal_sim_reasons.non_tradable,
@@ -1054,59 +1063,58 @@ pub async fn rescore_rank_and_evaluate_async(
     sim_cap: usize,
 ) -> anyhow::Result<(Vec<HfEvalResult>, Arc<StateArena>, usize)> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // spawn alone binds pool TLS for nested par_iter (no nested install).
     crate::util::cpu_pool().spawn(move || {
-        let result = crate::util::run_cpu(|| {
-            let rates = input.token_to_matic_rates.as_ref();
-            let decimals = input.token_decimals.as_ref();
-            let probe_window = probe_rank_window(sim_cap, cycles.len());
-            let mut spot_table =
-                crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
-            if probe_window > 0 {
-                crate::pipeline::spot_price::rescore_arc_cycles_with_table_and_gas(
-                    &input.arena,
-                    &mut spot_table,
-                    &mut cycles[..probe_window],
-                    Some(input.gas_price),
-                    Some(rates),
-                    Some(decimals),
-                    None,
-                );
-                cycles[..probe_window].sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
-            }
-            let route_gas = RouteGasLookup::for_fingerprints(
-                &input.gas_oracle,
-                cycles
-                    .iter()
-                    .take(probe_window)
-                    .map(|c| hash_cycle_edges(&c.as_ref().edges)),
-            );
-            let (cycles, probe_seeds) = rank_cycles_by_probe_net(
+        let rates = input.token_to_matic_rates.as_ref();
+        let decimals = input.token_decimals.as_ref();
+        let probe_window = probe_rank_window(sim_cap, cycles.len());
+        let mut spot_table =
+            crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
+        if probe_window > 0 {
+            crate::pipeline::spot_price::rescore_arc_cycles_with_table_and_gas(
                 &input.arena,
-                cycles,
-                rates,
-                decimals,
-                input.gas_price,
-                input.slippage_bps,
-                input.flash_policy,
-                sim_cap,
-                &input.gas_oracle,
-                &route_gas,
-                input.flash_liquidity.as_ref(),
-                input.safety_multiplier_bps,
-                input.profit_priority_alpha_bps,
+                &mut spot_table,
+                &mut cycles[..probe_window],
+                Some(input.gas_price),
+                Some(rates),
+                Some(decimals),
+                None,
             );
-            if !cycles.is_empty() {
-                crate::debug!("probe rank kept {} cycles for Brent", cycles.len());
-            }
-            let eval = input.as_eval_input(&route_gas);
-            let eval_results = evaluate_cycles_parallel(&cycles, &eval, &probe_seeds);
-            input
-                .execution
-                .route_sim_cache
-                .debug_log_if_active("hf_eval");
-            let probe_kept = cycles.len();
-            (eval_results, Arc::clone(&input.arena), probe_kept)
-        });
+            cycles[..probe_window].sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
+        }
+        let route_gas = RouteGasLookup::for_fingerprints(
+            &input.gas_oracle,
+            cycles
+                .iter()
+                .take(probe_window)
+                .map(|c| hash_cycle_edges(&c.as_ref().edges)),
+        );
+        let (cycles, probe_seeds) = rank_cycles_by_probe_net(
+            &input.arena,
+            cycles,
+            rates,
+            decimals,
+            input.gas_price,
+            input.slippage_bps,
+            input.flash_policy,
+            sim_cap,
+            &input.gas_oracle,
+            &route_gas,
+            input.flash_liquidity.as_ref(),
+            input.safety_multiplier_bps,
+            input.profit_priority_alpha_bps,
+        );
+        if !cycles.is_empty() {
+            crate::debug!("probe rank kept {} cycles for Brent", cycles.len());
+        }
+        let eval = input.as_eval_input(&route_gas);
+        let eval_results = evaluate_cycles_parallel(&cycles, &eval, &probe_seeds);
+        input
+            .execution
+            .route_sim_cache
+            .debug_log_if_active("hf_eval");
+        let probe_kept = cycles.len();
+        let result = (eval_results, Arc::clone(&input.arena), probe_kept);
         if tx.send(result).is_err() {
             crate::debug!("hf eval result channel closed before send");
         }
@@ -1780,5 +1788,4 @@ mod tests {
 
         assert_eq!(aggregate.probe(), 2);
     }
-
 }

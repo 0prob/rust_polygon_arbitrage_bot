@@ -57,7 +57,9 @@ fn matic_rate_from_probe_sim_with_decimals(
         return None;
     }
     let decimals = match token_decimals {
-        Some(hints) => crate::services::oracle::resolve_token_decimals_for_index(token, arena, hints),
+        Some(hints) => {
+            crate::services::oracle::resolve_token_decimals_for_index(token, arena, hints)
+        }
         None => arena.token_decimals(token),
     };
     if decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
@@ -157,9 +159,7 @@ fn build_reverse_hops(
                     let Some(index) = meta_index.as_ref() else {
                         continue;
                     };
-                    let Some(meta) = index
-                        .get(pending.pool_index.0 as usize)
-                        .and_then(|m| *m)
+                    let Some(meta) = index.get(pending.pool_index.0 as usize).and_then(|m| *m)
                     else {
                         continue;
                     };
@@ -230,7 +230,11 @@ fn reverse_bfs_parents(
     parent
 }
 
-fn reconstruct_path(parent: &[Option<RevHop>], from: TokenIndex, wmatic: TokenIndex) -> Option<Vec<Edge>> {
+fn reconstruct_path(
+    parent: &[Option<RevHop>],
+    from: TokenIndex,
+    wmatic: TokenIndex,
+) -> Option<Vec<Edge>> {
     if from == wmatic {
         return Some(Vec::new());
     }

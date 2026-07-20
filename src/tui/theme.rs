@@ -56,8 +56,7 @@ pub fn accent() -> Style {
 
 #[must_use]
 pub fn panel_block(label: &'static str) -> Block<'static> {
-    Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
+    Block::bordered()
         .border_style(muted())
         .style(Style::default().bg(PANEL))
         .title(Line::from(vec![
@@ -98,8 +97,7 @@ pub fn tab_style(active: bool) -> Style {
 
 #[must_use]
 pub fn tab_block() -> Block<'static> {
-    Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
+    Block::bordered()
         .style(Style::default().bg(TAB_BG))
         .border_style(muted())
         .title(Line::from(vec![

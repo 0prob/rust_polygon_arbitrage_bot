@@ -1,8 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
-use smallvec::SmallVec;
+use ratatui::widgets::{Block, Paragraph, Sparkline};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -16,24 +15,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),
-            Constraint::Min(11),
-            Constraint::Length(10),
-        ])
-        .split(area);
+    let [top_section, mid_section, bottom_section] = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Fill(1),
+        Constraint::Length(10),
+    ])
+    .areas(area);
 
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(22),
-            Constraint::Percentage(22),
-            Constraint::Percentage(28),
-            Constraint::Percentage(28),
-        ])
-        .split(sections[0]);
+    let [m0, m1, m2, m3] = Layout::horizontal([
+        Constraint::Percentage(22),
+        Constraint::Percentage(22),
+        Constraint::Percentage(28),
+        Constraint::Percentage(28),
+    ])
+    .areas(top_section);
 
     let pnl_matic = snapshot.overview.daily_pnl_wei as f64 / 1e18;
     let profitable_share = if app.last_cycles_considered > 0 {
@@ -43,7 +38,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     metric_card(
         frame,
-        top[0],
+        m0,
         "Net P&L",
         format!("{pnl_matic:+.4} MATIC"),
         format!("{:.2}% win rate", snapshot.overview.win_rate * 100.0),
@@ -55,7 +50,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     metric_card(
         frame,
-        top[1],
+        m1,
         "Yielding",
         format!(
             "{}/{}",
@@ -66,7 +61,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     metric_card(
         frame,
-        top[2],
+        m2,
         "Freshness",
         format!("search {} ms", snapshot.overview.search_ms),
         format!(
@@ -82,7 +77,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     metric_card(
         frame,
-        top[3],
+        m3,
         "Graph Health",
         format!(
             "{} pools | {} tokens",
@@ -100,19 +95,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     );
 
-    let lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(sections[1]);
-    recent_activity(frame, lower[0], app);
-    spark_panel(frame, lower[1], app, snapshot);
+    let [activity_area, spark_area] =
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .areas(mid_section);
+    recent_activity(frame, activity_area, app);
+    spark_panel(frame, spark_area, app, snapshot);
 
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(sections[2]);
-    risk_panel(frame, bottom[0], snapshot);
-    history_panel(frame, bottom[1], app);
+    let [risk_area, history_area] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .areas(bottom_section);
+    risk_panel(frame, risk_area, snapshot);
+    history_panel(frame, history_area, app);
 }
 
 fn metric_card(
@@ -123,28 +116,26 @@ fn metric_card(
     secondary: String,
     accent: ratatui::style::Style,
 ) {
-    let block = Block::default()
+    let block = Block::bordered()
         .title(Line::from(vec![
             Span::styled(" ", theme::muted()),
             Span::styled(title, theme::title()),
         ]))
-        .borders(Borders::ALL)
         .border_style(theme::muted())
         .style(ratatui::style::Style::default().bg(theme::PANEL));
-    let text: SmallVec<[Line; 2]> = SmallVec::from_buf([
+    // Fixed 2-line KPI — plain vec; SmallVec buys nothing here.
+    let text = vec![
         Line::from(Span::styled(primary, accent)),
         Line::from(Span::styled(secondary, theme::muted())),
-    ]);
-    frame.render_widget(Paragraph::new(text.as_slice()).block(block), area);
+    ];
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn recent_activity(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Activity", theme::title()),
-        ]));
+    let block = Block::bordered().title(Line::from(vec![
+        Span::styled(" ", theme::muted()),
+        Span::styled("Activity", theme::title()),
+    ]));
     let max_lines = layout::inner_lines(&block, area);
     let items: Vec<Line> = app
         .activity
@@ -168,31 +159,29 @@ fn spark_panel(
     app: &App,
     snapshot: &crate::tui::app::DashboardSnapshot,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(area);
+    let [s0, s1, s2] = Layout::vertical([
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+    ])
+    .areas(area);
     sparkline(
         frame,
-        chunks[0],
+        s0,
         "Search latency",
         &app.chart_search_ms,
         theme::warn(),
     );
     sparkline(
         frame,
-        chunks[1],
+        s1,
         "Cycles found",
         &app.chart_cycles,
         theme::accent(),
     );
     sparkline(
         frame,
-        chunks[2],
+        s2,
         "Profitable routes",
         &app.chart_profitable,
         theme::good(),
@@ -208,19 +197,20 @@ fn sparkline(
     style: ratatui::style::Style,
 ) {
     let max = data.iter().copied().max().unwrap_or(1);
-    let values: SmallVec<[u64; 120]> = data.iter().copied().collect();
+    // Chart series is already a VecDeque (cap 120); copying to Vec beats a 960-byte
+    // inline SmallVec that mostly just mirrors heap storage.
+    let values: Vec<u64> = data.iter().copied().collect();
     frame.render_widget(
         Sparkline::default()
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
+                Block::bordered()
                     .style(ratatui::style::Style::default().bg(theme::PANEL))
                     .title(Line::from(vec![
                         Span::styled(" ", theme::muted()),
                         Span::styled(title, theme::title()),
                     ])),
             )
-            .data(values.as_slice())
+            .data(&values)
             .style(style)
             .max(max),
         area,
@@ -228,7 +218,7 @@ fn sparkline(
 }
 
 fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::DashboardSnapshot) {
-    let lines: SmallVec<[Line; 6]> = SmallVec::from_buf([
+    let lines = vec![
         Line::from(format!(
             "indexer lag {} blocks",
             snapshot.graph.health.indexer_lag_blocks
@@ -252,9 +242,9 @@ fn risk_panel(frame: &mut Frame<'_>, area: Rect, snapshot: &crate::tui::app::Das
             "stale indexer {}",
             snapshot.graph.health.stale_indexer
         )),
-    ]);
+    ];
     frame.render_widget(
-        Paragraph::new(lines.as_slice()).block(theme::panel_block("Health")),
+        Paragraph::new(lines).block(theme::panel_block("Health")),
         area,
     );
 }

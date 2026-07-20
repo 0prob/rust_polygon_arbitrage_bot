@@ -64,6 +64,7 @@ static RAYON_THREADS: LazyLock<usize> = LazyLock::new(|| {
     // Ensure global rayon is capped to 1 thread as soon as we query worker count
     // (defense against stray par_iter before our named pools are first used).
     init_rayon_global_pool();
+    // Reuses Rayon's env name for *our* HF+LF pool budget (global stays 1 via build_global).
     std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -83,8 +84,9 @@ static LF_CPU_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .unwrap_or_else(|_| unreachable!("lf cpu pool should initialize"))
 });
 
-/// Cap the implicit global pool so stray `par_iter`/`join` without `install()` cannot
-/// spin up a full CPU pool (per rayon 0.13 docs: custom pools require `install()`).
+/// Cap the implicit global pool so stray `par_iter`/`join` without pool context cannot
+/// spin up a full CPU pool. Per rayon 1.x [`ThreadPool`](rayon::ThreadPool) docs, custom
+/// pools need `install`/`spawn` — free `par_iter`/`join` use the ambient (global) registry.
 fn init_rayon_global_pool() {
     RAYON_GLOBAL_INIT.call_once(|| {
         let _ = rayon::ThreadPoolBuilder::new()
@@ -155,7 +157,9 @@ pub fn lf_cpu_pool() -> &'static rayon::ThreadPool {
     &LF_CPU_POOL
 }
 
-/// Run CPU-bound HF work on [`cpu_pool`].
+/// Sync entry into [`cpu_pool`] via `install` (blocks the caller).
+/// Prefer [`cpu_pool`]`.spawn` from async code — nested `install` inside `spawn` is
+/// redundant (worker TLS already binds the pool; see rayon `ThreadPool::spawn`).
 pub fn run_cpu<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send,
@@ -164,7 +168,8 @@ where
     cpu_pool().install(f)
 }
 
-/// Run CPU-bound LF work on [`lf_cpu_pool`].
+/// Sync entry into [`lf_cpu_pool`] via `install` (blocks the caller).
+/// Prefer [`lf_cpu_pool`]`.spawn` from async code — see [`run_cpu`].
 pub fn run_lf_cpu<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send,

@@ -418,7 +418,7 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         .await;
     }
 
-    let pacing = tokio::time::Duration::from_millis(batch_pace_ms);
+    let pacing = std::time::Duration::from_millis(batch_pace_ms);
     let max_inflight = MAX_PARALLEL_PLAN_BATCHES.min(batches.len());
     // Pace spawn starts (not full serialize): keep up to `max_inflight` RPCs in
     // flight, stop spawning once any batch reports rate-limited.
@@ -452,9 +452,14 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
             execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
         });
     }
+    // Stop in-flight RPCs once any batch is rate-limited (JoinSet drop alone waits).
+    if result.rate_limited {
+        tasks.abort_all();
+    }
     while let Some(res) = tasks.join_next().await {
         match res {
             Ok(batch_result) => result = result.combine(batch_result),
+            Err(e) if e.is_cancelled() => {}
             Err(e) => crate::warn!("plan batch task failed: {e:#}"),
         }
     }

@@ -284,7 +284,9 @@ mod tests {
 
     #[test]
     fn queue_full_counts_info_plus_not_debug_trace() {
-        use super::{LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank};
+        use super::{
+            LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank,
+        };
         // INFO+ must be countable under saturation; DEBUG/TRACE are silent drops.
         assert!(log_level_rank("ERROR") < LEVEL_DEBUG);
         assert!(log_level_rank("WARN") < LEVEL_DEBUG);

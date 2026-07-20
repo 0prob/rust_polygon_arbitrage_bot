@@ -3,9 +3,12 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use std::future::poll_fn;
+
 use anyhow::{Context, ensure};
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use futures_util::{StreamExt, stream};
+use deadpool_postgres::{
+    Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType, Timeouts,
+};
 use tokio::sync::watch;
 use tokio_postgres::AsyncMessage;
 use tokio_postgres::error::SqlState;
@@ -78,10 +81,58 @@ const POOL_META_COUNT_SQL: &str = r#"SELECT COUNT(*)::bigint FROM "PoolMeta""#;
 
 const PG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound `pool.get()` so a saturated pool cannot stall discovery forever.
+const PG_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Detect dead TCP peers faster than libpq's 2h keepalive default.
+const PG_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const PG_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const PG_KEEPALIVE_RETRIES: u32 = 3;
+const PG_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap incremental catch-up rows per query so a long indexer gap cannot OOM the bot.
 const POOL_META_INCREMENTAL_LIMIT: i64 = 10_000;
-const MAX_POOL_SIZE: usize = 16; // increased from 8: discovery + bootstrap + token + health + spare
+const MAX_POOL_SIZE: usize = 16; // discovery + bootstrap + token + health + spare
 const NOTIFY_CHANNEL: &str = "pool_meta_channel";
+const PG_APP_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+/// Parse a libpq URL / key-value string (tokio-postgres `Config::from_str`) and apply bot defaults.
+fn pg_config(url: &str) -> anyhow::Result<tokio_postgres::Config> {
+    let mut config: tokio_postgres::Config = url
+        .parse()
+        .context("invalid postgres connection URL")?;
+    // URL query params already applied by `from_str`; fill only unset knobs.
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(PG_CONNECT_TIMEOUT);
+    }
+    if config.get_application_name().is_none() {
+        config.application_name(PG_APP_NAME);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(PG_TCP_USER_TIMEOUT);
+    }
+    config.keepalives(true);
+    config.keepalives_idle(PG_KEEPALIVE_IDLE);
+    if config.get_keepalives_interval().is_none() {
+        config.keepalives_interval(PG_KEEPALIVE_INTERVAL);
+    }
+    if config.get_keepalives_retries().is_none() {
+        config.keepalives_retries(PG_KEEPALIVE_RETRIES);
+    }
+    Ok(config)
+}
+
+/// Checkout with deadpool's configured wait/create/recycle timeouts (requires Runtime).
+async fn pg_checkout(pool: &Pool) -> anyhow::Result<deadpool_postgres::Client> {
+    pool.get().await.map_err(|e| {
+        let label = match &e {
+            PoolError::Timeout(TimeoutType::Wait) => "pg pool wait timed out",
+            PoolError::Timeout(TimeoutType::Create) => "pg pool create timed out",
+            PoolError::Timeout(TimeoutType::Recycle) => "pg pool recycle timed out",
+            _ => "pg pool checkout failed",
+        };
+        // Keep PoolError in the chain so transient retry can classify create/recycle.
+        anyhow::Error::new(e).context(label)
+    })
+}
 
 /// Execute a query against the pool with a cached (per-connection) prepared statement.
 async fn pg_query(
@@ -89,7 +140,7 @@ async fn pg_query(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
 ) -> anyhow::Result<Vec<Row>> {
-    let client = pool.get().await.context("pg pool checkout failed")?;
+    let client = pg_checkout(pool).await?;
     let stmt = tokio::time::timeout(PG_QUERY_TIMEOUT, client.prepare_cached(sql))
         .await
         .context("pg prepare_cached timed out")?
@@ -122,7 +173,7 @@ async fn pg_query_opt(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
 ) -> anyhow::Result<Option<Row>> {
-    let client = pool.get().await.context("pg pool checkout failed")?;
+    let client = pg_checkout(pool).await?;
     let stmt = tokio::time::timeout(PG_QUERY_TIMEOUT, client.prepare_cached(sql))
         .await
         .context("pg prepare_cached timed out")?
@@ -131,6 +182,22 @@ async fn pg_query_opt(
         .await
         .context("pg query_opt timed out")?
         .context("pg query_opt failed")
+}
+
+/// Same as `pg_query_opt` but with transient-error retry.
+async fn pg_query_opt_retry(
+    pool: &Pool,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> anyhow::Result<Option<Row>> {
+    match pg_query_opt(pool, sql, params).await {
+        Ok(row) => Ok(row),
+        Err(e) if is_transient_pg_error(&e) => {
+            crate::warn!("pg transient error — retrying: {e:#}");
+            pg_query_opt(pool, sql, params).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Keyset cursor for paginated PoolMeta bootstrap (avoids OFFSET scans).
@@ -147,28 +214,24 @@ pub struct PgClient {
 
 impl PgClient {
     pub fn new(url_str: String) -> anyhow::Result<Self> {
-        let (user, password, host, port, dbname) =
-            parse_pg_url(&url_str).context("invalid postgres connection URL")?;
-        let mut pg_config = tokio_postgres::Config::new();
-        pg_config.host(&host);
-        pg_config.port(port);
-        pg_config.dbname(&dbname);
-        pg_config.user(&user);
-        if !password.is_empty() {
-            pg_config.password(&password);
-        }
-        pg_config.connect_timeout(PG_CONNECT_TIMEOUT);
-        // HFT-optimized connection pool: small, fast-recycle, bounded wait.
+        let pg_config = pg_config(&url_str)?;
+        // Verified: recycle test-query (deadpool FAQ) — safer than Fast for long-lived indexer TCP.
         let mgr = Manager::from_config(
             pg_config,
             NoTls,
             ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
+                recycling_method: RecyclingMethod::Verified,
             },
         );
+        // Timeouts require Runtime (deadpool PoolBuilder); get() uses these via timeout_get.
         let pool = Pool::builder(mgr)
             .max_size(MAX_POOL_SIZE)
-            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .runtime(Runtime::Tokio1)
+            .timeouts(Timeouts {
+                wait: Some(PG_POOL_WAIT_TIMEOUT),
+                create: Some(PG_CONNECT_TIMEOUT),
+                recycle: Some(PG_QUERY_TIMEOUT),
+            })
             .build()
             .context("deadpool postgres pool build failed")?;
         Ok(Self { pool })
@@ -213,23 +276,13 @@ impl PgClient {
         notify_flag: &AtomicBool,
         shutdown: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let (user, password, host, port, dbname) =
-            parse_pg_url(url_str).context("invalid postgres LISTEN connection URL")?;
-        let mut config = tokio_postgres::Config::new();
-        config.host(&host);
-        config.port(port);
-        config.dbname(&dbname);
-        config.user(&user);
-        if !password.is_empty() {
-            config.password(&password);
-        }
-        config.connect_timeout(PG_CONNECT_TIMEOUT);
+        let config = pg_config(url_str)?;
         let (client, mut connection) = config
             .connect(NoTls)
             .await
             .context("pg LISTEN connect failed")?;
 
-        let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
+        // std::future::poll_fn — same as futures_util::stream::poll_fn + next(), no Stream dep.
         let listen_sql = format!("LISTEN {NOTIFY_CHANNEL}");
         let subscribe = client.batch_execute(&listen_sql);
         tokio::pin!(subscribe);
@@ -239,7 +292,7 @@ impl PgClient {
                     result.context("pg LISTEN pool_meta_channel failed")?;
                     break;
                 }
-                message = messages.next() => match message {
+                message = poll_fn(|cx| connection.poll_message(cx)) => match message {
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => anyhow::bail!("pg LISTEN connection closed during subscribe"),
@@ -260,7 +313,7 @@ impl PgClient {
                         return Ok(());
                     }
                 }
-                message = messages.next() => {
+                message = poll_fn(|cx| connection.poll_message(cx)) => {
                     match message {
                         Some(Ok(AsyncMessage::Notification(notification))) => {
                             if notification.channel() == NOTIFY_CHANNEL {
@@ -379,7 +432,9 @@ impl PgClient {
         chain_id: u64,
     ) -> anyhow::Result<Option<IndexerProgress>> {
         let chain_id_i32 = i32::try_from(chain_id).context("chain_id overflow")?;
-        if let Some(row) = pg_query_opt(&self.pool, INDEXER_META_SQL, &[&chain_id_i32]).await? {
+        if let Some(row) =
+            pg_query_opt_retry(&self.pool, INDEXER_META_SQL, &[&chain_id_i32]).await?
+        {
             return Ok(Some(parse_meta_row(row, chain_id_i32)));
         }
         let id = chain_id.to_string();
@@ -394,26 +449,6 @@ impl PgClient {
             }
         }))
     }
-}
-
-/// Lightweight PG URL parser (avoids url crate dependency).
-fn parse_pg_url(url_str: &str) -> Option<(String, String, String, u16, String)> {
-    let rest = url_str
-        .strip_prefix("postgres://")
-        .or_else(|| url_str.strip_prefix("postgresql://"))?;
-    let (userinfo, rest) = rest.split_once('@').unwrap_or(("", rest));
-    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    let (hostport, db_and_params) = rest.split_once('/').unwrap_or((rest, ""));
-    let dbname = db_and_params.split('?').next().unwrap_or("");
-    let (host, port_str) = hostport.rsplit_once(':').unwrap_or((hostport, "5432"));
-    let port: u16 = port_str.parse().unwrap_or(5432);
-    Some((
-        user.to_string(),
-        password.to_string(),
-        host.to_string(),
-        port,
-        dbname.to_string(),
-    ))
 }
 
 /// Cursor for pool discovery — tracks watermarks for incremental queries.
@@ -513,6 +548,14 @@ fn parse_incremental_rows(
 
 fn is_transient_pg_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if let Some(pool_err) = cause.downcast_ref::<PoolError>() {
+            // Create/recycle timeouts often mean a dead conn being replaced; wait = saturated.
+            // Backend errors still classify via the nested PgError below.
+            return matches!(
+                pool_err,
+                PoolError::Timeout(TimeoutType::Create | TimeoutType::Recycle)
+            );
+        }
         cause.downcast_ref::<PgError>().is_some_and(|pg| {
             pg.is_closed()
                 || matches!(
@@ -589,6 +632,37 @@ mod tests {
             .block_on(client.fetch_pool_meta_incremental(&DiscoveryCursor::default()))
             .expect_err("incremental fetch should fail without bootstrap");
         assert!(err.to_string().contains("not bootstrapped"));
+    }
+
+    #[test]
+    fn pg_config_uses_libpq_url_parser() {
+        let cfg = pg_config("postgres://alice:p%40ss@127.0.0.1:6543/indexer?connect_timeout=9")
+            .expect("parse url");
+        assert_eq!(cfg.get_user(), Some("alice"));
+        assert_eq!(cfg.get_password(), Some(b"p@ss".as_slice()));
+        assert_eq!(cfg.get_dbname(), Some("indexer"));
+        assert_eq!(cfg.get_connect_timeout(), Some(&Duration::from_secs(9)));
+        assert_eq!(cfg.get_application_name(), Some(PG_APP_NAME));
+        assert_eq!(cfg.get_tcp_user_timeout(), Some(&PG_TCP_USER_TIMEOUT));
+        assert!(cfg.get_keepalives());
+        assert_eq!(cfg.get_keepalives_idle(), PG_KEEPALIVE_IDLE);
+        assert_eq!(cfg.get_keepalives_interval(), Some(PG_KEEPALIVE_INTERVAL));
+        assert_eq!(cfg.get_keepalives_retries(), Some(PG_KEEPALIVE_RETRIES));
+    }
+
+    #[test]
+    fn pg_config_preserves_url_keepalive_overrides() {
+        let cfg = pg_config(
+            "postgres://127.0.0.1/db?keepalives_interval=7&keepalives_retries=9",
+        )
+        .expect("parse url");
+        assert_eq!(cfg.get_keepalives_interval(), Some(Duration::from_secs(7)));
+        assert_eq!(cfg.get_keepalives_retries(), Some(9));
+    }
+
+    #[test]
+    fn pg_config_rejects_garbage() {
+        assert!(pg_config("not-a-postgres-url").is_err());
     }
 
     #[test]

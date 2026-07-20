@@ -8,9 +8,8 @@ use crate::pipeline::abi_cache::{
     BALANCER_LINEAR_TARGETS, BALANCER_LINEAR_WRAPPED, BALANCER_SCALING, BALANCER_SWAP_FEE,
     BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_CRYPTO_PRECISIONS, CURVE_CRYPTO_PRICE_SCALE,
     CURVE_FEE, CURVE_GAMMA, CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K,
-    DODO_LP_FEE, DODO_MT_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES,
-    V3_FEE,
-    V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
+    DODO_LP_FEE, DODO_MT_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN,
+    V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
 use crate::services::discovery::{DiscoveredPool, resolve_v4_pool_id};
@@ -236,10 +235,14 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
     let known = plan.pool.pool_type.as_deref();
     let need_weights = matches!(known, Some("weighted") | None);
     let need_amp = matches!(known, Some("stable") | None);
-    let need_linear =
-        known == Some("linear") || (known.is_none() && plan.pool.tokens.len() >= 3);
+    let need_linear = known == Some("linear") || (known.is_none() && plan.pool.tokens.len() >= 3);
     if need_weights {
-        push_call(plan, addr, BALANCER_WEIGHTS.clone(), CallKind::BalancerWeights);
+        push_call(
+            plan,
+            addr,
+            BALANCER_WEIGHTS.clone(),
+            CallKind::BalancerWeights,
+        );
     }
     if need_amp {
         push_call(plan, addr, BALANCER_AMP.clone(), CallKind::BalancerAmp);

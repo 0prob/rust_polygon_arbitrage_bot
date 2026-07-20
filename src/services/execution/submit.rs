@@ -2,7 +2,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::{B256, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use super::candidate::CandidateExecution;
 use super::gas::{compute_conservative_gas_price, u256_to_u128};
@@ -174,13 +174,12 @@ pub async fn submit_with_recovery<P: Provider<Ethereum>>(
                         fees = bump_fees(fees, FEE_BUMP_BPS);
                     }
                     SubmitAction::AlreadyKnown => {
-                        if let Some(hash) = extract_tx_hash_from_error(&e.to_string()) {
+                        if let Some(hash) = extract_tx_hash_from_error(&format!("{e:#}")) {
                             return Ok(hash);
                         }
-                        return Err(anyhow!("transaction already known but hash unavailable"));
+                        bail!("transaction already known but hash unavailable");
                     }
-                    SubmitAction::InsufficientFunds => return Err(e),
-                    SubmitAction::Fail(msg) => return Err(anyhow!(msg)),
+                    SubmitAction::InsufficientFunds | SubmitAction::Fail => return Err(e),
                 }
             }
         }

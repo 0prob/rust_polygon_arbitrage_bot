@@ -388,26 +388,21 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
+    use crate::core::math::proptest_util::{u256_fp18, u256_nonzero};
     use alloy::primitives::Address;
     use proptest::prelude::*;
-
-    fn non_zero() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX).prop_map(U256::from)
-    }
 
     proptest! {
         #[test]
         fn output_bounded_by_reserve(
-            amount_in in non_zero(),
-            base_reserve in non_zero(),
-            quote_reserve in non_zero(),
-            i in non_zero(),
-            k in (0u64..1_000_000_000_000_000_000u64).prop_map(U256::from),
+            amount_in in u256_nonzero(),
+            base_reserve in u256_nonzero(),
+            quote_reserve in u256_nonzero(),
+            i in u256_nonzero(),
+            k in u256_fp18(),
         ) {
-            let k = k % super::super::fixed_point::ONE;
             let state = DodoPoolState {
                 base_reserve,
                 quote_reserve,
@@ -424,14 +419,20 @@ mod proptests {
 
             let out = get_dodo_amount_out(&state, amount_in, true);
             if !out.is_zero() {
-                prop_assert!(out <= state.quote_reserve,
-                    "dodo out={} exceeds quote reserve={}", out, state.quote_reserve);
+                prop_assert!(
+                    out <= state.quote_reserve,
+                    "dodo out={out} exceeds quote reserve={}",
+                    state.quote_reserve
+                );
             }
 
             let out_rev = get_dodo_amount_out(&state, amount_in, false);
             if !out_rev.is_zero() {
-                prop_assert!(out_rev <= state.base_reserve,
-                    "dodo rev out={} exceeds base reserve={}", out_rev, state.base_reserve);
+                prop_assert!(
+                    out_rev <= state.base_reserve,
+                    "dodo rev out={out_rev} exceeds base reserve={}",
+                    state.base_reserve
+                );
             }
         }
     }

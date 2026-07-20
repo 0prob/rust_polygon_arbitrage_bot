@@ -71,7 +71,6 @@ pub async fn refresh_balancer_flash_fee_with_fallback(rpc: &RpcPool) -> anyhow::
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!("balancer flash fee refresh failed on all RPCs")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("balancer flash fee refresh failed on all RPCs")))
 }

@@ -106,7 +106,7 @@ pub enum SubmitAction {
     BumpFeesAndRetry,
     AlreadyKnown,
     InsufficientFunds,
-    Fail(String),
+    Fail,
 }
 
 pub(crate) fn ic(haystack: &str, needle: &str) -> bool {
@@ -115,8 +115,10 @@ pub(crate) fn ic(haystack: &str, needle: &str) -> bool {
     h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
+/// Classify submit failures from the full anyhow/Display chain (`{err:#}`).
+/// Plain `{}` only shows the outermost `.context(...)` layer.
 pub fn classify_submit_error(err: &impl std::fmt::Display) -> SubmitAction {
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
 
     if ic(&msg, "nonce too low")
         || ic(&msg, "nonce has already been used")
@@ -140,11 +142,11 @@ pub fn classify_submit_error(err: &impl std::fmt::Display) -> SubmitAction {
         return SubmitAction::BumpFeesAndRetry;
     }
 
-    SubmitAction::Fail(msg)
+    SubmitAction::Fail
 }
 
 pub fn is_transient_receipt_error(err: &impl std::fmt::Display) -> bool {
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
     ic(&msg, "429")
         || ic(&msg, "rate limit")
         || ic(&msg, "timeout")
@@ -445,6 +447,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_submit_error_sees_through_anyhow_context() {
+        let err = anyhow::anyhow!("nonce too low")
+            .context("submit_transaction failed");
+        assert_eq!(classify_submit_error(&err), SubmitAction::ResyncAndRetry);
+        let rate = anyhow::anyhow!("HTTP 429 rate limit")
+            .context("private submit failed");
+        assert_eq!(classify_submit_error(&rate), SubmitAction::BumpFeesAndRetry);
+        assert!(is_transient_receipt_error(&rate));
+    }
+
+    #[test]
     fn test_buffer_gas_limit_nonzero() {
         assert!(buffer_gas_limit(100_000).is_some());
     }
@@ -599,12 +612,11 @@ mod tests {
             total_gas: 1,
         };
         // amount=10 → +5% collapses to 10; new path probes 11 instead of returning 0.
-        let bps = depth_impact_slippage_bps_with_base(
-            &arena,
-            &[edge],
-            U256::from(10u64),
-            Some(&base),
+        let bps =
+            depth_impact_slippage_bps_with_base(&arena, &[edge], U256::from(10u64), Some(&base));
+        assert!(
+            bps > 0,
+            "dust probe must measure depth, not short-circuit to 0"
         );
-        assert!(bps > 0, "dust probe must measure depth, not short-circuit to 0");
     }
 }

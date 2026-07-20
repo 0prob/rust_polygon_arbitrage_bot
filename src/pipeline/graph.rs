@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::core::constants::MAX_POOL_TOKENS;
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
@@ -154,7 +155,7 @@ pub fn edges_for_pair(
     out
 }
 
-pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallVec<[u8; 8]> {
+pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallVec<[u8; MAX_POOL_TOKENS]> {
     let mut out = SmallVec::new();
     // Balancer/Woofi indices must follow vault/oracle token order (state.tokens), not
     // discovery meta order — a mismatch yields phantom local sim and BAL#521 on-chain.
@@ -202,7 +203,7 @@ fn ensure_per_pool_hub(
     graph: &mut RoutingGraph,
     pool_index: PoolIndex,
     protocol: ProtocolType,
-    exit_legs: SmallVec<[u8; 8]>,
+    exit_legs: SmallVec<[u8; MAX_POOL_TOKENS]>,
 ) -> u32 {
     let node = graph.token_count + graph.virtual_hubs.len() as u32;
     graph.virtual_hubs.push(VirtualPoolHub {
@@ -297,7 +298,7 @@ fn attach_hub_spoke_pool(
     meta: &PoolMeta,
     state: &PoolState,
 ) {
-    let funded: SmallVec<[(u8, TokenIndex); 8]> = funded_token_indices(state, meta)
+    let funded: SmallVec<[(u8, TokenIndex); MAX_POOL_TOKENS]> = funded_token_indices(state, meta)
         .into_iter()
         .filter_map(|leg| {
             routing_token_at_leg(arena, state, meta, leg as usize).map(|token| (leg, token))
@@ -307,7 +308,7 @@ fn attach_hub_spoke_pool(
         return;
     }
 
-    let exit_legs: SmallVec<[u8; 8]> = funded.iter().map(|(leg, _)| *leg).collect();
+    let exit_legs: SmallVec<[u8; MAX_POOL_TOKENS]> = funded.iter().map(|(leg, _)| *leg).collect();
     let hub_node = if meta.protocol == ProtocolType::UniswapV4 {
         ensure_v4_singleton_hub(graph)
     } else {
@@ -497,7 +498,7 @@ pub fn pool_state_graph_eligible(
         return direct_pair_has_marginal_spot(state, protocol, fee_bps, decimals);
     }
     let _ = arena;
-    let mut funded = SmallVec::<[u8; 8]>::new();
+    let mut funded = SmallVec::<[u8; MAX_POOL_TOKENS]>::new();
     for i in 0..token_count {
         if bpt_index == Some(i) {
             continue;

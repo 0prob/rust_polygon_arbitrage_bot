@@ -5,6 +5,7 @@
 //! - **HyperSync** — fast head feed, receipts, traces, historical log scans
 //!
 //! See: <https://docs.rs/hypersync-client/latest/hypersync_client/>
+//! Docs: <https://docs.envio.dev/docs/HyperSync/overview>
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +15,7 @@ use hypersync_client::Client;
 use hypersync_client::HeightStreamEvent;
 use hypersync_client::format::{Hash, Quantity, TransactionStatus};
 use hypersync_client::net_types::{
-    JoinMode, Query, TransactionFilter, TransactionSelection, transaction::TransactionField,
+    JoinMode, Query, TransactionFilter, transaction::TransactionField,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, timeout};
@@ -25,7 +26,9 @@ use crate::util::now_ms;
 
 const DEFAULT_RECEIPT_LOOKBACK: u64 = 50;
 const HEIGHT_CACHE_TTL_MS: u64 = 15_000;
-const HYPERSYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const HYPERSYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Indexer-style default is 12; we poll receipts / height often and prefer fail-fast + RPC fallback.
+const HYPERSYNC_MAX_RETRIES: usize = 2;
 
 /// Thin wrapper around [`hypersync_client::Client`] for the arb bot.
 pub struct HyperSyncService {
@@ -38,13 +41,22 @@ pub struct HyperSyncService {
 
 impl HyperSyncService {
     pub fn from_config(rpc: &RpcConfig, api_token: &str) -> Result<Self> {
-        let request_timeout = Duration::from_millis(rpc.request_timeout_ms.max(1));
+        let request_timeout_ms = rpc.request_timeout_ms.max(1);
+        let request_timeout = Duration::from_millis(request_timeout_ms);
         let mut builder = Client::builder()
             .chain_id(POLYGON_CHAIN_ID)
-            .api_token(api_token)
-            .http_req_timeout_millis(rpc.request_timeout_ms);
+            .api_token(api_token.trim())
+            .http_req_timeout_millis(request_timeout_ms)
+            .max_num_retries(HYPERSYNC_MAX_RETRIES)
+            // Receipt wait has RPC fallback; don't stall it on quota-window sleep.
+            .proactive_rate_limit_sleep(false);
 
-        if let Some(url) = rpc.hyper_sync_url.as_deref() {
+        if let Some(url) = rpc
+            .hyper_sync_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             builder = builder.url(url);
         }
 
@@ -90,6 +102,7 @@ impl HyperSyncService {
             return Ok(height);
         }
 
+        // Overall budget: client already applies http_req_timeout + a few retries.
         let height = timeout(self.request_timeout, self.client.get_height())
             .await
             .context("hypersync get_height timed out")?
@@ -120,6 +133,15 @@ impl HyperSyncService {
         tx_hash: B256,
         lookback_blocks: Option<u64>,
     ) -> Result<Option<(bool, u64)>> {
+        // Prefer RPC fallback over blocking the receipt wait loop on a depleted quota.
+        if self
+            .client
+            .rate_limit_info()
+            .is_some_and(|info| info.is_rate_limited())
+        {
+            return Ok(None);
+        }
+
         let lookback = lookback_blocks.unwrap_or(DEFAULT_RECEIPT_LOOKBACK);
         let height = if let Some(height) = self.latest_height() {
             height
@@ -128,10 +150,10 @@ impl HyperSyncService {
         };
         let from_block = height.saturating_sub(lookback);
         let to_block = height.saturating_add(1);
-        let hash = Hash::from(tx_hash.0);
         let filter = TransactionFilter::all()
-            .and_hash([hash])
+            .and_hash([Hash::from(tx_hash.0)])
             .context("invalid tx hash filter")?;
+        // JoinNothing + minimal fields: docs recommend selecting only fields you use.
         let mut query = Query::new()
             .from_block(from_block)
             .to_block_excl(to_block)
@@ -141,7 +163,7 @@ impl HyperSyncService {
                 TransactionField::Status,
                 TransactionField::GasUsed,
             ])
-            .where_transactions(TransactionSelection::from(filter));
+            .where_transactions(filter);
         query.max_num_transactions = Some(1);
         let response = timeout(self.request_timeout, self.client.get(&query))
             .await
@@ -169,6 +191,7 @@ fn quantity_to_u64(q: &Quantity) -> u64 {
 pub fn try_from_env(rpc: &RpcConfig) -> Option<HyperSyncService> {
     let token = std::env::var("ENVIO_API_TOKEN")
         .ok()
+        .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())?;
     match HyperSyncService::from_config(rpc, &token) {
         Ok(svc) => Some(svc),
@@ -205,5 +228,18 @@ mod tests {
     fn quantity_to_u64_uses_least_significant_eight_bytes() {
         let q = Quantity::from(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
         assert_eq!(quantity_to_u64(&q), 0x0203_0405_0607_0809);
+    }
+
+    #[test]
+    fn from_config_trims_api_token_and_custom_url() {
+        let mut rpc = RpcConfig::default();
+        rpc.hyper_sync_url = Some("  https://polygon.hypersync.xyz  ".into());
+        // ClientConfig validates api_token as a UUID; whitespace must be trimmed first.
+        let service = HyperSyncService::from_config(
+            &rpc,
+            "  a3cbea70-ad7d-4308-a4be-b14e095ce169  ",
+        )
+        .expect("trimmed HyperSync configuration should be valid");
+        assert_eq!(service.client.url().as_str(), "https://polygon.hypersync.xyz/");
     }
 }

@@ -175,7 +175,13 @@ fn cl_edge_ratio_u256(
         return cl_spot_u256(state, edge);
     }
     let allow_zero = edge.protocol == ProtocolType::UniswapV4;
-    let r = simulate_v3_swap(state, probe, edge.zero_for_one, Some(edge.fee_bps), allow_zero);
+    let r = simulate_v3_swap(
+        state,
+        probe,
+        edge.zero_for_one,
+        Some(edge.fee_bps),
+        allow_zero,
+    );
     if r.shallow {
         return None;
     }

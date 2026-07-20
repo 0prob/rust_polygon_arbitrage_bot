@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy::primitives::Address;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
 use crate::services::discovery::{DiscoveredPool, discovered_to_pool_meta};
@@ -395,7 +395,7 @@ impl StateArena {
         }
         let (states, generation) = cache.get_arcs_with_generation(&unique);
         let mut fresh: FxHashMap<Address, (Arc<PoolState>, u64)> =
-            FxHashMap::with_capacity_and_hasher(states.len(), Default::default());
+            FxHashMap::with_capacity_and_hasher(states.len(), FxBuildHasher);
         for (address, state, revision) in states {
             fresh.insert(address, (state, revision));
         }

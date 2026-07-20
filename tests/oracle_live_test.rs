@@ -3,16 +3,24 @@
 //! Run: `cargo test --test oracle_live_test -- --ignored --nocapture`
 
 use alloy::primitives::{Address, address};
+use reqwest::Client;
 use rpbot::core::constants::{MIN_TOKEN_TO_MATIC_RATE, WMATIC};
+use rpbot::infra::http::{HttpClientOpts, build};
 use rpbot::services::oracle::price_oracle::PriceOracle;
 use serde::Deserialize;
 
+fn hermes_http() -> Client {
+    build(HttpClientOpts {
+        timeout: std::time::Duration::from_secs(10),
+        pool_max_idle_per_host: 4,
+        max_redirects: 5,
+    })
+    .expect("http client")
+}
+
 fn hermes_oracle() -> PriceOracle {
     PriceOracle::new(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("http client"),
+        hermes_http(),
         "https://hermes.pyth.network".to_string(),
         10_000,
     )
@@ -123,9 +131,10 @@ async fn pyth_extended_polygon_tokens_prefetch_enable_integer_matic_rates() {
             "Crypto.PENDLE/USD",
         ),
     ];
+    let http = hermes_http();
     for (_, feed_id, expected_symbol) in feeds {
         assert_eq!(
-            pyth_feed_id(expected_symbol).await.as_deref(),
+            pyth_feed_id(&http, expected_symbol).await.as_deref(),
             Some(feed_id),
             "wrong Pyth feed id for {expected_symbol}"
         );
@@ -172,9 +181,10 @@ async fn pyth_curated_polygon_extensions_prefetch_enable_rates() {
             "Crypto.FRAX/USD",
         ),
     ];
+    let http = hermes_http();
     for (_, feed_id, expected_symbol) in feeds {
         assert_eq!(
-            pyth_feed_id(expected_symbol).await.as_deref(),
+            pyth_feed_id(&http, expected_symbol).await.as_deref(),
             Some(feed_id),
             "wrong Pyth feed id for {expected_symbol}"
         );
@@ -198,9 +208,9 @@ async fn pyth_curated_polygon_extensions_prefetch_enable_rates() {
     assert!(bridged_rate >= MIN_TOKEN_TO_MATIC_RATE);
 }
 
-async fn pyth_feed_id(symbol: &str) -> Option<String> {
+async fn pyth_feed_id(http: &Client, symbol: &str) -> Option<String> {
     let url = format!("https://hermes.pyth.network/v2/price_feeds?query={symbol}");
-    let feeds: Vec<PythFeedMeta> = reqwest::get(url).await.ok()?.json().await.ok()?;
+    let feeds: Vec<PythFeedMeta> = http.get(url).send().await.ok()?.json().await.ok()?;
     feeds
         .into_iter()
         .find(|feed| feed.attributes.symbol == symbol)

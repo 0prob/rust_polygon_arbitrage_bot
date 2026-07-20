@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloy::primitives::{Address, B256, U256};
 use dashmap::DashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+
+type EdgeCentralityMap = FxHashMap<Address, u32>;
+type EdgeCentralityCache = Option<(u64, Arc<EdgeCentralityMap>)>;
 use tokio::sync::watch;
 
 pub use decode::{
@@ -140,15 +143,15 @@ pub struct PartialPoolCache {
     pools: DashMap<Address, SlimPoolState, FxBuildHasher>,
     patches: AtomicU64,
     trigger: StreamTrigger,
-    dirty: parking_lot::Mutex<FxHashSet<Address>>,
+    dirty: Mutex<FxHashSet<Address>>,
     /// Streamable pools currently in the arena — topic Sync/Swap on these wake HF
     /// even when outside the smaller WSS interest top-N.
-    universe: DashMap<Address, (), FxBuildHasher>,
+    universe: RwLock<FxHashSet<Address>>,
     /// Topic-observed pools not yet in the universe — LF merges into hot refresh
     /// so live Uni V3 venues enter the arena instead of staying wake_hf=false forever.
-    observed_live: DashMap<Address, (), FxBuildHasher>,
+    observed_live: Mutex<FxHashSet<Address>>,
     /// Live-edge centrality per pool, keyed by layout⊕state generation.
-    edge_centrality: Mutex<Option<(u64, Arc<FxHashMap<Address, u32>>)>>,
+    edge_centrality: Mutex<EdgeCentralityCache>,
 }
 
 impl PartialPoolCache {
@@ -157,7 +160,7 @@ impl PartialPoolCache {
         Self::with_capacity(0)
     }
 
-    /// Pre-size shards for the expected stream target count (see `with_shard_amount` in dashmap).
+    /// Pre-size the hot `pools` DashMap for the expected stream target count.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -165,8 +168,11 @@ impl PartialPoolCache {
             patches: AtomicU64::new(0),
             trigger: StreamTrigger::new(),
             dirty: Mutex::new(FxHashSet::default()),
-            universe: DashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
-            observed_live: DashMap::with_capacity_and_hasher(64, FxBuildHasher),
+            universe: RwLock::new(FxHashSet::with_capacity_and_hasher(
+                capacity,
+                FxBuildHasher,
+            )),
+            observed_live: Mutex::new(FxHashSet::with_capacity_and_hasher(64, FxBuildHasher)),
             edge_centrality: Mutex::new(None),
         }
     }
@@ -178,7 +184,7 @@ impl PartialPoolCache {
         graph: &crate::pipeline::types::RoutingGraph,
         arena: &crate::pipeline::arena::StateArena,
         capacity_hint: usize,
-    ) -> Arc<FxHashMap<Address, u32>> {
+    ) -> Arc<EdgeCentralityMap> {
         if cache_key != 0 {
             let guard = self.edge_centrality.lock();
             if let Some((key, map)) = guard.as_ref()
@@ -188,7 +194,7 @@ impl PartialPoolCache {
             }
         }
         let mut edge_counts =
-            FxHashMap::with_capacity_and_hasher(capacity_hint, FxBuildHasher);
+            EdgeCentralityMap::with_capacity_and_hasher(capacity_hint, FxBuildHasher);
         for edges in &graph.adjacency {
             for ge in edges {
                 if !crate::pipeline::cycle_finder::is_live_graph_edge(ge) {
@@ -208,10 +214,16 @@ impl PartialPoolCache {
 
     /// Replace the arena-known streamable universe used for HF wake gating.
     pub fn set_stream_universe(&self, addrs: &[Address]) {
-        self.universe.clear();
-        for addr in addrs {
-            self.universe.insert(*addr, ());
-            self.observed_live.remove(addr);
+        {
+            let mut universe = self.universe.write();
+            universe.clear();
+            universe.extend(addrs.iter().copied());
+        }
+        {
+            let mut observed = self.observed_live.lock();
+            for addr in addrs {
+                observed.remove(addr);
+            }
         }
         crate::info!(
             "stream universe: pools={} (topic Sync/Swap on these wake HF)",
@@ -225,20 +237,28 @@ impl PartialPoolCache {
         if observed.is_empty() {
             return;
         }
+        let admitted: Vec<Address> = {
+            let universe = self.universe.read();
+            observed
+                .iter()
+                .copied()
+                .filter(|addr| universe.contains(addr))
+                .collect()
+        };
+        if admitted.is_empty() {
+            return;
+        }
         let now = crate::util::now_ms();
         let mut woke = 0u32;
         {
             let mut dirty = self.dirty.lock();
-            for addr in observed {
-                if !self.universe.contains_key(addr) {
-                    continue;
-                }
-                dirty.insert(*addr);
+            for addr in admitted {
+                dirty.insert(addr);
                 // Stamp activity so HF `cycle_activity_score` can mark cycles
                 // containing this pool as active (seed-only states had count=0).
                 // or_insert: seed may have skipped Balancer/missing cache rows.
                 self.pools
-                    .entry(*addr)
+                    .entry(addr)
                     .and_modify(|state| {
                         state.patched_at_ms = now;
                         state.activity_count = state.activity_count.max(1);
@@ -259,22 +279,21 @@ impl PartialPoolCache {
 
     #[must_use]
     pub fn in_stream_universe(&self, addr: &Address) -> bool {
-        self.universe.contains_key(addr)
+        self.universe.read().contains(addr)
     }
 
     /// Record a topic-observed pool outside the current universe for LF hot refresh.
     pub fn note_observed_live(&self, addr: Address) {
-        if !self.universe.contains_key(&addr) {
-            self.observed_live.insert(addr, ());
+        if !self.universe.read().contains(&addr) {
+            self.observed_live.lock().insert(addr);
         }
     }
 
     /// Drain topic-observed addresses for the next state-refresh hot set.
     #[must_use]
     pub fn take_observed_live(&self) -> Vec<Address> {
-        let addrs: Vec<Address> = self.observed_live.iter().map(|e| *e.key()).collect();
-        self.observed_live.clear();
-        addrs
+        // Atomic take — DashMap iter()+clear could drop concurrent inserts.
+        self.observed_live.lock().drain().collect()
     }
 
     pub fn trigger(&self) -> &StreamTrigger {
@@ -593,7 +612,7 @@ impl StreamAddressSet {
         }
     }
 
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Vec<Address>> {
+    pub fn read(&self) -> RwLockReadGuard<'_, Vec<Address>> {
         self.inner.read()
     }
 
@@ -671,14 +690,7 @@ fn stream_liquidity_score(state: &PoolState) -> u64 {
                 u64::from(256u32.saturating_sub(min.leading_zeros() as u32))
             }
         }
-        PoolState::V3(s) => {
-            if s.liquidity == 0 || s.sqrt_price_x96.is_zero() {
-                0
-            } else {
-                u64::from(128u32.saturating_sub(s.liquidity.leading_zeros())).saturating_mul(2)
-            }
-        }
-        PoolState::V4(s) => {
+        PoolState::V3(s) | PoolState::V4(s) => {
             if s.liquidity == 0 || s.sqrt_price_x96.is_zero() {
                 0
             } else {
@@ -748,21 +760,14 @@ pub fn select_stream_targets_with_epoch(
     let addr_to_pool = arena.address_to_pool();
 
     let edge_counts = graph.map_or_else(Arc::default, |graph| {
-        partial_cache.live_edge_centrality(
-            centrality_cache_key,
-            graph,
-            arena,
-            pool_metas.len(),
-        )
+        partial_cache.live_edge_centrality(centrality_cache_key, graph, arena, pool_metas.len())
     });
 
     let mut scored: Vec<(u64, Address)> = discovered
         .iter()
         .filter(|p| is_streamable_protocol(p.protocol))
         .filter_map(|pool| {
-            let Some(&pool_idx) = addr_to_pool.get(&pool.address) else {
-                return None;
-            };
+            let &pool_idx = addr_to_pool.get(&pool.address)?;
             let liq = arena
                 .pool_state(pool_idx)
                 .map(stream_liquidity_score)

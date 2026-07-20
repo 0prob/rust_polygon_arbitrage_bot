@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use alloy::primitives::{Address, FixedBytes};
 use reqwest::Client;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::core::types::ProtocolType;
@@ -28,7 +28,7 @@ static BALANCER_HTTP: LazyLock<Client> = LazyLock::new(|| {
         HttpClientOpts {
             timeout: Duration::from_secs(10),
             pool_max_idle_per_host: 4,
-            max_redirects: 5,
+            max_redirects: 0,
         },
         "balancer backend",
     )
@@ -48,7 +48,7 @@ struct GraphQlResponse {
 
 #[derive(Debug, Deserialize)]
 struct GraphQlData {
-    #[serde(rename = "poolGetPools")]
+    #[serde(rename = "poolGetPools", default)]
     pools: Vec<BackendPool>,
 }
 
@@ -86,10 +86,7 @@ pub async fn enrich_polygon_balancer_pool_ids(
     endpoint: &str,
     pools: &mut Vec<DiscoveredPool>,
 ) -> anyhow::Result<(usize, usize)> {
-    if !pools
-        .iter()
-        .any(|p| p.protocol == ProtocolType::BalancerV2)
-    {
+    if !pools.iter().any(|p| p.protocol == ProtocolType::BalancerV2) {
         return Ok((0, 0));
     }
 
@@ -114,10 +111,7 @@ pub async fn enrich_polygon_balancer_pool_ids(
         anyhow::bail!("Balancer backend GraphQL error: {messages}");
     }
 
-    let backend = response
-        .data
-        .map(|data| data.pools)
-        .unwrap_or_default();
+    let backend = response.data.map(|data| data.pools).unwrap_or_default();
 
     Ok(apply_backend_pools(pools, &backend))
 }
@@ -131,7 +125,7 @@ fn pool_tradable(dynamic: Option<&BackendDynamicData>) -> bool {
 }
 
 fn apply_backend_pools(pools: &mut Vec<DiscoveredPool>, backend: &[BackendPool]) -> (usize, usize) {
-    let mut by_address: HashMap<Address, (FixedBytes<32>, bool)> = HashMap::new();
+    let mut by_address: FxHashMap<Address, (FixedBytes<32>, bool)> = FxHashMap::default();
     for pool in backend {
         let Ok(address) = pool.address.parse::<Address>() else {
             continue;
@@ -190,12 +184,7 @@ mod tests {
         }
     }
 
-    fn backend(
-        addr_byte: u8,
-        id_byte: u8,
-        swap_enabled: bool,
-        recovery: bool,
-    ) -> BackendPool {
+    fn backend(addr_byte: u8, id_byte: u8, swap_enabled: bool, recovery: bool) -> BackendPool {
         BackendPool {
             address: format!("{:?}", Address::repeat_byte(addr_byte)),
             id: format!("{:?}", FixedBytes::<32>::repeat_byte(id_byte)),

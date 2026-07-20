@@ -360,9 +360,13 @@ mod tests {
     #[test]
     fn mixed_balancer_hops_force_aave_dispatch() {
         let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
-        let (source, entry) =
-            resolve_dispatch(FlashLoanSource::Balancer, &hops, Some(&aave_liquidity()), false)
-                .expect("aave available");
+        let (source, entry) = resolve_dispatch(
+            FlashLoanSource::Balancer,
+            &hops,
+            Some(&aave_liquidity()),
+            false,
+        )
+        .expect("aave available");
         assert_eq!(source, FlashLoanSource::AaveV3);
         assert_eq!(entry, ExecutorEntrypoint::AaveFlash);
     }
@@ -379,9 +383,13 @@ mod tests {
     #[test]
     fn pure_balancer_hops_keep_direct_or_balancer_flash() {
         let hops = vec![hop(ProtocolType::BalancerV2)];
-        let (source, entry) =
-            resolve_dispatch(FlashLoanSource::Direct, &hops, Some(&aave_liquidity()), false)
-                .expect("direct");
+        let (source, entry) = resolve_dispatch(
+            FlashLoanSource::Direct,
+            &hops,
+            Some(&aave_liquidity()),
+            false,
+        )
+        .expect("direct");
         assert_eq!(source, FlashLoanSource::Direct);
         assert_eq!(entry, ExecutorEntrypoint::Direct);
         assert_eq!(
@@ -393,9 +401,13 @@ mod tests {
     #[test]
     fn candidate_stores_dispatch_flash_source_not_config_source() {
         let hops = vec![hop(ProtocolType::BalancerV2), hop(ProtocolType::UniswapV3)];
-        let (dispatch, _) =
-            resolve_dispatch(FlashLoanSource::Balancer, &hops, Some(&aave_liquidity()), false)
-                .expect("mixed Balancer/V3 route should dispatch through Aave");
+        let (dispatch, _) = resolve_dispatch(
+            FlashLoanSource::Balancer,
+            &hops,
+            Some(&aave_liquidity()),
+            false,
+        )
+        .expect("mixed Balancer/V3 route should dispatch through Aave");
         assert_eq!(dispatch, FlashLoanSource::AaveV3);
         assert_ne!(dispatch, FlashLoanSource::Balancer);
     }
@@ -409,9 +421,13 @@ mod tests {
             hop(ProtocolType::BalancerV2),
             hop(ProtocolType::BalancerV2),
         ];
-        let (source, entry) =
-            resolve_dispatch(FlashLoanSource::Direct, &hops, Some(&aave_liquidity()), false)
-                .expect("aave");
+        let (source, entry) = resolve_dispatch(
+            FlashLoanSource::Direct,
+            &hops,
+            Some(&aave_liquidity()),
+            false,
+        )
+        .expect("aave");
         assert_eq!(source, FlashLoanSource::AaveV3);
         assert_eq!(entry, ExecutorEntrypoint::AaveFlash);
     }

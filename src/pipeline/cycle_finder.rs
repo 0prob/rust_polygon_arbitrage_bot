@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use alloy::primitives::U256;
 
-use crate::core::constants::HOP_CAP;
+use crate::core::constants::{HOP_CAP, MAX_POOL_TOKENS};
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
 use crate::pipeline::arena::StateArena;
@@ -348,6 +348,76 @@ struct NodePrep {
     direct_legs: u16,
 }
 
+fn prep_node(
+    index: usize,
+    token_count: usize,
+    graph: &RoutingGraph,
+    coverage: &CycleCapableCoverage,
+) -> NodePrep {
+    let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
+    if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
+        return NodePrep {
+            live: Vec::new(),
+            protos: 0,
+            min_outgoing: None,
+            max_outgoing_ratio: ONE,
+            enter_legs: 0,
+            direct_legs: 0,
+        };
+    }
+    let mut live: Vec<GraphEdge> = Vec::with_capacity(edges.len());
+    let mut protos: u8 = 0;
+    let mut proto_bits = 0u16;
+    let mut min_outgoing: Option<f64> = None;
+    let mut max_outgoing_ratio = ONE;
+    let mut enter_legs = 0u16;
+    let mut direct_legs = 0u16;
+    for ge in edges {
+        if !is_live_graph_edge(ge) {
+            continue;
+        }
+        if index < token_count {
+            match ge.phase {
+                GraphHopPhase::EnterPool => enter_legs = enter_legs.saturating_add(1),
+                GraphHopPhase::Direct => direct_legs = direct_legs.saturating_add(1),
+                GraphHopPhase::ExitPool => {}
+            }
+            let bit = 1u16 << (ge.edge.protocol as u8);
+            if proto_bits & bit == 0 {
+                protos += 1;
+                proto_bits |= bit;
+            }
+            if ge.phase == GraphHopPhase::Direct {
+                let w = ge.log_weight;
+                match min_outgoing {
+                    Some(ref mut best) if w < *best => *best = w,
+                    None => min_outgoing = Some(w),
+                    _ => {}
+                }
+                if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio {
+                    max_outgoing_ratio = ge.ratio;
+                }
+            }
+        }
+        live.push(*ge);
+    }
+    // Best (most negative log-weight) edges first so DFS finds
+    // profitable cycles earlier and can hit max_cycles before deadline.
+    live.sort_unstable_by(|a, b| {
+        a.log_weight
+            .partial_cmp(&b.log_weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    NodePrep {
+        live,
+        protos,
+        min_outgoing,
+        max_outgoing_ratio,
+        enter_legs,
+        direct_legs,
+    }
+}
+
 /// Build the live-edge DFS view and hub/direct stats (single graph scan).
 #[must_use]
 pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
@@ -359,73 +429,16 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     let token_count = graph.token_count as usize;
     let node_count = graph.adjacency.len();
 
-    let per_node: Vec<NodePrep> = (0..node_count)
-        .into_par_iter()
-        .map(|index| {
-            let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
-            if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
-                return NodePrep {
-                    live: Vec::new(),
-                    protos: 0,
-                    min_outgoing: None,
-                    max_outgoing_ratio: ONE,
-                    enter_legs: 0,
-                    direct_legs: 0,
-                };
-            }
-            let mut live: Vec<GraphEdge> = Vec::with_capacity(edges.len());
-            let mut protos: u8 = 0;
-            let mut proto_bits = 0u16;
-            let mut min_outgoing: Option<f64> = None;
-            let mut max_outgoing_ratio = ONE;
-            let mut enter_legs = 0u16;
-            let mut direct_legs = 0u16;
-            for ge in edges {
-                if !is_live_graph_edge(ge) {
-                    continue;
-                }
-                if index < token_count {
-                    match ge.phase {
-                        GraphHopPhase::EnterPool => enter_legs = enter_legs.saturating_add(1),
-                        GraphHopPhase::Direct => direct_legs = direct_legs.saturating_add(1),
-                        GraphHopPhase::ExitPool => {}
-                    }
-                    let bit = 1u16 << (ge.edge.protocol as u8);
-                    if proto_bits & bit == 0 {
-                        protos += 1;
-                        proto_bits |= bit;
-                    }
-                    if ge.phase == GraphHopPhase::Direct {
-                        let w = ge.log_weight;
-                        match min_outgoing {
-                            Some(ref mut best) if w < *best => *best = w,
-                            None => min_outgoing = Some(w),
-                            _ => {}
-                        }
-                        if ge.ratio >= ONE && ge.ratio > max_outgoing_ratio {
-                            max_outgoing_ratio = ge.ratio;
-                        }
-                    }
-                }
-                live.push(*ge);
-            }
-            // Best (most negative log-weight) edges first so DFS finds
-            // profitable cycles earlier and can hit max_cycles before deadline.
-            live.sort_unstable_by(|a, b| {
-                a.log_weight
-                    .partial_cmp(&b.log_weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            NodePrep {
-                live,
-                protos,
-                min_outgoing,
-                max_outgoing_ratio,
-                enter_legs,
-                direct_legs,
-            }
-        })
-        .collect();
+    let per_node: Vec<NodePrep> = if crate::util::should_use_rayon(node_count) {
+        (0..node_count)
+            .into_par_iter()
+            .map(|index| prep_node(index, token_count, graph, coverage.as_ref()))
+            .collect()
+    } else {
+        (0..node_count)
+            .map(|index| prep_node(index, token_count, graph, coverage.as_ref()))
+            .collect()
+    };
 
     let mut hub_enter = 0usize;
     let mut hub_direct = 0usize;
@@ -602,7 +615,7 @@ fn hub_exit_legs(
     hub_node: u32,
     meta: &PoolMeta,
     state: &PoolState,
-) -> smallvec::SmallVec<[u8; 8]> {
+) -> smallvec::SmallVec<[u8; MAX_POOL_TOKENS]> {
     // Prefer live funded legs so newly funded Balancer/Woofi tokens appear mid-cache.
     let live = crate::pipeline::graph::funded_token_indices(state, meta);
     if !live.is_empty() {
@@ -1338,7 +1351,7 @@ pub fn apply_protocol_diverse_selection(
 
     let mut selected: Vec<FoundCycle> = Vec::with_capacity(cap);
     let mut seen: rustc_hash::FxHashSet<u64> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default());
+        rustc_hash::FxHashSet::with_capacity_and_hasher(cap, rustc_hash::FxBuildHasher);
 
     while selected.len() < cap && active_len > 0 {
         let mut i = 0;

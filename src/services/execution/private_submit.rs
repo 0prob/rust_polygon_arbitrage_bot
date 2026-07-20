@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use alloy::eips::eip2718::Encodable2718;
 use alloy::hex;
-use alloy::network::Ethereum;
+use alloy::network::{
+    Ethereum, EthereumWallet, NetworkTransactionBuilder, TransactionBuilder,
+};
 use alloy::primitives::B256;
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
@@ -15,7 +17,6 @@ use crate::infra::http::{HttpClientOpts, build_static};
 use crate::infra::json_rpc::{
     BloxroutePrivateTxParams, BloxrouteRequest, JsonRpcRequest, JsonRpcResponse, JsonRpcResult,
 };
-use serde_json::Value;
 
 const BLOXROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -170,32 +171,31 @@ pub async fn submit_bloxroute_private(raw_tx: &[u8], auth_header: &str) -> anyho
     let resp = post_bloxroute(&body, auth_header, SUBMIT_TIMEOUT).await?;
     let status = resp.status();
     // bloXroute returns HTTP 400 for JSON-RPC application errors; the body still has details.
-    let body = resp
-        .text()
+    let bytes = resp
+        .bytes()
         .await
         .context("bloxroute response read failed")?;
-    parse_bloxroute_submit_response(status, &body)
+    parse_bloxroute_submit_response(status, &bytes)
 }
 
 fn parse_bloxroute_submit_response(
     status: reqwest::StatusCode,
-    body: &str,
+    body: &[u8],
 ) -> anyhow::Result<B256> {
-    let trimmed = body.trim();
+    let trimmed = body.trim_ascii();
     if trimmed.is_empty() {
         anyhow::bail!("bloxroute returned empty response body (HTTP {status})");
     }
 
-    let value: Value = serde_json::from_str(trimmed).with_context(|| {
+    let parsed: JsonRpcResponse<'_> = serde_json::from_slice(trimmed).with_context(|| {
         format!(
             "bloxroute response decode failed (HTTP {status}): {}",
             preview_response_body(trimmed)
         )
     })?;
 
-    if let Some(err) = value.get("error") {
-        let message = jsonrpc_error_message(err).unwrap_or_else(|| err.to_string());
-        anyhow::bail!("bloxroute polygon_private_tx: {message}");
+    if let Some(err) = parsed.error {
+        anyhow::bail!("bloxroute polygon_private_tx: {}", err.message);
     }
     if !status.is_success() {
         anyhow::bail!(
@@ -204,9 +204,10 @@ fn parse_bloxroute_submit_response(
         );
     }
 
-    let hash_str = value
-        .get("result")
-        .and_then(extract_bloxroute_tx_hash)
+    let hash_str = parsed
+        .result
+        .as_ref()
+        .and_then(JsonRpcResult::as_tx_hash)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "bloxroute response missing tx_hash: {}",
@@ -216,31 +217,14 @@ fn parse_bloxroute_submit_response(
     parse_bloxroute_tx_hash(hash_str)
 }
 
-fn jsonrpc_error_message(err: &Value) -> Option<String> {
-    err.get("message").and_then(|msg| match msg {
-        Value::String(s) => Some(s.clone()),
-        Value::Null => None,
-        other => Some(other.to_string()),
-    })
-}
-
-fn extract_bloxroute_tx_hash(result: &Value) -> Option<&str> {
-    match result {
-        Value::String(hash) => Some(hash.as_str()),
-        Value::Object(map) => ["tx_hash", "txHash", "transactionHash", "hash"]
-            .iter()
-            .find_map(|key| map.get(*key))
-            .and_then(Value::as_str),
-        _ => None,
-    }
-}
-
-fn preview_response_body(body: &str) -> String {
+fn preview_response_body(body: &[u8]) -> String {
     const MAX: usize = 300;
+    let preview = &body[..body.len().min(MAX)];
+    let text = String::from_utf8_lossy(preview);
     if body.len() <= MAX {
-        body.to_string()
+        text.into_owned()
     } else {
-        format!("{}...", &body[..MAX])
+        format!("{text}...")
     }
 }
 
@@ -346,39 +330,19 @@ pub struct PrivateSubmitConfig {
 
 /// Sign a [`TransactionRequest`] and return EIP-2718-encoded raw bytes
 /// suitable for `eth_sendRawTransaction*` or `polygon_private_tx`.
+///
+/// Uses Alloy's `TransactionRequest::build` + `Encodable2718` (official raw-tx path).
 pub async fn sign_tx_to_raw(
     tx: TransactionRequest,
     signer: &PrivateKeySigner,
     chain_id: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-    use alloy::network::TxSigner;
-
-    let mut unsigned = TxEip1559 {
-        chain_id,
-        nonce: tx.nonce.ok_or_else(|| anyhow::anyhow!("nonce required"))?,
-        gas_limit: tx
-            .gas
-            .ok_or_else(|| anyhow::anyhow!("gas_limit required"))?,
-        max_fee_per_gas: tx
-            .max_fee_per_gas
-            .ok_or_else(|| anyhow::anyhow!("max_fee_per_gas required"))?,
-        max_priority_fee_per_gas: tx
-            .max_priority_fee_per_gas
-            .ok_or_else(|| anyhow::anyhow!("max_priority_fee_per_gas required"))?,
-        to: tx
-            .to
-            .ok_or_else(|| anyhow::anyhow!("to address required"))?,
-        value: tx.value.unwrap_or_default(),
-        access_list: tx.access_list.unwrap_or_default(),
-        input: tx.input.into_input().unwrap_or_default(),
-    };
-
-    let sig = signer
-        .sign_transaction(&mut unsigned)
+    let wallet = EthereumWallet::from(signer.clone());
+    let envelope = tx
+        .with_chain_id(chain_id)
+        .build(&wallet)
         .await
         .context("tx signing failed")?;
-    let envelope = TxEnvelope::Eip1559(unsigned.into_signed(sig));
     Ok(envelope.encoded_2718())
 }
 
@@ -415,6 +379,27 @@ pub async fn submit_via_provider<P: Provider<Ethereum>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::{Address, U256};
+
+    #[tokio::test]
+    async fn sign_tx_to_raw_produces_eip1559_type_byte() {
+        // Anvil account #0 — local signing only, no network.
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .expect("test key");
+        let tx = TransactionRequest::default()
+            .to(Address::repeat_byte(0x11))
+            .nonce(0)
+            .gas_limit(21_000)
+            .max_fee_per_gas(20_000_000_000)
+            .max_priority_fee_per_gas(1_000_000_000)
+            .value(U256::from(1u64));
+        let raw = sign_tx_to_raw(tx, &signer, 137)
+            .await
+            .expect("sign eip1559");
+        assert_eq!(raw.first().copied(), Some(0x02));
+    }
 
     #[test]
     fn bloxroute_request_matches_official_shape() {
@@ -485,7 +470,7 @@ mod tests {
 
     #[test]
     fn parse_bloxroute_submit_response_accepts_documented_shapes() {
-        let err = r#"{"id":1,"error":{"code":-32602,"message":"The transaction is invalid."},"jsonrpc":"2.0"}"#;
+        let err = br#"{"id":1,"error":{"code":-32602,"message":"The transaction is invalid."},"jsonrpc":"2.0"}"#;
         let err_out = parse_bloxroute_submit_response(reqwest::StatusCode::BAD_REQUEST, err);
         assert!(
             err_out
@@ -494,7 +479,7 @@ mod tests {
                 .contains("The transaction is invalid.")
         );
 
-        let ok = r#"{"jsonrpc":"2.0","id":"1","result":{"tx_hash":"ffd59870844e5bfa54a69ab0123456789abcdef0123456789abcdef012345678"}}"#;
+        let ok = br#"{"jsonrpc":"2.0","id":"1","result":{"tx_hash":"ffd59870844e5bfa54a69ab0123456789abcdef0123456789abcdef012345678"}}"#;
         let hash =
             parse_bloxroute_submit_response(reqwest::StatusCode::OK, ok).expect("snake_case");
         assert_eq!(
@@ -502,7 +487,7 @@ mod tests {
             "0xffd59870844e5bfa54a69ab0123456789abcdef0123456789abcdef012345678"
         );
 
-        let camel = r#"{"jsonrpc":"2.0","id":1,"result":{"txHash":"ffd59870844e5bfa54a69ab0123456789abcdef0123456789abcdef012345678"}}"#;
+        let camel = br#"{"jsonrpc":"2.0","id":1,"result":{"txHash":"ffd59870844e5bfa54a69ab0123456789abcdef0123456789abcdef012345678"}}"#;
         let hash =
             parse_bloxroute_submit_response(reqwest::StatusCode::OK, camel).expect("camelCase");
         assert_eq!(

@@ -4,6 +4,8 @@ pub mod curve_crypto;
 pub mod dodo;
 pub mod fixed_point;
 pub(crate) mod log_exp_math;
+#[cfg(test)]
+pub(crate) mod proptest_util;
 pub mod sqrt_price_math;
 pub mod swap_math;
 pub mod tick_math;

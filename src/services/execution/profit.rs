@@ -3,8 +3,6 @@ use std::sync::atomic::AtomicU64;
 use alloy::primitives::Address;
 use alloy::primitives::U256;
 use rustc_hash::FxHashMap;
-use thiserror::Error;
-
 use crate::core::constants::BPS_SCALE;
 use crate::core::types::{FlashLoanSource, ProfitAssessment, TokenIndex};
 use crate::pipeline::arena::StateArena;
@@ -53,21 +51,13 @@ pub const DODO_EXTERNAL_FLASH_ENABLED: bool = false;
 /// Cap profit-derived priority fee boost at 200 gwei (matches submit.rs).
 pub const MAX_PROFIT_PRIORITY_FEE_WEI: u128 = 200_000_000_000;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ProfitError {
-    #[error("invalid slippage {slippage_bps} bps")]
-    InvalidSlippage { slippage_bps: u64 },
-    #[error("arithmetic overflow in {field}")]
-    ArithmeticOverflow { field: &'static str },
-    #[error("token/MATIC rate unavailable")]
-    RateUnavailable,
-}
-
 pub fn flash_loan_fee_bps(source: FlashLoanSource) -> u64 {
     match source {
         // batchSwap flash-swap pays no Vault flashLoan fee.
         FlashLoanSource::Direct => 0,
-        FlashLoanSource::Balancer => balancer_flash_fee_pct_to_bps(balancer_flash_loan_fee_pct_cached()),
+        FlashLoanSource::Balancer => {
+            balancer_flash_fee_pct_to_bps(balancer_flash_loan_fee_pct_cached())
+        }
         FlashLoanSource::AaveV3 => {
             AAVE_FLASH_LOAN_FEE_BPS.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -112,9 +102,7 @@ pub fn flash_loan_fee_amount(source: FlashLoanSource, amount: U256) -> Option<U2
                 return Some(U256::ZERO);
             }
             let bps = DODO_FLASH_LOAN_FEE_BPS;
-            amount
-                .checked_mul(U256::from(bps))
-                .map(|v| v / BPS_SCALE)
+            amount.checked_mul(U256::from(bps)).map(|v| v / BPS_SCALE)
         }
     }
 }
@@ -1123,7 +1111,10 @@ mod safety_tests {
         let amount = U256::from(1_000u64);
         let fee = flash_loan_fee_amount(FlashLoanSource::AaveV3, amount).unwrap();
         assert_eq!(fee, U256::from(1u64)); // floor would be 0
-        assert_eq!(aave_percent_mul(U256::from(10_000u64), 5), Some(U256::from(5u64)));
+        assert_eq!(
+            aave_percent_mul(U256::from(10_000u64), 5),
+            Some(U256::from(5u64))
+        );
     }
 
     #[test]
@@ -1135,7 +1126,8 @@ mod safety_tests {
         );
         // 1 bps = 1e14 in 1e18 FixedPoint
         set_balancer_flash_loan_fee_pct(100_000_000_000_000);
-        let fee = flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64)).unwrap();
+        let fee =
+            flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64)).unwrap();
         assert_eq!(fee, U256::from(100u64));
         assert_eq!(balancer_flash_fee_pct_to_bps(100_000_000_000_000), 1);
         assert!(!DODO_EXTERNAL_FLASH_ENABLED);
@@ -1222,7 +1214,11 @@ mod proptests {
         }
 
         #[test]
-        fn slippage_at_or_above_10000_rejects(gross in 1u64..1000u64, amount_in in 1u64..1000u64) {
+        fn slippage_at_or_above_10000_rejects(
+            gross in 1u64..1000u64,
+            amount_in in 1u64..1000u64,
+            slippage in 10_000u64..=50_000u64,
+        ) {
             let input = AssessProfitInput {
                 gross_profit: U256::from(gross),
                 amount_in: U256::from(amount_in),
@@ -1233,7 +1229,7 @@ mod proptests {
                 hop_count: 1,
                 min_profit_matic_wei: U256::ZERO,
                 min_profit_roi_bps: 0,
-                slippage_bps: 10_000,
+                slippage_bps: slippage,
                 flash_loan_source: FlashLoanSource::Balancer,
                 safety_multiplier_bps: 0,
                 profit_priority_alpha_bps: 0,

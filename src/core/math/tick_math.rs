@@ -171,7 +171,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
     use proptest::prelude::*;
@@ -181,18 +180,20 @@ mod proptests {
         fn tick_sqrt_price_round_trip(
             tick in (MIN_TICK + 1)..=MAX_TICK,
         ) {
-            if let Some(sqrt_price) = get_sqrt_ratio_at_tick(tick) {
-                let round_trip = get_tick_at_sqrt_ratio_in_range(
-                    sqrt_price,
-                    MIN_TICK,
-                    MAX_TICK,
-                );
-                prop_assert!(round_trip.is_some(),
-                    "round-trip None for tick={}", tick);
-                let rt = round_trip.unwrap();
-                prop_assert!(rt.abs_diff(tick) <= 1,
-                    "round-trip error: tick={}, got={}", tick, rt);
-            }
+            let Some(sqrt_price) = get_sqrt_ratio_at_tick(tick) else {
+                return Err(TestCaseError::fail(format!(
+                    "valid tick {tick} must map to a sqrt price"
+                )));
+            };
+            let Some(rt) = get_tick_at_sqrt_ratio_in_range(sqrt_price, MIN_TICK, MAX_TICK) else {
+                return Err(TestCaseError::fail(format!(
+                    "round-trip None for tick={tick}"
+                )));
+            };
+            prop_assert!(
+                rt.abs_diff(tick) <= 1,
+                "round-trip error: tick={tick}, got={rt}"
+            );
         }
 
         #[test]
@@ -200,14 +201,17 @@ mod proptests {
             tick_a in (MIN_TICK + 1)..=MAX_TICK,
             tick_b in (MIN_TICK + 1)..=MAX_TICK,
         ) {
-            if tick_a >= tick_b { return Ok(()); }
-            let px_a = get_sqrt_ratio_at_tick(tick_a);
-            let px_b = get_sqrt_ratio_at_tick(tick_b);
-            if let (Some(a), Some(b)) = (px_a, px_b) {
-                prop_assert!(b > a,
-                    "higher tick {} has lower price than lower tick {}: {:?} <= {:?}",
-                    tick_b, tick_a, b, a);
-            }
+            prop_assume!(tick_a < tick_b);
+            let Some(a) = get_sqrt_ratio_at_tick(tick_a) else {
+                return Err(TestCaseError::fail("valid tick_a must have a price"));
+            };
+            let Some(b) = get_sqrt_ratio_at_tick(tick_b) else {
+                return Err(TestCaseError::fail("valid tick_b must have a price"));
+            };
+            prop_assert!(
+                b > a,
+                "higher tick {tick_b} has lower price than lower tick {tick_a}: {b:?} <= {a:?}"
+            );
         }
     }
 }

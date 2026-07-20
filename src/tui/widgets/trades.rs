@@ -1,38 +1,29 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
 use crate::tui::app::{App, Severity};
 use crate::tui::layout;
 use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(12), Constraint::Length(8)])
-        .split(area);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(8)]).areas(area);
 
     let len = app.trade_history.len();
     let table_block = theme::table_block("Trades");
-    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let visible_rows = layout::table_body_rows(&table_block, table_area);
     let (start, end) = layout::table_viewport(len, app.selected_index, visible_rows);
 
     let mut rows = Vec::with_capacity(end.saturating_sub(start));
-    for (view_idx, trade) in app
+    for trade in app
         .trade_history
         .iter()
         .rev()
-        .enumerate()
         .skip(start)
         .take(end.saturating_sub(start))
     {
-        let selected = view_idx == app.selected_index;
-        let style = if selected {
-            theme::selected_row()
-        } else {
-            ratatui::style::Style::default().bg(theme::PANEL)
-        };
         rows.push(
             Row::new(vec![
                 Cell::from(format!("{:x}", trade.fingerprint)),
@@ -49,11 +40,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ),
                 Cell::from(trade.tx_hash.as_deref().unwrap_or("-")),
             ])
-            .style(style),
+            .style(ratatui::style::Style::default().bg(theme::PANEL)),
         );
     }
 
-    frame.render_widget(
+    let mut table_state = TableState::default();
+    if len > 0 {
+        table_state.select(Some(app.selected_index.saturating_sub(start)));
+    }
+    frame.render_stateful_widget(
         Table::new(
             rows,
             [
@@ -74,8 +69,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
             .style(theme::table_header()),
         )
-        .block(table_block),
-        chunks[0],
+        .block(table_block)
+        .row_highlight_style(theme::selected_row()),
+        table_area,
+        &mut table_state,
     );
 
     let detail = if let Some(row) = app.selected_trade() {
@@ -108,12 +105,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![Line::from("no trade history yet")]
     };
     frame.render_widget(
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Latest", theme::title()),
-            ],
-        ))),
-        chunks[1],
+        Paragraph::new(detail).block(Block::bordered().title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Latest", theme::title()),
+        ]))),
+        detail_area,
     );
 }

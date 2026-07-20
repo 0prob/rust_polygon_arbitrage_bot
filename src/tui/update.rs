@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, U256};
 use alloy::sol_types::SolCall;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use rustc_hash::FxHashMap;
 
 use crate::config::AppConfig;
@@ -67,12 +67,12 @@ pub fn apply_event(app: &mut App, event: UiEvent) {
 }
 
 fn handle_input(app: &mut App, event: &Event) {
-    match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, *key),
-        Event::Paste(text) => handle_paste(app, text),
-        // Resize only needs a redraw; route filter/sort key is unchanged.
-        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Key(_) | Event::Mouse(_) => {}
+    if let Some(key) = event.as_key_press_event() {
+        handle_key(app, key);
+    } else if let Some(text) = event.as_paste_event() {
+        handle_paste(app, text);
     }
+    // Resize/focus/mouse: redraw only; route filter/sort key is unchanged.
 }
 
 fn handle_paste(app: &mut App, text: &str) {
@@ -171,17 +171,18 @@ pub struct RuntimeSnapshotInput {
     pub config_rows: Vec<KeyValueRow>,
     pub route_cache: Option<RouteBuildCache>,
     /// Prebuilt / COW graph view (poller skips full rebuild when generation matches).
-    pub graph: GraphSnapshot,
+    pub graph: Arc<GraphSnapshot>,
 }
 
 #[derive(Clone)]
 pub struct RouteBuildCache {
     pub generation: u64,
     pub gas_gwei: Option<f64>,
+    /// `Arc<Vec<_>>` so the TUI can `Arc::make_mut` for status overlays.
     pub opportunities: Arc<Vec<RouteSummary>>,
     /// Cached graph body keyed by `graph_generation` (indexer fields patched each poll).
     pub graph_generation: u64,
-    pub graph: Option<GraphSnapshot>,
+    pub graph: Option<Arc<GraphSnapshot>>,
 }
 
 impl Default for RouteBuildCache {
@@ -203,19 +204,27 @@ pub fn graph_snapshot_for_poll(
     hypersync_height: Option<u64>,
     indexer_lag_blocks: u64,
     stale_indexer: bool,
-) -> GraphSnapshot {
+) -> Arc<GraphSnapshot> {
     if cache.graph_generation == snap.generation
-        && let Some(cached) = cache.graph.as_ref()
+        && let Some(mut cached) = cache.graph.take()
     {
-        let mut graph = cached.clone();
-        graph.health.indexer_lag_blocks = indexer_lag_blocks;
-        graph.health.hypersync_height = hypersync_height;
-        graph.health.stale_indexer = stale_indexer;
-        return graph;
+        {
+            let graph = Arc::make_mut(&mut cached);
+            graph.health.indexer_lag_blocks = indexer_lag_blocks;
+            graph.health.hypersync_height = hypersync_height;
+            graph.health.stale_indexer = stale_indexer;
+        }
+        cache.graph = Some(Arc::clone(&cached));
+        return cached;
     }
-    let graph = build_graph_snapshot(snap, hypersync_height, indexer_lag_blocks, stale_indexer);
+    let graph = Arc::new(build_graph_snapshot(
+        snap,
+        hypersync_height,
+        indexer_lag_blocks,
+        stale_indexer,
+    ));
     cache.graph_generation = snap.generation;
-    cache.graph = Some(graph.clone());
+    cache.graph = Some(Arc::clone(&graph));
     graph
 }
 
@@ -272,9 +281,10 @@ pub async fn build_snapshot(input: RuntimeSnapshotInput) -> DashboardSnapshot {
     }
 }
 
-fn protocol_label_for_meta(meta: &crate::pipeline::types::PoolMeta) -> String {
-    meta.protocol_label.clone().unwrap_or_else(|| {
-        match meta.protocol {
+fn protocol_label_str(meta: &crate::pipeline::types::PoolMeta) -> &str {
+    meta.protocol_label
+        .as_deref()
+        .unwrap_or(match meta.protocol {
             ProtocolType::UniswapV2 => "uniswap-v2",
             ProtocolType::UniswapV3 => "uniswap-v3",
             ProtocolType::UniswapV4 => "uniswap-v4",
@@ -283,9 +293,17 @@ fn protocol_label_for_meta(meta: &crate::pipeline::types::PoolMeta) -> String {
             ProtocolType::CurveCrypto => "curve-crypto",
             ProtocolType::Dodo => "dodo",
             ProtocolType::Woofi => "woofi",
-        }
-        .to_string()
-    })
+        })
+}
+
+fn bump_label_count(counts: &mut BTreeMap<String, usize>, label: &str) {
+    // Avoid String alloc on every hit — `entry(label.to_owned())` reallocates the key
+    // even when the bucket already exists.
+    if let Some(count) = counts.get_mut(label) {
+        *count += 1;
+    } else {
+        counts.insert(label.to_owned(), 1);
+    }
 }
 
 fn build_graph_snapshot(
@@ -296,9 +314,7 @@ fn build_graph_snapshot(
 ) -> GraphSnapshot {
     let mut arena_counts: BTreeMap<String, usize> = BTreeMap::new();
     for meta in snap.pool_metas.iter() {
-        *arena_counts
-            .entry(protocol_label_for_meta(meta))
-            .or_default() += 1;
+        bump_label_count(&mut arena_counts, protocol_label_str(meta));
     }
 
     let mut token_counts: FxHashMap<u32, usize> = FxHashMap::default();
@@ -328,25 +344,25 @@ fn build_graph_snapshot(
         })
         .collect();
 
-    let mut protocol_labels: BTreeMap<String, ()> = BTreeMap::new();
+    let mut protocol_labels: BTreeMap<&str, ()> = BTreeMap::new();
     for label in arena_counts.keys() {
-        protocol_labels.insert(label.clone(), ());
+        protocol_labels.insert(label.as_str(), ());
     }
     for label in snap.graph_active_by_protocol.keys() {
-        protocol_labels.insert(label.clone(), ());
+        protocol_labels.insert(label.as_str(), ());
     }
     let protocol_count = protocol_labels.len();
     let protocol_counts = protocol_labels
         .into_keys()
         .map(|label| {
-            let arena = arena_counts.get(&label).copied().unwrap_or(0);
+            let arena = arena_counts.get(label).copied().unwrap_or(0);
             let graph = snap
                 .graph_active_by_protocol
-                .get(&label)
+                .get(label)
                 .copied()
                 .unwrap_or(0);
             KeyValueRow {
-                key: label,
+                key: label.to_owned(),
                 value: format!("{graph}/{arena} graph/arena"),
                 severity: if graph == 0 && arena > 0 {
                     Severity::Warn
@@ -647,7 +663,12 @@ fn build_route_row_parts(
         });
     }
 
-    let _ = write!(detail, "hops {} score {:.4}", cycle.edge_hops(), cycle.score);
+    let _ = write!(
+        detail,
+        "hops {} score {:.4}",
+        cycle.edge_hops(),
+        cycle.score
+    );
 
     (
         route_parts.join(" -> "),

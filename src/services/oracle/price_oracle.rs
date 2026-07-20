@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -6,8 +5,9 @@ use alloy::primitives::U256;
 use alloy::primitives::{Address, I256, address};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
+use parking_lot::RwLock;
 use reqwest::{Client, Url};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 
 const ORACLE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -269,18 +269,16 @@ struct PriceEntry {
 pub struct PriceOracle {
     http: Client,
     pyth_hermes_url: String,
-    matic_usd: parking_lot::RwLock<Option<PriceEntry>>,
-    token_usd: parking_lot::RwLock<FxHashMap<Address, PriceEntry>>,
+    matic_usd: RwLock<Option<PriceEntry>>,
+    token_usd: RwLock<FxHashMap<Address, PriceEntry>>,
     /// Raw Chainlink USD answers (8 decimals) for integer profit conversion.
-    chainlink_usd_raw: parking_lot::RwLock<FxHashMap<Address, I256>>,
+    chainlink_usd_raw: RwLock<FxHashMap<Address, I256>>,
     /// Config-driven Pyth feed overrides (token -> Pyth price ID).
-    custom_pyth: parking_lot::RwLock<FxHashMap<Address, String>>,
+    custom_pyth: RwLock<FxHashMap<Address, String>>,
     /// Config-driven Chainlink feed overrides (token -> aggregator address).
-    custom_chainlink: parking_lot::RwLock<FxHashMap<Address, Address>>,
+    custom_chainlink: RwLock<FxHashMap<Address, Address>>,
     /// Configurable cache TTL — overrides DEFAULT_CACHE_TTL_MS.
     cache_ttl: Duration,
-    /// Monotonic clock of the last successful rate-build across all tokens.
-    pub rates_updated_at: parking_lot::RwLock<Option<Instant>>,
     /// Coalesce concurrent MATIC/USD refreshes (HF ticks at 200ms can stampede).
     matic_refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -291,13 +289,12 @@ impl PriceOracle {
         Self {
             http,
             pyth_hermes_url,
-            matic_usd: parking_lot::RwLock::new(None),
-            token_usd: parking_lot::RwLock::new(FxHashMap::default()),
-            chainlink_usd_raw: parking_lot::RwLock::new(FxHashMap::default()),
-            custom_pyth: parking_lot::RwLock::new(FxHashMap::default()),
-            custom_chainlink: parking_lot::RwLock::new(FxHashMap::default()),
+            matic_usd: RwLock::new(None),
+            token_usd: RwLock::new(FxHashMap::default()),
+            chainlink_usd_raw: RwLock::new(FxHashMap::default()),
+            custom_pyth: RwLock::new(FxHashMap::default()),
+            custom_chainlink: RwLock::new(FxHashMap::default()),
             cache_ttl: Duration::from_millis(cache_ttl_ms),
-            rates_updated_at: parking_lot::RwLock::new(None),
             matic_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -662,49 +659,74 @@ impl PriceOracle {
         Some(quote.usd)
     }
 
-    async fn fetch_pyth(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
+    async fn fetch_pyth(&self, ids: &[&str]) -> anyhow::Result<FxHashMap<String, PythQuote>> {
         if ids.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(FxHashMap::default());
         }
         let chunks: Vec<&[&str]> = ids.chunks(PYTH_FETCH_CHUNK).collect();
         if chunks.len() == 1 {
             return self.fetch_pyth_chunk(chunks[0]).await;
         }
         // Parallel Hermes GETs — cold LF enrich often has 2+ chunks of feed ids.
-        let results =
-            futures_util::future::join_all(chunks.iter().map(|chunk| self.fetch_pyth_chunk(chunk)))
-                .await;
-        let mut out = HashMap::with_capacity(ids.len());
-        for batch in results {
-            out.extend(batch?);
+        // JoinSet (not futures_util::join_all): same concurrency style as pool_fetch/rpc.
+        let mut tasks = tokio::task::JoinSet::new();
+        for chunk in chunks {
+            let owned: Vec<String> = chunk.iter().map(|id| (*id).to_owned()).collect();
+            let http = self.http.clone();
+            let base = self.pyth_hermes_url.clone();
+            tasks.spawn(async move {
+                let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                Self::fetch_pyth_chunk_with(&http, &base, &refs).await
+            });
+        }
+        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), FxBuildHasher);
+        while let Some(joined) = tasks.join_next().await {
+            out.extend(
+                joined
+                    .map_err(|e| anyhow::anyhow!("pyth chunk task failed: {e}"))??,
+            );
         }
         Ok(out)
     }
 
-    async fn fetch_pyth_chunk(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
-        match self.fetch_pyth_once(ids).await {
+    async fn fetch_pyth_chunk(
+        &self,
+        ids: &[&str],
+    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+        Self::fetch_pyth_chunk_with(&self.http, &self.pyth_hermes_url, ids).await
+    }
+
+    async fn fetch_pyth_chunk_with(
+        http: &Client,
+        base_url: &str,
+        ids: &[&str],
+    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+        match Self::fetch_pyth_once_with(http, base_url, ids).await {
             Ok(prices) => Ok(prices),
             Err(e) => {
                 crate::debug!("Pyth Hermes request failed — retrying once: {e}");
-                self.fetch_pyth_once(ids).await
+                Self::fetch_pyth_once_with(http, base_url, ids).await
             }
         }
     }
 
-    async fn fetch_pyth_once(&self, ids: &[&str]) -> anyhow::Result<HashMap<String, PythQuote>> {
+    async fn fetch_pyth_once_with(
+        http: &Client,
+        base_url: &str,
+        ids: &[&str],
+    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
         if ids.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(FxHashMap::default());
         }
-        let url = pyth_updates_url(&self.pyth_hermes_url, ids)?;
-        let resp = self
-            .http
+        let url = pyth_updates_url(base_url, ids)?;
+        let resp = http
             .get(url)
             .timeout(ORACLE_HTTP_TIMEOUT)
             .send()
             .await?
             .error_for_status()?;
         let body: PythHermesResponse = resp.json().await?;
-        let mut out = HashMap::with_capacity(body.parsed.len());
+        let mut out = FxHashMap::with_capacity_and_hasher(body.parsed.len(), FxBuildHasher);
         for item in body.parsed {
             let Some(mantissa) = item.price.mantissa.as_i128() else {
                 continue;
@@ -764,7 +786,7 @@ impl PriceOracle {
         };
         // Snapshot USD cache once — avoids per-addr `token_usd` re-locks on LF enrich.
         let token_usd = self.token_usd.read();
-        let mut out = FxHashMap::with_capacity_and_hasher(addrs.len(), rustc_hash::FxBuildHasher);
+        let mut out = FxHashMap::with_capacity_and_hasher(addrs.len(), FxBuildHasher);
         for addr in addrs {
             let fresh = token_usd
                 .get(addr)

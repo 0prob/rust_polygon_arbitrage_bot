@@ -7,6 +7,7 @@ use alloy::primitives::Address;
 use alloy::primitives::address;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
+use serde::{Deserialize, Serialize};
 
 use super::RateEnrichStats;
 use super::feed_verify;
@@ -282,6 +283,14 @@ pub fn default_runtime_demand_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("target/run-logs/oracle-demand.json"))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DemandSnapshotRow {
+    address: String,
+    demand_score: u64,
+    #[serde(default)]
+    symbol: String,
+}
+
 pub fn persist_runtime_demand_snapshot(path: &Path) -> anyhow::Result<()> {
     let snap = snapshot_runtime_unmapped_demand();
     if snap.is_empty() {
@@ -295,36 +304,30 @@ pub fn persist_runtime_demand_snapshot(path: &Path) -> anyhow::Result<()> {
         lines.push((addr, score));
     }
     lines.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let body: Vec<serde_json::Value> = lines
+    let body: Vec<DemandSnapshotRow> = lines
         .into_iter()
-        .map(|(addr, score)| {
-            serde_json::json!({
-                "address": format!("{addr:#x}"),
-                "demand_score": score,
-                "symbol": token_symbol_label(&addr).unwrap_or(""),
-            })
+        .map(|(addr, score)| DemandSnapshotRow {
+            address: format!("{addr:#x}"),
+            demand_score: score,
+            symbol: token_symbol_label(&addr)
+                .unwrap_or("")
+                .to_string(),
         })
         .collect();
-    std::fs::write(path, serde_json::to_string_pretty(&body)?)?;
+    let file = std::fs::File::create(path)?;
+    serde_json::to_writer_pretty(file, &body)?;
     Ok(())
 }
 
 pub fn load_runtime_demand_snapshot(path: &Path) -> anyhow::Result<FxHashMap<Address, u64>> {
-    let raw = std::fs::read_to_string(path)?;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+    let raw = std::fs::read(path)?;
+    let rows: Vec<DemandSnapshotRow> = serde_json::from_slice(&raw)?;
     let mut out = FxHashMap::default();
     for row in rows {
-        let Some(addr_s) = row.get("address").and_then(|v| v.as_str()) else {
+        let Ok(addr) = row.address.parse::<Address>() else {
             continue;
         };
-        let Ok(addr) = addr_s.parse::<Address>() else {
-            continue;
-        };
-        let score = row
-            .get("demand_score")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        out.insert(addr, score);
+        out.insert(addr, row.demand_score);
     }
     Ok(out)
 }

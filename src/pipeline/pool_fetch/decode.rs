@@ -217,9 +217,9 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
     } else {
         U256::ZERO
     };
-    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(
-        by_kind(CallKind::DodoPmmState)?,
-    )
+    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(by_kind(
+        CallKind::DodoPmmState,
+    )?)
     .ok()?;
     let pmm_i = U256::from(pmm.i);
     let pmm_k = U256::from(pmm.K);

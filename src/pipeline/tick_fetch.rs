@@ -229,6 +229,26 @@ fn finalize_cl_ticks(ticks: &mut Vec<V3Tick>) {
     ticks.dedup_by(|a, b| a.tick == b.tick);
 }
 
+/// Bitmap-word visit order centered on the current-tick word (cap-friendly).
+#[must_use]
+fn cl_bitmap_center_out_offsets(word_count: usize) -> Vec<usize> {
+    if word_count == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(word_count);
+    let mid = word_count / 2;
+    out.push(mid);
+    for d in 1..=mid.max(word_count.saturating_sub(mid + 1)) {
+        if mid >= d {
+            out.push(mid - d);
+        }
+        if mid + d < word_count {
+            out.push(mid + d);
+        }
+    }
+    out
+}
+
 /// Collect (algebra, algebra_integral) pool address sets from metas for tick enrichment.
 /// Integral pools are also algebra (use special tick path) but require different decode ABI.
 #[must_use]
@@ -476,7 +496,11 @@ pub async fn enrich_v3_ticks<
     // initialized ticks outside word_range=10 (Algebra-only widen misses them).
     // Cap + liquidity-rank: full widen of 30+ empties dominates LF under rate limits.
     let mut wide_loaded = 0usize;
-    if updated < pool_addresses.len() && word_range < 48 {
+    // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
+    // may enter the empty cooldown — capped-out narrow misses must stay eligible.
+    let mut wide_attempted: FxHashSet<Address> = FxHashSet::default();
+    let widen_available = word_range < 48;
+    if updated < pool_addresses.len() && widen_available {
         let wide_range = word_range.saturating_mul(3).max(24).min(48);
         let mut still_empty: Vec<(Address, u128)> = Vec::new();
         let mut seen: FxHashSet<Address> = FxHashSet::default();
@@ -498,6 +522,7 @@ pub async fn enrich_v3_ticks<
                 .take(MAX_WIDE_TICK_POOLS)
                 .map(|(p, _)| p)
                 .collect();
+            wide_attempted.extend(wide_targets.iter().copied());
             wide_loaded =
                 enrich_v3_tick_lens_only(provider, arena, &wide_targets, wide_range, block_number)
                     .await;
@@ -526,7 +551,11 @@ pub async fn enrich_v3_ticks<
     let needs_url_fallback = !still_tickless.is_empty()
         && (tick_lens_rpc_failed || algebra.rpc_failed || incomplete_pools > 0);
     if !still_tickless.is_empty() && !needs_url_fallback {
-        mark_empty_tick_cooldown(still_tickless.iter().copied());
+        // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
+        let cool = still_tickless.iter().copied().filter(|p| {
+            !widen_available || wide_attempted.contains(p)
+        });
+        mark_empty_tick_cooldown(cool);
     }
 
     if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
@@ -748,26 +777,41 @@ pub async fn enrich_v4_ticks<
         }
     };
 
+    // Dense spacing=1 pools can exhaust the tick-info budget; hydrate high-liquidity
+    // pools first so the cap does not starve the routes that matter.
+    let mut spans = spans;
+    spans.sort_unstable_by(|a, b| {
+        let liq = |idx: PoolIndex| match arena.pool_state(idx) {
+            Some(crate::core::types::PoolState::V4(s)) => s.liquidity,
+            _ => 0,
+        };
+        liq(b.0).cmp(&liq(a.0))
+    });
+
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
     let mut incomplete_pools = FxHashSet::default();
     let mut capped = false;
-    'pools: for (idx, pool_id, spacing, word_min, start, end) in spans {
+    for (idx, pool_id, spacing, word_min, start, end) in spans {
         let mut complete = true;
-        for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
-            let Some(bytes) = bytes else {
+        let mut pool_capped = false;
+        // Center-out word order: when capped, keep ticks nearest the current price.
+        'words: for offset in cl_bitmap_center_out_offsets(end - start) {
+            let Some(bytes) = bitmaps[start + offset].as_ref() else {
                 complete = false;
-                break;
+                continue;
             };
             let Some(bitmap) = decode_abi_word(bytes) else {
                 complete = false;
-                break;
+                continue;
             };
             for bit in 0..256u16 {
                 if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                    // ponytail: stop this pool only — keep budget peers eligible
                     incomplete_pools.insert(idx);
                     capped = true;
-                    break 'pools;
+                    pool_capped = true;
+                    break 'words;
                 }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
                     continue;
@@ -784,7 +828,7 @@ pub async fn enrich_v4_ticks<
                 tick_owners.push((idx, tick));
             }
         }
-        if !complete {
+        if !complete && !pool_capped {
             incomplete_pools.insert(idx);
         }
     }
@@ -811,12 +855,12 @@ pub async fn enrich_v4_ticks<
         let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
             rustc_hash::FxHashMap::default();
         for ((idx, tick), bytes) in tick_owners.into_iter().zip(states) {
+            // Missing individual tick reads must not discard the rest of the pool —
+            // partial depth beats staying tickless (shallow-cap path already gates size).
             let Some(bytes) = bytes else {
-                incomplete_pools.insert(idx);
                 continue;
             };
             let Some(raw) = decode_abi_word(&bytes) else {
-                incomplete_pools.insert(idx);
                 continue;
             };
             let (liquidity_gross, liquidity_net) = decode_v4_tick_liquidity(raw);
@@ -830,7 +874,7 @@ pub async fn enrich_v4_ticks<
         }
 
         for (idx, mut ticks) in grouped {
-            if incomplete_pools.contains(&idx) {
+            if ticks.is_empty() {
                 continue;
             }
             finalize_cl_ticks(&mut ticks);
@@ -849,7 +893,7 @@ pub async fn enrich_v4_ticks<
     };
     if !incomplete_pools.is_empty() || capped {
         crate::warn!(
-            "v4 tick hydration left {} pools tickless after partial responses or read cap (capped={capped})",
+            "v4 tick hydration partial/capped: incomplete_pools={} capped={capped} loaded={updated}",
             incomplete_pools.len()
         );
     }
@@ -857,7 +901,11 @@ pub async fn enrich_v4_ticks<
     // Wider bitmap window for still-empty V4 (same sparse-tick pattern as V3).
     // Liquidity-ranked cap mirrors V3 — full widen of 90+ V4 empties was ~2s p50.
     let mut wide_loaded = 0usize;
-    if updated < targets.len() && word_range < 48 {
+    // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
+    // may enter the empty cooldown — capped-out narrow misses must stay eligible.
+    let mut wide_attempted: FxHashSet<FixedBytes<32>> = FxHashSet::default();
+    let widen_available = word_range < 48;
+    if updated < targets.len() && widen_available {
         let wide_range = word_range.saturating_mul(3).max(24).min(48);
         let mut still: Vec<(PoolIndex, FixedBytes<32>, u128)> = targets
             .iter()
@@ -876,6 +924,7 @@ pub async fn enrich_v4_ticks<
                 .take(MAX_WIDE_TICK_POOLS)
                 .map(|(idx, pool_id, _)| (idx, pool_id))
                 .collect();
+            wide_attempted.extend(wide_targets.iter().map(|&(_, id)| id));
             wide_loaded =
                 enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number)
                     .await;
@@ -900,7 +949,11 @@ pub async fn enrich_v4_ticks<
     let incomplete_count = incomplete_pools.len();
     let needs_url_fallback = !still_tickless.is_empty() && (incomplete_count > 0 || capped);
     if !still_tickless.is_empty() && !needs_url_fallback {
-        mark_empty_v4_tick_cooldown(still_tickless.iter().copied());
+        // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
+        let cool = still_tickless.iter().copied().filter(|id| {
+            !widen_available || wide_attempted.contains(id)
+        });
+        mark_empty_v4_tick_cooldown(cool);
     }
 
     if empty_pools > 0 || wide_loaded > 0 || updated > 0 {
@@ -974,11 +1027,19 @@ async fn enrich_v4_ticks_once<
     let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
         return 0;
     };
+    let mut spans = spans;
+    spans.sort_unstable_by(|a, b| {
+        let liq = |idx: PoolIndex| match arena.pool_state(idx) {
+            Some(crate::core::types::PoolState::V4(s)) => s.liquidity,
+            _ => 0,
+        };
+        liq(b.0).cmp(&liq(a.0))
+    });
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
     for (idx, pool_id, spacing, word_min, start, end) in spans {
-        for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
-            let Some(bytes) = bytes else {
+        'words: for offset in cl_bitmap_center_out_offsets(end - start) {
+            let Some(bytes) = bitmaps[start + offset].as_ref() else {
                 continue;
             };
             let Some(bitmap) = decode_abi_word(bytes) else {
@@ -986,7 +1047,7 @@ async fn enrich_v4_ticks_once<
             };
             for bit in 0..256u16 {
                 if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
-                    break;
+                    break 'words;
                 }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
                     continue;
@@ -1205,6 +1266,18 @@ mod tests {
     fn bitmap_bit_reconstructs_spacing_aligned_tick() {
         assert_eq!(cl_tick_from_bitmap_bit(0, 1, 60), Some(60));
         assert_eq!(cl_tick_from_bitmap_bit(-1, 0, 60), Some(-256 * 60));
+    }
+
+    #[test]
+    fn cl_bitmap_center_out_offsets_visits_mid_first() {
+        assert!(cl_bitmap_center_out_offsets(0).is_empty());
+        assert_eq!(cl_bitmap_center_out_offsets(1), vec![0]);
+        assert_eq!(cl_bitmap_center_out_offsets(5), vec![2, 1, 3, 0, 4]);
+        let mut seen = cl_bitmap_center_out_offsets(21);
+        assert_eq!(seen.len(), 21);
+        assert_eq!(seen[0], 10);
+        seen.sort_unstable();
+        assert_eq!(seen, (0..21).collect::<Vec<_>>());
     }
 
     #[test]

@@ -28,9 +28,17 @@ pub fn encode_balancer_hop(
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     let pool_id = resolve_balancer_pool_id(hop.pool_address, hop.pool_id)?;
     // Weighted multi-token single swaps overquote vs vault by >50 bps on some
-    // pools (BAL#507 = SWAP_LIMIT). Shared floor with assess / V2 / Curve.
+    // pools (BAL#507 = SWAP_LIMIT). Shared floor with assess / V2 / Curve; take
+    // the tighter of re-quote vs conservative_execution_hops amount_out.
     let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
-    let limit = super::shared::compute_min_out(arena, hop, bps, "balancer")?;
+    let limit = {
+        let quoted = super::shared::compute_min_out(arena, hop, bps, "balancer")?;
+        if hop.amount_out.is_zero() {
+            quoted
+        } else {
+            hop.amount_out.min(quoted)
+        }
+    };
 
     let swap = IBalancerVault::swapCall {
         singleSwap: BalancerSingleSwap {

@@ -77,8 +77,8 @@ pub use flash_policy::{FlashLoanPolicy, hf_eval_flash_source, try_parse_flash_po
 pub use gas::{FeeSnapshot, compute_assessment_gas_price, compute_conservative_gas_price};
 pub use gas_oracle::{GasOracle, ROUTE_GAS_CACHE_MIN_ROUTES, RouteGasLookup};
 pub use profit::{
-    AssessProfitInput, AssessmentGas, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitError,
-    ProfitEvalContext, ProfitThresholds, RouteAssessRequest, RouteProfitParams, assess_profit,
+    AssessProfitInput, AssessmentGas, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitEvalContext,
+    ProfitThresholds, RouteAssessRequest, RouteProfitParams, assess_profit,
     assess_route_from_sim, assess_route_profit, assessment_gas_units, compound_slippage_bps,
     modeled_net_profit_tokens, on_chain_min_profit_for_route, on_chain_min_profit_from_assessment,
     profit_priority_uplift_wei, safety_floor_matic_wei,

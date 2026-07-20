@@ -35,7 +35,7 @@ pub enum JsonRpcResult<'a> {
 
 #[derive(Debug, Deserialize)]
 pub struct BloxrouteTxResult<'a> {
-    #[serde(alias = "txHash")]
+    #[serde(alias = "txHash", alias = "transactionHash", alias = "hash")]
     #[serde(borrow)]
     pub tx_hash: Cow<'a, str>,
 }

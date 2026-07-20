@@ -1,7 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -16,25 +16,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
 
-    let left_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(" ", theme::muted()),
-            Span::styled("Health", theme::title()),
-        ]));
-    let max_lines = layout::inner_lines(&left_block, chunks[0]);
+    let left_block = Block::bordered().title(Line::from(vec![
+        Span::styled(" ", theme::muted()),
+        Span::styled("Health", theme::title()),
+    ]));
+    let max_lines = layout::inner_lines(&left_block, left_area);
     let left: Vec<Line> = snapshot
         .diagnostics
         .iter()
         .take(max_lines)
         .map(|row| theme::label_value(row.key.clone(), row.value.clone(), row.severity))
         .collect();
-    frame.render_widget(Paragraph::new(left).block(left_block), chunks[0]);
+    frame.render_widget(Paragraph::new(left).block(left_block), left_area);
 
     let right = vec![
         theme::label_value(
@@ -74,12 +70,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     ];
     frame.render_widget(
-        Paragraph::new(right).block(Block::default().borders(Borders::ALL).title(Line::from(
-            vec![
-                Span::styled(" ", theme::muted()),
-                Span::styled("Runtime", theme::title()),
-            ],
-        ))),
-        chunks[1],
+        Paragraph::new(right).block(Block::bordered().title(Line::from(vec![
+            Span::styled(" ", theme::muted()),
+            Span::styled("Runtime", theme::title()),
+        ]))),
+        right_area,
     );
 }

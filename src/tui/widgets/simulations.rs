@@ -1,7 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use crate::tui::app::{App, Severity};
 use crate::tui::layout;
@@ -10,14 +10,12 @@ use crate::tui::theme;
 /// HF Pipeline tab: post-verify assess/dispatch candidates with real gates.
 /// Not a second soft-sim of Opportunities.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(14), Constraint::Length(12)])
-        .split(area);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(12)]).areas(area);
 
     let total = app.hf_candidates.len();
     let table_block = theme::table_block("HF Pipeline");
-    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let visible_rows = layout::table_body_rows(&table_block, table_area);
     let selected = if total == 0 {
         0
     } else {
@@ -58,7 +56,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
     }
 
-    frame.render_widget(
+    let mut table_state = TableState::default();
+    if total > 0 {
+        table_state.select(Some(selected.saturating_sub(start)));
+    }
+    frame.render_stateful_widget(
         Table::new(
             rows,
             [
@@ -87,8 +89,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "HF Pipeline (full gates) [{} / {}] — not LF soft scout",
             if total == 0 { 0 } else { start + 1 },
             total
-        )))),
-        chunks[0],
+        ))))
+        .row_highlight_style(theme::selected_row()),
+        table_area,
+        &mut table_state,
     );
 
     let detail = if let Some(row) = app.hf_candidates.get(selected).filter(|_| total > 0) {
@@ -175,6 +179,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(detail).block(theme::panel_block("HF candidate detail")),
-        chunks[1],
+        detail_area,
     );
 }

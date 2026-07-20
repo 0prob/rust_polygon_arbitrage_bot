@@ -339,15 +339,11 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
+    use crate::core::math::proptest_util::{U256_AMT_MAX, u256_fp18, u256_nonzero};
     use alloy::primitives::Address;
     use proptest::prelude::*;
-
-    fn non_zero_u256() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX / 2).prop_map(U256::from)
-    }
 
     fn small_fee() -> impl Strategy<Value = U256> {
         (0u64..100_000u64).prop_map(U256::from)
@@ -355,17 +351,16 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn fee_adjusted_invariant(
-            amount in (1u128..u128::MAX / 1_000_000).prop_map(U256::from),
-            price in non_zero_u256(),
-            spread in (0u128..=1_000_000_000_000_000_000u128).prop_map(U256::from),
-            coeff in (0u128..1_000_000_000_000_000_000u128).prop_map(U256::from),
-            reserve in non_zero_u256(),
+        fn output_bounded_by_quote_reserve(
+            amount in (1u128..=U256_AMT_MAX / 1_000_000).prop_map(U256::from),
+            price in u256_nonzero(),
+            spread in u256_fp18(),
+            coeff in (0u128..=crate::core::math::proptest_util::FP18_ONE).prop_map(U256::from),
+            reserve in u256_nonzero(),
             fee_rate in small_fee(),
-            quote_reserve in non_zero_u256(),
-            max_gamma in (0u128..=1_000_000_000_000_000_000u128).prop_map(U256::from),
+            quote_reserve in u256_nonzero(),
+            max_gamma in (0u128..=crate::core::math::proptest_util::FP18_ONE).prop_map(U256::from),
         ) {
-            let spread = spread % super::super::fixed_point::ONE;
             let base = WoofiBaseTokenState {
                 price,
                 spread,
@@ -388,8 +383,11 @@ mod proptests {
 
             let out = get_woofi_amount_out(&state, amount, false, true, Some(0), None);
             if !out.is_zero() {
-                prop_assert!(out <= state.quote_reserve,
-                    "woofi out={} exceeds quote reserve={}", out, state.quote_reserve);
+                prop_assert!(
+                    out <= state.quote_reserve,
+                    "woofi out={out} exceeds quote reserve={}",
+                    state.quote_reserve
+                );
             }
         }
     }

@@ -269,13 +269,13 @@ impl ExecutionService {
         let route_stats = Self::replay_route_stats(&route_stats_path);
         Self {
             last_submit: RwLock::new(FxHashMap::default()),
-            last_global_submit: parking_lot::Mutex::new(None),
-            mempool_nonce_cache: parking_lot::Mutex::new(None),
+            last_global_submit: Mutex::new(None),
+            mempool_nonce_cache: Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
             direct_token_quarantine: RwLock::new(FxHashMap::default()),
             underwater_strikes: RwLock::new(FxHashMap::default()),
-            global_quarantine_until: parking_lot::Mutex::new(None),
+            global_quarantine_until: Mutex::new(None),
             fail_counts: RwLock::new(FxHashMap::default()),
             nonce: RwLock::new(None),
             flash_liquidity: Arc::new(FlashLiquidityCache::new()),
@@ -1058,7 +1058,7 @@ impl ExecutionService {
             Err(e) => {
                 self.quarantine_route(fp, now, RouteFailureKind::DryRun);
                 let outcome = ExecutionOutcome::DryRunFailed {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
                 if let Some(ui_hook) = ui_hook {
                     ui_hook.on_execution_outcome(&outcome, fp);
@@ -1206,7 +1206,7 @@ impl ExecutionService {
             Err(e) => {
                 crate::warn!("dispatch skip: fp={}, mempool check failed: {e:#}", fp);
                 return ExecutionOutcome::SubmitFailed {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
             }
         };
@@ -1320,7 +1320,7 @@ impl ExecutionService {
             Ok(n) => n,
             Err(e) => {
                 let outcome = ExecutionOutcome::SubmitFailed {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
                 if let Some(ui_hook) = ui_hook {
                     ui_hook.on_execution_outcome(&outcome, fp);
@@ -1380,7 +1380,7 @@ impl ExecutionService {
                     }
                 }
                 let outcome = ExecutionOutcome::SubmitFailed {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
                 if let Some(ui_hook) = ui_hook {
                     ui_hook.on_execution_outcome(&outcome, fp);

@@ -1,18 +1,16 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use crate::tui::app::App;
 use crate::tui::layout;
 use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(14), Constraint::Length(11)])
-        .split(area);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(11)]).areas(area);
 
     let Some((snapshot, indices)) = app.route_view() else {
         frame.render_widget(
@@ -25,7 +23,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let total = indices.len();
     let table_block = theme::table_block("Opportunities");
-    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let visible_rows = layout::table_body_rows(&table_block, table_area);
     let (start, end) = layout::table_viewport(total, app.selected_index, visible_rows);
     let table_block = table_block.title(Line::from(format!(
         "Opportunities · LF scout (soft gates) [{} / {}] filter: {} | sort: {:?}",
@@ -40,19 +38,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     )));
 
     let mut table_rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(start));
-    for (idx, &route_idx) in indices[start..end].iter().enumerate() {
+    for &route_idx in &indices[start..end] {
         let Some(route) = snapshot.opportunities.get(route_idx) else {
             continue;
         };
-        let selected = start + idx == app.selected_index;
         let net_style = if route.net_profit_matic > 0.0 {
             theme::good()
         } else {
             theme::bad()
         };
-        let style = if selected {
-            theme::selected_row()
-        } else if route.long_tail {
+        let style = if route.long_tail {
             theme::warn()
         } else {
             Style::default().bg(theme::PANEL)
@@ -101,7 +96,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(10),
     ];
 
-    frame.render_widget(
+    let mut table_state = TableState::default();
+    if total > 0 {
+        table_state.select(Some(app.selected_index.saturating_sub(start)));
+    }
+    frame.render_stateful_widget(
         Table::new(table_rows, widths)
             .header(
                 Row::new(vec![
@@ -117,7 +116,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )
             .block(table_block)
             .row_highlight_style(theme::selected_row()),
-        chunks[0],
+        table_area,
+        &mut table_state,
     );
 
     let detail = if let Some(route) = app.selected_route() {
@@ -226,7 +226,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(detail).block(theme::panel_block("Selected route")),
-        chunks[1],
+        detail_area,
     );
 }
 

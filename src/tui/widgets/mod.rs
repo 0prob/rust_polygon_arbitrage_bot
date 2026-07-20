@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::{Frame, text::Line};
 
 use crate::tui::app::{App, Tab};
@@ -65,8 +65,7 @@ fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         vec![Line::from("no selection")]
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .border_style(theme::muted())
         .title(Line::from(vec![ratatui::text::Span::styled(
             " status ",

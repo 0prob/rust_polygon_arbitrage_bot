@@ -1,7 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -16,39 +16,34 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(14), Constraint::Length(10)])
-        .split(area);
+    let [table_area, bottom_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(10)]).areas(area);
 
     let total = snapshot.portfolio.len();
     let table_block = theme::table_block("Portfolio");
-    let visible_rows = layout::table_body_rows(&table_block, chunks[0]);
+    let visible_rows = layout::table_body_rows(&table_block, table_area);
     let selected = app.selected_row_index().unwrap_or(0);
     let (start, end) = layout::table_viewport(total, selected, visible_rows);
 
     let rows = snapshot.portfolio[start..end]
         .iter()
-        .enumerate()
         .map(|row| {
-            let is_selected = start + row.0 == selected;
-            let style = if is_selected {
-                theme::selected_row()
-            } else {
-                theme::severity_style(row.1.severity)
-            };
             Row::new(vec![
-                Cell::from(row.1.label.clone()),
-                Cell::from(row.1.address.clone()),
-                Cell::from(row.1.balance.clone()),
-                Cell::from(row.1.usd.clone()),
-                Cell::from(row.1.source.clone()),
+                Cell::from(row.label.clone()),
+                Cell::from(row.address.clone()),
+                Cell::from(row.balance.clone()),
+                Cell::from(row.usd.clone()),
+                Cell::from(row.source.clone()),
             ])
-            .style(style)
+            .style(theme::severity_style(row.severity))
         })
         .collect::<Vec<_>>();
 
-    frame.render_widget(
+    let mut table_state = TableState::default();
+    if total > 0 {
+        table_state.select(Some(selected.saturating_sub(start)));
+    }
+    frame.render_stateful_widget(
         Table::new(
             rows,
             [
@@ -79,8 +74,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ),
                 theme::title(),
             ),
-        ]))),
-        chunks[0],
+        ])))
+        .row_highlight_style(theme::selected_row()),
+        table_area,
+        &mut table_state,
     );
 
     let summary = vec![
@@ -123,16 +120,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     );
 
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(chunks[1]);
+    let [summary_area, selected_area] =
+        Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .areas(bottom_area);
     frame.render_widget(
         Paragraph::new(summary).block(theme::panel_block("Summary")),
-        bottom[0],
+        summary_area,
     );
     frame.render_widget(
         Paragraph::new(selected).block(theme::panel_block("Selected asset")),
-        bottom[1],
+        selected_area,
     );
 }

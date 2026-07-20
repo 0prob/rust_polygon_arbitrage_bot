@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, U256};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rpbot::config::CycleFinderMode;
 use rpbot::core::constants::MIN_HOP_TOKEN_BALANCE;
 use rpbot::core::math::uniswap_v2::simulate_v2_swap;
@@ -15,8 +15,10 @@ use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-fn bench_v2_swap(c: &mut Criterion) {
-    let state = V2PoolState {
+fn bench_swaps(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swap");
+
+    let v2 = V2PoolState {
         reserve0: U256::from(10_000_000u64) * U256::from(10u128.pow(18)),
         reserve1: U256::from(20_000_000u64) * U256::from(10u128.pow(6)),
         fee: U256::from(997u64),
@@ -24,13 +26,11 @@ fn bench_v2_swap(c: &mut Criterion) {
         block_timestamp_last: 0,
     };
     let amount = U256::from(10u128.pow(15));
-    c.bench_function("simulate_v2_swap", |b| {
-        b.iter(|| simulate_v2_swap(black_box(&state), black_box(amount), true, Some(30)));
+    group.bench_function("v2", |b| {
+        b.iter(|| simulate_v2_swap(black_box(&v2), black_box(amount), true, Some(30)));
     });
-}
 
-fn bench_v3_swap(c: &mut Criterion) {
-    let state = V3PoolState {
+    let v3 = V3PoolState {
         sqrt_price_x96: U256::from(1u128 << 96),
         liquidity: 10_000_000_000,
         tick: 0,
@@ -52,12 +52,11 @@ fn bench_v3_swap(c: &mut Criterion) {
             },
         ]),
     };
-    let amount = U256::from(10u128.pow(15));
-    c.bench_function("simulate_v3_swap_ticks", |b| {
-        b.iter(|| {
-            simulate_v3_swap(black_box(&state), black_box(amount), true, Some(30), false)
-        });
+    group.bench_function("v3_ticks", |b| {
+        b.iter(|| simulate_v3_swap(black_box(&v3), black_box(amount), true, Some(30), false));
     });
+
+    group.finish();
 }
 
 fn bench_route_sim(c: &mut Criterion) {
@@ -110,9 +109,13 @@ fn bench_route_sim(c: &mut Criterion) {
         .map(|ge| ge.edge)
         .collect();
     let amount = U256::from(10u128.pow(15));
-    c.bench_function("simulate_route_3hop", |b| {
+
+    let mut group = c.benchmark_group("route");
+    group.throughput(Throughput::Elements(3));
+    group.bench_function("simulate_3hop", |b| {
         b.iter(|| simulate_route_minimal(black_box(&arena), black_box(&edges), black_box(amount)));
     });
+    group.finish();
 }
 
 fn bench_graph_rescore(c: &mut Criterion) {
@@ -143,10 +146,19 @@ fn bench_graph_rescore(c: &mut Criterion) {
             30,
         ));
     }
-    let mut graph = build_graph(&arena, &metas);
-    c.bench_function("rescore_graph_64_pools", |b| {
-        b.iter(|| rescore_graph_in_place(black_box(&arena), black_box(&mut graph)));
+    let graph = build_graph(&arena, &metas);
+
+    let mut group = c.benchmark_group("graph");
+    group.throughput(Throughput::Elements(64));
+    // rescore mutates + may compact adjacency — clone per iteration (Criterion timing-loop guide).
+    group.bench_function("rescore_64_pools", |b| {
+        b.iter_batched(
+            || graph.clone(),
+            |mut g| rescore_graph_in_place(black_box(&arena), black_box(&mut g)),
+            BatchSize::SmallInput,
+        );
     });
+    group.finish();
 }
 
 fn bench_cycle_search(c: &mut Criterion) {
@@ -196,8 +208,11 @@ fn bench_cycle_search(c: &mut Criterion) {
         max_hops: 4,
         max_cycles: 500,
     }];
-    c.bench_function("find_cycles_hybrid_3pool", |b| {
-        b.iter(|| {
+
+    let mut group = c.benchmark_group("search");
+    // Drop Vec<FoundCycle> outside the timed loop (Criterion: iter_with_large_drop).
+    group.bench_function("find_cycles_hybrid_3pool", |b| {
+        b.iter_with_large_drop(|| {
             find_cycles_for_mode(
                 CycleFinderMode::Hybrid,
                 black_box(&arena),
@@ -210,6 +225,7 @@ fn bench_cycle_search(c: &mut Criterion) {
             .cycles
         });
     });
+    group.finish();
 }
 
 fn bench_optimize_cycle(c: &mut Criterion) {
@@ -278,7 +294,9 @@ fn bench_optimize_cycle(c: &mut Criterion) {
         50,
         rpbot::core::types::FlashLoanSource::Balancer,
     );
-    c.bench_function("optimize_cycle_2hop", |b| {
+
+    let mut group = c.benchmark_group("optimize");
+    group.bench_function("cycle_2hop", |b| {
         b.iter(|| {
             optimize_cycle(
                 black_box(&arena),
@@ -297,12 +315,12 @@ fn bench_optimize_cycle(c: &mut Criterion) {
             )
         });
     });
+    group.finish();
 }
 
 criterion_group!(
     benches,
-    bench_v2_swap,
-    bench_v3_swap,
+    bench_swaps,
     bench_route_sim,
     bench_graph_rescore,
     bench_cycle_search,

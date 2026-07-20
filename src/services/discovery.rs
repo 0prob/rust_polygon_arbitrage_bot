@@ -844,7 +844,10 @@ mod tests {
             )
             .expect("supported Balancer pool");
             assert_eq!(pool.pool_type.as_deref(), expected);
-            assert!(pool.pool_id_verified, "PG Balancer pool_id must skip hydrate RPC");
+            assert!(
+                pool.pool_id_verified,
+                "PG Balancer pool_id must skip hydrate RPC"
+            );
         }
     }
 

@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy::primitives::U256;
-use dashmap::DashMap;
-use rustc_hash::FxBuildHasher;
+use parking_lot::Mutex;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::pipeline::types::MinimalSimResult;
 
@@ -37,9 +37,11 @@ impl RouteSimCacheStats {
     }
 }
 
+/// Shared across rayon Brent workers. One mutex avoids DashMap `len`/`retain`/`clear`
+/// stampedes (docs: those lock every shard; parallel callers wipe each other).
 #[derive(Debug, Default)]
 pub struct RouteSimCache {
-    entries: DashMap<RouteSimKey, MinimalSimResult, FxBuildHasher>,
+    entries: Mutex<FxHashMap<RouteSimKey, MinimalSimResult>>,
     pub stats: RouteSimCacheStats,
     last_logged_traffic: AtomicU64,
 }
@@ -48,7 +50,10 @@ impl RouteSimCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: DashMap::with_capacity_and_hasher(ROUTE_SIM_CACHE_CAPACITY, FxBuildHasher),
+            entries: Mutex::new(FxHashMap::with_capacity_and_hasher(
+                ROUTE_SIM_CACHE_CAPACITY,
+                FxBuildHasher,
+            )),
             stats: RouteSimCacheStats::default(),
             last_logged_traffic: AtomicU64::new(0),
         }
@@ -66,9 +71,9 @@ impl RouteSimCache {
             route_fp,
             amount,
         };
-        if let Some(entry) = self.entries.get(&key) {
+        if let Some(entry) = self.entries.lock().get(&key).copied() {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(*entry);
+            return Some(entry);
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
         None
@@ -81,23 +86,22 @@ impl RouteSimCache {
         amount: U256,
         sim: MinimalSimResult,
     ) {
-        if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
-            // ponytail: DashMap iter().next() victim was arbitrary + racy under
-            // parallel Brent. Drop stale revisions first; hard-clear if still full.
-            let before = self.entries.len();
-            self.entries
-                .retain(|k, _| k.route_state_revision == route_state_revision);
-            if self.entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
-                self.entries.clear();
+        let mut entries = self.entries.lock();
+        if entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+            // Drop stale revisions first; hard-clear if still full.
+            let before = entries.len();
+            entries.retain(|k, _| k.route_state_revision == route_state_revision);
+            if entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+                entries.clear();
             }
-            let removed = before.saturating_sub(self.entries.len());
+            let removed = before.saturating_sub(entries.len());
             if removed > 0 {
                 self.stats
                     .evictions
                     .fetch_add(removed as u64, Ordering::Relaxed);
             }
         }
-        self.entries.insert(
+        entries.insert(
             RouteSimKey {
                 route_state_revision,
                 route_fp,
@@ -121,7 +125,7 @@ impl RouteSimCache {
             self.stats.hit_rate_bps(),
             self.stats.inserts.load(Ordering::Relaxed),
             self.stats.evictions.load(Ordering::Relaxed),
-            self.entries.len()
+            self.entries.lock().len()
         );
     }
 
@@ -137,7 +141,7 @@ impl RouteSimCache {
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
-        self.entries.len()
+        self.entries.lock().len()
     }
 }
 

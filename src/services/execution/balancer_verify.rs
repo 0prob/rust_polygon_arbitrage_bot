@@ -341,8 +341,14 @@ fn confirm_decode_revert(raw: &str) -> Option<String> {
 }
 
 fn confirm_extract_revert_bytes(raw: &str) -> Option<Vec<u8>> {
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw)
-        && let Some(data) = map.get("data").and_then(|v| v.as_str())
+    // Typed partial parse (serde_json docs: prefer structs over Value for known keys).
+    #[derive(serde::Deserialize)]
+    struct RpcRevertEnvelope<'a> {
+        #[serde(borrow)]
+        data: Option<&'a str>,
+    }
+    if let Ok(env) = serde_json::from_str::<RpcRevertEnvelope<'_>>(raw)
+        && let Some(data) = env.data
     {
         let hex = data.strip_prefix("0x").unwrap_or(data);
         if let Ok(bytes) = alloy::hex::decode(hex) {
@@ -505,5 +511,12 @@ mod tests {
         let bal = U256::from(1_000_000u64);
         assert!(!exceeds_balancer_max_in_ratio(U256::from(300_000u64), bal));
         assert!(exceeds_balancer_max_in_ratio(U256::from(300_001u64), bal));
+    }
+
+    #[test]
+    fn confirm_extract_revert_bytes_reads_json_data_field() {
+        let raw = r#"{"code":3,"message":"execution reverted","data":"0x08c379a0"}"#;
+        let bytes = confirm_extract_revert_bytes(raw).expect("json data");
+        assert_eq!(bytes, alloy::hex::decode("08c379a0").expect("hex"));
     }
 }

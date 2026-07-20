@@ -2,7 +2,7 @@
 //!
 //! Per reqwest 0.13 docs: reuse one `Client` per role, set `user_agent`, and call
 //! `no_proxy()` so env proxy vars cannot redirect RPC/API traffic.
-//! TCP_NODELAY + 90s idle timeout applied for RPC responsiveness.
+//! TLS is rustls (aligned with alloy's default); TCP_NODELAY + 90s idle for RPC.
 
 use std::time::Duration;
 

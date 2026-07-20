@@ -1,7 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::tui::app::App;
 use crate::tui::layout;
@@ -16,19 +16,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(area);
+    let [health, protocols, hubs, recent] = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+    ])
+    .areas(area);
 
     render_panel(
         frame,
-        chunks[0],
+        health,
         "Health",
         vec![
             theme::label_value(
@@ -65,7 +63,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     render_panel(
         frame,
-        chunks[1],
+        protocols,
         "Protocols",
         snapshot
             .graph
@@ -77,7 +75,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     render_panel(
         frame,
-        chunks[2],
+        hubs,
         "Hubs",
         snapshot
             .graph
@@ -95,7 +93,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     render_panel(
         frame,
-        chunks[3],
+        recent,
         "Recent",
         snapshot
             .graph
@@ -107,8 +105,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line>) {
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = Block::bordered()
         .style(ratatui::style::Style::default().bg(theme::PANEL))
         .title(Line::from(vec![
             Span::styled(" ", theme::muted()),

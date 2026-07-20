@@ -314,25 +314,22 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
     use crate::core::constants::FEE_PIPS_SCALE;
+    use crate::core::math::proptest_util::{U256_AMT_MAX, u256_nonzero};
     use crate::core::math::sqrt_price_math::{
         get_amount0_delta, get_amount1_delta, get_next_sqrt_price_from_input,
     };
     use proptest::prelude::*;
 
     fn sqrt_price() -> impl Strategy<Value = U256> {
-        (..=u128::MAX).prop_map(|v| {
+        // Sample then clamp into the open Uniswap V3 sqrt-price band.
+        (..=U256_AMT_MAX).prop_map(|v| {
             U256::from(v)
                 .max(MIN_SQRT_RATIO + U256::from(1))
                 .min(MAX_SQRT_RATIO - U256::from(1))
         })
-    }
-
-    fn liquidity() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX).prop_map(U256::from)
     }
 
     proptest! {
@@ -340,47 +337,55 @@ mod proptests {
         fn compute_swap_step_output_bounded(
             sqrt_a in sqrt_price(),
             sqrt_b in sqrt_price(),
-            liq in liquidity(),
-            amount in (1u128..u128::MAX).prop_map(U256::from),
-            fee_pips in 1u32..1000000u32,
+            liq in u256_nonzero(),
+            amount in u256_nonzero(),
+            fee_pips in 1u32..1_000_000u32,
         ) {
-            if sqrt_a == sqrt_b { return Ok(()); }
+            prop_assume!(sqrt_a != sqrt_b);
             let fee = U256::from(fee_pips);
-            if fee >= FEE_PIPS_SCALE { return Ok(()); }
+            prop_assume!(fee < FEE_PIPS_SCALE);
 
-            if let Some(step) = compute_swap_step(sqrt_a, sqrt_b, liq, amount, fee) {
-                let consumed = step.amount_in + step.fee_amount;
-                prop_assert!(consumed <= amount || amount.is_zero(),
-                    "consumed {} exceeds amount {}", consumed, amount);
-            }
+            let Some(step) = compute_swap_step(sqrt_a, sqrt_b, liq, amount, fee) else {
+                return Err(TestCaseError::reject("no swap step for inputs"));
+            };
+            let consumed = step.amount_in + step.fee_amount;
+            prop_assert!(
+                consumed <= amount,
+                "consumed {consumed} exceeds amount {amount}"
+            );
         }
 
         #[test]
         fn amount_delta_liquidity_invariant(
             sqrt_a in sqrt_price(),
             sqrt_b in sqrt_price(),
-            liq in liquidity(),
+            liq in u256_nonzero(),
         ) {
-            if sqrt_a.is_zero() || sqrt_b.is_zero() || sqrt_a == sqrt_b { return Ok(()); }
+            prop_assume!(!sqrt_a.is_zero() && !sqrt_b.is_zero() && sqrt_a != sqrt_b);
 
-            if let Some(amount0) = get_amount0_delta(sqrt_a, sqrt_b, liq, false)
-                && let Some(amount1) = get_amount1_delta(sqrt_a, sqrt_b, liq, false)
-                    && (!amount0.is_zero() || !amount1.is_zero()) {
-                        prop_assert!(!liq.is_zero(), "nonzero delta needs liquidity");
-                    }
+            let Some(amount0) = get_amount0_delta(sqrt_a, sqrt_b, liq, false) else {
+                return Err(TestCaseError::reject("amount0 delta unavailable"));
+            };
+            let Some(amount1) = get_amount1_delta(sqrt_a, sqrt_b, liq, false) else {
+                return Err(TestCaseError::reject("amount1 delta unavailable"));
+            };
+            prop_assume!(!amount0.is_zero() || !amount1.is_zero());
+            prop_assert!(!liq.is_zero(), "nonzero delta needs liquidity");
         }
 
         #[test]
         fn get_next_sqrt_price_monotonic(
             sqrt_px in sqrt_price(),
-            liq in liquidity(),
-            amount in (1u128..u128::MAX).prop_map(U256::from),
+            liq in u256_nonzero(),
+            amount in u256_nonzero(),
         ) {
-            let next = get_next_sqrt_price_from_input(sqrt_px, liq, amount, false);
-            if let Some(next_px) = next {
-                prop_assert!(next_px >= sqrt_px,
-                    "price decreased on non-zero-for-one swap");
-            }
+            let Some(next_px) = get_next_sqrt_price_from_input(sqrt_px, liq, amount, false) else {
+                return Err(TestCaseError::reject("next sqrt price unavailable"));
+            };
+            prop_assert!(
+                next_px >= sqrt_px,
+                "price decreased on non-zero-for-one swap"
+            );
         }
     }
 }

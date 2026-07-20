@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
+use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -42,7 +43,7 @@ use crate::services::state_cache::StateCache;
 use crate::services::state_refresh::{PoolRefreshResult, StateRefreshService};
 use crate::util::now_ms;
 use crate::util::ten_pow_u256;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 pub struct HfContext {
     pub config: Arc<AppConfig>,
@@ -58,7 +59,7 @@ pub struct HfContext {
     pub hypersync: Option<Arc<HyperSyncService>>,
     pub shutdown: watch::Receiver<bool>,
     pub ui_hook: SharedUiHook,
-    pub inactive_rotation: parking_lot::Mutex<InactiveCycleRotation>,
+    pub inactive_rotation: Mutex<InactiveCycleRotation>,
 }
 
 /// Compact HF assess/dispatch row for the TUI (built only from already-evaluated results).
@@ -86,7 +87,7 @@ pub struct HfTickResult {
     pub best_profit: U256,
     pub elapsed_ms: u64,
     /// Dispatch queue (and optional single near-miss when queue empty). Cheap summaries only.
-    pub candidates: Arc<Vec<HfCandidateUiRow>>,
+    pub candidates: Arc<[HfCandidateUiRow]>,
 }
 
 impl Default for HfTickResult {
@@ -96,7 +97,7 @@ impl Default for HfTickResult {
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: 0,
-            candidates: Arc::new(Vec::new()),
+            candidates: Arc::from([]),
         }
     }
 }
@@ -334,7 +335,7 @@ fn hf_reselect_from_snapshot(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: 0,
-            candidates: Arc::new(Vec::new()),
+            candidates: Arc::from([]),
         });
     }
     let _ = selection_generation;
@@ -386,9 +387,9 @@ fn cycle_edges_quarantined(
     if n == 0 {
         return false;
     }
-    let mut rotated: smallvec::SmallVec<[crate::core::types::Edge; 8]> =
-        edges.iter().copied().collect();
-    let mut fps: smallvec::SmallVec<[u64; 8]> = smallvec::SmallVec::with_capacity(n);
+    // from_slice: Copy-optimal without smallvec `specialization` (servo docs).
+    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
+    let mut fps = smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
     for _ in 0..n {
         fps.push(hash_cycle_edges(&rotated));
         rotated.rotate_left(1);
@@ -672,6 +673,16 @@ fn select_cycles_for_rescore(
                 micro_dead_skipped += 1;
                 continue;
             }
+            // Balancer MAX_IN at economic floor → Brent `bal_bounds_fail` (live: all
+            // bounds_fail). Inactive path already prunes; active was skipping this.
+            if crate::pipeline::local_sim::balancer_economic_floor_max_in_dead(
+                arena,
+                &ready.edges,
+                economic_floor,
+            ) {
+                bal_floor_dead_skipped += 1;
+                continue;
+            }
             active.push((ready, score));
             continue;
         }
@@ -769,7 +780,7 @@ fn select_cycles_for_rescore(
     let mut cycles = Vec::with_capacity(activity_selected + inactive_selected);
     let mut hot_pools = FxHashSet::with_capacity_and_hasher(
         (activity_selected + inactive_selected).saturating_mul(3),
-        Default::default(),
+        FxBuildHasher,
     );
 
     for (cycle, _) in active.into_iter().take(activity_selected) {
@@ -826,7 +837,7 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: 0,
-                candidates: Arc::new(Vec::new()),
+                candidates: Arc::from([]),
             });
         }
     }
@@ -843,7 +854,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Arc::new(Vec::new()),
+            candidates: Arc::from([]),
         });
     }
 
@@ -917,7 +928,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Arc::new(Vec::new()),
+            candidates: Arc::from([]),
         });
     }
     let mut hot_pools = hot_pools_arc_from_set(
@@ -934,7 +945,7 @@ pub async fn run_hf_tick(
             profitable_count: 0,
             best_profit: U256::ZERO,
             elapsed_ms: now_ms().saturating_sub(start),
-            candidates: Arc::new(Vec::new()),
+            candidates: Arc::from([]),
         });
     };
     // Spot tip for ranking/assess; submit still uses compute_conservative_gas_price.
@@ -981,7 +992,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::new(Vec::new()),
+                    candidates: Arc::from([]),
                 });
             }
         }
@@ -1032,7 +1043,7 @@ pub async fn run_hf_tick(
                             profitable_count: 0,
                             best_profit: U256::ZERO,
                             elapsed_ms: now_ms().saturating_sub(start),
-                            candidates: Arc::new(Vec::new()),
+                            candidates: Arc::from([]),
                         });
                     }
                 }
@@ -1043,7 +1054,7 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Arc::new(Vec::new()),
+                        candidates: Arc::from([]),
                     });
                 }
                 Err(_) => {
@@ -1056,7 +1067,7 @@ pub async fn run_hf_tick(
                         profitable_count: 0,
                         best_profit: U256::ZERO,
                         elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Arc::new(Vec::new()),
+                        candidates: Arc::from([]),
                     });
                 }
             }
@@ -1143,7 +1154,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::new(Vec::new()),
+                    candidates: Arc::from([]),
                 });
             }
         }
@@ -1194,7 +1205,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::new(Vec::new()),
+                    candidates: Arc::from([]),
                 });
             }
             Err(_) => {
@@ -1204,7 +1215,7 @@ pub async fn run_hf_tick(
                     profitable_count: 0,
                     best_profit: U256::ZERO,
                     elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::new(Vec::new()),
+                    candidates: Arc::from([]),
                 });
             }
         },
@@ -1324,7 +1335,7 @@ pub async fn run_hf_tick(
                 profitable_count: 0,
                 best_profit: U256::ZERO,
                 elapsed_ms: now_ms().saturating_sub(start),
-                candidates: Arc::new(Vec::new()),
+                candidates: Arc::from([]),
             });
         }
     };
@@ -1659,7 +1670,7 @@ pub async fn run_hf_tick(
 
     // UI rows from already-evaluated results only (no extra sims). Built before
     // dispatch moves `profitable`; cost is O(dispatch size) short strings.
-    let candidates = Arc::new(build_hf_candidate_ui_rows(
+    let candidates: Arc<[HfCandidateUiRow]> = Arc::from(build_hf_candidate_ui_rows(
         eval_arena.as_ref(),
         pool_metas_for_dispatch.as_ref(),
         &profitable,

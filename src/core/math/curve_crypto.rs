@@ -433,39 +433,34 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
 mod proptests {
     use super::*;
+    use crate::core::math::proptest_util::u256_nonzero;
     use proptest::prelude::*;
-
-    fn non_zero() -> impl Strategy<Value = U256> {
-        (1u128..=u128::MAX).prop_map(U256::from)
-    }
 
     proptest! {
         #[test]
-        fn newton_convergence_or_graceful(
+        fn newton_converged_produces_nonzero_d(
             ann in (100u64..1_000_000u64).prop_map(U256::from),
-            gamma in non_zero(),
-            balance0 in non_zero(),
-            balance1 in non_zero(),
+            gamma in u256_nonzero(),
+            balance0 in u256_nonzero(),
+            balance1 in u256_nonzero(),
         ) {
             let xp = vec![balance0, balance1];
             let result = curve_crypto_newton_d(ann, gamma, &xp);
-            if result.converged {
-                prop_assert!(!result.value.is_zero());
-                let y_result = curve_crypto_newton_y(ann, gamma, &xp, result.value, 1);
-                prop_assert!(y_result.converged || !y_result.value.is_zero());
-            }
+            prop_assume!(result.converged);
+            prop_assert!(!result.value.is_zero());
+            let y_result = curve_crypto_newton_y(ann, gamma, &xp, result.value, 1);
+            prop_assert!(y_result.converged || !y_result.value.is_zero());
         }
 
         #[test]
         fn output_bounded(
-            amount_in in non_zero(),
+            amount_in in u256_nonzero(),
             ann in (100u64..1_000_000u64).prop_map(U256::from),
-            gamma in non_zero(),
-            balance0 in non_zero(),
-            balance1 in non_zero(),
+            gamma in u256_nonzero(),
+            balance0 in u256_nonzero(),
+            balance1 in u256_nonzero(),
         ) {
             let state = CurvePoolState {
                 balances: vec![balance0, balance1],
@@ -478,8 +473,11 @@ mod proptests {
             };
             let out = get_curve_crypto_amount_out(&state, amount_in, 0, 1);
             if !out.is_zero() {
-                prop_assert!(out <= state.balances[1],
-                    "out={} exceeds balance={}", out, state.balances[1]);
+                prop_assert!(
+                    out <= state.balances[1],
+                    "out={out} exceeds balance={}",
+                    state.balances[1]
+                );
             }
         }
     }

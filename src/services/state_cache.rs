@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::Address;
-use parking_lot::{Mutex as ParkingMutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ pub struct StateCache {
     stale_tradable_ttl: Duration,
     generation: AtomicU64,
     /// Pools touched since last graph partial-rescore drain.
-    dirty: ParkingMutex<FxHashSet<Address>>,
+    dirty: Mutex<FxHashSet<Address>>,
 }
 
 impl Default for StateCache {
@@ -50,7 +50,7 @@ impl StateCache {
             invalid_retry_ttl: DEFAULT_INVALID_RETRY_TTL,
             stale_tradable_ttl: DEFAULT_STALE_TRADABLE_TTL,
             generation: AtomicU64::new(0),
-            dirty: ParkingMutex::new(FxHashSet::default()),
+            dirty: Mutex::new(FxHashSet::default()),
         }
     }
 
@@ -293,18 +293,21 @@ impl StateCache {
 
     /// Apply an in-place mutation when a full pool entry already exists.
     pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState)) -> bool {
-        let mut guard = self.inner.write();
-        let Some(entry) = guard.get_mut(&address) else {
-            return false;
-        };
-        // ponytail: Arc::make_mut provides COW semantics — no deep clone when
-        // the Arc is uniquely held (common for hot-patched pool states from WSS).
-        f(Arc::make_mut(&mut entry.state));
-        entry.updated_at = Instant::now();
-        entry.revision = self
-            .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
+        {
+            let mut guard = self.inner.write();
+            let Some(entry) = guard.get_mut(&address) else {
+                return false;
+            };
+            // ponytail: Arc::make_mut provides COW semantics — no deep clone when
+            // the Arc is uniquely held (common for hot-patched pool states from WSS).
+            f(Arc::make_mut(&mut entry.state));
+            entry.updated_at = Instant::now();
+            entry.revision = self
+                .generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+        }
+        // Defer dirty mark until write guard drops (docs: avoid nested lock hold).
         self.mark_dirty(address);
         true
     }
@@ -356,29 +359,35 @@ impl StateCache {
     }
 
     pub fn insert(&self, address: Address, state: PoolState) {
-        let mut guard = self.inner.write();
-        if guard.len() >= self.max_entries
-            && !guard.contains_key(&address)
-            && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
+        let mut dirty_addrs = Vec::with_capacity(2);
         {
-            guard.remove(&victim);
-            // Eviction drops cache state while the LF arena may still reference the pool
-            // until the next sync — mark dirty so partial graph rescore can react.
-            self.mark_dirty(victim);
+            let mut guard = self.inner.write();
+            if guard.len() >= self.max_entries
+                && !guard.contains_key(&address)
+                && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
+            {
+                guard.remove(&victim);
+                // Eviction drops cache state while the LF arena may still reference the pool
+                // until the next sync — mark dirty so partial graph rescore can react.
+                dirty_addrs.push(victim);
+            }
+            let revision = self
+                .generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            guard.insert(
+                address,
+                CachedEntry {
+                    state: Arc::new(state),
+                    updated_at: Instant::now(),
+                    revision,
+                },
+            );
+            dirty_addrs.push(address);
         }
-        let revision = self
-            .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        guard.insert(
-            address,
-            CachedEntry {
-                state: Arc::new(state),
-                updated_at: Instant::now(),
-                revision,
-            },
-        );
-        self.mark_dirty(address);
+        for addr in dirty_addrs {
+            self.mark_dirty(addr);
+        }
     }
 
     pub fn remove(&self, address: &Address) -> bool {

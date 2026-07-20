@@ -45,8 +45,8 @@ pub struct RuntimeContext {
     pub gas_oracle: Arc<GasOracle>,
     pub price_oracle: Arc<PriceOracle>,
     pub hypersync: Option<Arc<HyperSyncService>>,
-    pub graph_cache: Arc<parking_lot::Mutex<GraphCache>>,
-    pub arena: Arc<parking_lot::Mutex<StateArena>>,
+    pub graph_cache: Arc<ParkingMutex<GraphCache>>,
+    pub arena: Arc<ParkingMutex<StateArena>>,
     pub lf_tick_lock: Arc<Mutex<()>>,
     pub ui_hook: SharedUiHook,
     #[cfg(feature = "tui")]
@@ -109,11 +109,11 @@ impl RuntimeContext {
             gas_oracle,
             price_oracle,
             hypersync: hypersync.map(Arc::new),
-            graph_cache: Arc::new(parking_lot::Mutex::new(GraphCache::with_intervals(
+            graph_cache: Arc::new(ParkingMutex::new(GraphCache::with_intervals(
                 rebuild_interval,
                 cycle_refind_interval,
             ))),
-            arena: Arc::new(parking_lot::Mutex::new(StateArena::default())),
+            arena: Arc::new(ParkingMutex::new(StateArena::default())),
             lf_tick_lock: Arc::new(Mutex::new(())),
             ui_hook: Arc::new(()),
             #[cfg(feature = "tui")]
@@ -173,7 +173,7 @@ impl RuntimeContext {
             hypersync: self.hypersync.clone(),
             shutdown,
             ui_hook: Arc::clone(&self.ui_hook),
-            inactive_rotation: parking_lot::Mutex::new(InactiveCycleRotation::default()),
+            inactive_rotation: ParkingMutex::new(InactiveCycleRotation::default()),
         }
     }
 }
@@ -343,9 +343,11 @@ pub async fn run_pass_loop(
     drop(height_rx);
     if let Some(handle) = stream_feed {
         handle.abort();
+        let _ = handle.await;
     }
     if let Some(handle) = sidecars.daily_loss_guard {
         handle.abort();
+        let _ = handle.await;
     }
     let hf_join = hf_scheduler.task.lock().take();
     const TASK_SHUTDOWN: Duration = Duration::from_secs(10);
@@ -374,13 +376,14 @@ pub async fn run_pass_loop(
         crate::warn!("lf background task aborted after {TASK_SHUTDOWN:?} shutdown timeout");
     }
     #[cfg(feature = "tui")]
-    if let Some(handle) = sidecars.snapshot_handle {
+    if let Some(mut handle) = sidecars.snapshot_handle {
         handle.abort();
-        if tokio::time::timeout(Duration::from_secs(2), handle)
+        if tokio::time::timeout(Duration::from_secs(2), &mut handle)
             .await
             .is_err()
         {
             crate::warn!("ui snapshot task did not exit within 2s of shutdown");
+            let _ = handle.await;
         }
     }
     Ok(())

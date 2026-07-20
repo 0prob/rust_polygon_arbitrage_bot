@@ -143,7 +143,11 @@ impl PoolLogFeed {
         addr_rx: &mut watch::Receiver<Vec<Address>>,
     ) -> anyhow::Result<SubscriptionExit> {
         let ws = WsConnect::new(wss_url.to_string());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
+        // Read-only subscriptions: no RecommendedFillers.
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_ws(ws)
+            .await?;
 
         // Topic-only Sync|Swap: address-filtered subs stayed armed but delivered
         // ~0 logs because predicted top-N pools were deep-but-quiet. Topic-wide
@@ -354,10 +358,15 @@ fn ordered_wss_urls(
 async fn probe_wss_latency(url: &str) -> Option<Duration> {
     let started = Instant::now();
     let ws = WsConnect::new(url.to_string());
-    let provider = tokio::time::timeout(WSS_PROBE_TIMEOUT, ProviderBuilder::new().connect_ws(ws))
-        .await
-        .ok()?
-        .ok()?;
+    let provider = tokio::time::timeout(
+        WSS_PROBE_TIMEOUT,
+        ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_ws(ws),
+    )
+    .await
+    .ok()?
+    .ok()?;
     tokio::time::timeout(WSS_PROBE_TIMEOUT, provider.get_block_number())
         .await
         .ok()?
