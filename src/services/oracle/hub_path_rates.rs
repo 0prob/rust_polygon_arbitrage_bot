@@ -330,6 +330,7 @@ pub fn hub_path_matic_rates_batch(
     let mut path_miss = 0u32;
     let mut sim_fail = 0u32;
     let mut alt_rescue = 0u32;
+    let mut dual_reject = 0u32;
     let mut priced = 0u32;
     for token in need {
         if out.contains_key(&token) {
@@ -343,15 +344,10 @@ pub fn hub_path_matic_rates_batch(
             path_miss += 1;
             continue;
         }
-        if let Some(rate) =
-            matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals)
-        {
-            out.insert(token, rate);
-            priced += 1;
-            continue;
-        }
-        // Shortest path sim-failed — one alternate first hop (live: sim_fail≈10–18/batch).
-        let rescued = alt
+        let primary =
+            matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals);
+        // Alternate first-hop path when present (rescue + dual-DEX sanity).
+        let alt_rate = alt
             .get(token.0 as usize)
             .copied()
             .flatten()
@@ -360,27 +356,55 @@ pub fn hub_path_matic_rates_batch(
             .and_then(|p| {
                 matic_rate_from_probe_sim_with_decimals(arena, token, &p, token_decimals)
             });
-        if let Some(rate) = rescued {
-            out.insert(token, rate);
-            priced += 1;
-            alt_rescue += 1;
-        } else {
-            sim_fail += 1;
+        match (primary, alt_rate) {
+            (Some(a), Some(b)) if rates_diverge_bps(a, b) > HUB_DUAL_PATH_MAX_DIVERGE_BPS => {
+                // ponytail: >2% across two first hops → skip (flash / thin-pool risk).
+                dual_reject += 1;
+            }
+            (Some(a), Some(b)) => {
+                out.insert(token, a.min(b));
+                priced += 1;
+            }
+            (Some(a), None) => {
+                out.insert(token, a);
+                priced += 1;
+            }
+            (None, Some(b)) => {
+                out.insert(token, b);
+                priced += 1;
+                alt_rescue += 1;
+            }
+            (None, None) => {
+                sim_fail += 1;
+            }
         }
     }
     let ms = crate::util::now_ms().saturating_sub(started);
-    if path_miss > 0 || sim_fail > 0 || alt_rescue > 0 || need_n > 32 {
+    if path_miss > 0 || sim_fail > 0 || alt_rescue > 0 || dual_reject > 0 || need_n > 32 {
         crate::info!(
-            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} ms={ms} max_hops={}",
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} ms={ms} max_hops={}",
             params.max_hops
         );
     } else if need_n > 0 {
         crate::debug!(
-            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} ms={ms} max_hops={}",
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} ms={ms} max_hops={}",
             params.max_hops
         );
     }
     out
+}
+
+/// Max relative divergence (bps) between shortest and alt first-hop rates.
+const HUB_DUAL_PATH_MAX_DIVERGE_BPS: u64 = 200;
+
+#[inline]
+fn rates_diverge_bps(a: U256, b: U256) -> u64 {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    if hi.is_zero() {
+        return 0;
+    }
+    let delta = hi - lo;
+    u64::try_from((delta * U256::from(10_000u64) / hi).min(U256::from(10_000u64))).unwrap_or(10_000)
 }
 
 #[cfg(test)]

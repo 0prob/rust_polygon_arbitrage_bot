@@ -480,6 +480,19 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
     // Observed force-refind: skip catchup attach (pins use force_attach below).
     let scan_missing = catchup_due && !work.force_cycle_refind;
     if catchup_due && work.force_cycle_refind {
+        // If nothing is actually missing, drop the latch — otherwise freeze-era
+        // defer left catchup_pending stuck across force ticks (arena growth halted
+        // when freeze was on; latch still poisons connectivity_stale).
+        if !has_missing_eligible_pools_with_gate(
+            &work.arena,
+            work.pool_metas.as_ref(),
+            graph.as_ref(),
+            gate_ref,
+        ) {
+            work.graph_cache
+                .lock()
+                .set_attach_catchup_pending(false);
+        }
         crate::info!(
             "lf attach_missing defer: force_refind=true stale={connectivity_stale} eligible={eligible_count} lf_pass={}",
             work.lf_pass
@@ -1035,13 +1048,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         ctx.cache.len()
     );
     let decimals = ctx.refresh.token_decimals_map();
-    let freeze_append = ctx.graph_cache.lock().attach_catchup_pending();
     let arena_sync_started = crate::util::now_ms();
-    let arena_sync = ctx.refresh.sync_routable_arena_gated(
-        &mut arena,
-        Some(decimals.as_ref()),
-        freeze_append,
-    );
+    // ponytail: no freeze_append — latch+force_refind defer stuck arena at 1019
+    // forever (live cycle97). ARENA_APPEND_CAP paces growth vs attach.
+    let arena_sync =
+        ctx.refresh
+            .sync_routable_arena_gated(&mut arena, Some(decimals.as_ref()), false);
     // Persist immediately — end-of-tick writeback was skipped on shutdown returns
     // and left the next LF cloning an empty arena (live: indices_rebuilt every
     // few passes with growing pool_metas from cold Rebuild).
@@ -1057,12 +1069,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         );
     }
     let pool_metas = Arc::new(arena_sync.metas);
-    if freeze_append && (lf_pass <= 3 || lf_pass.is_multiple_of(10)) {
-        crate::info!(
-            "lf arena sync: freeze_append=true pool_metas={} (attach catchup pending)",
-            pool_metas.len()
-        );
-    }
     let arena_sync_ms = crate::util::now_ms().saturating_sub(arena_sync_started);
     if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
         let hints_missing = arena_tokens_without_decimal_hints(&arena, decimals.as_ref());

@@ -231,7 +231,7 @@ mod tests {
     fn ignores_unrelated_tui_and_other_binaries() {
         assert!(label_if_instance(Path::new("/usr/bin/tui")).is_none());
         assert!(label_if_instance(Path::new("/usr/local/bin/tmux")).is_none());
-        assert!(label_if_instance(Path::new("./target/release/oracle_feeds")).is_none());
+        assert!(label_if_instance(Path::new("./target/release/oracle_live_test")).is_none());
         assert!(label_if_instance(Path::new("/bin/bash")).is_none());
     }
 

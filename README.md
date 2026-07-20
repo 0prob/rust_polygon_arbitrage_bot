@@ -26,7 +26,6 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 |---|---|
 | `rpbot` | Main bot (default, headless) |
 | `tui` | Optional terminal dashboard (`cargo run --release --features tui --bin tui`) |
-| `oracle_feeds` | Audit / propose / verify Pyth feed mappings (human-in-the-loop) |
 
 ## Prerequisites
 
@@ -83,13 +82,7 @@ cargo run --release                    # headless bot (default bin: rpbot)
 cargo run --release --features tui --bin tui
 ```
 
-Oracle feed workflow:
-
-```bash
-cargo run --release --bin oracle_feeds -- audit --top 50
-cargo run --release --bin oracle_feeds -- propose --curated-only --verify --out proposed-feeds.txt
-cargo run --release --bin oracle_feeds -- verify --file proposed-feeds.txt
-```
+Unmapped tokens accumulate at runtime; every 20 **new** addresses trigger a Hermes USD-spot scan. Verified feeds are registered and persisted to `target/run-logs/oracle-auto-feeds.json` (override with `RPBOT_ORACLE_AUTO_FEEDS`); misses are marked `no_feed` so they are not rescanned.
 
 Help: `cargo run -- --help` (or `rpbot --help` after build). Concurrent `rpbot`/`tui` processes are killed at startup unless `RPBOT_ALLOW_MULTIPLE` is set.
 

@@ -708,7 +708,14 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     };
 
     let meets_absolute_min = gate_net_matic >= input.min_profit_matic_wei;
-    let meets_safety_ratio = gate_net_matic >= required_net_matic;
+    // Safety floor hedges revert gas loss — compare pre-tip net. Priority uplift is a
+    // success-path inclusion cost (already in gate_net for min_profit). Live: tip ate
+    // ~0.03 MATIC and 1.5× floor rejected a route with pre-tip net≈gas.
+    let meets_safety_ratio = if ignore_gas {
+        gate_net_matic >= required_net_matic
+    } else {
+        net_profit_after_gas_matic_wei >= required_net_matic
+    };
     let meets_sane_matic_cap = gate_net_matic <= U256::from(MAX_SANE_PROFIT_MATIC_WEI);
     let roi_bps = if input.amount_in.is_zero() || gate_net_tokens.is_zero() {
         0u64

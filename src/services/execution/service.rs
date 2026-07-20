@@ -76,7 +76,10 @@ const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
 /// Thin-liq underwater (available≪0.01 MATIC) — longer cool; live sticky V2
 /// 0xe43e/0x2f44 kept returning at cover~380 / gross=0.0067 with ~1-unit scarce side.
 const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
-const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(16); // 0.01 MATIC
+/// Below this absolute MATIC, cover%≥500 is still chronic (live: USDT dust
+/// avail≈0.035 / cover≈1770 escaped the old 0.01 floor and crowded a
+/// cover≈20000 / avail≈0.15 near-miss).
+const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 5u128 * 10u128.pow(16); // 0.05 MATIC
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -636,8 +639,13 @@ impl ExecutionService {
         gas_cover_bps: u64,
         available_matic_wei: U256,
     ) -> bool {
+        // Clamp inflated cover% into the chronic band when absolute MATIC is thin.
+        // Live: USDT-start dust posted cover≈1768 with gross≈0 while real WMATIC
+        // edges at ~0.017 MATIC / ~490 cover never won best-eval long enough.
         let cover_bps = if available_matic_wei
             < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
+            || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+                && gas_cover_bps >= CHRONIC_UNDERWATER_COVER_BPS)
         {
             gas_cover_bps.min(CHRONIC_UNDERWATER_COVER_BPS.saturating_sub(1))
         } else {
@@ -1783,6 +1791,19 @@ mod safety_tests {
         assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
         assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
         assert!(exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
+        // Thin absolute MATIC with cover≥500 also clamps (live: USDT ~1770 / ~0.035).
+        let thin_fp = 0x7e17_u64;
+        let thin_avail = U256::from(35u128 * 10u128.pow(15)); // 0.035 MATIC
+        assert!(!exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
+        assert!(exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
+        // ≥0.05 MATIC with cover≥500 escapes chronic (real near-miss territory).
+        let near_fp = 0x9ea5_u64;
+        let near_avail = U256::from(15u128 * 10u128.pow(16)); // 0.15 MATIC
+        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
+        assert!(!exec.is_route_quarantined(near_fp));
     }
 
     #[test]

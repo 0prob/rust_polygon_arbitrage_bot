@@ -1289,6 +1289,30 @@ fn v2_reserve_in(state: &crate::core::types::V2PoolState, zero_for_one: bool) ->
     }
 }
 
+/// Absolute wei floor on either V2 reserve. Amount-independent — safe on the live
+/// activity bypass that skips micro/economic probes (live: mid-route `0x5efc`
+/// r1=45433; after 1e6 floor, `0x1a6f` r1≈6.3e7 still ranked at cover≈1149).
+/// 1e8 ≈ 100 USDT (6dp) / dust for 18dp tokens — keeps real stables, drops junk.
+pub const V2_DUST_RESERVE_WEI: u64 = 100_000_000;
+
+/// First V2 hop with either reserve below [`V2_DUST_RESERVE_WEI`].
+#[must_use]
+pub fn v2_any_hop_dust_reserves(arena: &StateArena, edges: &[Edge]) -> Option<usize> {
+    let floor = U256::from(V2_DUST_RESERVE_WEI);
+    for (hop, edge) in edges.iter().enumerate() {
+        if edge.protocol != ProtocolType::UniswapV2 {
+            continue;
+        }
+        let Some(PoolState::V2(state)) = arena.pool_state(edge.pool_index) else {
+            continue;
+        };
+        if state.reserve0 < floor || state.reserve1 < floor {
+            return Some(hop);
+        }
+    }
+    None
+}
+
 /// Hop-0 V2 input reserve cannot cover `min_amount` (dead/dust pool).
 ///
 /// Only the first hop is checked: `min_amount` is in cycle-start token units (micro/spot
@@ -2596,8 +2620,8 @@ mod tests {
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: U256::from(1_000_000u64),
-                reserve1: U256::from(1_000_000u64),
+                reserve0: U256::from(1_000_000_000u64),
+                reserve1: U256::from(1_000_000_000u64),
                 fee: U256::from(997u64),
                 fee_denominator: U256::from(1_000u64),
                 block_timestamp_last: 1,
@@ -2618,13 +2642,30 @@ mod tests {
         assert!(sim.amount_out.is_zero());
         // Matches simulate_hop: amount_in >= reserve_in is unusable.
         assert_eq!(
-            first_v2_hop_below_reserve(&arena, &[edge], U256::from(1_000_000u64)),
+            first_v2_hop_below_reserve(&arena, &[edge], U256::from(1_000_000_000u64)),
             Some(0)
         );
         assert_eq!(
-            first_v2_hop_below_reserve(&arena, &[edge], U256::from(999_999u64)),
+            first_v2_hop_below_reserve(&arena, &[edge], U256::from(999_999_999u64)),
             None
         );
+        // At/above dust floor is live; below floor on either side is dust.
+        assert_eq!(v2_any_hop_dust_reserves(&arena, &[edge]), None);
+        let dust_pool = arena.register_pool(
+            Address::from([4u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000_000u64),
+                reserve1: U256::from(62_950_524u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let dust_edge = Edge {
+            pool_index: dust_pool,
+            ..edge
+        };
+        assert_eq!(v2_any_hop_dust_reserves(&arena, &[dust_edge]), Some(0));
         // Intermediate V2: do not compare its reserve to start-token min_amount.
         let v3_edge = Edge {
             protocol: ProtocolType::UniswapV3,

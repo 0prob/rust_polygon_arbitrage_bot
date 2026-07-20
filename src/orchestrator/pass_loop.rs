@@ -28,6 +28,7 @@ use crate::services::execution::GasOracle;
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::price_oracle::PriceOracle;
+use crate::services::oracle::{load_and_apply_auto_feeds, spawn_auto_feed_sidecar};
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet};
 use crate::services::state_cache::StateCache;
 use crate::services::state_refresh::StateRefreshService;
@@ -96,6 +97,7 @@ impl RuntimeContext {
             config.oracle.cache_ttl_ms,
         ));
         register_configured_oracle_feeds(&price_oracle, &config.oracle);
+        load_and_apply_auto_feeds(&price_oracle);
         Ok(Self {
             config,
             wallet,
@@ -499,6 +501,12 @@ async fn spawn_pass_loop_sidecars(
         Arc::clone(&ctx.price_oracle),
         Arc::clone(&ctx.rpc),
         ctx.config.oracle.cache_ttl_ms,
+        shutdown.clone(),
+    );
+    spawn_auto_feed_sidecar(
+        Arc::clone(&ctx.price_oracle),
+        ctx.rpc.http().clone(),
+        ctx.config.oracle.pyth_hermes_url.clone(),
         shutdown.clone(),
     );
 

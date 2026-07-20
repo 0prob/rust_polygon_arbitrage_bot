@@ -535,12 +535,16 @@ impl StateArena {
             }
             ArenaReuse::Rebuild if !self.inner.pools.is_empty() => {
                 // Prefer index-stable refresh over wipe+reassign. Live: 12 full
-                // rebuilds/150s cleared cycle cache (proto_mismatch storms). Shrink
-                // / reorder keeps PoolIndex for addresses still present; new
-                // tradable tails append on later Prefix ticks.
+                // rebuilds/150s cleared cycle cache (proto_mismatch storms).
+                // Must still admit novel tradable addresses — frozen-only left
+                // arena stuck at 1019 forever when every tick was Rebuild
+                // (order mismatch) rather than Prefix.
                 let _ = freeze_append;
+                let mut metas =
+                    self.sync_frozen_membership(&tradable, pools, decimal_hints);
+                self.append_novel_tradable(&tradable, pools, decimal_hints, &mut metas);
                 return ArenaSyncReport {
-                    metas: self.sync_frozen_membership(&tradable, pools, decimal_hints),
+                    metas,
                     indices_rebuilt: false,
                 };
             }
@@ -597,6 +601,43 @@ impl StateArena {
         ArenaSyncReport {
             metas,
             indices_rebuilt: true,
+        }
+    }
+
+    /// Admit tradable pools not yet in the arena (capped). Used after frozen
+    /// Rebuild refresh when order mismatch blocks the Prefix append path.
+    fn append_novel_tradable(
+        &mut self,
+        tradable: &[(usize, Address, Arc<PoolState>)],
+        pools: &[DiscoveredPool],
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        metas: &mut Vec<crate::pipeline::types::PoolMeta>,
+    ) {
+        const ARENA_APPEND_CAP: usize = 512;
+        let mut added = 0usize;
+        for (idx, address, state) in tradable {
+            if added >= ARENA_APPEND_CAP {
+                break;
+            }
+            if self.inner.address_to_pool.contains_key(address) {
+                continue;
+            }
+            let Some(pool) = pools.get(*idx) else {
+                continue;
+            };
+            if !sync_pool_graph_eligible(state.as_ref(), pool, decimal_hints) {
+                continue;
+            }
+            metas.push(self.append_synced_pool(
+                pool,
+                Arc::clone(state),
+                decimal_hints,
+                /*touch_layout=*/ false,
+            ));
+            added += 1;
+        }
+        if added > 0 {
+            self.recompute_layout_fingerprint();
         }
     }
 

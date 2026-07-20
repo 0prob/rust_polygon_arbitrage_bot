@@ -1045,6 +1045,13 @@ fn select_cycles_for_rescore(
             }
             continue;
         }
+        // Structural V2 dust (either reserve < 1e6 wei) — apply before live bypass.
+        // Activity path skips micro/economic probes; mid-route dust still ranked
+        // (live: 0x5efc r1=45433 → best-eval cover≈2348).
+        if crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &ready.edges).is_some() {
+            v2_dead_skipped += 1;
+            continue;
+        }
         // Activity first: live-touching cycles were dying as micro_dead before
         // score (livehold: cycles_touching=22 → selected=4 active=0). Fresh WSS
         // moves can look shallow on stale local sim — still probe them.
@@ -1328,7 +1335,7 @@ pub async fn run_hf_tick(
                 .is_ok()
         {
             crate::info!(
-                "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 active_candidates={activity_candidates} hot_pools={}",
+                "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 active_candidates={activity_candidates} active_selected={activity_selected} inactive_selected={inactive_selected} hot_pools={}",
                 cycles.len(),
                 hot_pools_set.len(),
             );
@@ -2048,7 +2055,13 @@ pub async fn run_hf_tick(
                 best.gas_cover_bps,
             )
         });
-        if better_near_breakeven && !assessment.gross_profit.is_zero() {
+        // Rank by absolute MATIC (≥0.001). Thin high-cover dust still wins when no
+        // larger edge exists — chronic uq (thin floor 0.05) cools it; do not silence
+        // best-eval/cover-dist logging by gating rank at 0.05 (live: zero diag ticks).
+        if better_near_breakeven
+            && !assessment.gross_profit.is_zero()
+            && available_matic >= U256::from(10u128.pow(15))
+        {
             let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
@@ -2202,10 +2215,21 @@ pub async fn run_hf_tick(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, probe_kept={probe_kept}, evaluated={eval_count}, stream_triggered=1)"
             );
         }
-        if profitable_count == 0 && eval_count > 0 && (log_summary || stream_triggered) {
-            crate::debug!(
-                "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
-            );
+        if profitable_count == 0 && eval_count > 0 {
+            // INFO when a near-miss exists — debug hid positive_net / high-cover ticks
+            // at RPBOT_LOG=info (live: safety-floor rejects were invisible).
+            let near = best_gross_diag
+                .as_ref()
+                .is_some_and(|d| d.gas_cover_bps >= 1_000 || !d.net_matic.is_zero());
+            if near || ((log_summary || stream_triggered) && positive_net_rejects > 0) {
+                crate::info!(
+                    "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
+                );
+            } else if log_summary || stream_triggered {
+                crate::debug!(
+                    "hf assess summary: zero_net={zero_net_rejects} positive_net={positive_net_rejects}"
+                );
+            }
         }
         if eval_count == 0 {
             crate::debug!(
@@ -2235,7 +2259,15 @@ pub async fn run_hf_tick(
                         diag.gas_cover_bps
                     );
                 }
-                if should_log_best_eval() {
+                // Always log near-misses ≥4% cover with real MATIC — rate-limit hid
+                // live ~490bps / 0.017 MATIC while sticky ~370 filled the slot.
+                let diag_available = diag
+                    .gas_cost_wei
+                    .saturating_sub(diag.gas_shortfall_matic_wei);
+                if (diag.gas_cover_bps >= 400
+                    && diag_available >= U256::from(10u128.pow(15)))
+                    || should_log_best_eval()
+                {
                     log_best_eval_diagnostic(diag);
                     let cover_avg = if cover_n == 0 {
                         0

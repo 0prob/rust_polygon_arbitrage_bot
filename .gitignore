@@ -39,7 +39,7 @@ PRIVATE_KEY_FILE
 **/operator.key
 *.mnemonic.txt
 
-# Local oracle-feed proposals (regenerate via oracle_feeds)
+# Local oracle-feed proposal scratch files
 proposed-feeds.txt
 proposed-feeds*.txt
 

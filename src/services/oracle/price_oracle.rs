@@ -309,6 +309,10 @@ impl PriceOracle {
             .insert(token, normalize_pyth_feed_id(&feed_id));
     }
 
+    pub fn unregister_pyth_feed(&self, token: &Address) {
+        self.custom_pyth.write().remove(token);
+    }
+
     pub fn register_chainlink_feed(&self, token: Address, feed: Address) {
         self.custom_chainlink.write().insert(token, feed);
     }

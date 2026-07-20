@@ -17,10 +17,6 @@ name = "tui"
 path = "src/bin/tui.rs"
 required-features = ["tui"]
 
-[[bin]]
-name = "oracle_feeds"
-path = "src/bin/oracle_feeds.rs"
-
 [features]
 # Production path is headless (`default = []`). Enable only for the optional `tui` bin.
 default = []

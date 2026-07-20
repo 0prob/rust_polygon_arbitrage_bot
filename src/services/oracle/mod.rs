@@ -1,17 +1,22 @@
+pub mod auto_feeds;
 pub mod feed_audit;
 pub mod feed_verify;
 pub mod hub_path_rates;
+pub mod lst_rates;
 pub mod price_oracle;
 pub mod pyth_catalog;
 pub mod rates;
 pub mod token_labels;
 
+pub use auto_feeds::{
+    AUTO_FEED_SCAN_BATCH, default_auto_feeds_path, load_and_apply_auto_feeds,
+    note_unmapped_addresses, pending_auto_feed_count, spawn_auto_feed_sidecar,
+};
 pub use feed_audit::{
-    CURATED_POLYGON_TOKEN_HINTS, FeedAuditReport, UnmappedTokenRow, build_audit_report,
-    default_runtime_demand_path, load_runtime_demand_snapshot, log_ranked_unmapped_demand,
-    parse_runtime_demand_from_log, persist_runtime_demand_snapshot,
-    propose_curated_unmapped_pyth_feeds, propose_pyth_feed_lines, record_unmapped_token_demand,
-    snapshot_runtime_unmapped_demand, token_symbol_label,
+    CURATED_POLYGON_TOKEN_HINTS, UsdFeedScanRow, UsdFeedScanStatus, default_runtime_demand_path,
+    hint_label, load_runtime_demand_snapshot, log_ranked_unmapped_demand,
+    parse_runtime_demand_from_log, persist_runtime_demand_snapshot, record_unmapped_token_demand,
+    scan_addresses_for_usd_feeds, snapshot_runtime_unmapped_demand, token_symbol_label,
 };
 pub use feed_verify::{
     ProposedPythFeed, VerifiedPythFeed, format_config_pyth_feeds, parse_proposed_pyth_feed_lines,
@@ -331,6 +336,8 @@ pub struct RateEnrichStats {
     pub pyth_integer: usize,
     /// Float USD÷MATIC fallback (rare when integer+hub both miss).
     pub pyth_or_float: usize,
+    /// On-chain LST exchange rate × (implicit) POL backing.
+    pub lst: usize,
     pub hub_path: usize,
     pub unresolved: usize,
 }
@@ -366,10 +373,14 @@ where
         ctx.token_decimals,
         ctx.pool_metas,
     );
+    let lst_rates = match provider {
+        Some(p) => lst_rates::fetch_lst_matic_rates(arena, &tokens, p).await,
+        None => FxHashMap::default(),
+    };
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd(&addrs, provider).await;
     let matic_usd = matic_usd_raw_for_lf_enrich(oracle, provider, true).await;
-    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
+    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates, &lst_rates)
 }
 
 /// Pyth + in-memory cache only (no Chainlink RPC). Used when state RPC is down.
@@ -394,7 +405,15 @@ where
     let addrs = prefetch_addrs_for_oracle_fallback(arena, oracle, &tokens, &hub_rates);
     oracle.prefetch_token_usd_offline(&addrs).await;
     let matic_usd = matic_usd_raw_for_lf_enrich_offline(oracle).await;
-    build_token_to_matic_rates(oracle, arena, &tokens, matic_usd, &hub_rates)
+    // ponytail: LST views need RPC — offline keeps hub/Pyth only.
+    build_token_to_matic_rates(
+        oracle,
+        arena,
+        &tokens,
+        matic_usd,
+        &hub_rates,
+        &FxHashMap::default(),
+    )
 }
 
 async fn matic_usd_raw_for_lf_enrich<P>(
@@ -552,6 +571,7 @@ fn build_token_to_matic_rates(
     tokens: &[TokenIndex],
     matic_usd: f64,
     hub_rates: &FxHashMap<TokenIndex, U256>,
+    lst_rates: &FxHashMap<TokenIndex, U256>,
 ) -> (FxHashMap<TokenIndex, U256>, RateEnrichStats) {
     let wmatic = WMATIC;
     let rate_one = crate::core::constants::RATE_PRECISION;
@@ -581,14 +601,21 @@ fn build_token_to_matic_rates(
             .get(idx)
             .copied()
             .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
+        let lst = lst_rates
+            .get(idx)
+            .copied()
+            .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
         let chainlink = integer_by_addr
             .get(&addr)
             .copied()
             .filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
-        match (chainlink, hub) {
-            (Some(cl), Some(hub_rate))
-                if !crate::core::constants::is_polygon_hub_token(addr)
-                    && rates_diverge_bps(cl, hub_rate) > 2_000 =>
+        // Priority: CL/Pyth integer > LST exchange rate > hub path > float.
+        // LSTs must not use DEX spot as the gas/profit base price.
+        if let Some(cl) = chainlink {
+            if let Some(hub_rate) = hub
+                && !crate::core::constants::is_polygon_hub_token(addr)
+                && lst.is_none()
+                && rates_diverge_bps(cl, hub_rate) > 2_000
             {
                 // Long-tail: executable pool basis when Chainlink diverges >20%.
                 stats.hub_path += 1;
@@ -596,23 +623,26 @@ fn build_token_to_matic_rates(
                 out.insert(*idx, hub_rate);
                 continue;
             }
-            (Some(cl), _) => {
-                if oracle.is_pyth_sourced(&addr) {
-                    stats.pyth_integer += 1;
-                } else {
-                    stats.chainlink += 1;
-                }
-                stats.resolved += 1;
-                out.insert(*idx, cl);
-                continue;
+            if oracle.is_pyth_sourced(&addr) {
+                stats.pyth_integer += 1;
+            } else {
+                stats.chainlink += 1;
             }
-            (None, Some(hub_rate)) => {
-                stats.hub_path += 1;
-                stats.resolved += 1;
-                out.insert(*idx, hub_rate);
-                continue;
-            }
-            (None, None) => {}
+            stats.resolved += 1;
+            out.insert(*idx, cl);
+            continue;
+        }
+        if let Some(lst_rate) = lst {
+            stats.lst += 1;
+            stats.resolved += 1;
+            out.insert(*idx, lst_rate);
+            continue;
+        }
+        if let Some(hub_rate) = hub {
+            stats.hub_path += 1;
+            stats.resolved += 1;
+            out.insert(*idx, hub_rate);
+            continue;
         }
         let float_oracle_rate = oracle.has_configured_feed(&addr).then(|| {
             if matic_usd > 0.0 {
@@ -645,23 +675,25 @@ fn build_token_to_matic_rates(
     }
     if stats.requested > 0 && (stats.unresolved > 0 || stats.requested > 32) {
         crate::info!(
-            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} hub_path={} unresolved={}",
+            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} lst={} hub_path={} unresolved={}",
             stats.requested,
             stats.resolved,
             stats.chainlink,
             stats.pyth_integer,
             stats.pyth_or_float,
+            stats.lst,
             stats.hub_path,
             stats.unresolved
         );
     } else if stats.requested > 0 {
         crate::debug!(
-            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} hub_path={} unresolved={}",
+            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} lst={} hub_path={} unresolved={}",
             stats.requested,
             stats.resolved,
             stats.chainlink,
             stats.pyth_integer,
             stats.pyth_or_float,
+            stats.lst,
             stats.hub_path,
             stats.unresolved
         );
@@ -874,6 +906,31 @@ mod tests {
     }
 
     #[test]
+    fn lst_exchange_rate_wins_over_hub_path() {
+        use super::price_oracle::PriceOracle;
+
+        let mut arena = StateArena::default();
+        let token: Address = "0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4"
+            .parse()
+            .expect("stmatic");
+        let idx = arena.register_token(token);
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            10_000,
+        );
+        let hub_rate = RATE_PRECISION * U256::from(2u64);
+        let lst_rate = RATE_PRECISION + U256::from(1u64);
+        let hub_rates = FxHashMap::from_iter([(idx, hub_rate)]);
+        let lst_rates = FxHashMap::from_iter([(idx, lst_rate)]);
+        let (out, stats) =
+            build_token_to_matic_rates(&oracle, &arena, &[idx], 0.5, &hub_rates, &lst_rates);
+        assert_eq!(out.get(&idx).copied(), Some(lst_rate));
+        assert_eq!(stats.lst, 1);
+        assert_eq!(stats.hub_path, 0);
+    }
+
+    #[test]
     fn hub_path_rate_wins_over_configured_float_oracle_leverage() {
         use super::price_oracle::PriceOracle;
 
@@ -891,7 +948,14 @@ mod tests {
 
         let hub_rate = RATE_PRECISION * U256::from(3u64);
         let hub_rates = FxHashMap::from_iter([(idx, hub_rate)]);
-        let (out, stats) = build_token_to_matic_rates(&oracle, &arena, &[idx], 0.5, &hub_rates);
+        let (out, stats) = build_token_to_matic_rates(
+            &oracle,
+            &arena,
+            &[idx],
+            0.5,
+            &hub_rates,
+            &FxHashMap::default(),
+        );
 
         assert_eq!(out.get(&idx).copied(), Some(hub_rate));
         assert_eq!(stats.hub_path, 1);
@@ -912,8 +976,14 @@ mod tests {
         );
         oracle.seed_float_usd_for_test(token, 2.0);
 
-        let (out, stats) =
-            build_token_to_matic_rates(&oracle, &arena, &[idx], 0.5, &FxHashMap::default());
+        let (out, stats) = build_token_to_matic_rates(
+            &oracle,
+            &arena,
+            &[idx],
+            0.5,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
 
         assert!(!out.contains_key(&idx));
         assert_eq!(stats.unresolved, 1);

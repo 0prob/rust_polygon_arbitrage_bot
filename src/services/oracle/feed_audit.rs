@@ -6,11 +6,9 @@ use parking_lot::Mutex;
 use alloy::primitives::Address;
 use alloy::primitives::address;
 use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use super::RateEnrichStats;
-use super::feed_verify;
 use super::price_oracle::PriceOracle;
 use super::pyth_catalog;
 use crate::core::types::{FoundCycle, TokenIndex};
@@ -149,23 +147,8 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
 static RUNTIME_UNMAPPED_DEMAND: LazyLock<Mutex<FxHashMap<Address, u64>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-#[derive(Debug, Clone)]
-pub struct UnmappedTokenRow {
-    pub address: Address,
-    pub pool_hits: u64,
-    pub cycle_hits: u64,
-    pub demand_score: u64,
-    pub label: Option<&'static str>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FeedAuditReport {
-    pub rows: Vec<UnmappedTokenRow>,
-    pub mapped_count: usize,
-    pub scanned_tokens: usize,
-}
-
-fn hint_label(addr: &Address) -> Option<&'static str> {
+#[must_use]
+pub fn hint_label(addr: &Address) -> Option<&'static str> {
     token_symbol_label(addr).or_else(|| {
         CURATED_POLYGON_TOKEN_HINTS
             .iter()
@@ -214,6 +197,7 @@ pub fn record_unmapped_token_demand(
     if local.is_empty() {
         return;
     }
+    let addrs: Vec<Address> = local.keys().copied().collect();
     let Some(mut global) = RUNTIME_UNMAPPED_DEMAND.try_lock() else {
         return;
     };
@@ -223,9 +207,11 @@ pub fn record_unmapped_token_demand(
             .saturating_add(cycle_hits.saturating_mul(4))
             .saturating_add(pool_hits);
     }
+    drop(global);
+    super::auto_feeds::note_unmapped_addresses(oracle, addrs);
 }
 
-/// Ranked auto-discovery log (never auto-enables feeds).
+/// Ranked unmapped-demand log (auto-feed scan is separate; see `auto_feeds`).
 pub fn log_ranked_unmapped_demand(
     oracle: &PriceOracle,
     lf_pass: u64,
@@ -364,155 +350,104 @@ pub fn parse_runtime_demand_from_log(path: &Path) -> anyhow::Result<FxHashMap<Ad
     Ok(out)
 }
 
-#[must_use]
-pub fn build_audit_report(
-    oracle: &PriceOracle,
-    pool_frequency: &[(Address, i64)],
-    runtime_demand: &FxHashMap<Address, u64>,
-) -> FeedAuditReport {
-    let mut rows = Vec::new();
-    let mut mapped_count = 0usize;
-    let mut seen = FxHashSet::default();
-    for &(addr, pool_hits) in pool_frequency {
-        if oracle.has_configured_feed(&addr) {
-            mapped_count += 1;
-            continue;
-        }
-        seen.insert(addr);
-        let pool_hits = u64::try_from(pool_hits.max(0)).unwrap_or(0);
-        let runtime_score = runtime_demand.get(&addr).copied().unwrap_or(0);
-        let demand_score = merged_demand_score(pool_hits, runtime_score);
-        rows.push(UnmappedTokenRow {
-            address: addr,
-            pool_hits,
-            cycle_hits: runtime_score,
-            demand_score,
-            label: hint_label(&addr),
-        });
-    }
-    for (&addr, &runtime_score) in runtime_demand {
-        if oracle.has_configured_feed(&addr) || !seen.insert(addr) {
-            continue;
-        }
-        rows.push(UnmappedTokenRow {
-            address: addr,
-            pool_hits: 0,
-            cycle_hits: runtime_score,
-            demand_score: runtime_score,
-            label: hint_label(&addr),
-        });
-    }
-    rows.sort_by(|a, b| {
-        b.demand_score
-            .cmp(&a.demand_score)
-            .then_with(|| b.pool_hits.cmp(&a.pool_hits))
-            .then_with(|| a.address.cmp(&b.address))
-    });
-    FeedAuditReport {
-        scanned_tokens: pool_frequency.len(),
-        mapped_count,
-        rows,
-    }
+/// Hermes USD-spot scan result for one address.
+#[derive(Debug, Clone)]
+pub struct UsdFeedScanRow {
+    pub address: Address,
+    pub label: Option<&'static str>,
+    pub query: Option<String>,
+    pub status: UsdFeedScanStatus,
+    pub feed_id: Option<String>,
+    pub symbol: Option<String>,
 }
 
-#[inline]
-fn merged_demand_score(pool_hits: u64, runtime_score: u64) -> u64 {
-    pool_hits.saturating_add(runtime_score)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsdFeedScanStatus {
+    /// Crypto TOKEN/USD spot match (safe to register).
+    UsdMatch,
+    /// Hermes returned feeds but none passed USD-spot + hint rules.
+    NoUsd,
+    /// No ticker label — cannot query Hermes meaningfully.
+    NoSymbol,
+    /// Catalog request failed (retry later).
+    Error,
 }
 
-/// Propose feeds only for curated hint tokens (never auto-map demand-ranked unknowns).
-pub async fn propose_curated_unmapped_pyth_feeds(
+/// Hermes-check addresses for a USD spot feed.
+pub async fn scan_addresses_for_usd_feeds(
     http: &reqwest::Client,
     hermes_url: &str,
-    oracle: &PriceOracle,
-    include_non_usd: bool,
-) -> anyhow::Result<Vec<feed_verify::ProposedPythFeed>> {
-    let mut proposals = Vec::new();
-    for (label, addr, hint_query) in CURATED_POLYGON_TOKEN_HINTS {
-        if oracle.has_configured_feed(addr) {
-            continue;
-        }
-        let candidates = pyth_catalog::search_pyth_feeds(http, hermes_url, hint_query).await?;
-        if let Some(best) = pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, hint_query)
-        {
-            proposals.push(feed_verify::ProposedPythFeed {
-                token: *addr,
-                feed_id: best.id.clone(),
-                comment: Some(format!("{label}: {}", best.symbol)),
+    rows: &[(Address, Option<&'static str>)],
+) -> anyhow::Result<Vec<UsdFeedScanRow>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for &(address, label) in rows {
+        let query = hermes_query_for_addr(address, label);
+        let Some(query) = query else {
+            out.push(UsdFeedScanRow {
+                address,
+                label,
+                query: None,
+                status: UsdFeedScanStatus::NoSymbol,
+                feed_id: None,
+                symbol: None,
             });
             continue;
-        }
-        if include_non_usd {
-            if let Some(rr) = pyth_catalog::pick_best_rr_candidate_for_hint(&candidates, hint_query)
-            {
-                proposals.push(feed_verify::ProposedPythFeed {
-                    token: *addr,
-                    feed_id: rr.id.clone(),
-                    comment: Some(format!(
-                        "REVIEW RR {label}: {} — not USD; manual base-price policy required",
-                        rr.symbol
-                    )),
-                });
-                continue;
+        };
+        match pyth_catalog::search_pyth_feeds(http, hermes_url, &query).await {
+            Ok(candidates) => {
+                if let Some(best) =
+                    pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, &query)
+                {
+                    out.push(UsdFeedScanRow {
+                        address,
+                        label,
+                        query: Some(query),
+                        status: UsdFeedScanStatus::UsdMatch,
+                        feed_id: Some(best.id.clone()),
+                        symbol: Some(best.symbol.clone()),
+                    });
+                } else {
+                    out.push(UsdFeedScanRow {
+                        address,
+                        label,
+                        query: Some(query),
+                        status: UsdFeedScanStatus::NoUsd,
+                        feed_id: None,
+                        symbol: None,
+                    });
+                }
             }
-            if let Some(any) = candidates.first() {
-                proposals.push(feed_verify::ProposedPythFeed {
-                    token: *addr,
-                    feed_id: any.id.clone(),
-                    comment: Some(format!(
-                        "REVIEW non-USD {label}: {} — not auto-merge safe",
-                        any.symbol
-                    )),
+            Err(_) => {
+                out.push(UsdFeedScanRow {
+                    address,
+                    label,
+                    query: Some(query),
+                    status: UsdFeedScanStatus::Error,
+                    feed_id: None,
+                    symbol: None,
                 });
             }
-        } else {
-            crate::debug!(
-                "oracle propose: no USD Pyth match for {label} {addr} (hint={hint_query})"
-            );
         }
     }
-    Ok(proposals)
+    Ok(out)
 }
 
-pub async fn propose_pyth_feed_lines(
-    http: &reqwest::Client,
-    hermes_url: &str,
-    rows: &[UnmappedTokenRow],
-    include_non_usd: bool,
-) -> anyhow::Result<Vec<feed_verify::ProposedPythFeed>> {
-    let mut proposals = Vec::new();
-    for row in rows {
-        let Some(hint_query) = CURATED_POLYGON_TOKEN_HINTS
-            .iter()
-            .find(|(_, a, _)| a == &row.address)
-            .map(|(_, _, q)| *q)
-        else {
-            continue;
-        };
-        let candidates = pyth_catalog::search_pyth_feeds(http, hermes_url, hint_query).await?;
-        let Some(best) = pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, hint_query)
-        else {
-            if include_non_usd && let Some(any) = candidates.first() {
-                proposals.push(feed_verify::ProposedPythFeed {
-                    token: row.address,
-                    feed_id: any.id.clone(),
-                    comment: Some(format!(
-                        "REVIEW non-USD {} — not auto-merge safe",
-                        any.symbol
-                    )),
-                });
-            }
-            continue;
-        };
-        proposals.push(feed_verify::ProposedPythFeed {
-            token: row.address,
-            feed_id: best.id.clone(),
-            comment: Some(best.symbol.to_string()),
-        });
+fn hermes_query_for_addr(address: Address, label: Option<&'static str>) -> Option<String> {
+    if let Some((_, _, hint)) = CURATED_POLYGON_TOKEN_HINTS
+        .iter()
+        .find(|(_, a, _)| *a == address)
+    {
+        return Some((*hint).to_string());
     }
-    proposals.sort_by_key(|a| a.token);
-    proposals.dedup_by(|a, b| a.token == b.token);
-    Ok(proposals)
+    let label = label?;
+    // Strip common suffix noise so QUICKv2 → QUICK for catalog search.
+    let q = label
+        .trim_end_matches("v2")
+        .trim_end_matches("V2")
+        .trim_end_matches("v3")
+        .trim_end_matches("V3");
+    let q = if q.is_empty() { label } else { q };
+    Some(q.to_string())
 }
 
 #[cfg(test)]
