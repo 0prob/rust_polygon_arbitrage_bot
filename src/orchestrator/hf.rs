@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use parking_lot::Mutex;
@@ -161,6 +161,27 @@ const HF_MATIC_STALE_WARN_MS: u64 = 45_000;
 // 750ms timed out on WMATIC cold-cache (live: skip_flash_source=6, fresh=false).
 /// Fallback when caller has no pool budget (should be rare).
 const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 800;
+/// Cap on waiting for another task's flash multicall. Live ticks burned full
+/// `HF_PREFETCH_BUDGET_MS` (2.5s) waiting for dust tokens while WMATIC was fresh.
+const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
+/// Stream path already has WSS state — don't spend the full prep budget on flash.
+const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(400);
+/// Skip probe-tick hydrate when residual prep budget is below this (leave room for eval).
+const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(50);
+
+#[inline]
+fn prep_remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Hub tokens that block probe ranking when cold (WMATIC ColdCache → empty ranks).
+fn flash_blocking_stale(stale: &[Address]) -> Vec<Address> {
+    stale
+        .iter()
+        .copied()
+        .filter(|addr| crate::core::constants::is_polygon_hub_token(*addr))
+        .collect()
+}
 
 async fn hf_pool_prefetch(
     refresh: &StateRefreshService,
@@ -192,44 +213,72 @@ async fn hf_flash_prefetch_stale(
     stale.sort_by_key(|addr| {
         u8::from(!crate::core::constants::is_polygon_hub_token(*addr))
     });
-    // Share the HF pool-prefetch budget (was a hard 2500ms that bloated ticks).
+    // Share residual HF prep budget (was a hard 2500ms that bloated ticks).
     let flash_budget = if budget.is_zero() {
         Duration::from_millis(HF_FLASH_PREFETCH_BUDGET_MS)
     } else {
         budget
     };
+    if flash_budget.is_zero() {
+        return;
+    }
     let stale_n = stale.len();
     let fresh_n = flash_token_list.len().saturating_sub(stale_n);
-    let deadline = std::time::Instant::now() + flash_budget;
+    let blocking = flash_blocking_stale(&stale);
+    let blocking_n = blocking.len();
+    let deadline = Instant::now() + flash_budget;
     let Some(_inflight) = flash_cache.try_acquire_refresh_inflight() else {
-        // Background refresh owns the multicall — wait for our stale set to land.
-        while std::time::Instant::now() < deadline {
-            if stale.iter().all(|addr| flash_cache.has_fresh_entry(*addr)) {
+        // Background refresh owns the multicall. Only block on hubs — live
+        // waited 2500ms for 2/3 dust tokens while WMATIC was already fresh.
+        if blocking.is_empty() {
+            crate::debug!(
+                "flash loan: hf_prefetch skip inflight wait non-hub stale={stale_n} fresh={fresh_n}"
+            );
+            return;
+        }
+        let wait_cap = flash_budget.min(HF_FLASH_INFLIGHT_WAIT_CAP);
+        let wait_deadline = Instant::now() + wait_cap;
+        while Instant::now() < wait_deadline {
+            if blocking
+                .iter()
+                .all(|addr| flash_cache.has_fresh_entry(*addr))
+            {
                 crate::info!(
-                    "flash loan: hf_prefetch waited inflight ok stale={stale_n} fresh={fresh_n}"
+                    "flash loan: hf_prefetch waited inflight ok hubs={blocking_n} stale={stale_n} fresh={fresh_n}"
                 );
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let still = stale
+        let still_hubs = blocking
             .iter()
             .filter(|addr| !flash_cache.has_fresh_entry(**addr))
             .count();
         crate::info!(
-            "flash loan: hf_prefetch waited inflight timeout_ms={} stale_still={still}/{stale_n}",
-            flash_budget.as_millis(),
+            "flash loan: hf_prefetch waited inflight timeout_ms={} hub_still={still_hubs}/{blocking_n} stale={stale_n}",
+            wait_cap.as_millis(),
         );
         return;
     };
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    match timeout(remaining, flash_cache.refresh_with_fallback(rpc, &stale)).await {
+    // Tight budget: refresh hubs only so WMATIC lands; dust rides background.
+    let refresh_set: &[Address] = if flash_budget <= HF_FLASH_INFLIGHT_WAIT_CAP && !blocking.is_empty()
+    {
+        &blocking
+    } else {
+        &stale
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    match timeout(remaining, flash_cache.refresh_with_fallback(rpc, refresh_set)).await {
         Ok(Ok(generation)) => {
             let wmatic = crate::core::constants::WMATIC;
             let wmatic_fresh = flash_cache.has_fresh_entry(wmatic);
             let wmatic_liq = flash_cache.snapshot(wmatic);
             crate::info!(
-                "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation} wmatic_fresh={wmatic_fresh} wmatic_bal={} wmatic_aave={} wmatic_listed={}",
+                "flash loan: hf_prefetch ok stale={stale_n} refresh={} fresh={fresh_n} generation={generation} wmatic_fresh={wmatic_fresh} wmatic_bal={} wmatic_aave={} wmatic_listed={}",
+                refresh_set.len(),
                 wmatic_liq.balancer,
                 wmatic_liq.aave,
                 wmatic_liq.aave_listed,
@@ -1546,7 +1595,10 @@ pub async fn run_hf_tick(
     let prefetch_count = pipeline.hf_prefetch_count.min(hot_pools.len().max(1));
     let skip_prefetch = stream_triggered && pipeline.stream_enabled;
     let mut prefetch_ok = skip_prefetch;
-    let pool_prefetch_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+    // One shared prep wall for recovery + pool + flash + probe hydrate.
+    // Stages used to each take HF_PREFETCH_BUDGET_MS (live: pool 194 + probe 2501 = 2.7s).
+    let prep_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+    let prep_deadline = Instant::now() + prep_budget;
     let pool_prefetch_started = now_ms();
 
     if stream_triggered && pipeline.stream_enabled {
@@ -1559,7 +1611,17 @@ pub async fn run_hf_tick(
                 "stream flush incomplete: flushed={flushed} hot_dirty_pending={} — refreshing before HF eval",
                 pending_pools.len(),
             );
-            let recovery_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
+            let recovery_budget = prep_remaining(prep_deadline);
+            if recovery_budget.is_zero() {
+                crate::warn!("hf tick skipped: stream state recovery has no prep budget left");
+                return Ok(HfTickResult {
+                    cycles_considered: cycles.len(),
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                    candidates: Arc::from([]),
+                });
+            }
             match timeout(
                 recovery_budget,
                 ctx.refresh
@@ -1626,23 +1688,31 @@ pub async fn run_hf_tick(
     let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
     let rpc = Arc::clone(&ctx.rpc);
     let refresh = Arc::clone(&ctx.refresh);
+    // Residual prep budget for pool/flash (shared deadline — no stage stacking).
+    let stage_budget = prep_remaining(prep_deadline);
+    let flash_budget = if skip_prefetch {
+        stage_budget.min(HF_STREAM_FLASH_BUDGET_CAP)
+    } else {
+        stage_budget
+    };
 
     if skip_prefetch || hot_pools.is_empty() {
         hf_flash_prefetch_stale(
             flash_cache.as_ref(),
             rpc.as_ref(),
             &flash_token_list,
-            pool_prefetch_budget,
+            flash_budget,
         )
         .await;
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
-    } else {
+    } else if !stage_budget.is_zero() {
         let hot = Arc::clone(&hot_pools);
+        let pool_budget = stage_budget;
         let pool_fut = async {
             timeout(
-                pool_prefetch_budget,
+                pool_budget,
                 hf_pool_prefetch(refresh.as_ref(), hot.as_ref(), prefetch_count),
             )
             .await
@@ -1651,7 +1721,7 @@ pub async fn run_hf_tick(
             flash_cache.as_ref(),
             rpc.as_ref(),
             &flash_token_list,
-            pool_prefetch_budget,
+            flash_budget,
         );
         let (pool_out, _) = tokio::join!(pool_fut, flash_fut);
         match pool_out {
@@ -1659,7 +1729,7 @@ pub async fn run_hf_tick(
             Ok(Err(e)) => crate::debug!("hf prefetch failed: {e:#}"),
             Err(_) => crate::debug!(
                 "hf prefetch timed out after {}ms",
-                pool_prefetch_budget.as_millis()
+                pool_budget.as_millis()
             ),
         }
         if !flash_token_list.is_empty() {
@@ -1704,13 +1774,16 @@ pub async fn run_hf_tick(
                 hot_pools = hot;
                 // Reselect can introduce start tokens absent from the prefetched set.
                 let flash_token_list = collect_hf_flash_token_list(&arena_base, &cycles).1;
-                hf_flash_prefetch_stale(
-                    flash_cache.as_ref(),
-                    rpc.as_ref(),
-                    &flash_token_list,
-                    pool_prefetch_budget,
-                )
-                .await;
+                let reselect_flash = prep_remaining(prep_deadline);
+                if !reselect_flash.is_zero() {
+                    hf_flash_prefetch_stale(
+                        flash_cache.as_ref(),
+                        rpc.as_ref(),
+                        &flash_token_list,
+                        reselect_flash,
+                    )
+                    .await;
+                }
             }
             Err(_) if cycles.is_empty() => {
                 if should_log_hf_summary() || stream_triggered {
@@ -1845,39 +1918,48 @@ pub async fn run_hf_tick(
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
-    // Same budget as pool prefetch — the old 900ms hard cap ignored HF_PREFETCH_BUDGET_MS.
-    let probe_tick_budget =
-        Duration::from_millis(ctx.config.pipeline.hf_prefetch_budget_ms.max(200));
+    // Residual of shared prep_deadline — do not re-open a full HF_PREFETCH_BUDGET_MS.
+    let probe_tick_budget = prep_remaining(prep_deadline);
     let probe_tick_started = now_ms();
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
-    let hydrate_stats = match timeout(
-        probe_tick_budget,
-        hydrate_tickless_cl_for_cycles(
-            ctx.rpc.as_ref(),
-            &mut arena,
-            &cycles,
-            pool_metas_for_dispatch.as_ref(),
-            ctx.config.oracle.tick_word_range,
-            None,
-        ),
-    )
-    .await
-    {
-        Ok(stats) => stats,
-        Err(_) => {
-            // Cool the attempted targets — without this the next tick re-burns
-            // the full budget on the same pools (median tick pinned at budget).
-            let cooled = crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
-                &arena,
+    let hydrate_stats = if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET {
+        crate::debug!(
+            "hf probe-tick hydrate skipped: residual prep {}ms < {}ms",
+            probe_tick_budget.as_millis(),
+            HF_PROBE_HYDRATE_MIN_BUDGET.as_millis()
+        );
+        crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
+    } else {
+        match timeout(
+            probe_tick_budget,
+            hydrate_tickless_cl_for_cycles(
+                ctx.rpc.as_ref(),
+                &mut arena,
                 &cycles,
                 pool_metas_for_dispatch.as_ref(),
-            );
-            crate::warn!(
-                "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools",
-                probe_tick_budget.as_millis()
-            );
-            crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
+                ctx.config.oracle.tick_word_range,
+                None,
+            ),
+        )
+        .await
+        {
+            Ok(stats) => stats,
+            Err(_) => {
+                // Cool the attempted targets — without this the next tick re-burns
+                // the full budget on the same pools (median tick pinned at budget).
+                let cooled =
+                    crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
+                        &arena,
+                        &cycles,
+                        pool_metas_for_dispatch.as_ref(),
+                    );
+                crate::warn!(
+                    "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools",
+                    probe_tick_budget.as_millis()
+                );
+                crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
+            }
         }
     };
     let probe_tick_ms = now_ms().saturating_sub(probe_tick_started);
@@ -2514,8 +2596,33 @@ fn prefer_near_miss_by_absolute_matic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::constants::{WMATIC, is_polygon_hub_token};
     use crate::core::types::{CycleEdges, Edge, PoolIndex, PoolState, TokenIndex, V2PoolState};
     use crate::services::partial_cache::SlimPoolState;
+
+    #[test]
+    fn flash_blocking_stale_keeps_only_hubs() {
+        let dust = Address::repeat_byte(0xab);
+        let stale = vec![dust, WMATIC, Address::repeat_byte(0xcd)];
+        let blocking = flash_blocking_stale(&stale);
+        assert_eq!(blocking, vec![WMATIC]);
+        assert!(is_polygon_hub_token(WMATIC));
+        assert!(!is_polygon_hub_token(dust));
+    }
+
+    #[test]
+    fn flash_blocking_stale_empty_when_only_dust() {
+        let stale = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
+        assert!(flash_blocking_stale(&stale).is_empty());
+    }
+
+    #[test]
+    fn prep_remaining_zero_after_deadline() {
+        let past = Instant::now() - Duration::from_millis(5);
+        assert!(prep_remaining(past).is_zero());
+        let future = Instant::now() + Duration::from_secs(10);
+        assert!(prep_remaining(future) > Duration::from_secs(1));
+    }
 
     #[test]
     fn near_miss_prefers_absolute_matic_over_cover_bps_dust() {
