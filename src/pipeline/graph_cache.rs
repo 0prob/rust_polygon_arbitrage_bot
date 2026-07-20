@@ -180,6 +180,32 @@ impl GraphCache {
         self.cached_state_generation = state_generation;
     }
 
+    /// Update graph topology without clearing a valid cycle cache.
+    ///
+    /// Post-rate `attach_missing` used to call [`Self::store`] with `cycles: None`,
+    /// which wiped the snap and forced exclusive pin-miss ticks to publish
+    /// `cycles=0` (live: pin_covered=0 → raw=0 with empty prior).
+    pub fn store_graph_keep_cycles(
+        &mut self,
+        graph: Arc<crate::pipeline::types::RoutingGraph>,
+        pool_count: usize,
+        layout_fingerprint: u64,
+        state_generation: u64,
+        eligible_pool_count: usize,
+        family_prefix: u64,
+    ) {
+        let keep = self.cycles.clone();
+        self.store(
+            graph,
+            keep,
+            pool_count,
+            layout_fingerprint,
+            state_generation,
+            eligible_pool_count,
+            family_prefix,
+        );
+    }
+
     /// True when pools gained eligibility since the last connectivity build.
     /// Pools losing eligibility only need edge rescoring (dead edges).
     /// Also true while a prior capped attach still has missing pools to catch up.
@@ -316,6 +342,32 @@ mod tests {
             0,
         );
         assert!(cache.needs_cycle_refind(10, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn store_graph_keep_cycles_preserves_nonempty_cache() {
+        let mut cache = GraphCache::with_rebuild_interval(60);
+        cache.advance_pass();
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            100,
+            1,
+            1,
+            80,
+            0,
+        );
+        assert_eq!(cache.cycles().map(|c| c.len()), Some(1));
+        cache.store_graph_keep_cycles(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            120,
+            2,
+            2,
+            100,
+            0,
+        );
+        assert_eq!(cache.cycles().map(|c| c.len()), Some(1));
+        assert!(!cache.needs_cycle_refind(120, 2, 2, 0, 120));
     }
 
     #[test]

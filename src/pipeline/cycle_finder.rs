@@ -413,9 +413,13 @@ impl ActiveGraph {
         }
     }
 
-    /// Fresh attach leaves Direct pin edges at ratio=0 (not live). Inject them with
-    /// a neutral ONE ratio so exclusive DFS can open through the observed venue
-    /// (live: first_hop_pin>0 on RoutingGraph, ActiveGraph starts empty → raw=0).
+    /// Ensure exclusive DFS can open through observed pin pools.
+    ///
+    /// - Fresh attach leaves Direct pins at ratio=0 (not live in ActiveGraph).
+    /// - Coverage prep may strip tokens whose only pin edge is a bridge-side
+    ///   incidence even when the RoutingGraph still has the live Direct.
+    ///
+    /// Inject any missing pin Direct (zero-ratio → ONE filler; live ratios kept).
     pub fn inject_unpriced_pin_directs(
         &mut self,
         graph: &RoutingGraph,
@@ -431,10 +435,7 @@ impl ActiveGraph {
                 self.adjacency.push(Vec::new());
             }
             for ge in edges {
-                if ge.phase != GraphHopPhase::Direct
-                    || !pin.contains(&ge.edge.pool_index)
-                    || !ge.ratio.is_zero()
-                {
+                if ge.phase != GraphHopPhase::Direct || !pin.contains(&ge.edge.pool_index) {
                     continue;
                 }
                 let already = self.adjacency[ti].iter().any(|e| {
@@ -446,8 +447,10 @@ impl ActiveGraph {
                     continue;
                 }
                 let mut injected = *ge;
-                injected.ratio = ONE;
-                injected.log_weight = 0.0;
+                if injected.ratio.is_zero() {
+                    injected.ratio = ONE;
+                    injected.log_weight = 0.0;
+                }
                 self.adjacency[ti].push(injected);
             }
         }

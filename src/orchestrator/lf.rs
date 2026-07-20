@@ -718,6 +718,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             &work.observed_pool_indices,
             Some(graph.as_ref()),
         );
+        let mut first_hop_pin = 0usize;
+        let mut pin_covered = 0usize;
         if !work.observed_pool_indices.is_empty() {
             let obs_in_graph = work
                 .observed_pool_indices
@@ -727,7 +729,6 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             let pin: FxHashSet<PoolIndex> =
                 work.observed_pool_indices.iter().copied().collect();
             // Count opening Enter/Direct edges from seed tokens into pin pools.
-            let mut first_hop_pin = 0usize;
             for &t in &obs_starts {
                 let Some(edges) = graph.adjacency.get(t.0 as usize) else {
                     continue;
@@ -740,7 +741,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     }
                 }
             }
-            let pin_covered = graph.coverage.as_ref().map_or(0, |cov| {
+            pin_covered = graph.coverage.as_ref().map_or(0, |cov| {
                 work.observed_pool_indices
                     .iter()
                     .filter(|p| cov.pool_indices.contains(&p.0))
@@ -757,7 +758,13 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         }
         // Exclusive obs starts when admitting — hub fill was starving SharedCycleCap
         // (live: in_graph=N/N enum_touch=0 after attach).
-        let exclusive_obs = work.force_cycle_refind && !obs_starts.is_empty();
+        // Bridge-only pins (pin_covered=0) cannot form multi-pool cycles; exclusive
+        // DFS always returns raw=0 and used to wipe the snap when prior was empty.
+        let pin_bridge_only = work.force_cycle_refind
+            && !work.observed_pool_indices.is_empty()
+            && pin_covered == 0;
+        let exclusive_obs =
+            work.force_cycle_refind && !obs_starts.is_empty() && !pin_bridge_only;
         let first_hop = if exclusive_obs {
             work.observed_pool_indices.as_slice()
         } else {
@@ -766,7 +773,21 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         // Skip atomic prefilter on exclusive obs — pin cycles are for hot-path
         // coverage, not profit rank (live: first_hop_pin>0 → enum_touch=0).
         let atomic_prefilter = !exclusive_obs;
-        let outcome = if incremental_refind {
+        let outcome = if pin_bridge_only {
+            crate::info!(
+                "stream observed-live: pin_bridge_skip first_hop_pin={first_hop_pin} pin_pools={} — no multi-pool close lf_pass={}",
+                work.observed_pool_indices.len(),
+                work.lf_pass
+            );
+            crate::pipeline::cycle_search::CycleSearchOutcome {
+                cycles: Vec::new(),
+                diag: crate::pipeline::cycle_search::CycleSearchDiagnostics {
+                    mode: work.cycle_finder,
+                    start_tokens: obs_starts.len(),
+                    ..Default::default()
+                },
+            }
+        } else if incremental_refind {
             find_cycles_for_mode_with_budget(
                 work.cycle_finder,
                 &work.arena,
@@ -809,7 +830,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         };
         // ponytail: dropped relax-uni-or-pin retry — live still dfs=0 (sparse pin
         // close); keeping-prior already covers empty exclusive.
-        if exclusive_obs || work.force_cycle_refind {
+        if exclusive_obs || work.force_cycle_refind || pin_bridge_only {
             crate::info!(
                 "stream observed-live: cycle_search raw={} dedupe={} out={} dfs={} starts={} enum_ms={} lf_pass={}",
                 outcome.diag.raw_collected,
@@ -827,7 +848,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         // Merge cache on observed admit. Exclusive: only Uni-only cached
         // cycles that already touch a pin pool (full Uni cache re-poisoned
         // pins; skipping cache zeroed enum_touch when DFS closed none).
-        if (incremental_refind || work.force_cycle_refind)
+        // Bridge-only pins: keep full prior cache (no pin filter — there is no close).
+        if (incremental_refind || work.force_cycle_refind || pin_bridge_only)
             && let Some(cached) = cached_cycles.as_ref()
         {
             if exclusive_obs {
@@ -864,19 +886,21 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         }
         enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
         let enumerated_cycles = result.len();
-        let diversified = if work.observed_pool_indices.is_empty() {
+        // pins_only only when exclusive pin search ran; bridge-skip keeps full prior.
+        let pins_only = exclusive_obs;
+        let diversified = if work.observed_pool_indices.is_empty() || pin_bridge_only {
             finalize_enumerated_cycles(result, work.max_paths)
         } else {
             pin_cycles_touching_pools(
                 result,
                 &work.observed_pool_indices,
                 work.max_paths,
-                exclusive_obs,
+                pins_only,
             )
         };
-        // Exclusive pin miss used to store [] and wipe a good prior snap
+        // Exclusive / bridge pin miss used to store [] and wipe a good prior snap
         // (live: cycles_touching=6 → next admit 0/0).
-        let cycles = if exclusive_obs && diversified.is_empty() {
+        let cycles = if (exclusive_obs || pin_bridge_only) && diversified.is_empty() {
             if let Some(prior) = cached_cycles.as_ref().filter(|c| !c.is_empty()) {
                 crate::info!(
                     "stream observed-live: exclusive empty — keeping prior cache cycles={} lf_pass={}",
@@ -885,7 +909,22 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 );
                 Arc::clone(prior)
             } else {
-                Arc::new(diversified)
+                // Prior wiped (e.g. old post-rate store) — refill with hub DFS so
+                // we do not publish an empty snap (live: cycles=0 until next interval).
+                crate::info!(
+                    "stream observed-live: exclusive empty no prior — hub refill lf_pass={}",
+                    work.lf_pass
+                );
+                let refill = find_cycles_for_mode(
+                    work.cycle_finder,
+                    &work.arena,
+                    &graph,
+                    work.pool_metas.as_ref(),
+                    passes.as_slice(),
+                    true,
+                    Some(&probe_ctx),
+                );
+                Arc::new(finalize_enumerated_cycles(refill.cycles, work.max_paths))
             }
         } else {
             Arc::new(diversified)
@@ -1466,9 +1505,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             if report.attached_pools > 0 {
                 {
                     let mut gc = ctx.graph_cache.lock();
-                    gc.store(
+                    // Keep cycles — wiping here left exclusive pin-miss ticks with
+                    // empty prior (live: cycles=108 → next obs pin_covered=0 → 0).
+                    gc.store_graph_keep_cycles(
                         Arc::clone(&routing_graph),
-                        None,
                         routable_count,
                         layout_fp,
                         state_generation,
