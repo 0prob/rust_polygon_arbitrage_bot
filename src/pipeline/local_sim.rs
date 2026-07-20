@@ -8,7 +8,7 @@ use crate::core::math::uniswap_v2::simulate_v2_swap;
 use crate::core::math::uniswap_v3::simulate_v3_swap;
 use crate::core::math::woofi::get_woofi_amount_out;
 use crate::core::types::{
-    Edge, PoolState, ProtocolType, RouteSimulationResult, hop_amounts_zeroed,
+    Edge, PoolState, ProtocolType, RouteSimulationResult, TokenIndex, hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::curve_sim::curve_hop_amount_out;
@@ -412,6 +412,15 @@ pub fn protocol_from_pool_state(state: &PoolState, fallback: ProtocolType) -> Pr
     }
 }
 
+#[inline]
+#[must_use]
+fn protocol_is_pair(protocol: ProtocolType) -> bool {
+    matches!(
+        protocol,
+        ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+    )
+}
+
 /// Every hop's edge protocol matches the arena `PoolState` variant (else probe is
 /// `UnsupportedState` — live: V2 edges on V3/Balancer state crowding the HF window).
 #[must_use]
@@ -448,15 +457,57 @@ pub fn cycle_v2_edges_match_pool_meta(
         };
         match pool_meta_at(pool_metas, edge.pool_index) {
             Some(m) if m.tokens.len() >= 2 => {
-                m.tokens
-                    .iter()
-                    .any(|&t| arena.token_address(t) == Some(tin))
-                    && m.tokens
-                        .iter()
-                        .any(|&t| arena.token_address(t) == Some(tout))
+                let on_meta = |want: alloy::primitives::Address| {
+                    m.tokens.iter().any(|&t| {
+                        arena
+                            .token_address(t)
+                            .is_some_and(|maddr| {
+                                crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                            })
+                    })
+                };
+                on_meta(tin) && on_meta(tout)
             }
             _ => true,
         }
+    })
+}
+
+/// True when any Uni V2/V3/V4 edge has neither endpoint on pool meta (wrong pool).
+/// Complement realign cannot recover these — prune must hard-drop, not soft-keep.
+#[must_use]
+pub fn uni_cycle_has_both_foreign_edge(
+    arena: &StateArena,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    edges: &[Edge],
+) -> bool {
+    use crate::pipeline::types::pool_meta_at;
+    edges.iter().any(|edge| {
+        if !matches!(
+            edge.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        ) {
+            return false;
+        }
+        let Some(m) = pool_meta_at(pool_metas, edge.pool_index) else {
+            return false;
+        };
+        if m.tokens.len() < 2 {
+            return false;
+        }
+        let on_meta = |tok: TokenIndex| {
+            m.tokens.iter().any(|&t| t == tok)
+                || arena.token_address(tok).is_some_and(|want| {
+                    m.tokens.iter().any(|&t| {
+                        arena
+                            .token_address(t)
+                            .is_some_and(|maddr| {
+                                crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                            })
+                    })
+                })
+        };
+        !on_meta(edge.token_in) && !on_meta(edge.token_out)
     })
 }
 
@@ -489,31 +540,34 @@ pub fn realign_uni_cycle_from_pool_meta(
                 | ProtocolType::Dodo
                 | ProtocolType::Woofi
         ) {
+            // ponytail: skip remap on stale meta — don't fail-closed the whole
+            // cycle (live: uni_realign wiped Woofi/Balancer mixes with healthy Uni hops).
             let Some(in_pos) = m.tokens.iter().position(|&t| t == edge.token_in) else {
-                return None;
+                continue;
             };
             let Some(out_pos) = m.tokens.iter().position(|&t| t == edge.token_out) else {
-                return None;
+                continue;
             };
             if let Some(PoolState::Curve(s)) = arena.pool_state(edge.pool_index)
                 && (in_pos >= s.balances.len() || out_pos >= s.balances.len() || in_pos == out_pos)
             {
-                return None;
+                continue;
             }
-            if matches!(edge.protocol, ProtocolType::Dodo) && (in_pos > 1 || out_pos > 1 || in_pos == out_pos)
+            if matches!(edge.protocol, ProtocolType::Dodo)
+                && (in_pos > 1 || out_pos > 1 || in_pos == out_pos)
             {
-                return None;
+                continue;
             }
             if let Some(PoolState::Woofi(s)) = arena.pool_state(edge.pool_index)
                 && (in_pos >= s.tokens.len() || out_pos >= s.tokens.len() || in_pos == out_pos)
             {
-                return None;
+                continue;
             }
             let Ok(in_idx) = u8::try_from(in_pos) else {
-                return None;
+                continue;
             };
             let Ok(out_idx) = u8::try_from(out_pos) else {
-                return None;
+                continue;
             };
             if edge.token_in_idx != in_idx || edge.token_out_idx != out_idx {
                 edge.token_in_idx = in_idx;
@@ -529,10 +583,22 @@ pub fn realign_uni_cycle_from_pool_meta(
         ) {
             continue;
         }
-        // Prefer address→idx when both tokens are in meta. Stale idxs otherwise
-        // overwrite a valid hop (e.g. correct t0→t1 with idxs (1,0) flipped to t1→t0).
-        let in_pos = m.tokens.iter().position(|&t| t == edge.token_in);
-        let out_pos = m.tokens.iter().position(|&t| t == edge.token_out);
+        // Resolve legs: TokenIndex → address → idxs. Prefer endpoint membership
+        // over blind idx invent (live: invent rewrote foreign tokens onto wrong pools).
+        let meta_pos = |tok: TokenIndex| {
+            m.tokens.iter().position(|&t| t == tok).or_else(|| {
+                let want = arena.token_address(tok)?;
+                m.tokens.iter().position(|&t| {
+                    arena
+                        .token_address(t)
+                        .is_some_and(|maddr| {
+                            crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                        })
+                })
+            })
+        };
+        let in_pos = meta_pos(edge.token_in);
+        let out_pos = meta_pos(edge.token_out);
         if let (Some(in_pos), Some(out_pos)) = (in_pos, out_pos) {
             if in_pos == out_pos {
                 return None;
@@ -543,21 +609,69 @@ pub fn realign_uni_cycle_from_pool_meta(
             let Ok(out_idx) = u8::try_from(out_pos) else {
                 return None;
             };
+            let meta_in = m.tokens[in_pos];
+            let meta_out = m.tokens[out_pos];
+            if edge.token_in != meta_in || edge.token_out != meta_out {
+                edge.token_in = meta_in;
+                edge.token_out = meta_out;
+                changed = true;
+            }
+            if edge.token_in_idx != in_idx || edge.token_out_idx != out_idx {
+                edge.token_in_idx = in_idx;
+                edge.token_out_idx = out_idx;
+                changed = true;
+            }
+        } else if m.tokens.len() == 2 {
+            // ponytail: one endpoint on meta → other leg is the complement.
+            // Idx invent was rewriting the good leg when idxs disagreed with
+            // address membership (live: tin_ok=true tout_ok=false → cull).
+            let (in_pos, out_pos) = match (in_pos, out_pos) {
+                (Some(i), None) => (i, 1 - i),
+                (None, Some(o)) => (1 - o, o),
+                _ => return None,
+            };
+            let Ok(in_idx) = u8::try_from(in_pos) else {
+                return None;
+            };
+            let Ok(out_idx) = u8::try_from(out_pos) else {
+                return None;
+            };
+            let meta_in = m.tokens[in_pos];
+            let meta_out = m.tokens[out_pos];
+            if edge.token_in != meta_in || edge.token_out != meta_out {
+                edge.token_in = meta_in;
+                edge.token_out = meta_out;
+                changed = true;
+            }
             if edge.token_in_idx != in_idx || edge.token_out_idx != out_idx {
                 edge.token_in_idx = in_idx;
                 edge.token_out_idx = out_idx;
                 changed = true;
             }
         } else {
-            let Some(&tin) = m.tokens.get(edge.token_in_idx as usize) else {
+            // Multi-token / odd shapes: one endpoint on a meta leg + idxs in
+            // range — remap stale TokenIndex from idxs. Both foreign = wrong pool.
+            let in_i = usize::from(edge.token_in_idx);
+            let out_i = usize::from(edge.token_out_idx);
+            if in_i >= m.tokens.len()
+                || out_i >= m.tokens.len()
+                || in_i == out_i
+                || (in_pos.is_none() && out_pos.is_none())
+            {
                 return None;
-            };
-            let Some(&tout) = m.tokens.get(edge.token_out_idx as usize) else {
+            }
+            let meta_in = m.tokens[in_i];
+            let meta_out = m.tokens[out_i];
+            let in_agrees = in_pos == Some(in_i)
+                || arena.token_address(edge.token_in) == arena.token_address(meta_in);
+            let out_agrees = out_pos == Some(out_i)
+                || arena.token_address(edge.token_out) == arena.token_address(meta_out);
+            if !in_agrees && !out_agrees {
                 return None;
-            };
-            if edge.token_in != tin || edge.token_out != tout {
-                edge.token_in = tin;
-                edge.token_out = tout;
+            }
+            if edge.token_in != meta_in || edge.token_out != meta_out {
+                edge.token_in = meta_in;
+                edge.token_out = meta_out;
                 changed = true;
             }
         }
@@ -572,12 +686,82 @@ pub fn realign_uni_cycle_from_pool_meta(
             }
         }
     }
-    if !owned
-        .edges
-        .windows(2)
-        .all(|pair| pair[0].token_out == pair[1].token_in)
-    {
-        return None;
+    let addr_eq = |a: TokenIndex, b: TokenIndex| {
+        a == b
+            || (arena.token_address(a).is_some() && arena.token_address(a) == arena.token_address(b))
+    };
+    let hop_ok = |edges: &[Edge]| {
+        edges
+            .windows(2)
+            .all(|pair| addr_eq(pair[0].token_out, pair[1].token_in))
+    };
+    if !hop_ok(&owned.edges) {
+        // Independent per-hop idx remap can desync multi-hop Uni cycles when a
+        // middle hop's idxs are flipped. Re-anchor each hop to prev.token_out
+        // when that token is a meta leg (2-token Uni: other leg = token_out).
+        for i in 1..owned.edges.len() {
+            let need = owned.edges[i - 1].token_out;
+            let edge = &mut owned.edges[i];
+            // Same address, different TokenIndex — unify to prev.token_out.
+            if addr_eq(edge.token_in, need) {
+                if edge.token_in != need {
+                    edge.token_in = need;
+                    changed = true;
+                }
+                continue;
+            }
+            let Some(m) = pool_meta_at(pool_metas, edge.pool_index) else {
+                continue;
+            };
+            if !matches!(
+                edge.protocol,
+                ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ) || m.tokens.len() < 2
+            {
+                continue;
+            }
+            let Some(in_pos) = m.tokens.iter().position(|&t| t == need) else {
+                continue;
+            };
+            let out_pos = if m.tokens.len() == 2 {
+                1 - in_pos
+            } else if let Some(pos) = m.tokens.iter().position(|&t| t == edge.token_out) {
+                if pos == in_pos {
+                    continue;
+                }
+                pos
+            } else {
+                continue;
+            };
+            let Ok(in_idx) = u8::try_from(in_pos) else {
+                continue;
+            };
+            let Ok(out_idx) = u8::try_from(out_pos) else {
+                continue;
+            };
+            edge.token_in = need;
+            edge.token_out = m.tokens[out_pos];
+            edge.token_in_idx = in_idx;
+            edge.token_out_idx = out_idx;
+            if let (Some(a_in), Some(a_out)) = (
+                arena.token_address(edge.token_in),
+                arena.token_address(edge.token_out),
+            ) {
+                edge.zero_for_one = a_in < a_out;
+            }
+            changed = true;
+        }
+        if !hop_ok(&owned.edges) {
+            // Only keep original when it still chains AND would clear meta_match;
+            // otherwise soft-fail just delayed the same cull (live: all samples
+            // were meta_match after uni_realign soft-fail).
+            if hop_ok(&cycle.edges)
+                && cycle_v2_edges_match_pool_meta(arena, pool_metas, &cycle.edges)
+            {
+                return Some(cycle);
+            }
+            return None;
+        }
     }
     if !owned.edges.is_empty() && !owned.edges.iter().any(|e| e.token_in == owned.start_token) {
         owned.start_token = owned.edges[0].token_in;
@@ -706,7 +890,14 @@ pub fn realign_multi_token_found_cycle(
         ) {
             continue;
         }
-        let state = arena.pool_state(edge.pool_index)?;
+        let Some(state) = arena.pool_state(edge.pool_index) else {
+            return None;
+        };
+        // Family skew (Balancer tag × V3 state) — heal rewrites protocol; vault
+        // realign here false-fails (live: obs multi-fail sample state=v3).
+        if !protocol_matches_pool_state(edge.protocol, state) {
+            continue;
+        }
         let before = (edge.token_in_idx, edge.token_out_idx);
         if !realign_multi_token_edge(arena, state, edge) {
             return None;
@@ -796,6 +987,11 @@ pub fn heal_cycle_edge_protocols(
             if corrected == edge.protocol {
                 return None;
             }
+            // ponytail: pair↔multi heal leaves vault idxs (4/0) on Uni edges —
+            // uni_realign then culls every live_touch (live: drop_proto=touch).
+            if protocol_is_pair(edge.protocol) != protocol_is_pair(corrected) {
+                return None;
+            }
             edge.protocol = corrected;
             changed = true;
         }
@@ -836,7 +1032,7 @@ pub fn minimal_sim_failure(
     edges: &[Edge],
     amount_in: U256,
 ) -> Option<MinimalSimFailure> {
-    if !route_edges_simulatable(edges) {
+    if !route_edges_simulatable(arena, edges) {
         return Some(MinimalSimFailure::InvalidRoute);
     }
     if amount_in.is_zero() {
@@ -1509,13 +1705,38 @@ fn walk_route_hops(
     Some((current, total_gas))
 }
 
+/// First hop index `i` where `edges[i].token_out != edges[i+1].token_in`.
 #[inline]
-fn route_edges_simulatable(edges: &[Edge]) -> bool {
+#[must_use]
+pub fn first_hop_continuity_break(edges: &[Edge]) -> Option<usize> {
+    edges
+        .windows(2)
+        .position(|pair| pair[0].token_out != pair[1].token_in)
+}
+
+/// Address-aware continuity — TokenIndex inequality false-positives aliases.
+#[inline]
+#[must_use]
+pub fn first_hop_continuity_break_in_arena(
+    arena: &StateArena,
+    edges: &[Edge],
+) -> Option<usize> {
+    edges.windows(2).position(|pair| {
+        match (
+            arena.token_address(pair[0].token_out),
+            arena.token_address(pair[1].token_in),
+        ) {
+            (Some(a), Some(b)) => a != b,
+            _ => pair[0].token_out != pair[1].token_in,
+        }
+    })
+}
+
+#[inline]
+fn route_edges_simulatable(arena: &StateArena, edges: &[Edge]) -> bool {
     !edges.is_empty()
         && edges.len() <= HOP_CAP_USIZE
-        && edges
-            .windows(2)
-            .all(|pair| pair[0].token_out == pair[1].token_in)
+        && first_hop_continuity_break_in_arena(arena, edges).is_none()
 }
 
 pub fn simulate_route_minimal(
@@ -1533,7 +1754,7 @@ pub fn simulate_route_minimal_with_caps(
     amount_in: U256,
     precomputed_shallow_caps: Option<&[U256; HOP_CAP_USIZE]>,
 ) -> Option<MinimalSimResult> {
-    if !route_edges_simulatable(edges) {
+    if !route_edges_simulatable(arena, edges) {
         return None;
     }
     if amount_in.is_zero() {
@@ -1573,7 +1794,7 @@ pub fn simulate_route_detailed_with_caps(
     precomputed_shallow_caps: Option<&[U256; HOP_CAP_USIZE]>,
 ) -> Option<RouteSimulationResult> {
     let hop_count = edges.len();
-    if !route_edges_simulatable(edges) {
+    if !route_edges_simulatable(arena, edges) {
         return None;
     }
     if amount_in.is_zero() {
@@ -1917,6 +2138,64 @@ mod tests {
         }];
         assert!(!cycle_v2_edges_match_pool_meta(&arena, &[meta], &edges));
         assert!(cycle_v2_edges_match_pool_meta(&arena, &[], &edges)); // defer when no meta
+    }
+
+    #[test]
+    fn cycle_v2_edges_match_pool_meta_accepts_usdc_e_on_native_usdc_leg() {
+        use crate::core::constants::{USDC_E, USDC_NATIVE, WMATIC};
+        use crate::core::types::V2PoolState;
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let usdc_native = arena.register_token(USDC_NATIVE);
+        let usdc_e = arena.register_token(USDC_E);
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV2,
+            tokens: vec![wmatic, usdc_native],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        // Stale edge used USDC.e TokenIndex on a native-USDC pool leg.
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: wmatic,
+            token_out: usdc_e,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        assert!(cycle_v2_edges_match_pool_meta(&arena, &[meta.clone()], &edges));
+        let cycle = Arc::new(crate::core::types::FoundCycle {
+            start_token: wmatic,
+            edges: crate::core::types::CycleEdges::from_slice(&edges),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let realigned = realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign");
+        assert_eq!(realigned.edges[0].token_out, usdc_native);
     }
 
     #[test]

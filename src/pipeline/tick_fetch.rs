@@ -12,6 +12,10 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 pub const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
 /// Shorter cooldown when hydrate times out before marking misses (HF probe path).
 pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 10_000;
+/// After a successful tick load, suppress re-hydrate briefly. Hot-cache price
+/// moves clear ticks (`preserve_cl_ticks_on_replace`) and HF was re-fetching the
+/// same 5–6 pools every 200ms tick (~0.5–1.6s). Shared HF/LF via this map.
+pub const RECENT_HYDRATE_COOLDOWN_MS: u64 = 3_000;
 /// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
 /// dominate LF under rate limits.
 const MAX_WIDE_TICK_POOLS: usize = 24;
@@ -404,7 +408,12 @@ pub async fn enrich_v3_ticks<
     let mut algebra_fallback: Vec<(Address, PoolIndex, i32, i32, i32)> = Vec::new();
     let mut tick_lens_rpc_failed = false;
     if !items.is_empty() {
-        match crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
+        match crate::pipeline::multicall::execute_tick_lens_multicall_at(
+            provider,
+            &items,
+            block_number,
+        )
+        .await
         {
             Ok(results) => {
                 for (start, end, idx) in &spans {
@@ -591,21 +600,26 @@ pub async fn enrich_v3_ticks<
         }
     }
 
-    // Cooldown pools that remain empty after the full attempt; clear on success.
+    // Cooldown empties after a full attempt; briefly suppress re-fetch on success
+    // so hot-cache tick drops don't thrash TickLens every HF tick.
     let mut still_tickless = Vec::new();
+    let mut loaded_ok = Vec::new();
     for &pool in pool_addresses {
         let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
             continue;
         };
         match arena.pool_state(idx) {
             Some(crate::core::types::PoolState::V3(s)) if !s.ticks.is_empty() => {
-                clear_empty_tick_cooldown(pool);
+                loaded_ok.push(pool);
             }
             Some(crate::core::types::PoolState::V3(s)) if s.ticks.is_empty() => {
                 still_tickless.push(pool);
             }
             _ => {}
         }
+    }
+    if !loaded_ok.is_empty() {
+        mark_tick_cooldown_addresses(loaded_ok, RECENT_HYDRATE_COOLDOWN_MS);
     }
     // URL fallback when empties remain after hard RPC fail or incomplete words.
     // Genuinely empty (complete probe) gets cooldown instead — not another URL.
@@ -617,6 +631,10 @@ pub async fn enrich_v3_ticks<
             !widen_available || wide_attempted.contains(p)
         });
         mark_empty_tick_cooldown(cool);
+    } else if !still_tickless.is_empty() && incomplete_pools > 0 {
+        // Incomplete words without finishing URL fallback — short suppress so the
+        // next HF tick doesn't re-clear+refetch the same batch immediately.
+        mark_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
     }
 
     if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
@@ -739,8 +757,12 @@ async fn enrich_v3_tick_lens_only<
     if items.is_empty() {
         return 0;
     }
-    let Ok(results) =
-        crate::pipeline::multicall::execute_multicall_at(provider, &items, block_number).await
+    let Ok(results) = crate::pipeline::multicall::execute_tick_lens_multicall_at(
+        provider,
+        &items,
+        block_number,
+    )
+    .await
     else {
         return 0;
     };
@@ -990,19 +1012,23 @@ pub async fn enrich_v4_ticks<
         }
     }
 
-    // Cooldown pools that remain empty after a completed probe; clear on success.
-    // (Hard RPC failures return early above. Incomplete/capped → URL fallback.)
+    // Cooldown empties after a completed probe; briefly suppress re-fetch on
+    // success (hot-cache tick drops). Incomplete/capped → URL fallback + short cool.
     let mut still_tickless: Vec<FixedBytes<32>> = Vec::new();
+    let mut loaded_ok: Vec<FixedBytes<32>> = Vec::new();
     for &(idx, pool_id) in targets {
         match arena.pool_state(idx) {
             Some(crate::core::types::PoolState::V4(s)) if !s.ticks.is_empty() => {
-                clear_empty_v4_tick_cooldown(pool_id);
+                loaded_ok.push(pool_id);
             }
             Some(crate::core::types::PoolState::V4(s)) if s.ticks.is_empty() => {
                 still_tickless.push(pool_id);
             }
             _ => {}
         }
+    }
+    if !loaded_ok.is_empty() {
+        mark_v4_tick_cooldown(loaded_ok, RECENT_HYDRATE_COOLDOWN_MS);
     }
     let incomplete_count = incomplete_pools.len();
     let needs_url_fallback = !still_tickless.is_empty() && (incomplete_count > 0 || capped);
@@ -1012,6 +1038,8 @@ pub async fn enrich_v4_ticks<
             !widen_available || wide_attempted.contains(id)
         });
         mark_empty_v4_tick_cooldown(cool);
+    } else if !still_tickless.is_empty() && incomplete_count > 0 {
+        mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
     }
 
     if empty_pools > 0 || wide_loaded > 0 || updated > 0 {

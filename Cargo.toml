@@ -51,13 +51,13 @@ rayon = "1.12.0"
 smallvec = { version = "1.15.2", features = ["union", "const_generics"] }
 # tokio 1.53 defaults are empty; enable only what we use. `parking_lot` reuses our dep
 # for sync primitives inside the runtime. CPU work stays on rayon (not spawn_blocking).
-tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "parking_lot"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "parking_lot"] }
 tokio-postgres = "0.7.18"
 # Statement-cached pool for tokio-postgres; Runtime::Tokio1 + Verified recycle in infra::pg.
 deadpool-postgres = "0.14.1"
 [dev-dependencies]
 figment = { version = "0.10", features = ["test"] }
-tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 # Default features: std + fork + timeout (Proptest 1.11 book quickstart).
 proptest = "1.11"
 # html_reports is non-default since 0.4; cargo_bench_support comes from default features.

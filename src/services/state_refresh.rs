@@ -766,6 +766,17 @@ impl StateRefreshService {
         arena: &mut crate::pipeline::arena::StateArena,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
     ) -> Vec<crate::pipeline::types::PoolMeta> {
+        self.sync_routable_arena_gated(arena, decimal_hints, false)
+            .metas
+    }
+
+    /// `freeze_append`: skip new arena membership while graph attach catch-up runs.
+    pub fn sync_routable_arena_gated(
+        &self,
+        arena: &mut crate::pipeline::arena::StateArena,
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        freeze_append: bool,
+    ) -> crate::pipeline::arena::ArenaSyncReport {
         let (discovered, address_index) = {
             let state = self.discovery_state.read();
             (
@@ -773,11 +784,12 @@ impl StateRefreshService {
                 Arc::clone(&state.address_index),
             )
         };
-        arena.sync_from_discovery(
+        arena.sync_from_discovery_gated(
             &self.cache,
             discovered.as_ref(),
             address_index.as_ref(),
             decimal_hints,
+            freeze_append,
         )
     }
 

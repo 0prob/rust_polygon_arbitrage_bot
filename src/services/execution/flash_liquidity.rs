@@ -464,11 +464,9 @@ impl FlashLiquidityCache {
             return;
         }
         self.track_hot_tokens(tokens);
-        {
-            let snap = self.inner.load();
-            if tokens.iter().all(|token| snap.has_fresh(*token, self.ttl)) {
-                return;
-            }
+        // Use 75% TTL stale set — full-TTL has_fresh left a 7.5s ColdCache window.
+        if self.stale_tokens(tokens).is_empty() {
+            return;
         }
         if self.refresh_inflight.load(Ordering::Acquire) {
             return;
@@ -543,10 +541,19 @@ impl FlashLiquidityCache {
             .unwrap_or_else(|| anyhow::anyhow!("flash liquidity refresh failed on all state RPCs")))
     }
 
+    /// Tokens missing or past 75% of TTL — shared by HF prefetch + background refresh.
+    #[must_use]
+    pub fn tokens_needing_refresh(&self, tokens: &[Address]) -> Vec<Address> {
+        self.stale_tokens(tokens)
+    }
+
     fn stale_tokens(&self, tokens: &[Address]) -> Vec<Address> {
         // Short stack borrow — `load()` not `load_full()` (arc-swap performance docs).
+        // Refresh at 75% TTL so HF doesn't probe into ColdCache at the 30s edge
+        // (live: wmatic_fresh=true then ColdCache ~30s later on stream ticks).
         let current = self.inner.load();
         let now = Instant::now();
+        let refresh_after = self.ttl.mul_f32(0.75);
         tokens
             .iter()
             .copied()
@@ -554,7 +561,7 @@ impl FlashLiquidityCache {
                 current
                     .entries
                     .get(token)
-                    .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= self.ttl)
+                    .is_none_or(|e| now.saturating_duration_since(e.fetched_at) >= refresh_after)
             })
             .collect()
     }

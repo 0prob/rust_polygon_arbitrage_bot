@@ -127,7 +127,8 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
     },
     TokenFeed {
         token: address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
-        chainlink: Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD868eE6b11a9")),
+        // Official Polygon UNI/USD proxy (typo eE6b11a9 returned empty eth_call / multicall fail).
+        chainlink: Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD8682386e13C")),
         pyth_id: Some("78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501"),
     },
     TokenFeed {
@@ -277,6 +278,8 @@ pub struct PriceOracle {
     custom_pyth: RwLock<FxHashMap<Address, String>>,
     /// Config-driven Chainlink feed overrides (token -> aggregator address).
     custom_chainlink: RwLock<FxHashMap<Address, Address>>,
+    /// Tokens whose current USD raw came from Hermes (vs on-chain Chainlink).
+    pyth_sourced: RwLock<rustc_hash::FxHashSet<Address>>,
     /// Configurable cache TTL — overrides DEFAULT_CACHE_TTL_MS.
     cache_ttl: Duration,
     /// Coalesce concurrent MATIC/USD refreshes (HF ticks at 200ms can stampede).
@@ -294,13 +297,16 @@ impl PriceOracle {
             chainlink_usd_raw: RwLock::new(FxHashMap::default()),
             custom_pyth: RwLock::new(FxHashMap::default()),
             custom_chainlink: RwLock::new(FxHashMap::default()),
+            pyth_sourced: RwLock::new(rustc_hash::FxHashSet::default()),
             cache_ttl: Duration::from_millis(cache_ttl_ms),
             matic_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub fn register_pyth_feed(&self, token: Address, feed_id: String) {
-        self.custom_pyth.write().insert(token, feed_id);
+        self.custom_pyth
+            .write()
+            .insert(token, normalize_pyth_feed_id(&feed_id));
     }
 
     pub fn register_chainlink_feed(&self, token: Address, feed: Address) {
@@ -323,7 +329,9 @@ impl PriceOracle {
             }
             entry.value
         };
-        self.store_matic_usd(usd);
+        // Slot only — do not rewrite chainlink_usd_raw via f64 round-trip (clobbers
+        // exact Chainlink/Pyth raw already stored by cache_token_usd).
+        self.store_matic_usd_slot(usd);
         Some(usd)
     }
 
@@ -346,8 +354,30 @@ impl PriceOracle {
         );
         self.chainlink_usd_raw.write().insert(token, chainlink_raw);
         if token == WMATIC {
-            self.store_matic_usd(usd);
+            // Slot only — raw already inserted above; store_matic_usd would round-trip f64.
+            self.store_matic_usd_slot(usd);
         }
+    }
+
+    fn cache_token_usd_from_pyth(
+        &self,
+        token: Address,
+        usd: f64,
+        chainlink_raw: I256,
+        now: Instant,
+    ) {
+        self.cache_token_usd(token, usd, chainlink_raw, now);
+        self.pyth_sourced.write().insert(token);
+    }
+
+    fn mark_chainlink_sourced(&self, token: Address) {
+        self.pyth_sourced.write().remove(&token);
+    }
+
+    /// True when the cached USD raw for `token` last came from Hermes.
+    #[must_use]
+    pub(crate) fn is_pyth_sourced(&self, token: &Address) -> bool {
+        self.pyth_sourced.read().contains(token)
     }
 
     fn collect_pyth_id_groups(&self, tokens: &[Address]) -> FxHashMap<String, Vec<Address>> {
@@ -355,8 +385,8 @@ impl PriceOracle {
         let mut out: FxHashMap<String, Vec<Address>> = FxHashMap::default();
         for token in tokens {
             let id = pyth_feed(token)
-                .map(str::to_string)
-                .or_else(|| custom.get(token).cloned());
+                .map(normalize_pyth_feed_id)
+                .or_else(|| custom.get(token).map(|s| normalize_pyth_feed_id(s)));
             let Some(id) = id else {
                 continue;
             };
@@ -414,9 +444,15 @@ impl PriceOracle {
         if let Some(usd) = self.resolve_matic_usd_cached() {
             return usd;
         }
+        // Singleflight: LF enrich, HF flash-cap, background warm, and TUI all share this.
+        let _guard = self.matic_refresh.lock().await;
+        if let Some(usd) = self.resolve_matic_usd_cached() {
+            return usd;
+        }
         if let Some(p) = provider {
             self.refresh_chainlink_token_usd(p, &[WMATIC]).await;
             if let Some(usd) = self.resolve_matic_usd_cached() {
+                crate::debug!("matic/usd refresh: source=chainlink usd={usd}");
                 return usd;
             }
             crate::debug!("Chainlink MATIC/USD missing or stale after multicall — trying Pyth");
@@ -425,6 +461,7 @@ impl PriceOracle {
         }
         if let Some(usd) = self.fetch_pyth_matic_usd().await {
             self.store_matic_usd(usd);
+            crate::debug!("matic/usd refresh: source=pyth usd={usd}");
             return usd;
         }
         if let Some(stale) = self.touch_stale_matic_usd("Chainlink and Pyth unavailable") {
@@ -441,8 +478,13 @@ impl PriceOracle {
         if let Some(usd) = self.resolve_matic_usd_cached() {
             return usd;
         }
+        let _guard = self.matic_refresh.lock().await;
+        if let Some(usd) = self.resolve_matic_usd_cached() {
+            return usd;
+        }
         if let Some(usd) = self.fetch_pyth_matic_usd().await {
             self.store_matic_usd(usd);
+            crate::debug!("matic/usd refresh offline: source=pyth usd={usd}");
             return usd;
         }
         if let Some(stale) = self.touch_stale_matic_usd("Pyth unavailable") {
@@ -452,7 +494,7 @@ impl PriceOracle {
         DEFAULT_MATIC_USD
     }
 
-    /// Refresh MATIC/USD for flash-cap sizing (fresh cache, singleflight, then feeds).
+    /// Refresh MATIC/USD for flash-cap sizing (fresh cache, then singleflight via get_matic_*).
     pub async fn ensure_matic_usd_for_flash_cap<P: Provider<Ethereum> + Clone + Send + 'static>(
         &self,
         state_provider: Option<&P>,
@@ -464,12 +506,7 @@ impl PriceOracle {
         {
             return Some(usd);
         }
-        let _guard = self.matic_refresh.lock().await;
-        if let Some(cached) = self.resolve_matic_usd_cached()
-            && let Some(usd) = matic_usd_for_flash_cap(cached)
-        {
-            return Some(usd);
-        }
+        // Lock lives inside get_matic_* — do not nest matic_refresh here (non-reentrant).
         let usd = match state_provider {
             Some(p) => self.get_matic_usd(Some(p)).await,
             None => self.get_matic_usd_offline().await,
@@ -512,16 +549,35 @@ impl PriceOracle {
         if pyth_ids.is_empty() {
             return;
         }
-        let ids: Vec<&str> = pyth_ids.keys().map(String::as_str).collect();
-        if let Ok(prices) = self.fetch_pyth(&ids).await {
-            let now = Instant::now();
-            for (id, tokens) in pyth_ids {
-                let Some(quote) = prices.get(&id) else {
-                    continue;
-                };
-                for token in tokens {
-                    self.cache_token_usd(token, quote.usd, quote.chainlink_raw, now);
+        let id_count = pyth_ids.len();
+        let ids: Vec<String> = pyth_ids.keys().cloned().collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let started = Instant::now();
+        match self.fetch_pyth(&id_refs).await {
+            Ok((prices, parse)) => {
+                let cached = self.apply_pyth_quotes(pyth_ids, &prices);
+                if parse.rejected > 0 || parse.chunk_errors > 0 {
+                    crate::info!(
+                        "pyth prefetch offline: ids={} accepted={} rejected={} cached={} chunk_err={} ms={}",
+                        id_count,
+                        parse.accepted,
+                        parse.rejected,
+                        cached,
+                        parse.chunk_errors,
+                        started.elapsed().as_millis()
+                    );
+                } else {
+                    crate::debug!(
+                        "pyth prefetch offline: ids={} accepted={} cached={} ms={}",
+                        id_count,
+                        parse.accepted,
+                        cached,
+                        started.elapsed().as_millis()
+                    );
                 }
+            }
+            Err(e) => {
+                crate::warn!("pyth prefetch offline failed: ids={id_count} err={e}");
             }
         }
     }
@@ -544,6 +600,10 @@ impl PriceOracle {
                     feed_map.entry(feed).or_default().push(*token);
                 }
             }
+            for addrs in feed_map.values_mut() {
+                addrs.sort_unstable();
+                addrs.dedup();
+            }
             feed_map
         };
         if feed_map.is_empty() {
@@ -557,16 +617,33 @@ impl PriceOracle {
                 data: encode_call(&IChainlinkAggregator::latestRoundDataCall {}),
             })
             .collect();
-        let Ok(results) = execute_multicall(provider, &items).await else {
-            return;
+        let started = Instant::now();
+        let results = match execute_multicall(provider, &items).await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::warn!(
+                    "chainlink multicall failed: feeds={} err={e:#}",
+                    feeds.len()
+                );
+                return;
+            }
+        };
+        let mut stats = ChainlinkRefreshStats {
+            feeds: feeds.len() as u32,
+            ..ChainlinkRefreshStats::default()
         };
         let now = Instant::now();
+        let mut failed_feeds: Vec<Address> = Vec::new();
         for (feed, bytes) in feeds.iter().zip(results) {
             let Some(bytes) = bytes else {
+                stats.call_failed = stats.call_failed.saturating_add(1);
+                failed_feeds.push(*feed);
                 continue;
             };
             let Ok(data) = IChainlinkAggregator::latestRoundDataCall::abi_decode_returns(&bytes)
             else {
+                stats.decode_failed = stats.decode_failed.saturating_add(1);
+                failed_feeds.push(*feed);
                 continue;
             };
             let Some((usd, answer)) = chainlink_latest_round_usd(
@@ -575,13 +652,49 @@ impl PriceOracle {
                 data.updatedAt,
                 data.answeredInRound.to::<u128>(),
             ) else {
+                stats.rejected_trust = stats.rejected_trust.saturating_add(1);
+                failed_feeds.push(*feed);
                 continue;
             };
-            if let Some(tokens) = feed_map.get(feed) {
-                for token in tokens {
-                    self.cache_token_usd(*token, usd, answer, now);
-                }
+            let Some(mapped) = feed_map.get(feed) else {
+                continue;
+            };
+            for token in mapped {
+                self.mark_chainlink_sourced(*token);
+                self.cache_token_usd(*token, usd, answer, now);
+                stats.cached_tokens = stats.cached_tokens.saturating_add(1);
             }
+            stats.accepted = stats.accepted.saturating_add(1);
+        }
+        let ms = started.elapsed().as_millis();
+        if stats.rejected_trust > 0
+            || stats.call_failed > 0
+            || stats.decode_failed > 0
+            || stats.accepted == 0
+        {
+            let failed = failed_feeds
+                .iter()
+                .map(|a| format!("{a:#x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::info!(
+                "chainlink refresh: feeds={} accepted={} cached={} call_fail={} decode_fail={} untrusted={} ms={} failed=[{failed}]",
+                stats.feeds,
+                stats.accepted,
+                stats.cached_tokens,
+                stats.call_failed,
+                stats.decode_failed,
+                stats.rejected_trust,
+                ms
+            );
+        } else {
+            crate::debug!(
+                "chainlink refresh: feeds={} accepted={} cached={} ms={}",
+                stats.feeds,
+                stats.accepted,
+                stats.cached_tokens,
+                ms
+            );
         }
     }
 
@@ -610,9 +723,26 @@ impl PriceOracle {
         if need.is_empty() {
             return;
         }
+        crate::debug!(
+            "oracle prefetch: need={} provider={}",
+            need.len(),
+            provider.is_some()
+        );
 
         if let Some(p) = provider {
-            self.refresh_chainlink_token_usd(p, &need).await;
+            // Only tokens with a CL feed — Pyth-only majors skip the multicall.
+            let cl_need: Vec<Address> = {
+                let custom_cl = self.custom_chainlink.read();
+                need.iter()
+                    .copied()
+                    .filter(|token| {
+                        chainlink_feed(token).is_some() || custom_cl.contains_key(token)
+                    })
+                    .collect()
+            };
+            if !cl_need.is_empty() {
+                self.refresh_chainlink_token_usd(p, &cl_need).await;
+            }
         }
 
         let pyth_need: Vec<Address> = {
@@ -623,52 +753,97 @@ impl PriceOracle {
                 .collect()
         };
         let pyth_ids = self.collect_pyth_id_groups(&pyth_need);
-        if !pyth_ids.is_empty() {
-            let ids: Vec<&str> = pyth_ids.keys().map(String::as_str).collect();
-            if let Ok(prices) = self.fetch_pyth(&ids).await {
-                let now = Instant::now();
-                for (id, tokens) in pyth_ids {
-                    let Some(quote) = prices.get(&id) else {
-                        continue;
-                    };
-                    for token in tokens {
-                        self.cache_token_usd(token, quote.usd, quote.chainlink_raw, now);
-                    }
+        if pyth_ids.is_empty() {
+            return;
+        }
+        let id_count = pyth_ids.len();
+        let ids: Vec<String> = pyth_ids.keys().cloned().collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let started = Instant::now();
+        match self.fetch_pyth(&id_refs).await {
+            Ok((prices, parse)) => {
+                let cached = self.apply_pyth_quotes(pyth_ids, &prices);
+                if parse.rejected > 0 || parse.chunk_errors > 0 {
+                    crate::info!(
+                        "pyth prefetch: ids={} accepted={} rejected={} cached={} chunk_err={} ms={}",
+                        id_count,
+                        parse.accepted,
+                        parse.rejected,
+                        cached,
+                        parse.chunk_errors,
+                        started.elapsed().as_millis()
+                    );
+                } else {
+                    crate::debug!(
+                        "pyth prefetch: ids={} accepted={} cached={} ms={}",
+                        id_count,
+                        parse.accepted,
+                        cached,
+                        started.elapsed().as_millis()
+                    );
                 }
+            }
+            Err(e) => {
+                crate::warn!("pyth prefetch failed: ids={id_count} err={e}");
             }
         }
     }
 
-    fn store_matic_usd(&self, usd: f64) {
+    fn store_matic_usd_slot(&self, usd: f64) {
         self.matic_usd.write().replace(PriceEntry {
             value: usd,
             updated_at: Instant::now(),
         });
+    }
+
+    fn store_matic_usd(&self, usd: f64) {
+        self.store_matic_usd_slot(usd);
         if let Some(raw) = usd_to_chainlink_raw(usd) {
             self.chainlink_usd_raw.write().insert(WMATIC, raw);
         }
     }
 
     async fn fetch_pyth_matic_usd(&self) -> Option<f64> {
-        let prices = self.fetch_pyth(&[PYTH_MATIC_USD_ID]).await.ok()?;
+        let (prices, _) = self.fetch_pyth(&[PYTH_MATIC_USD_ID]).await.ok()?;
         let quote = prices.get(PYTH_MATIC_USD_ID)?;
         if quote.usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return None;
         }
-        self.cache_token_usd(WMATIC, quote.usd, quote.chainlink_raw, Instant::now());
+        self.cache_token_usd_from_pyth(WMATIC, quote.usd, quote.chainlink_raw, Instant::now());
         Some(quote.usd)
     }
 
-    async fn fetch_pyth(&self, ids: &[&str]) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+    fn apply_pyth_quotes(
+        &self,
+        pyth_ids: FxHashMap<String, Vec<Address>>,
+        prices: &FxHashMap<String, PythQuote>,
+    ) -> u32 {
+        let now = Instant::now();
+        let mut cached = 0u32;
+        for (id, tokens) in pyth_ids {
+            let Some(quote) = prices.get(&id) else {
+                continue;
+            };
+            for token in tokens {
+                self.cache_token_usd_from_pyth(token, quote.usd, quote.chainlink_raw, now);
+                cached = cached.saturating_add(1);
+            }
+        }
+        cached
+    }
+
+    async fn fetch_pyth(
+        &self,
+        ids: &[&str],
+    ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         if ids.is_empty() {
-            return Ok(FxHashMap::default());
+            return Ok((FxHashMap::default(), PythParseStats::default()));
         }
         let chunks: Vec<&[&str]> = ids.chunks(PYTH_FETCH_CHUNK).collect();
         if chunks.len() == 1 {
             return self.fetch_pyth_chunk(chunks[0]).await;
         }
-        // Parallel Hermes GETs — cold LF enrich often has 2+ chunks of feed ids.
-        // JoinSet (not futures_util::join_all): same concurrency style as pool_fetch/rpc.
+        // Parallel Hermes GETs — keep partial success if one chunk fails.
         let mut tasks = tokio::task::JoinSet::new();
         for chunk in chunks {
             let owned: Vec<String> = chunk.iter().map(|id| (*id).to_owned()).collect();
@@ -680,19 +855,36 @@ impl PriceOracle {
             });
         }
         let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), FxBuildHasher);
+        let mut stats = PythParseStats::default();
         while let Some(joined) = tasks.join_next().await {
-            out.extend(
-                joined
-                    .map_err(|e| anyhow::anyhow!("pyth chunk task failed: {e}"))??,
+            match joined {
+                Ok(Ok((batch, chunk_stats))) => {
+                    out.extend(batch);
+                    stats.merge(chunk_stats);
+                }
+                Ok(Err(e)) => {
+                    stats.chunk_errors = stats.chunk_errors.saturating_add(1);
+                    crate::warn!("pyth chunk failed (keeping other chunks): {e}");
+                }
+                Err(e) => {
+                    stats.chunk_errors = stats.chunk_errors.saturating_add(1);
+                    crate::warn!("pyth chunk task join failed: {e}");
+                }
+            }
+        }
+        if out.is_empty() && stats.chunk_errors > 0 {
+            anyhow::bail!(
+                "all pyth chunks failed (chunk_errors={})",
+                stats.chunk_errors
             );
         }
-        Ok(out)
+        Ok((out, stats))
     }
 
     async fn fetch_pyth_chunk(
         &self,
         ids: &[&str],
-    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+    ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         Self::fetch_pyth_chunk_with(&self.http, &self.pyth_hermes_url, ids).await
     }
 
@@ -700,7 +892,7 @@ impl PriceOracle {
         http: &Client,
         base_url: &str,
         ids: &[&str],
-    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+    ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         match Self::fetch_pyth_once_with(http, base_url, ids).await {
             Ok(prices) => Ok(prices),
             Err(e) => {
@@ -714,9 +906,9 @@ impl PriceOracle {
         http: &Client,
         base_url: &str,
         ids: &[&str],
-    ) -> anyhow::Result<FxHashMap<String, PythQuote>> {
+    ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         if ids.is_empty() {
-            return Ok(FxHashMap::default());
+            return Ok((FxHashMap::default(), PythParseStats::default()));
         }
         let url = pyth_updates_url(base_url, ids)?;
         let resp = http
@@ -727,19 +919,24 @@ impl PriceOracle {
             .error_for_status()?;
         let body: PythHermesResponse = resp.json().await?;
         let mut out = FxHashMap::with_capacity_and_hasher(body.parsed.len(), FxBuildHasher);
+        let mut stats = PythParseStats::default();
         for item in body.parsed {
+            stats.parsed = stats.parsed.saturating_add(1);
             let Some(mantissa) = item.price.mantissa.as_i128() else {
+                stats.rejected = stats.rejected.saturating_add(1);
                 continue;
             };
             let conf = item.price.conf.as_ref().and_then(PythMantissa::as_i128);
             let publish_time = item.price.publish_time;
             let Some(quote) = pyth_fields_to_quote(mantissa, item.price.expo, conf, publish_time)
             else {
+                stats.rejected = stats.rejected.saturating_add(1);
                 continue;
             };
-            out.insert(item.id, quote);
+            out.insert(normalize_pyth_feed_id(&item.id), quote);
+            stats.accepted = stats.accepted.saturating_add(1);
         }
-        Ok(out)
+        Ok((out, stats))
     }
 
     pub fn token_usd(&self, token: &Address) -> Option<f64> {
@@ -843,6 +1040,44 @@ fn pyth_updates_url(base_url: &str, ids: &[&str]) -> anyhow::Result<Url> {
         }
     }
     Ok(url)
+}
+
+/// Strip optional `0x` and lowercase — Hermes keys and config must match.
+#[must_use]
+fn normalize_pyth_feed_id(id: &str) -> String {
+    let id = id.trim();
+    let id = id
+        .strip_prefix("0x")
+        .or_else(|| id.strip_prefix("0X"))
+        .unwrap_or(id);
+    id.to_ascii_lowercase()
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PythParseStats {
+    parsed: u32,
+    accepted: u32,
+    rejected: u32,
+    chunk_errors: u32,
+}
+
+impl PythParseStats {
+    fn merge(&mut self, other: Self) {
+        self.parsed = self.parsed.saturating_add(other.parsed);
+        self.accepted = self.accepted.saturating_add(other.accepted);
+        self.rejected = self.rejected.saturating_add(other.rejected);
+        self.chunk_errors = self.chunk_errors.saturating_add(other.chunk_errors);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ChainlinkRefreshStats {
+    feeds: u32,
+    accepted: u32,
+    cached_tokens: u32,
+    call_failed: u32,
+    decode_failed: u32,
+    rejected_trust: u32,
 }
 
 #[inline]
@@ -1164,6 +1399,15 @@ mod tests {
     }
 
     #[test]
+    fn normalize_pyth_feed_id_strips_0x_and_lowercases() {
+        assert_eq!(
+            normalize_pyth_feed_id("0xAaBbCc"),
+            "aabbcc"
+        );
+        assert_eq!(normalize_pyth_feed_id("AABBCC"), "aabbcc");
+    }
+
+    #[test]
     fn pyth_quote_trusted_rejects_stale_and_wide_confidence() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1327,6 +1571,7 @@ mod tests {
         let usdc_e = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
         let weth = address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619");
         let wbtc = address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6");
+        let uni = address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f");
 
         assert_eq!(
             chainlink_feed(&usdc_e),
@@ -1339,6 +1584,10 @@ mod tests {
         assert_eq!(
             chainlink_feed(&wbtc),
             Some(address!("0xDE31F8bFBD8c84b5360CFACCa3539B938dd78ae6"))
+        );
+        assert_eq!(
+            chainlink_feed(&uni),
+            Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD8682386e13C"))
         );
     }
 

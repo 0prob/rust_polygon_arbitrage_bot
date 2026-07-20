@@ -14,6 +14,10 @@ use crate::core::constants::MULTICALL3;
 
 /// Max `aggregate3` sub-calls per RPC round-trip (provider payload limits).
 pub const MULTICALL_CHUNK: usize = 200;
+/// TickLens `getPopulatedTicksInWord` returns fat ABI arrays. Polygon nodes
+/// reject eth_calls with `out of gas` or `result length … exceeding limit 100000`
+/// when many words share one aggregate3 — keep chunks modest; resilient bisects.
+pub const TICK_LENS_MULTICALL_CHUNK: usize = 12;
 /// Max concurrent chunk RPCs for batched multicalls. Parallelizes IO for large
 /// refreshes while a semaphore prevents thundering herd. 8×200-call chunks
 /// (1600-call plan batches) routinely tripped free-tier 1200 req/min limits;
@@ -101,10 +105,19 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                 pending.push((start, mid));
             }
             Err(e) => {
-                crate::warn!(
-                    "multicall chunk failed ({} call(s) at index {start}): {e:#}",
-                    slice.len()
-                );
+                // Polygon: single TickLens word can still exceed the ~100KB
+                // eth_call response cap — leave None (caller treats incomplete).
+                let msg = format!("{e:#}");
+                if msg.contains("exceeding limit") || msg.contains("out of gas") {
+                    crate::debug!(
+                        "multicall call skipped (payload/gas at index {start}): {e:#}"
+                    );
+                } else {
+                    crate::warn!(
+                        "multicall chunk failed ({} call(s) at index {start}): {e:#}",
+                        slice.len()
+                    );
+                }
             }
         }
     }
@@ -196,8 +209,10 @@ pub async fn execute_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    // Always resilient: Polygon OOG / response-size errors must bisect instead of
+    // failing the whole TickLens/state batch (live: 1–9 pools → full rpc_failed).
     if items.len() <= MULTICALL_CHUNK {
-        execute_multicall_chunk(provider, items, block_number).await
+        execute_multicall_chunk_resilient(provider, items, block_number).await
     } else {
         execute_multicall_at_chunked(
             provider.clone(),
@@ -207,6 +222,24 @@ pub async fn execute_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static
         )
         .await
     }
+}
+
+/// TickLens-sized chunks + bisect — use for V3 tick hydration on Polygon.
+pub async fn execute_tick_lens_multicall_at<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: &P,
+    items: &[MulticallItem],
+    block_number: Option<u64>,
+) -> anyhow::Result<Vec<Option<Bytes>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    execute_multicall_at_chunked(
+        provider.clone(),
+        Arc::from(items.to_vec()),
+        block_number,
+        TICK_LENS_MULTICALL_CHUNK,
+    )
+    .await
 }
 
 /// Like [`execute_multicall_at`] but with a configurable per-RPC chunk size.
@@ -223,7 +256,7 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
     }
     let max_chunk = max_chunk.max(1);
     if items.len() <= max_chunk {
-        return execute_multicall_chunk(&provider, &items, block_number).await;
+        return execute_multicall_chunk_resilient(&provider, &items, block_number).await;
     }
     let num_chunks = items.len().div_ceil(max_chunk);
     let sem = Arc::new(tokio::sync::Semaphore::new(
@@ -306,6 +339,8 @@ mod tests {
     #[test]
     fn default_chunk_matches_config_default() {
         assert_eq!(MULTICALL_CHUNK, 200);
+        assert_eq!(super::TICK_LENS_MULTICALL_CHUNK, 12);
+        assert!(super::TICK_LENS_MULTICALL_CHUNK < MULTICALL_CHUNK);
     }
 
     #[test]

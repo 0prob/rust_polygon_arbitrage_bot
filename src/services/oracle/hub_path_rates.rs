@@ -17,7 +17,7 @@ use crate::pipeline::graph::{
     PendingHubSwap, funded_token_indices, resolve_lazy_swap_edge, routing_token_at_leg,
 };
 use crate::pipeline::local_sim::simulate_route_minimal;
-use crate::pipeline::spot_price::{spot_probe_for_decimals, spot_probe_for_token};
+use crate::pipeline::spot_price::spot_probe_for_decimals;
 use crate::pipeline::types::{GraphHopPhase, PoolMeta, RoutingGraph};
 use crate::util::ten_pow_u256_cached;
 
@@ -65,24 +65,37 @@ fn matic_rate_from_probe_sim_with_decimals(
     if decimals > MAX_SUPPORTED_TOKEN_DECIMALS {
         return None;
     }
-    let probe = match token_decimals {
-        Some(_) => spot_probe_for_decimals(decimals),
-        None => spot_probe_for_token(arena, token),
+    // ponytail: micro then spot — thin V2/spoke paths exhaust at spot-only (HF rank ladder).
+    let spot = spot_probe_for_decimals(decimals);
+    let micro = if decimals >= 6 {
+        ten_pow_u256_cached(decimals - 6)
+    } else {
+        U256::from(1u64)
     };
-    if probe.is_zero() {
-        return None;
-    }
-    let sim = simulate_route_minimal(arena, edges, probe)?;
-    if sim.amount_out.is_zero() {
-        return None;
-    }
     let scale = ten_pow_u256_cached(decimals);
-    let rate = sim
-        .amount_out
-        .checked_mul(scale)?
-        .checked_mul(RATE_PRECISION)?
-        / probe;
-    (rate >= MIN_TOKEN_TO_MATIC_RATE).then_some(rate)
+    for probe in [micro, spot] {
+        if probe.is_zero() {
+            continue;
+        }
+        let Some(sim) = simulate_route_minimal(arena, edges, probe) else {
+            continue;
+        };
+        if sim.amount_out.is_zero() {
+            continue;
+        }
+        let Some(rate) = sim
+            .amount_out
+            .checked_mul(scale)
+            .and_then(|v| v.checked_mul(RATE_PRECISION))
+            .map(|v| v / probe)
+        else {
+            continue;
+        };
+        if rate >= MIN_TOKEN_TO_MATIC_RATE {
+            return Some(rate);
+        }
+    }
+    None
 }
 
 #[inline]
@@ -195,17 +208,19 @@ fn build_reverse_hops(
 }
 
 /// One reverse BFS from WMATIC: `parent[token] = (next_toward_wmatic, edge token→next)`.
+/// `alt` keeps one second-choice first hop when the shortest path fails probe sim.
 fn reverse_bfs_parents(
     rev: &[Vec<RevHop>],
     wmatic: TokenIndex,
     max_hops: u32,
-) -> Vec<Option<RevHop>> {
+) -> (Vec<Option<RevHop>>, Vec<Option<RevHop>>) {
     let token_slots = rev.len();
     let mut parent = vec![None; token_slots];
+    let mut alt = vec![None; token_slots];
     let mut depth = vec![u32::MAX; token_slots];
     let w = wmatic.0 as usize;
     if w >= token_slots {
-        return parent;
+        return (parent, alt);
     }
     depth[w] = 0;
     let mut queue = std::collections::VecDeque::new();
@@ -219,7 +234,17 @@ fn reverse_bfs_parents(
         }
         for &(prev, edge) in &rev[curr.0 as usize] {
             let pi = prev.0 as usize;
-            if pi >= token_slots || depth[pi] != u32::MAX {
+            if pi >= token_slots {
+                continue;
+            }
+            if depth[pi] != u32::MAX {
+                // Second hop toward WMATIC — only when next already has a path.
+                if alt[pi].is_none()
+                    && parent[pi].is_some_and(|(n, _)| n != curr)
+                    && depth[curr.0 as usize] < max_hops
+                {
+                    alt[pi] = Some((curr, edge));
+                }
                 continue;
             }
             depth[pi] = d + 1;
@@ -227,7 +252,7 @@ fn reverse_bfs_parents(
             queue.push_back(prev);
         }
     }
-    parent
+    (parent, alt)
 }
 
 fn reconstruct_path(
@@ -235,17 +260,33 @@ fn reconstruct_path(
     from: TokenIndex,
     wmatic: TokenIndex,
 ) -> Option<Vec<Edge>> {
+    reconstruct_path_with_first(parent, from, wmatic, None)
+}
+
+fn reconstruct_path_with_first(
+    parent: &[Option<RevHop>],
+    from: TokenIndex,
+    wmatic: TokenIndex,
+    first: Option<RevHop>,
+) -> Option<Vec<Edge>> {
     if from == wmatic {
         return Some(Vec::new());
     }
     let mut path = Vec::new();
     let mut cur = from;
+    let mut used_first = false;
     // ponytail: hop cap already enforced in BFS; bound walk to parent len.
     for _ in 0..parent.len() {
         if cur == wmatic {
             return Some(path);
         }
-        let (next, edge) = parent.get(cur.0 as usize).copied().flatten()?;
+        let (next, edge) = if !used_first {
+            used_first = true;
+            first
+                .or_else(|| parent.get(cur.0 as usize).copied().flatten())?
+        } else {
+            parent.get(cur.0 as usize).copied().flatten()?
+        };
         path.push(edge);
         cur = next;
     }
@@ -281,25 +322,63 @@ pub fn hub_path_matic_rates_batch(
     }
 
     // One reverse BFS for the whole batch (was per-token forward BFS + path.clone).
+    let started = crate::util::now_ms();
     let rev = build_reverse_hops(arena, graph, pool_metas);
-    let parent = reverse_bfs_parents(&rev, wmatic, params.max_hops);
+    let (parent, alt) = reverse_bfs_parents(&rev, wmatic, params.max_hops);
 
+    let need_n = need.len();
+    let mut path_miss = 0u32;
+    let mut sim_fail = 0u32;
+    let mut alt_rescue = 0u32;
+    let mut priced = 0u32;
     for token in need {
         if out.contains_key(&token) {
             continue;
         }
         let Some(path) = reconstruct_path(&parent, token, wmatic) else {
+            path_miss += 1;
             continue;
         };
         if path.is_empty() {
+            path_miss += 1;
             continue;
         }
-        let Some(rate) =
+        if let Some(rate) =
             matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals)
-        else {
+        {
+            out.insert(token, rate);
+            priced += 1;
             continue;
-        };
-        out.insert(token, rate);
+        }
+        // Shortest path sim-failed — one alternate first hop (live: sim_fail≈10–18/batch).
+        let rescued = alt
+            .get(token.0 as usize)
+            .copied()
+            .flatten()
+            .and_then(|first| reconstruct_path_with_first(&parent, token, wmatic, Some(first)))
+            .filter(|p| !p.is_empty())
+            .and_then(|p| {
+                matic_rate_from_probe_sim_with_decimals(arena, token, &p, token_decimals)
+            });
+        if let Some(rate) = rescued {
+            out.insert(token, rate);
+            priced += 1;
+            alt_rescue += 1;
+        } else {
+            sim_fail += 1;
+        }
+    }
+    let ms = crate::util::now_ms().saturating_sub(started);
+    if path_miss > 0 || sim_fail > 0 || alt_rescue > 0 || need_n > 32 {
+        crate::info!(
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} ms={ms} max_hops={}",
+            params.max_hops
+        );
+    } else if need_n > 0 {
+        crate::debug!(
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} ms={ms} max_hops={}",
+            params.max_hops
+        );
     }
     out
 }
@@ -337,6 +416,18 @@ mod tests {
     fn v2_pool() -> Arc<PoolState> {
         // Reserves must exceed the 18-decimal spot probe (~1e15) used by matic_rate_from_probe_sim.
         let funded = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(100u64);
+        Arc::new(PoolState::V2(V2PoolState {
+            reserve0: funded,
+            reserve1: funded * U256::from(2u64),
+            fee: U256::from(30u8),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }))
+    }
+
+    /// Thin enough that spot (~1e15) exhausts but micro (~1e12) still sims.
+    fn thin_v2_pool() -> Arc<PoolState> {
+        let funded = U256::from(10u128.pow(13)); // between micro and spot
         Arc::new(PoolState::V2(V2PoolState {
             reserve0: funded,
             reserve1: funded * U256::from(2u64),
@@ -389,6 +480,32 @@ mod tests {
             None,
         );
         assert_eq!(rates.get(&wmatic), Some(&RATE_PRECISION));
+    }
+
+    #[test]
+    fn thin_v2_hub_path_prices_via_micro_probe() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x33u8; 20]));
+        let p = arena.register_pool(Address::from([0xb1u8; 20]), thin_v2_pool());
+        let metas = [pool_meta_from_pair(
+            p,
+            ProtocolType::UniswapV2,
+            wmatic,
+            spoke,
+            30,
+        )];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[spoke],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        let rate = rates.get(&spoke).copied().expect("thin spoke must price via micro");
+        assert!(rate >= MIN_TOKEN_TO_MATIC_RATE);
     }
 
     #[test]

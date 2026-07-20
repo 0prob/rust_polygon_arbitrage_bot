@@ -493,19 +493,29 @@ fn compute_ternary_search_bounds(
     })
 }
 
-/// Cap Brent `high` to `8 ×` largest profitable probe seed when that is tighter
-/// than the capacity-derived window. Returns `None` when no clamp applies.
+/// Cap Brent `high` to a multiple of the largest profitable probe seed when that
+/// is tighter than the capacity-derived window. Returns `None` when no clamp applies.
+///
+/// Also raises the cap to ~1.2× gas-breakeven size inferred from seed ROI — pure
+/// 8× of a 0.1 MATIC dust seed capped at 0.8 while live gas needed ~1.8 MATIC.
 #[must_use]
 fn clamp_brent_high_to_probe_seeds(
     high: U256,
     low: U256,
     economic_floor: U256,
     seeds: &[(U256, crate::pipeline::types::MinimalSimResult)],
+    profit_ctx: Option<&ProfitEvalContext>,
 ) -> Option<U256> {
     let mut max_feasible_seed = U256::ZERO;
+    let mut best_amt = U256::ZERO;
+    let mut best_profit = U256::ZERO;
+    let mut best_gas = 0u32;
     for (amount, sim) in seeds {
         if !sim.profit.is_zero() && *amount > max_feasible_seed {
             max_feasible_seed = *amount;
+            best_amt = *amount;
+            best_profit = sim.profit;
+            best_gas = sim.total_gas;
         }
     }
     if max_feasible_seed.is_zero() {
@@ -514,7 +524,46 @@ fn clamp_brent_high_to_probe_seeds(
     // 8× headroom: 4× cut ok-rate in live capture (774→530) by starving Brent
     // of room above dust probes; 8× still far below capacity-derived highs.
     let mut seed_high = max_feasible_seed.saturating_mul(U256::from(8u8));
-    if seed_high < economic_floor || seed_high >= high {
+    if let Some(ctx) = profit_ctx
+        && !best_profit.is_zero()
+        && !best_amt.is_zero()
+        && best_gas > 0
+        && !ctx.gas_price.is_zero()
+        && !ctx.token_to_matic_rate.is_zero()
+    {
+        let gas_units = crate::services::execution::gas::scaled_simulated_gas(
+            best_gas,
+            ctx.gas_scale_bps,
+        );
+        let gas_cost_matic = ctx.gas_price.saturating_mul(U256::from(gas_units));
+        let scale = crate::util::ten_pow_u256(ctx.token_decimals);
+        let gas_cost_start = gas_cost_matic
+            .saturating_mul(scale)
+            .checked_div(ctx.token_to_matic_rate)
+            .unwrap_or(U256::ZERO);
+        if !gas_cost_start.is_zero() {
+            // amount * gas_cost_start / profit ≈ size where gross covers gas at seed ROI.
+            let breakeven = best_amt
+                .saturating_mul(gas_cost_start)
+                .checked_div(best_profit)
+                .unwrap_or(U256::ZERO);
+            let with_headroom = breakeven
+                .saturating_mul(U256::from(12u8))
+                .checked_div(U256::from(10u8))
+                .unwrap_or(breakeven);
+            seed_high = seed_high.max(with_headroom);
+        }
+    }
+    if seed_high < economic_floor {
+        return None;
+    }
+    // Capacity soft-cap is often depth/10 (live: high=0.1 while gas-breakeven
+    // needs ~1.8). Raise toward seed_high instead of only tightening.
+    if seed_high > high {
+        let raised = seed_high.min(high.saturating_mul(U256::from(16u8)));
+        return (raised > high).then_some(raised);
+    }
+    if seed_high >= high {
         return None;
     }
     if seed_high <= low {
@@ -764,9 +813,14 @@ pub fn optimize_cycle(
     // largest profitable probe seed so Brent stays in the feasible band; the
     // first_infeasible wall still catches residual overshoots.
     if let Some(seeds) = seed_sims
-        && let Some(clamped) = clamp_brent_high_to_probe_seeds(high, low, economic_floor, seeds)
+        && let Some(clamped) =
+            clamp_brent_high_to_probe_seeds(high, low, economic_floor, seeds, Some(profit_ctx))
     {
         record_brent_seed_high_clamp();
+        // ponytail: raise is hot-path; DEBUG avoids routing.jsonl spam.
+        if clamped > high {
+            crate::debug!("brent seed-high raise: {high} -> {clamped}");
+        }
         high = clamped;
     }
 
@@ -1127,7 +1181,7 @@ mod tests {
         let low = U256::from(1u8);
         let floor = U256::from(10u8);
         let clamped =
-            clamp_brent_high_to_probe_seeds(high, low, floor, &seeds).expect("seed clamp");
+            clamp_brent_high_to_probe_seeds(high, low, floor, &seeds, None).expect("seed clamp");
         assert_eq!(clamped, seed * U256::from(8u8));
         // Zero-profit seeds do not clamp.
         let dust = [(
@@ -1138,11 +1192,22 @@ mod tests {
                 total_gas: 100_000,
             },
         )];
-        assert!(clamp_brent_high_to_probe_seeds(high, low, floor, &dust).is_none());
-        // Already-tight high is left alone.
+        assert!(clamp_brent_high_to_probe_seeds(high, low, floor, &dust, None).is_none());
+        // Already at/under 8× seed: leave alone (no tighten, no raise).
         assert!(
-            clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds).is_none()
+            clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds, None)
+                .is_none()
         );
+        // Soft-cap below 8× seed: raise (was: return None and starve gas cover).
+        let raised = clamp_brent_high_to_probe_seeds(
+            U256::from(2_000u64),
+            low,
+            floor,
+            &seeds,
+            None,
+        )
+        .expect("raise soft-cap");
+        assert_eq!(raised, seed * U256::from(8u8));
     }
 
     #[test]

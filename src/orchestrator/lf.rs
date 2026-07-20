@@ -18,9 +18,11 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{ProbeContext, cycle_key, retain_cycles_with_priced_start};
 use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
 use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
-use crate::pipeline::graph::{
-    GraphBuildGate, attach_missing_eligible_pools_with_gate, build_graph_with_gate,
-    count_graph_eligible_pools_with_gate, has_missing_eligible_pools_with_gate,
+    use crate::pipeline::graph::{
+    GraphBuildGate, attach_missing_eligible_pools_with_gate, attach_pool_to_graph,
+    build_graph_with_gate, count_graph_eligible_pools_with_gate, funded_token_indices,
+    has_missing_eligible_pools_with_gate, refresh_graph_cycle_coverage, rescore_pools_in_place,
+    routing_token_at_leg,
 };
 use crate::pipeline::graph_cache::GraphCache;
 use crate::pipeline::spot_price::{
@@ -76,6 +78,8 @@ struct LfCpuResult {
     /// Cycle enumeration only (0 when graph cache reused).
     enumeration_ms: u64,
     enumerated_cycles: usize,
+    /// Early attach hit ATTACH_MISSING_CAP — skip same-tick post-rate attach/refind.
+    attach_hit_cap: bool,
 }
 
 /// Keep cycles that touch freshly observed pools, then fill remaining slots with
@@ -84,6 +88,9 @@ fn pin_cycles_touching_pools(
     cycles: Vec<crate::core::types::FoundCycle>,
     pin_pools: &[PoolIndex],
     max_cycles: usize,
+    // Exclusive observed admit: never fill snap with non-pin cycles (they
+    // burn prune + empty the publish window).
+    pins_only: bool,
 ) -> Vec<crate::core::types::FoundCycle> {
     if max_cycles == 0 || cycles.is_empty() || pin_pools.is_empty() {
         return finalize_enumerated_cycles(cycles, max_cycles);
@@ -103,36 +110,73 @@ fn pin_cycles_touching_pools(
         }
     }
     if pinned.is_empty() {
+        crate::info!(
+            "stream observed-live: enum_touch=0/{} pin_pools={} (DFS found none)",
+            rest.len(),
+            pin_pools.len()
+        );
+        if pins_only {
+            return Vec::new();
+        }
         return finalize_enumerated_cycles(rest, max_cycles);
     }
-    pinned.sort_by(crate::pipeline::types::compare_cycle_score);
+    let enum_touch = pinned.len();
+    let is_uni_only = |c: &crate::core::types::FoundCycle| {
+        c.edges.iter().all(|e| {
+            matches!(
+                e.protocol,
+                crate::core::types::ProtocolType::UniswapV2
+                    | crate::core::types::ProtocolType::UniswapV3
+                    | crate::core::types::ProtocolType::UniswapV4
+            )
+        })
+    };
+    let uni_only = pinned.iter().filter(|c| is_uni_only(c)).count();
+    let ratio_gt_one = pinned.iter().filter(|c| c.cycle_ratio > ONE).count();
+    // Prefer Uni-only + ratio>ONE pins — Balancer mixes and ONE-inject junk
+    // burn HF probe (live: touch=32 → drop_obs=32; near_net with cover≪gas).
+    pinned.sort_by(|a, b| {
+        is_uni_only(b)
+            .cmp(&is_uni_only(a))
+            .then_with(|| (b.cycle_ratio > ONE).cmp(&(a.cycle_ratio > ONE)))
+            .then_with(|| crate::pipeline::types::compare_cycle_score(a, b))
+    });
     pinned.truncate(max_cycles);
     let pin_kept = pinned.len();
-    let mut seen: rustc_hash::FxHashSet<u64> = pinned
-        .iter()
-        .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-        .collect();
-    let fill = finalize_enumerated_cycles(rest, max_cycles.saturating_sub(pinned.len()));
-    for cycle in fill {
-        let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-        if seen.insert(key) {
-            pinned.push(cycle);
-            if pinned.len() >= max_cycles {
-                break;
+    if !pins_only {
+        let mut seen: rustc_hash::FxHashSet<u64> = pinned
+            .iter()
+            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+            .collect();
+        let fill = finalize_enumerated_cycles(rest, max_cycles.saturating_sub(pinned.len()));
+        for cycle in fill {
+            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+            if seen.insert(key) {
+                pinned.push(cycle);
+                if pinned.len() >= max_cycles {
+                    break;
+                }
             }
         }
     }
-    crate::debug!(
-        "stream observed-live: pinned_cycles={pin_kept} total={} (cap={max_cycles})",
+    crate::info!(
+        "stream observed-live: enum_touch={enum_touch} uni_only={uni_only} ratio_gt_one={ratio_gt_one} pinned_cycles={pin_kept} total={} (cap={max_cycles})",
         pinned.len()
     );
     pinned
 }
 
 /// Token endpoints of observed pools — seed incremental DFS (hub starts miss peripherals).
+/// Prefer arena/vault legs (graph edges) over discovery meta order — Balancer meta
+/// often lists 2 tokens while Enter edges sit on other vault tokens (live:
+/// in_graph=N/N enum_touch=0 with first-hop pin).
+/// When `graph` is set, also seed every token that already has a live edge into a pin
+/// (live: pin_covered>0 first_hop_pin=0 — Enter sits off meta/arena seed set).
 fn observed_pool_start_tokens(
+    arena: &StateArena,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     pools: &[PoolIndex],
+    graph: Option<&crate::pipeline::types::RoutingGraph>,
 ) -> Vec<TokenIndex> {
     if pools.is_empty() {
         return Vec::new();
@@ -144,9 +188,36 @@ fn observed_pool_start_tokens(
         if !want.contains(&meta.pool_index) {
             continue;
         }
-        for &t in &meta.tokens {
-            if seen.insert(t) {
-                out.push(t);
+        let mut added = false;
+        if let Some(state) = arena.pool_state(meta.pool_index) {
+            for leg in funded_token_indices(state, meta) {
+                if let Some(t) = routing_token_at_leg(arena, state, meta, leg as usize)
+                    && seen.insert(t)
+                {
+                    out.push(t);
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            for &t in &meta.tokens {
+                if seen.insert(t) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    if let Some(graph) = graph {
+        let token_n = graph.token_count as usize;
+        for (ti, edges) in graph.adjacency.iter().enumerate().take(token_n) {
+            if edges.iter().any(|ge| {
+                want.contains(&ge.edge.pool_index)
+                    && crate::pipeline::cycle_finder::is_live_graph_edge(ge)
+            }) {
+                let t = TokenIndex(ti as u32);
+                if seen.insert(t) {
+                    out.push(t);
+                }
             }
         }
     }
@@ -267,8 +338,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
     // Capture cycle-cache validity *before* rebuild store can replace graph meta.
     let (cycle_cache_valid, prior_cycles) = {
         let gc = work.graph_cache.lock();
+        let family_prefix = work
+            .arena
+            .routing_family_prefix_fingerprint(gc.cached_pool_count());
         (
-            gc.cycle_cache_still_valid(routable_count, layout_fp),
+            gc.cycle_cache_still_valid(routable_count, layout_fp, family_prefix),
             gc.cycles(),
         )
     };
@@ -320,6 +394,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             layout_fp,
             work.state_generation,
             eligible_count,
+            work.arena.routing_family_prefix_fingerprint(routable_count),
         );
         g
     } else {
@@ -338,7 +413,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 layout_fp,
                 work.state_generation,
                 eligible_count,
-            );
+            work.arena.routing_family_prefix_fingerprint(routable_count),
+        );
         }
         if work.state_generation != gc.cached_state_generation() {
             // Use helper: mutates under &mut self when rc==1 (no prior .graph() clone in scope)
@@ -366,7 +442,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     layout_fp,
                     work.state_generation,
                     eligible_count,
-                );
+            work.arena.routing_family_prefix_fingerprint(routable_count),
+        );
                 gg
             })
         } else {
@@ -383,21 +460,37 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     layout_fp,
                     work.state_generation,
                     eligible_count,
-                );
+            work.arena.routing_family_prefix_fingerprint(routable_count),
+        );
                 gg
             })
         }
     };
 
-    // Quiet ticks: no rebuild, no eligibility growth, no dirty state — skip O(n) scan.
+    // Quiet ticks: no rebuild / eligibility growth — skip O(n) scan.
+    // Dirty pools are rescored above; observed pins use force_attach below.
+    // Skip catchup attach on observed force-refind — it burned 256 slots + graph
+    // churn before exclusive DFS (live: attached=256 dfs=0 enum_ms≈2).
     let cached_eligible = {
         let gc = work.graph_cache.lock();
         gc.cached_eligible_pool_count()
     };
-    let scan_missing = needs_rebuild
-        || connectivity_stale
-        || !work.dirty_pools.is_empty()
-        || eligible_count > cached_eligible;
+    let catchup_due =
+        needs_rebuild || connectivity_stale || eligible_count > cached_eligible;
+    // Observed force-refind: skip catchup attach (pins use force_attach below).
+    let scan_missing = catchup_due && !work.force_cycle_refind;
+    if catchup_due && work.force_cycle_refind {
+        crate::info!(
+            "lf attach_missing defer: force_refind=true stale={connectivity_stale} eligible={eligible_count} lf_pass={}",
+            work.lf_pass
+        );
+    }
+    let obs_in_graph_before = work
+        .observed_pool_indices
+        .iter()
+        .filter(|&&p| graph.pool_has_live_edges(p))
+        .count();
+    let mut attach_hit_cap = false;
     let missing_graph_pools = if scan_missing
         && has_missing_eligible_pools_with_gate(
             &work.arena,
@@ -405,12 +498,117 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             graph.as_ref(),
             gate_ref,
         ) {
+        crate::info!(
+            "lf attach_missing scan: rebuild={needs_rebuild} stale={connectivity_stale} eligible={eligible_count} cached_eligible={cached_eligible} lf_pass={}",
+            work.lf_pass
+        );
         let g = Arc::make_mut(&mut graph);
-        attach_missing_eligible_pools_with_gate(&work.arena, g, work.pool_metas.as_ref(), gate_ref)
-            .attached_pools
+        let report = attach_missing_eligible_pools_with_gate(
+            &work.arena,
+            g,
+            work.pool_metas.as_ref(),
+            gate_ref,
+        );
+        attach_hit_cap = report.hit_cap;
+        // Cap leaves remainder — keep connectivity_stale true across LF passes
+        // even after rescore credits full eligible_count.
+        work.graph_cache
+            .lock()
+            .set_attach_catchup_pending(report.hit_cap);
+        if report.hit_cap || report.attached_pools > 0 {
+            crate::info!(
+                "lf attach_missing catchup: attached={} live_after={} hit_cap={} missing_after={} eligible={eligible_count} lf_pass={}",
+                report.attached_pools,
+                report.live_after,
+                report.hit_cap,
+                report.missing_after,
+                work.lf_pass
+            );
+        }
+        report.attached_pools
     } else {
+        // Clear latch only when we actually scanned and found nothing missing.
+        // Observed force ticks skip the scan — must not drop catchup_pending.
+        if scan_missing {
+            let mut gc = work.graph_cache.lock();
+            if gc.attach_catchup_pending() {
+                gc.set_attach_catchup_pending(false);
+            }
+        }
         0
     };
+    // Observed WSS pools: gate can reject unpriced spokes while attach_missing
+    // still attaches unrelated eligible pools (live: in_graph=0/1 attached=N).
+    let mut force_attached = 0usize;
+    if work.force_cycle_refind && !work.observed_pool_indices.is_empty() {
+        let need_force: Vec<PoolIndex> = work
+            .observed_pool_indices
+            .iter()
+            .copied()
+            .filter(|&p| !graph.pool_has_live_edges(p))
+            .collect();
+        if !need_force.is_empty() {
+            let g = Arc::make_mut(&mut graph);
+            let mut attached = Vec::new();
+            let mut rescored_stubs = 0usize;
+            for meta in work.pool_metas.as_ref() {
+                if !need_force.contains(&meta.pool_index) {
+                    continue;
+                }
+                if g.pool_has_edges(meta.pool_index) {
+                    // Dead stubs: price in place (no strip/reattach thrash).
+                    attached.push(meta.pool_index);
+                    rescored_stubs += 1;
+                    continue;
+                }
+                // ponytail: bypass pricing gate for topic-live venues only
+                if attach_pool_to_graph(g, &work.arena, meta, None) {
+                    attached.push(meta.pool_index);
+                }
+            }
+            // Direct stubs need rescore before they count as live.
+            if !attached.is_empty() {
+                let _ = rescore_pools_in_place(&work.arena, g, &attached);
+                refresh_graph_cycle_coverage(g);
+            }
+            let forced: Vec<PoolIndex> = attached
+                .iter()
+                .copied()
+                .filter(|&p| g.pool_has_live_edges(p))
+                .collect();
+            force_attached = forced.len();
+            if force_attached > 0 {
+                crate::info!(
+                    "stream observed-live: force_attach={force_attached}/{} stubs={} rescored_stubs={rescored_stubs} lf_pass={}",
+                    need_force.len(),
+                    attached.len(),
+                    work.lf_pass
+                );
+            } else if let Some(&pi) = need_force.first() {
+                let reason = work
+                    .pool_metas
+                    .iter()
+                    .find(|m| m.pool_index == pi)
+                    .map(|_m| {
+                        match work.arena.pool_state(pi) {
+                            None => "no_state",
+                            Some(s) if !s.is_tradable() => "untradable",
+                            Some(_) if attached.contains(&pi) => "dead_after_rescore",
+                            Some(_) => "inadmissible",
+                        }
+                    })
+                    .unwrap_or("no_meta");
+                crate::info!(
+                    "stream observed-live: force_attach_fail={}/{} sample={reason} stubs={} rescored_stubs={rescored_stubs} lf_pass={}",
+                    need_force.len(),
+                    need_force.len(),
+                    attached.len(),
+                    work.lf_pass
+                );
+            }
+        }
+    }
+    let missing_graph_pools = missing_graph_pools + force_attached;
     if missing_graph_pools > 0 {
         let stats = crate::pipeline::graph::topology_stats(graph.as_ref());
         stats.log_summary("patch_attach");
@@ -430,6 +628,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             layout_fp,
             work.state_generation,
             eligible_count,
+            work.arena.routing_family_prefix_fingerprint(routable_count),
         );
     }
 
@@ -442,8 +641,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         let gc = work.graph_cache.lock();
         // Newly attached pools are invisible to cached cycles until we re-enumerate.
         // Growth rebuilds no longer clear the cycle cache when indices stay valid.
+        // Capped catchup alone: store graph, defer enum to interval / final uncapped
+        // attach / observed force (live: every catchup tick burned ~1s DFS).
         (needs_rebuild && !cycle_cache_valid)
-            || missing_graph_pools > 0
+            || (missing_graph_pools > 0
+                && (work.force_cycle_refind || force_attached > 0 || !attach_hit_cap))
             || work.force_cycle_refind
             || gc.cycles().is_none()
             || cached_cycles.is_none()
@@ -455,12 +657,13 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 work.arena.pool_count(),
             )
     };
-    // Incremental: attach/observed-admit on a cached graph. Full rebuild keeps the 1s budget
-    // even when WSS pins fire — patch DFS under-explores new topology.
+    // Incremental only when topology unchanged. Fresh attaches need the full budget —
+    // patch DFS under-explores new adjacency (live: cycles_touching=0 after attach).
     let incremental_refind = !needs_rebuild
         && cycle_cache_valid
         && cached_cycles.as_ref().is_some_and(|c| !c.is_empty())
-        && (work.force_cycle_refind || missing_graph_pools > 0 || connectivity_stale);
+        && missing_graph_pools == 0
+        && (work.force_cycle_refind || connectivity_stale);
     let mut enumeration_ms = 0u64;
     let (cycles, enumerated_cycles) = if need_cycle_refind {
         crate::debug!(
@@ -473,8 +676,14 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             needs_rebuild
         );
         let passes = cycle_search_passes(work.max_hops, work.max_paths);
+        // ponytail: defer priced-start when seeding observed endpoints — prior_rates
+        // lack peripheral tokens and finalize_cycles was wiping enum_touch to 0.
         let probe_ctx = ProbeContext {
-            token_to_matic_rates: Some(work.prior_rates.as_ref()),
+            token_to_matic_rates: if work.force_cycle_refind {
+                None
+            } else {
+                Some(work.prior_rates.as_ref())
+            },
             token_decimals: Some(work.token_decimals.as_ref()),
             gas_price_wei: work.gas_price_wei,
         };
@@ -483,17 +692,67 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         if work.arena.token_count() > graph.token_count {
             Arc::make_mut(&mut graph).ensure_token_capacity(work.arena.token_count());
         }
+        // Fresh attaches leave Direct ratio=0 until rescore; exclusive inject
+        // walks them with ONE fillers that rank as ZeroProfit. Rescore pins first.
+        if work.force_cycle_refind && !work.observed_pool_indices.is_empty() {
+            let g = Arc::make_mut(&mut graph);
+            let _ = rescore_pools_in_place(&work.arena, g, &work.observed_pool_indices);
+        }
         let enum_started = crate::util::now_ms();
-        let obs_starts =
-            observed_pool_start_tokens(work.pool_metas.as_ref(), &work.observed_pool_indices);
-        if !obs_starts.is_empty() {
-            crate::debug!(
-                "stream observed-live: dfs_seed tokens={} pools={} incremental={incremental_refind} lf_pass={}",
+        let obs_starts = observed_pool_start_tokens(
+            &work.arena,
+            work.pool_metas.as_ref(),
+            &work.observed_pool_indices,
+            Some(graph.as_ref()),
+        );
+        if !work.observed_pool_indices.is_empty() {
+            let obs_in_graph = work
+                .observed_pool_indices
+                .iter()
+                .filter(|&&p| graph.pool_has_live_edges(p))
+                .count();
+            let pin: FxHashSet<PoolIndex> =
+                work.observed_pool_indices.iter().copied().collect();
+            // Count opening Enter/Direct edges from seed tokens into pin pools.
+            let mut first_hop_pin = 0usize;
+            for &t in &obs_starts {
+                let Some(edges) = graph.adjacency.get(t.0 as usize) else {
+                    continue;
+                };
+                for ge in edges {
+                    if pin.contains(&ge.edge.pool_index)
+                        && crate::pipeline::cycle_finder::is_live_graph_edge(ge)
+                    {
+                        first_hop_pin = first_hop_pin.saturating_add(1);
+                    }
+                }
+            }
+            let pin_covered = graph.coverage.as_ref().map_or(0, |cov| {
+                work.observed_pool_indices
+                    .iter()
+                    .filter(|p| cov.pool_indices.contains(&p.0))
+                    .count()
+            });
+            crate::info!(
+                "stream observed-live: dfs_seed tokens={} pools={} in_graph={obs_in_graph}/{} (pre_attach={obs_in_graph_before}) attached={missing_graph_pools} force_attach={force_attached} first_hop_pin={first_hop_pin} pin_covered={pin_covered} incremental={incremental_refind} exclusive={} lf_pass={}",
                 obs_starts.len(),
                 work.observed_pool_indices.len(),
+                work.observed_pool_indices.len(),
+                work.force_cycle_refind,
                 work.lf_pass
             );
         }
+        // Exclusive obs starts when admitting — hub fill was starving SharedCycleCap
+        // (live: in_graph=N/N enum_touch=0 after attach).
+        let exclusive_obs = work.force_cycle_refind && !obs_starts.is_empty();
+        let first_hop = if exclusive_obs {
+            work.observed_pool_indices.as_slice()
+        } else {
+            &[]
+        };
+        // Skip atomic prefilter on exclusive obs — pin cycles are for hot-path
+        // coverage, not profit rank (live: first_hop_pin>0 → enum_touch=0).
+        let atomic_prefilter = !exclusive_obs;
         let outcome = if incremental_refind {
             find_cycles_for_mode_with_budget(
                 work.cycle_finder,
@@ -501,10 +760,13 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 &graph,
                 work.pool_metas.as_ref(),
                 passes.as_slice(),
-                true,
+                atomic_prefilter,
                 Some(&probe_ctx),
                 CYCLE_ENUM_PATCH_BUDGET,
                 &obs_starts,
+                exclusive_obs,
+                first_hop,
+                exclusive_obs,
             )
         } else if obs_starts.is_empty() {
             find_cycles_for_mode(
@@ -517,24 +779,62 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 Some(&probe_ctx),
             )
         } else {
-            // Full refind still hub-seeds by default — inject observed endpoints.
             find_cycles_for_mode_with_budget(
                 work.cycle_finder,
                 &work.arena,
                 &graph,
                 work.pool_metas.as_ref(),
                 passes.as_slice(),
-                true,
+                atomic_prefilter,
                 Some(&probe_ctx),
                 crate::pipeline::cycle_finder::CYCLE_ENUM_TIME_BUDGET,
                 &obs_starts,
+                exclusive_obs,
+                first_hop,
+                exclusive_obs,
             )
         };
-        outcome.diag.log_summary();
+        // ponytail: dropped relax-uni-or-pin retry — live still dfs=0 (sparse pin
+        // close); keeping-prior already covers empty exclusive.
+        if exclusive_obs || work.force_cycle_refind {
+            crate::info!(
+                "stream observed-live: cycle_search raw={} dedupe={} out={} dfs={} starts={} enum_ms={} lf_pass={}",
+                outcome.diag.raw_collected,
+                outcome.diag.post_dedupe,
+                outcome.diag.post_prefilter,
+                outcome.diag.dfs_raw,
+                outcome.diag.start_tokens,
+                outcome.diag.enumerate_ms,
+                work.lf_pass
+            );
+        } else {
+            outcome.diag.log_summary();
+        }
         let mut result = outcome.cycles;
-        if incremental_refind && let Some(cached) = cached_cycles.as_ref() {
-            result.reserve(cached.len());
-            result.extend(cached.iter().cloned());
+        // Merge cache on observed admit. Exclusive: only Uni-only cached
+        // cycles that already touch a pin pool (full Uni cache re-poisoned
+        // pins; skipping cache zeroed enum_touch when DFS closed none).
+        if (incremental_refind || work.force_cycle_refind)
+            && let Some(cached) = cached_cycles.as_ref()
+        {
+            if exclusive_obs {
+                let pin: rustc_hash::FxHashSet<PoolIndex> =
+                    work.observed_pool_indices.iter().copied().collect();
+                result.extend(cached.iter().filter(|c| {
+                    c.edges.iter().any(|e| pin.contains(&e.pool_index))
+                        && c.edges.iter().all(|e| {
+                            matches!(
+                                e.protocol,
+                                crate::core::types::ProtocolType::UniswapV2
+                                    | crate::core::types::ProtocolType::UniswapV3
+                                    | crate::core::types::ProtocolType::UniswapV4
+                            )
+                        })
+                }).cloned());
+            } else {
+                result.reserve(cached.len());
+                result.extend(cached.iter().cloned());
+            }
         }
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             let mut hop_hist = [0u32; HOP_CAP as usize + 1];
@@ -554,16 +854,36 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         let diversified = if work.observed_pool_indices.is_empty() {
             finalize_enumerated_cycles(result, work.max_paths)
         } else {
-            pin_cycles_touching_pools(result, &work.observed_pool_indices, work.max_paths)
+            pin_cycles_touching_pools(
+                result,
+                &work.observed_pool_indices,
+                work.max_paths,
+                exclusive_obs,
+            )
+        };
+        // Exclusive pin miss used to store [] and wipe a good prior snap
+        // (live: cycles_touching=6 → next admit 0/0).
+        let cycles = if exclusive_obs && diversified.is_empty() {
+            if let Some(prior) = cached_cycles.as_ref().filter(|c| !c.is_empty()) {
+                crate::info!(
+                    "stream observed-live: exclusive empty — keeping prior cache cycles={} lf_pass={}",
+                    prior.len(),
+                    work.lf_pass
+                );
+                Arc::clone(prior)
+            } else {
+                Arc::new(diversified)
+            }
+        } else {
+            Arc::new(diversified)
         };
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
                 "cycle search diversity: cap={} post_diversity={}",
                 work.max_paths,
-                diversified.len()
+                cycles.len()
             );
         }
-        let cycles = Arc::new(diversified);
         work.graph_cache.lock().store(
             Arc::clone(&graph),
             Some(Arc::clone(&cycles)),
@@ -571,6 +891,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             layout_fp,
             work.state_generation,
             eligible_count,
+            work.arena.routing_family_prefix_fingerprint(routable_count),
         );
         (cycles, enumerated_cycles)
     } else {
@@ -590,6 +911,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             layout_fp,
             work.state_generation,
             eligible_count,
+            work.arena.routing_family_prefix_fingerprint(routable_count),
         );
         let enumerated_cycles = cached.len();
         (cached, enumerated_cycles)
@@ -607,6 +929,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         cycles,
         enumeration_ms,
         enumerated_cycles,
+        attach_hit_cap,
     }
 }
 
@@ -705,17 +1028,41 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     let mut arena = ctx.arena.lock().clone();
+    let arena_pools_before = arena.pool_count();
     crate::debug!(
         "lf sync: discovered={}, cache_size={}",
         pools.len(),
         ctx.cache.len()
     );
     let decimals = ctx.refresh.token_decimals_map();
+    let freeze_append = ctx.graph_cache.lock().attach_catchup_pending();
     let arena_sync_started = crate::util::now_ms();
-    let pool_metas = Arc::new(
-        ctx.refresh
-            .sync_routable_arena(&mut arena, Some(decimals.as_ref())),
+    let arena_sync = ctx.refresh.sync_routable_arena_gated(
+        &mut arena,
+        Some(decimals.as_ref()),
+        freeze_append,
     );
+    // Persist immediately — end-of-tick writeback was skipped on shutdown returns
+    // and left the next LF cloning an empty arena (live: indices_rebuilt every
+    // few passes with growing pool_metas from cold Rebuild).
+    *ctx.arena.lock() = arena.clone();
+    if arena_sync.indices_rebuilt {
+        // Growth+layout-fp change used to keep poison cycles (live: snap=187
+        // selected=0 proto_mismatch=187 after arena Rebuild).
+        ctx.graph_cache.lock().invalidate_cycles();
+        crate::info!(
+            "lf arena sync: indices_rebuilt=true before={} pool_metas={} (cycle cache cleared)",
+            arena_pools_before,
+            arena_sync.metas.len()
+        );
+    }
+    let pool_metas = Arc::new(arena_sync.metas);
+    if freeze_append && (lf_pass <= 3 || lf_pass.is_multiple_of(10)) {
+        crate::info!(
+            "lf arena sync: freeze_append=true pool_metas={} (attach catchup pending)",
+            pool_metas.len()
+        );
+    }
     let arena_sync_ms = crate::util::now_ms().saturating_sub(arena_sync_started);
     if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
         let hints_missing = arena_tokens_without_decimal_hints(&arena, decimals.as_ref());
@@ -957,7 +1304,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .count()
     };
     if !observed_pin.is_empty() {
-        crate::debug!(
+        crate::info!(
             "stream observed-live: pre_hold_touching={pre_hold_touching}/{} lf_pass={lf_pass}",
             capped.len()
         );
@@ -990,7 +1337,16 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         // Rescore held pins with post-hydrate weights; still skip dead-prune so WSS
         // topic-live cycles survive a transient zero after tick hydrate.
         rescore_cycles_with_table(&arena, &mut table, &mut live_held);
-        live_held.sort_by(crate::pipeline::types::compare_cycle_score);
+        let held_gt_one = live_held.iter().filter(|c| c.cycle_ratio > ONE).count();
+        crate::info!(
+            "stream observed-live: live_held_ratio_gt_one={held_gt_one}/{} lf_pass={lf_pass}",
+            live_held.len()
+        );
+        live_held.sort_by(|a, b| {
+            (b.cycle_ratio > ONE)
+                .cmp(&(a.cycle_ratio > ONE))
+                .then_with(|| crate::pipeline::types::compare_cycle_score(a, b))
+        });
         live_held.truncate(32);
         let mut seen: rustc_hash::FxHashSet<u64> = live_held
             .iter()
@@ -1050,7 +1406,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         )
         .await
     };
-    // Fail-closed: drop non-refreshed priors when the previous snapshot aged past oracle TTL.
+    // Age stamp for observability — merge always retains non-refreshed priors now;
+    // retain_stale_prior=false only forces a rebuild (new Arc) when the snapshot aged.
     let retain_stale_prior = ctx
         .snapshots
         .read()
@@ -1066,7 +1423,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // Trigger on content change (Arc identity), not map length — swap-in/out rated
     // tokens can keep the same len while eligibility changes. Run before priced-start
     // filter so same-tick hub rates can keep cycles.
-    if !Arc::ptr_eq(&rates, &prior_rates) {
+    // Skip when early attach already hit cap — another 128 + full enum same tick
+    // (live: post-rate attached=128 after cycle_search_ms≈1000) just burns budget;
+    // catch-up continues next LF pass with merged rates already in the snapshot.
+    if !cpu.attach_hit_cap && !Arc::ptr_eq(&rates, &prior_rates) {
         let post_gate = GraphBuildGate {
             token_to_matic_rates: Arc::clone(&rates),
             flash: ctx.flash_liquidity.load(),
@@ -1098,17 +1458,24 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 Some(&post_gate),
             );
             if report.attached_pools > 0 {
-                ctx.graph_cache.lock().store(
-                    Arc::clone(&routing_graph),
-                    None,
-                    routable_count,
-                    layout_fp,
-                    state_generation,
-                    eligible,
-                );
+                {
+                    let mut gc = ctx.graph_cache.lock();
+                    gc.store(
+                        Arc::clone(&routing_graph),
+                        None,
+                        routable_count,
+                        layout_fp,
+                        state_generation,
+                        eligible,
+                        arena.routing_family_prefix_fingerprint(routable_count),
+                    );
+                    gc.set_attach_catchup_pending(report.hit_cap);
+                }
                 crate::info!(
-                    "lf graph post-rate patch: attached={} merged_rates={} prior_rates={}",
+                    "lf graph post-rate patch: attached={} hit_cap={} missing_after={} merged_rates={} prior_rates={}",
                     report.attached_pools,
+                    report.hit_cap,
+                    report.missing_after,
                     rates.len(),
                     prior_rates.len()
                 );
@@ -1151,21 +1518,44 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     Arc::make_mut(&mut routing_graph).ensure_token_capacity(arena.token_count());
                 }
                 let passes = cycle_search_passes(max_hops, max_paths);
+                let defer_priced = !observed_pin.is_empty();
                 let probe_ctx = ProbeContext {
-                    token_to_matic_rates: Some(rates.as_ref()),
+                    token_to_matic_rates: if defer_priced {
+                        None
+                    } else {
+                        Some(rates.as_ref())
+                    },
                     token_decimals: Some(decimals.as_ref()),
                     gas_price_wei,
                 };
+                // ponytail: same seed as pre-rate DFS — `&[]` hub-only missed
+                // observed peripherals (live: cycles_touching then prune drop_obs).
+                let obs_starts = observed_pool_start_tokens(
+                    &arena,
+                    pool_metas.as_ref(),
+                    &observed_pin,
+                    Some(routing_graph.as_ref()),
+                );
+                let exclusive_obs = defer_priced && !obs_starts.is_empty();
+                let first_hop = if exclusive_obs {
+                    observed_pin.as_slice()
+                } else {
+                    &[]
+                };
+                // Primary enum already spent the full budget; post-rate is a patch.
                 let outcome = find_cycles_for_mode_with_budget(
                     ctx.config.routing.cycle_finder,
                     &arena,
                     routing_graph.as_ref(),
                     pool_metas.as_ref(),
                     passes.as_slice(),
-                    true,
+                    !exclusive_obs,
                     Some(&probe_ctx),
                     CYCLE_ENUM_PATCH_BUDGET,
-                    &[],
+                    &obs_starts,
+                    exclusive_obs,
+                    first_hop,
+                    exclusive_obs,
                 );
                 if !outcome.cycles.is_empty() {
                     let mut seen: FxHashSet<u64> =
@@ -1209,7 +1599,17 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         });
     }
     retain_cycles_with_priced_start(&mut capped, rates.as_ref());
+    // Observed pins: try rotate/priced-start but keep unpriced survivors so
+    // stream_universe / dirty_in_sel can see the live venue.
+    let live_unpriced_backup = live_for_rates.clone();
     retain_cycles_with_priced_start(&mut live_for_rates, rates.as_ref());
+    if live_for_rates.is_empty() && !live_unpriced_backup.is_empty() {
+        crate::info!(
+            "stream observed-live: priced_start dropped all {} live pins — restoring unpriced lf_pass={lf_pass}",
+            live_unpriced_backup.len()
+        );
+        live_for_rates = live_unpriced_backup;
+    }
     if !live_for_rates.is_empty() {
         let mut seen: rustc_hash::FxHashSet<u64> = live_for_rates
             .iter()
@@ -1237,8 +1637,193 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     .any(|edge| observed_pin_set.contains(&edge.pool_index))
             })
             .count();
-        crate::debug!(
+        crate::info!(
             "stream observed-live: cycles_touching={touching}/{} observed_pools={} lf_pass={lf_pass}",
+            capped.len(),
+            observed_pin.len()
+        );
+    }
+    // Drop family/meta-poisoned cycles before HF publish (live: snap refill burned
+    // every live_touch as drop_proto). Match HF select gate order so observed pins
+    // aren't culled for missing multi-token vault realign.
+    let before_publish = capped.len();
+    let mut drop_multi = 0usize;
+    let mut drop_heal = 0usize;
+    let mut drop_uni = 0usize;
+    let mut drop_uni_both = 0usize;
+    let mut drop_arena = 0usize;
+    let mut drop_meta = 0usize;
+    let mut drop_hop = 0usize;
+    let mut drop_obs = 0usize;
+    let mut soft_keep_obs = 0usize;
+    let prior_capped = capped;
+    let mut kept = Vec::with_capacity(prior_capped.len());
+    for cycle in &prior_capped {
+        let obs_touch = !observed_pin_set.is_empty()
+            && cycle
+                .edges
+                .iter()
+                .any(|e| observed_pin_set.contains(&e.pool_index));
+        // ponytail: observed pins stay in snap for stream_universe / HF anchor
+        // even when meta gates fail (live: drop_obs==touching → dirty_in_sel=0).
+        let soft_obs = |kept: &mut Vec<_>, drop_obs: &mut usize, soft_keep_obs: &mut usize| {
+            *drop_obs += 1;
+            *soft_keep_obs += 1;
+            kept.push(cycle.clone());
+        };
+        let ready = match crate::pipeline::local_sim::realign_multi_token_found_cycle(
+            &arena,
+            Arc::new(cycle.clone()),
+        ) {
+            Some(c) => c,
+            None if obs_touch => {
+                // Soft-keep observed multi for dirty_in_sel / universe; HF still
+                // drops them at live realign. Hard-drop wiped enum_touch=21 pins.
+                drop_multi += 1;
+                soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+                continue;
+            }
+            None => {
+                drop_multi += 1;
+                continue;
+            }
+        };
+        let Some(ready) = crate::pipeline::local_sim::heal_cycle_edge_protocols(&arena, ready)
+        else {
+            // Family poison (Balancer×V3) — do not soft-keep; family_prefix
+            // cycle invalidation must drop these from cache.
+            drop_heal += 1;
+            if obs_touch {
+                drop_obs += 1;
+            }
+            continue;
+        };
+        let ready = match crate::pipeline::local_sim::realign_uni_cycle_from_pool_meta(
+            &arena,
+            pool_metas.as_ref(),
+            Arc::clone(&ready),
+        ) {
+            Some(c) => c,
+            None => {
+                drop_uni += 1;
+                let both_foreign = crate::pipeline::local_sim::uni_cycle_has_both_foreign_edge(
+                    &arena,
+                    pool_metas.as_ref(),
+                    &ready.edges,
+                );
+                if both_foreign {
+                    drop_uni_both += 1;
+                    // Obs Uni pins from cache often have TokenIndex drift on both
+                    // legs (live: enum_touch=2 → uni_both drop_obs=2 emptied).
+                    // Soft-keep when hops still connect so stream_universe sees them.
+                    let hop_ok = crate::pipeline::local_sim::first_hop_continuity_break_in_arena(
+                        &arena,
+                        &ready.edges,
+                    )
+                    .is_none();
+                    if obs_touch && hop_ok {
+                        soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+                    } else if obs_touch {
+                        drop_obs += 1;
+                    }
+                    continue;
+                }
+                // Obs Uni pin: keep healed when hops+arena already ok (meta
+                // TokenIndex drift). Hop-broken pins are wrong-pool — hard-drop
+                // (soft-keep burned snap slots with live_touch=0).
+                let hop_break = crate::pipeline::local_sim::first_hop_continuity_break_in_arena(
+                    &arena,
+                    &ready.edges,
+                );
+                let arena_ok = crate::pipeline::local_sim::cycle_edges_match_arena_state(
+                    &arena,
+                    &ready.edges,
+                );
+                let meta_ok = crate::pipeline::local_sim::cycle_v2_edges_match_pool_meta(
+                    &arena,
+                    pool_metas.as_ref(),
+                    &ready.edges,
+                );
+                if obs_touch {
+                    static UNI_FAIL_SAMPLE: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if UNI_FAIL_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0
+                    {
+                        crate::info!(
+                            "obs uni realign fail: hop_break={hop_break:?} arena_ok={arena_ok} meta_ok={meta_ok} hops={} edges={}",
+                            ready.edge_hops(),
+                            ready.edges.len()
+                        );
+                    }
+                }
+                if obs_touch && hop_break.is_none() && arena_ok {
+                    ready
+                } else if obs_touch && hop_break.is_none() {
+                    soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+                    continue;
+                } else if obs_touch {
+                    drop_obs += 1;
+                    continue;
+                } else {
+                    continue;
+                }
+            }
+        };
+        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(&arena, &ready.edges) {
+            drop_arena += 1;
+            if obs_touch {
+                soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+            }
+            continue;
+        }
+        if !crate::pipeline::local_sim::cycle_v2_edges_match_pool_meta(
+            &arena,
+            pool_metas.as_ref(),
+            &ready.edges,
+        ) {
+            drop_meta += 1;
+            if obs_touch {
+                soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+            }
+            continue;
+        }
+        if crate::pipeline::local_sim::first_hop_continuity_break_in_arena(&arena, &ready.edges)
+            .is_some()
+        {
+            drop_hop += 1;
+            if obs_touch {
+                soft_obs(&mut kept, &mut drop_obs, &mut soft_keep_obs);
+            }
+            continue;
+        }
+        kept.push(Arc::unwrap_or_clone(ready));
+    }
+    // ponytail: never publish an empty snap after prune (live: kept=0 starved HF).
+    let pruned_stale = before_publish.saturating_sub(kept.len());
+    let emptied = kept.is_empty() && before_publish > 0;
+    if emptied {
+        crate::warn!(
+            "lf publish prune emptied snap — keeping prior cycles before_publish={before_publish} lf_pass={lf_pass}"
+        );
+        capped = prior_capped;
+    } else {
+        capped = kept;
+    }
+    let touching_after = if observed_pin_set.is_empty() {
+        0
+    } else {
+        capped
+            .iter()
+            .filter(|c| {
+                c.edges
+                    .iter()
+                    .any(|e| observed_pin_set.contains(&e.pool_index))
+            })
+            .count()
+    };
+    if pruned_stale > 0 || emptied || (!observed_pin.is_empty() && touching_after == 0) {
+        crate::info!(
+            "lf publish prune: dropped_stale={pruned_stale} kept={} emptied={emptied} observed_touching={touching_after}/{} drop_obs={drop_obs} soft_keep_obs={soft_keep_obs} reasons(multi={drop_multi} heal={drop_heal} uni={drop_uni} uni_both={drop_uni_both} arena={drop_arena} meta={drop_meta} hop={drop_hop}) lf_pass={lf_pass}",
             capped.len(),
             observed_pin.len()
         );
@@ -1377,13 +1962,34 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         return Ok(());
     }
 
-    // Universe = streamable pools present in the arena (superset of interest).
+    // Universe = streamable pools that appear in published HF cycles.
+    // Arena-wide metas woke HF on interest/universe patches with
+    // active_candidates=0 (dirty never landed in snap edges).
     let stream_universe: Option<Vec<_>> = ctx.config.pipeline.stream_enabled.then(|| {
-        pool_metas
-            .iter()
-            .filter(|m| crate::services::partial_cache::is_streamable_protocol(m.protocol))
-            .filter_map(|m| arena.pool_address(m.pool_index))
-            .collect()
+        let mut addrs = Vec::with_capacity(capped.len().saturating_mul(3) + observed.len());
+        let mut seen =
+            rustc_hash::FxHashSet::with_capacity_and_hasher(capped.len() * 2, rustc_hash::FxBuildHasher);
+        for cycle in &capped {
+            for edge in &cycle.edges {
+                if !crate::services::partial_cache::is_streamable_protocol(edge.protocol) {
+                    continue;
+                }
+                let Some(addr) = arena.pool_address(edge.pool_index) else {
+                    continue;
+                };
+                if seen.insert(addr) {
+                    addrs.push(addr);
+                }
+            }
+        }
+        // Topic-observed arena hits join universe even when prune culled their
+        // cycles (live: drop_obs==touching → never wake_hf on the live venue).
+        for &addr in &observed {
+            if seen.insert(addr) {
+                addrs.push(addr);
+            }
+        }
+        addrs
     });
 
     // Topic-observed V3 pools admitted this tick — nudge HF after snapshot publish
@@ -1433,7 +2039,26 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     publish_hot.dedup();
     ctx.refresh.set_hot_addresses(publish_hot);
 
-    if let Some(targets) = stream_targets {
+    if let Some(mut targets) = stream_targets {
+        // Pin cycle-covered pools into the WSS interest set — otherwise Sync/Swap
+        // never lands on universe pools (live: wake_true=0 with cycle universe).
+        if let Some(ref universe) = stream_universe {
+            let cap = ctx.config.pipeline.stream_max_pools;
+            let mut pinned = Vec::with_capacity(cap.min(universe.len() + targets.len()));
+            let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
+                pinned.capacity(),
+                rustc_hash::FxBuildHasher,
+            );
+            for addr in universe.iter().copied().chain(targets.drain(..)) {
+                if pinned.len() >= cap {
+                    break;
+                }
+                if seen.insert(addr) {
+                    pinned.push(addr);
+                }
+            }
+            targets = pinned;
+        }
         // Apply hysteresis first so retain/seed match the addresses WSS actually
         // watches (replace may keep the prior set on small top-N churn).
         let force = ctx.stream_addresses.force_replace_pending();
@@ -1456,6 +2081,9 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         }
         let tracked: Vec<_> = ctx.stream_addresses.read().clone();
         if let Some(universe) = stream_universe {
+            if !observed.is_empty() {
+                ctx.partial_cache.note_sticky_observed(&observed);
+            }
             ctx.partial_cache.set_stream_universe(&universe);
         }
         ctx.partial_cache.retain_tracked(&tracked);

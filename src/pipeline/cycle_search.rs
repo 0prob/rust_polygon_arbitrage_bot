@@ -129,12 +129,21 @@ pub fn find_cycles_for_mode(
         probe_ctx,
         CYCLE_ENUM_TIME_BUDGET,
         &[],
+        false,
+        &[],
+        false,
     )
 }
 
 /// Like [`find_cycles_for_mode`] with an explicit DFS wall-clock budget.
 ///
 /// `extra_start_tokens` are prepended to hub DFS starts (WSS-observed pool endpoints).
+/// `exclusive_starts`: seed only those tokens (no hub fill) for observed-admit refinds.
+/// `first_hop_pools`: when non-empty with exclusive starts, opening hop must use one
+/// of these pools (observed venue pin).
+/// `uni_or_pin_only`: with exclusive starts, drop non-Uni non-pin edges. Set false to
+/// retry closes through Balancer/etc while keeping pin-first open (live: exclusive
+/// dfs=0 → relax retry enum_touch=0 when this stayed true via exclusive=false).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn find_cycles_for_mode_with_budget(
@@ -147,6 +156,9 @@ pub fn find_cycles_for_mode_with_budget(
     probe_ctx: Option<&ProbeContext<'_>>,
     enum_budget: Duration,
     extra_start_tokens: &[crate::core::types::TokenIndex],
+    exclusive_starts: bool,
+    first_hop_pools: &[crate::core::types::PoolIndex],
+    uni_or_pin_only: bool,
 ) -> CycleSearchOutcome {
     if passes.is_empty() {
         return CycleSearchOutcome {
@@ -175,11 +187,21 @@ pub fn find_cycles_for_mode_with_budget(
             enum_started,
             enum_budget,
             extra_start_tokens,
+            exclusive_starts,
+            first_hop_pools,
+            uni_or_pin_only,
             &mut diag,
         ),
         CycleFinderMode::Dfs => {
             let mut prep = prepare_active_graph(graph);
-            prep.prefer_start_tokens(extra_start_tokens);
+            prep.prefer_start_tokens(extra_start_tokens, exclusive_starts);
+            if exclusive_starts {
+                if uni_or_pin_only {
+                    prep.retain_uni_or_pin_edges(first_hop_pools);
+                }
+                prep.inject_unpriced_pin_directs(graph, first_hop_pools);
+                prep.prioritize_first_hop_pools(first_hop_pools);
+            }
             let pool_index = index_pool_metas(pool_metas);
             let raw = find_cycles_multi_pass_with_prep_budget(
                 graph,
@@ -198,7 +220,14 @@ pub fn find_cycles_for_mode_with_budget(
         }
         CycleFinderMode::BellmanFord => {
             let mut prep = prepare_active_graph(graph);
-            prep.prefer_start_tokens(extra_start_tokens);
+            prep.prefer_start_tokens(extra_start_tokens, exclusive_starts);
+            if exclusive_starts {
+                if uni_or_pin_only {
+                    prep.retain_uni_or_pin_edges(first_hop_pools);
+                }
+                prep.inject_unpriced_pin_directs(graph, first_hop_pools);
+                prep.prioritize_first_hop_pools(first_hop_pools);
+            }
             diag.hub_heavy = prep.hub_heavy;
             diag.start_tokens = prep.start_token_count();
             // BF adjacency strips Enter/Exit legs; fall back to DFS on hub-spoke graphs.
@@ -238,6 +267,9 @@ fn find_cycles_hybrid_multi_pass(
     enum_started: u64,
     enum_budget: Duration,
     extra_start_tokens: &[crate::core::types::TokenIndex],
+    exclusive_starts: bool,
+    first_hop_pools: &[crate::core::types::PoolIndex],
+    uni_or_pin_only: bool,
     diag: &mut CycleSearchDiagnostics,
 ) -> CycleSearchOutcome {
     if passes.is_empty() {
@@ -248,7 +280,14 @@ fn find_cycles_hybrid_multi_pass(
     }
 
     let mut prep_mut = prepare_active_graph(graph);
-    prep_mut.prefer_start_tokens(extra_start_tokens);
+    prep_mut.prefer_start_tokens(extra_start_tokens, exclusive_starts);
+    if exclusive_starts {
+        if uni_or_pin_only {
+            prep_mut.retain_uni_or_pin_edges(first_hop_pools);
+        }
+        prep_mut.inject_unpriced_pin_directs(graph, first_hop_pools);
+        prep_mut.prioritize_first_hop_pools(first_hop_pools);
+    }
     let prep = Arc::new(prep_mut);
     diag.hub_heavy = prep.hub_heavy;
     diag.start_tokens = prep.start_token_count();
@@ -273,7 +312,10 @@ fn find_cycles_hybrid_multi_pass(
             }
         })
         .collect();
-    let bf_enabled = !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
+    // Exclusive obs pin search: BF ignores first_hop_pools and floods non-pin
+    // Direct cycles (live: first_hop_pin>0 enum_touch=0/103).
+    let bf_enabled =
+        !exclusive_starts && !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
     let pool_index = index_pool_metas(pool_metas);
     let prep_dfs = Arc::clone(&prep);
 

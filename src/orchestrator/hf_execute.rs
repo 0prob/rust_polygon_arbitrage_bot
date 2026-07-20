@@ -396,7 +396,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
     };
 
-    // HF tick already prefetches stale flash tokens (750ms budget); avoid a second blocking refresh here.
+    // HF tick already prefetches stale flash tokens (2.5s budget); avoid a second blocking refresh here.
     if !flash_tokens.is_empty() {
         ctx.execution
             .flash_liquidity

@@ -130,6 +130,19 @@ fn arena_reuse_for_tradable(
     }
 }
 
+fn pool_state_family_tag(state: &PoolState) -> u8 {
+    match state {
+        PoolState::Invalid => 0,
+        PoolState::V2(_) => 1,
+        PoolState::V3(_) => 2,
+        PoolState::V4(_) => 3,
+        PoolState::Curve(_) => 4,
+        PoolState::Balancer(_) => 5,
+        PoolState::Dodo(_) => 6,
+        PoolState::Woofi(_) => 7,
+    }
+}
+
 fn compute_layout_fingerprint(inner: &ArenaInner) -> u64 {
     let mut h = FxHasher::default();
     h.write_u32(inner.tokens.len() as u32);
@@ -137,8 +150,11 @@ fn compute_layout_fingerprint(inner: &ArenaInner) -> u64 {
         h.write(addr.as_slice());
     }
     h.write_usize(inner.pools.len());
-    for addr in &inner.pool_addresses {
+    // Include protocol family so Balancer→V3 (etc.) in-place updates invalidate
+    // cached cycles (live: heal BalancerV2 vs arena V3, fingerprint was address-only).
+    for (addr, state) in inner.pool_addresses.iter().zip(inner.pools.iter()) {
         h.write(addr.as_slice());
+        h.write_u8(pool_state_family_tag(state));
     }
     h.finish()
 }
@@ -177,6 +193,14 @@ impl Clone for StateArena {
     }
 }
 
+/// Result of syncing tradable pools into the arena.
+#[derive(Debug)]
+pub struct ArenaSyncReport {
+    pub metas: Vec<crate::pipeline::types::PoolMeta>,
+    /// TokenIndex/PoolIndex were reassigned — cached cycles are poison.
+    pub indices_rebuilt: bool,
+}
+
 impl StateArena {
     #[must_use]
     pub fn pool_count(&self) -> usize {
@@ -190,6 +214,20 @@ impl StateArena {
     #[must_use]
     pub fn routing_layout_fingerprint(&self) -> u64 {
         self.inner.layout_fingerprint
+    }
+
+    /// Family tags for the first `n` pools — detects in-place Balancer→V3 flips
+    /// during append-only growth (layout fp alone is masked by count-up).
+    #[must_use]
+    pub fn routing_family_prefix_fingerprint(&self, n: usize) -> u64 {
+        use std::hash::Hasher;
+        let mut h = FxHasher::default();
+        let take = n.min(self.inner.pools.len());
+        h.write_usize(take);
+        for state in self.inner.pools.iter().take(take) {
+            h.write_u8(pool_state_family_tag(state));
+        }
+        h.finish()
     }
 
     #[must_use]
@@ -344,15 +382,21 @@ impl StateArena {
         if let Some(&idx) = self.inner.address_to_pool.get(&address) {
             // Skip COW when the Arc pointer is already the same (common on stable
             // LF ticks that re-sync unchanged cache entries).
+            let prior = self.inner.pools.get(idx.0 as usize).map(AsRef::as_ref);
             let same = self
                 .inner
                 .pools
                 .get(idx.0 as usize)
                 .is_some_and(|slot| Arc::ptr_eq(slot, &state));
+            let family_flip = prior.is_some_and(|p| !pool_state_family_compatible(p, state.as_ref()));
             if !same {
                 let inner = Arc::make_mut(&mut self.inner);
                 if let Some(slot) = inner.pools.get_mut(idx.0 as usize) {
                     *slot = state;
+                }
+                // Family flip changes routing edges; recompute even when touch_layout=false.
+                if family_flip || touch_layout {
+                    inner.layout_fingerprint = compute_layout_fingerprint(inner);
                 }
             }
             self.clear_hot_slot(idx);
@@ -443,14 +487,62 @@ impl StateArena {
         address_index: &FxHashMap<Address, usize>,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
     ) -> Vec<crate::pipeline::types::PoolMeta> {
+        self.sync_from_discovery_gated(cache, pools, address_index, decimal_hints, false)
+            .metas
+    }
+
+    /// Like [`Self::sync_from_discovery`], but when `freeze_append` skip prefix-tail
+    /// growth so graph `attach_missing` catch-up can drain (live: eligible 1.7k→7k
+    /// while attach was capped at 512/tick).
+    pub fn sync_from_discovery_gated(
+        &mut self,
+        cache: &StateCache,
+        pools: &[DiscoveredPool],
+        address_index: &FxHashMap<Address, usize>,
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+        freeze_append: bool,
+    ) -> ArenaSyncReport {
         let tradable = cache.tradable_by_discovery_index(address_index);
 
         match arena_reuse_for_tradable(&self.inner, &tradable, pools, decimal_hints) {
             ArenaReuse::Exact => {
-                return self.sync_tradable_inplace(&tradable, pools, decimal_hints);
+                return ArenaSyncReport {
+                    metas: self.sync_tradable_inplace(&tradable, pools, decimal_hints),
+                    indices_rebuilt: false,
+                };
             }
             ArenaReuse::Prefix { prefix_len } => {
-                return self.sync_tradable_append(&tradable, pools, decimal_hints, prefix_len);
+                if freeze_append {
+                    // ponytail: refresh membership only — defer new arena slots.
+                    return ArenaSyncReport {
+                        metas: self.sync_tradable_inplace(
+                            &tradable[..prefix_len],
+                            pools,
+                            decimal_hints,
+                        ),
+                        indices_rebuilt: false,
+                    };
+                }
+                return ArenaSyncReport {
+                    metas: self.sync_tradable_append(
+                        &tradable,
+                        pools,
+                        decimal_hints,
+                        prefix_len,
+                    ),
+                    indices_rebuilt: false,
+                };
+            }
+            ArenaReuse::Rebuild if !self.inner.pools.is_empty() => {
+                // Prefer index-stable refresh over wipe+reassign. Live: 12 full
+                // rebuilds/150s cleared cycle cache (proto_mismatch storms). Shrink
+                // / reorder keeps PoolIndex for addresses still present; new
+                // tradable tails append on later Prefix ticks.
+                let _ = freeze_append;
+                return ArenaSyncReport {
+                    metas: self.sync_frozen_membership(&tradable, pools, decimal_hints),
+                    indices_rebuilt: false,
+                };
             }
             ArenaReuse::Rebuild => {}
         }
@@ -474,9 +566,17 @@ impl StateArena {
         self.hot_overlay.clear();
         self.hot_revisions.clear();
 
-        let mut metas = Vec::with_capacity(tradable.len().max(1));
-        for (idx, _address, state) in tradable {
-            let Some(pool) = pools.get(idx) else {
+        // Cap rebuild ingest — uncapped tradable dumps (live: 12 rebuilds/150s
+        // each reloading 1k–6k) thrash cycle cache. Remainder appends next ticks.
+        const ARENA_REBUILD_CAP: usize = 2048;
+        let rebuild_n = tradable.len().min(ARENA_REBUILD_CAP);
+        let mut metas = Vec::with_capacity(rebuild_n.max(1));
+        let mut appended = 0usize;
+        for (idx, _address, state) in &tradable {
+            if appended >= ARENA_REBUILD_CAP {
+                break;
+            }
+            let Some(pool) = pools.get(*idx) else {
                 continue;
             };
             // On rebuild we still filter — some tradable cache entries fail
@@ -486,13 +586,87 @@ impl StateArena {
             }
             metas.push(self.append_synced_pool(
                 pool,
-                state,
+                Arc::clone(state),
                 decimal_hints,
                 /*touch_layout=*/ false,
             ));
+            appended += 1;
         }
         // One layout fingerprint for the full bulk rebuild (not per insert).
         self.recompute_layout_fingerprint();
+        ArenaSyncReport {
+            metas,
+            indices_rebuilt: true,
+        }
+    }
+
+    /// Catch-up freeze: refresh states for current membership only (no grow/shrink).
+    fn sync_frozen_membership(
+        &mut self,
+        tradable: &[(usize, Address, Arc<PoolState>)],
+        pools: &[DiscoveredPool],
+        decimal_hints: Option<&FxHashMap<Address, u8>>,
+    ) -> Vec<crate::pipeline::types::PoolMeta> {
+        let existing = self.inner.pools.len();
+        // Fast path: arena prefix still aligns with tradable order.
+        let mut prefix = 0usize;
+        for i in 0..existing.min(tradable.len()) {
+            if self.inner.pool_addresses.get(i) != Some(&tradable[i].1) {
+                break;
+            }
+            prefix += 1;
+        }
+        if prefix == existing {
+            return self.sync_tradable_inplace(&tradable[..prefix], pools, decimal_hints);
+        }
+        let by_addr: rustc_hash::FxHashMap<Address, (usize, Arc<PoolState>)> = tradable
+            .iter()
+            .map(|(idx, addr, state)| (*addr, (*idx, Arc::clone(state))))
+            .collect();
+        let mut ordered = Vec::with_capacity(existing);
+        for i in 0..existing {
+            let addr = self.inner.pool_addresses[i];
+            if let Some((idx, state)) = by_addr.get(&addr) {
+                ordered.push((*idx, addr, Arc::clone(state)));
+                continue;
+            }
+            // Still in arena but dropped from tradable — keep prior state.
+            let Some(idx) = pools.iter().position(|p| p.address == addr) else {
+                // Discovery row gone: cannot safely rebuild metas — keep prior
+                // states and rematerialize from whatever discovery rows remain.
+                ordered.clear();
+                break;
+            };
+            ordered.push((idx, addr, Arc::clone(&self.inner.pools[i])));
+        }
+        if ordered.len() == existing {
+            return self.sync_tradable_inplace(&ordered, pools, decimal_hints);
+        }
+        // Last resort: refresh the longest still-aligned prefix only.
+        if prefix > 0 {
+            return self.sync_tradable_inplace(&tradable[..prefix], pools, decimal_hints);
+        }
+        // Membership unreadable vs discovery — return metas from current slots
+        // without growing (states untouched).
+        let mut metas = Vec::with_capacity(existing);
+        for i in 0..existing {
+            let addr = self.inner.pool_addresses[i];
+            let Some(idx) = pools.iter().position(|p| p.address == addr) else {
+                continue;
+            };
+            let Some(pool) = pools.get(idx) else {
+                continue;
+            };
+            let state = Arc::clone(&self.inner.pools[i]);
+            let token_indices =
+                self.token_indices_for_pool(state.as_ref(), pool, decimal_hints, false);
+            metas.push(pool_meta_from_synced(
+                pool,
+                PoolIndex(i as u32),
+                &token_indices,
+                state.as_ref(),
+            ));
+        }
         metas
     }
 
@@ -512,23 +686,26 @@ impl StateArena {
         let mut metas = self.sync_tradable_inplace(&tradable[..prefix_len], pools, decimal_hints);
         metas.reserve(tradable.len().saturating_sub(prefix_len));
 
-        // Append only the newly tradable tail without rehashing the prefix.
-        let extra_tokens: usize = tradable[prefix_len..]
+        // Match graph ATTACH_MISSING_CAP — uncapped tails made eligible grow
+        // faster than attach could drain (live: 1.7k→6k/150s).
+        const ARENA_APPEND_CAP: usize = 512;
+        let tail = &tradable[prefix_len..];
+        let append_n = tail.len().min(ARENA_APPEND_CAP);
+        let extra_tokens: usize = tail[..append_n]
             .iter()
             .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
             .sum();
         {
             let inner = Arc::make_mut(&mut self.inner);
-            let grow = tradable.len() - prefix_len;
-            inner.pools.reserve(grow);
-            inner.pool_addresses.reserve(grow);
-            inner.address_to_pool.reserve(grow);
+            inner.pools.reserve(append_n);
+            inner.pool_addresses.reserve(append_n);
+            inner.address_to_pool.reserve(append_n);
             inner.tokens.reserve(extra_tokens);
             inner.token_decimals.reserve(extra_tokens);
             inner.address_to_token.reserve(extra_tokens);
         }
 
-        for (idx, _address, state) in &tradable[prefix_len..] {
+        for (idx, _address, state) in &tail[..append_n] {
             let Some(pool) = pools.get(*idx) else {
                 continue;
             };
@@ -754,6 +931,34 @@ mod tests {
         let _ = arena.register_pool(addr_b, v2_state());
         let fp_ab = arena.routing_layout_fingerprint();
         assert_ne!(fp_a, fp_ab);
+    }
+
+    #[test]
+    fn routing_layout_fingerprint_changes_on_protocol_family_flip() {
+        use crate::core::types::{V3PoolState, V3Tick};
+        let addr = Address::from([7u8; 20]);
+        let mut arena = StateArena::default();
+        let _ = arena.register_pool(addr, v2_state());
+        let fp_v2 = arena.routing_layout_fingerprint();
+        let _ = arena.register_pool(
+            addr,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![V3Tick {
+                    tick: -60_000,
+                    liquidity_gross: 1,
+                    liquidity_net: 0,
+                }]),
+            })),
+        );
+        assert_ne!(fp_v2, arena.routing_layout_fingerprint());
     }
 
     #[test]

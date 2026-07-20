@@ -250,11 +250,15 @@ pub fn expand_hub_spoke_resolvable(
 /// Soft cap on retained non-refreshed prior rates (unbounded growth otherwise).
 const MERGED_RATES_SOFT_CAP: usize = 2_048;
 
-/// A requested token absent from `fresh` failed its current freshness check, so its
-/// old rate must be removed to keep HF pricing fail-closed.
+/// Merge LF enrich output into the prior rate map.
 ///
-/// When `retain_stale_prior` is false (prior snapshot older than oracle cache TTL),
-/// only `fresh` is kept — fail-closed on stale merge.
+/// Non-refreshed priors are always retained (enrich only covers cycle+hub tokens).
+/// Refreshed tokens present in `fresh` overwrite; refreshed tokens missing from
+/// `fresh` keep their prior rate when one exists (transient Hermes/hub misses
+/// must not wipe a still-usable quote). Soft-cap bounds retained map growth.
+///
+/// `retain_stale_prior=false` forces a rebuild (new Arc) when the snapshot aged
+/// past quote TTL — it no longer wipes non-refreshed spokes.
 #[must_use]
 pub fn merge_token_rates(
     prior: &Arc<FxHashMap<TokenIndex, U256>>,
@@ -262,29 +266,35 @@ pub fn merge_token_rates(
     fresh: FxHashMap<TokenIndex, U256>,
     retain_stale_prior: bool,
 ) -> Arc<FxHashMap<TokenIndex, U256>> {
-    if !retain_stale_prior || prior.is_empty() {
+    if prior.is_empty() {
         return Arc::new(fresh);
     }
-    let needs_merge = refreshed_tokens
-        .iter()
-        .any(|token| prior.contains_key(token) && !fresh.contains_key(token))
+    let needs_merge = !retain_stale_prior
         || fresh
             .iter()
-            .any(|(token, rate)| prior.get(token) != Some(rate));
+            .any(|(token, rate)| prior.get(token) != Some(rate))
+        || refreshed_tokens
+            .iter()
+            .any(|token| !prior.contains_key(token) && fresh.contains_key(token));
     if !needs_merge {
         return Arc::clone(prior);
     }
+    let retained_prior = prior
+        .iter()
+        .filter(|(token, _)| !refreshed_tokens.contains(token))
+        .count();
+    let kept_stale_refreshed = refreshed_tokens
+        .iter()
+        .filter(|t| prior.contains_key(t) && !fresh.contains_key(t))
+        .count();
+    let fresh_len = fresh.len();
     let mut merged =
         FxHashMap::with_capacity_and_hasher(prior.len().saturating_add(fresh.len()), FxBuildHasher);
-    merged.extend(
-        prior
-            .iter()
-            .filter(|(token, _)| !refreshed_tokens.contains(token))
-            .map(|(&token, &rate)| (token, rate)),
-    );
+    // Keep all prior rates first; fresh overwrites successful refreshes.
+    // Unresolved refreshed tokens therefore retain their prior quote.
+    merged.extend(prior.iter().map(|(&token, &rate)| (token, rate)));
     merged.extend(fresh);
-    // ponytail: drop excess stale priors (not in this refresh). Prefer keeping
-    // tokens touched this tick; age gate is `retain_stale_prior` above.
+    // Soft-cap: drop excess priors not touched this tick.
     if merged.len() > MERGED_RATES_SOFT_CAP {
         let overflow = merged.len() - MERGED_RATES_SOFT_CAP;
         let drop_keys: Vec<TokenIndex> = merged
@@ -297,6 +307,17 @@ pub fn merge_token_rates(
             merged.remove(&k);
         }
     }
+    if kept_stale_refreshed > 0 || !retain_stale_prior {
+        crate::info!(
+            "token rates merge: prior={} fresh={} retained_prior={} kept_stale_refreshed={} merged={} retain_stale={}",
+            prior.len(),
+            fresh_len,
+            retained_prior,
+            kept_stale_refreshed,
+            merged.len(),
+            retain_stale_prior
+        );
+    }
     Arc::new(merged)
 }
 
@@ -304,7 +325,11 @@ pub fn merge_token_rates(
 pub struct RateEnrichStats {
     pub requested: usize,
     pub resolved: usize,
+    /// Integer rates from on-chain Chainlink multicall.
     pub chainlink: usize,
+    /// Integer rates whose USD raw last came from Hermes Pyth.
+    pub pyth_integer: usize,
+    /// Float USD÷MATIC fallback (rare when integer+hub both miss).
     pub pyth_or_float: usize,
     pub hub_path: usize,
     pub unresolved: usize,
@@ -410,7 +435,11 @@ fn hub_rates_for_tokens(
     }
 }
 
-/// Oracle prefetch for configured feeds, hub tokens, and tokens without a hub-path rate.
+/// Oracle prefetch for hub tokens and tokens without a usable hub-path rate.
+///
+/// Long-tail tokens that already have a hub-path rate skip Hermes/Chainlink —
+/// `build_token_to_matic_rates` prefers hub when oracle is absent, and CL
+/// divergence override only matters for tokens we still fetch.
 fn prefetch_addrs_for_oracle_fallback(
     arena: &StateArena,
     oracle: &PriceOracle,
@@ -422,7 +451,14 @@ fn prefetch_addrs_for_oracle_fallback(
         let Some(addr) = arena.token_address(*idx) else {
             continue;
         };
-        if oracle.has_configured_feed(&addr) || !hub_rates.contains_key(idx) {
+        let has_hub = hub_rates
+            .get(idx)
+            .is_some_and(|r| *r >= MIN_TOKEN_TO_MATIC_RATE);
+        // Hub tokens always prefetch (integer CL preferred). Long-tail with hub: skip.
+        if has_hub && !crate::core::constants::is_polygon_hub_token(addr) {
+            continue;
+        }
+        if oracle.has_configured_feed(&addr) || !has_hub {
             addrs.push(addr);
         }
     }
@@ -561,7 +597,11 @@ fn build_token_to_matic_rates(
                 continue;
             }
             (Some(cl), _) => {
-                stats.chainlink += 1;
+                if oracle.is_pyth_sourced(&addr) {
+                    stats.pyth_integer += 1;
+                } else {
+                    stats.chainlink += 1;
+                }
                 stats.resolved += 1;
                 out.insert(*idx, cl);
                 continue;
@@ -603,12 +643,24 @@ fn build_token_to_matic_rates(
             }
         }
     }
-    if stats.requested > 0 {
-        crate::debug!(
-            "token rates enrich: requested={} resolved={} chainlink={} pyth_or_float={} hub_path={} unresolved={}",
+    if stats.requested > 0 && (stats.unresolved > 0 || stats.requested > 32) {
+        crate::info!(
+            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} hub_path={} unresolved={}",
             stats.requested,
             stats.resolved,
             stats.chainlink,
+            stats.pyth_integer,
+            stats.pyth_or_float,
+            stats.hub_path,
+            stats.unresolved
+        );
+    } else if stats.requested > 0 {
+        crate::debug!(
+            "token rates enrich: requested={} resolved={} chainlink={} pyth_integer={} float={} hub_path={} unresolved={}",
+            stats.requested,
+            stats.resolved,
+            stats.chainlink,
+            stats.pyth_integer,
             stats.pyth_or_float,
             stats.hub_path,
             stats.unresolved
@@ -741,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_token_rates_evicts_unresolved_refreshed_tokens() {
+    fn merge_token_rates_keeps_prior_when_refresh_unresolved() {
         let prior = Arc::new(FxHashMap::from_iter([
             (TokenIndex(0), U256::from(1_000u64)),
             (TokenIndex(1), U256::from(2_000u64)),
@@ -750,7 +802,10 @@ mod tests {
 
         let merged = merge_token_rates(&prior, &refreshed, FxHashMap::default(), true);
 
-        assert!(!merged.contains_key(&TokenIndex(0)));
+        assert_eq!(
+            merged.get(&TokenIndex(0)).copied(),
+            Some(U256::from(1_000u64))
+        );
         assert_eq!(
             merged.get(&TokenIndex(1)).copied(),
             Some(U256::from(2_000u64))
@@ -758,7 +813,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_token_rates_drops_prior_when_stale() {
+    fn merge_token_rates_keeps_non_refreshed_when_snapshot_aged() {
+        // retain_stale_prior=false used to wipe spoke rates not in this tick's
+        // enrich set — that killed hub-path spokes when LF spacing > quote TTL.
         let prior = Arc::new(FxHashMap::from_iter([(
             TokenIndex(1),
             U256::from(2_000u64),
@@ -774,7 +831,10 @@ mod tests {
             merged.get(&TokenIndex(0)).copied(),
             Some(U256::from(1_000u64))
         );
-        assert!(!merged.contains_key(&TokenIndex(1)));
+        assert_eq!(
+            merged.get(&TokenIndex(1)).copied(),
+            Some(U256::from(2_000u64))
+        );
     }
 
     #[test]

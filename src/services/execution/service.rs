@@ -51,15 +51,21 @@ const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
 /// Best-eval cover below this (bps of gas cost) is chronic dust — soft-quarantine
 /// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
 /// at ~358 bps across captures while ge_1000 stayed 0).
-const CHRONIC_UNDERWATER_COVER_BPS: u64 = 2_000;
+// Cool only sub-5% cover dust. Live: ~880 cover near-misses were quarantined
+// in the old <10% band while still the best absolute-MATIC candidates.
+const CHRONIC_UNDERWATER_COVER_BPS: u64 = 500;
+/// Absolute MATIC available toward gas; below this, cover_bps≥1000 is wei-dust
+/// (live: USDT input=8040 cover=1024 escaped uq while sticky V2 at 0.006 MATIC cooled).
+const CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(15); // 0.001 MATIC
 /// Require repeated best-eval wins before soft quarantine. Live uqfix: unblocking
 /// quarantine then one-shot-quarantined 74 distinct fps → selected=0 / kept max 1.
 const CHRONIC_UNDERWATER_STRIKES: u32 = 3;
 /// Reset strike count when best-eval gaps exceed this (one-shot diversions).
 const CHRONIC_UNDERWATER_STRIKE_WINDOW: Duration = Duration::from_secs(120);
-/// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
-/// into selected=0). Sticky V3 dust sits ~300–400 bps.
-const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 100;
+    /// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
+    /// into selected=0). Live: cover=42/65 4-hop losers escaped the old 100 floor and
+    /// kept winning best-eval after sticky cool — cool from 25 bps with real MATIC.
+    const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 25;
 const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 /// Start-token cooldown when vault query profit does not appear in executor balance
 /// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
@@ -67,6 +73,10 @@ const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 /// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
+/// Thin-liq underwater (available≪0.01 MATIC) — longer cool; live sticky V2
+/// 0xe43e/0x2f44 kept returning at cover~380 / gross=0.0067 with ~1-unit scarce side.
+const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
+const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(16); // 0.01 MATIC
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
@@ -562,6 +572,18 @@ impl ExecutionService {
         self.prepare_skip_counts.write().remove(&fingerprint);
     }
 
+    /// Soft cooldown for structurally dead routes (e.g. Balancer tokens ∉ vault).
+    /// Uses `ROUTE_COOLDOWN` — batch-query's 600s emptied the HF window (live: selected=0).
+    /// Never shortens an existing longer cooldown (underwater 600s was getting
+    /// clobbered to 30s by rotation cools).
+    pub fn quarantine_stale_route(&self, fingerprint: u64) {
+        let until = Instant::now() + ROUTE_COOLDOWN;
+        let mut q = self.quarantine.write();
+        if q.get(&fingerprint).is_none_or(|exp| *exp < until) {
+            q.insert(fingerprint, until);
+        }
+    }
+
     /// Cool down a Direct start token after `executeArbDirect` realizes zero vs vault query.
     pub fn quarantine_direct_token_zero_realized(&self, token: Address) {
         self.direct_token_quarantine.write().insert(
@@ -608,9 +630,20 @@ impl ExecutionService {
 
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
     /// Returns true only when a *new* cooldown was applied (not on refresh / first strike).
-    pub fn quarantine_chronic_gas_underwater(&self, fingerprint: u64, gas_cover_bps: u64) -> bool {
-        if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS)
-            .contains(&gas_cover_bps)
+    pub fn quarantine_chronic_gas_underwater(
+        &self,
+        fingerprint: u64,
+        gas_cover_bps: u64,
+        available_matic_wei: U256,
+    ) -> bool {
+        let cover_bps = if available_matic_wei
+            < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
+        {
+            gas_cover_bps.min(CHRONIC_UNDERWATER_COVER_BPS.saturating_sub(1))
+        } else {
+            gas_cover_bps
+        };
+        if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS).contains(&cover_bps)
         {
             return false;
         }
@@ -637,9 +670,13 @@ impl ExecutionService {
             return false;
         }
         self.underwater_strikes.write().remove(&fingerprint);
-        self.quarantine
-            .write()
-            .insert(fingerprint, now + CHRONIC_UNDERWATER_QUARANTINE);
+        let ttl = if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+        {
+            CHRONIC_THIN_LIQ_QUARANTINE
+        } else {
+            CHRONIC_UNDERWATER_QUARANTINE
+        };
+        self.quarantine.write().insert(fingerprint, now + ttl);
         true
     }
 
@@ -1721,19 +1758,31 @@ mod safety_tests {
     fn chronic_underwater_quarantine_needs_repeated_strikes() {
         let exec = ExecutionService::default();
         let fp = 0xdead_beef_u64;
+        let avail = U256::from(10u128.pow(16)); // 0.01 MATIC
         // Near-zero cover never strikes (cascade guard).
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10, avail));
         assert!(!exec.is_route_quarantined(fp));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
         assert!(!exec.is_route_quarantined(fp));
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, avail));
         assert!(exec.is_route_quarantined(fp));
         // Already quarantined — no re-apply signal.
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
         // One-shot diversion (different fp) stays selectable.
-        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200));
+        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, avail));
         assert!(!exec.is_route_quarantined(0xcafe_u64));
+        // Sub-100 cover with real MATIC still chronic-cools (live: 42/65 best-evals).
+        let low_fp = 0x1042_u64;
+        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
+        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
+        // Wei-dust with fake cover≥1000 still chronic-cools (clamped into band).
+        let dust_fp = 0xd057_u64;
+        let dust_avail = U256::from(100u64);
+        assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
+        assert!(exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
     }
 
     #[test]

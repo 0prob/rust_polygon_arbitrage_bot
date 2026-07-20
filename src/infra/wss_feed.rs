@@ -248,12 +248,44 @@ impl PoolLogFeed {
                 data.len()
             );
         }
-        // Wake HF for interest top-N or any arena-known streamable pool.
-        // Pure topic spam outside the universe must not thrash empty ticks.
-        let wake_hf = {
+        // Wake on cycle-covered (universe) or interest. Interest-only still
+        // early-returns when active_candidates=0; universe-only missed all
+        // trading venues (live: wake_true=0 while interest saw Sync/Swap).
+        let in_interest = {
             let addrs = self.addresses.read();
-            addrs.binary_search(&pool).is_ok() || self.partial.in_stream_universe(&pool)
+            addrs.binary_search(&pool).is_ok()
         };
+        let in_universe = self.partial.in_stream_universe(&pool);
+        let wake_hf = in_interest || in_universe;
+        // Rate-limited wake-gate funnel (live: ~95% wake_hf=false → active_candidates=0).
+        {
+            static WAKE_TRUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static WAKE_FALSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static INTEREST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static UNIVERSE_ONLY: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if wake_hf {
+                WAKE_TRUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if in_interest {
+                    INTEREST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    UNIVERSE_ONLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                WAKE_FALSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let total = WAKE_TRUE.load(std::sync::atomic::Ordering::Relaxed)
+                + WAKE_FALSE.load(std::sync::atomic::Ordering::Relaxed);
+            if total == 1 || total.is_multiple_of(200) {
+                info!(
+                    "WSS wake gate: n={total} wake_true={} wake_false={} in_interest={} universe_only={} sample_pool={pool} in_interest={in_interest} in_universe={in_universe}",
+                    WAKE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
+                    WAKE_FALSE.load(std::sync::atomic::Ordering::Relaxed),
+                    INTEREST.load(std::sync::atomic::Ordering::Relaxed),
+                    UNIVERSE_ONLY.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        }
         if !self
             .partial
             .apply_log_notify(pool, topic0, data, ts, wake_hf)

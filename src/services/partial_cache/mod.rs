@@ -150,6 +150,9 @@ pub struct PartialPoolCache {
     /// Topic-observed pools not yet in the universe — LF merges into hot refresh
     /// so live Uni V3 venues enter the arena instead of staying wake_hf=false forever.
     observed_live: Mutex<FxHashSet<Address>>,
+    /// Recently topic-observed venues kept in the wake universe across LF ticks
+    /// that drain `observed` (activity-based retain bloated with interest-set noise).
+    sticky_observed: Mutex<FxHashMap<Address, u64>>,
     /// Live-edge centrality per pool, keyed by layout⊕state generation.
     edge_centrality: Mutex<EdgeCentralityCache>,
 }
@@ -173,7 +176,22 @@ impl PartialPoolCache {
                 FxBuildHasher,
             )),
             observed_live: Mutex::new(FxHashSet::with_capacity_and_hasher(64, FxBuildHasher)),
+            sticky_observed: Mutex::new(FxHashMap::with_capacity_and_hasher(64, FxBuildHasher)),
             edge_centrality: Mutex::new(None),
+        }
+    }
+
+    /// Stamp topic-observed venues so they survive empty admit ticks in the universe.
+    pub fn note_sticky_observed(&self, addrs: &[Address]) {
+        if addrs.is_empty() {
+            return;
+        }
+        const KEEP_MS: u64 = 120_000;
+        let now = crate::util::now_ms();
+        let mut sticky = self.sticky_observed.lock();
+        sticky.retain(|_, ts| now.saturating_sub(*ts) < KEEP_MS);
+        for &addr in addrs {
+            sticky.insert(addr, now);
         }
     }
 
@@ -212,13 +230,22 @@ impl PartialPoolCache {
         map
     }
 
-    /// Replace the arena-known streamable universe used for HF wake gating.
+    /// Replace the streamable wake universe with `addrs` plus sticky observed venues.
     pub fn set_stream_universe(&self, addrs: &[Address]) {
-        {
+        const KEEP_MS: u64 = 120_000;
+        let now = crate::util::now_ms();
+        let sticky: Vec<Address> = {
+            let mut s = self.sticky_observed.lock();
+            s.retain(|_, ts| now.saturating_sub(*ts) < KEEP_MS);
+            s.keys().copied().collect()
+        };
+        let size = {
             let mut universe = self.universe.write();
             universe.clear();
             universe.extend(addrs.iter().copied());
-        }
+            universe.extend(sticky.iter().copied());
+            universe.len()
+        };
         {
             let mut observed = self.observed_live.lock();
             for addr in addrs {
@@ -226,8 +253,7 @@ impl PartialPoolCache {
             }
         }
         crate::info!(
-            "stream universe: pools={} (topic Sync/Swap on these wake HF)",
-            addrs.len()
+            "stream universe: pools={size} (cycle+observed+sticky; topic Sync/Swap wake HF)"
         );
     }
 

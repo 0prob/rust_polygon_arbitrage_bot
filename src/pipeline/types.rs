@@ -250,6 +250,14 @@ impl RoutingGraph {
             })
         })
     }
+
+    /// True when the pool already has adjacency stubs (live or ratio=0 Direct).
+    #[must_use]
+    pub fn pool_has_edges(&self, pool_index: PoolIndex) -> bool {
+        self.pool_edge_positions
+            .get(pool_index.0 as usize)
+            .is_some_and(|p| !p.is_empty())
+    }
 }
 
 #[must_use]

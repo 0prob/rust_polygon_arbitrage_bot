@@ -26,7 +26,11 @@ pub struct GraphCache {
     cached_pool_count: usize,
     cached_eligible_pool_count: usize,
     cached_layout_fingerprint: u64,
+    /// Family tags for `cached_pool_count` pools at last store.
+    cached_family_prefix: u64,
     cached_state_generation: u64,
+    /// Capped `attach_missing` left work — keep scanning until a non-capped pass.
+    attach_catchup_pending: bool,
 }
 
 impl GraphCache {
@@ -96,16 +100,24 @@ impl GraphCache {
 
     /// True when cached cycles remain index-valid after this membership change.
     /// Growth (append-only arena) keeps PoolIndex; shrink/reorder does not.
+    /// `family_prefix` must be [`StateArena::routing_family_prefix_fingerprint`]
+    /// over the previously cached pool count.
     #[must_use]
     pub fn cycle_cache_still_valid(
         &self,
         routable_pool_count: usize,
         layout_fingerprint: u64,
+        family_prefix: u64,
     ) -> bool {
         if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
             return false;
         }
         if routable_pool_count < self.cached_pool_count {
+            return false;
+        }
+        // In-place family flip during growth (Balancer→V3) — layout fp is new
+        // from appends so the count<= gate would keep poison cycles.
+        if family_prefix != self.cached_family_prefix {
             return false;
         }
         if self.cached_layout_fingerprint != layout_fingerprint
@@ -157,19 +169,25 @@ impl GraphCache {
         layout_fingerprint: u64,
         state_generation: u64,
         eligible_pool_count: usize,
+        family_prefix: u64,
     ) {
         self.graph = Some(graph);
         self.cycles = cycles.and_then(|c| (!c.is_empty()).then_some(c));
         self.cached_pool_count = pool_count;
         self.cached_eligible_pool_count = eligible_pool_count;
         self.cached_layout_fingerprint = layout_fingerprint;
+        self.cached_family_prefix = family_prefix;
         self.cached_state_generation = state_generation;
     }
 
     /// True when pools gained eligibility since the last connectivity build.
     /// Pools losing eligibility only need edge rescoring (dead edges).
+    /// Also true while a prior capped attach still has missing pools to catch up.
     #[must_use]
     pub fn connectivity_stale(&self, eligible_pool_count: usize) -> bool {
+        if self.attach_catchup_pending {
+            return true;
+        }
         if self.graph.is_none() || eligible_pool_count <= self.cached_eligible_pool_count {
             return false;
         }
@@ -185,6 +203,20 @@ impl GraphCache {
     #[must_use]
     pub fn cached_eligible_pool_count(&self) -> usize {
         self.cached_eligible_pool_count
+    }
+
+    pub fn set_attach_catchup_pending(&mut self, pending: bool) {
+        self.attach_catchup_pending = pending;
+    }
+
+    #[must_use]
+    pub fn attach_catchup_pending(&self) -> bool {
+        self.attach_catchup_pending
+    }
+
+    /// Drop cached cycles after arena index rebuild (TokenIndex reassignment).
+    pub fn invalidate_cycles(&mut self) {
+        self.cycles = None;
     }
 
     #[must_use]
@@ -229,6 +261,7 @@ impl GraphCache {
         }
         let g = Arc::clone(self.graph.as_ref()?);
         let cyc = self.cycles.clone();
+        let family_prefix = arena.routing_family_prefix_fingerprint(routable_count);
         self.store(
             Arc::clone(&g),
             cyc,
@@ -236,6 +269,7 @@ impl GraphCache {
             layout_fingerprint,
             new_state_generation,
             eligible_count,
+            family_prefix,
         );
         Some(g)
     }
@@ -279,6 +313,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         );
         assert!(cache.needs_cycle_refind(10, 0, 0, 0, 0));
     }
@@ -295,10 +330,11 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_connectivity_rebuild(1_050, 1));
         assert!(!cache.needs_connectivity_rebuild(1_500, 99));
-        assert!(cache.cycle_cache_still_valid(1_500, 99));
+        assert!(cache.cycle_cache_still_valid(1_500, 99, 0));
         assert!(!cache.needs_cycle_refind(1_050, 1, 6, 0, 1_000));
     }
 
@@ -316,10 +352,11 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         cache.advance_pass(); // pass 4 — rebuild due, cycle refind interval not yet
         assert!(cache.needs_connectivity_rebuild(1_000, 1));
-        assert!(cache.cycle_cache_still_valid(1_000, 1));
+        assert!(cache.cycle_cache_still_valid(1_000, 1, 0));
         assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
     }
 
@@ -334,12 +371,13 @@ mod tests {
             1,
             5,
             3_500,
+            0,
         );
         // Small shrink under warm threshold — keep cache path.
         assert!(!cache.needs_connectivity_rebuild(3_900, 1));
         // Large shrink — rebuild.
         assert!(cache.needs_connectivity_rebuild(3_500, 1));
-        assert!(!cache.cycle_cache_still_valid(3_500, 1));
+        assert!(!cache.cycle_cache_still_valid(3_500, 1, 0));
     }
 
     #[test]
@@ -353,6 +391,7 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
         assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
@@ -369,6 +408,7 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
         assert!(cache.needs_cycle_refind(1_000, 1, 6, 51, 100));
@@ -387,6 +427,7 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
         cache.advance_pass();
@@ -404,11 +445,12 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_connectivity_rebuild(1_100, 1));
         // Interval / empty cycles still force refind; growth alone does not.
         assert!(!cache.needs_cycle_refind(1_100, 1, 6, 0, 1_000));
-        assert!(cache.cycle_cache_still_valid(1_100, 1));
+        assert!(cache.cycle_cache_still_valid(1_100, 1, 0));
     }
 
     #[test]
@@ -422,11 +464,12 @@ mod tests {
             1,
             0,
             8,
+            0,
         );
         assert!(!cache.needs_connectivity_rebuild(10, 1));
         assert!(cache.needs_connectivity_rebuild(10, 2));
         // Rebuild alone does not force refind — LF uses cycle_cache_still_valid.
-        assert!(!cache.cycle_cache_still_valid(10, 2));
+        assert!(!cache.cycle_cache_still_valid(10, 2, 0));
         assert!(!cache.needs_cycle_refind(10, 2, 0, 0, 10));
     }
 
@@ -443,6 +486,7 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         // +30 pools, new fingerprint: below rebuild delta (64 / 5%).
         assert!(!cache.needs_connectivity_rebuild(1_030, 99));
@@ -462,11 +506,30 @@ mod tests {
             11,
             5,
             800,
+            0,
         );
         assert!(!cache.needs_connectivity_rebuild(1_000, 11));
         assert!(cache.needs_connectivity_rebuild(1_000, 12));
-        assert!(!cache.cycle_cache_still_valid(1_000, 12));
+        assert!(!cache.cycle_cache_still_valid(1_000, 12, 0));
         assert!(!cache.needs_cycle_refind(1_000, 12, 6, 0, 1_000));
+    }
+
+    #[test]
+    fn family_prefix_change_invalidates_cycles_during_growth() {
+        // Growth changes layout fp but must not mask in-place family flips.
+        let mut cache = GraphCache::with_rebuild_interval(60);
+        cache.advance_pass();
+        cache.store(
+            Arc::new(crate::pipeline::types::RoutingGraph::default()),
+            Some(Arc::new(vec![dummy_cycle()])),
+            1_000,
+            1,
+            5,
+            800,
+            11,
+        );
+        assert!(cache.cycle_cache_still_valid(1_050, 99, 11));
+        assert!(!cache.cycle_cache_still_valid(1_050, 99, 12));
     }
 
     #[test]
@@ -480,6 +543,7 @@ mod tests {
             1,
             5,
             800,
+            0,
         );
         assert!(!cache.connectivity_stale(800));
         assert!(!cache.connectivity_stale(799));
@@ -498,6 +562,7 @@ mod tests {
             1,
             7,
             800,
+            0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 7, 0, 1_000));
         assert!(!cache.needs_cycle_refind(1_000, 1, 8, 0, 1_000));

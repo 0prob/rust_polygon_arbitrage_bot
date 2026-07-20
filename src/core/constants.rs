@@ -38,12 +38,16 @@ pub const AAVE_V3_POOL: Address = address!("0x794a61358D6845594F94dc1DB02A252b5b
 pub const TICK_LENS_POLYGON: Address = address!("0xbfd8137f7d1516D3ea5cA83523914859ec47F573");
 /// Wrapped MATIC on Polygon.
 pub const WMATIC: Address = address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270");
+/// Bridged USDC.e on Polygon (PoS).
+pub const USDC_E: Address = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
+/// Native USDC on Polygon.
+pub const USDC_NATIVE: Address = address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359");
 
 /// Oracle-priced hub tokens on Polygon.
 pub const POLYGON_HUB_TOKENS: [Address; 20] = [
     WMATIC,
-    address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
-    address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
+    USDC_E,
+    USDC_NATIVE,
     address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"),
     address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"),
     address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6"),
@@ -67,6 +71,21 @@ pub const POLYGON_HUB_TOKENS: [Address; 20] = [
 #[must_use]
 pub fn is_polygon_hub_token(addr: Address) -> bool {
     POLYGON_HUB_TOKENS.contains(&addr)
+}
+
+/// Bridged USDC.e and native USDC share oracle feeds; meta/realign may treat them
+/// as the same leg. Hop continuity stays address-strict (distinct ERC-20s).
+#[inline]
+#[must_use]
+pub fn is_polygon_usd_stable(addr: Address) -> bool {
+    addr == USDC_E || addr == USDC_NATIVE
+}
+
+/// True when addresses are identical or both Polygon USD stables (USDC.e / native).
+#[inline]
+#[must_use]
+pub fn polygon_usd_stable_equivalent(a: Address, b: Address) -> bool {
+    a == b || (is_polygon_usd_stable(a) && is_polygon_usd_stable(b))
 }
 
 /// Fee precision for per-gas-amount fee computation (1e6).
@@ -131,5 +150,10 @@ mod tests {
     #[test]
     fn polygon_constants_are_distinct() {
         assert_ne!(BALANCER_VAULT, WOOFI_ROUTER_V2);
+        assert_ne!(USDC_E, USDC_NATIVE);
+        assert!(is_polygon_usd_stable(USDC_E));
+        assert!(is_polygon_usd_stable(USDC_NATIVE));
+        assert!(polygon_usd_stable_equivalent(USDC_E, USDC_NATIVE));
+        assert!(!polygon_usd_stable_equivalent(USDC_E, WMATIC));
     }
 }

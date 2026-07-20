@@ -8,7 +8,9 @@ use alloy::primitives::U256;
 
 use crate::core::constants::{HOP_CAP, MAX_POOL_TOKENS};
 use crate::core::math::fixed_point::ONE;
-use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolState, ProtocolType, TokenIndex};
+use crate::core::types::{
+    CycleEdges, Edge, FoundCycle, PoolIndex, PoolState, ProtocolType, TokenIndex,
+};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
@@ -51,6 +53,16 @@ impl SharedCycleCap {
     #[inline]
     fn is_full(&self) -> bool {
         self.found.load(AtomicOrdering::Relaxed) >= self.max
+    }
+
+    /// True when claimed count is at least `num/den` of max (pin-search headroom).
+    #[inline]
+    fn is_past_fraction(&self, num: usize, den: usize) -> bool {
+        if den == 0 || self.max == 0 {
+            return self.is_full();
+        }
+        self.found.load(AtomicOrdering::Relaxed).saturating_mul(den)
+            >= self.max.saturating_mul(num)
     }
 
     /// Reserve one slot. Returns false when the global cap is already filled.
@@ -304,6 +316,10 @@ pub struct ActiveGraph {
     max_outgoing_ratio: Vec<U256>,
     /// Graph-wide best live edge ratio.
     global_max_live_edge_ratio: U256,
+    /// When set, the first hop from each start token must use one of these pools
+    /// (observed-admit exclusive DFS — otherwise SharedCycleCap fills with
+    /// unrelated spokes from the same endpoints).
+    first_hop_pools: Option<rustc_hash::FxHashSet<PoolIndex>>,
 }
 
 impl ActiveGraph {
@@ -314,28 +330,127 @@ impl ActiveGraph {
 
     /// Prepend DFS start tokens (e.g. endpoints of WSS-observed pools) so patch
     /// enumeration is not hub-blind for freshly admitted venues.
-    pub fn prefer_start_tokens(&mut self, extra: &[TokenIndex]) {
+    ///
+    /// `exclusive`: only seed `extra` (no hub fill). Use for observed-admit
+    /// refinds so SharedCycleCap is not filled by hub routes before peripherals.
+    pub fn prefer_start_tokens(&mut self, extra: &[TokenIndex], exclusive: bool) {
         if extra.is_empty() {
             return;
         }
         let extra_cap = extra.len().min(16);
         let mut seen = rustc_hash::FxHashSet::default();
-        let mut out = Vec::with_capacity(DFS_MAX_START_SOURCES + extra_cap);
+        let mut out = Vec::with_capacity(if exclusive {
+            extra_cap
+        } else {
+            DFS_MAX_START_SOURCES + extra_cap
+        });
         for &t in extra.iter().take(extra_cap) {
             if seen.insert(t) {
                 out.push(t);
             }
         }
-        let hub_cap = DFS_MAX_START_SOURCES;
-        for &t in &self.start_tokens {
-            if out.len() >= hub_cap + extra_cap {
-                break;
-            }
-            if seen.insert(t) {
-                out.push(t);
+        if !exclusive {
+            let hub_cap = DFS_MAX_START_SOURCES;
+            for &t in &self.start_tokens {
+                if out.len() >= hub_cap + extra_cap {
+                    break;
+                }
+                if seen.insert(t) {
+                    out.push(t);
+                }
             }
         }
         self.start_tokens = out;
+    }
+
+    /// Prefer opening hops through `pools` (observed venue pin). When a start has
+    /// any pin edge, DFS opening hard-requires it. Drop starts that cannot open
+    /// through a pin — sibling non-pin starts filled SharedCycleCap (live:
+    /// first_hop_pin>0 raw=100+ enum_touch=0).
+    pub fn prioritize_first_hop_pools(&mut self, pools: &[PoolIndex]) {
+        if pools.is_empty() {
+            return;
+        }
+        let pin: rustc_hash::FxHashSet<PoolIndex> = pools.iter().copied().collect();
+        self.first_hop_pools = Some(pin.clone());
+        let pin_starts: Vec<TokenIndex> = self
+            .start_tokens
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.adjacency.get(t.0 as usize).is_some_and(|edges| {
+                    edges
+                        .iter()
+                        .any(|ge| pin.contains(&ge.edge.pool_index))
+                })
+            })
+            .collect();
+        if !pin_starts.is_empty() {
+            self.start_tokens = pin_starts;
+        }
+        for &t in &self.start_tokens {
+            let Some(edges) = self.adjacency.get_mut(t.0 as usize) else {
+                continue;
+            };
+            edges.sort_by_key(|ge| !pin.contains(&ge.edge.pool_index));
+        }
+    }
+
+    /// Drop Balancer/Woofi/DODO sidehops that aren't the observed pin — exclusive
+    /// obs DFS otherwise fills with multi-fail pins (live: uni_only=0 enum_touch=11).
+    pub fn retain_uni_or_pin_edges(&mut self, pools: &[PoolIndex]) {
+        let pin: rustc_hash::FxHashSet<PoolIndex> = pools.iter().copied().collect();
+        for edges in &mut self.adjacency {
+            edges.retain(|ge| {
+                pin.contains(&ge.edge.pool_index)
+                    || matches!(
+                        ge.edge.protocol,
+                        ProtocolType::UniswapV2
+                            | ProtocolType::UniswapV3
+                            | ProtocolType::UniswapV4
+                    )
+            });
+        }
+    }
+
+    /// Fresh attach leaves Direct pin edges at ratio=0 (not live). Inject them with
+    /// a neutral ONE ratio so exclusive DFS can open through the observed venue
+    /// (live: first_hop_pin>0 on RoutingGraph, ActiveGraph starts empty → raw=0).
+    pub fn inject_unpriced_pin_directs(
+        &mut self,
+        graph: &RoutingGraph,
+        pools: &[PoolIndex],
+    ) {
+        if pools.is_empty() {
+            return;
+        }
+        let pin: rustc_hash::FxHashSet<PoolIndex> = pools.iter().copied().collect();
+        let token_n = graph.token_count as usize;
+        for (ti, edges) in graph.adjacency.iter().enumerate().take(token_n) {
+            while self.adjacency.len() <= ti {
+                self.adjacency.push(Vec::new());
+            }
+            for ge in edges {
+                if ge.phase != GraphHopPhase::Direct
+                    || !pin.contains(&ge.edge.pool_index)
+                    || !ge.ratio.is_zero()
+                {
+                    continue;
+                }
+                let already = self.adjacency[ti].iter().any(|e| {
+                    e.edge.pool_index == ge.edge.pool_index
+                        && e.edge.token_out == ge.edge.token_out
+                        && e.phase == GraphHopPhase::Direct
+                });
+                if already {
+                    continue;
+                }
+                let mut injected = *ge;
+                injected.ratio = ONE;
+                injected.log_weight = 0.0;
+                self.adjacency[ti].push(injected);
+            }
+        }
     }
 }
 
@@ -502,6 +617,7 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         },
         max_outgoing_ratio,
         global_max_live_edge_ratio: global_max_ratio,
+        first_hop_pools: None,
     }
 }
 
@@ -586,6 +702,12 @@ fn can_still_find_profitable_cycle(
     curr: TokenIndex,
     prep: &ActiveGraph,
 ) -> bool {
+    // Observed-admit first-hop pin: keep exploring so pin pools can close a
+    // cycle even when spot bounds look underwater (live: first_hop_pin>0
+    // enum_touch=0 under profit prune).
+    if prep.first_hop_pools.is_some() {
+        return true;
+    }
     let hop_floor = hops.max(2);
     if product_ratio > ONE && product_ratio >= min_profitable_cycle_ratio(hop_floor) {
         return true;
@@ -779,19 +901,37 @@ fn collect_cycles_dfs_single_start(
         }
         let curr = TokenIndex(curr_node);
         if hops >= 2 && curr == start {
-            if route_hop_budget_exceeded(path_hop_calls)
-                || product_ratio <= ONE
-                || product_ratio < min_profitable_cycle_ratio(hops)
+            if route_hop_budget_exceeded(path_hop_calls) {
+                return;
+            }
+            // Observed pin search: relax close profit/score for pin-touching
+            // paths (live: first_hop_pin>0 enum_touch=0 under min_ratio).
+            // Hard pin-only recording zeroed exclusive DFS (raw=0); pin paths
+            // rarely close before budget while non-pin Uni fills the cap —
+            // prefer pin via prioritize_first_hop + pin_cycles_touching_pools.
+            let pin_touch = prep.first_hop_pools.as_ref().is_some_and(|pins| {
+                path.iter().any(|e| pins.contains(&e.pool_index))
+            });
+            if !pin_touch
+                && (product_ratio <= ONE || product_ratio < min_profitable_cycle_ratio(hops))
             {
                 return;
             }
             let penalty = hop_penalty(hops);
             let score = log_w + penalty;
-            if score > LOG_WEIGHT_PRUNE_THRESHOLD {
+            if !pin_touch && score > LOG_WEIGHT_PRUNE_THRESHOLD {
                 return;
             }
             let fp = cycle_key(path);
             if seen.contains(&fp) {
+                return;
+            }
+            // Reserve half the shared cap for pin-touch closes during obs search
+            // (live: non-pin Uni filled cap before pin paths returned).
+            if prep.first_hop_pools.is_some()
+                && !pin_touch
+                && global_cap.is_past_fraction(1, 2)
+            {
                 return;
             }
             if !global_cap.try_claim() {
@@ -928,11 +1068,25 @@ fn collect_cycles_dfs_single_start(
         Some(e) if !e.is_empty() => e,
         _ => return cycles,
     };
+    // Exclusive obs: if this start has a pin opening edge, only take those.
+    let pin_open = prep.first_hop_pools.as_ref().is_some_and(|pins| {
+        first_edges
+            .iter()
+            .any(|ge| pins.contains(&ge.edge.pool_index))
+    });
 
     used_tokens[start.0 as usize] = true;
     for ge in first_edges {
         if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
             break;
+        }
+        if pin_open
+            && prep
+                .first_hop_pools
+                .as_ref()
+                .is_some_and(|pins| !pins.contains(&ge.edge.pool_index))
+        {
+            continue;
         }
         match ge.phase {
             GraphHopPhase::EnterPool => {
@@ -1425,7 +1579,7 @@ mod tests {
         graph.add_edge(spoke, graph_edge(1, spoke, hub));
         let mut prep = prepare_active_graph(&graph);
         assert!(prep.start_tokens.contains(&hub));
-        prep.prefer_start_tokens(&[spoke]);
+        prep.prefer_start_tokens(&[spoke], false);
         assert_eq!(prep.start_tokens.first().copied(), Some(spoke));
     }
 

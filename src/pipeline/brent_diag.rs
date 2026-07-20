@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+const BRENT_SUMMARY_INTERVAL_MS: u64 = 15_000;
+static BRENT_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrentOptimizeReject {
@@ -333,8 +336,14 @@ pub fn log_brent_summary() {
     if attempts == 0 {
         return;
     }
-    // ponytail: diagnostic dump — DEBUG so default INFO isn't flooded every HF eval.
-    crate::debug!(
+    let now = crate::util::now_ms();
+    let last = BRENT_SUMMARY_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < BRENT_SUMMARY_INTERVAL_MS {
+        return;
+    }
+    BRENT_SUMMARY_LOG_AT.store(now, Ordering::Relaxed);
+    // Debug-session: INFO so cyclical runs capture sizing funnel without RPBOT_LOG=debug.
+    crate::info!(
         "brent: attempts={attempts} ok={ok} bounds_fail={} bal_bounds_fail={} cl_cap_fail={} floor_fail={} zero_profit={} sanity_fail={} \
          eval_sim={} eval_reject={} (sim_none={} zero={} sanity={}) \
          sim_none_sample(v2={} shallow={} tickless={} zero_out={} unsupported={} token_mismatch={} other={}) \

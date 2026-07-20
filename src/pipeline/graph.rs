@@ -90,7 +90,13 @@ fn multi_zero_for_one(token_in_idx: u8, token_out_idx: u8) -> bool {
 
 #[inline]
 fn uses_hub_spoke(meta: &PoolMeta) -> bool {
-    meta.protocol == ProtocolType::UniswapV4 || meta.tokens.len() > 2
+    // Balancer/Woofi always hub-spoke: discovery meta often lists 2 tokens while
+    // the vault has N>2 — Direct path only wires vault[0]↔[1] and can leave
+    // phantom idxs on cached cycles (live: multi realign foreign tout).
+    matches!(
+        meta.protocol,
+        ProtocolType::UniswapV4 | ProtocolType::BalancerV2 | ProtocolType::Woofi
+    ) || meta.tokens.len() > 2
 }
 
 /// Build directed swap edges for a two-token pool (V2/V3/DODO).
@@ -528,11 +534,19 @@ fn pool_has_admissible_edges(
     let Some(state) = arena.pool_state(meta.pool_index) else {
         return false;
     };
-    // Meta protocol from discovery can disagree with the fetched arena variant
-    // (live: V2 edges on V3 state → probe UnsupportedState ~20/scan).
-    if !protocol_matches_pool_state(meta.protocol, state) {
-        return false;
-    }
+    // Meta protocol from discovery can disagree with the fetched arena variant.
+    // Prefer arena family when it yields a matching tag (live: attach_fail=all
+    // on V2-meta/V3-state skew after strip).
+    let protocol = if protocol_matches_pool_state(meta.protocol, state) {
+        meta.protocol
+    } else {
+        let healed =
+            crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
+        if !protocol_matches_pool_state(healed, state) {
+            return false;
+        }
+        healed
+    };
     let token_count = match state {
         PoolState::Balancer(b) if !b.tokens.is_empty() => b.tokens.len(),
         PoolState::Woofi(w) if !w.tokens.is_empty() => w.tokens.len(),
@@ -549,7 +563,7 @@ fn pool_has_admissible_edges(
     if !pool_state_graph_eligible(
         Some(arena),
         state,
-        meta.protocol,
+        protocol,
         token_count,
         bpt_index,
         meta.fee_bps,
@@ -586,10 +600,45 @@ fn pool_has_admissible_edges(
     })
 }
 
+/// Priced or flash-borrowable — worth a capped `attach_missing` slot.
+/// Spoke-only admissibility waits for full rebuild (live: spoke attaches → dead
+/// stubs that burned the 128/tick cap while `graph_pools` barely grew).
+fn pool_worth_capped_attach(
+    arena: &StateArena,
+    meta: &PoolMeta,
+    gate: Option<&GraphBuildGate>,
+) -> bool {
+    let Some(gate) = gate.filter(|g| g.active()) else {
+        return true;
+    };
+    let bpt_index = meta.bpt_index.or_else(|| {
+        arena
+            .pool_state(meta.pool_index)
+            .and_then(|s| match s {
+                PoolState::Balancer(b) => b.bpt_index,
+                _ => None,
+            })
+    });
+    if meta.tokens.iter().enumerate().any(|(i, &token)| {
+        bpt_index != Some(i) && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
+    }) {
+        return true;
+    }
+    meta.tokens.iter().enumerate().any(|(i, &token)| {
+        bpt_index != Some(i)
+            && arena.token_address(token).is_some_and(|addr| {
+                token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl)
+            })
+    })
+}
+
 #[inline]
 fn is_prunable_direct_edge(ge: &GraphEdge) -> bool {
-    ge.phase == GraphHopPhase::Direct
-        && (ge.ratio.is_zero() || ge.log_weight >= DEAD_EDGE_LOG_WEIGHT)
+    // ponytail: do not drop dead Direct stubs — compact was deleting them, then
+    // attach_missing reattached 1k+/LF forever (ratio=0 → prune → missing → attach).
+    // DFS already ignores non-live edges via is_live_graph_edge.
+    let _ = ge;
+    false
 }
 
 /// Returns true when parallel thinning removed at least one edge.
@@ -686,13 +735,98 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
     }
 }
 
-fn attach_pool_to_graph(
+/// True when every Direct edge for `meta.pool_index` still matches meta token legs
+/// (address-aware). Stale edges survive `pool_has_live_edges` after discovery meta
+/// refresh (live: V3 tin=WMATIC tout=foreign vs meta=[WMATIC, other]).
+fn pool_direct_edges_match_meta(
+    graph: &RoutingGraph,
+    arena: &StateArena,
+    meta: &PoolMeta,
+) -> bool {
+    if meta.tokens.len() < 2 {
+        return true;
+    }
+    let pool_idx = meta.pool_index.0 as usize;
+    let Some(positions) = graph.pool_edge_positions.get(pool_idx) else {
+        return true;
+    };
+    // Discovery meta order can disagree with vault/oracle routing legs used at attach.
+    let mut ok: smallvec::SmallVec<[TokenIndex; 8]> =
+        smallvec::SmallVec::from_slice(&meta.tokens);
+    if let Some(state) = arena.pool_state(meta.pool_index) {
+        for leg in 0..2 {
+            if let Some(t) = routing_token_at_leg(arena, state, meta, leg) {
+                if !ok.contains(&t) {
+                    ok.push(t);
+                }
+            }
+        }
+    }
+    let on_ok = |tok: TokenIndex| {
+        ok.iter().any(|&t| {
+            t == tok
+                || (arena.token_address(t).is_some()
+                    && arena.token_address(t) == arena.token_address(tok))
+        })
+    };
+    for &(adj_idx, edge_pos) in positions {
+        let Some(ge) = graph.adjacency.get(adj_idx).and_then(|a| a.get(edge_pos)) else {
+            continue;
+        };
+        if ge.phase != GraphHopPhase::Direct {
+            continue;
+        }
+        if !on_ok(ge.edge.token_in) || !on_ok(ge.edge.token_out) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn remove_pool_edges_from_graph(graph: &mut RoutingGraph, pool: PoolIndex) {
+    let pool_idx = pool.0 as usize;
+    let mut reindex = rustc_hash::FxHashSet::default();
+    reindex.insert(pool_idx);
+    let mut changed = false;
+    for adj in graph.adjacency.iter_mut() {
+        let before = adj.len();
+        adj.retain(|ge| ge.edge.pool_index != pool);
+        if adj.len() != before {
+            changed = true;
+            for ge in adj.iter() {
+                reindex.insert(ge.edge.pool_index.0 as usize);
+            }
+        }
+    }
+    if !changed {
+        if let Some(slot) = graph.pool_edge_positions.get_mut(pool_idx) {
+            slot.clear();
+        }
+        return;
+    }
+    // ponytail: leave hub slot; clear exit_legs so DFS won't fan out.
+    if let Some(hub) = graph.virtual_hubs.iter_mut().find(|h| h.pool_index == pool) {
+        hub.exit_legs.clear();
+    }
+    rebuild_pool_edge_positions_for_pools(graph, reindex);
+    graph.coverage = None;
+}
+
+pub(crate) fn attach_pool_to_graph(
     graph: &mut RoutingGraph,
     arena: &StateArena,
     meta: &PoolMeta,
     gate: Option<&GraphBuildGate>,
 ) -> bool {
     if graph.pool_has_live_edges(meta.pool_index) {
+        // ponytail: meta token refresh leaves phantom Direct edges; strip+rebuild.
+        if pool_direct_edges_match_meta(graph, arena, meta) {
+            return false;
+        }
+        remove_pool_edges_from_graph(graph, meta.pool_index);
+    } else if graph.pool_has_edges(meta.pool_index) {
+        // Dead stubs already present — dirty/force rescore prices them; strip+reattach
+        // every LF was thrashing thousands of Directs (live: attached=2000+/admit).
         return false;
     }
     let Some(state) = arena
@@ -721,9 +855,14 @@ fn attach_pool_to_graph(
         if token0 == token1 {
             return false;
         }
+        let edge_proto = if protocol_matches_pool_state(meta.protocol, state) {
+            meta.protocol
+        } else {
+            crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol)
+        };
         for mut edge in edges_for_pair(
             meta.pool_index,
-            meta.protocol,
+            edge_proto,
             token0,
             token1,
             meta.fee_bps,
@@ -744,10 +883,15 @@ fn attach_pool_to_graph(
     } else {
         return false;
     }
-    graph.pool_has_live_edges(meta.pool_index)
+    // Direct edges stay ratio=0 until rescore; callers must rescore then check live.
+    // Returning live-only made attach_missing/force_attach skip rescore (always false).
+    graph
+        .pool_edge_positions
+        .get(meta.pool_index.0 as usize)
+        .is_some_and(|p| !p.is_empty())
 }
 
-fn refresh_graph_cycle_coverage(graph: &mut RoutingGraph) {
+pub(crate) fn refresh_graph_cycle_coverage(graph: &mut RoutingGraph) {
     graph.coverage = Some(std::sync::Arc::new(
         crate::pipeline::cycle_finder::cycle_capable_coverage(graph),
     ));
@@ -797,9 +941,20 @@ impl GraphTopologyStats {
     }
 }
 
+/// Per-LF-tick attach budget. Remainder continues on later ticks via
+/// `attach_catchup_pending`. Priced/flash-only (spoke waits for rebuild).
+/// Live: 256/tick lost to arena growth (eligible 1.7k→7.4k/150s) — never drained.
+pub const ATTACH_MISSING_CAP: usize = 512;
+
 #[derive(Debug, Clone, Default)]
 pub struct GraphAttachReport {
     pub attached_pools: usize,
+    /// Attached pools that have live edges after the batch rescore.
+    pub live_after: usize,
+    /// True when the per-tick cap stopped the pass with more missing pools left.
+    pub hit_cap: bool,
+    /// Priced/flash missing pools still absent after this pass (diag backlog).
+    pub missing_after: usize,
 }
 
 /// Single-pass adjacency scan for LF/HF diagnostics.
@@ -851,7 +1006,9 @@ pub fn count_eligible_pools_missing_from_graph_with_gate(
         .iter()
         .filter(|meta| {
             pool_has_admissible_edges(arena, meta, gate)
+                && pool_worth_capped_attach(arena, meta, gate)
                 && !graph.pool_has_live_edges(meta.pool_index)
+                && !graph.pool_has_edges(meta.pool_index)
         })
         .count()
 }
@@ -881,7 +1038,19 @@ pub fn has_missing_eligible_pools_with_gate(
     gate: Option<&GraphBuildGate>,
 ) -> bool {
     pools.iter().any(|meta| {
-        pool_has_admissible_edges(arena, meta, gate) && !graph.pool_has_live_edges(meta.pool_index)
+        if !pool_has_admissible_edges(arena, meta, gate) {
+            return false;
+        }
+        if !pool_worth_capped_attach(arena, meta, gate) {
+            return false;
+        }
+        // Stale Direct edges after meta refresh still count as "live" and
+        // skipped the attach pass entirely (live: 0 graph rebuilds / 120s).
+        if graph.pool_has_live_edges(meta.pool_index) {
+            return !pool_direct_edges_match_meta(graph, arena, meta);
+        }
+        // Dead stubs are not "missing" — dirty/force rescore prices them.
+        !graph.pool_has_edges(meta.pool_index)
     })
 }
 
@@ -909,8 +1078,34 @@ pub fn attach_missing_eligible_pools_with_gate(
     // repeated layout shifts when many late tokens arrive in one tick).
     graph.ensure_token_capacity(arena.token_count());
     let mut attached_pools: Vec<PoolIndex> = Vec::new();
+    // ponytail: uncapped growth attaches were 2k–3k/LF and stalled enum; remainder
+    // lands on later ticks via LF catch-up (cached_eligible held back on hit_cap).
     for meta in pools {
-        if graph.pool_has_live_edges(meta.pool_index) {
+        if attached_pools.len() >= ATTACH_MISSING_CAP {
+            break;
+        }
+        if !pool_worth_capped_attach(arena, meta, gate) {
+            continue;
+        }
+        // Stale Direct edges after meta refresh still look "live" — strip so
+        // attach_pool can rebuild (live: uni pin tout ∉ meta → uni_both).
+        if graph.pool_has_live_edges(meta.pool_index)
+            && !pool_direct_edges_match_meta(graph, arena, meta)
+        {
+            static STALE_META_EDGES: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            if STALE_META_EDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 == 0 {
+                crate::info!(
+                    "graph rebuild stale meta edges: pool_index={} tokens={}",
+                    meta.pool_index.0,
+                    meta.tokens.len()
+                );
+            }
+            remove_pool_edges_from_graph(graph, meta.pool_index);
+        } else if graph.pool_has_live_edges(meta.pool_index) {
+            continue;
+        } else if graph.pool_has_edges(meta.pool_index) {
+            // Already stubbed; leave for dirty/force rescore (not a missing attach).
             continue;
         }
         if attach_pool_to_graph(graph, arena, meta, gate) {
@@ -922,8 +1117,18 @@ pub fn attach_missing_eligible_pools_with_gate(
         let _ = rescore_pools_in_place(arena, graph, &attached_pools);
         refresh_graph_cycle_coverage(graph);
     }
+    let live_after = attached_pools
+        .iter()
+        .filter(|&&p| graph.pool_has_live_edges(p))
+        .count();
+    let missing_after =
+        count_eligible_pools_missing_from_graph_with_gate(arena, pools, graph, gate);
+    let hit_cap = attached_pools.len() >= ATTACH_MISSING_CAP && missing_after > 0;
     GraphAttachReport {
         attached_pools: attached_pools.len(),
+        live_after,
+        hit_cap,
+        missing_after,
     }
 }
 
@@ -1784,9 +1989,13 @@ mod tests {
             })),
         );
         rescore_graph_in_place(&arena, &mut graph);
+        // Dead Direct stubs stay in adjacency (attach-thrash guard); only live count.
         let live_pools: Vec<u32> = graph.adjacency[hub.0 as usize]
             .iter()
-            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .filter(|ge| {
+                ge.phase == GraphHopPhase::Direct
+                    && crate::pipeline::cycle_finder::is_live_graph_edge(ge)
+            })
             .map(|ge| ge.edge.pool_index.0)
             .collect();
         assert_eq!(live_pools, vec![live_pool.0]);

@@ -11,7 +11,7 @@ use crate::config::AppConfig;
 use crate::config::WalletSecrets;
 use crate::core::constants::BPS_SCALE;
 use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
-use crate::core::types::{FlashLoanSource, FoundCycle, ProtocolType};
+use crate::core::types::{Edge, FlashLoanSource, FoundCycle, ProtocolType};
 use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
@@ -158,7 +158,9 @@ static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
 const HF_ORACLE_SKIP_INTERVAL_MS: u64 = 30_000;
 /// MATIC/USD refresh can hold singleflight longer than cache TTL; HF may use slightly stale price.
 const HF_MATIC_STALE_WARN_MS: u64 = 45_000;
-const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 750;
+// 750ms timed out on WMATIC cold-cache (live: skip_flash_source=6, fresh=false).
+/// Fallback when caller has no pool budget (should be rare).
+const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 800;
 
 async fn hf_pool_prefetch(
     refresh: &StateRefreshService,
@@ -174,30 +176,63 @@ async fn hf_flash_prefetch_stale(
     flash_cache: &FlashLiquidityCache,
     rpc: &RpcPool,
     flash_token_list: &[Address],
+    budget: Duration,
 ) {
     if flash_token_list.is_empty() {
         return;
     }
     flash_cache.track_hot_tokens(flash_token_list);
-    let stale: Vec<Address> = flash_token_list
-        .iter()
-        .copied()
-        .filter(|addr| !flash_cache.has_fresh_entry(*addr))
-        .collect();
+    // Must match flash_liquidity::stale_tokens (75% TTL). Full-TTL has_fresh_entry
+    // skipped refresh in the last 7.5s → probe ColdCache on WMATIC (live).
+    let mut stale = flash_cache.tokens_needing_refresh(flash_token_list);
     if stale.is_empty() {
         return;
     }
-    let flash_budget = Duration::from_millis(HF_FLASH_PREFETCH_BUDGET_MS);
+    // Hub tokens first — WMATIC ColdCache emptied probe ranks while dust tokens refreshed.
+    stale.sort_by_key(|addr| {
+        u8::from(!crate::core::constants::is_polygon_hub_token(*addr))
+    });
+    // Share the HF pool-prefetch budget (was a hard 2500ms that bloated ticks).
+    let flash_budget = if budget.is_zero() {
+        Duration::from_millis(HF_FLASH_PREFETCH_BUDGET_MS)
+    } else {
+        budget
+    };
     let stale_n = stale.len();
     let fresh_n = flash_token_list.len().saturating_sub(stale_n);
+    let deadline = std::time::Instant::now() + flash_budget;
     let Some(_inflight) = flash_cache.try_acquire_refresh_inflight() else {
-        crate::debug!("flash loan: hf_prefetch skipped stale={stale_n} (refresh inflight)");
+        // Background refresh owns the multicall — wait for our stale set to land.
+        while std::time::Instant::now() < deadline {
+            if stale.iter().all(|addr| flash_cache.has_fresh_entry(*addr)) {
+                crate::info!(
+                    "flash loan: hf_prefetch waited inflight ok stale={stale_n} fresh={fresh_n}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let still = stale
+            .iter()
+            .filter(|addr| !flash_cache.has_fresh_entry(**addr))
+            .count();
+        crate::info!(
+            "flash loan: hf_prefetch waited inflight timeout_ms={} stale_still={still}/{stale_n}",
+            flash_budget.as_millis(),
+        );
         return;
     };
-    match timeout(flash_budget, flash_cache.refresh_with_fallback(rpc, &stale)).await {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match timeout(remaining, flash_cache.refresh_with_fallback(rpc, &stale)).await {
         Ok(Ok(generation)) => {
+            let wmatic = crate::core::constants::WMATIC;
+            let wmatic_fresh = flash_cache.has_fresh_entry(wmatic);
+            let wmatic_liq = flash_cache.snapshot(wmatic);
             crate::info!(
-                "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation}"
+                "flash loan: hf_prefetch ok stale={stale_n} fresh={fresh_n} generation={generation} wmatic_fresh={wmatic_fresh} wmatic_bal={} wmatic_aave={} wmatic_listed={}",
+                wmatic_liq.balancer,
+                wmatic_liq.aave,
+                wmatic_liq.aave_listed,
             );
         }
         Ok(Err(e)) => {
@@ -216,6 +251,15 @@ fn collect_hf_flash_token_list(
 ) -> (FxHashSet<Address>, Vec<Address>) {
     let mut seen = FxHashSet::default();
     let mut list = Vec::new();
+    // Always warm WMATIC first — probe ranks ColdCache it when start-rotate /
+    // concurrent ticks race past a cycle-only prefetch set.
+    for &hub in &crate::core::constants::POLYGON_HUB_TOKENS
+        [..crate::core::constants::POLYGON_HUB_TOKENS.len().min(4)]
+    {
+        if seen.insert(hub) {
+            list.push(hub);
+        }
+    }
     for c in cycles {
         collect_flash_tokens_for_cycle(arena, c.as_ref(), &mut seen, &mut list);
     }
@@ -319,6 +363,18 @@ fn hf_reselect_from_snapshot(
         inactive_offset,
     );
     drop(snap);
+    // Do not clobber a prior non-empty selection with []. Empty reselect after
+    // LF snap advance aborted stream ticks post-filter (live: 72 stream
+    // filter logs → 0 stream hf-tick ends; timer ticks alone finished).
+    if selected.cycles.is_empty() {
+        return Err(HfTickResult {
+            cycles_considered: 0,
+            profitable_count: 0,
+            best_profit: U256::ZERO,
+            elapsed_ms: 0,
+            candidates: Arc::from([]),
+        });
+    }
     *cycles = selected.cycles;
     *quarantine_skipped = selected.quarantine_skipped;
     *rate_skipped = selected.rate_skipped;
@@ -329,15 +385,6 @@ fn hf_reselect_from_snapshot(
     *bal_floor_dead_skipped = selected.bal_floor_dead_skipped;
     *inactive_len = selected.inactive_len;
     *inactive_selected = selected.inactive_selected;
-    if cycles.is_empty() {
-        return Err(HfTickResult {
-            cycles_considered: 0,
-            profitable_count: 0,
-            best_profit: U256::ZERO,
-            elapsed_ms: 0,
-            candidates: Arc::from([]),
-        });
-    }
     let _ = selection_generation;
     Ok((
         new_generation,
@@ -379,6 +426,21 @@ fn cycle_with_reliable_start(
 /// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
 ///
 /// Batches all rotation fingerprints into one quarantine map read.
+fn quarantine_all_edge_rotations(
+    execution: &ExecutionService,
+    edges: &[crate::core::types::Edge],
+) {
+    let n = edges.len();
+    if n == 0 {
+        return;
+    }
+    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
+    for _ in 0..n {
+        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
+        rotated.rotate_left(1);
+    }
+}
+
 fn cycle_edges_quarantined(
     execution: &ExecutionService,
     edges: &[crate::core::types::Edge],
@@ -441,8 +503,13 @@ fn should_log_best_eval() -> bool {
 struct BestEvalDiag {
     fp: u64,
     hops: u32,
+    /// For underwater quarantine of all start-rotations (not just `fp`).
+    edges: crate::core::types::CycleEdges,
     route: String,
+    /// Full pool addresses (+ V2 reserve snapshot) for sticky-edge diagnosis.
+    pools: String,
     input: U256,
+    search_low: U256,
     raw_sim_gas: u32,
     assessed_gas: u32,
     gas_basis: &'static str,
@@ -469,11 +536,13 @@ struct BestEvalDiag {
 fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
     let reason = diag.reject.as_deref().unwrap_or("unknown");
     crate::info!(
-        "hf best-eval: fp={} hops={} route={} input={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_base_fee_wei={} gas_priority_fee_wei={} gas_snapshot_age_ms={:?} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} gas_shortfall_tokens={} gas_shortfall_matic_wei={} gas_cover_bps={} slippage_bps={} slippage={} flash_fee={} reject={}",
+        "hf best-eval: fp={} hops={} route={} pools={} input={} search_low={} raw_sim_gas={} assessed_gas={} gas_basis={} sim_scale_bps={} gas_base_fee_wei={} gas_priority_fee_wei={} gas_snapshot_age_ms={:?} gas_price_gwei={:.3} gross={} net_matic={} gas_cost_wei={} gas_shortfall_tokens={} gas_shortfall_matic_wei={} gas_cover_bps={} slippage_bps={} slippage={} flash_fee={} reject={}",
         diag.fp,
         diag.hops,
         diag.route,
+        diag.pools,
         diag.input,
+        diag.search_low,
         diag.raw_sim_gas,
         diag.assessed_gas,
         diag.gas_basis,
@@ -499,6 +568,205 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
 #[must_use]
 fn hf_activity_slot_cap(rescore_cap: usize) -> usize {
     rescore_cap.saturating_div(3).max(8).min(rescore_cap)
+}
+
+fn sample_proto_mismatch(
+    arena: &crate::pipeline::arena::StateArena,
+    pool_metas: &[PoolMeta],
+    cycle: &FoundCycle,
+    stage: &'static str,
+) {
+    use crate::pipeline::types::pool_meta_at;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    if let Some((hop, expected, actual)) =
+        crate::pipeline::local_sim::first_protocol_state_mismatch(arena, &cycle.edges)
+    {
+        crate::info!(
+            "proto mismatch sample: stage={stage} hop={hop} edge={expected:?} arena={actual:?} hops={}",
+            cycle.edges.len()
+        );
+        return;
+    }
+    if stage == "meta_match" || stage == "uni_realign" {
+        for (hop, edge) in cycle.edges.iter().enumerate() {
+            if !matches!(
+                edge.protocol,
+                ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ) {
+                continue;
+            }
+            let tin = arena.token_address(edge.token_in);
+            let tout = arena.token_address(edge.token_out);
+            let Some(m) = pool_meta_at(pool_metas, edge.pool_index) else {
+                crate::info!(
+                    "proto mismatch sample: stage={stage} hop={hop} tin={tin:?} tout={tout:?} idxs={}/{} meta=None pool={:?}",
+                    edge.token_in_idx,
+                    edge.token_out_idx,
+                    arena.pool_address(edge.pool_index),
+                );
+                return;
+            };
+            let meta: Vec<Address> = m
+                .tokens
+                .iter()
+                .filter_map(|&t| arena.token_address(t))
+                .collect();
+            let tin_ok = tin.is_some_and(|a| meta.iter().any(|&m| m == a));
+            let tout_ok = tout.is_some_and(|a| meta.iter().any(|&m| m == a));
+            // Address continuity — TokenIndex inequality false-positives aliases.
+            let hop_break = hop > 0
+                && cycle.edges.get(hop - 1).is_some_and(|prev| {
+                    let po = arena.token_address(prev.token_out);
+                    match (po, tin) {
+                        (Some(a), Some(b)) => a != b,
+                        _ => prev.token_out != edge.token_in,
+                    }
+                });
+            if tin_ok && tout_ok && !hop_break {
+                continue;
+            }
+            let arena_kind = arena
+                .pool_state(edge.pool_index)
+                .map(|s| match s {
+                    crate::core::types::PoolState::V2(_) => "v2",
+                    crate::core::types::PoolState::V3(_) => "v3",
+                    crate::core::types::PoolState::V4(_) => "v4",
+                    crate::core::types::PoolState::Curve(_) => "curve",
+                    crate::core::types::PoolState::Balancer(_) => "bal",
+                    crate::core::types::PoolState::Dodo(_) => "dodo",
+                    crate::core::types::PoolState::Woofi(_) => "woofi",
+                    crate::core::types::PoolState::Invalid => "invalid",
+                })
+                .unwrap_or("none");
+            crate::info!(
+                "proto mismatch sample: stage={stage} hop={hop} proto={:?} arena={arena_kind} tin={tin:?} tout={tout:?} idxs={}/{} tin_ok={tin_ok} tout_ok={tout_ok} hop_break={hop_break} meta={meta:?} pool={:?}",
+                edge.protocol,
+                edge.token_in_idx,
+                edge.token_out_idx,
+                arena.pool_address(edge.pool_index),
+            );
+            return;
+        }
+    }
+    let hops: String = cycle
+        .edges
+        .iter()
+        .map(|e| format!("{:?}", e.protocol))
+        .collect::<Vec<_>>()
+        .join(">");
+    crate::info!("proto mismatch sample: stage={stage} (no state mismatch) route=[{hops}]");
+}
+
+fn sample_multi_realign_fail(
+    arena: &crate::pipeline::arena::StateArena,
+    cycle: &FoundCycle,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    for (hop, edge) in cycle.edges.iter().enumerate() {
+        if !matches!(
+            edge.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
+        ) {
+            continue;
+        }
+        let tin = arena.token_address(edge.token_in);
+        let tout = arena.token_address(edge.token_out);
+        let Some(state) = arena.pool_state(edge.pool_index) else {
+            crate::info!(
+                "multi realign sample: hop={hop} proto={:?} tin={tin:?} tout={tout:?} state=None pool={:?}",
+                edge.protocol,
+                arena.pool_address(edge.pool_index),
+            );
+            return;
+        };
+        let mut probe = *edge;
+        if crate::pipeline::local_sim::realign_multi_token_edge(arena, state, &mut probe) {
+            continue;
+        }
+        let vault: Vec<_> = match state {
+            crate::core::types::PoolState::Balancer(s) => s.tokens.clone(),
+            crate::core::types::PoolState::Woofi(s) => s.tokens.clone(),
+            crate::core::types::PoolState::Dodo(s) => vec![s.base_token, s.quote_token],
+            _ => Vec::new(),
+        };
+        crate::info!(
+            "multi realign sample: hop={hop} proto={:?} tin={tin:?} tout={tout:?} idxs={}/{} vault={vault:?} pool={:?}",
+            edge.protocol,
+            edge.token_in_idx,
+            edge.token_out_idx,
+            arena.pool_address(edge.pool_index),
+        );
+        return;
+    }
+    crate::info!(
+        "multi realign sample: (no failing multi hop) hops={}",
+        cycle.edges.len()
+    );
+}
+
+fn sample_hop_break(
+    arena: &crate::pipeline::arena::StateArena,
+    cycle: &FoundCycle,
+    break_at: usize,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 2_000 {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let Some(prev_e) = cycle.edges.get(break_at) else {
+        return;
+    };
+    let Some(next_e) = cycle.edges.get(break_at + 1) else {
+        return;
+    };
+    let hops: String = cycle
+        .edges
+        .iter()
+        .map(|e| format!("{:?}", e.protocol))
+        .collect::<Vec<_>>()
+        .join(">");
+    crate::info!(
+        "hop break sample: at={break_at} prev={:?} out={:?}/{:?} next={:?} in={:?}/{:?} route=[{hops}]",
+        prev_e.protocol,
+        prev_e.token_out,
+        arena.token_address(prev_e.token_out),
+        next_e.protocol,
+        next_e.token_in,
+        arena.token_address(next_e.token_in),
+    );
 }
 
 fn cycle_activity_score(
@@ -541,6 +809,12 @@ struct RescoreSelection {
     micro_dead_skipped: usize,
     /// Balancer route infeasible at economic floor (would be Brent `bal_bounds_fail`).
     bal_floor_dead_skipped: usize,
+    /// Live-touching cycles culled before activity partition.
+    live_drop_proto: usize,
+    live_drop_tickless: usize,
+    live_drop_quarantine: usize,
+    live_drop_multi: usize,
+    live_drop_rate: usize,
     activity_candidates: usize,
     activity_selected: usize,
     inactive_len: usize,
@@ -569,6 +843,11 @@ fn select_cycles_for_rescore(
             v2_dead_skipped: 0,
             micro_dead_skipped: 0,
             bal_floor_dead_skipped: 0,
+            live_drop_proto: 0,
+            live_drop_tickless: 0,
+            live_drop_quarantine: 0,
+            live_drop_multi: 0,
+            live_drop_rate: 0,
             activity_candidates: 0,
             activity_selected: 0,
             inactive_len: 0,
@@ -589,46 +868,140 @@ fn select_cycles_for_rescore(
     let mut v2_dead_skipped = 0usize;
     let mut micro_dead_skipped = 0usize;
     let mut bal_floor_dead_skipped = 0usize;
+    let mut live_drop_proto = 0usize;
+    let mut live_drop_tickless = 0usize;
+    let mut live_drop_quarantine = 0usize;
+    let mut live_drop_multi = 0usize;
+    let mut live_drop_rate = 0usize;
+    // Pools from live cycles culled by proto gates — keep in hot set so
+    // dirty∩sel can land and stream ticks prefetch instead of skip.
+    let mut live_anchor_hot =
+        FxHashSet::with_capacity_and_hasher(32, FxBuildHasher);
+    let anchor_live = |edges: &[Edge], hot: &mut FxHashSet<Address>| {
+        for edge in edges {
+            if let Some(addr) = arena.pool_address(edge.pool_index) {
+                hot.insert(addr);
+            }
+        }
+    };
     for cycle in snap_cycles {
+        // Pool set unchanged by heal/realign — cheap live flag for drop staging.
+        let live = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now) > 0;
         // Skip only when every tickless CL hop is on miss cooldown. Skipping any
         // CL pool on cooldown (even with LF ticks) wiped the HF window
         // (`selected=0`, tickless_stuck≫candidates) whenever a hub pool missed.
+        // Live WSS: do not tickless-cull. Miss cooldowns wiped stream ticks
+        // (`selected=0`, hot_pools=0) while wake_hf=true; hydrate+probe still useful.
         if cycle_tickless_cl_all_on_miss_cooldown(arena, cycle.as_ref(), pool_metas) {
-            tickless_stuck_skipped += 1;
-            continue;
+            if live {
+                live_drop_tickless += 1; // counted, still admitted
+            } else {
+                tickless_stuck_skipped += 1;
+                continue;
+            }
         }
         // Cheap reject before remap/heal — raw fingerprint still covers cooldowns
         // stamped before vault-idx realign. Remapped fps checked after heal.
         if cycle_edges_quarantined(execution, &cycle.edges) {
             quarantine_skipped += 1;
+            if live {
+                // Anchor for stream wake, but do not probe — livehold was re-admitting
+                // chronic underwater dust as best-eval (same fp ~369 cover forever).
+                live_drop_quarantine += 1;
+                anchor_live(&cycle.edges, &mut live_anchor_hot);
+            }
             continue;
         }
         let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
             rate_skipped += 1;
+            if live {
+                live_drop_rate += 1;
+            }
             continue;
         };
         // Recover Balancer/Woofi vault-index skew (meta vs getPoolTokens) before
         // quarantine/micro-dead — otherwise we only prune recoverable liquidity.
-        let Some(ready) = crate::pipeline::local_sim::realign_multi_token_found_cycle(arena, ready)
-        else {
-            micro_dead_skipped += 1;
-            continue;
+        let pre_multi = Arc::clone(&ready);
+        let ready = match crate::pipeline::local_sim::realign_multi_token_found_cycle(
+            arena, ready,
+        ) {
+            Some(ready) => ready,
+            None if live => {
+                // livehold: vault token absent/unroutable on cold arena wiped
+                // live_touch→active (live: touch=22 drop_multi=19). Probe still
+                // TokenMismatch-filters; keep the WSS-touched cycle in-window.
+                live_drop_multi += 1;
+                sample_multi_realign_fail(arena, pre_multi.as_ref());
+                pre_multi
+            }
+            None => {
+                micro_dead_skipped += 1;
+                sample_multi_realign_fail(arena, pre_multi.as_ref());
+                // Stale Balancer/Woofi edges (tokens ∉ vault) refill every tick as
+                // micro_dead~100 — cool all rotations so select's quarantine gate bites.
+                quarantine_all_edge_rotations(execution, &pre_multi.edges);
+                continue;
+            }
         };
         // Cached-cycle protocol tags can lag hot-cache family flips (V2→V3).
         let Some(ready) = crate::pipeline::local_sim::heal_cycle_edge_protocols(arena, ready)
         else {
             protocol_mismatch_skipped += 1;
+            if live {
+                live_drop_proto += 1;
+                // Anchor only — do not quarantine (cools wipe the next LF pin window).
+                anchor_live(&cycle.edges, &mut live_anchor_hot);
+            } else {
+                // Family-poisoned edges refill every tick until LF layout fp invalidates
+                // the cycle cache (live: BalancerV2×V3 heal storms).
+                quarantine_all_edge_rotations(execution, &cycle.edges);
+            }
+            sample_proto_mismatch(arena, pool_metas, cycle.as_ref(), "heal");
             continue;
         };
         // Remap stale Uni TokenIndex endpoints from PoolMeta legs before reject.
-        let Some(ready) =
-            crate::pipeline::local_sim::realign_uni_cycle_from_pool_meta(arena, pool_metas, ready)
-        else {
-            protocol_mismatch_skipped += 1;
-            continue;
+        let healed = ready;
+        let ready = match crate::pipeline::local_sim::realign_uni_cycle_from_pool_meta(
+            arena,
+            pool_metas,
+            Arc::clone(&healed),
+        ) {
+            Some(c) => c,
+            None if live
+                && crate::pipeline::local_sim::first_hop_continuity_break_in_arena(
+                    arena,
+                    &healed.edges,
+                )
+                .is_none()
+                && crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &healed.edges) =>
+            {
+                // ponytail: match LF obs bypass — meta TokenIndex drift with
+                // continuous arena hops (live: soft_keep pins → live_drop_proto).
+                healed
+            }
+            None => {
+                // Never livehold into probe: mismatch burns the window. Anchor pools
+                // so stream dirty∩sel can prefetch instead of skip.
+                protocol_mismatch_skipped += 1;
+                if live {
+                    live_drop_proto += 1;
+                    anchor_live(&healed.edges, &mut live_anchor_hot);
+                } else {
+                    quarantine_all_edge_rotations(execution, &healed.edges);
+                }
+                sample_proto_mismatch(arena, pool_metas, healed.as_ref(), "uni_realign");
+                continue;
+            }
         };
         if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &ready.edges) {
             protocol_mismatch_skipped += 1;
+            if live {
+                live_drop_proto += 1;
+                anchor_live(&ready.edges, &mut live_anchor_hot);
+            } else {
+                quarantine_all_edge_rotations(execution, &ready.edges);
+            }
+            sample_proto_mismatch(arena, pool_metas, ready.as_ref(), "arena_match");
             continue;
         }
         // Stale V2/V3/V4 TokenIndex vs refreshed PoolMeta — sim invents profit.
@@ -638,12 +1011,38 @@ fn select_cycles_for_rescore(
             &ready.edges,
         ) {
             protocol_mismatch_skipped += 1;
+            if live {
+                live_drop_proto += 1;
+                anchor_live(&ready.edges, &mut live_anchor_hot);
+            } else {
+                quarantine_all_edge_rotations(execution, &ready.edges);
+            }
+            sample_proto_mismatch(arena, pool_metas, ready.as_ref(), "meta_match");
+            continue;
+        }
+        // Probe `InvalidRoute` is hop TokenIndex discontinuity — cull here so sticky
+        // Balancer mixes never burn the probe window (live: invalid=scanned).
+        if let Some(break_at) =
+            crate::pipeline::local_sim::first_hop_continuity_break_in_arena(arena, &ready.edges)
+        {
+            protocol_mismatch_skipped += 1;
+            if live {
+                live_drop_proto += 1;
+                anchor_live(&ready.edges, &mut live_anchor_hot);
+            } else {
+                quarantine_all_edge_rotations(execution, &ready.edges);
+            }
+            sample_hop_break(arena, ready.as_ref(), break_at);
             continue;
         }
         // Quarantine keys are assess/best-eval fingerprints (post start-rotation /
         // vault-idx remap). Raw already checked; only remapped rotations remain.
         if cycle_edges_quarantined(execution, &ready.edges) {
             quarantine_skipped += 1;
+            if live {
+                live_drop_quarantine += 1;
+                anchor_live(&ready.edges, &mut live_anchor_hot);
+            }
             continue;
         }
         // Activity first: live-touching cycles were dying as micro_dead before
@@ -660,29 +1059,9 @@ fn select_cycles_for_rescore(
         let start_rate = resolve_token_to_matic_rate(ready.start_token, token_to_matic_rates);
         let economic_floor = min_economic_amount_in(start_decimals, start_rate);
         if score > 0 {
-            // Live WSS: skip insane-gross phantom only (stale sim can look "too good").
-            // Still drop micro-shallow/mismatch — they never rank after hydrate either and
-            // crowded the probe window (protoheal: shallow_cl/mismatch empty ranks).
-            if crate::pipeline::local_sim::micro_probe_liquidity_dead(
-                arena,
-                &ready.edges,
-                micro_probe,
-            )
-            .is_some()
-            {
-                micro_dead_skipped += 1;
-                continue;
-            }
-            // Balancer MAX_IN at economic floor → Brent `bal_bounds_fail` (live: all
-            // bounds_fail). Inactive path already prunes; active was skipping this.
-            if crate::pipeline::local_sim::balancer_economic_floor_max_in_dead(
-                arena,
-                &ready.edges,
-                economic_floor,
-            ) {
-                bal_floor_dead_skipped += 1;
-                continue;
-            }
+            // Live WSS: do not micro/bal-floor prune. Stale local sim looked shallow
+            // and wiped live_touch→active (live: touch=38 active=0). Proto/heal gates
+            // above already dropped UnsupportedState; hydrate+probe filter dust.
             active.push((ready, score));
             continue;
         }
@@ -747,7 +1126,7 @@ fn select_cycles_for_rescore(
     if activity_candidates == 0 && inactive_len == 0 {
         return RescoreSelection {
             cycles: Vec::new(),
-            hot_pools: FxHashSet::default(),
+            hot_pools: live_anchor_hot,
             quarantine_skipped,
             rate_skipped,
             tickless_stuck_skipped,
@@ -755,6 +1134,11 @@ fn select_cycles_for_rescore(
             v2_dead_skipped,
             micro_dead_skipped,
             bal_floor_dead_skipped,
+            live_drop_proto,
+            live_drop_tickless,
+            live_drop_quarantine,
+            live_drop_multi,
+            live_drop_rate,
             activity_candidates: 0,
             activity_selected: 0,
             inactive_len: 0,
@@ -800,6 +1184,7 @@ fn select_cycles_for_rescore(
         }
         cycles.push(cycle);
     }
+    hot_pools.extend(live_anchor_hot);
 
     RescoreSelection {
         cycles,
@@ -811,6 +1196,11 @@ fn select_cycles_for_rescore(
         v2_dead_skipped,
         micro_dead_skipped,
         bal_floor_dead_skipped,
+        live_drop_proto,
+        live_drop_tickless,
+        live_drop_quarantine,
+        live_drop_multi,
+        live_drop_rate,
         activity_candidates,
         activity_selected,
         inactive_len,
@@ -889,6 +1279,11 @@ pub async fn run_hf_tick(
     let mut v2_dead_skipped = selection.v2_dead_skipped;
     let mut micro_dead_skipped = selection.micro_dead_skipped;
     let mut bal_floor_dead_skipped = selection.bal_floor_dead_skipped;
+    let live_drop_proto = selection.live_drop_proto;
+    let live_drop_tickless = selection.live_drop_tickless;
+    let live_drop_quarantine = selection.live_drop_quarantine;
+    let live_drop_multi = selection.live_drop_multi;
+    let live_drop_rate = selection.live_drop_rate;
     let activity_candidates = selection.activity_candidates;
     let activity_selected = selection.activity_selected;
     let mut inactive_len = selection.inactive_len;
@@ -899,17 +1294,45 @@ pub async fn run_hf_tick(
     // Throttle only — stream_triggered used to bypass and spam INFO every wssobs tick.
     let log_hf_summary = should_log_hf_summary();
     if log_hf_summary {
+        // live_touch: snap cycles with recent WSS activity (ignores micro/bal filters).
+        let live_touch = if activity_candidates == 0 {
+            let now = now_ms();
+            let snap = ctx.snapshots.read();
+            snap.cycles
+                .iter()
+                .take(256)
+                .filter(|c| {
+                    cycle_activity_score(c.as_ref(), &arena_base, &ctx.partial_cache, now) > 0
+                })
+                .count()
+        } else {
+            activity_candidates
+        };
         crate::info!(
-            "hf cycle filter: snap={snap_cycle_count} selected={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} tickless_stuck_skip={tickless_stuck_skipped} proto_mismatch_skip={protocol_mismatch_skipped} v2_dead_skip={v2_dead_skipped} micro_dead_skip={micro_dead_skipped} bal_floor_dead_skip={bal_floor_dead_skipped} active_candidates={activity_candidates} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
+            "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered={} quarantine_skip={quarantine_skipped} rate_skip={rate_skipped} tickless_stuck_skip={tickless_stuck_skipped} proto_mismatch_skip={protocol_mismatch_skipped} v2_dead_skip={v2_dead_skipped} micro_dead_skip={micro_dead_skipped} bal_floor_dead_skip={bal_floor_dead_skipped} active_candidates={activity_candidates} live_touch={live_touch} live_drop_proto={live_drop_proto} live_drop_tickless={live_drop_tickless} live_drop_quarantine={live_drop_quarantine} live_drop_multi={live_drop_multi} live_drop_rate={live_drop_rate} active_selected={activity_selected} inactive_candidates={inactive_len} inactive_selected={inactive_selected} inactive_offset={inactive_offset} hot_pools={} rescore_cap={rescore_cap}",
             cycles.len(),
+            u8::from(stream_triggered),
             hot_pools_set.len(),
         );
     } else if stream_triggered {
-        crate::debug!(
-            "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 hot_pools={}",
-            cycles.len(),
-            hot_pools_set.len(),
-        );
+        // Every 2–3ms stream tick was INFO-logging here and saturating the
+        // 8k log queue — hf tick ends / evals were dropped (live: 93 filters,
+        // 47 dropped_events storms, only 2 stream tick-end lines survived).
+        static STREAM_FILTER_LOG_AT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let prev = STREAM_FILTER_LOG_AT.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 2_000
+            && STREAM_FILTER_LOG_AT
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            crate::info!(
+                "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 active_candidates={activity_candidates} hot_pools={}",
+                cycles.len(),
+                hot_pools_set.len(),
+            );
+        }
     }
     if cycles.is_empty() {
         if log_hf_summary {
@@ -917,8 +1340,8 @@ pub async fn run_hf_tick(
                 "hf tick: 0 cycles after filter (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped}, stream_triggered={stream_triggered})"
             );
         } else if stream_triggered {
-            crate::debug!(
-                "hf tick: 0 cycles after filter (snap={snap_cycle_count}, stream_triggered=1)"
+            crate::info!(
+                "hf tick: 0 cycles after filter (snap={snap_cycle_count}, quarantine={quarantine_skipped}, stream_triggered=1)"
             );
         }
         // Do not re-notify here — that looped promote storms with selected=0
@@ -931,6 +1354,112 @@ pub async fn run_hf_tick(
             candidates: Arc::from([]),
         });
     }
+    // Stream wakes with no live-scoring cycles just re-eval sticky inactive
+    // dust in 2–3ms (live: 44 stream ticks, active=0). Leave inactive
+    // rotation for the timer path — unless dirty hits anchored/selected pools
+    // (prefetch can heal meta for the next LF pin).
+    if stream_triggered && activity_candidates == 0 {
+        let dirty = ctx.partial_cache.dirty_addresses();
+        let overlap = dirty
+            .iter()
+            .filter(|a| hot_pools_set.contains(*a))
+            .count();
+        // Observed venues land in stream_universe before they appear in the
+        // sticky selected set (live: dirty_in_sel=0 while dirty∩universe>0).
+        let dirty_in_universe = dirty
+            .iter()
+            .filter(|a| ctx.partial_cache.in_stream_universe(a))
+            .count();
+        if overlap == 0 && dirty_in_universe == 0 {
+            static SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
+            let now = now_ms();
+            let prev = SKIP_LOG_AT.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 5_000
+                && SKIP_LOG_AT
+                    .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                crate::info!(
+                    "hf tick skipped: stream wake with no active cycles (selected={} dirty={} sel_hot={} dirty_in_sel={} dirty_in_uni=0)",
+                    cycles.len(),
+                    dirty.len(),
+                    hot_pools_set.len(),
+                    overlap,
+                );
+            }
+            return Ok(HfTickResult {
+                cycles_considered: 0,
+                profitable_count: 0,
+                best_profit: U256::ZERO,
+                elapsed_ms: now_ms().saturating_sub(start),
+                candidates: Arc::from([]),
+            });
+        }
+        // Universe-only dirty: sticky inactive selected rarely touches those
+        // venues (live: dirty_in_uni=10 eval sticky dust). Pull snap cycles
+        // that actually include the dirty pools; else skip.
+        if overlap == 0 && dirty_in_universe > 0 {
+            let dirty_uni: FxHashSet<Address> = dirty
+                .iter()
+                .copied()
+                .filter(|a| ctx.partial_cache.in_stream_universe(a))
+                .collect();
+            let snap = ctx.snapshots.read();
+            let mut prefer = Vec::with_capacity(rescore_cap.min(32));
+            for c in snap.cycles.iter() {
+                let touches = c.edges.iter().any(|e| {
+                    arena_base
+                        .pool_address(e.pool_index)
+                        .is_some_and(|a| dirty_uni.contains(&a))
+                });
+                if !touches {
+                    continue;
+                }
+                prefer.push(Arc::clone(c));
+                if prefer.len() >= rescore_cap.min(32) {
+                    break;
+                }
+            }
+            drop(snap);
+            if prefer.is_empty() {
+                static SKIP_UNI_AT: AtomicU64 = AtomicU64::new(0);
+                let now = now_ms();
+                let prev = SKIP_UNI_AT.load(Ordering::Relaxed);
+                if now.saturating_sub(prev) >= 5_000
+                    && SKIP_UNI_AT
+                        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    crate::info!(
+                        "hf tick skipped: dirty_in_uni={dirty_in_universe} but no snap cycle touches dirty (selected={} dirty={})",
+                        cycles.len(),
+                        dirty.len(),
+                    );
+                }
+                return Ok(HfTickResult {
+                    cycles_considered: 0,
+                    profitable_count: 0,
+                    best_profit: U256::ZERO,
+                    elapsed_ms: now_ms().saturating_sub(start),
+                    candidates: Arc::from([]),
+                });
+            }
+            crate::info!(
+                "hf tick: stream wake dirty_in_uni={dirty_in_universe} — swapped in {} dirty-touching snap cycles (was selected={})",
+                prefer.len(),
+                cycles.len(),
+            );
+            cycles = prefer;
+        } else {
+            crate::info!(
+                "hf tick: stream wake active=0 dirty_in_sel={overlap} dirty_in_uni={dirty_in_universe} — prefetch path (selected={} dirty={} sel_hot={})",
+                cycles.len(),
+                dirty.len(),
+                hot_pools_set.len(),
+            );
+        }
+    }
+
     let mut hot_pools = hot_pools_arc_from_set(
         hot_pools_set,
         &ctx.partial_cache,
@@ -981,10 +1510,11 @@ pub async fn run_hf_tick(
                 selection_generation = new_gen;
                 hot_pools = hot;
             }
-            Err(_) => {
-                if should_log_hf_summary() {
+            Err(_) if cycles.is_empty() => {
+                if should_log_hf_summary() || stream_triggered {
                     crate::info!(
-                        "hf tick: 0 cycles after refresh (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped})"
+                        "hf tick: 0 cycles after refresh (snap={snap_cycle_count}, quarantine={quarantine_skipped}, no_rate={rate_skipped}, stream_triggered={})",
+                        u8::from(stream_triggered),
                     );
                 }
                 return Ok(HfTickResult {
@@ -994,6 +1524,14 @@ pub async fn run_hf_tick(
                     elapsed_ms: now_ms().saturating_sub(start),
                     candidates: Arc::from([]),
                 });
+            }
+            Err(_) => {
+                // Prior selection intact — empty reselect must not kill the tick.
+                crate::info!(
+                    "hf reselect empty: keeping prior selected={} stream_triggered={}",
+                    cycles.len(),
+                    u8::from(stream_triggered),
+                );
             }
         }
     }
@@ -1083,9 +1621,15 @@ pub async fn run_hf_tick(
     let refresh = Arc::clone(&ctx.refresh);
 
     if skip_prefetch || hot_pools.is_empty() {
-        hf_flash_prefetch_stale(flash_cache.as_ref(), rpc.as_ref(), &flash_token_list).await;
+        hf_flash_prefetch_stale(
+            flash_cache.as_ref(),
+            rpc.as_ref(),
+            &flash_token_list,
+            pool_prefetch_budget,
+        )
+        .await;
         if !flash_token_list.is_empty() {
-            flash_cache.spawn_refresh_if_stale(rpc, &flash_token_list);
+            flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
     } else {
         let hot = Arc::clone(&hot_pools);
@@ -1096,8 +1640,12 @@ pub async fn run_hf_tick(
             )
             .await
         };
-        let flash_fut =
-            hf_flash_prefetch_stale(flash_cache.as_ref(), rpc.as_ref(), &flash_token_list);
+        let flash_fut = hf_flash_prefetch_stale(
+            flash_cache.as_ref(),
+            rpc.as_ref(),
+            &flash_token_list,
+            pool_prefetch_budget,
+        );
         let (pool_out, _) = tokio::join!(pool_fut, flash_fut);
         match pool_out {
             Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
@@ -1108,7 +1656,7 @@ pub async fn run_hf_tick(
             ),
         }
         if !flash_token_list.is_empty() {
-            flash_cache.spawn_refresh_if_stale(rpc, &flash_token_list);
+            flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
     }
 
@@ -1147,8 +1695,23 @@ pub async fn run_hf_tick(
             Ok((new_gen, hot)) => {
                 selection_generation = new_gen;
                 hot_pools = hot;
+                // Reselect can introduce start tokens absent from the prefetched set.
+                let flash_token_list = collect_hf_flash_token_list(&arena_base, &cycles).1;
+                hf_flash_prefetch_stale(
+                    flash_cache.as_ref(),
+                    rpc.as_ref(),
+                    &flash_token_list,
+                    pool_prefetch_budget,
+                )
+                .await;
             }
-            Err(_) => {
+            Err(_) if cycles.is_empty() => {
+                if should_log_hf_summary() || stream_triggered {
+                    crate::info!(
+                        "hf tick: 0 cycles after prefetch reselect (snap={snap_cycle_count}, stream_triggered={})",
+                        u8::from(stream_triggered),
+                    );
+                }
                 return Ok(HfTickResult {
                     cycles_considered: snap_cycle_count,
                     profitable_count: 0,
@@ -1157,14 +1720,65 @@ pub async fn run_hf_tick(
                     candidates: Arc::from([]),
                 });
             }
+            Err(_) => {
+                crate::info!(
+                    "hf prefetch-reselect empty: keeping prior selected={} stream_triggered={}",
+                    cycles.len(),
+                    u8::from(stream_triggered),
+                );
+            }
         }
     }
 
     let mut arena = arena_base;
     let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
+    // Select used the LF snapshot arena; hot overlay can empty V2 reserves /
+    // Balancer maxIn — drop those before hydrate/probe burns the window.
+    let before_hot_filter = cycles.len();
+    cycles.retain(|cycle| {
+        let start_decimals =
+            resolve_token_decimals_for_index(cycle.start_token, &arena, &token_decimals);
+        let micro_probe = if start_decimals >= 6 {
+            crate::util::ten_pow_u256_cached(start_decimals - 6)
+        } else {
+            U256::from(1u64)
+        };
+        let start_rate = resolve_token_to_matic_rate(cycle.start_token, &token_to_matic_rates);
+        let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
+            &arena,
+            &cycle.edges,
+            micro_probe,
+        )
+        .is_some()
+        {
+            v2_dead_skipped += 1;
+            return false;
+        }
+        match crate::pipeline::local_sim::economic_floor_liquidity_dead(
+            &arena,
+            &cycle.edges,
+            economic_floor,
+        ) {
+            Some(crate::pipeline::local_sim::MinimalSimFailure::V2ReserveExhausted { .. }) => {
+                v2_dead_skipped += 1;
+                false
+            }
+            Some(crate::pipeline::local_sim::MinimalSimFailure::BalancerMaxInRatio { .. }) => {
+                bal_floor_dead_skipped += 1;
+                false
+            }
+            Some(_) => {
+                micro_dead_skipped += 1;
+                false
+            }
+            None => true,
+        }
+    });
+    let hot_cache_dropped = before_hot_filter.saturating_sub(cycles.len());
     if log_hf_summary {
         crate::info!(
-            "hf eval input: stream_triggered={stream_triggered} snap_generation={selection_generation} state_generation={evaluation_state_generation} state_block={} hot_pools={} gas_snapshot_age_ms={gas_snapshot_age_ms:?}",
+            "hf eval input: stream_triggered={stream_triggered} snap_generation={selection_generation} state_generation={evaluation_state_generation} state_block={} hot_pools={} hot_cache_drop={hot_cache_dropped} gas_snapshot_age_ms={gas_snapshot_age_ms:?}",
             ctx.refresh.last_state_block(),
             hot_pools.len(),
         );
@@ -1286,10 +1900,20 @@ pub async fn run_hf_tick(
     let stuck_tickless =
         drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas_for_dispatch.as_ref());
     if stuck_tickless > 0 {
-        crate::info!(
-            "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} remaining={}",
-            cycles.len()
-        );
+        // Stream ticks can drain the same stuck set every ~100ms — rate-limit noise.
+        static TICKLESS_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
+        let now = crate::util::now_ms();
+        let last = TICKLESS_SKIP_LOG_AT.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= HF_SUMMARY_INTERVAL_MS
+            && TICKLESS_SKIP_LOG_AT
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            crate::info!(
+                "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} remaining={}",
+                cycles.len()
+            );
+        }
     }
 
     let matic_usd_chainlink = ctx.price_oracle.fresh_matic_usd_chainlink_raw();
@@ -1429,12 +2053,15 @@ pub async fn run_hf_tick(
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
                 hops: result.cycle.edge_hops(),
+                edges: result.cycle.edges.clone(),
                 route: near_miss_route_summary(
                     eval_arena.as_ref(),
                     &result.cycle,
                     pool_metas_for_dispatch.as_ref(),
                 ),
+                pools: best_eval_pools_summary(eval_arena.as_ref(), &result.cycle),
                 input: result.sim.amount_in,
+                search_low: result.opt.search_low,
                 raw_sim_gas: result.sim.total_gas,
                 assessed_gas: observed_gas.unwrap_or_else(|| {
                     ctx.gas_oracle
@@ -1569,8 +2196,10 @@ pub async fn run_hf_tick(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
             );
         } else if stream_triggered {
-            crate::debug!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, stream_triggered=1)"
+            // INFO not debug — at RPBOT_LOG=info, debug hid all stream completions
+            // (live: rate-limited stream filters fired, zero stream tick-end lines).
+            crate::info!(
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, probe_kept={probe_kept}, evaluated={eval_count}, stream_triggered=1)"
             );
         }
         if profitable_count == 0 && eval_count > 0 && (log_summary || stream_triggered) {
@@ -1589,12 +2218,19 @@ pub async fn run_hf_tick(
             // Also ignore best_profit_matic: positive_net rejects bump it above zero
             // even when profitable_count==0, which previously skipped quarantine.
             if let Some(ref diag) = best_gross_diag {
-                if ctx
-                    .execution
-                    .quarantine_chronic_gas_underwater(diag.fp, diag.gas_cover_bps)
-                {
+                let available_matic = diag
+                    .gas_cost_wei
+                    .saturating_sub(diag.gas_shortfall_matic_wei);
+                if ctx.execution.quarantine_chronic_gas_underwater(
+                    diag.fp,
+                    diag.gas_cover_bps,
+                    available_matic,
+                ) {
+                    // Cool rotations too — sticky 2-hop V2 dust returned as a
+                    // different fp with the same edges after single-fp cool.
+                    quarantine_all_edge_rotations(&ctx.execution, &diag.edges);
                     crate::info!(
-                        "hf underwater quarantine: fp={} cover_bps={}",
+                        "hf underwater quarantine: fp={} cover_bps={} (+rotations)",
                         diag.fp,
                         diag.gas_cover_bps
                     );
@@ -1726,6 +2362,28 @@ fn protocol_tag(protocol: ProtocolType) -> &'static str {
     }
 }
 
+fn best_eval_pools_summary(arena: &StateArena, cycle: &FoundCycle) -> String {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(cycle.edges.len().saturating_mul(80).max(80));
+    for (i, edge) in cycle.edges.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        match arena.pool_address(edge.pool_index) {
+            Some(addr) => {
+                let _ = write!(buf, "{addr}");
+            }
+            None => {
+                let _ = write!(buf, "p{}", edge.pool_index.0);
+            }
+        }
+        if let Some(crate::core::types::PoolState::V2(s)) = arena.pool_state(edge.pool_index) {
+            let _ = write!(buf, "(r0={}/r1={})", s.reserve0, s.reserve1);
+        }
+    }
+    buf
+}
+
 fn near_miss_route_summary(
     arena: &StateArena,
     cycle: &FoundCycle,
@@ -1751,7 +2409,8 @@ fn near_miss_route_summary(
             .map(|m| protocol_tag(m.protocol))
             .unwrap_or_else(|| protocol_tag(edge.protocol));
         let _ = write!(buf, "->{tag}:");
-        if let Some(addr) = arena.token_address(edge.token_out) {
+        // Pool address (was token_out — live sticky diag looked like WMATIC↔token loops).
+        if let Some(addr) = arena.pool_address(edge.pool_index) {
             let bytes = addr.as_slice();
             let _ = write!(
                 buf,
@@ -1759,7 +2418,7 @@ fn near_miss_route_summary(
                 bytes[0], bytes[1], bytes[2], bytes[3]
             );
         } else {
-            let _ = write!(buf, "t{}", edge.token_out.0);
+            let _ = write!(buf, "p{}", edge.pool_index.0);
         }
     }
     buf

@@ -156,7 +156,7 @@ impl MinimalSimReasonCounts {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum MinimalProbeReject {
     NoSimulation,
     ZeroProfit,
@@ -499,7 +499,16 @@ fn rank_one_cycle_probe(
     profit_priority_alpha_bps: u64,
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
-    let cycle = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
+    let rotated =
+        prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
+    // Aave start-rotation must not admit hop-broken edges into InvalidRoute.
+    let cycle = if local_sim::first_hop_continuity_break_in_arena(arena, &rotated.edges).is_some()
+        && local_sim::first_hop_continuity_break_in_arena(arena, &cycle_arc.edges).is_none()
+    {
+        std::borrow::Cow::Borrowed(cycle_arc.as_ref())
+    } else {
+        rotated
+    };
     let fp = hash_cycle_edges(&cycle.edges);
     if !route_fits_executor(&cycle.edges) {
         out.skip.executor_budget = 1;
@@ -571,6 +580,44 @@ fn rank_one_cycle_probe(
                     out.minimal_sim_reasons.record(reason);
                 }
             }
+            // Empty-rank sample was flash-only; zero_profit left sample=none.
+            if out.flash_diag.is_none()
+                && matches!(
+                    reject,
+                    MinimalProbeReject::ZeroProfit | MinimalProbeReject::NoSimulation
+                )
+            {
+                let hops: String = cycle
+                    .edges
+                    .iter()
+                    .map(|e| format!("{:?}", e.protocol))
+                    .collect::<Vec<_>>()
+                    .join(">");
+                let hop_break = local_sim::first_hop_continuity_break_in_arena(arena, &cycle.edges);
+                let break_detail = match hop_break {
+                    Some(i) => {
+                        let prev = &cycle.edges[i];
+                        let next = &cycle.edges[i + 1];
+                        format!(
+                            " hop_break={i} out={:?}/{:?} in={:?}/{:?}",
+                            prev.token_out,
+                            arena.token_address(prev.token_out),
+                            next.token_in,
+                            arena.token_address(next.token_in),
+                        )
+                    }
+                    None if cycle.edges.is_empty() => " empty".to_string(),
+                    None if cycle.edges.len() > crate::core::constants::HOP_CAP_USIZE => {
+                        format!(" too_long={}", cycle.edges.len())
+                    }
+                    None => String::new(),
+                };
+                out.flash_diag = Some(format!(
+                    "fp={fp:#x} hops={} reject={reject:?} route=[{hops}]{break_detail} start_dec={start_decimals} rate={rate} start={}",
+                    cycle.edges.len(),
+                    cycle.start_token.0,
+                ));
+            }
             if should_rescue_probe_reject(reject, &attempt_failures) {
                 out.rescue.push((fp, cycle.into_owned()));
             } else {
@@ -586,14 +633,20 @@ fn rank_one_cycle_probe(
         resolve_flash_source_with_context(&flash_ctx, flash_policy, probe_amount)
     else {
         out.skip.flash_source = 1;
-        if let Some(reason) = flash_reject_reason(&flash_ctx, flash_policy, probe_amount) {
+        let reason = flash_reject_reason(&flash_ctx, flash_policy, probe_amount);
+        if let Some(reason) = reason {
             out.flash_loan.record_reject(reason);
         }
         if out.flash_diag.is_none() {
             out.flash_diag = Some(format!(
-                "fp={fp:#x} hops={} flash_source_reject start={} probe_amt={probe_amount}",
+                "fp={fp:#x} hops={} flash_source_reject reason={reason:?} start={} probe_amt={probe_amount} fresh={} bal={} aave={} listed={} forbid_bal={}",
                 cycle.edges.len(),
                 flash_ctx.start_addr,
+                flash_ctx.start_fresh,
+                flash_ctx.liquidity.balancer,
+                flash_ctx.liquidity.aave,
+                flash_ctx.liquidity.aave_listed,
+                flash_ctx.forbid_balancer_flash,
             ));
         }
         return out;
@@ -822,36 +875,52 @@ pub fn rank_cycles_by_probe_net(
                 }
             }
         }
-        if had_net_ranked || near_net_count > 0 {
-            crate::debug!(
-                "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={near_net_count} rescue={rescue_len}",
-                kept.len(),
-                scanned.len(),
-                skip.rate,
-                skip.probe(),
-                skip.minimal_sim(),
-                skip.minimal_no_sim,
-                skip.minimal_zero_profit,
-                skip.minimal_sanity,
-                minimal_sim_reasons.invalid_route,
-                minimal_sim_reasons.missing_pool,
-                minimal_sim_reasons.non_tradable,
-                minimal_sim_reasons.cl_tickless,
-                minimal_sim_reasons.cl_cap,
-                minimal_sim_reasons.shallow_cl,
-                minimal_sim_reasons.v2_reserve_exhausted,
-                minimal_sim_reasons.token_mismatch,
-                minimal_sim_reasons.math,
-                minimal_sim_reasons.unsupported_state,
-                minimal_sim_reasons.bal_max_in,
-                minimal_sim_reasons.zero_output,
-                minimal_sim_reasons.sanity_ratio,
-                minimal_sim_reasons.sanity_matic,
-                minimal_sim_reasons.sanity_floor,
-                minimal_sim_reasons.sanity_decimals,
-                minimal_sim_reasons.sanity_pin,
-                skip.net,
-            );
+        // Rate-limited INFO when probe drops cycles (live: kept=4 of selected=6–13).
+        if kept.len() < scanned.len() {
+            static LAST_PROBE_BACKFILL_LOG_MS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now = crate::util::now_ms();
+            let prev = LAST_PROBE_BACKFILL_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 2_000
+                && LAST_PROBE_BACKFILL_LOG_MS
+                    .compare_exchange(
+                        prev,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                crate::info!(
+                    "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={near_net_count} rescue={rescue_len} had_net={had_net_ranked}",
+                    kept.len(),
+                    scanned.len(),
+                    skip.rate,
+                    skip.probe(),
+                    skip.minimal_sim(),
+                    skip.minimal_no_sim,
+                    skip.minimal_zero_profit,
+                    skip.minimal_sanity,
+                    minimal_sim_reasons.invalid_route,
+                    minimal_sim_reasons.missing_pool,
+                    minimal_sim_reasons.non_tradable,
+                    minimal_sim_reasons.cl_tickless,
+                    minimal_sim_reasons.cl_cap,
+                    minimal_sim_reasons.shallow_cl,
+                    minimal_sim_reasons.v2_reserve_exhausted,
+                    minimal_sim_reasons.token_mismatch,
+                    minimal_sim_reasons.math,
+                    minimal_sim_reasons.unsupported_state,
+                    minimal_sim_reasons.bal_max_in,
+                    minimal_sim_reasons.zero_output,
+                    minimal_sim_reasons.sanity_ratio,
+                    minimal_sim_reasons.sanity_matic,
+                    minimal_sim_reasons.sanity_floor,
+                    minimal_sim_reasons.sanity_decimals,
+                    minimal_sim_reasons.sanity_pin,
+                    skip.net,
+                );
+            }
         }
     }
     probe_seeds.retain(|fingerprint, _| seen.contains(fingerprint));
@@ -874,10 +943,11 @@ pub fn rank_cycles_by_probe_net(
                 .is_ok()
         {
             crate::info!(
-                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} rescue={rescue_len} sample={sample}",
+                "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} rescue={rescue_len} sample={sample}",
                 scanned.len(),
                 skip.rate,
                 skip.flash,
+                skip.flash_source,
                 skip.probe(),
                 skip.minimal_sim(),
                 skip.minimal_no_sim,
@@ -996,8 +1066,8 @@ impl EvalFailStats {
         if in_count == 0 {
             return;
         }
-        // ponytail: per-eval diagnostic — DEBUG; default INFO already has throttled hf tick.
-        crate::debug!(
+        // INFO when every assessed route dies — otherwise DEBUG (hf tick already INFO).
+        let msg = format!(
             "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} missing_decimals={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
             load(&self.quarantine),
             load(&self.executor_budget),
@@ -1012,6 +1082,11 @@ impl EvalFailStats {
             load(&self.probe_fidelity),
             load(&self.probe_sanity),
         );
+        if out_count == 0 {
+            crate::info!("{msg}");
+        } else {
+            crate::debug!("{msg}");
+        }
     }
 }
 
