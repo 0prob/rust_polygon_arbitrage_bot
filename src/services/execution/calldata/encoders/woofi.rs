@@ -22,7 +22,17 @@ pub fn encode_woofi_hop(
     slippage_bps: u64,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     let router = resolve_woofi_router(hop);
-    let min_to = compute_min_out(arena, hop, slippage_bps, "woofi")?;
+    // Oracle/spread drift with SLIPPAGE_BPS=0 → router minTo revert. Floor matches
+    // assess; take tighter of re-quote vs conservative_execution_hops amount_out.
+    let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
+    let min_to = {
+        let quoted = compute_min_out(arena, hop, bps, "woofi")?;
+        if hop.amount_out.is_zero() {
+            quoted
+        } else {
+            hop.amount_out.min(quoted)
+        }
+    };
 
     let swap = IWoofiRouter::swapCall {
         fromToken: hop.token_in,

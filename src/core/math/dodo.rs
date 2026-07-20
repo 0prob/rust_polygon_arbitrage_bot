@@ -243,6 +243,17 @@ pub fn get_dodo_amount_out(state: &DodoPoolState, amount_in: U256, base_to_quote
     gross - mul_floor(gross, lp) - mul_floor(gross, mt)
 }
 
+/// Convert live DODO `_LP_FEE_RATE_` + `_MT_FEE_RATE_` (1e18) to edge `fee_bps`.
+#[must_use]
+pub fn dodo_fee_bps_from_pool(lp_fee_rate: U256, mt_fee_rate: U256) -> Option<u32> {
+    let total = lp_fee_rate.saturating_add(mt_fee_rate);
+    if total.is_zero() || total >= ONE {
+        return None;
+    }
+    let bps = (total * U256::from(10_000u64)) / ONE;
+    Some(bps.min(U256::from(9_999u64)).to::<u32>())
+}
+
 #[must_use]
 pub fn estimate_dodo_hop_capacity(state: &DodoPoolState, base_to_quote: bool) -> U256 {
     let b = state.base_reserve;
@@ -264,6 +275,20 @@ pub fn estimate_dodo_hop_capacity(state: &DodoPoolState, base_to_quote: bool) ->
 mod tests {
     use super::*;
     use alloy::primitives::Address;
+
+    #[test]
+    fn dodo_fee_bps_from_1e18_lp_mt() {
+        assert_eq!(
+            dodo_fee_bps_from_pool(ONE / U256::from(1000u64), U256::ZERO),
+            Some(10)
+        );
+        assert_eq!(
+            dodo_fee_bps_from_pool(ONE / U256::from(1000u64), ONE / U256::from(2000u64)),
+            Some(15)
+        );
+        assert_eq!(dodo_fee_bps_from_pool(U256::ZERO, U256::ZERO), None);
+        assert_eq!(dodo_fee_bps_from_pool(ONE, U256::ZERO), None);
+    }
 
     #[test]
     fn test_zero_amount_returns_zero() {

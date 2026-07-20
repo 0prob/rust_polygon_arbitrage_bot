@@ -321,7 +321,7 @@ pub enum MinimalSimFailure {
     V2ReserveExhausted {
         hop: usize,
     },
-    /// Edge TokenIndex addresses disagree with Balancer/Woofi `state.tokens[idx]`.
+    /// Edge TokenIndex addresses disagree with Balancer/Woofi/DODO pool legs.
     TokenMismatch {
         hop: usize,
     },
@@ -479,10 +479,15 @@ pub fn realign_uni_cycle_from_pool_meta(
         if m.tokens.len() < 2 {
             continue;
         }
-        // Curve: TokenIndex is source of truth — remap stale coin i/j from meta order.
+        // Curve/DODO/Woofi: TokenIndex is source of truth — remap stale leg idxs from meta.
+        // DODO meta is always [base, quote] after arena sync (sellBase ⇔ idx 0).
+        // Woofi meta is [bases…, quote] matching hydrated `state.tokens`.
         if matches!(
             edge.protocol,
-            ProtocolType::CurveStable | ProtocolType::CurveCrypto
+            ProtocolType::CurveStable
+                | ProtocolType::CurveCrypto
+                | ProtocolType::Dodo
+                | ProtocolType::Woofi
         ) {
             let Some(in_pos) = m.tokens.iter().position(|&t| t == edge.token_in) else {
                 return None;
@@ -492,6 +497,15 @@ pub fn realign_uni_cycle_from_pool_meta(
             };
             if let Some(PoolState::Curve(s)) = arena.pool_state(edge.pool_index)
                 && (in_pos >= s.balances.len() || out_pos >= s.balances.len() || in_pos == out_pos)
+            {
+                return None;
+            }
+            if matches!(edge.protocol, ProtocolType::Dodo) && (in_pos > 1 || out_pos > 1 || in_pos == out_pos)
+            {
+                return None;
+            }
+            if let Some(PoolState::Woofi(s)) = arena.pool_state(edge.pool_index)
+                && (in_pos >= s.tokens.len() || out_pos >= s.tokens.len() || in_pos == out_pos)
             {
                 return None;
             }
@@ -515,18 +529,42 @@ pub fn realign_uni_cycle_from_pool_meta(
         ) {
             continue;
         }
-        let Some(&tin) = m.tokens.get(edge.token_in_idx as usize) else {
-            return None;
-        };
-        let Some(&tout) = m.tokens.get(edge.token_out_idx as usize) else {
-            return None;
-        };
-        if edge.token_in != tin || edge.token_out != tout {
-            edge.token_in = tin;
-            edge.token_out = tout;
-            changed = true;
+        // Prefer address→idx when both tokens are in meta. Stale idxs otherwise
+        // overwrite a valid hop (e.g. correct t0→t1 with idxs (1,0) flipped to t1→t0).
+        let in_pos = m.tokens.iter().position(|&t| t == edge.token_in);
+        let out_pos = m.tokens.iter().position(|&t| t == edge.token_out);
+        if let (Some(in_pos), Some(out_pos)) = (in_pos, out_pos) {
+            if in_pos == out_pos {
+                return None;
+            }
+            let Ok(in_idx) = u8::try_from(in_pos) else {
+                return None;
+            };
+            let Ok(out_idx) = u8::try_from(out_pos) else {
+                return None;
+            };
+            if edge.token_in_idx != in_idx || edge.token_out_idx != out_idx {
+                edge.token_in_idx = in_idx;
+                edge.token_out_idx = out_idx;
+                changed = true;
+            }
+        } else {
+            let Some(&tin) = m.tokens.get(edge.token_in_idx as usize) else {
+                return None;
+            };
+            let Some(&tout) = m.tokens.get(edge.token_out_idx as usize) else {
+                return None;
+            };
+            if edge.token_in != tin || edge.token_out != tout {
+                edge.token_in = tin;
+                edge.token_out = tout;
+                changed = true;
+            }
         }
-        if let (Some(a_in), Some(a_out)) = (arena.token_address(tin), arena.token_address(tout)) {
+        if let (Some(a_in), Some(a_out)) = (
+            arena.token_address(edge.token_in),
+            arena.token_address(edge.token_out),
+        ) {
             let zfo = a_in < a_out;
             if edge.zero_for_one != zfo {
                 edge.zero_for_one = zfo;
@@ -570,6 +608,14 @@ pub fn multi_token_edge_aligned(
             s.tokens.get(edge.token_in_idx as usize).copied() == Some(token_in)
                 && s.tokens.get(edge.token_out_idx as usize).copied() == Some(token_out)
         }
+        // Meta/sim contract: idx 0 = base, 1 = quote (sellBase iff token_in_idx == 0).
+        PoolState::Dodo(s)
+            if !s.base_token.is_zero() && !s.quote_token.is_zero() =>
+        {
+            let expected = [s.base_token, s.quote_token];
+            expected.get(edge.token_in_idx as usize).copied() == Some(token_in)
+                && expected.get(edge.token_out_idx as usize).copied() == Some(token_out)
+        }
         _ => true,
     }
 }
@@ -591,19 +637,27 @@ pub fn resolve_multi_token_vault_indices(
     Some((u8::try_from(in_idx).ok()?, u8::try_from(out_idx).ok()?))
 }
 
-/// Rewrite Balancer/Woofi `token_*_idx` to match live `state.tokens` addresses.
-/// Returns `false` when the edge tokens are absent from the vault (unrecoverable).
+/// Rewrite Balancer/Woofi/DODO `token_*_idx` to match live pool token addresses.
+/// Returns `false` when the edge tokens are absent from the vault/base-quote
+/// (unrecoverable). DODO sim keys sellBase off `token_in_idx == 0` while encode
+/// uses on-chain base/quote — stale idxs invent profit.
 #[must_use]
 pub fn realign_multi_token_edge(arena: &StateArena, state: &PoolState, edge: &mut Edge) -> bool {
     if !matches!(
         edge.protocol,
-        ProtocolType::BalancerV2 | ProtocolType::Woofi
+        ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
     ) {
         return true;
     }
+    // DODO owns a 2-slot stack array; keep it alive for the borrow below.
+    let dodo_tokens;
     let tokens = match state {
         PoolState::Balancer(s) if !s.tokens.is_empty() => s.tokens.as_slice(),
         PoolState::Woofi(s) if !s.tokens.is_empty() => s.tokens.as_slice(),
+        PoolState::Dodo(s) if !s.base_token.is_zero() && !s.quote_token.is_zero() => {
+            dodo_tokens = [s.base_token, s.quote_token];
+            dodo_tokens.as_slice()
+        }
         _ => return true,
     };
     let Some(tin) = arena.token_address(edge.token_in) else {
@@ -627,8 +681,8 @@ pub fn realign_multi_token_edge(arena: &StateArena, state: &PoolState, edge: &mu
     true
 }
 
-/// Clone-and-fix Balancer/Woofi vault indices on a ranked cycle. `None` = unrecoverable
-/// mismatch (tokens not in vault) — caller should treat like micro-dead.
+/// Clone-and-fix Balancer/Woofi/DODO vault indices on a ranked cycle. `None` =
+/// unrecoverable mismatch — caller should treat like micro-dead.
 #[must_use]
 pub fn realign_multi_token_found_cycle(
     arena: &StateArena,
@@ -637,7 +691,7 @@ pub fn realign_multi_token_found_cycle(
     let needs_scan = cycle.edges.iter().any(|edge| {
         matches!(
             edge.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
         )
     });
     if !needs_scan {
@@ -648,7 +702,7 @@ pub fn realign_multi_token_found_cycle(
     for edge in &mut owned.edges {
         if !matches!(
             edge.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
         ) {
             continue;
         }
@@ -698,6 +752,22 @@ pub fn sync_edge_fee_bps_from_state(edge: &mut Edge, state: &PoolState) {
         }
         PoolState::Balancer(b) => {
             if let Some(bps) = crate::core::math::balancer::balancer_fee_bps_from_pool(b.fee) {
+                edge.fee_bps = bps;
+            }
+        }
+        PoolState::Dodo(d) => {
+            if let Some(bps) =
+                crate::core::math::dodo::dodo_fee_bps_from_pool(d.lp_fee_rate, d.mt_fee_rate)
+            {
+                edge.fee_bps = bps;
+            }
+        }
+        PoolState::Woofi(w) => {
+            if let Some(bps) = crate::core::math::woofi::woofi_fee_bps_from_edge(
+                w,
+                edge.token_in_idx,
+                edge.token_out_idx,
+            ) {
                 edge.fee_bps = bps;
             }
         }
@@ -788,7 +858,7 @@ pub fn minimal_sim_failure(
         let mut edge = *edge;
         if matches!(
             edge.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
         ) && !realign_multi_token_edge(arena, state, &mut edge)
         {
             return Some(MinimalSimFailure::TokenMismatch { hop });
@@ -882,10 +952,9 @@ pub fn minimal_sim_failure(
 /// so they do not crowd the probe window. Includes `ZeroOutput` / Balancer
 /// `MAX_IN`, CL shallow/cap-dead at dust, any-hop `V2ReserveExhausted`
 /// (hop-0 dust V2 is also caught earlier by `first_v2_hop_below_reserve`; this
-/// covers mid-route V2 that dies even at micro), and Balancer/Woofi
-/// `TokenMismatch` (amount-independent vault/meta index skew — live empty ranks
-/// were dominated by a sticky Balancer hop-0 mismatch after other dead probes
-/// cleared). Leave `ClTickless` alone — spot probe sizes can still rank those.
+    /// covers mid-route V2 that dies even at micro), and Balancer/Woofi/DODO
+    /// `TokenMismatch` (amount-independent vault/base-quote index skew). Leave
+    /// `ClTickless` alone — spot probe sizes can still rank those.
 #[must_use]
 pub fn micro_probe_liquidity_dead(
     arena: &StateArena,
@@ -1420,7 +1489,7 @@ fn walk_route_hops(
         let mut edge = *edge;
         if matches!(
             edge.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
         ) && !realign_multi_token_edge(arena, state, &mut edge)
         {
             return None;
@@ -1916,6 +1985,67 @@ mod tests {
             &metas,
             &healed.edges
         ));
+    }
+
+    #[test]
+    fn realign_v2_keeps_valid_addresses_when_idxs_stale() {
+        use crate::core::types::{FoundCycle, V2PoolState};
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::from([1u8; 20]));
+        let t1 = arena.register_token(Address::from([2u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 0,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV2,
+            tokens: vec![t0, t1],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        // Correct t0→t1 hop, but idxs claim the reverse.
+        let cycle = Arc::new(FoundCycle {
+            start_token: t0,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: t0,
+                token_out: t1,
+                token_in_idx: 1,
+                token_out_idx: 0,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed =
+            realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign v2");
+        assert_eq!((healed.edges[0].token_in, healed.edges[0].token_out), (t0, t1));
+        assert_eq!(
+            (healed.edges[0].token_in_idx, healed.edges[0].token_out_idx),
+            (0, 1)
+        );
+        assert!(healed.edges[0].zero_for_one);
     }
 
     #[test]
@@ -2996,5 +3126,175 @@ mod tests {
         let big = U256::from(1_500u64) * ONE;
         let out_big = simulate_hop_amount_out(&state, &edge, big).expect("capped sellQuote");
         assert_eq!(out_big, U256::from(1_000u64) * ONE);
+    }
+
+    #[test]
+    fn realign_dodo_recovers_stale_base_quote_indices() {
+        use crate::core::math::fixed_point::ONE;
+        use crate::core::types::{DodoPoolState, DodoRState, FoundCycle};
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let base = Address::repeat_byte(0x0b);
+        let quote = Address::repeat_byte(0x0a); // quote < base by address
+        let mut arena = StateArena::default();
+        let bi = arena.register_token(base);
+        let qi = arena.register_token(quote);
+        let pool = arena.register_pool(
+            Address::repeat_byte(0xdd),
+            Arc::new(PoolState::Dodo(DodoPoolState {
+                base_reserve: U256::from(1_000u64) * ONE,
+                quote_reserve: U256::from(2_000u64) * ONE,
+                base_token: base,
+                quote_token: quote,
+                base_target: U256::from(1_000u64) * ONE,
+                quote_target: U256::from(2_000u64) * ONE,
+                r_state: DodoRState::One,
+                i: ONE,
+                k: U256::ZERO,
+                lp_fee_rate: ONE / U256::from(1000u64), // 10 bps
+                mt_fee_rate: U256::ZERO,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::Dodo,
+            tokens: vec![bi, qi], // [base, quote]
+            fee_bps: 30,          // stale discovery
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        // sellQuote by addresses, but idxs claim sellBase.
+        let mut edge = Edge {
+            pool_index: pool,
+            token_in: qi,
+            token_out: bi,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::Dodo,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let state = arena.pool_state(pool).unwrap();
+        assert!(realign_multi_token_edge(&arena, state, &mut edge));
+        assert_eq!((edge.token_in_idx, edge.token_out_idx), (1, 0));
+
+        let cycle = Arc::new(FoundCycle {
+            start_token: qi,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: qi,
+                token_out: bi,
+                token_in_idx: 0, // stale
+                token_out_idx: 1,
+                protocol: ProtocolType::Dodo,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed =
+            realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign dodo");
+        assert_eq!((healed.edges[0].token_in_idx, healed.edges[0].token_out_idx), (1, 0));
+        let mut fee_edge = healed.edges[0];
+        sync_edge_fee_bps_from_state(&mut fee_edge, state);
+        assert_eq!(fee_edge.fee_bps, 10);
+    }
+
+    #[test]
+    fn realign_woofi_recovers_stale_base_quote_indices() {
+        use crate::core::types::{FoundCycle, WoofiBaseTokenState, WoofiPoolState};
+        use crate::pipeline::types::PoolMeta;
+        use std::sync::Arc;
+
+        let base = Address::repeat_byte(0xb1);
+        let quote = Address::repeat_byte(0xa1); // quote < base
+        let mut arena = StateArena::default();
+        let bi = arena.register_token(base);
+        let qi = arena.register_token(quote);
+        let pool = arena.register_pool(
+            Address::repeat_byte(0xee),
+            Arc::new(PoolState::Woofi(WoofiPoolState {
+                tokens: vec![base, quote],
+                quote_reserve: U256::from(2_000_000u64),
+                base_states: vec![WoofiBaseTokenState {
+                    price: U256::from(10u128.pow(18)),
+                    spread: U256::ZERO,
+                    coeff: U256::ZERO,
+                    reserve: U256::from(1_000u64) * U256::from(10u128.pow(18)),
+                    base_dec: U256::from(10u128.pow(18)),
+                    quote_dec: U256::from(10u128.pow(6)),
+                    price_dec: U256::from(10u128.pow(8)),
+                    fee_rate: U256::from(100u64), // 10 bps
+                    max_gamma: U256::ZERO,
+                    max_notional_swap: U256::ZERO,
+                }],
+                fee: U256::ZERO,
+            })),
+        );
+        let meta = PoolMeta {
+            pool_index: pool,
+            protocol: ProtocolType::Woofi,
+            tokens: vec![bi, qi],
+            fee_bps: 30,
+            bpt_index: None,
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            hooks: None,
+            tick_spacing: None,
+        };
+        // quote→base by addresses, idxs claim base→quote.
+        let mut edge = Edge {
+            pool_index: pool,
+            token_in: qi,
+            token_out: bi,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::Woofi,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let state = arena.pool_state(pool).unwrap();
+        assert!(realign_multi_token_edge(&arena, state, &mut edge));
+        assert_eq!((edge.token_in_idx, edge.token_out_idx), (1, 0));
+
+        let cycle = Arc::new(FoundCycle {
+            start_token: qi,
+            edges: vec![Edge {
+                pool_index: pool,
+                token_in: qi,
+                token_out: bi,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::Woofi,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]
+            .into(),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let healed =
+            realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign woofi");
+        assert_eq!(
+            (healed.edges[0].token_in_idx, healed.edges[0].token_out_idx),
+            (1, 0)
+        );
+        let mut fee_edge = healed.edges[0];
+        sync_edge_fee_bps_from_state(&mut fee_edge, state);
+        assert_eq!(fee_edge.fee_bps, 10);
     }
 }

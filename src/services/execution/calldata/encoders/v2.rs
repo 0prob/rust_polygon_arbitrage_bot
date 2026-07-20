@@ -35,10 +35,19 @@ pub fn encode_v2_hop(
     if hop.edge.zero_for_one != (hop.token_in < hop.token_out) {
         anyhow::bail!("v2 zero_for_one must match sorted token0 (token_in < token_out)");
     }
-    // Reserve drift between multicall and eth_call → UniswapV2: K on exact quote.
-    // Shared floor with assess (`effective_slippage_bps`) so minProfit tracks encode.
+    // V2 swap is exact-out: amount{0,1}Out is what the pair sends. A re-quote
+    // above assess `hop.amount_out` after reserve drift needs more input than
+    // pre-funded → UniswapV2: K. Floor slip + take the tighter of re-quote vs
+    // conservative_execution_hops (same as Curve/Balancer/Woofi).
     let bps = slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
-    let amount_out = super::shared::compute_min_out(arena, hop, bps, "v2")?;
+    let amount_out = {
+        let quoted = super::shared::compute_min_out(arena, hop, bps, "v2")?;
+        if hop.amount_out.is_zero() {
+            quoted
+        } else {
+            hop.amount_out.min(quoted)
+        }
+    };
     if amount_out.is_zero() {
         anyhow::bail!("v2 hop quoted amountOut is zero");
     }

@@ -120,6 +120,41 @@ fn apply_woofi_fee(amount: U256, fee_rate: U256) -> U256 {
     amount - (amount * fee_rate) / WOOFI_FEE_DENOMINATOR
 }
 
+fn woofi_fee_rate_to_bps(fee_rate: U256) -> u32 {
+    if fee_rate >= WOOFI_FEE_DENOMINATOR {
+        return 9_999;
+    }
+    ((fee_rate * U256::from(10_000u64)) / WOOFI_FEE_DENOMINATOR)
+        .min(U256::from(9_999u64))
+        .to::<u32>()
+}
+
+/// Active-leg WooFi `feeRate` (1e5 denom) → edge `fee_bps` for graph ranking.
+/// Base→base sums both legs (matches two `apply_woofi_fee` charges in sim).
+#[must_use]
+pub fn woofi_fee_bps_from_edge(
+    state: &WoofiPoolState,
+    token_in_idx: u8,
+    token_out_idx: u8,
+) -> Option<u32> {
+    let quote_idx = state.base_states.len();
+    let tin = token_in_idx as usize;
+    let tout = token_out_idx as usize;
+    if tin == tout || tin > quote_idx || tout > quote_idx {
+        return None;
+    }
+    let total = if tout == quote_idx {
+        woofi_fee_rate_to_bps(state.base_states.get(tin)?.fee_rate)
+    } else if tin == quote_idx {
+        woofi_fee_rate_to_bps(state.base_states.get(tout)?.fee_rate)
+    } else {
+        let sell = woofi_fee_rate_to_bps(state.base_states.get(tin)?.fee_rate);
+        let buy = woofi_fee_rate_to_bps(state.base_states.get(tout)?.fee_rate);
+        sell.saturating_add(buy)
+    };
+    Some(total.min(9_999))
+}
+
 /// Simulate WooFi swap by base index (0 = quote token path uses base_states[0]).
 #[inline]
 #[must_use]
@@ -211,6 +246,27 @@ mod tests {
             max_gamma: U256::ZERO,
             max_notional_swap: U256::ZERO,
         }
+    }
+
+    #[test]
+    fn fee_rate_1e5_converts_to_bps_per_active_leg() {
+        let mut sell = base_state(U256::from(1_000u64));
+        let mut buy = base_state(U256::from(1_000u64));
+        sell.fee_rate = U256::from(25u64); // 25 / 1e5 = 2.5 bps → 2
+        buy.fee_rate = U256::from(50u64); // 5 bps
+        let state = WoofiPoolState {
+            tokens: vec![
+                Address::with_last_byte(1),
+                Address::with_last_byte(2),
+                Address::with_last_byte(3),
+            ],
+            quote_reserve: U256::from(1_000u64),
+            base_states: vec![sell, buy],
+            fee: U256::ZERO,
+        };
+        assert_eq!(woofi_fee_bps_from_edge(&state, 0, 2), Some(2)); // sell base→quote
+        assert_eq!(woofi_fee_bps_from_edge(&state, 2, 1), Some(5)); // quote→buy
+        assert_eq!(woofi_fee_bps_from_edge(&state, 0, 1), Some(7)); // base→base
     }
 
     #[test]

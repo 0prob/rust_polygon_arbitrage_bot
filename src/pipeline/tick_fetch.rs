@@ -145,8 +145,11 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
 
 const MAX_TICK_POOLS: usize = 512;
-/// Cap per-pass extsload tick-info reads (dense bitmaps can fan out quickly).
-const MAX_V4_TICK_INFO_READS: usize = 2_048;
+/// Cap per-pass CL tick-info reads (dense bitmaps can fan out quickly).
+/// Shared by V4 extsload and Algebra `ticks()` hydrate.
+const MAX_CL_TICK_INFO_READS: usize = 2_048;
+/// Cap Algebra tickTable targets per pass. Live: 100+ pool batches rate-limit to zero.
+const MAX_ALGEBRA_TICK_POOLS: usize = 32;
 
 /// Drop stale tick bitmap before re-enriching (slot0/liquidity may have moved).
 pub fn clear_v3_pool_ticks(arena: &mut StateArena, pool_addresses: &[Address]) {
@@ -410,13 +413,13 @@ pub async fn enrich_v3_ticks<
                     for bytes in &results[*start..*end] {
                         let Some(bytes) = bytes else {
                             complete = false;
-                            break;
+                            continue;
                         };
                         let Ok(populated) =
                             ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
                         else {
                             complete = false;
-                            break;
+                            continue;
                         };
                         for pt in populated {
                             let tick = pt.tick.as_i32();
@@ -432,16 +435,26 @@ pub async fn enrich_v3_ticks<
                     }
                     if !complete {
                         incomplete_pools += 1;
-                        if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                        // ponytail: partial depth beats tickless (same as V4)
+                        if !ticks.is_empty() {
+                            finalize_cl_ticks(&mut ticks);
+                            if let Some(crate::core::types::PoolState::V3(s)) =
+                                arena.pool_state_mut(*idx)
+                            {
+                                s.ticks = Arc::from(ticks);
+                                updated += 1;
+                            }
+                        } else if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                            // Empty+incomplete: unlabeled Algebra often fails TickLens
                             algebra_fallback.push(fb);
                         }
                         continue;
                     }
                     if ticks.is_empty() {
+                        // Complete empty TickLens words → widen TickLens, not Algebra.
+                        // Unlabeled Algebra almost always reverts/incomplete (path above);
+                        // probing every sparse UniV3 via tickTable was the live rate-limit storm.
                         empty_pools += 1;
-                        if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
-                            algebra_fallback.push(fb);
-                        }
                         continue;
                     }
                     finalize_cl_ticks(&mut ticks);
@@ -452,19 +465,26 @@ pub async fn enrich_v3_ticks<
                 }
                 if incomplete_pools > 0 {
                     crate::warn!(
-                        "v3 tick lens left {} pools tickless after partial word responses",
-                        incomplete_pools
+                        "v3 tick lens partial/incomplete: incomplete_pools={incomplete_pools} loaded={updated}"
                     );
                 }
             }
             Err(error) => {
                 crate::warn!(
-                    "v3 tick lens multicall failed ({} pools) — trying algebra/seed: {error:#}",
+                    "v3 tick lens multicall failed ({} pools) — algebra only for labeled: {error:#}",
                     pool_addresses.len(),
                 );
                 tick_lens_rpc_failed = true;
-                for (_, _, idx) in &spans {
-                    if let Some(fb) = algebra_fallback_target(arena, *idx, word_range) {
+                // Hard fail must not dump every UniV3 into Algebra tickTable —
+                // live: 100+ pool OOG/rate-limit → identical Algebra storm.
+                for &pool in pool_addresses {
+                    if !(algebra_pools.contains(&pool) || algebra_integral_pools.contains(&pool)) {
+                        continue;
+                    }
+                    let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+                        continue;
+                    };
+                    if let Some(fb) = algebra_fallback_target(arena, idx, word_range) {
                         algebra_fallback.push(fb);
                     }
                 }
@@ -482,6 +502,9 @@ pub async fn enrich_v3_ticks<
         }
     }
     let algebra_target_count = all_algebra.len();
+    // Pools that already took the tickTable path (labeled or TickLens-miss fallback).
+    let algebra_attempted: FxHashSet<Address> =
+        all_algebra.iter().map(|(addr, _, _, _, _)| *addr).collect();
     let algebra = enrich_algebra_ticks(
         provider,
         arena,
@@ -492,8 +515,9 @@ pub async fn enrich_v3_ticks<
     .await;
     updated += algebra.loaded;
 
-    // One wider TickLens pass for pools still tickless. Quiet UniV3 pools often have
-    // initialized ticks outside word_range=10 (Algebra-only widen misses them).
+    // Wider window for still-tickless pools. UniV3 → TickLens; Algebra (labeled or
+    // prior tickTable attempt) → tickTable widen. TickLens-only widen never helps
+    // QuickSwap; unlabeled Algebra fallbacks need both when still empty.
     // Cap + liquidity-rank: full widen of 30+ empties dominates LF under rate limits.
     let mut wide_loaded = 0usize;
     // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
@@ -523,9 +547,46 @@ pub async fn enrich_v3_ticks<
                 .map(|(p, _)| p)
                 .collect();
             wide_attempted.extend(wide_targets.iter().copied());
-            wide_loaded =
-                enrich_v3_tick_lens_only(provider, arena, &wide_targets, wide_range, block_number)
-                    .await;
+            let mut lens_wide = Vec::new();
+            let mut algebra_wide = Vec::new();
+            for pool in wide_targets {
+                let labeled = algebra_pools.contains(&pool)
+                    || algebra_integral_pools.contains(&pool);
+                if labeled || algebra_attempted.contains(&pool) {
+                    let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
+                        continue;
+                    };
+                    if let Some(fb) = algebra_fallback_target(arena, idx, wide_range) {
+                        algebra_wide.push(fb);
+                    }
+                }
+                // Labeled Algebra skips TickLens entirely; unlabeled still needs a
+                // wider TickLens pass when the Algebra probe was a false positive.
+                if !labeled {
+                    lens_wide.push(pool);
+                }
+            }
+            if !lens_wide.is_empty() {
+                wide_loaded += enrich_v3_tick_lens_only(
+                    provider,
+                    arena,
+                    &lens_wide,
+                    wide_range,
+                    block_number,
+                )
+                .await;
+            }
+            if !algebra_wide.is_empty() {
+                let alg = enrich_algebra_ticks(
+                    provider,
+                    arena,
+                    &algebra_wide,
+                    algebra_integral_pools,
+                    block_number,
+                )
+                .await;
+                wide_loaded += alg.loaded;
+            }
             updated += wide_loaded;
         }
     }
@@ -686,16 +747,13 @@ async fn enrich_v3_tick_lens_only<
     let mut loaded = 0usize;
     for (start, end, idx) in spans {
         let mut ticks: Vec<V3Tick> = Vec::new();
-        let mut complete = true;
         for bytes in &results[start..end] {
             let Some(bytes) = bytes else {
-                complete = false;
-                break;
+                continue;
             };
             let Ok(populated) = ITickLens::getPopulatedTicksInWordCall::abi_decode_returns(bytes)
             else {
-                complete = false;
-                break;
+                continue;
             };
             for pt in populated {
                 let tick = pt.tick.as_i32();
@@ -709,7 +767,7 @@ async fn enrich_v3_tick_lens_only<
                 });
             }
         }
-        if !complete || ticks.is_empty() {
+        if ticks.is_empty() {
             continue;
         }
         finalize_cl_ticks(&mut ticks);
@@ -806,7 +864,7 @@ pub async fn enrich_v4_ticks<
                 continue;
             };
             for bit in 0..256u16 {
-                if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                if tick_calls.len() >= MAX_CL_TICK_INFO_READS {
                     // ponytail: stop this pool only — keep budget peers eligible
                     incomplete_pools.insert(idx);
                     capped = true;
@@ -1046,7 +1104,7 @@ async fn enrich_v4_ticks_once<
                 continue;
             };
             for bit in 0..256u16 {
-                if tick_calls.len() >= MAX_V4_TICK_INFO_READS {
+                if tick_calls.len() >= MAX_CL_TICK_INFO_READS {
                     break 'words;
                 }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
@@ -1142,13 +1200,33 @@ async fn enrich_algebra_ticks<
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
 
-    let word_count: usize = targets
+    if targets.is_empty() {
+        return TickEnrichment::default();
+    }
+
+    // Liquidity-rank + cap: live 100+ pool tickTable multicalls rate-limit to zero.
+    let mut ranked: Vec<(Address, PoolIndex, i32, i32, i32, u128)> = targets
         .iter()
-        .map(|(_, _, _, word_min, word_max)| (word_max - word_min + 1) as usize)
+        .copied()
+        .map(|(pool, idx, spacing, word_min, word_max)| {
+            let liq = match arena.pool_state(idx) {
+                Some(crate::core::types::PoolState::V3(s)) => s.liquidity,
+                _ => 0,
+            };
+            (pool, idx, spacing, word_min, word_max, liq)
+        })
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.5.cmp(&a.5));
+    let truncated = ranked.len() > MAX_ALGEBRA_TICK_POOLS;
+    ranked.truncate(MAX_ALGEBRA_TICK_POOLS);
+
+    let word_count: usize = ranked
+        .iter()
+        .map(|(_, _, _, word_min, word_max, _)| (word_max - word_min + 1) as usize)
         .sum();
     let mut bitmap_calls = Vec::with_capacity(word_count);
-    let mut spans = Vec::with_capacity(targets.len());
-    for &(pool, idx, spacing, word_min, word_max) in targets {
+    let mut spans = Vec::with_capacity(ranked.len());
+    for &(pool, idx, spacing, word_min, word_max, _) in &ranked {
         let start = bitmap_calls.len();
         for word in word_min..=word_max {
             bitmap_calls.push(MulticallItem {
@@ -1168,7 +1246,7 @@ async fn enrich_algebra_ticks<
         Err(error) => {
             crate::warn!(
                 "algebra tick bitmap multicall failed ({} pools): {error:#}",
-                targets.len(),
+                ranked.len(),
             );
             return TickEnrichment {
                 rpc_failed: true,
@@ -1176,11 +1254,15 @@ async fn enrich_algebra_ticks<
             };
         }
     };
+
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
+    let mut incomplete_pools = 0usize;
+    let mut capped = false;
     for (pool, idx, spacing, word_min, start, end) in spans {
-        for (offset, bytes) in bitmaps[start..end].iter().enumerate() {
-            let Some(bytes) = bytes else {
+        // Center-out: when tick budget hits, keep depth nearest the current price.
+        'words: for offset in cl_bitmap_center_out_offsets(end - start) {
+            let Some(bytes) = bitmaps[start + offset].as_ref() else {
                 continue;
             };
             let Ok(bitmap) = IAlgebraPool::tickTableCall::abi_decode_returns(bytes) else {
@@ -1188,6 +1270,12 @@ async fn enrich_algebra_ticks<
             };
             let bitmap = U256::from(bitmap);
             for bit in 0..256u16 {
+                if tick_calls.len() >= MAX_CL_TICK_INFO_READS {
+                    // ponytail: stop this pool only — keep budget peers eligible
+                    incomplete_pools += 1;
+                    capped = true;
+                    break 'words;
+                }
                 if ((bitmap >> bit) & U256::from(1u8)).is_zero() {
                     continue;
                 }
@@ -1206,6 +1294,13 @@ async fn enrich_algebra_ticks<
             }
         }
     }
+    if tick_calls.is_empty() {
+        return TickEnrichment {
+            // Truncated peers stay eligible via URL / next pass.
+            rpc_failed: truncated,
+            ..TickEnrichment::default()
+        };
+    }
     let states = match execute_multicall_at(provider, &tick_calls, block_number).await {
         Ok(states) => states,
         Err(error) => {
@@ -1215,6 +1310,7 @@ async fn enrich_algebra_ticks<
             );
             return TickEnrichment {
                 rpc_failed: true,
+                incomplete_pools,
                 ..TickEnrichment::default()
             };
         }
@@ -1244,8 +1340,16 @@ async fn enrich_algebra_ticks<
             updated += 1;
         }
     }
+    if incomplete_pools > 0 || capped || truncated {
+        crate::warn!(
+            "algebra tick hydration partial/capped: incomplete_pools={incomplete_pools} capped={capped} truncated={truncated} loaded={updated}"
+        );
+    }
     TickEnrichment {
         loaded: updated,
+        // Cap/truncate left empties → retry other URL; genuine empties cooldown upstream.
+        rpc_failed: capped || truncated,
+        incomplete_pools,
         ..TickEnrichment::default()
     }
 }
