@@ -529,8 +529,8 @@ mod tests {
         cache.insert(
             addr,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: U256::from(1_000_000u64),
-                reserve1: U256::from(1_000_000u64),
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE,
                 fee: U256::from(3u64),
                 fee_denominator: U256::from(1000u64),
                 block_timestamp_last: 1,
@@ -551,8 +551,8 @@ mod tests {
         cache.insert(
             fresh,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: U256::from(1_000_000u64),
-                reserve1: U256::from(1_000_000u64),
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE,
                 fee: U256::from(3u64),
                 fee_denominator: U256::from(1000u64),
                 block_timestamp_last: 1,
@@ -603,8 +603,8 @@ mod tests {
         cache.insert(
             tradable,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
-                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE
                     + alloy::primitives::U256::from(1u64),
                 fee: alloy::primitives::U256::from(997u64),
                 fee_denominator: alloy::primitives::U256::from(1_000u64),
@@ -630,8 +630,8 @@ mod tests {
         cache.insert(
             in_index,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
-                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE
                     + alloy::primitives::U256::from(1u64),
                 fee: alloy::primitives::U256::from(997u64),
                 fee_denominator: alloy::primitives::U256::from(1_000u64),
@@ -641,8 +641,8 @@ mod tests {
         cache.insert(
             off_index,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
-                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE
                     + alloy::primitives::U256::from(1u64),
                 fee: alloy::primitives::U256::from(997u64),
                 fee_denominator: alloy::primitives::U256::from(1_000u64),
@@ -662,8 +662,8 @@ mod tests {
             cache.insert(
                 address,
                 PoolState::V2(crate::core::types::V2PoolState {
-                    reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
-                    reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                    reserve0: crate::core::constants::V2_MIN_RESERVE,
+                    reserve1: crate::core::constants::V2_MIN_RESERVE
                         + alloy::primitives::U256::from(1u64),
                     fee: alloy::primitives::U256::from(997u64),
                     fee_denominator: alloy::primitives::U256::from(1_000u64),
@@ -696,8 +696,8 @@ mod tests {
         cache.insert(
             tradable_addr,
             PoolState::V2(crate::core::types::V2PoolState {
-                reserve0: crate::core::constants::MIN_HOP_TOKEN_BALANCE,
-                reserve1: crate::core::constants::MIN_HOP_TOKEN_BALANCE
+                reserve0: crate::core::constants::V2_MIN_RESERVE,
+                reserve1: crate::core::constants::V2_MIN_RESERVE
                     + alloy::primitives::U256::from(1u64),
                 fee: alloy::primitives::U256::from(997u64),
                 fee_denominator: alloy::primitives::U256::from(1_000u64),

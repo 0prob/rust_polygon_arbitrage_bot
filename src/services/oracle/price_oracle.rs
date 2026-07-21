@@ -115,46 +115,32 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("07ad7b4a7662d19a6bc675f6b467172d2f3947fa653ca97555a9b20236406628"),
     },
+    // SAND / MANA / UNI / GRT / GHST — addresses must match core::constants hubs.
     TokenFeed {
-        token: address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
+        token: address!("0xbbba073c31bf03b8acf7c28ef0738decf3695683"), // SAND
         chainlink: None,
         pyth_id: Some("cb7a1d45139117f8d3da0a4b67264579aa905e3b124efede272634f094e1e9d1"),
     },
     TokenFeed {
-        token: address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
+        token: address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"), // MANA
         chainlink: None,
         pyth_id: Some("1dfffdcbc958d732750f53ff7f06d24bb01364b3f62abea511a390c74b8d16a5"),
     },
     TokenFeed {
-        token: address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
+        token: address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"), // UNI
         // Official Polygon UNI/USD proxy (typo eE6b11a9 returned empty eth_call / multicall fail).
         chainlink: Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD8682386e13C")),
         pyth_id: Some("78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501"),
     },
     TokenFeed {
-        token: address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
+        token: address!("0x5fe2b58c013d7601147dcdd68c143a77499f5531"), // GRT
         chainlink: None,
         pyth_id: Some("4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7"),
     },
     TokenFeed {
-        token: address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
-        chainlink: None,
-        pyth_id: Some("4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478"),
-    },
-    TokenFeed {
-        token: address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
-        chainlink: None,
-        pyth_id: Some("63f341689d98a12ef60a5cff1d7f85c70a9e17bf1575f0e7c0b2512d48b1c8b3"),
-    },
-    TokenFeed {
-        token: address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
+        token: address!("0x385eeac5cb85a38a9a07a70c73e0a3271cfb54a7"), // GHST
         chainlink: None,
         pyth_id: Some("c63e2a7f37a04e5e614c07238bedb25dcc38927fba8fe890597a593c0b2fa4ad"),
-    },
-    TokenFeed {
-        token: address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
-        chainlink: None,
-        pyth_id: Some("9a4df90b25497f66b1afb012467e316e801ca3d839456db028892fe8c70c8016"),
     },
     TokenFeed {
         token: address!("0x03b54A0eF8042C0f6A77B15e637c9f5d7c6790D0"),
@@ -1475,20 +1461,11 @@ mod tests {
 
     #[test]
     fn built_in_pyth_feeds_cover_extended_polygon_tokens() {
+        use crate::core::constants::{
+            AAVE, BAL, COMP, CRV, GHST, GRT, LINK, MANA, SAND, SNX, SUSHI, UNI, WST_ETH,
+        };
         let tokens = [
-            address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
-            address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),
-            address!("0x172370d5cd63279efa6d502dab29171933a610af"),
-            address!("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a"),
-            address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
-            address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
-            address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
-            address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
-            address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
-            address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
-            address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
-            address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
-            address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
+            LINK, AAVE, CRV, SUSHI, BAL, SAND, MANA, UNI, GRT, GHST, WST_ETH, COMP, SNX,
         ];
         assert!(tokens.iter().all(|token| pyth_feed(token).is_some()));
     }

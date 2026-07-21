@@ -572,12 +572,13 @@ impl StateArena {
 
         // Cap rebuild ingest — uncapped tradable dumps (live: 12 rebuilds/150s
         // each reloading 1k–6k) thrash cycle cache. Remainder appends next ticks.
-        const ARENA_REBUILD_CAP: usize = 2048;
-        let rebuild_n = tradable.len().min(ARENA_REBUILD_CAP);
+        let rebuild_n = tradable
+            .len()
+            .min(crate::core::constants::ARENA_REBUILD_CAP);
         let mut metas = Vec::with_capacity(rebuild_n.max(1));
         let mut appended = 0usize;
         for (idx, _address, state) in &tradable {
-            if appended >= ARENA_REBUILD_CAP {
+            if appended >= crate::core::constants::ARENA_REBUILD_CAP {
                 break;
             }
             let Some(pool) = pools.get(*idx) else {
@@ -613,10 +614,10 @@ impl StateArena {
         decimal_hints: Option<&FxHashMap<Address, u8>>,
         metas: &mut Vec<crate::pipeline::types::PoolMeta>,
     ) {
-        const ARENA_APPEND_CAP: usize = 512;
+        let arena_append_cap = crate::core::constants::ATTACH_BATCH_CAP;
         let mut added = 0usize;
         for (idx, address, state) in tradable {
-            if added >= ARENA_APPEND_CAP {
+            if added >= arena_append_cap {
                 break;
             }
             if self.inner.address_to_pool.contains_key(address) {
@@ -729,9 +730,9 @@ impl StateArena {
 
         // Match graph ATTACH_MISSING_CAP — uncapped tails made eligible grow
         // faster than attach could drain (live: 1.7k→6k/150s).
-        const ARENA_APPEND_CAP: usize = 512;
+        let arena_append_cap = crate::core::constants::ATTACH_BATCH_CAP;
         let tail = &tradable[prefix_len..];
-        let append_n = tail.len().min(ARENA_APPEND_CAP);
+        let append_n = tail.len().min(arena_append_cap);
         let extra_tokens: usize = tail[..append_n]
             .iter()
             .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
@@ -1374,8 +1375,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_skips_two_token_pool_when_decimal_hints_incomplete() {
-        use crate::core::constants::MIN_HOP_TOKEN_BALANCE;
+    fn sync_admits_two_token_pool_when_one_decimal_hint_missing() {
+        // Missing tips fall back to 18 (see sync_pool_graph_eligible). Old test
+        // used 1-wei reserves which failed marginal-spot and looked like a reject.
+        use crate::core::constants::V2_MIN_RESERVE;
         use crate::core::types::V2PoolState;
 
         let usdc = Address::from([1u8; 20]);
@@ -1385,8 +1388,8 @@ mod tests {
         cache.insert(
             pool_address,
             PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE,
-                reserve1: MIN_HOP_TOKEN_BALANCE + U256::from(1u64),
+                reserve0: V2_MIN_RESERVE,
+                reserve1: V2_MIN_RESERVE + U256::from(1u64),
                 fee: U256::from(997u64),
                 fee_denominator: U256::from(1_000u64),
                 block_timestamp_last: 1,
@@ -1414,10 +1417,7 @@ mod tests {
             .collect();
         let mut arena = StateArena::default();
         let metas = arena.sync_from_discovery(&cache, &discovered, &address_index, Some(&hints));
-        assert!(
-            metas.is_empty(),
-            "missing weth decimals must not admit pool"
-        );
+        assert_eq!(metas.len(), 1, "missing weth hint falls back to 18dp");
     }
 
     #[test]

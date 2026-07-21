@@ -245,8 +245,10 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         return (Vec::new(), diag);
     }
 
+    // Survivors cap at max_keep — only probe that many best-by-score candidates.
+    // (was max_keep + rescue_cap with rescue_cap=max_keep → 2× dust sims, same keep.)
     let rescue_cap = max_keep;
-    let sim_window = simulable.len().min(max_keep.saturating_add(rescue_cap));
+    let sim_window = simulable.len().min(max_keep);
     diag.sim_window = sim_window;
     // Partial select then sort only the sim window — avoid O(n log n) on the tail.
     if simulable.len() > sim_window {
@@ -267,41 +269,49 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
             .collect()
     };
 
-    let mut rescue_used = 0usize;
-    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
+    // Prefer Keep → RescueGas → RescueSpot so dust spot-rescues cannot crowd out
+    // gas-coverable routes when scores interleave (live: probe_kept=0 with near_net).
+    let mut keeps = Vec::new();
+    let mut gas_rescues = Vec::new();
+    let mut spot_rescues = Vec::new();
     for (cycle, verdict) in candidates.into_iter().zip(verdicts) {
-        let keep = match verdict {
+        match verdict {
             PrefilterVerdict::Keep => {
                 diag.profit_keep += 1;
-                true
+                keeps.push(cycle);
             }
-            PrefilterVerdict::RescueGas => {
-                if rescue_used >= rescue_cap {
-                    diag.rescue_cap_drop += 1;
-                    false
-                } else {
-                    rescue_used += 1;
-                    diag.gas_rescue += 1;
-                    true
-                }
-            }
-            PrefilterVerdict::RescueSpot => {
-                if rescue_used >= rescue_cap {
-                    diag.rescue_cap_drop += 1;
-                    false
-                } else {
-                    rescue_used += 1;
-                    diag.spot_rescue += 1;
-                    true
-                }
-            }
-        };
-        if keep {
-            survivors.push(cycle);
-            if survivors.len() >= max_keep {
-                break;
-            }
+            PrefilterVerdict::RescueGas => gas_rescues.push(cycle),
+            PrefilterVerdict::RescueSpot => spot_rescues.push(cycle),
         }
+    }
+
+    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
+    survivors.extend(keeps.into_iter().take(max_keep));
+
+    let mut rescue_used = 0usize;
+    for cycle in gas_rescues {
+        if survivors.len() >= max_keep {
+            break;
+        }
+        if rescue_used >= rescue_cap {
+            diag.rescue_cap_drop += 1;
+            continue;
+        }
+        rescue_used += 1;
+        diag.gas_rescue += 1;
+        survivors.push(cycle);
+    }
+    for cycle in spot_rescues {
+        if survivors.len() >= max_keep {
+            break;
+        }
+        if rescue_used >= rescue_cap {
+            diag.rescue_cap_drop += 1;
+            continue;
+        }
+        rescue_used += 1;
+        diag.spot_rescue += 1;
+        survivors.push(cycle);
     }
     diag.out = survivors.len();
     (survivors, diag)
@@ -578,8 +588,9 @@ mod tests {
         let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([1u8; 20]));
         let b = arena.register_token(Address::from([2u8; 20]));
-        let deep = crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(1100u64);
-        let shallow = crate::core::constants::MIN_HOP_TOKEN_BALANCE * U256::from(900u64);
+        // Above V2 dust floor so the pool is graph-tradable; still dust at probe size.
+        let deep = crate::core::constants::V2_MIN_RESERVE * U256::from(1100u64);
+        let shallow = crate::core::constants::V2_MIN_RESERVE * U256::from(900u64);
         let pool = arena.register_pool(Address::from([3u8; 20]), v2_pool(deep, shallow));
         let pool2 = arena.register_pool(Address::from([4u8; 20]), v2_pool(shallow, deep));
         let graph_negative = FoundCycle {

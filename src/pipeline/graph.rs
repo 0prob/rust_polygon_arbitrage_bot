@@ -700,6 +700,10 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) -
 }
 
 /// Drop dead/unprofitable direct edges, re-thin parallel routes, and refresh coverage.
+///
+/// `token_slots`: when `Some`, only those token adjacencies are thinned/sorted
+/// (partial dirty rescore). Hub adjacencies are only fully re-sorted on a full
+/// compact — partial path used to re-sort every hub every tick (live: 500+ hubs).
 fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize]>) {
     let token_count = graph.token_count as usize;
     let touch_all = token_slots.is_none();
@@ -710,8 +714,17 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
             continue;
         }
         if let Some(adj) = graph.adjacency.get_mut(adj_idx) {
+            // Capture pool ids *before* thin so fully-dropped parallels still reindex
+            // (live: stale pool_edge_positions pointed at thinned-away Directs).
+            let pools_before: smallvec::SmallVec<[usize; 16]> = adj
+                .iter()
+                .map(|ge| ge.edge.pool_index.0 as usize)
+                .collect();
             if thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR) {
                 topology_changed = true;
+                for p in pools_before {
+                    reindex_pools.insert(p);
+                }
             }
             sort_adjacency_edges(adj);
             for ge in adj.iter() {
@@ -719,10 +732,12 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
             }
         }
     }
-    for adj in graph.adjacency.iter_mut().skip(token_count) {
-        sort_adjacency_edges(adj);
-        for ge in adj.iter() {
-            reindex_pools.insert(ge.edge.pool_index.0 as usize);
+    if touch_all {
+        for adj in graph.adjacency.iter_mut().skip(token_count) {
+            sort_adjacency_edges(adj);
+            for ge in adj.iter() {
+                reindex_pools.insert(ge.edge.pool_index.0 as usize);
+            }
         }
     }
     if !reindex_pools.is_empty() {
@@ -785,10 +800,27 @@ fn pool_direct_edges_match_meta(
 
 pub(crate) fn remove_pool_edges_from_graph(graph: &mut RoutingGraph, pool: PoolIndex) {
     let pool_idx = pool.0 as usize;
+    // Use reverse index — full adjacency scan was O(all edges) per stale-meta strip
+    // (live: attach_missing strip+rebuild thrash on large graphs).
+    let positions = graph
+        .pool_edge_positions
+        .get(pool_idx)
+        .cloned()
+        .unwrap_or_default();
+    if positions.is_empty() {
+        return;
+    }
     let mut reindex = rustc_hash::FxHashSet::default();
     reindex.insert(pool_idx);
+    let mut adj_touched = rustc_hash::FxHashSet::default();
+    for &(adj_idx, _) in &positions {
+        adj_touched.insert(adj_idx);
+    }
     let mut changed = false;
-    for adj in graph.adjacency.iter_mut() {
+    for adj_idx in adj_touched {
+        let Some(adj) = graph.adjacency.get_mut(adj_idx) else {
+            continue;
+        };
         let before = adj.len();
         adj.retain(|ge| ge.edge.pool_index != pool);
         if adj.len() != before {
@@ -944,7 +976,8 @@ impl GraphTopologyStats {
 /// Per-LF-tick attach budget. Remainder continues on later ticks via
 /// `attach_catchup_pending`. Priced/flash-only (spoke waits for rebuild).
 /// Live: 256/tick lost to arena growth (eligible 1.7k→7.4k/150s) — never drained.
-pub const ATTACH_MISSING_CAP: usize = 512;
+/// Alias of [`crate::core::constants::ATTACH_BATCH_CAP`] for graph attach catch-up.
+pub const ATTACH_MISSING_CAP: usize = crate::core::constants::ATTACH_BATCH_CAP;
 
 #[derive(Debug, Clone, Default)]
 pub struct GraphAttachReport {
@@ -1226,6 +1259,7 @@ pub fn rescore_pools_in_place(
         .filter(|idx| *idx < token_count)
         .collect();
     if compact_slots.is_empty() {
+        // Hub-only dirty set: sort those hubs and reindex (no full-hub compact).
         for adj_idx in &affected_adjacencies {
             if let Some(adj) = graph.adjacency.get_mut(*adj_idx) {
                 sort_adjacency_edges(adj);
@@ -1233,7 +1267,20 @@ pub fn rescore_pools_in_place(
         }
         rebuild_pool_edge_positions_for_pools(graph, touched_pools);
     } else {
+        // Also sort any affected hub adjacencies without walking every hub.
+        let token_count = graph.token_count as usize;
+        for &adj_idx in &affected_adjacencies {
+            if adj_idx >= token_count
+                && let Some(adj) = graph.adjacency.get_mut(adj_idx)
+            {
+                sort_adjacency_edges(adj);
+            }
+        }
         compact_token_adjacency(graph, Some(&compact_slots));
+        // Hub rescores need positions refreshed for dirty pools (compact skipped hubs).
+        if affected_adjacencies.iter().any(|&i| i >= token_count) {
+            rebuild_pool_edge_positions_for_pools(graph, touched_pools.iter().copied());
+        }
     }
     touched
 }
@@ -1434,7 +1481,9 @@ mod tests {
     }
 
     #[test]
-    fn two_token_balancer_direct_edges_follow_vault_order() {
+    fn two_token_balancer_hub_spoke_follows_vault_order() {
+        // Balancer is always hub-spoke (not Direct) — meta may reverse tokens
+        // vs vault order; Enter legs must use vault indices 0/1.
         let mut arena = StateArena::default();
         let addr_a = Address::from([10u8; 20]);
         let addr_b = Address::from([20u8; 20]);
@@ -1460,18 +1509,27 @@ mod tests {
                 last_change_block: 0,
             })),
         );
-        // Discovery meta reversed vs vault order — edges must still use vault indices.
+        // Discovery meta reversed vs vault order.
         let meta = pool_meta_from_pair(pool, ProtocolType::BalancerV2, token_b, token_a, 10);
         let graph = build_graph(&arena, std::slice::from_ref(&meta));
-        let from_a: Vec<&GraphEdge> = graph.adjacency[token_a.0 as usize]
+        assert_eq!(graph.virtual_hubs.len(), 1);
+        let enter_a: Vec<&GraphEdge> = graph.adjacency[token_a.0 as usize]
             .iter()
-            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .filter(|ge| {
+                ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool
+            })
             .collect();
-        assert_eq!(from_a.len(), 1);
-        assert_eq!(from_a[0].edge.token_in, token_a);
-        assert_eq!(from_a[0].edge.token_out, token_b);
-        assert_eq!(from_a[0].edge.token_in_idx, 0);
-        assert_eq!(from_a[0].edge.token_out_idx, 1);
+        assert_eq!(enter_a.len(), 1);
+        assert_eq!(enter_a[0].edge.token_in, token_a);
+        assert_eq!(enter_a[0].edge.token_in_idx, 0); // vault leg 0 = addr_a
+        let enter_b: Vec<&GraphEdge> = graph.adjacency[token_b.0 as usize]
+            .iter()
+            .filter(|ge| {
+                ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool
+            })
+            .collect();
+        assert_eq!(enter_b.len(), 1);
+        assert_eq!(enter_b[0].edge.token_in_idx, 1);
     }
 
     #[test]
@@ -2092,12 +2150,13 @@ mod tests {
         let a = arena.register_token(Address::from([40u8; 20]));
         let b = arena.register_token(Address::from([41u8; 20]));
         let c = arena.register_token(Address::from([42u8; 20]));
-        let funded = TEST_FUNDED_RESERVE;
+        // Modest reserves so ratio moves are visible in f64 log-weight.
+        let r0 = crate::core::constants::V2_MIN_RESERVE * U256::from(10u64);
         let pool0 = arena.register_pool(
             Address::from([43u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: funded,
-                reserve1: funded + U256::from(1u64),
+                reserve0: r0,
+                reserve1: r0,
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -2106,8 +2165,8 @@ mod tests {
         let pool1 = arena.register_pool(
             Address::from([44u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: funded,
-                reserve1: funded + U256::from(100u64),
+                reserve0: r0,
+                reserve1: r0 * U256::from(2u64),
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 1,
@@ -2119,11 +2178,12 @@ mod tests {
         ];
         let mut graph = build_graph(&arena, &metas);
         let before = graph.adjacency[a.0 as usize][0].log_weight;
+        // Skew pool0 heavily so log-weight must move.
         arena.register_pool(
             Address::from([43u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: funded,
-                reserve1: funded + U256::from(50u64),
+                reserve0: r0,
+                reserve1: r0 * U256::from(50u64),
                 fee: U256::from(30u8),
                 fee_denominator: U256::from(10_000u64),
                 block_timestamp_last: 2,
@@ -2141,8 +2201,99 @@ mod tests {
             .find(|ge| ge.edge.pool_index == pool1)
             .expect("pool1 edge")
             .log_weight;
-        assert_ne!(before, after);
-        assert_eq!(untouched, still);
+        assert_ne!(before, after, "dirty pool0 weight must update");
+        assert_eq!(untouched, still, "untouched pool1 weight must stay");
+    }
+
+    #[test]
+    fn thin_parallel_reindexes_fully_dropped_pool() {
+        // When a worse parallel is thinned away, its pool_edge_positions must clear
+        // so rescore/attach do not chase stale adj indices.
+        let mut arena = StateArena::default();
+        let a = arena.register_token(Address::from([1u8; 20]));
+        let b = arena.register_token(Address::from([2u8; 20]));
+        let r = crate::core::constants::V2_MIN_RESERVE * U256::from(100u64);
+        let better = arena.register_pool(
+            Address::from([3u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: r,
+                reserve1: r * U256::from(3u64),
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let worse = arena.register_pool(
+            Address::from([4u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: r,
+                reserve1: r, // flatter ratio → lower priority
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        // Third parallel so thin keeps top-2 and can drop the worst.
+        let mid = arena.register_pool(
+            Address::from([5u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: r,
+                reserve1: r * U256::from(2u64),
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let metas = [
+            pool_meta_from_pair(better, ProtocolType::UniswapV2, a, b, 30),
+            pool_meta_from_pair(mid, ProtocolType::UniswapV2, a, b, 30),
+            pool_meta_from_pair(worse, ProtocolType::UniswapV2, a, b, 30),
+        ];
+        let mut graph = build_graph(&arena, &metas);
+        // Force thin via full compact (MAX_PARALLEL_EDGES_PER_PAIR = 2).
+        rescore_graph_in_place(&arena, &mut graph);
+        let from_a_direct = graph.adjacency[a.0 as usize]
+            .iter()
+            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .count();
+        assert!(
+            from_a_direct <= 2,
+            "thin keeps at most 2 a→b parallels, got {from_a_direct}"
+        );
+        // Reverse index must never point at a different pool's slot.
+        if let Some(pos) = graph.pool_edge_positions.get(worse.0 as usize) {
+            for &(adj_idx, edge_pos) in pos {
+                let ge = &graph.adjacency[adj_idx][edge_pos];
+                assert_eq!(
+                    ge.edge.pool_index, worse,
+                    "stale reverse index: pos points at pool {}",
+                    ge.edge.pool_index.0
+                );
+            }
+        }
+        // Fully dropped pool (both directions) must clear reverse index.
+        let still_present = graph
+            .adjacency
+            .iter()
+            .any(|adj| adj.iter().any(|ge| ge.edge.pool_index == worse));
+        if !still_present {
+            assert!(
+                graph
+                    .pool_edge_positions
+                    .get(worse.0 as usize)
+                    .is_none_or(|p| p.is_empty()),
+                "fully thinned pool must clear reverse index"
+            );
+        } else {
+            // Kept as one of top-2 on at least one direction — must still be indexed.
+            assert!(
+                graph
+                    .pool_edge_positions
+                    .get(worse.0 as usize)
+                    .is_some_and(|p| !p.is_empty()),
+                "live pool must keep reverse index"
+            );
+        }
     }
 
     fn v4_pool_state() -> Arc<PoolState> {

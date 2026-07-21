@@ -879,6 +879,30 @@ pub fn optimize_cycle(
         }
     }
 
+    // Balancer/floor clamps can raise `low` above every profitable probe seed.
+    // Re-include the best in-range seed so warm scores are not dropped (live:
+    // zero_profit after seed_high_clamp with warm_seed=0 despite gross probes).
+    if let Some(seeds) = seed_sims {
+        let mut any_in_window = false;
+        let mut best_below_low = U256::ZERO;
+        for (amount, sim) in seeds {
+            if sim.profit.is_zero() {
+                continue;
+            }
+            if *amount >= low && *amount <= high {
+                any_in_window = true;
+            } else if *amount < low && *amount >= economic_floor && *amount > best_below_low {
+                best_below_low = *amount;
+            }
+        }
+        if !any_in_window && !best_below_low.is_zero() {
+            low = best_below_low;
+            if high <= low {
+                high = low.saturating_add(U256::from(1u8));
+            }
+        }
+    }
+
     let mut sim_cache: FxHashMap<U256, crate::pipeline::types::MinimalSimResult> =
         FxHashMap::default();
     if let Some(seeds) = seed_sims {
@@ -1018,7 +1042,18 @@ pub fn optimize_cycle(
         }
     };
 
-    let iterations = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
+    // Probe ladder already showed zero gross everywhere — full 16-iter golden
+    // search mostly re-sims dead sizes (live: eval_reject≈98% zero_profit).
+    // Keep a short search in case a non-ladder size still prints profit.
+    let base_iters = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
+    let all_seed_zero_gross = seed_sims.is_some_and(|s| {
+        s.is_empty() || s.iter().all(|(_, sim)| sim.profit.is_zero())
+    });
+    let iterations = if all_seed_zero_gross {
+        base_iters.min(6)
+    } else {
+        base_iters
+    };
     let optimal = solve_brent_optimal_warm(low, high, evaluate, iterations, &warm_scores);
     if optimal < economic_floor {
         record_brent_reject(BrentOptimizeReject::BelowEconomicFloor);
@@ -1208,6 +1243,51 @@ mod tests {
         )
         .expect("raise soft-cap");
         assert_eq!(raised, seed * U256::from(8u8));
+    }
+
+    #[test]
+    fn clamp_does_not_starve_when_only_seed_sits_below_raised_low() {
+        // Mirrors optimize_cycle re-include: profitable seed below a raised low
+        // must still be representable in the window (expand low to seed).
+        use crate::pipeline::types::MinimalSimResult;
+        let seed = U256::from(100u64);
+        let seeds = [(
+            seed,
+            MinimalSimResult {
+                profit: U256::from(5u8),
+                amount_out: seed + U256::from(5u8),
+                total_gas: 50_000,
+            },
+        )];
+        // Capacity high still wide; seed clamp would set high=800.
+        let high = U256::from(10_000u64);
+        let low = U256::from(500u64); // raised above seed (e.g. balancer floor)
+        let floor = U256::from(50u64);
+        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, &seeds, None);
+        // Seed is below low so clamp still uses it for 8× headroom from amount.
+        assert_eq!(clamped, Some(seed * U256::from(8u8)));
+        // Re-include logic in optimize_cycle: low → seed when no seed in [low, high].
+        let mut low2 = low;
+        let mut high2 = clamped.unwrap_or(high).min(high);
+        let mut any_in = false;
+        let mut best_below = U256::ZERO;
+        for (amount, sim) in &seeds {
+            if sim.profit.is_zero() {
+                continue;
+            }
+            if *amount >= low2 && *amount <= high2 {
+                any_in = true;
+            } else if *amount < low2 && *amount >= floor {
+                best_below = best_below.max(*amount);
+            }
+        }
+        if !any_in && !best_below.is_zero() {
+            low2 = best_below;
+            if high2 <= low2 {
+                high2 = low2.saturating_add(U256::from(1u8));
+            }
+        }
+        assert!(seed >= low2 && seed <= high2, "seed must sit in window");
     }
 
     #[test]

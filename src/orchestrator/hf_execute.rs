@@ -846,8 +846,25 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
     }
 }
 
-/// Cap tick RPC work so HF probe hydration cannot starve evaluation.
-const HF_PROBE_TICK_POOL_CAP: usize = 64;
+/// Hard cap on tick RPC targets per probe-tick hydrate.
+/// Live: 64 under residual prep often hit 2.5s timeout and cooled 20–45 pools
+/// for 10s (`hf probe-tick hydrate timed out` ×300/run). Keep small enough that
+/// one state multicall finishes inside residual prep (median ok hydrate ~50ms).
+const HF_PROBE_TICK_POOL_CAP: usize = 16;
+/// Rough ms budget per tickless pool (lens + algebra paths under RPC RTT).
+const HF_PROBE_TICK_MS_PER_POOL: u64 = 120;
+
+/// Scale the probe hydrate pool set to residual prep budget so we finish more
+/// often instead of cooling a large pending set on timeout.
+#[must_use]
+pub(crate) fn probe_tick_pool_cap_for_budget(budget: std::time::Duration) -> usize {
+    let ms = budget.as_millis() as u64;
+    if ms < 50 {
+        return 0;
+    }
+    let by_budget = (ms / HF_PROBE_TICK_MS_PER_POOL).max(1) as usize;
+    by_budget.min(HF_PROBE_TICK_POOL_CAP)
+}
 
 fn cl_pool_on_hydrate_cooldown(
     arena: &StateArena,
@@ -1038,14 +1055,20 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
 /// mark misses, so the next tick would re-burn the whole budget on the same
 /// pools. Briefly cooldown the targets it was about to fetch; live pools
 /// recover on the next completed attempt. Returns how many were cooled.
+///
+/// `cap` must match the set `hydrate_tickless_cl_for_cycles` attempted (budget-
+/// scaled). Using the hard 64-cap here used to cool pools never in-flight.
 pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     arena: &StateArena,
     cycles: &[C],
     pool_metas: &[crate::pipeline::types::PoolMeta],
+    cap: usize,
 ) -> usize {
-    let (_, v3) = tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
-    let (_, v4) =
-        tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
+    if cap == 0 {
+        return 0;
+    }
+    let (_, v3) = tickless_v3_addresses_prioritized(arena, cycles, cap);
+    let (_, v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, cap);
     mark_tick_hydrate_timeout_cooldown(v3.iter().copied());
     mark_v4_tick_hydrate_timeout_cooldown(v4.iter().map(|&(_, pool_id)| pool_id));
     v3.len() + v4.len()
@@ -1054,6 +1077,8 @@ pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
 /// Hydrate empty V3/V4 tick arrays on selected HF cycles before probe ranking.
 /// Hot-cache refresh drops ticks when price/liquidity moves; without this, those
 /// routes classify as `cl_tickless` and never reach Brent/economics.
+///
+/// `pool_cap` limits how many tickless pools to fetch this tick (budget-scaled).
 pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     rpc: &RpcPool,
     arena: &mut StateArena,
@@ -1061,18 +1086,19 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     pool_metas: &[crate::pipeline::types::PoolMeta],
     word_range: i16,
     block_number: Option<u64>,
+    pool_cap: usize,
 ) -> ProbeTickHydrateStats {
     let mut stats = ProbeTickHydrateStats {
         cycles_tickless_before: count_tickless_cl_cycles(arena, cycles),
         ..ProbeTickHydrateStats::default()
     };
-    if cycles.is_empty() {
+    if cycles.is_empty() || pool_cap == 0 {
         stats.cycles_tickless_after = stats.cycles_tickless_before;
         return stats;
     }
-    let (v3_total, v3) = tickless_v3_addresses_prioritized(arena, cycles, HF_PROBE_TICK_POOL_CAP);
+    let (v3_total, v3) = tickless_v3_addresses_prioritized(arena, cycles, pool_cap);
     let (v4_total, v4) =
-        tickless_v4_targets_prioritized(arena, cycles, pool_metas, HF_PROBE_TICK_POOL_CAP);
+        tickless_v4_targets_prioritized(arena, cycles, pool_metas, pool_cap);
     stats.v3_total = v3_total;
     stats.v3_needed = v3.len();
     stats.v4_total = v4_total;
@@ -1739,6 +1765,22 @@ mod tests {
             attempted: false,
             matched: 10,
         }));
+    }
+
+    #[test]
+    fn probe_tick_pool_cap_scales_with_residual_budget() {
+        use std::time::Duration;
+        assert_eq!(probe_tick_pool_cap_for_budget(Duration::from_millis(40)), 0);
+        assert_eq!(probe_tick_pool_cap_for_budget(Duration::from_millis(50)), 1);
+        assert_eq!(
+            probe_tick_pool_cap_for_budget(Duration::from_millis(500)),
+            (500 / HF_PROBE_TICK_MS_PER_POOL).min(HF_PROBE_TICK_POOL_CAP as u64) as usize
+        );
+        // Full residual prep must never exceed hard cap (live cooled 45 under 64).
+        assert_eq!(
+            probe_tick_pool_cap_for_budget(Duration::from_millis(5_000)),
+            HF_PROBE_TICK_POOL_CAP
+        );
     }
 
     #[test]

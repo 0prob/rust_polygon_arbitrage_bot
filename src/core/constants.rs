@@ -9,12 +9,22 @@ pub const DEFAULT_HUB_PATH_MAX_HOPS: u32 = 4;
 /// Maximum tokens per pool metadata row (Curve/Balancer upper bound in this bot).
 pub const MAX_POOL_TOKENS: usize = 8;
 
-/// Structural nonzero-liquidity floor. Decimal- and price-aware economic floors
-/// are applied before simulation and execution.
+/// Structural nonzero-liquidity floor (non-V2). Decimal- and price-aware economic
+/// floors are applied before simulation and execution.
 pub const MIN_HOP_TOKEN_BALANCE: U256 = U256::ONE;
 
+/// Absolute wei floor on **either** Uniswap V2 reserve for graph routing and HF
+/// dust cull. Alias: [`crate::pipeline::local_sim::V2_DUST_RESERVE_WEI`].
+/// 1e8 ≈ 100 units of a 6dp stable / dust for 18dp tokens — keeps real stables,
+/// drops junk that used to fill the cycle snap (`v2_dead_skip` 90%+ of HF filter).
+pub const V2_MIN_RESERVE_WEI: u64 = 100_000_000;
+pub const V2_MIN_RESERVE: U256 = U256::from_limbs([V2_MIN_RESERVE_WEI, 0, 0, 0]);
+
+/// UniV2-style fee denominator (997/1000 = 30 bps).
 pub const FEE_DENOMINATOR: U256 = U256::from_limbs([1000, 0, 0, 0]);
+/// Basis-point scale (10_000 = 100%).
 pub const BPS_SCALE: U256 = U256::from_limbs([10_000, 0, 0, 0]);
+/// Default UniV2 fee numerator with [`FEE_DENOMINATOR`].
 pub const DEFAULT_FEE_NUMERATOR: U256 = U256::from_limbs([997, 0, 0, 0]);
 
 /// Polygon mainnet chain id.
@@ -36,35 +46,81 @@ pub const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976
 pub const AAVE_V3_POOL: Address = address!("0x794a61358D6845594F94dc1DB02A252b5b4814aD");
 /// Uniswap V3 TickLens on Polygon.
 pub const TICK_LENS_POLYGON: Address = address!("0xbfd8137f7d1516D3ea5cA83523914859ec47F573");
+
+// ─── Polygon ERC-20 hubs (never put routers/contracts here) ─────────────────
+
 /// Wrapped MATIC on Polygon.
 pub const WMATIC: Address = address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270");
 /// Bridged USDC.e on Polygon (PoS).
 pub const USDC_E: Address = address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174");
 /// Native USDC on Polygon.
 pub const USDC_NATIVE: Address = address!("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359");
+/// Bridged USDT on Polygon.
+pub const USDT: Address = address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f");
+/// Bridged WETH on Polygon.
+pub const WETH: Address = address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619");
+/// Bridged WBTC on Polygon.
+pub const WBTC: Address = address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6");
+/// Bridged DAI on Polygon.
+pub const DAI: Address = address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063");
+/// Chainlink LINK on Polygon.
+pub const LINK: Address = address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39");
+/// Aave AAVE on Polygon.
+pub const AAVE: Address = address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b");
+/// Curve CRV on Polygon.
+pub const CRV: Address = address!("0x172370d5cd63279efa6d502dab29171933a610af");
+/// SushiToken (ERC-20) on Polygon — **not** the SushiSwap router.
+pub const SUSHI: Address = address!("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a");
+/// Balancer BAL on Polygon.
+pub const BAL: Address = address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3");
+/// The Sandbox SAND on Polygon.
+pub const SAND: Address = address!("0xbbba073c31bf03b8acf7c28ef0738decf3695683");
+/// Decentraland MANA on Polygon.
+pub const MANA: Address = address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4");
+/// Uniswap UNI on Polygon.
+pub const UNI: Address = address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f");
+/// The Graph GRT on Polygon.
+pub const GRT: Address = address!("0x5fe2b58c013d7601147dcdd68c143a77499f5531");
+/// Aavegotchi GHST on Polygon.
+pub const GHST: Address = address!("0x385eeac5cb85a38a9a07a70c73e0a3271cfb54a7");
+/// Bridged wstETH on Polygon (Aave market mint).
+pub const WST_ETH: Address = address!("0x03b54a6e9a984069379fae1a4fc4dbae93b3bccd");
+/// Compound COMP on Polygon.
+pub const COMP: Address = address!("0x8505b9d2254a7ae468c0e9dd10ccea3a837aef5c");
+/// Synthetix SNX on Polygon.
+pub const SNX: Address = address!("0x50b728d8d964fd00c2d0aad81718b71311fef68a");
+/// QuickSwap QUICK (legacy) on Polygon.
+pub const QUICK: Address = address!("0x831753dd7087cac61ab5644b308642cc1c33dc13");
+/// Lido stMATIC on Polygon (LST path rates).
+pub const ST_MATIC: Address = address!("0x3a58a54c066fdc0f2d55fc9c89f0415c92ebf3c4");
+/// Stader MaticX on Polygon.
+pub const MATIC_X: Address = address!("0xfa68fb4628dff1028cfec22b4162fccd0d45efb6");
 
-/// Oracle-priced hub tokens on Polygon.
+/// Oracle-priced hub tokens on Polygon (flash/path seeds, LF prefetch, graph hubs).
+///
+/// **Must be ERC-20s only** — routers/vaults corrupt hub-path rates and flash
+/// eligibility (was: SushiSwap router `0x1b02…` and corrupted SAND/GRT digests).
 pub const POLYGON_HUB_TOKENS: [Address; 20] = [
     WMATIC,
     USDC_E,
     USDC_NATIVE,
-    address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"),
-    address!("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"),
-    address!("0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6"),
-    address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"),
-    address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
-    address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),
-    address!("0x172370d5cd63279efa6d502dab29171933a610af"),
-    address!("0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a"),
-    address!("0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3"),
-    address!("0xbbba073c31bf03b8acf7c28ef0738decf2b0bcee"),
-    address!("0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"),
-    address!("0xb33eaad8d922b1083446dc23f610c2567fb5180f"),
-    address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
-    address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
-    address!("0x9c2c5fd7b9e403564dc385c89d647e8bd6566614"),
-    address!("0x53a0b3a00de21b8cf755f75ed53af39ecd158171"),
-    address!("0xc9e3f325b6e02f3ca7e3ae0f329aee1014537c14"),
+    USDT,
+    WETH,
+    WBTC,
+    DAI,
+    LINK,
+    AAVE,
+    CRV,
+    SUSHI,
+    BAL,
+    SAND,
+    MANA,
+    UNI,
+    GRT,
+    GHST,
+    WST_ETH,
+    COMP,
+    SNX,
 ];
 
 #[inline]
@@ -92,7 +148,7 @@ pub fn polygon_usd_stable_equivalent(a: Address, b: Address) -> bool {
 pub const FEE_PIPS_SCALE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
 
 /// Oracle rate precision: MATIC wei per whole token unit.
-/// Convert base-unit amounts by dividing by `10^token_decimals`.
+/// Must equal [`crate::core::math::fixed_point::ONE`] (1e18).
 pub const RATE_PRECISION: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 /// Largest ERC-20 precision accepted for execution metadata.
 /// The on-chain enrichment path shares this bound; higher values are rejected rather than scaled.
@@ -143,9 +199,16 @@ pub const GAS_WOOFI_HOP: u32 = 160_000;
 /// Per-tick-crossed gas increment for V3/V4 pools.
 pub const GAS_PER_TICK_CROSSED: u32 = 28_000;
 
+/// LF graph attach / arena append batch size (growth catch-up per tick).
+pub const ATTACH_BATCH_CAP: usize = 512;
+/// Full arena rebuild ingest cap (remainder appends on later LF ticks).
+pub const ARENA_REBUILD_CAP: usize = 2048;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
+    use rustc_hash::FxHashSet;
 
     #[test]
     fn polygon_constants_are_distinct() {
@@ -155,5 +218,62 @@ mod tests {
         assert!(is_polygon_usd_stable(USDC_NATIVE));
         assert!(polygon_usd_stable_equivalent(USDC_E, USDC_NATIVE));
         assert!(!polygon_usd_stable_equivalent(USDC_E, WMATIC));
+    }
+
+    #[test]
+    fn hub_token_list_has_unique_erc20s_not_routers() {
+        let mut seen = FxHashSet::default();
+        for &hub in &POLYGON_HUB_TOKENS {
+            assert!(seen.insert(hub), "duplicate hub token {hub}");
+            assert_ne!(hub, BALANCER_VAULT, "vault is not a hub token");
+            assert_ne!(hub, WOOFI_ROUTER_V2, "router is not a hub token");
+            assert_ne!(hub, AAVE_V3_POOL, "pool is not a hub token");
+            assert_ne!(hub, MULTICALL3, "multicall is not a hub token");
+            // Historical bug: SushiSwap router was listed as a "hub token".
+            assert_ne!(
+                hub,
+                address!("0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"),
+                "SushiSwap router must not be a hub token"
+            );
+        }
+        assert_eq!(POLYGON_HUB_TOKENS.len(), 20);
+        assert!(is_polygon_hub_token(WMATIC));
+        assert!(is_polygon_hub_token(SAND));
+        assert!(is_polygon_hub_token(GRT));
+        assert!(is_polygon_hub_token(WST_ETH));
+        assert!(is_polygon_hub_token(COMP));
+        assert!(is_polygon_hub_token(SNX));
+    }
+
+    #[test]
+    fn rate_precision_matches_fixed_point_one() {
+        assert_eq!(RATE_PRECISION, crate::core::math::fixed_point::ONE);
+    }
+
+    #[test]
+    fn v2_min_reserve_matches_local_sim_alias() {
+        assert_eq!(
+            V2_MIN_RESERVE_WEI,
+            crate::pipeline::local_sim::V2_DUST_RESERVE_WEI
+        );
+        assert_eq!(V2_MIN_RESERVE, U256::from(V2_MIN_RESERVE_WEI));
+        assert!(V2_MIN_RESERVE > MIN_HOP_TOKEN_BALANCE);
+    }
+
+    #[test]
+    fn fee_scales_are_consistent() {
+        assert_eq!(FEE_DENOMINATOR, U256::from(1000u64));
+        assert_eq!(BPS_SCALE, U256::from(10_000u64));
+        assert_eq!(DEFAULT_FEE_NUMERATOR, U256::from(997u64));
+        assert!(DEFAULT_FEE_NUMERATOR < FEE_DENOMINATOR);
+        assert!(MAX_SANE_PROFIT_RATIO_BPS > 10_000);
+        assert_eq!(EXECUTION_MIN_SLIPPAGE_BPS, 100);
+    }
+
+    #[test]
+    fn hop_cap_matches_usize_mirror() {
+        assert_eq!(HOP_CAP_USIZE, HOP_CAP as usize);
+        assert!(DEFAULT_HUB_PATH_MAX_HOPS <= HOP_CAP);
+        assert_eq!(MAX_POOL_TOKENS, 8);
     }
 }

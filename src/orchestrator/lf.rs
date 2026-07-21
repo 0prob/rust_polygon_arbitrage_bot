@@ -224,6 +224,53 @@ fn observed_pool_start_tokens(
     out
 }
 
+/// Drop cycles that touch dust V2 hops before they poison the HF window.
+///
+/// Graph eligibility now matches the HF floor, but cached routes and mid-tick
+/// reserve drains still leave `v2_dead_skip` hundreds of dead cycles per tick
+/// (live: snap=325 v2_dead=311 selected=6).
+fn prune_dust_v2_cycles(
+    arena: &crate::pipeline::arena::StateArena,
+    cycles: Vec<crate::core::types::FoundCycle>,
+) -> Vec<crate::core::types::FoundCycle> {
+    let before = cycles.len();
+    if before == 0 {
+        return cycles;
+    }
+    let kept: Vec<_> = cycles
+        .into_iter()
+        .filter(|c| {
+            crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &c.edges).is_none()
+        })
+        .collect();
+    let dropped = before.saturating_sub(kept.len());
+    if dropped > 0 {
+        crate::info!(
+            "lf cycle prune: v2_dust_drop={dropped} keep={} (graph/HF V2 floor)",
+            kept.len()
+        );
+    }
+    kept
+}
+
+/// Like [`prune_dust_v2_cycles`] but avoids clone when the cache is already clean.
+fn prune_dust_v2_cycles_arc(
+    arena: &crate::pipeline::arena::StateArena,
+    cycles: std::sync::Arc<Vec<crate::core::types::FoundCycle>>,
+) -> std::sync::Arc<Vec<crate::core::types::FoundCycle>> {
+    if cycles.is_empty()
+        || cycles.iter().all(|c| {
+            crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &c.edges).is_none()
+        })
+    {
+        return cycles;
+    }
+    std::sync::Arc::new(prune_dust_v2_cycles(
+        arena,
+        cycles.iter().cloned().collect(),
+    ))
+}
+
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
     let max_hops = max_hops.clamp(2, HOP_CAP);
     let mut passes: SmallVec<[CycleSearchPass; 2]> = SmallVec::new();
@@ -907,7 +954,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     prior.len(),
                     work.lf_pass
                 );
-                Arc::clone(prior)
+                // Re-publish a pruned copy so dust V2 does not linger forever.
+                prune_dust_v2_cycles_arc(&work.arena, Arc::clone(prior))
             } else {
                 // Prior wiped (e.g. old post-rate store) — refill with hub DFS so
                 // we do not publish an empty snap (live: cycles=0 until next interval).
@@ -924,10 +972,13 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     true,
                     Some(&probe_ctx),
                 );
-                Arc::new(finalize_enumerated_cycles(refill.cycles, work.max_paths))
+                Arc::new(prune_dust_v2_cycles(
+                    &work.arena,
+                    finalize_enumerated_cycles(refill.cycles, work.max_paths),
+                ))
             }
         } else {
-            Arc::new(diversified)
+            Arc::new(prune_dust_v2_cycles(&work.arena, diversified))
         };
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
@@ -948,25 +999,28 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         (cycles, enumerated_cycles)
     } else {
         let cached = cached_cycles.unwrap_or_default();
+        // Rescore may have killed V2 legs mid-cache — drop dust before HF sees them.
+        let pre_prune = cached.len();
+        let pruned = prune_dust_v2_cycles_arc(&work.arena, cached);
         if work.lf_pass <= 2 || work.lf_pass.is_multiple_of(30) {
             crate::debug!(
-                "lf cycle cache: pass={} cycles={}",
+                "lf cycle cache: pass={} cycles={} (pre_prune={pre_prune})",
                 work.lf_pass,
-                cached.len()
+                pruned.len(),
             );
         }
         // Keep cache metadata current even when cycles are reused.
         work.graph_cache.lock().store(
             Arc::clone(&graph),
-            Some(Arc::clone(&cached)),
+            Some(Arc::clone(&pruned)),
             routable_count,
             layout_fp,
             work.state_generation,
             eligible_count,
             work.arena.routing_family_prefix_fingerprint(routable_count),
         );
-        let enumerated_cycles = cached.len();
-        (cached, enumerated_cycles)
+        let enumerated_cycles = pruned.len();
+        (pruned, enumerated_cycles)
     };
 
     if graph_action == "cache"

@@ -2,7 +2,9 @@ use alloy::primitives::{Address, U256};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-use crate::core::constants::{HOP_CAP, MAX_POOL_TOKENS, MIN_HOP_TOKEN_BALANCE};
+use crate::core::constants::{
+    HOP_CAP, MAX_POOL_TOKENS, MIN_HOP_TOKEN_BALANCE, V2_MIN_RESERVE,
+};
 
 const EDGE_CAP: usize = HOP_CAP as usize;
 const HOP_AMOUNT_CAP: usize = EDGE_CAP + 1;
@@ -223,9 +225,12 @@ impl PoolState {
     pub fn hop_token_funded(&self, token_idx: usize) -> bool {
         match self {
             PoolState::Invalid => false,
+            // Align with HF `v2_any_hop_dust_reserves` — 1-wei floors admitted dust
+            // V2 into the routing graph and poisoned the cycle snap (live: v2_dead
+            // 300+/325).
             PoolState::V2(s) => match token_idx {
-                0 => s.reserve0 >= MIN_HOP_TOKEN_BALANCE,
-                1 => s.reserve1 >= MIN_HOP_TOKEN_BALANCE,
+                0 => s.reserve0 >= V2_MIN_RESERVE,
+                1 => s.reserve1 >= V2_MIN_RESERVE,
                 _ => false,
             },
             PoolState::V3(s) | PoolState::V4(s) => {
@@ -483,16 +488,27 @@ mod hop_routing_tests {
     }
 
     #[test]
-    fn v2_accepts_nonzero_six_decimal_reserves() {
-        let state = PoolState::V2(V2PoolState {
+    fn v2_rejects_dust_reserves_below_graph_hf_floor() {
+        // Below V2_MIN_RESERVE (1e8) — must not be graph-tradable (aligned with HF).
+        let dust = PoolState::V2(V2PoolState {
             reserve0: U256::from(1_000_000u64),
             reserve1: U256::from(2_000_000u64),
             fee: U256::from(30u8),
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 0,
         });
+        assert!(!dust.is_tradable());
+        assert!(!dust.hop_pair_routable(0, 1));
 
-        assert!(state.is_tradable());
+        let live = PoolState::V2(V2PoolState {
+            reserve0: crate::core::constants::V2_MIN_RESERVE,
+            reserve1: crate::core::constants::V2_MIN_RESERVE + U256::from(1u64),
+            fee: U256::from(30u8),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        });
+        assert!(live.is_tradable());
+        assert!(live.hop_pair_routable(0, 1));
     }
 
     #[test]

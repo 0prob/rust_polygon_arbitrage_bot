@@ -1289,16 +1289,14 @@ fn v2_reserve_in(state: &crate::core::types::V2PoolState, zero_for_one: bool) ->
     }
 }
 
-/// Absolute wei floor on either V2 reserve. Amount-independent — safe on the live
-/// activity bypass that skips micro/economic probes (live: mid-route `0x5efc`
-/// r1=45433; after 1e6 floor, `0x1a6f` r1≈6.3e7 still ranked at cover≈1149).
-/// 1e8 ≈ 100 USDT (6dp) / dust for 18dp tokens — keeps real stables, drops junk.
-pub const V2_DUST_RESERVE_WEI: u64 = 100_000_000;
+/// Absolute wei floor on either V2 reserve — alias of
+/// [`crate::core::constants::V2_MIN_RESERVE_WEI`] so graph + HF share one number.
+pub const V2_DUST_RESERVE_WEI: u64 = crate::core::constants::V2_MIN_RESERVE_WEI;
 
 /// First V2 hop with either reserve below [`V2_DUST_RESERVE_WEI`].
 #[must_use]
 pub fn v2_any_hop_dust_reserves(arena: &StateArena, edges: &[Edge]) -> Option<usize> {
-    let floor = U256::from(V2_DUST_RESERVE_WEI);
+    let floor = crate::core::constants::V2_MIN_RESERVE;
     for (hop, edge) in edges.iter().enumerate() {
         if edge.protocol != ProtocolType::UniswapV2 {
             continue;
@@ -2863,17 +2861,20 @@ mod tests {
 
     #[test]
     fn minimal_sim_diagnoses_v2_reserve_exhaustion() {
+        use crate::core::constants::V2_MIN_RESERVE;
         use crate::core::types::V2PoolState;
         use std::sync::Arc;
 
         let mut arena = StateArena::default();
         let token_in = arena.register_token(Address::from([11u8; 20]));
         let token_out = arena.register_token(Address::from([12u8; 20]));
+        // Just above dust floor so hop is tradable; amount_in == reserve0 exhausts.
+        let reserve_in = V2_MIN_RESERVE;
         let pool = arena.register_pool(
             Address::from([13u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
-                reserve0: U256::from(1_000_000u64),
-                reserve1: U256::from(2_000_000u64),
+                reserve0: reserve_in,
+                reserve1: V2_MIN_RESERVE * U256::from(2u64),
                 fee: U256::from(997u64),
                 fee_denominator: U256::from(1_000u64),
                 block_timestamp_last: 0,
@@ -2891,14 +2892,14 @@ mod tests {
         };
 
         assert_eq!(
-            minimal_sim_failure(&arena, &[edge], U256::from(1_000_000u64)),
+            minimal_sim_failure(&arena, &[edge], reserve_in),
             Some(MinimalSimFailure::V2ReserveExhausted { hop: 0 })
         );
         // Micro walks; economic-sized start dies — select must prune (rank probe
         // no longer keeps below-floor dust that would hide this).
         assert!(micro_probe_liquidity_dead(&arena, &[edge], U256::from(1u64)).is_none());
         assert_eq!(
-            economic_floor_liquidity_dead(&arena, &[edge], U256::from(1_000_000u64)),
+            economic_floor_liquidity_dead(&arena, &[edge], reserve_in),
             Some(MinimalSimFailure::V2ReserveExhausted { hop: 0 })
         );
     }

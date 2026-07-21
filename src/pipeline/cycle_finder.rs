@@ -697,6 +697,13 @@ fn can_still_be_profitable_u256(
 }
 
 #[inline]
+fn edge_is_pin(prep: &ActiveGraph, pool: PoolIndex) -> bool {
+    prep.first_hop_pools
+        .as_ref()
+        .is_some_and(|pins| pins.contains(&pool))
+}
+
+#[inline]
 fn can_still_find_profitable_cycle(
     log_weight: f64,
     product_ratio: U256,
@@ -704,11 +711,13 @@ fn can_still_find_profitable_cycle(
     hop_cap: u32,
     curr: TokenIndex,
     prep: &ActiveGraph,
+    pin_touched: bool,
 ) -> bool {
-    // Observed-admit first-hop pin: keep exploring so pin pools can close a
-    // cycle even when spot bounds look underwater (live: first_hop_pin>0
-    // enum_touch=0 under profit prune).
-    if prep.first_hop_pools.is_some() {
+    // Once a pin pool is on the path (or pending hub enter), keep exploring so
+    // pin closes survive underwater intermediate scores (live: first_hop_pin>0
+    // enum_touch=0 under profit prune). Disabling prune for *all* branches while
+    // first_hop_pools is set burned the full 1s enum budget on non-pin Uni filler.
+    if pin_touched {
         return true;
     }
     let hop_floor = hops.max(2);
@@ -807,6 +816,7 @@ fn collect_cycles_dfs_single_start(
         global_cap: &SharedCycleCap,
         cycles: &mut Vec<FoundCycle>,
         seen: &mut rustc_hash::FxHashSet<u64>,
+        pin_touched: bool,
     ) {
         if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
             return;
@@ -820,6 +830,8 @@ fn collect_cycles_dfs_single_start(
             if !pool_mark(used_pools, pool_id) {
                 return;
             }
+            // Hub enter already marks pin_touched when the pending pool is a pin.
+            let hub_pin = pin_touched || edge_is_pin(prep, pending.pool_index);
             // Hoist meta/state once — exit-leg loop used to re-fetch every iteration.
             let Some(meta) = pool_metas
                 .get(pending.pool_index.0 as usize)
@@ -860,6 +872,7 @@ fn collect_cycles_dfs_single_start(
                     hop_cap,
                     token_out,
                     prep,
+                    hub_pin,
                 ) {
                     continue;
                 }
@@ -890,6 +903,7 @@ fn collect_cycles_dfs_single_start(
                     global_cap,
                     cycles,
                     seen,
+                    hub_pin,
                 );
                 path.pop();
             }
@@ -912,9 +926,10 @@ fn collect_cycles_dfs_single_start(
             // Hard pin-only recording zeroed exclusive DFS (raw=0); pin paths
             // rarely close before budget while non-pin Uni fills the cap —
             // prefer pin via prioritize_first_hop + pin_cycles_touching_pools.
-            let pin_touch = prep.first_hop_pools.as_ref().is_some_and(|pins| {
-                path.iter().any(|e| pins.contains(&e.pool_index))
-            });
+            let pin_touch = pin_touched
+                || prep.first_hop_pools.as_ref().is_some_and(|pins| {
+                    path.iter().any(|e| pins.contains(&e.pool_index))
+                });
             if !pin_touch
                 && (product_ratio <= ONE || product_ratio < min_profitable_cycle_ratio(hops))
             {
@@ -957,7 +972,15 @@ fn collect_cycles_dfs_single_start(
         if used_tokens[curr_idx] || hops >= hop_cap {
             return;
         }
-        if !can_still_find_profitable_cycle(log_w, product_ratio, hops, hop_cap, curr, prep) {
+        if !can_still_find_profitable_cycle(
+            log_w,
+            product_ratio,
+            hops,
+            hop_cap,
+            curr,
+            prep,
+            pin_touched,
+        ) {
             return;
         }
         let next_edges = match prep.adjacency.get(curr_idx) {
@@ -973,6 +996,7 @@ fn collect_cycles_dfs_single_start(
             }
             match ge.phase {
                 GraphHopPhase::EnterPool => {
+                    let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
                     let pending = PendingHubSwap {
                         pool_index: ge.edge.pool_index,
                         token_in: ge.edge.token_in,
@@ -1002,6 +1026,7 @@ fn collect_cycles_dfs_single_start(
                         global_cap,
                         cycles,
                         seen,
+                        next_pin,
                     );
                 }
                 GraphHopPhase::Direct => {
@@ -1014,6 +1039,7 @@ fn collect_cycles_dfs_single_start(
                     }
                     let next_log_w = log_w + ge.log_weight;
                     let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
+                    let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
                     if !can_still_find_profitable_cycle(
                         next_log_w,
                         next_ratio,
@@ -1021,6 +1047,7 @@ fn collect_cycles_dfs_single_start(
                         hop_cap,
                         ge.edge.token_out,
                         prep,
+                        next_pin,
                     ) {
                         pool_unmark(used_pools, pool_id);
                         continue;
@@ -1053,6 +1080,7 @@ fn collect_cycles_dfs_single_start(
                         global_cap,
                         cycles,
                         seen,
+                        next_pin,
                     );
                     path.pop();
                     pool_unmark(used_pools, pool_id);
@@ -1093,6 +1121,7 @@ fn collect_cycles_dfs_single_start(
         }
         match ge.phase {
             GraphHopPhase::EnterPool => {
+                let next_pin = edge_is_pin(prep, ge.edge.pool_index);
                 let pending = PendingHubSwap {
                     pool_index: ge.edge.pool_index,
                     token_in: ge.edge.token_in,
@@ -1122,6 +1151,7 @@ fn collect_cycles_dfs_single_start(
                     global_cap,
                     &mut cycles,
                     &mut seen,
+                    next_pin,
                 );
             }
             GraphHopPhase::Direct => {
@@ -1130,6 +1160,7 @@ fn collect_cycles_dfs_single_start(
                 }
                 let pool_id = ge.edge.pool_index.0;
                 let next_ratio_preview = mul_ratio_saturating(ONE, ge.ratio);
+                let next_pin = edge_is_pin(prep, ge.edge.pool_index);
                 if !can_still_find_profitable_cycle(
                     ge.log_weight,
                     next_ratio_preview,
@@ -1137,6 +1168,7 @@ fn collect_cycles_dfs_single_start(
                     hop_cap,
                     ge.edge.token_out,
                     prep,
+                    next_pin,
                 ) {
                     continue;
                 }
@@ -1168,6 +1200,7 @@ fn collect_cycles_dfs_single_start(
                     global_cap,
                     &mut cycles,
                     &mut seen,
+                    next_pin,
                 );
                 path.pop();
                 pool_unmark(&mut used_pools, pool_id);
@@ -1754,6 +1787,28 @@ mod tests {
             TokenIndex(0),
             &min_out,
             -1.0
+        ));
+    }
+
+    #[test]
+    fn pin_touched_bypasses_profit_prune_not_mere_pin_presence() {
+        // Hopeless prefix: log_w far above any live edge recovery.
+        let a = TokenIndex(0);
+        let b = TokenIndex(1);
+        let mut graph = RoutingGraph::new(2);
+        graph.add_edge(a, graph_edge(0, a, b));
+        graph.add_edge(b, graph_edge(1, b, a));
+        let mut prep = prepare_active_graph(&graph);
+        prep.prioritize_first_hop_pools(&[PoolIndex(0)]);
+        let dead_log = 50.0;
+
+        // Pins configured but path has not touched one → still prune.
+        assert!(!can_still_find_profitable_cycle(
+            dead_log, ONE, 1, 3, a, &prep, false,
+        ));
+        // Path already on a pin → keep exploring for the close.
+        assert!(can_still_find_profitable_cycle(
+            dead_log, ONE, 1, 3, a, &prep, true,
         ));
     }
 

@@ -1921,11 +1921,14 @@ pub async fn run_hf_tick(
     // Residual of shared prep_deadline — do not re-open a full HF_PREFETCH_BUDGET_MS.
     let probe_tick_budget = prep_remaining(prep_deadline);
     let probe_tick_started = now_ms();
+    let probe_pool_cap =
+        crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(probe_tick_budget);
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
-    let hydrate_stats = if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET {
+    let hydrate_stats = if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET || probe_pool_cap == 0
+    {
         crate::debug!(
-            "hf probe-tick hydrate skipped: residual prep {}ms < {}ms",
+            "hf probe-tick hydrate skipped: residual prep {}ms < {}ms (cap={probe_pool_cap})",
             probe_tick_budget.as_millis(),
             HF_PROBE_HYDRATE_MIN_BUDGET.as_millis()
         );
@@ -1940,22 +1943,24 @@ pub async fn run_hf_tick(
                 pool_metas_for_dispatch.as_ref(),
                 ctx.config.oracle.tick_word_range,
                 None,
+                probe_pool_cap,
             ),
         )
         .await
         {
             Ok(stats) => stats,
             Err(_) => {
-                // Cool the attempted targets — without this the next tick re-burns
-                // the full budget on the same pools (median tick pinned at budget).
+                // Cool only the budget-scaled set that was in-flight — not the
+                // full hard cap (live: cooled 20–45 pools ×10s after every timeout).
                 let cooled =
                     crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
                         &arena,
                         &cycles,
                         pool_metas_for_dispatch.as_ref(),
+                        probe_pool_cap,
                     );
                 crate::warn!(
-                    "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools",
+                    "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools (cap={probe_pool_cap})",
                     probe_tick_budget.as_millis()
                 );
                 crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
