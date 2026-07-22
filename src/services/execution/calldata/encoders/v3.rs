@@ -76,7 +76,7 @@ pub fn encode_v3_hop(
         recipient,
         zeroForOne: hop.edge.zero_for_one,
         amountSpecified: amount_spec,
-        sqrtPriceLimitX96: U160::from(sqrt_limit),
+        sqrtPriceLimitX96: sqrt_limit_u160(sqrt_limit)?,
         data: callback.into(),
     };
 
@@ -85,4 +85,21 @@ pub fn encode_v3_hop(
         value: U256::ZERO,
         data: swap.abi_encode().into(),
     }])
+}
+
+fn sqrt_limit_u160(sqrt_limit: U256) -> anyhow::Result<U160> {
+    if sqrt_limit.bit_len() > 160 {
+        anyhow::bail!("v3 sqrt price limit does not fit uint160");
+    }
+    Ok(U160::from(sqrt_limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_sqrt_limit_outside_uint160() {
+        assert!(sqrt_limit_u160(U256::MAX).is_err());
+    }
 }

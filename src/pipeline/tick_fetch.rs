@@ -134,6 +134,8 @@ pub struct TickEnrichment {
     pub incomplete_pools: usize,
     /// Pools hydrated via Algebra tickTable after TickLens miss / label route.
     pub algebra_loaded: usize,
+    pub algebra_no_tick_calls: usize,
+    pub algebra_decode_rejects: usize,
     /// Deprecated: probe sentinel seeding removed (phantom depth). Always 0.
     pub seeded_pools: usize,
 }
@@ -147,6 +149,12 @@ impl TickEnrichment {
             empty_pools: self.empty_pools.saturating_add(other.empty_pools),
             incomplete_pools: self.incomplete_pools.saturating_add(other.incomplete_pools),
             algebra_loaded: self.algebra_loaded.saturating_add(other.algebra_loaded),
+            algebra_no_tick_calls: self
+                .algebra_no_tick_calls
+                .saturating_add(other.algebra_no_tick_calls),
+            algebra_decode_rejects: self
+                .algebra_decode_rejects
+                .saturating_add(other.algebra_decode_rejects),
             seeded_pools: self.seeded_pools.saturating_add(other.seeded_pools),
         }
     }
@@ -534,6 +542,8 @@ pub async fn enrich_v3_ticks<
         block_number,
     )
     .await;
+    let mut algebra_no_tick_calls = algebra.algebra_no_tick_calls;
+    let mut algebra_decode_rejects = algebra.algebra_decode_rejects;
     updated += algebra.loaded;
 
     // Wider window for still-tickless pools. UniV3 → TickLens; Algebra (labeled or
@@ -602,6 +612,8 @@ pub async fn enrich_v3_ticks<
                 )
                 .await;
                 wide_loaded += alg.loaded;
+                algebra_no_tick_calls += alg.algebra_no_tick_calls;
+                algebra_decode_rejects += alg.algebra_decode_rejects;
             }
             updated += wide_loaded;
         }
@@ -655,13 +667,15 @@ pub async fn enrich_v3_ticks<
 
     if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
         crate::info!(
-            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} wide_loaded={} loaded={} still_empty={}",
+            "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} algebra_no_tick_calls={} algebra_decode_rejects={} wide_loaded={} loaded={} still_empty={}",
             pool_addresses.len(),
             direct_loaded,
             empty_pools,
             incomplete_pools,
             algebra_target_count,
             algebra.loaded,
+            algebra_no_tick_calls,
+            algebra_decode_rejects,
             wide_loaded,
             updated,
             still_tickless.len(),
@@ -700,6 +714,8 @@ pub async fn enrich_v3_ticks<
         // Wide TickLens pass counts toward hydrated pools; keep separate from
         // algebra_loaded for diagnostics (was previously summed into this field).
         algebra_loaded: algebra.loaded,
+        algebra_no_tick_calls,
+        algebra_decode_rejects,
         ..TickEnrichment::default()
     }
 }
@@ -994,7 +1010,7 @@ pub async fn enrich_v4_ticks<
 
     // Wider bitmap window for still-empty V4 (same sparse-tick pattern as V3).
     // Liquidity-ranked cap mirrors V3 — full widen of 90+ V4 empties was ~2s p50.
-    let mut wide_loaded = 0usize;
+    let mut wide = TickEnrichment::default();
     // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
     // may enter the empty cooldown — capped-out narrow misses must stay eligible.
     let mut wide_attempted: FxHashSet<FixedBytes<32>> = FxHashSet::default();
@@ -1019,10 +1035,9 @@ pub async fn enrich_v4_ticks<
                 .map(|(idx, pool_id, _)| (idx, pool_id))
                 .collect();
             wide_attempted.extend(wide_targets.iter().map(|&(_, id)| id));
-            wide_loaded =
-                enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number)
-                    .await;
-            updated += wide_loaded;
+            wide = enrich_v4_ticks_once(provider, arena, &wide_targets, wide_range, block_number)
+                .await;
+            updated += wide.loaded;
         }
     }
 
@@ -1045,7 +1060,8 @@ pub async fn enrich_v4_ticks<
         mark_v4_tick_cooldown(loaded_ok, RECENT_HYDRATE_COOLDOWN_MS);
     }
     let incomplete_count = incomplete_pools.len();
-    let needs_url_fallback = !still_tickless.is_empty() && (incomplete_count > 0 || capped);
+    let needs_url_fallback =
+        !still_tickless.is_empty() && (incomplete_count > 0 || capped || wide.rpc_failed);
     if !still_tickless.is_empty() && !needs_url_fallback {
         // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
         let cool = still_tickless
@@ -1057,18 +1073,20 @@ pub async fn enrich_v4_ticks<
         mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
     }
 
-    if empty_pools > 0 || wide_loaded > 0 || updated > 0 {
+    if empty_pools > 0 || wide.loaded > 0 || updated > 0 || wide.rpc_failed {
         for &(idx, pool_id) in targets {
             if let Some(crate::core::types::PoolState::V4(s)) = arena.pool_state(idx)
                 && s.ticks.is_empty()
             {
                 let addr = arena.pool_address(idx).unwrap_or_default();
                 crate::info!(
-                    "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_loaded={}",
+                    "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_attempted={} wide_loaded={} wide_rpc_failed={}",
                     s.tick,
                     s.tick_spacing,
                     s.liquidity,
-                    wide_loaded,
+                    wide_attempted.contains(&pool_id),
+                    wide.loaded,
+                    wide.rpc_failed,
                 );
                 break;
             }
@@ -1093,13 +1111,13 @@ async fn enrich_v4_ticks_once<
     targets: &[(PoolIndex, FixedBytes<32>)],
     word_range: i16,
     block_number: Option<u64>,
-) -> usize {
+) -> TickEnrichment {
     use crate::pipeline::abi_cache::{decode_abi_word, encode_extsload};
     use crate::pipeline::multicall::{MulticallItem, execute_multicall_at};
     use alloy::primitives::U256;
 
     if targets.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
     let manager = UNISWAP_V4_POOL_MANAGER;
     let mut bitmap_calls = Vec::new();
@@ -1123,10 +1141,13 @@ async fn enrich_v4_ticks_once<
         spans.push((idx, pool_id, spacing, word_min, start, bitmap_calls.len()));
     }
     if bitmap_calls.is_empty() {
-        return 0;
+        return TickEnrichment::default();
     }
     let Ok(bitmaps) = execute_multicall_at(provider, &bitmap_calls, block_number).await else {
-        return 0;
+        return TickEnrichment {
+            rpc_failed: true,
+            ..TickEnrichment::default()
+        };
     };
     let mut spans = spans;
     spans.sort_unstable_by(|a, b| {
@@ -1167,10 +1188,16 @@ async fn enrich_v4_ticks_once<
         }
     }
     if tick_calls.is_empty() {
-        return 0;
+        return TickEnrichment {
+            empty_pools: targets.len(),
+            ..TickEnrichment::default()
+        };
     }
     let Ok(states) = execute_multicall_at(provider, &tick_calls, block_number).await else {
-        return 0;
+        return TickEnrichment {
+            rpc_failed: true,
+            ..TickEnrichment::default()
+        };
     };
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
         rustc_hash::FxHashMap::default();
@@ -1198,7 +1225,10 @@ async fn enrich_v4_ticks_once<
             loaded += 1;
         }
     }
-    loaded
+    TickEnrichment {
+        loaded,
+        ..TickEnrichment::default()
+    }
 }
 
 fn decode_algebra_tick_entry(bytes: &[u8], tick: i32, integral: bool) -> Option<V3Tick> {
@@ -1301,8 +1331,10 @@ async fn enrich_algebra_ticks<
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
     let mut incomplete_pools = 0usize;
+    let mut no_tick_calls = 0usize;
     let mut capped = false;
     for (pool, idx, spacing, word_min, start, end) in spans {
+        let tick_start = tick_calls.len();
         // Center-out: when tick budget hits, keep depth nearest the current price.
         'words: for offset in cl_bitmap_center_out_offsets(end - start) {
             let Some(bytes) = bitmaps[start + offset].as_ref() else {
@@ -1336,11 +1368,15 @@ async fn enrich_algebra_ticks<
                 tick_owners.push((pool, idx, tick));
             }
         }
+        if tick_calls.len() == tick_start {
+            no_tick_calls += 1;
+        }
     }
     if tick_calls.is_empty() {
         return TickEnrichment {
             // Truncated peers stay eligible via URL / next pass.
             rpc_failed: truncated,
+            algebra_no_tick_calls: no_tick_calls,
             ..TickEnrichment::default()
         };
     }
@@ -1360,6 +1396,7 @@ async fn enrich_algebra_ticks<
     };
     let mut grouped: rustc_hash::FxHashMap<PoolIndex, Vec<V3Tick>> =
         rustc_hash::FxHashMap::default();
+    let mut decode_rejects = 0usize;
     for ((pool, idx, tick), bytes) in tick_owners.into_iter().zip(states) {
         let Some(bytes) = bytes else {
             continue;
@@ -1371,7 +1408,10 @@ async fn enrich_algebra_ticks<
             .or_else(|| decode_algebra_tick_entry(&bytes, tick, !prefer_integral))
         {
             Some(entry) => entry,
-            None => continue,
+            None => {
+                decode_rejects += 1;
+                continue;
+            }
         };
         grouped.entry(idx).or_default().push(tick_entry);
     }
@@ -1393,6 +1433,8 @@ async fn enrich_algebra_ticks<
         // Cap/truncate left empties → retry other URL; genuine empties cooldown upstream.
         rpc_failed: capped || truncated,
         incomplete_pools,
+        algebra_no_tick_calls: no_tick_calls,
+        algebra_decode_rejects: decode_rejects,
         ..TickEnrichment::default()
     }
 }

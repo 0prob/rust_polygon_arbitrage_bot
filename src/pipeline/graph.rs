@@ -639,37 +639,32 @@ fn pool_worth_capped_attach(
     })
 }
 
-#[inline]
-fn is_prunable_direct_edge(ge: &GraphEdge) -> bool {
-    // ponytail: do not drop dead Direct stubs — compact was deleting them, then
-    // attach_missing reattached 1k+/LF forever (ratio=0 → prune → missing → attach).
-    // DFS already ignores non-live edges via is_live_graph_edge.
-    let _ = ge;
-    false
-}
-
 /// Returns true when parallel thinning removed at least one edge.
 fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) -> bool {
     use std::cmp::Reverse;
 
     let before_len = adj.len();
     let drained = std::mem::take(adj);
-    let (mut direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
+    let (direct, mut hub_legs): (Vec<GraphEdge>, Vec<GraphEdge>) = drained
         .into_iter()
         .partition(|ge| ge.phase == GraphHopPhase::Direct);
-    direct.retain(|ge| !is_prunable_direct_edge(ge));
+    let (mut live_direct, mut stubs): (Vec<GraphEdge>, Vec<GraphEdge>) = direct
+        .into_iter()
+        .partition(crate::pipeline::cycle_finder::is_live_graph_edge);
     if max_per_pair == 0 {
-        direct.append(&mut hub_legs);
-        *adj = direct;
+        live_direct.append(&mut stubs);
+        live_direct.append(&mut hub_legs);
+        *adj = live_direct;
         return before_len != adj.len();
     }
-    if direct.len() <= max_per_pair {
-        direct.append(&mut hub_legs);
-        *adj = direct;
+    if live_direct.len() <= max_per_pair {
+        live_direct.append(&mut stubs);
+        live_direct.append(&mut hub_legs);
+        *adj = live_direct;
         return before_len != adj.len();
     }
 
-    direct.sort_by(|a, b| {
+    live_direct.sort_by(|a, b| {
         (
             a.edge.token_out.0,
             a.edge.protocol as u8,
@@ -683,26 +678,27 @@ fn thin_parallel_edges_in_place(adj: &mut Vec<GraphEdge>, max_per_pair: usize) -
                 b.edge.pool_index.0,
             ))
     });
-    let mut out_len = 0usize;
+    let mut retained = Vec::with_capacity(live_direct.len());
     let mut group_kept = 0usize;
     let mut cur_key = (u32::MAX, u8::MAX);
-    for i in 0..direct.len() {
-        let key = (direct[i].edge.token_out.0, direct[i].edge.protocol as u8);
+    for mut edge in live_direct {
+        let key = (edge.edge.token_out.0, edge.edge.protocol as u8);
         if key != cur_key {
             cur_key = key;
             group_kept = 0;
         }
         if group_kept < max_per_pair {
-            if out_len != i {
-                direct.swap(out_len, i);
-            }
-            out_len += 1;
+            retained.push(edge);
             group_kept += 1;
+        } else {
+            edge.ratio = U256::ZERO;
+            edge.log_weight = DEAD_EDGE_LOG_WEIGHT;
+            stubs.push(edge);
         }
     }
-    direct.truncate(out_len);
-    direct.append(&mut hub_legs);
-    *adj = direct;
+    retained.append(&mut stubs);
+    retained.append(&mut hub_legs);
+    *adj = retained;
     before_len != adj.len()
 }
 
@@ -988,6 +984,7 @@ pub struct GraphAttachReport {
     pub hit_cap: bool,
     /// Priced/flash missing pools still absent after this pass (diag backlog).
     pub missing_after: usize,
+    pub missing_sample: Option<PoolIndex>,
 }
 
 /// Single-pass adjacency scan for LF/HF diagnostics.
@@ -1143,6 +1140,36 @@ pub fn attach_missing_eligible_pools_with_gate(
         }
         if attach_pool_to_graph(graph, arena, meta, gate) {
             attached_pools.push(meta.pool_index);
+        } else if !graph.pool_has_edges(meta.pool_index)
+            && pool_has_admissible_edges(arena, meta, gate)
+        {
+            let state = arena.pool_state(meta.pool_index);
+            let (state_protocol, state_tokens, leg0, leg1) = state.map_or(
+                (meta.protocol, 0, None, None),
+                |state| {
+                    (
+                        crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
+                        match state {
+                            PoolState::Balancer(pool) => pool.tokens.len(),
+                            PoolState::Woofi(pool) => pool.tokens.len(),
+                            _ => meta.tokens.len(),
+                        },
+                        routing_token_at_leg(arena, state, meta, 0),
+                        routing_token_at_leg(arena, state, meta, 1),
+                    )
+                },
+            );
+            crate::debug!(
+                "graph attach no adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} legs={:?}/{:?}",
+                meta.pool_index.0,
+                arena.pool_address(meta.pool_index),
+                meta.protocol,
+                state_protocol,
+                meta.tokens.len(),
+                state_tokens,
+                leg0,
+                leg1,
+            );
         }
     }
     if !attached_pools.is_empty() {
@@ -1154,14 +1181,58 @@ pub fn attach_missing_eligible_pools_with_gate(
         .iter()
         .filter(|&&p| graph.pool_has_live_edges(p))
         .count();
-    let missing_after =
-        count_eligible_pools_missing_from_graph_with_gate(arena, pools, graph, gate);
+    let (missing_after, missing_sample) = pools.iter().fold((0usize, None), |acc, meta| {
+        let missing = pool_has_admissible_edges(arena, meta, gate)
+            && pool_worth_capped_attach(arena, meta, gate)
+            && !graph.pool_has_live_edges(meta.pool_index)
+            && !graph.pool_has_edges(meta.pool_index);
+        if missing {
+            (acc.0 + 1, acc.1.or(Some(meta.pool_index)))
+        } else {
+            acc
+        }
+    });
+    if let Some(pool_index) = missing_sample
+        && let Some(meta) = pools.iter().find(|meta| meta.pool_index == pool_index)
+    {
+        let state = arena.pool_state(pool_index);
+        let (state_protocol, state_tokens, leg0, leg1) = state.map_or(
+            (meta.protocol, 0, None, None),
+            |state| {
+                (
+                    crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
+                    match state {
+                        PoolState::Balancer(pool) => pool.tokens.len(),
+                        PoolState::Woofi(pool) => pool.tokens.len(),
+                        _ => meta.tokens.len(),
+                    },
+                    routing_token_at_leg(arena, state, meta, 0),
+                    routing_token_at_leg(arena, state, meta, 1),
+                )
+            },
+        );
+        crate::debug!(
+            "graph missing adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} hub_spoke={} edges={} live={} legs={:?}/{:?}",
+            pool_index.0,
+            arena.pool_address(pool_index),
+            meta.protocol,
+            state_protocol,
+            meta.tokens.len(),
+            state_tokens,
+            uses_hub_spoke(meta),
+            graph.pool_has_edges(pool_index),
+            graph.pool_has_live_edges(pool_index),
+            leg0,
+            leg1,
+        );
+    }
     let hit_cap = attached_pools.len() >= ATTACH_MISSING_CAP && missing_after > 0;
     GraphAttachReport {
         attached_pools: attached_pools.len(),
         live_after,
         hit_cap,
         missing_after,
+        missing_sample,
     }
 }
 
@@ -2202,13 +2273,31 @@ mod tests {
     }
 
     #[test]
-    fn thin_parallel_reindexes_fully_dropped_pool() {
-        // When a worse parallel is thinned away, its pool_edge_positions must clear
-        // so rescore/attach do not chase stale adj indices.
+    fn thin_parallel_retains_stub_for_dropped_pool() {
         let mut arena = StateArena::default();
         let a = arena.register_token(Address::from([1u8; 20]));
         let b = arena.register_token(Address::from([2u8; 20]));
         let r = crate::core::constants::V2_MIN_RESERVE * U256::from(100u64);
+        let best = arena.register_pool(
+            Address::from([6u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: r,
+                reserve1: r * U256::from(5u64),
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let higher = arena.register_pool(
+            Address::from([7u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: r,
+                reserve1: r * U256::from(4u64),
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
         let better = arena.register_pool(
             Address::from([3u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -2229,7 +2318,6 @@ mod tests {
                 block_timestamp_last: 1,
             })),
         );
-        // Third parallel so thin keeps top-2 and can drop the worst.
         let mid = arena.register_pool(
             Address::from([5u8; 20]),
             Arc::new(PoolState::V2(V2PoolState {
@@ -2241,6 +2329,8 @@ mod tests {
             })),
         );
         let metas = [
+            pool_meta_from_pair(best, ProtocolType::UniswapV2, a, b, 30),
+            pool_meta_from_pair(higher, ProtocolType::UniswapV2, a, b, 30),
             pool_meta_from_pair(better, ProtocolType::UniswapV2, a, b, 30),
             pool_meta_from_pair(mid, ProtocolType::UniswapV2, a, b, 30),
             pool_meta_from_pair(worse, ProtocolType::UniswapV2, a, b, 30),
@@ -2248,48 +2338,30 @@ mod tests {
         let mut graph = build_graph(&arena, &metas);
         // Force thin via full compact (MAX_PARALLEL_EDGES_PER_PAIR = 2).
         rescore_graph_in_place(&arena, &mut graph);
-        let from_a_direct = graph.adjacency[a.0 as usize]
+        let from_a_live = graph.adjacency[a.0 as usize]
             .iter()
-            .filter(|ge| ge.phase == GraphHopPhase::Direct)
+            .filter(|ge| crate::pipeline::cycle_finder::is_live_graph_edge(ge))
             .count();
         assert!(
-            from_a_direct <= 2,
-            "thin keeps at most 2 a→b parallels, got {from_a_direct}"
+            from_a_live <= 2,
+            "thin keeps at most 2 live a→b parallels, got {from_a_live}"
         );
-        // Reverse index must never point at a different pool's slot.
-        if let Some(pos) = graph.pool_edge_positions.get(worse.0 as usize) {
+        if let Some(pos) = graph.pool_edge_positions.get(better.0 as usize) {
             for &(adj_idx, edge_pos) in pos {
                 let ge = &graph.adjacency[adj_idx][edge_pos];
                 assert_eq!(
-                    ge.edge.pool_index, worse,
+                    ge.edge.pool_index, better,
                     "stale reverse index: pos points at pool {}",
                     ge.edge.pool_index.0
                 );
             }
         }
-        // Fully dropped pool (both directions) must clear reverse index.
-        let still_present = graph
-            .adjacency
-            .iter()
-            .any(|adj| adj.iter().any(|ge| ge.edge.pool_index == worse));
-        if !still_present {
-            assert!(
-                graph
-                    .pool_edge_positions
-                    .get(worse.0 as usize)
-                    .is_none_or(|p| p.is_empty()),
-                "fully thinned pool must clear reverse index"
-            );
-        } else {
-            // Kept as one of top-2 on at least one direction — must still be indexed.
-            assert!(
-                graph
-                    .pool_edge_positions
-                    .get(worse.0 as usize)
-                    .is_some_and(|p| !p.is_empty()),
-                "live pool must keep reverse index"
-            );
-        }
+        assert!(graph.pool_has_edges(better));
+        assert!(!graph.pool_has_live_edges(better));
+        assert_eq!(
+            attach_missing_eligible_pools(&arena, &mut graph, &metas).attached_pools,
+            0
+        );
     }
 
     fn v4_pool_state() -> Arc<PoolState> {

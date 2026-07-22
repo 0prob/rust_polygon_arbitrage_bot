@@ -1664,8 +1664,8 @@ pub async fn run_hf_tick(
             .flush_to_state_cache(&ctx.cache, hot_pools.as_ref());
         let pending_pools = stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
         if !pending_pools.is_empty() {
-            crate::warn!(
-                "stream flush incomplete: flushed={flushed} hot_dirty_pending={} — refreshing before HF eval",
+            crate::info!(
+                "stream state catch-up: flushed={flushed} unseeded_hot={} — refreshing before HF eval",
                 pending_pools.len(),
             );
             // Do not burn the hydrate floor on recovery (live: recovery 2.5s →

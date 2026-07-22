@@ -745,9 +745,9 @@ impl AppConfig {
                 self.lf_interval_ms
             );
         }
-        if self.routing.enumeration_max_paths > 200 {
+        if self.routing.enumeration_max_paths > 1_000 {
             crate::warn!(
-                "ROUTING_ENUMERATION_MAX_PATHS={} is high — cycle search may dominate LF ticks (try ≤100)",
+                "ROUTING_ENUMERATION_MAX_PATHS={} is very high — cycle search may dominate LF ticks (try ≤650)",
                 self.routing.enumeration_max_paths
             );
         }

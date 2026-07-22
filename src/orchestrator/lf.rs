@@ -572,11 +572,12 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             .set_attach_catchup_pending(report.hit_cap);
         if report.hit_cap || report.attached_pools > 0 {
             crate::info!(
-                "lf attach_missing catchup: attached={} live_after={} hit_cap={} missing_after={} eligible={eligible_count} lf_pass={}",
+                "lf attach_missing catchup: attached={} live_after={} hit_cap={} missing_after={} missing_sample={:?} eligible={eligible_count} lf_pass={}",
                 report.attached_pools,
                 report.live_after,
                 report.hit_cap,
                 report.missing_after,
+                report.missing_sample,
                 work.lf_pass
             );
         }
@@ -1556,10 +1557,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     gc.set_attach_catchup_pending(report.hit_cap);
                 }
                 crate::info!(
-                    "lf graph post-rate patch: attached={} hit_cap={} missing_after={} merged_rates={} prior_rates={}",
+                    "lf graph post-rate patch: attached={} hit_cap={} missing_after={} missing_sample={:?} merged_rates={} prior_rates={}",
                     report.attached_pools,
                     report.hit_cap,
                     report.missing_after,
+                    report.missing_sample,
                     rates.len(),
                     prior_rates.len()
                 );
