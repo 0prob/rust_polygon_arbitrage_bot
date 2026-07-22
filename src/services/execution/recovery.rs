@@ -5,8 +5,9 @@ use alloy::rpc::types::TransactionRequest;
 
 use super::gas::u256_to_u128;
 use super::nonce::NonceManager;
+use super::private_submit::PrivateSubmitConfig;
 use super::receipt::ReceiptData;
-use super::submit::{FEE_BUMP_BPS, SubmitFees, bump_fees};
+use super::submit::{FEE_BUMP_BPS, SubmitFees, bump_fees, submit_transaction};
 
 #[derive(Debug)]
 pub enum NonceRecoveryOutcome {
@@ -29,6 +30,7 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
     nonce: u64,
     fees: &SubmitFees,
     gas_limit: u64,
+    private: Option<&PrivateSubmitConfig>,
 ) -> NonceRecoveryOutcome {
     if let Some(r) = provider
         .get_transaction_receipt(tx_hash)
@@ -78,9 +80,8 @@ pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
             u256_to_u128(bumped.max_priority_fee_per_gas).unwrap_or(u128::MAX),
         );
 
-    match provider.send_transaction(cancel_tx).await {
-        Ok(pending) => {
-            let hash = *pending.tx_hash();
+    match submit_transaction(provider, cancel_tx, private).await {
+        Ok(hash) => {
             nonce_mgr.mark_stale(nonce);
             NonceRecoveryOutcome::Cancelled(hash)
         }

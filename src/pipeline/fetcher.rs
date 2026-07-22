@@ -162,6 +162,34 @@ pub async fn fetch_missing_pool_states_indexed<P: Provider<Ethereum> + Clone + S
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn fetch_pool_states_at_addresses<P: Provider<Ethereum> + Clone + Send + 'static>(
+    provider: P,
+    cache: Arc<StateCache>,
+    pools: &[DiscoveredPool],
+    address_index: &FxHashMap<Address, usize>,
+    addresses: &[Address],
+    max_multicall_calls: usize,
+    batch_pace_ms: u64,
+    block_number: Option<u64>,
+    meta_cache: &PoolMetaCache,
+) -> FetchTargetsResult {
+    let targets = select_fetch_targets_at_addresses(pools, address_index, addresses);
+    if targets.is_empty() {
+        return FetchTargetsResult::default();
+    }
+    run_fetch_targets(
+        provider,
+        cache,
+        &targets,
+        max_multicall_calls,
+        batch_pace_ms,
+        block_number,
+        meta_cache,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: P,
     cache: Arc<StateCache>,
@@ -326,6 +354,17 @@ fn select_fetch_targets_indexed<'a>(
     finalize_fetch_targets(max_pools, priority_candidates, per_protocol)
 }
 
+fn select_fetch_targets_at_addresses<'a>(
+    pools: &'a [DiscoveredPool],
+    address_index: &FxHashMap<Address, usize>,
+    addresses: &[Address],
+) -> Vec<&'a DiscoveredPool> {
+    addresses
+        .iter()
+        .filter_map(|address| address_index.get(address).and_then(|&idx| pools.get(idx)))
+        .collect()
+}
+
 fn enqueue_fetch_candidate<'a>(
     pool: &'a DiscoveredPool,
     class: u8,
@@ -466,5 +505,24 @@ mod tests {
         };
 
         assert!(!result.requires_provider_fallback());
+    }
+
+    #[test]
+    fn indexed_retry_targets_borrow_discovery_rows() {
+        let pools = [pool(1, 2), pool(2, 1)];
+        let address_index = FxHashMap::from_iter(
+            pools
+                .iter()
+                .enumerate()
+                .map(|(idx, pool)| (pool.address, idx)),
+        );
+        let selected = select_fetch_targets_at_addresses(
+            &pools,
+            &address_index,
+            &[pools[1].address, Address::ZERO],
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert!(std::ptr::eq(selected[0], &pools[1]));
     }
 }

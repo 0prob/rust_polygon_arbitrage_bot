@@ -117,7 +117,7 @@ fn build_transaction_request_with_calldata(
         .gas_limit(gas_limit))
 }
 
-async fn submit_transaction<P: Provider<Ethereum>>(
+pub(crate) async fn submit_transaction<P: Provider<Ethereum>>(
     provider: &P,
     tx: TransactionRequest,
     private: Option<&PrivateSubmitConfig>,

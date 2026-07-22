@@ -38,7 +38,7 @@ use crate::services::execution::private_submit::{
 };
 use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
-use crate::services::execution::receipt::ReceiptPoller;
+use crate::services::execution::receipt::{ReceiptPollOutcome, ReceiptPoller};
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
@@ -701,13 +701,12 @@ impl ExecutionService {
         };
         // ponytail: thin-liq (<0.05 MATIC) cools on first strike — sticky V2 dust
         // burned 3 best-eval ticks every cold start before the 1h cool applied.
-        let strikes_needed = if available_matic_wei
-            < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
-        {
-            1
-        } else {
-            CHRONIC_UNDERWATER_STRIKES
-        };
+        let strikes_needed =
+            if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI) {
+                1
+            } else {
+                CHRONIC_UNDERWATER_STRIKES
+            };
         if strikes < strikes_needed {
             return false;
         }
@@ -963,24 +962,26 @@ impl ExecutionService {
 
         let chain_head = match chain_head_hint {
             Some(head) => head,
-            None => match tokio::time::timeout(CHAIN_HEAD_RPC_TIMEOUT, sim_provider.get_block_number())
-                .await
-            {
-                Ok(Ok(block)) => block,
-                Ok(Err(e)) => {
-                    return ExecutionOutcome::SubmitFailed {
-                        reason: format!("cannot establish simulation block: {e}"),
-                    };
+            None => {
+                match tokio::time::timeout(CHAIN_HEAD_RPC_TIMEOUT, sim_provider.get_block_number())
+                    .await
+                {
+                    Ok(Ok(block)) => block,
+                    Ok(Err(e)) => {
+                        return ExecutionOutcome::SubmitFailed {
+                            reason: format!("cannot establish simulation block: {e}"),
+                        };
+                    }
+                    Err(_) => {
+                        return ExecutionOutcome::SubmitFailed {
+                            reason: format!(
+                                "cannot establish simulation block: eth_blockNumber timed out after {}ms",
+                                CHAIN_HEAD_RPC_TIMEOUT.as_millis()
+                            ),
+                        };
+                    }
                 }
-                Err(_) => {
-                    return ExecutionOutcome::SubmitFailed {
-                        reason: format!(
-                            "cannot establish simulation block: eth_blockNumber timed out after {}ms",
-                            CHAIN_HEAD_RPC_TIMEOUT.as_millis()
-                        ),
-                    };
-                }
-            },
+            }
         };
         // Pin eth_call to the LF/HF state block so simulation matches routed pool state.
         let provenance_block = candidate.state_block.max(expected_state_block);
@@ -1567,10 +1568,32 @@ impl ExecutionService {
 
         let tx_hash_str = tx_hash.to_string();
 
-        let Some(receipt) = poller
+        let poll_outcome = poller
             .wait_with_hypersync(sim_provider, tx_hash, hypersync, shutdown)
-            .await
-        else {
+            .await;
+        let Some(receipt) = (match poll_outcome {
+            ReceiptPollOutcome::Received(receipt) => Some(receipt),
+            ReceiptPollOutcome::Shutdown => {
+                nonce_mgr.release(nonce);
+                let outcome = ExecutionOutcome::SkippedShutdown;
+                if let Some(ui_hook) = ui_hook {
+                    ui_hook.on_execution_outcome(&outcome, fp);
+                }
+                return outcome;
+            }
+            ReceiptPollOutcome::RpcFailure(reason) => {
+                nonce_mgr.mark_stale(nonce);
+                self.quarantine_route_soft(fp, now);
+                let outcome = ExecutionOutcome::SubmitFailed {
+                    reason: format!("receipt RPC failed; transaction fate unknown: {reason}"),
+                };
+                if let Some(ui_hook) = ui_hook {
+                    ui_hook.on_execution_outcome(&outcome, fp);
+                }
+                return outcome;
+            }
+            ReceiptPollOutcome::TimedOut => None,
+        }) else {
             crate::info!(
                 "receipt timeout: fp={}, tx_hash={}, nonce={}",
                 fp,
@@ -1594,6 +1617,7 @@ impl ExecutionService {
                 nonce,
                 &fees,
                 final_gas,
+                private_cfg.as_ref(),
             )
             .await
             {

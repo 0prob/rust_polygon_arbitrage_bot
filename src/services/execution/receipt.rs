@@ -20,6 +20,14 @@ pub struct ReceiptData {
 }
 
 #[derive(Debug, Clone)]
+pub enum ReceiptPollOutcome {
+    Received(ReceiptData),
+    TimedOut,
+    Shutdown,
+    RpcFailure(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct ReceiptPoller {
     timeout: Duration,
     poll_interval: Duration,
@@ -44,7 +52,7 @@ impl ReceiptPoller {
         &self,
         provider: &P,
         tx_hash: B256,
-    ) -> Option<ReceiptData> {
+    ) -> ReceiptPollOutcome {
         self.wait_with_hypersync(provider, tx_hash, None, None)
             .await
     }
@@ -55,23 +63,23 @@ impl ReceiptPoller {
         tx_hash: B256,
         hypersync: Option<&HyperSyncService>,
         shutdown: Option<&watch::Receiver<bool>>,
-    ) -> Option<ReceiptData> {
+    ) -> ReceiptPollOutcome {
         let deadline = Instant::now() + self.timeout;
         let mut hypersync_seen_mined = false;
         let mut next_hypersync_check = Instant::now();
 
         loop {
             if shutdown.is_some_and(|rx| *rx.borrow()) {
-                return None;
+                return ReceiptPollOutcome::Shutdown;
             }
 
             if Instant::now() >= deadline {
-                return None;
+                return ReceiptPollOutcome::TimedOut;
             }
 
             match provider.get_transaction_receipt(tx_hash).await {
                 Ok(Some(receipt)) => {
-                    return Some(ReceiptData {
+                    return ReceiptPollOutcome::Received(ReceiptData {
                         success: receipt.status(),
                         gas_used: receipt.gas_used,
                         effective_gas_price: Some(receipt.effective_gas_price),
@@ -81,7 +89,7 @@ impl ReceiptPoller {
                 Ok(None) => {}
                 Err(err) => {
                     if !is_transient_receipt_error(&err) {
-                        return None;
+                        return ReceiptPollOutcome::RpcFailure(err.to_string());
                     }
                 }
             }
@@ -95,7 +103,7 @@ impl ReceiptPoller {
                     Ok(Some((_success, _gas_used))) => {
                         hypersync_seen_mined = true;
                         if let Some(full) = fetch_receipt_from_rpc(provider, tx_hash).await {
-                            return Some(full);
+                            return ReceiptPollOutcome::Received(full);
                         }
                         crate::debug!(
                             "hypersync receipt available but full RPC receipt is not yet available: success={_success}, gas_used={_gas_used}"
@@ -121,7 +129,7 @@ impl ReceiptPoller {
                     () = tokio::time::sleep(delay) => {}
                     changed = shutdown_rx.changed() => {
                         if changed.is_ok() && *shutdown_rx.borrow() {
-                            return None;
+                            return ReceiptPollOutcome::Shutdown;
                         }
                     }
                 }
@@ -143,4 +151,16 @@ async fn fetch_receipt_from_rpc<P: Provider<Ethereum>>(
         effective_gas_price: Some(receipt.effective_gas_price),
         logs: receipt.logs().to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_failure_is_distinct_from_timeout() {
+        let outcome = ReceiptPollOutcome::RpcFailure("unauthorized".into());
+        assert!(matches!(outcome, ReceiptPollOutcome::RpcFailure(_)));
+        assert!(!matches!(outcome, ReceiptPollOutcome::TimedOut));
+    }
 }

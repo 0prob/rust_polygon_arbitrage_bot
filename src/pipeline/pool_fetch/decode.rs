@@ -327,11 +327,6 @@ fn decode_curve_crypto_rates(
 fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let balances = decode_curve_balances(plan, results)?;
     let n_fetched = balances.len();
-    if crate::core::protocol::is_curve_stableswap_ng_pool_type(plan.pool.pool_type.as_deref())
-        && n_fetched != 2
-    {
-        return None;
-    }
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
@@ -545,6 +540,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
+    use alloy::sol_types::SolCall;
 
     fn abi_word(value: u64) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -629,6 +625,51 @@ mod tests {
         bytes.extend_from_slice(&abi_word(0));
         let results = vec![Some(Bytes::from(bytes))];
         assert!(decode_plan(&plan, &results).is_none());
+    }
+
+    #[test]
+    fn decode_curve_stable_accepts_three_coin_stableswap_ng() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![
+                    Address::with_last_byte(1),
+                    Address::with_last_byte(2),
+                    Address::with_last_byte(3),
+                ],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("stable_ng".into()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::CurveBalance(0),
+                CallKind::CurveBalance(1),
+                CallKind::CurveBalance(2),
+                CallKind::CurveA,
+                CallKind::CurveFee,
+                CallKind::CurveRates,
+            ],
+        };
+        let rates = ICurvePool::stored_ratesCall::abi_encode_returns(&vec![ONE; 3]);
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(1_000))),
+            Some(Bytes::copy_from_slice(&abi_word(2_000))),
+            Some(Bytes::copy_from_slice(&abi_word(3_000))),
+            Some(Bytes::copy_from_slice(&abi_word(100))),
+            Some(Bytes::copy_from_slice(&abi_word(4_000_000))),
+            Some(Bytes::from(rates)),
+        ];
+
+        let Some(PoolState::Curve(state)) = decode_plan(&plan, &results) else {
+            panic!("three-coin Curve NG pool should decode");
+        };
+        assert_eq!(state.n_coins, 3);
+        assert_eq!(state.balances.len(), 3);
+        assert_eq!(state.rates, vec![ONE; 3]);
     }
 
     #[test]

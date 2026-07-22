@@ -19,7 +19,9 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::{fetch_missing_pool_states, fetch_missing_pool_states_indexed};
+use crate::pipeline::fetcher::{
+    fetch_missing_pool_states_indexed, fetch_pool_states_at_addresses,
+};
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -937,27 +939,14 @@ impl StateRefreshService {
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
             let fetch_result = if let Some(ref addrs) = retry_addrs {
-                let retry_pools = {
-                    let state = self.discovery_state.read();
-                    addrs
-                        .iter()
-                        .filter_map(|addr| {
-                            let &idx = state.address_index.get(addr)?;
-                            state.discovered.get(idx).cloned()
-                        })
-                        .collect::<Vec<_>>()
-                };
-                if retry_pools.is_empty() {
-                    break;
-                }
-                fetch_missing_pool_states(
+                fetch_pool_states_at_addresses(
                     provider,
                     Arc::clone(&self.cache),
-                    &retry_pools,
-                    retry_pools.len(),
+                    pools,
+                    &address_index,
+                    addrs,
                     self.config.max_multicall_calls as usize,
                     self.config.rpc.batch_pace_ms,
-                    addrs,
                     pinned_block,
                     &self.pool_meta_cache,
                 )

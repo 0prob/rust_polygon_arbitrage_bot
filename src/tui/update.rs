@@ -166,7 +166,7 @@ pub struct RuntimeSnapshotInput {
     pub gas_gwei: Option<f64>,
     pub hypersync_height: Option<u64>,
     pub matic_usd: f64,
-    pub portfolio_rows: Vec<PortfolioRow>,
+    pub portfolio_rows: Arc<Vec<PortfolioRow>>,
     pub diagnostics: Vec<KeyValueRow>,
     pub config_rows: Vec<KeyValueRow>,
     pub route_cache: Option<RouteBuildCache>,

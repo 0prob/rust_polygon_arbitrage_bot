@@ -43,7 +43,7 @@ pub fn spawn_snapshot_publisher(
         // blocked dashboard updates for up to ~12s at startup.
         let mut last_oracle_refresh = Instant::now();
         let mut last_portfolio_refresh = Instant::now();
-        let mut portfolio_rows = Vec::new();
+        let mut portfolio_rows = Arc::new(Vec::new());
         let mut route_cache = RouteBuildCache::default();
 
         loop {
@@ -67,7 +67,7 @@ pub fn spawn_snapshot_publisher(
                     refresh_oracle,
                     refresh_portfolio,
                     &mut route_cache,
-                    std::mem::take(&mut portfolio_rows),
+                    Arc::clone(&portfolio_rows),
                 ),
             )
             .await
@@ -100,10 +100,10 @@ async fn build_ui_snapshot(
     refresh_oracle: bool,
     refresh_portfolio: bool,
     route_cache: &mut RouteBuildCache,
-    mut portfolio_rows: Vec<crate::tui::app::PortfolioRow>,
+    mut portfolio_rows: Arc<Vec<crate::tui::app::PortfolioRow>>,
 ) -> anyhow::Result<(
     crate::tui::app::DashboardSnapshot,
-    Vec<crate::tui::app::PortfolioRow>,
+    Arc<Vec<crate::tui::app::PortfolioRow>>,
 )> {
     let snap = ctx.snapshots.read();
 
@@ -184,7 +184,7 @@ async fn build_ui_snapshot(
 
     if let Some(mut task) = portfolio_task {
         match tokio::time::timeout(Duration::from_secs(6), &mut task).await {
-            Ok(Ok(rows)) => portfolio_rows = rows,
+            Ok(Ok(rows)) => portfolio_rows = Arc::new(rows),
             Ok(Err(e)) => crate::debug!("snapshot portfolio refresh failed: {e:#}"),
             Err(_) => {
                 task.abort();
@@ -272,7 +272,7 @@ async fn build_ui_snapshot(
         gas_gwei,
         hypersync_height,
         matic_usd,
-        portfolio_rows: portfolio_rows.clone(),
+        portfolio_rows: Arc::clone(&portfolio_rows),
         diagnostics,
         config_rows,
         route_cache: Some(route_cache.clone()),

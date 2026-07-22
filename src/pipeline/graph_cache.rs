@@ -142,18 +142,21 @@ impl GraphCache {
         dirty_pool_count: usize,
         arena_pool_count: usize,
     ) -> bool {
-        let _ = (routable_pool_count, layout_fingerprint);
+        let _ = (
+            routable_pool_count,
+            layout_fingerprint,
+            dirty_pool_count,
+            arena_pool_count,
+        );
         // Connectivity rebuild is handled by LF via `(needs_rebuild && !cycle_cache_valid)`.
         // Coupling rebuild→refind here defeated keep_cycles on growth/interval rebuilds.
         if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
             return true;
         }
-        // Mirror graph rescoring: a majority-dirty tick can invalidate cached routes.
-        if state_generation != self.cached_state_generation
-            && dirty_pool_count > 0
-            && arena_pool_count > 0
-            && dirty_pool_count > arena_pool_count / 2
-        {
+        // A sparse pool update can invalidate the only cached profitable route.
+        // Rescoring prices existing edges, but it cannot discover a newly negative
+        // cycle, so never reuse cycles from an older state generation.
+        if state_generation != self.cached_state_generation {
             return true;
         }
         // LF rescoring reflects pool-state deltas; full enumeration is periodic.
@@ -387,7 +390,7 @@ mod tests {
         assert!(!cache.needs_connectivity_rebuild(1_050, 1));
         assert!(!cache.needs_connectivity_rebuild(1_500, 99));
         assert!(cache.cycle_cache_still_valid(1_500, 99, 0));
-        assert!(!cache.needs_cycle_refind(1_050, 1, 6, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_050, 1, 5, 0, 1_000));
     }
 
     #[test]
@@ -433,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_does_not_force_cycle_refind() {
+    fn state_generation_change_forces_cycle_refind() {
         let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
@@ -446,7 +449,7 @@ mod tests {
             0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
-        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
+        assert!(cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
     }
 
     #[test]
@@ -462,7 +465,7 @@ mod tests {
             800,
             0,
         );
-        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
+        assert!(cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
         assert!(cache.needs_cycle_refind(1_000, 1, 6, 51, 100));
     }
 
@@ -481,9 +484,9 @@ mod tests {
             800,
             0,
         );
-        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
         cache.advance_pass();
-        assert!(cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
+        assert!(cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
     }
 
     #[test]
@@ -501,7 +504,7 @@ mod tests {
         );
         assert!(!cache.needs_connectivity_rebuild(1_100, 1));
         // Interval / empty cycles still force refind; growth alone does not.
-        assert!(!cache.needs_cycle_refind(1_100, 1, 6, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_100, 1, 5, 0, 1_000));
         assert!(cache.cycle_cache_still_valid(1_100, 1, 0));
     }
 
@@ -563,7 +566,7 @@ mod tests {
         assert!(!cache.needs_connectivity_rebuild(1_000, 11));
         assert!(cache.needs_connectivity_rebuild(1_000, 12));
         assert!(!cache.cycle_cache_still_valid(1_000, 12, 0));
-        assert!(!cache.needs_cycle_refind(1_000, 12, 6, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 12, 5, 0, 1_000));
     }
 
     #[test]
@@ -604,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_does_not_force_refind_without_interval() {
+    fn state_generation_change_forces_refind_without_interval() {
         let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
@@ -617,6 +620,6 @@ mod tests {
             0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 7, 0, 1_000));
-        assert!(!cache.needs_cycle_refind(1_000, 1, 8, 0, 1_000));
+        assert!(cache.needs_cycle_refind(1_000, 1, 8, 0, 1_000));
     }
 }

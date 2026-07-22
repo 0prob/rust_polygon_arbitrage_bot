@@ -255,7 +255,7 @@ pub struct DashboardSnapshot {
     pub graph: Arc<GraphSnapshot>,
     /// `Arc<Vec<_>>` (not `Arc<[_]>`) so status overlays can `Arc::make_mut`.
     pub opportunities: Arc<Vec<RouteSummary>>,
-    pub portfolio: Vec<PortfolioRow>,
+    pub portfolio: Arc<Vec<PortfolioRow>>,
     pub diagnostics: Vec<KeyValueRow>,
     pub config: Vec<KeyValueRow>,
 }
@@ -406,7 +406,6 @@ impl App {
         }
         self.snapshot = Some(snapshot);
         self.route_view_dirty = true;
-        self.rebuild_route_view();
     }
 
     pub fn rebuild_route_view(&mut self) {
@@ -921,7 +920,7 @@ mod tests {
                 recent_discoveries: Vec::new(),
             }),
             opportunities: Arc::new(opportunities),
-            portfolio: Vec::new(),
+            portfolio: Arc::new(Vec::new()),
             diagnostics: Vec::new(),
             config: Vec::new(),
         }
@@ -934,6 +933,7 @@ mod tests {
             1,
             vec![test_route(1, "WMATIC route"), test_route(2, "USDC route")],
         )));
+        app.rebuild_route_view();
 
         assert_eq!(app.route_view().expect("view").1.len(), 2);
         app.search = "wmatic".to_string();
@@ -950,9 +950,12 @@ mod tests {
         let mut app = App::new();
         let snapshot = Arc::new(test_snapshot(7, vec![test_route(1, "WMATIC")]));
         app.set_snapshot(Arc::clone(&snapshot));
+        app.rebuild_route_view();
         let ptr = app.route_view_indices.as_ptr();
         app.mark_route_view_dirty();
         app.set_snapshot(snapshot);
+        assert!(app.route_view_is_dirty());
+        app.rebuild_route_view();
         assert!(!app.route_view_is_dirty());
         assert_eq!(app.route_view_indices.as_ptr(), ptr);
         assert_eq!(app.route_view().expect("view").1.len(), 1);
@@ -963,9 +966,11 @@ mod tests {
         let mut app = App::new();
         let route = test_route(1, "WMATIC");
         app.set_snapshot(Arc::new(test_snapshot(7, vec![route.clone(), route])));
+        app.rebuild_route_view();
         assert_eq!(app.route_view().expect("view").1.len(), 2);
         // Gas-driven republish keeps HF generation but replaces the opportunities Arc.
         app.set_snapshot(Arc::new(test_snapshot(7, Vec::new())));
+        app.rebuild_route_view();
         assert_eq!(app.route_view().expect("view").1.len(), 0);
         assert_eq!(app.selected_index, 0);
     }
@@ -978,6 +983,7 @@ mod tests {
         let mut snap = test_snapshot(1, Vec::new());
         snap.opportunities = Arc::clone(&opportunities);
         app.set_snapshot(Arc::new(snap));
+        app.rebuild_route_view();
         let sort_ptr = app.route_sort_indices.as_ptr();
         let view_ptr = app.route_view_indices.as_ptr();
         app.apply_outcome_to_routes(1, "ok", Severity::Good, Some(RouteStatus::Executed));

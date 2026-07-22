@@ -530,18 +530,24 @@ impl StateArena {
                 };
             }
             ArenaReuse::Rebuild if !self.inner.pools.is_empty() => {
-                // Prefer index-stable refresh over wipe+reassign. Live: 12 full
-                // rebuilds/150s cleared cycle cache (proto_mismatch storms).
-                // Must still admit novel tradable addresses — frozen-only left
-                // arena stuck at 1019 forever when every tick was Rebuild
-                // (order mismatch) rather than Prefix.
-                let _ = freeze_append;
-                let mut metas = self.sync_frozen_membership(&tradable, pools, decimal_hints);
-                self.append_novel_tradable(&tradable, pools, decimal_hints, &mut metas);
-                return ArenaSyncReport {
-                    metas,
-                    indices_rebuilt: false,
-                };
+                let tradable_addresses: rustc_hash::FxHashSet<_> =
+                    tradable.iter().map(|(_, address, _)| *address).collect();
+                if self
+                    .inner
+                    .pool_addresses
+                    .iter()
+                    .all(|address| tradable_addresses.contains(address))
+                {
+                    // Prefer index-stable refresh over wipe+reassign. Live: 12 full
+                    // rebuilds/150s cleared cycle cache (proto_mismatch storms).
+                    let _ = freeze_append;
+                    let mut metas = self.sync_frozen_membership(&tradable, pools, decimal_hints);
+                    self.append_novel_tradable(&tradable, pools, decimal_hints, &mut metas);
+                    return ArenaSyncReport {
+                        metas,
+                        indices_rebuilt: false,
+                    };
+                }
             }
             ArenaReuse::Rebuild => {}
         }

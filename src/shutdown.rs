@@ -106,12 +106,12 @@ pub async fn join_pass_loop_after_shutdown(
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(e))) => {
             crate::warn!("pass loop failed during shutdown: {e:#}");
-            Ok(())
+            Err(e).context("pass loop failed during shutdown")
         }
         Ok(Err(e)) if e.is_cancelled() => Ok(()),
         Ok(Err(e)) => {
             crate::warn!("pass loop panicked during shutdown: {e:#}");
-            Ok(())
+            anyhow::bail!("pass loop panicked during shutdown: {e}")
         }
         Err(_) => {
             pass_handle.abort();
@@ -137,6 +137,28 @@ mod tests {
         assert!(
             PASS_LOOP_SHUTDOWN_TIMEOUT <= Duration::from_secs(30),
             "keep outer budget within typical 30s termination grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_join_propagates_pass_loop_error() {
+        let handle = tokio::spawn(async { anyhow::bail!("expected pass-loop failure") });
+        let error = join_pass_loop_after_shutdown(handle)
+            .await
+            .expect_err("pass-loop error must remain visible during shutdown");
+        assert!(format!("{error:#}").contains("expected pass-loop failure"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_join_propagates_pass_loop_panic() {
+        let handle = tokio::spawn(async { panic!("expected pass-loop panic") });
+        let error = join_pass_loop_after_shutdown(handle)
+            .await
+            .expect_err("pass-loop panic must remain visible during shutdown");
+        assert!(
+            error
+                .to_string()
+                .contains("pass loop panicked during shutdown")
         );
     }
 }
