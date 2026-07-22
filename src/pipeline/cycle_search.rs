@@ -314,8 +314,7 @@ fn find_cycles_hybrid_multi_pass(
         .collect();
     // Exclusive obs pin search: BF ignores first_hop_pools and floods non-pin
     // Direct cycles (live: first_hop_pin>0 enum_touch=0/103).
-    let bf_enabled =
-        !exclusive_starts && !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
+    let bf_enabled = !exclusive_starts && !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
     let pool_index = index_pool_metas(pool_metas);
     let prep_dfs = Arc::clone(&prep);
 

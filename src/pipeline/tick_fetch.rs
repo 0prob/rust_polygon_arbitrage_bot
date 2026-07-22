@@ -10,12 +10,15 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 /// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
 /// this deadline. Live LF was re-fetching ~30–40 empty pools every pass.
 pub const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
-/// Shorter cooldown when hydrate times out before marking misses (HF probe path).
-pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 10_000;
-/// After a successful tick load, suppress re-hydrate briefly. Hot-cache price
-/// moves clear ticks (`preserve_cl_ticks_on_replace`) and HF was re-fetching the
-/// same 5–6 pools every 200ms tick (~0.5–1.6s). Shared HF/LF via this map.
-pub const RECENT_HYDRATE_COOLDOWN_MS: u64 = 3_000;
+/// After hydrate timeout (fetch never completed). Live: 30s under rate-limit left
+/// high-priority pools stuck tickless while residual prep re-burned elsewhere.
+pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 12_000;
+/// After a successful tick load, suppress re-hydrate. Preserve-on-price-move
+/// already keeps arrays; 8s cuts redundant TickLens when stream patches land.
+pub const RECENT_HYDRATE_COOLDOWN_MS: u64 = 8_000;
+/// HF probe narrow-only empty miss — not a full-empty proof (no widen). Short
+/// suppress only; 45s EMPTY cool was pinning probe misses until LF widen.
+pub const PROBE_NARROW_EMPTY_COOLDOWN_MS: u64 = 5_000;
 /// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
 /// dominate LF under rate limits.
 const MAX_WIDE_TICK_POOLS: usize = 24;
@@ -155,7 +158,8 @@ const MAX_CL_TICK_INFO_READS: usize = 2_048;
 /// Cap Algebra tickTable targets per pass. Live: 100+ pool batches rate-limit to zero.
 const MAX_ALGEBRA_TICK_POOLS: usize = 32;
 
-/// Drop stale tick bitmap before re-enriching (slot0/liquidity may have moved).
+/// Drop tick bitmap before re-enriching. Prefer not calling on HF probe targets
+/// that are already empty — clearing is only needed when replacing partial loads.
 pub fn clear_v3_pool_ticks(arena: &mut StateArena, pool_addresses: &[Address]) {
     for pool in pool_addresses {
         let Some(&index) = arena.address_to_pool().get(pool) else {
@@ -353,6 +357,8 @@ pub async fn enrich_v3_ticks<
     algebra_pools: &FxHashSet<Address>,
     algebra_integral_pools: &FxHashSet<Address>,
     block_number: Option<u64>,
+    // HF probe: skip widen (2nd multicall wave) — live 1–4 pools timed out at 600–800ms.
+    allow_widen: bool,
 ) -> TickEnrichment {
     use alloy::sol_types::SolCall;
 
@@ -532,7 +538,7 @@ pub async fn enrich_v3_ticks<
     // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
     // may enter the empty cooldown — capped-out narrow misses must stay eligible.
     let mut wide_attempted: FxHashSet<Address> = FxHashSet::default();
-    let widen_available = word_range < 48;
+    let widen_available = allow_widen && word_range < 48;
     if updated < pool_addresses.len() && widen_available {
         let wide_range = word_range.saturating_mul(3).max(24).min(48);
         let mut still_empty: Vec<(Address, u128)> = Vec::new();
@@ -559,8 +565,8 @@ pub async fn enrich_v3_ticks<
             let mut lens_wide = Vec::new();
             let mut algebra_wide = Vec::new();
             for pool in wide_targets {
-                let labeled = algebra_pools.contains(&pool)
-                    || algebra_integral_pools.contains(&pool);
+                let labeled =
+                    algebra_pools.contains(&pool) || algebra_integral_pools.contains(&pool);
                 if labeled || algebra_attempted.contains(&pool) {
                     let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
                         continue;
@@ -576,14 +582,9 @@ pub async fn enrich_v3_ticks<
                 }
             }
             if !lens_wide.is_empty() {
-                wide_loaded += enrich_v3_tick_lens_only(
-                    provider,
-                    arena,
-                    &lens_wide,
-                    wide_range,
-                    block_number,
-                )
-                .await;
+                wide_loaded +=
+                    enrich_v3_tick_lens_only(provider, arena, &lens_wide, wide_range, block_number)
+                        .await;
             }
             if !algebra_wide.is_empty() {
                 let alg = enrich_algebra_ticks(
@@ -626,11 +627,20 @@ pub async fn enrich_v3_ticks<
     let needs_url_fallback = !still_tickless.is_empty()
         && (tick_lens_rpc_failed || algebra.rpc_failed || incomplete_pools > 0);
     if !still_tickless.is_empty() && !needs_url_fallback {
-        // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
-        let cool = still_tickless.iter().copied().filter(|p| {
-            !widen_available || wide_attempted.contains(p)
-        });
-        mark_empty_tick_cooldown(cool);
+        if allow_widen {
+            // LF/dispatch: EMPTY cool only after wide attempt, or word_range already maxed.
+            let cool = still_tickless.iter().copied().filter(|p| {
+                word_range >= 48 || wide_attempted.contains(p)
+            });
+            mark_empty_tick_cooldown(cool);
+        } else {
+            // HF probe narrow-only: complete empty is *not* a full-empty proof.
+            // Live: treated like full empty → 45s cool → cl_tickless stuck until LF.
+            mark_tick_cooldown_addresses(
+                still_tickless.iter().copied(),
+                PROBE_NARROW_EMPTY_COOLDOWN_MS,
+            );
+        }
     } else if !still_tickless.is_empty() && incomplete_pools > 0 {
         // Incomplete words without finishing URL fallback — short suppress so the
         // next HF tick doesn't re-clear+refetch the same batch immediately.
@@ -757,12 +767,9 @@ async fn enrich_v3_tick_lens_only<
     if items.is_empty() {
         return 0;
     }
-    let Ok(results) = crate::pipeline::multicall::execute_tick_lens_multicall_at(
-        provider,
-        &items,
-        block_number,
-    )
-    .await
+    let Ok(results) =
+        crate::pipeline::multicall::execute_tick_lens_multicall_at(provider, &items, block_number)
+            .await
     else {
         return 0;
     };
@@ -1034,9 +1041,10 @@ pub async fn enrich_v4_ticks<
     let needs_url_fallback = !still_tickless.is_empty() && (incomplete_count > 0 || capped);
     if !still_tickless.is_empty() && !needs_url_fallback {
         // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
-        let cool = still_tickless.iter().copied().filter(|id| {
-            !widen_available || wide_attempted.contains(id)
-        });
+        let cool = still_tickless
+            .iter()
+            .copied()
+            .filter(|id| !widen_available || wide_attempted.contains(id));
         mark_empty_v4_tick_cooldown(cool);
     } else if !still_tickless.is_empty() && incomplete_count > 0 {
         mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());

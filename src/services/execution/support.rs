@@ -192,8 +192,11 @@ pub struct FeeSnapshot {
     pub priority_fee: U256,
 }
 
-pub const ROUTE_EXECUTION_GAS_OVERHEAD: u32 = 150_000;
-pub const PER_HOP_EXECUTOR_GAS_OVERHEAD: u32 = 30_000;
+/// Flash + entrypoint overhead (Aave/Balancer flashLoan outer). Protocol hop constants
+/// already include pool swap work — 100k + 2×85k V2 + glue ≈310k (live 2×V2 flash 250–320k).
+pub const ROUTE_EXECUTION_GAS_OVERHEAD: u32 = 100_000;
+/// Per-hop Huff dispatch/callback glue on top of protocol hop gas.
+pub const PER_HOP_EXECUTOR_GAS_OVERHEAD: u32 = 18_000;
 /// Floor tip for assess + submit (Polygon MEV); shared so ranking matches live fees.
 pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([30_000_000_000, 0, 0, 0]);
 /// Raised post-revert (actual 1.87M vs sim 720k on BAL-ish ~2.6x); 25% buffer + fallback 50% for headroom w/o inflating sim gas used in net calc.
@@ -307,11 +310,19 @@ pub fn submit_gas_basis(
 pub const GAS_COLD_SLOAD: u32 = 2100;
 pub const GAS_WARM_SLOAD: u32 = 100;
 
-/// Huff executor: ~4 warm `SLOAD`s per hop (pool, token0, token1, reserve/slot0).
+/// Huff executor: ~4 `SLOAD`s per hop (pool, token0, token1, reserve/slot0).
+/// Base = warm×4/hop; `cold_pool_slots` adds first-touch premium (COLD−WARM) once per
+/// newly touched pool address (not cold×1 **plus** warm×4 on the same slot).
 #[must_use]
 pub fn estimate_route_storage_gas(hop_count: usize, cold_pool_slots: u32) -> u32 {
-    let warm_reads = hop_count as u32 * 4;
-    cold_pool_slots * GAS_COLD_SLOAD + warm_reads * GAS_WARM_SLOAD
+    let hops = hop_count as u32;
+    if hops == 0 {
+        return 0;
+    }
+    let cold = cold_pool_slots.min(hops);
+    let warm_base = hops.saturating_mul(4).saturating_mul(GAS_WARM_SLOAD);
+    let cold_premium = cold.saturating_mul(GAS_COLD_SLOAD.saturating_sub(GAS_WARM_SLOAD));
+    warm_base.saturating_add(cold_premium)
 }
 
 #[must_use]
@@ -328,6 +339,23 @@ pub fn estimate_route_gas_from_hops_evm(
 ) -> u32 {
     estimate_route_gas_from_hops(hop_gas, hop_count)
         .saturating_add(estimate_route_storage_gas(hop_count, cold_pool_slots))
+}
+
+#[cfg(test)]
+mod gas_seed_tests {
+    use super::*;
+    use crate::core::constants::GAS_V2_HOP;
+
+    #[test]
+    fn two_hop_v2_flash_assess_gas_in_live_band() {
+        // Live 2×V2 flash dry-runs ~250–320k; prior stack was 360.8k.
+        let hop = GAS_V2_HOP.saturating_mul(2);
+        let total = estimate_route_gas_from_hops_evm(hop, 2, 2);
+        assert!(
+            (250_000..=340_000).contains(&total),
+            "2-hop V2 assess gas {total} outside 250k–340k live band"
+        );
+    }
 }
 
 #[must_use]
@@ -412,8 +440,9 @@ pub fn depth_impact_slippage_bps_with_base(
         probe_in = amount_in.saturating_add(U256::ONE);
     }
     let Some(probe) = simulate_route_minimal(arena, edges, probe_in) else {
-        // Probe failure means unknown depth impact — do not report 0 slippage.
-        return 10_000;
+        // Live: +5% SimNone returned 10000 → evaluate_one dropped 100% of assess.
+        // 25% haircut keeps routes assessable without inventing zero depth.
+        return 2_500;
     };
 
     marginal_shortfall_bps(base_out, amount_in, probe.amount_out, probe_in)
@@ -448,11 +477,9 @@ mod tests {
 
     #[test]
     fn classify_submit_error_sees_through_anyhow_context() {
-        let err = anyhow::anyhow!("nonce too low")
-            .context("submit_transaction failed");
+        let err = anyhow::anyhow!("nonce too low").context("submit_transaction failed");
         assert_eq!(classify_submit_error(&err), SubmitAction::ResyncAndRetry);
-        let rate = anyhow::anyhow!("HTTP 429 rate limit")
-            .context("private submit failed");
+        let rate = anyhow::anyhow!("HTTP 429 rate limit").context("private submit failed");
         assert_eq!(classify_submit_error(&rate), SubmitAction::BumpFeesAndRetry);
         assert!(is_transient_receipt_error(&rate));
     }

@@ -85,7 +85,9 @@ pub fn simulate_v3_swap(
             zero_for_one,
         );
         let lp = fee_pips.to::<u32>();
-        fee_pips = U256::from(crate::core::v4_storage::v4_combined_swap_fee_pips(proto, lp));
+        fee_pips = U256::from(crate::core::v4_storage::v4_combined_swap_fee_pips(
+            proto, lp,
+        ));
     }
 
     if amount_in.is_zero()
@@ -310,7 +312,6 @@ mod tests {
         assert!(r.shallow);
         assert!(r.amount_out > U256::ZERO);
     }
-
 }
 
 #[cfg(test)]

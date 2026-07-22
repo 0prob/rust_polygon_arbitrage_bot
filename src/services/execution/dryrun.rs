@@ -346,6 +346,10 @@ pub async fn dry_run_candidate<P: Provider<Ethereum>>(
                         format!("{raw} (bare revert — check entrypoint: pure Balancer→executeArbDirect, mixed→executeArbWithAave, Balancer-only flash→executeArb)")
                     } else if raw.contains("90cd6f24") {
                         format!("{raw} (Aave ReserveInactive — token reserve not active for flash loan)")
+                    } else if raw.contains("IIA") {
+                        // Pool callback unpaid: executor must transfer amount0/1Delta to the pool.
+                        // Live root cause was ArbExecutor.huff `dup1 0x00 gt` (always false).
+                        format!("{raw} (V3/Algebra IIA — callback did not pay pool input token)")
                     } else {
                         raw.clone()
                     }

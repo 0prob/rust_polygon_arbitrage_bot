@@ -407,7 +407,14 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let dispatch_candidates = u32::try_from(profitable.len()).unwrap_or(u32::MAX);
     let shutdown = ctx.shutdown.clone();
     let arena_ref: &StateArena = &*arena;
-    let chain_head_hint = sim_provider.get_block_number().await.ok();
+    // Bound head RPC — hung eth_blockNumber blocked the entire dispatch window.
+    let chain_head_hint = tokio::time::timeout(
+        std::time::Duration::from_millis(1_500),
+        sim_provider.get_block_number(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
 
     for evaluated in profitable {
         if *shutdown.borrow() {
@@ -847,23 +854,21 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
 }
 
 /// Hard cap on tick RPC targets per probe-tick hydrate.
-/// Live: 64 under residual prep often hit 2.5s timeout and cooled 20–45 pools
-/// for 10s (`hf probe-tick hydrate timed out` ×300/run). Keep small enough that
-/// one state multicall finishes inside residual prep (median ok hydrate ~50ms).
-const HF_PROBE_TICK_POOL_CAP: usize = 16;
-/// Rough ms budget per tickless pool (lens + algebra paths under RPC RTT).
-const HF_PROBE_TICK_MS_PER_POOL: u64 = 120;
+/// Narrow-only; max budget 900ms so one pool at a time under rate limits.
+const HF_PROBE_TICK_POOL_CAP: usize = 1;
+/// ms per tickless pool — aligned with HF_PROBE_HYDRATE_MAX_BUDGET (900ms).
+const HF_PROBE_TICK_MS_PER_POOL: u64 = 900;
 
 /// Scale the probe hydrate pool set to residual prep budget so we finish more
 /// often instead of cooling a large pending set on timeout.
 #[must_use]
 pub(crate) fn probe_tick_pool_cap_for_budget(budget: std::time::Duration) -> usize {
     let ms = budget.as_millis() as u64;
-    if ms < 50 {
+    // Do not `.max(1)` — a sub-pool budget always times out and cools the target.
+    if ms < HF_PROBE_TICK_MS_PER_POOL {
         return 0;
     }
-    let by_budget = (ms / HF_PROBE_TICK_MS_PER_POOL).max(1) as usize;
-    by_budget.min(HF_PROBE_TICK_POOL_CAP)
+    ((ms / HF_PROBE_TICK_MS_PER_POOL) as usize).min(HF_PROBE_TICK_POOL_CAP)
 }
 
 fn cl_pool_on_hydrate_cooldown(
@@ -994,16 +999,19 @@ pub(crate) fn drain_cooldown_stuck_tickless_cycles(
     before.saturating_sub(cycles.len())
 }
 
-/// Collect tickless V3 addresses in cycle order (active/high-priority cycles first).
+/// Collect tickless V3 addresses ranked by how many selected cycles they unlock
+/// (then liquidity). Cap=1 under residual prep — cycle order alone left the same
+/// low-value pool hydrating while multi-cycle hubs stayed tickless (live).
 fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
     arena: &StateArena,
     cycles: &[C],
     cap: usize,
 ) -> (usize, Vec<Address>) {
-    let mut all = 0usize;
-    let mut out = Vec::with_capacity(cap.min(cycles.len()));
-    let mut seen: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
+    use rustc_hash::FxHashMap;
+    // addr → (cycle_hits, liquidity, pool_index)
+    let mut freq: FxHashMap<Address, (u32, u128)> = FxHashMap::default();
     for cycle in cycles {
+        let mut in_cycle: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
         for edge in &cycle.as_ref().edges {
             if edge.protocol != crate::core::types::ProtocolType::UniswapV3 {
                 continue;
@@ -1011,19 +1019,27 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
             let Some(addr) = arena.pool_address(edge.pool_index) else {
                 continue;
             };
-            let tickless = match arena.pool_state(edge.pool_index) {
-                Some(PoolState::V3(st)) => st.ticks.is_empty(),
-                _ => false,
+            let (tickless, liq) = match arena.pool_state(edge.pool_index) {
+                Some(PoolState::V3(st)) => (st.ticks.is_empty(), st.liquidity),
+                _ => (false, 0),
             };
-            if !tickless || !seen.insert(addr) {
+            if !tickless || is_empty_tick_on_cooldown(addr) {
                 continue;
             }
-            all += 1;
-            if out.len() < cap && !is_empty_tick_on_cooldown(addr) {
-                out.push(addr);
+            if in_cycle.insert(addr) {
+                let e = freq.entry(addr).or_insert((0, liq));
+                e.0 = e.0.saturating_add(1);
+                e.1 = e.1.max(liq);
             }
         }
     }
+    let all = freq.len();
+    let mut ranked: Vec<(Address, u32, u128)> = freq
+        .into_iter()
+        .map(|(addr, (hits, liq))| (addr, hits, liq))
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    let out: Vec<Address> = ranked.into_iter().take(cap).map(|(a, _, _)| a).collect();
     (all, out)
 }
 
@@ -1067,11 +1083,32 @@ pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     if cap == 0 {
         return 0;
     }
-    let (_, v3) = tickless_v3_addresses_prioritized(arena, cycles, cap);
-    let (_, v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, cap);
+    let (_, v3, _, v4) = tickless_cl_targets_shared_cap(arena, cycles, pool_metas, cap);
     mark_tick_hydrate_timeout_cooldown(v3.iter().copied());
     mark_v4_tick_hydrate_timeout_cooldown(v4.iter().map(|&(_, pool_id)| pool_id));
     v3.len() + v4.len()
+}
+
+/// Split `pool_cap` across V3+V4 (prefer V3). Using the full cap for each family
+/// doubled RPC work under one residual-prep timeout.
+fn tickless_cl_targets_shared_cap<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    pool_cap: usize,
+) -> (
+    usize,
+    Vec<Address>,
+    usize,
+    Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>,
+) {
+    let (v3_total, mut v3) = tickless_v3_addresses_prioritized(arena, cycles, pool_cap);
+    v3.truncate(pool_cap);
+    let v4_cap = pool_cap.saturating_sub(v3.len());
+    // Cap arg only bounds the fetch vec; `v4_total` is the uncapped tickless count.
+    let (v4_total, mut v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, pool_cap);
+    v4.truncate(v4_cap);
+    (v3_total, v3, v4_total, v4)
 }
 
 /// Hydrate empty V3/V4 tick arrays on selected HF cycles before probe ranking.
@@ -1096,9 +1133,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
         stats.cycles_tickless_after = stats.cycles_tickless_before;
         return stats;
     }
-    let (v3_total, v3) = tickless_v3_addresses_prioritized(arena, cycles, pool_cap);
-    let (v4_total, v4) =
-        tickless_v4_targets_prioritized(arena, cycles, pool_metas, pool_cap);
+    let (v3_total, v3, v4_total, v4) =
+        tickless_cl_targets_shared_cap(arena, cycles, pool_metas, pool_cap);
     stats.v3_total = v3_total;
     stats.v3_needed = v3.len();
     stats.v4_total = v4_total;
@@ -1109,11 +1145,13 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     }
     let (algebra_pools, algebra_integral_pools) =
         crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
-    // Clear once — URL retry must not wipe a family that already hydrated.
-    crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &v3);
-    crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4);
+    // Targets are already tickless — skip clear (was a no-op for empty; keep
+    // any partial ticks from incomplete prior loads if we ever expand selection).
     let mut v3_pending = !v3.is_empty();
     let mut v4_pending = !v4.is_empty();
+    // Probe: fewer bitmap words finish inside residual (default word_range=10 → 21
+    // multicall items/pool; 4 → 9). Partial depth still unlocks probe rank.
+    let probe_word_range = word_range.min(4);
     for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
         let Ok(provider) = rpc.connect_state_at(url) else {
             rpc.deprioritize_state_url(url);
@@ -1128,10 +1166,11 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
                     &provider,
                     arena,
                     &needed,
-                    word_range,
+                    probe_word_range,
                     &algebra_pools,
                     &algebra_integral_pools,
                     block_number,
+                    false, // probe residual budget — narrow only
                 )
                 .await;
                 stats.v3_loaded = stats.v3_loaded.saturating_add(res.loaded);
@@ -1218,6 +1257,7 @@ async fn enrich_dispatch_cl_ticks(
                     &algebra_pools,
                     &algebra_integral_pools,
                     block_number,
+                    true, // dispatch path can afford widen
                 )
                 .await;
                 v3_loaded = v3_loaded.saturating_add(res.loaded);
@@ -1771,10 +1811,22 @@ mod tests {
     fn probe_tick_pool_cap_scales_with_residual_budget() {
         use std::time::Duration;
         assert_eq!(probe_tick_pool_cap_for_budget(Duration::from_millis(40)), 0);
-        assert_eq!(probe_tick_pool_cap_for_budget(Duration::from_millis(50)), 1);
+        // Sub-pool budget must not force cap=1 (that always timed out + cooled).
         assert_eq!(
-            probe_tick_pool_cap_for_budget(Duration::from_millis(500)),
-            (500 / HF_PROBE_TICK_MS_PER_POOL).min(HF_PROBE_TICK_POOL_CAP as u64) as usize
+            probe_tick_pool_cap_for_budget(Duration::from_millis(
+                HF_PROBE_TICK_MS_PER_POOL.saturating_sub(1)
+            )),
+            0
+        );
+        assert_eq!(
+            probe_tick_pool_cap_for_budget(Duration::from_millis(HF_PROBE_TICK_MS_PER_POOL)),
+            1
+        );
+        assert_eq!(
+            probe_tick_pool_cap_for_budget(Duration::from_millis(
+                HF_PROBE_TICK_MS_PER_POOL.saturating_mul(2)
+            )),
+            2.min(HF_PROBE_TICK_POOL_CAP)
         );
         // Full residual prep must never exceed hard cap (live cooled 45 under 64).
         assert_eq!(

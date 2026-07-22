@@ -17,7 +17,7 @@ const MAX_SUBMIT_ATTEMPTS: u32 = 3;
 pub use super::gas::MIN_PRIORITY_FEE_PER_GAS;
 /// ponytail: cap profit-derived priority fee boost at 200 gwei.
 /// 100 gwei was too conservative during Polygon MEV competition.
-use crate::services::execution::profit::profit_priority_uplift_wei;
+use crate::services::execution::profit::profit_priority_tip_per_gas;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SubmitFees {
@@ -62,18 +62,27 @@ pub fn resolve_submit_fees_with_profit(
         return Some(fees);
     }
 
-    let total_boost = profit_priority_uplift_wei(
+    // Absolute tip bid (not incremental) — max with oracle floor tip.
+    let tip = profit_priority_tip_per_gas(
         expected_profit_matic_wei,
         alpha_bps,
         gas_limit.min(u64::from(u32::MAX)) as u32,
     );
-    let per_gas = total_boost / U256::from(gas_limit);
-    fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(per_gas);
+    fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(tip);
 
+    // EIP-1559: max_fee is a base-spike ceiling; expected pay is base + priority.
     let min_max_fee = snap.base_fee + fees.max_priority_fee_per_gas;
     fees.max_fee_per_gas = fees.max_fee_per_gas.max(min_max_fee);
 
     Some(fees)
+}
+
+/// Expected EIP-1559 effective gas price for the tip we will bid (`base + priority`).
+/// Prefer this over [`SubmitFees::max_fee_per_gas`] for profit reassess — max_fee is only
+/// a base-fee spike ceiling (includes 12.5% buffer), not what the chain charges.
+#[must_use]
+pub fn expected_submit_gas_price(base_fee: U256, fees: &SubmitFees) -> U256 {
+    base_fee.saturating_add(fees.max_priority_fee_per_gas)
 }
 
 pub fn build_transaction_request(
@@ -241,5 +250,41 @@ mod tests {
             .expect("snapshot should resolve");
         assert!(fees.max_priority_fee_per_gas >= U256::from(2u64));
         assert!(fees.max_fee_per_gas >= U256::from(12u64));
+    }
+
+    #[test]
+    fn expected_submit_gas_price_is_base_plus_priority_not_max_fee() {
+        let fees = SubmitFees {
+            max_fee_per_gas: U256::from(400_000_000_000u64), // ceiling
+            max_priority_fee_per_gas: U256::from(30_000_000_000u64),
+        };
+        let base = U256::from(250_000_000_000u64);
+        assert_eq!(
+            expected_submit_gas_price(base, &fees),
+            U256::from(280_000_000_000u64)
+        );
+        assert!(expected_submit_gas_price(base, &fees) < fees.max_fee_per_gas);
+    }
+
+    #[test]
+    fn profit_tip_raises_priority_but_not_beyond_cap() {
+        let oracle = GasOracle::default();
+        // Floor tip 30 gwei; large profit should lift tip but stay ≤ 200 gwei.
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(250_000_000_000u64),
+            priority_fee: MIN_PRIORITY_FEE_PER_GAS,
+        });
+        let profit = U256::from(5u128 * 10u128.pow(17)); // 0.5 MATIC
+        let fees = resolve_submit_fees_with_profit(&oracle, profit, 5_000, 200_000).expect("fees");
+        assert!(fees.max_priority_fee_per_gas >= MIN_PRIORITY_FEE_PER_GAS);
+        assert!(
+            fees.max_priority_fee_per_gas
+                <= U256::from(crate::services::execution::profit::MAX_PROFIT_PRIORITY_FEE_WEI)
+        );
+        let expected = expected_submit_gas_price(U256::from(250_000_000_000u64), &fees);
+        assert_eq!(
+            expected,
+            U256::from(250_000_000_000u64) + fees.max_priority_fee_per_gas
+        );
     }
 }

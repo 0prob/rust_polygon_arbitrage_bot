@@ -17,8 +17,8 @@ pub const LEVEL_INFO: u8 = 3;
 pub const LEVEL_DEBUG: u8 = 4;
 pub const LEVEL_TRACE: u8 = 5;
 
-    // Stream/WSS INFO bursts used to fill 8k and drop hf tick ends.
-    const QUEUE_CAPACITY: usize = 32_768;
+// Stream/WSS INFO bursts used to fill 8k and drop hf tick ends.
+const QUEUE_CAPACITY: usize = 32_768;
 const DEFAULT_LOG_DIR: &str = "/tmp/bot";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 

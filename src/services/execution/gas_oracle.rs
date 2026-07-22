@@ -24,8 +24,9 @@ const ROUTE_GAS_HISTORY: usize = 256;
 const MAX_SIM_SCALE_BPS: u32 = 30_000;
 const SNAPSHOT_LOG_CHANGE_BPS: u64 = 500;
 
-/// Prefetch observed route gas when an HF tick evaluates at least this many routes.
-pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 48;
+/// Prefetch observed route gas for an HF tick's fingerprints (always — was gated at 48,
+/// so small ticks paid a mutex per route on the hot path).
+pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 1;
 
 /// Per-HF-tick snapshot of route gas data for lock-free lookups in `hf_eval`.
 #[derive(Clone, Debug)]
@@ -36,18 +37,18 @@ pub struct RouteGasLookup {
 }
 
 impl RouteGasLookup {
-    /// Build a tick-local lookup table when route volume warrants prefetch.
+    /// Build a tick-local observed-gas map for `fingerprints` (one mutex pass).
     pub fn for_fingerprints(
         oracle: &GasOracle,
         fingerprints: impl IntoIterator<Item = u64>,
     ) -> Self {
         let fps: Vec<u64> = fingerprints.into_iter().collect();
         let scale_bps = oracle.sim_scale_bps().max(10_000);
-        if fps.len() < ROUTE_GAS_CACHE_MIN_ROUTES {
+        if fps.is_empty() {
             return Self {
                 scale_bps,
                 observed: FxHashMap::default(),
-                preloaded: false,
+                preloaded: true,
             };
         }
         let mut observed =
@@ -79,13 +80,17 @@ impl RouteGasLookup {
         self.observed.get(&route_fp).copied()
     }
 
-    /// Prefer prefetched observed gas; otherwise scaled heuristic (no map lock on preload path).
+    /// Prefer prefetched observed gas; otherwise scaled heuristic (lock-free after build).
     pub fn route_gas_or_heuristic(&self, oracle: &GasOracle, route_fp: u64, heuristic: u32) -> u32 {
         if let Some(&gas) = self.observed.get(&route_fp) {
             return gas;
         }
+        // Snapshot miss: fall back to live oracle map (handles empty tick fps / races).
         if !self.preloaded {
             return oracle.route_gas_or_heuristic(route_fp, heuristic);
+        }
+        if let Some(gas) = oracle.observed_route_gas(route_fp) {
+            return gas;
         }
         scaled_simulated_gas(heuristic, self.scale_bps)
     }
@@ -408,11 +413,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_gas_lookup_prefetches_observed_gas_for_large_batches() {
+    fn route_gas_lookup_prefetches_observed_gas() {
         let oracle = GasOracle::new(Duration::from_secs(1));
         oracle.record_route_gas(7, 500_000);
-        let fps: Vec<u64> = (0..ROUTE_GAS_CACHE_MIN_ROUTES as u64).collect();
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, fps);
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [7u64, 8, 9]);
         assert!(lookup.preloaded());
         assert_eq!(lookup.observed_gas(7), Some(500_000));
         assert_eq!(lookup.route_gas_or_heuristic(&oracle, 7, 100_000), 500_000);
@@ -447,12 +451,22 @@ mod tests {
     }
 
     #[test]
-    fn route_gas_lookup_skips_prefetch_for_small_batches() {
+    fn route_gas_lookup_prefetches_even_small_batches() {
         let oracle = GasOracle::new(Duration::from_secs(1));
         oracle.record_route_gas(1, 250_000);
         let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64, 2]);
-        assert!(!lookup.preloaded());
+        assert!(lookup.preloaded());
+        assert_eq!(lookup.observed_gas(1), Some(250_000));
         assert_eq!(lookup.route_gas_or_heuristic(&oracle, 1, 100_000), 250_000);
+    }
+
+    #[test]
+    fn storage_gas_first_touch_premium_not_double_count() {
+        use crate::services::execution::support::estimate_route_storage_gas;
+        // 2 hops, both cold: 2*4*100 warm base + 2*(2100-100) premium = 800 + 4000 = 4800
+        assert_eq!(estimate_route_storage_gas(2, 2), 4_800);
+        // 2 hops, 0 cold: pure warm
+        assert_eq!(estimate_route_storage_gas(2, 0), 800);
     }
 
     #[test]

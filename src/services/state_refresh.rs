@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
@@ -11,6 +12,7 @@ use alloy::sol_types::SolCall;
 use anyhow::Context;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use tokio::time::timeout;
 
 use crate::config::AppConfig;
 use crate::core::constants::POLYGON_CHAIN_ID;
@@ -33,6 +35,9 @@ use crate::util::now_ms;
 /// Remove a pool from the discovered list after this many consecutive
 /// fetch classifications as invalid / never-fetched.
 const MAX_INVALID_FETCHES: u32 = 30;
+/// Live: eth_blockNumber hung 5–11s (head_ms) and blew the 4s refresh interval
+/// with updated=0 — pin to cache on timeout instead of blocking the LF tick.
+const RPC_HEAD_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// Outcome of a targeted or batch pool-state refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,8 +118,7 @@ impl StateRefreshService {
         cache: Arc<StateCache>,
         rpc: Arc<RpcPool>,
     ) -> anyhow::Result<Self> {
-        let pg = PgClient::new(config.pg_url.clone())
-            .context("failed to connect to PostgreSQL")?;
+        let pg = PgClient::new(config.pg_url.clone()).context("failed to connect to PostgreSQL")?;
         let pool_meta_cache = Arc::new(PoolMetaCache::new(PathBuf::from(
             &config.pipeline.pool_meta_cache_path,
         )));
@@ -893,7 +897,17 @@ impl StateRefreshService {
             let provider_for_hash = provider.clone();
             if pinned_block.is_none() || idx > 0 {
                 let head_started = now_ms();
-                pinned_block = provider.get_block_number().await.ok().or(cached_block);
+                pinned_block = match timeout(RPC_HEAD_TIMEOUT, provider.get_block_number()).await {
+                    Ok(Ok(n)) => Some(n),
+                    Ok(Err(_)) => cached_block,
+                    Err(_) => {
+                        crate::debug!(
+                            "state RPC head timed out after {}ms (url_index={idx}) — using cached block",
+                            RPC_HEAD_TIMEOUT.as_millis()
+                        );
+                        cached_block
+                    }
+                };
                 rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
             }
             last_pinned_block = pinned_block;
@@ -945,6 +959,8 @@ impl StateRefreshService {
             total_updated = total_updated.saturating_add(updated);
             fetch_attempted |= fetch_result.attempted;
             if updated > 0 {
+                // Healthy responses clear cool-off so rank/primary recover after transient fails.
+                self.rpc.clear_state_url_penalty(url);
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
                     let need_hash = prior_hash.is_none() || block != prior_block;
@@ -974,7 +990,11 @@ impl StateRefreshService {
             if !fetch_result.attempted {
                 break;
             }
-            self.rpc.deprioritize_state_url(url);
+            if fetch_result.rate_limited {
+                self.rpc.deprioritize_state_url_rate_limited(url);
+            } else {
+                self.rpc.deprioritize_state_url(url);
+            }
             if idx + 1 < candidates.len() {
                 // Within-call URL fallback: retry Invalid/missing too.
                 // `needs_fetch` alone skips fresh Invalid (invalid_retry_ttl) and

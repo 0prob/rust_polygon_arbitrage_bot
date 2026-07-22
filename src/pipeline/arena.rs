@@ -388,7 +388,8 @@ impl StateArena {
                 .pools
                 .get(idx.0 as usize)
                 .is_some_and(|slot| Arc::ptr_eq(slot, &state));
-            let family_flip = prior.is_some_and(|p| !pool_state_family_compatible(p, state.as_ref()));
+            let family_flip =
+                prior.is_some_and(|p| !pool_state_family_compatible(p, state.as_ref()));
             if !same {
                 let inner = Arc::make_mut(&mut self.inner);
                 if let Some(slot) = inner.pools.get_mut(idx.0 as usize) {
@@ -524,12 +525,7 @@ impl StateArena {
                     };
                 }
                 return ArenaSyncReport {
-                    metas: self.sync_tradable_append(
-                        &tradable,
-                        pools,
-                        decimal_hints,
-                        prefix_len,
-                    ),
+                    metas: self.sync_tradable_append(&tradable, pools, decimal_hints, prefix_len),
                     indices_rebuilt: false,
                 };
             }
@@ -540,8 +536,7 @@ impl StateArena {
                 // arena stuck at 1019 forever when every tick was Rebuild
                 // (order mismatch) rather than Prefix.
                 let _ = freeze_append;
-                let mut metas =
-                    self.sync_frozen_membership(&tradable, pools, decimal_hints);
+                let mut metas = self.sync_frozen_membership(&tradable, pools, decimal_hints);
                 self.append_novel_tradable(&tradable, pools, decimal_hints, &mut metas);
                 return ArenaSyncReport {
                     metas,
@@ -903,7 +898,12 @@ fn pool_state_family_compatible(prior: &PoolState, incoming: &PoolState) -> bool
     )
 }
 
-/// Keep LF-hydrated tick arrays when replacing a cache Arc that has no ticks.
+/// Keep LF/HF-hydrated tick arrays when replacing a cache Arc that has no ticks.
+///
+/// Hot-cache / stream patches often land tickless with a new sqrt/tick. Dropping
+/// the array forced `cl_tickless` on ~half of probe skips (live) until TickLens
+/// re-hydrate — which rate-limits and times out. Keep prior ticks and let
+/// `simulate_v3_swap` fail closed (`shallow`) if the walk leaves the loaded range.
 fn preserve_cl_ticks_on_replace(
     prior: Option<&PoolState>,
     incoming: Arc<PoolState>,
@@ -911,25 +911,16 @@ fn preserve_cl_ticks_on_replace(
     let Some(prior) = prior else {
         return incoming;
     };
-    // Keep tick arrays when the concentrated price level is unchanged. Global
-    // liquidity may move on refresh without invalidating the bitmap; a tick or
-    // sqrt move fails closed (incoming tickless state wins until re-enrich).
     match (prior, incoming.as_ref()) {
         (PoolState::V3(old), PoolState::V3(new))
-            if !old.ticks.is_empty()
-                && new.ticks.is_empty()
-                && old.tick == new.tick
-                && old.sqrt_price_x96 == new.sqrt_price_x96 =>
+            if !old.ticks.is_empty() && new.ticks.is_empty() =>
         {
             let mut merged = new.clone();
             merged.ticks = Arc::clone(&old.ticks);
             Arc::new(PoolState::V3(merged))
         }
         (PoolState::V4(old), PoolState::V4(new))
-            if !old.ticks.is_empty()
-                && new.ticks.is_empty()
-                && old.tick == new.tick
-                && old.sqrt_price_x96 == new.sqrt_price_x96 =>
+            if !old.ticks.is_empty() && new.ticks.is_empty() =>
         {
             let mut merged = new.clone();
             merged.ticks = Arc::clone(&old.ticks);
@@ -1552,6 +1543,66 @@ mod tests {
             "LF ticks must survive HF hot-cache overlay"
         );
         assert_eq!(s.ticks[0].tick, 0);
+    }
+
+    #[test]
+    fn apply_hot_cache_preserves_v3_ticks_across_price_move() {
+        use crate::core::types::{V3PoolState, V3Tick};
+
+        // Stream/hot-cache often patches sqrt+tick without ticks; dropping the array
+        // made cl_tickless dominate probe rank until TickLens re-hydrate.
+        let pool = Address::with_last_byte(94);
+        let ticks: Arc<[V3Tick]> = Arc::from([
+            V3Tick {
+                tick: -60,
+                liquidity_gross: 1,
+                liquidity_net: 1,
+            },
+            V3Tick {
+                tick: 60,
+                liquidity_gross: 1,
+                liquidity_net: -1,
+            },
+        ]);
+        let with_ticks = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::clone(&ticks),
+        };
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(pool, Arc::new(PoolState::V3(with_ticks)));
+        let cache = StateCache::default();
+        cache.insert(
+            pool,
+            PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(2u128 << 96), // price moved
+                liquidity: 1_000_000,
+                tick: 12,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from([]),
+            }),
+        );
+        arena.apply_hot_cache(&cache, &[pool]);
+        let PoolState::V3(s) = arena.pool_state(idx).expect("overlay") else {
+            panic!("expected v3");
+        };
+        assert_eq!(s.tick, 12);
+        assert_eq!(s.sqrt_price_x96, U256::from(2u128 << 96));
+        assert_eq!(
+            s.ticks.len(),
+            2,
+            "ticks must survive price-move overlay until re-enrich"
+        );
     }
 
     #[test]

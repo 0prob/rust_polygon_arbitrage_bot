@@ -109,9 +109,7 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                 // eth_call response cap — leave None (caller treats incomplete).
                 let msg = format!("{e:#}");
                 if msg.contains("exceeding limit") || msg.contains("out of gas") {
-                    crate::debug!(
-                        "multicall call skipped (payload/gas at index {start}): {e:#}"
-                    );
+                    crate::debug!("multicall call skipped (payload/gas at index {start}): {e:#}");
                 } else {
                     crate::warn!(
                         "multicall chunk failed ({} call(s) at index {start}): {e:#}",

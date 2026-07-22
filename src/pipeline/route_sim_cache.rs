@@ -6,7 +6,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::pipeline::types::MinimalSimResult;
 
-const ROUTE_SIM_CACHE_CAPACITY: usize = 4096;
+/// Sized for zero-profit memos too (Brent now inserts those; was thrashing at 4k
+/// with only profitable inserts and hit_rate≈0).
+const ROUTE_SIM_CACHE_CAPACITY: usize = 8192;
 const ROUTE_SIM_LOG_INTERVAL: u64 = 10_000;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]

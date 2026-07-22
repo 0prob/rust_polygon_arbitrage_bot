@@ -213,13 +213,15 @@ fn default_lf_interval_ms() -> u64 {
     1_000
 }
 fn default_hf_interval_ms() -> u64 {
-    150
+    // 150ms + 3.5s hard ticks piled pending stream work (live runs 200ms).
+    200
 }
 fn default_max_multicall_calls() -> u32 {
     200
 }
 fn default_request_timeout_ms() -> u64 {
-    30_000
+    // 30s let one hung eth_call pin a worker; MEV prefers fail-fast + URL failover.
+    12_000
 }
 fn default_rpc_batch_pace_ms() -> u64 {
     5
@@ -241,7 +243,9 @@ fn default_execution_mode() -> String {
     "dry-run".to_string()
 }
 fn default_min_profit_matic_wei() -> String {
-    "100000000000000000".to_string()
+    // 0.01 MATIC — 0.1 MATIC default starved dry-run/live funnel while best-eval
+    // gross sat at ~0.007 MATIC (cover ≪ gas). Live .env uses this floor.
+    "10000000000000000".to_string()
 }
 fn default_slippage_bps() -> u64 {
     0
@@ -265,7 +269,8 @@ fn default_profit_priority_fee_alpha_bps() -> u64 {
     1_000
 }
 fn default_profit_safety_multiplier_bps() -> u64 {
-    25_000
+    // 1.5× gas floor. 2.5× rejected near-misses that clear at tip; live often uses 1.0×.
+    15_000
 }
 fn default_min_operator_matic_wei() -> String {
     "500000000000000000".to_string()
@@ -286,10 +291,20 @@ fn default_lf_full_sweep_interval() -> u64 {
     10
 }
 fn default_hf_prefetch_count() -> usize {
-    80
+    // 80 often timed out under rate limits; live runs ~50. 60 leaves room for hot set.
+    60
 }
+/// Floor for `HF_PREFETCH_BUDGET_MS` — must cover one TickLens pool
+/// (`HF_PROBE_HYDRATE_MIN_BUDGET` in orchestrator/hf.rs = 900ms).
+const HF_PREFETCH_BUDGET_MIN_MS: u64 = 900;
+/// Cap so a mis-set env cannot open a 60s prep wall and stall the HF semaphore.
+const HF_PREFETCH_BUDGET_MAX_MS: u64 = 8_000;
+/// Select/sim caps above this burn CPU on the HF async worker without extra profit.
+const HF_CYCLE_CAP_MAX: usize = 512;
+
 fn default_hf_prefetch_budget_ms() -> u64 {
-    1_200
+    // Shared prep wall: pool/flash work + hydrate floor (900ms one TickLens pool).
+    2_500
 }
 fn default_hf_score_cap() -> usize {
     120
@@ -323,7 +338,8 @@ fn default_pyth_hermes_url() -> String {
     "https://hermes.pyth.network".to_string()
 }
 fn default_tick_word_range() -> i16 {
-    10
+    // LF full hydrate; probe path already min(4). 10 → 21 multicall words/pool.
+    6
 }
 fn default_cache_ttl_ms() -> u64 {
     DEFAULT_CACHE_TTL_MS
@@ -661,14 +677,19 @@ impl AppConfig {
         self.discovery_interval_ms = self.discovery_interval_ms.max(1);
         self.discovery_bootstrap_batch = self.discovery_bootstrap_batch.max(1);
         self.max_multicall_calls = self.max_multicall_calls.max(1);
-        self.rpc.request_timeout_ms = self.rpc.request_timeout_ms.max(1);
+        // Sub-1s timeouts thrash failover; >60s pins workers on hung endpoints.
+        self.rpc.request_timeout_ms = self.rpc.request_timeout_ms.clamp(1_000, 60_000);
         self.rpc.batch_pace_ms = self.rpc.batch_pace_ms.min(60_000);
         self.execution.receipt_poll_ms = self.execution.receipt_poll_ms.max(50);
         self.execution.receipt_timeout_ms = self.execution.receipt_timeout_ms.max(1);
         self.pipeline.indexer_max_lag_blocks = self.pipeline.indexer_max_lag_blocks.max(1);
         self.pipeline.graph_rebuild_interval = self.pipeline.graph_rebuild_interval.max(1);
         self.pipeline.cycle_refind_interval = self.pipeline.cycle_refind_interval.max(1);
-        self.pipeline.hf_prefetch_budget_ms = self.pipeline.hf_prefetch_budget_ms.max(1);
+        // Must leave residual for one TickLens hydrate; unbounded env opens multi-second tails.
+        self.pipeline.hf_prefetch_budget_ms = self
+            .pipeline
+            .hf_prefetch_budget_ms
+            .clamp(HF_PREFETCH_BUDGET_MIN_MS, HF_PREFETCH_BUDGET_MAX_MS);
         self.oracle.cache_ttl_ms = self.oracle.cache_ttl_ms.max(1);
         // TickLens words per side; 0 is useless, >48 blows RPC (wide-pass cap).
         self.oracle.tick_word_range = self.oracle.tick_word_range.clamp(1, 48);
@@ -679,18 +700,27 @@ impl AppConfig {
             .max(1);
         self.oracle.hub_path_max_hops = self.oracle.hub_path_max_hops.clamp(1, hub_hop_cap);
 
+        self.pipeline.hf_score_cap = self.pipeline.hf_score_cap.min(HF_CYCLE_CAP_MAX).max(1);
+        self.pipeline.hf_sim_cap = self.pipeline.hf_sim_cap.min(HF_CYCLE_CAP_MAX).max(1);
         if self.pipeline.hf_score_cap < self.pipeline.hf_sim_cap {
             self.pipeline.hf_score_cap = self.pipeline.hf_sim_cap;
         }
         if self.pipeline.hf_max_dispatch > self.pipeline.hf_sim_cap {
             self.pipeline.hf_max_dispatch = self.pipeline.hf_sim_cap;
         }
+        self.pipeline.hf_max_dispatch = self.pipeline.hf_max_dispatch.max(1);
+        self.pipeline.stream_max_pools = self.pipeline.stream_max_pools.clamp(1, 2_000);
+        self.pipeline.lf_bootstrap_batch = self.pipeline.lf_bootstrap_batch.max(1);
+        self.pipeline.lf_hot_batch = self.pipeline.lf_hot_batch.max(1);
+        self.routing.enumeration_max_paths = self.routing.enumeration_max_paths.max(1);
+        self.routing.brent_search_iterations = self.routing.brent_search_iterations.clamp(1, 64);
 
         let mc = self.max_multicall_calls as usize;
         let prefetch_cap = mc.saturating_mul(2).min(200);
         if self.pipeline.hf_prefetch_count > prefetch_cap {
             self.pipeline.hf_prefetch_count = prefetch_cap;
         }
+        self.pipeline.hf_prefetch_count = self.pipeline.hf_prefetch_count.max(1);
     }
 
     /// Non-fatal hints for configs that work but waste RPC budget or backlog LF/HF.
@@ -715,22 +745,59 @@ impl AppConfig {
                 self.lf_interval_ms
             );
         }
-        if self.routing.enumeration_max_paths > 1_000 {
+        if self.routing.enumeration_max_paths > 200 {
             crate::warn!(
-                "ROUTING_ENUMERATION_MAX_PATHS={} is high — cycle search may dominate LF ticks",
+                "ROUTING_ENUMERATION_MAX_PATHS={} is high — cycle search may dominate LF ticks (try ≤100)",
                 self.routing.enumeration_max_paths
             );
         }
-        if self.pipeline.hf_prefetch_count > 120 {
+        if self.pipeline.hf_prefetch_count > 100 {
             crate::warn!(
-                "HF_PREFETCH_COUNT={} is high — prefetch often times out; try 60–100",
+                "HF_PREFETCH_COUNT={} is high — prefetch often times out; try 40–80",
                 self.pipeline.hf_prefetch_count
             );
         }
+        if self.pipeline.hf_prefetch_budget_ms <= HF_PREFETCH_BUDGET_MIN_MS {
+            crate::warn!(
+                "HF_PREFETCH_BUDGET_MS={} leaves no pool/flash work after hydrate floor {}ms — raise to ≥1800",
+                self.pipeline.hf_prefetch_budget_ms,
+                HF_PREFETCH_BUDGET_MIN_MS
+            );
+        }
+        if self.pipeline.stream_enabled {
+            let has_wss = self
+                .rpc
+                .wss_url
+                .as_deref()
+                .is_some_and(|u| !u.is_empty())
+                || !self.rpc.polygon_wss_urls.is_empty();
+            if !has_wss {
+                crate::warn!(
+                    "STREAM_ENABLED=true but WSS_URL / POLYGON_WSS_URLS empty — stream ticks stay inactive"
+                );
+            }
+        }
+        if self.hf_interval_ms < 100 {
+            crate::warn!(
+                "HF_INTERVAL_MS={} is very low — with ~3.5s tick hard budget, pending stream work piles up",
+                self.hf_interval_ms
+            );
+        }
         if self.rpc.request_timeout_ms > 20_000 {
-            crate::debug!(
-                "RPC request_timeout_ms={} is long — slow endpoints will block workers",
+            crate::warn!(
+                "RPC request_timeout_ms={} is long — slow endpoints will block workers; try 8–15s",
                 self.rpc.request_timeout_ms
+            );
+        }
+        if !self.is_dry_run() && self.execution.profit_safety_multiplier_bps >= 25_000 {
+            crate::warn!(
+                "PROFIT_SAFETY_MULTIPLIER_BPS={} (≥2.5×) is strict at Polygon gas — near-miss edges rarely clear",
+                self.execution.profit_safety_multiplier_bps
+            );
+        }
+        if self.min_profit_matic >= U256::from(10u128.pow(17)) {
+            crate::warn!(
+                "MIN_PROFIT_MATIC_WEI≥0.1 MATIC — live best-eval gross often sits well below that; try 0.01 MATIC"
             );
         }
     }
@@ -923,6 +990,43 @@ mod tests {
     }
 
     #[test]
+    fn normalize_floors_prefetch_budget_for_hydrate() {
+        let mut config = AppConfig::default();
+        config.pipeline.hf_prefetch_budget_ms = 200; // below one TickLens pool
+        config.pipeline.hf_score_cap = 10_000;
+        config.rpc.request_timeout_ms = 100; // too short
+        config.normalize();
+        assert_eq!(
+            config.pipeline.hf_prefetch_budget_ms,
+            HF_PREFETCH_BUDGET_MIN_MS
+        );
+        assert_eq!(config.pipeline.hf_score_cap, HF_CYCLE_CAP_MAX);
+        assert_eq!(config.rpc.request_timeout_ms, 1_000);
+
+        config.pipeline.hf_prefetch_budget_ms = 99_000;
+        config.normalize();
+        assert_eq!(
+            config.pipeline.hf_prefetch_budget_ms,
+            HF_PREFETCH_BUDGET_MAX_MS
+        );
+    }
+
+    #[test]
+    fn defaults_align_with_orchestrator_budgets() {
+        let c = AppConfig::default();
+        assert!(c.pipeline.hf_prefetch_budget_ms >= HF_PREFETCH_BUDGET_MIN_MS);
+        assert_eq!(c.hf_interval_ms, 200);
+        assert_eq!(c.rpc.request_timeout_ms, 12_000);
+        assert_eq!(c.pipeline.hf_prefetch_count, 60);
+        assert_eq!(c.oracle.tick_word_range, 6);
+        assert_eq!(c.execution.profit_safety_multiplier_bps, 15_000);
+        assert_eq!(
+            c.execution.min_profit_matic_wei,
+            "10000000000000000"
+        );
+    }
+
+    #[test]
     fn cycle_finder_mode_parses_aliases() {
         assert_eq!(
             CycleFinderMode::parse("bellman-ford").expect("bellman-ford alias should parse"),
@@ -1034,7 +1138,7 @@ mod tests {
             assert_eq!(config.discovery_bootstrap_batch, 20_000);
             assert_eq!(config.execution.mode, "dry-run");
             assert_eq!(config.rpc.batch_pace_ms, 5);
-            assert_eq!(config.rpc.request_timeout_ms, 30_000);
+            assert_eq!(config.rpc.request_timeout_ms, 12_000);
             Ok(())
         });
     }

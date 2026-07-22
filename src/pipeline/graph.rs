@@ -161,7 +161,10 @@ pub fn edges_for_pair(
     out
 }
 
-pub(crate) fn funded_token_indices(state: &PoolState, meta: &PoolMeta) -> SmallVec<[u8; MAX_POOL_TOKENS]> {
+pub(crate) fn funded_token_indices(
+    state: &PoolState,
+    meta: &PoolMeta,
+) -> SmallVec<[u8; MAX_POOL_TOKENS]> {
     let mut out = SmallVec::new();
     // Balancer/Woofi indices must follow vault/oracle token order (state.tokens), not
     // discovery meta order — a mismatch yields phantom local sim and BAL#521 on-chain.
@@ -540,8 +543,7 @@ fn pool_has_admissible_edges(
     let protocol = if protocol_matches_pool_state(meta.protocol, state) {
         meta.protocol
     } else {
-        let healed =
-            crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
+        let healed = crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol);
         if !protocol_matches_pool_state(healed, state) {
             return false;
         }
@@ -612,12 +614,10 @@ fn pool_worth_capped_attach(
         return true;
     };
     let bpt_index = meta.bpt_index.or_else(|| {
-        arena
-            .pool_state(meta.pool_index)
-            .and_then(|s| match s {
-                PoolState::Balancer(b) => b.bpt_index,
-                _ => None,
-            })
+        arena.pool_state(meta.pool_index).and_then(|s| match s {
+            PoolState::Balancer(b) => b.bpt_index,
+            _ => None,
+        })
     });
     if meta.tokens.iter().enumerate().any(|(i, &token)| {
         bpt_index != Some(i) && has_reliable_matic_rate(token, gate.token_to_matic_rates.as_ref())
@@ -716,10 +716,8 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
         if let Some(adj) = graph.adjacency.get_mut(adj_idx) {
             // Capture pool ids *before* thin so fully-dropped parallels still reindex
             // (live: stale pool_edge_positions pointed at thinned-away Directs).
-            let pools_before: smallvec::SmallVec<[usize; 16]> = adj
-                .iter()
-                .map(|ge| ge.edge.pool_index.0 as usize)
-                .collect();
+            let pools_before: smallvec::SmallVec<[usize; 16]> =
+                adj.iter().map(|ge| ge.edge.pool_index.0 as usize).collect();
             if thin_parallel_edges_in_place(adj, MAX_PARALLEL_EDGES_PER_PAIR) {
                 topology_changed = true;
                 for p in pools_before {
@@ -753,11 +751,7 @@ fn compact_token_adjacency(graph: &mut RoutingGraph, token_slots: Option<&[usize
 /// True when every Direct edge for `meta.pool_index` still matches meta token legs
 /// (address-aware). Stale edges survive `pool_has_live_edges` after discovery meta
 /// refresh (live: V3 tin=WMATIC tout=foreign vs meta=[WMATIC, other]).
-fn pool_direct_edges_match_meta(
-    graph: &RoutingGraph,
-    arena: &StateArena,
-    meta: &PoolMeta,
-) -> bool {
+fn pool_direct_edges_match_meta(graph: &RoutingGraph, arena: &StateArena, meta: &PoolMeta) -> bool {
     if meta.tokens.len() < 2 {
         return true;
     }
@@ -766,8 +760,7 @@ fn pool_direct_edges_match_meta(
         return true;
     };
     // Discovery meta order can disagree with vault/oracle routing legs used at attach.
-    let mut ok: smallvec::SmallVec<[TokenIndex; 8]> =
-        smallvec::SmallVec::from_slice(&meta.tokens);
+    let mut ok: smallvec::SmallVec<[TokenIndex; 8]> = smallvec::SmallVec::from_slice(&meta.tokens);
     if let Some(state) = arena.pool_state(meta.pool_index) {
         for leg in 0..2 {
             if let Some(t) = routing_token_at_leg(arena, state, meta, leg) {
@@ -1515,18 +1508,14 @@ mod tests {
         assert_eq!(graph.virtual_hubs.len(), 1);
         let enter_a: Vec<&GraphEdge> = graph.adjacency[token_a.0 as usize]
             .iter()
-            .filter(|ge| {
-                ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool
-            })
+            .filter(|ge| ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool)
             .collect();
         assert_eq!(enter_a.len(), 1);
         assert_eq!(enter_a[0].edge.token_in, token_a);
         assert_eq!(enter_a[0].edge.token_in_idx, 0); // vault leg 0 = addr_a
         let enter_b: Vec<&GraphEdge> = graph.adjacency[token_b.0 as usize]
             .iter()
-            .filter(|ge| {
-                ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool
-            })
+            .filter(|ge| ge.phase == GraphHopPhase::EnterPool && ge.edge.pool_index == pool)
             .collect();
         assert_eq!(enter_b.len(), 1);
         assert_eq!(enter_b[0].edge.token_in_idx, 1);

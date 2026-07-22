@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use alloy::eips::eip2718::Encodable2718;
 use alloy::hex;
-use alloy::network::{
-    Ethereum, EthereumWallet, NetworkTransactionBuilder, TransactionBuilder,
-};
+use alloy::network::{Ethereum, EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::B256;
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;

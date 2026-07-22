@@ -27,6 +27,9 @@ use crate::util::now_ms;
 const DEFAULT_RECEIPT_LOOKBACK: u64 = 50;
 const HEIGHT_CACHE_TTL_MS: u64 = 15_000;
 const HYPERSYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap outer height/receipt waits — config request_timeout can be 12–30s and would
+/// stall receipt loops when HyperSync is slow (RPC fallback is preferred).
+const HYPERSYNC_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Indexer-style default is 12; we poll receipts / height often and prefer fail-fast + RPC fallback.
 const HYPERSYNC_MAX_RETRIES: usize = 2;
 
@@ -103,7 +106,8 @@ impl HyperSyncService {
         }
 
         // Overall budget: client already applies http_req_timeout + a few retries.
-        let height = timeout(self.request_timeout, self.client.get_height())
+        let op_timeout = self.request_timeout.min(HYPERSYNC_OP_TIMEOUT);
+        let height = timeout(op_timeout, self.client.get_height())
             .await
             .context("hypersync get_height timed out")?
             .context("hypersync get_height failed")?;
@@ -165,7 +169,8 @@ impl HyperSyncService {
             ])
             .where_transactions(filter);
         query.max_num_transactions = Some(1);
-        let response = timeout(self.request_timeout, self.client.get(&query))
+        let op_timeout = self.request_timeout.min(HYPERSYNC_OP_TIMEOUT);
+        let response = timeout(op_timeout, self.client.get(&query))
             .await
             .context("hypersync get_transaction_receipt timed out")?
             .context("hypersync get_transaction_receipt failed")?;
@@ -235,11 +240,12 @@ mod tests {
         let mut rpc = RpcConfig::default();
         rpc.hyper_sync_url = Some("  https://polygon.hypersync.xyz  ".into());
         // ClientConfig validates api_token as a UUID; whitespace must be trimmed first.
-        let service = HyperSyncService::from_config(
-            &rpc,
-            "  a3cbea70-ad7d-4308-a4be-b14e095ce169  ",
-        )
-        .expect("trimmed HyperSync configuration should be valid");
-        assert_eq!(service.client.url().as_str(), "https://polygon.hypersync.xyz/");
+        let service =
+            HyperSyncService::from_config(&rpc, "  a3cbea70-ad7d-4308-a4be-b14e095ce169  ")
+                .expect("trimmed HyperSync configuration should be valid");
+        assert_eq!(
+            service.client.url().as_str(),
+            "https://polygon.hypersync.xyz/"
+        );
     }
 }

@@ -473,52 +473,49 @@ pub fn simulate_balancer_swap(
     }
 }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::core::types::BalancerLinearState;
-        use alloy::primitives::Address;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::BalancerLinearState;
+    use alloy::primitives::Address;
 
-        #[test]
-        fn balancer_fee_bps_from_1e18() {
-            // 0.04% = 4 bps → 4e14
-            assert_eq!(
-                balancer_fee_bps_from_pool(U256::from(400_000_000_000_000u64)),
-                Some(4)
-            );
-            assert_eq!(balancer_fee_bps_from_pool(U256::ZERO), None);
-            assert_eq!(balancer_fee_bps_from_pool(ONE), None);
-        }
+    #[test]
+    fn balancer_fee_bps_from_1e18() {
+        // 0.04% = 4 bps → 4e14
+        assert_eq!(
+            balancer_fee_bps_from_pool(U256::from(400_000_000_000_000u64)),
+            Some(4)
+        );
+        assert_eq!(balancer_fee_bps_from_pool(U256::ZERO), None);
+        assert_eq!(balancer_fee_bps_from_pool(ONE), None);
+    }
 
-        #[test]
-        fn balancer_balance_in_prefers_vault_address() {
-            let t0 = Address::from([1u8; 20]);
-            let t1 = Address::from([2u8; 20]);
-            let state = BalancerPoolState {
-                pool_id: None,
-                tokens: vec![t0, t1],
-                balances: vec![U256::from(100u64), U256::from(999_999u64)],
-                weights: vec![ONE / U256::from(2u64); 2],
-                scaling_factors: vec![ONE; 2],
-                amp: U256::ZERO,
-                amp_precision: U256::ZERO,
-                fee: U256::from(400_000_000_000_000u64),
-                pool_type: BalancerPoolKind::Weighted,
-                linear: None,
-                bpt_index: None,
-                is_updating: false,
-                last_change_block: 0,
-            };
-            // Stale idx 0 but token_in is t1 → use vault order.
-            assert_eq!(
-                balancer_balance_in(&state, 0, Some(t1)),
-                U256::from(999_999u64)
-            );
-            assert_eq!(
-                balancer_balance_in(&state, 0, None),
-                U256::from(100u64)
-            );
-        }
+    #[test]
+    fn balancer_balance_in_prefers_vault_address() {
+        let t0 = Address::from([1u8; 20]);
+        let t1 = Address::from([2u8; 20]);
+        let state = BalancerPoolState {
+            pool_id: None,
+            tokens: vec![t0, t1],
+            balances: vec![U256::from(100u64), U256::from(999_999u64)],
+            weights: vec![ONE / U256::from(2u64); 2],
+            scaling_factors: vec![ONE; 2],
+            amp: U256::ZERO,
+            amp_precision: U256::ZERO,
+            fee: U256::from(400_000_000_000_000u64),
+            pool_type: BalancerPoolKind::Weighted,
+            linear: None,
+            bpt_index: None,
+            is_updating: false,
+            last_change_block: 0,
+        };
+        // Stale idx 0 but token_in is t1 → use vault order.
+        assert_eq!(
+            balancer_balance_in(&state, 0, Some(t1)),
+            U256::from(999_999u64)
+        );
+        assert_eq!(balancer_balance_in(&state, 0, None), U256::from(100u64));
+    }
 
     fn linear_state(main_balance: U256, fee: U256, rate: U256) -> BalancerPoolState {
         BalancerPoolState {

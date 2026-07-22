@@ -83,12 +83,11 @@ fn matic_rate_from_probe_sim_with_decimals(
         if sim.amount_out.is_zero() {
             continue;
         }
-        let Some(rate) = sim
-            .amount_out
-            .checked_mul(scale)
-            .and_then(|v| v.checked_mul(RATE_PRECISION))
-            .map(|v| v / probe)
-        else {
+        // MATIC wei per whole token unit — same convention as Chainlink/LST rates:
+        // `amount_out * 10^decimals / probe`. Do **not** multiply by RATE_PRECISION
+        // (live: 1e18 inflation → hub vs CL always >20% diverge → wrong hub preferred;
+        // gas/profit MATIC gates off by 1e18 for hub-only tokens).
+        let Some(rate) = sim.amount_out.checked_mul(scale).map(|v| v / probe) else {
             continue;
         };
         if rate >= MIN_TOKEN_TO_MATIC_RATE {
@@ -282,8 +281,7 @@ fn reconstruct_path_with_first(
         }
         let (next, edge) = if !used_first {
             used_first = true;
-            first
-                .or_else(|| parent.get(cur.0 as usize).copied().flatten())?
+            first.or_else(|| parent.get(cur.0 as usize).copied().flatten())?
         } else {
             parent.get(cur.0 as usize).copied().flatten()?
         };
@@ -344,8 +342,7 @@ pub fn hub_path_matic_rates_batch(
             path_miss += 1;
             continue;
         }
-        let primary =
-            matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals);
+        let primary = matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals);
         // Alternate first-hop path when present (rescue + dual-DEX sanity).
         let alt_rate = alt
             .get(token.0 as usize)
@@ -437,13 +434,14 @@ mod tests {
         }
     }
 
+    /// V2 `fee` is the **keep numerator** (9970/10000 = 30 bps), not the bps fee itself.
     fn v2_pool() -> Arc<PoolState> {
         // Reserves must exceed the 18-decimal spot probe (~1e15) used by matic_rate_from_probe_sim.
         let funded = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(100u64);
         Arc::new(PoolState::V2(V2PoolState {
             reserve0: funded,
             reserve1: funded * U256::from(2u64),
-            fee: U256::from(30u8),
+            fee: U256::from(9970u64),
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 1,
         }))
@@ -455,7 +453,7 @@ mod tests {
         Arc::new(PoolState::V2(V2PoolState {
             reserve0: funded,
             reserve1: funded * U256::from(2u64),
-            fee: U256::from(30u8),
+            fee: U256::from(9970u64),
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 1,
         }))
@@ -487,7 +485,84 @@ mod tests {
         );
         let rate = rates.get(&tail).copied().expect("tail rate");
         assert!(rate >= MIN_TOKEN_TO_MATIC_RATE);
+        // Pre-fix multiplied by RATE_PRECISION → ~1e30. Correct = MATIC-wei/whole.
+        assert!(
+            rate < U256::from(10u128.pow(24)),
+            "hub rate still looks RATE_PRECISION-inflated: {rate}"
+        );
         assert_eq!(rates.get(&wmatic).copied(), Some(RATE_PRECISION));
+    }
+
+    #[test]
+    fn direct_probe_sim_one_hop_equal_reserves() {
+        use crate::core::types::Edge;
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x55u8; 20]));
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let pool = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep, // wmatic
+            reserve1: deep, // spoke
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        let p = arena.register_pool(Address::from([0xd1u8; 20]), pool);
+        // spoke (token1) -> wmatic (token0)
+        let edge = Edge {
+            pool_index: p,
+            token_in: spoke,
+            token_out: wmatic,
+            token_in_idx: 1,
+            token_out_idx: 0,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: false,
+        };
+        let rate = matic_rate_from_probe_sim(&arena, spoke, &[edge]).expect("rate");
+        assert!(
+            rate > U256::from(9u128 * 10u128.pow(17)) && rate < U256::from(11u128 * 10u128.pow(17)),
+            "direct 1:1 rate expected ~1e18, got {rate}"
+        );
+    }
+
+    #[test]
+    fn one_hop_equal_reserves_rate_near_rate_precision() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x44u8; 20]));
+        // Equal deep reserves → ~1 MATIC per whole spoke token after 30 bps fee.
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let pool = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep,
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        let p = arena.register_pool(Address::from([0xc1u8; 20]), pool);
+        let metas = [pool_meta_from_pair(
+            p,
+            ProtocolType::UniswapV2,
+            wmatic,
+            spoke,
+            30,
+        )];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[spoke],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        let rate = rates.get(&spoke).copied().expect("spoke rate");
+        // ~0.997e18 after 30 bps — must be O(RATE_PRECISION), not O(1e36).
+        assert!(
+            rate > U256::from(9u128 * 10u128.pow(17)) && rate < U256::from(11u128 * 10u128.pow(17)),
+            "1:1 hub rate expected ~1e18, got {rate}"
+        );
     }
 
     #[test]
@@ -528,8 +603,16 @@ mod tests {
             None,
             Some(&metas),
         );
-        let rate = rates.get(&spoke).copied().expect("thin spoke must price via micro");
+        let rate = rates
+            .get(&spoke)
+            .copied()
+            .expect("thin spoke must price via micro");
         assert!(rate >= MIN_TOKEN_TO_MATIC_RATE);
+        // Same scale as WMATIC self-rate (RATE_PRECISION = 1e18 for 1:1).
+        assert!(
+            rate < U256::from(10u128.pow(22)),
+            "thin hub rate inflated: {rate}"
+        );
     }
 
     #[test]

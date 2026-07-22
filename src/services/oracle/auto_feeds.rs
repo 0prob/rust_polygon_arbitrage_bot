@@ -83,10 +83,7 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
 }
 
 /// Note unmapped addresses for a future batch scan (skips configured / known no-feed).
-pub fn note_unmapped_addresses(
-    oracle: &PriceOracle,
-    addrs: impl IntoIterator<Item = Address>,
-) {
+pub fn note_unmapped_addresses(oracle: &PriceOracle, addrs: impl IntoIterator<Item = Address>) {
     let store = STORE.lock();
     let no_feed: FxHashSet<Address> = store
         .no_feed
@@ -103,7 +100,9 @@ pub fn note_unmapped_addresses(
     let mut pending = PENDING.lock();
     let before = pending.len();
     for addr in addrs {
-        if oracle.has_configured_feed(&addr) || no_feed.contains(&addr) || known_feeds.contains(&addr)
+        if oracle.has_configured_feed(&addr)
+            || no_feed.contains(&addr)
+            || known_feeds.contains(&addr)
         {
             continue;
         }
@@ -176,7 +175,12 @@ async fn run_auto_feed_batch(
     };
     let rows: Vec<(Address, Option<&'static str>)> = batch
         .iter()
-        .map(|&addr| (addr, hint_label(&addr).or_else(|| token_symbol_label(&addr))))
+        .map(|&addr| {
+            (
+                addr,
+                hint_label(&addr).or_else(|| token_symbol_label(&addr)),
+            )
+        })
         .collect();
     crate::info!(
         "oracle auto-feeds: scanning batch={} (labeled={})",

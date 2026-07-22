@@ -18,7 +18,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{ProbeContext, cycle_key, retain_cycles_with_priced_start};
 use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
 use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
-    use crate::pipeline::graph::{
+use crate::pipeline::graph::{
     GraphBuildGate, attach_missing_eligible_pools_with_gate, attach_pool_to_graph,
     build_graph_with_gate, count_graph_eligible_pools_with_gate, funded_token_indices,
     has_missing_eligible_pools_with_gate, refresh_graph_cycle_coverage, rescore_pools_in_place,
@@ -239,9 +239,7 @@ fn prune_dust_v2_cycles(
     }
     let kept: Vec<_> = cycles
         .into_iter()
-        .filter(|c| {
-            crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &c.edges).is_none()
-        })
+        .filter(|c| crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &c.edges).is_none())
         .collect();
     let dropped = before.saturating_sub(kept.len());
     if dropped > 0 {
@@ -460,8 +458,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 layout_fp,
                 work.state_generation,
                 eligible_count,
-            work.arena.routing_family_prefix_fingerprint(routable_count),
-        );
+                work.arena.routing_family_prefix_fingerprint(routable_count),
+            );
         }
         if work.state_generation != gc.cached_state_generation() {
             // Use helper: mutates under &mut self when rc==1 (no prior .graph() clone in scope)
@@ -489,8 +487,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     layout_fp,
                     work.state_generation,
                     eligible_count,
-            work.arena.routing_family_prefix_fingerprint(routable_count),
-        );
+                    work.arena.routing_family_prefix_fingerprint(routable_count),
+                );
                 gg
             })
         } else {
@@ -507,8 +505,8 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     layout_fp,
                     work.state_generation,
                     eligible_count,
-            work.arena.routing_family_prefix_fingerprint(routable_count),
-        );
+                    work.arena.routing_family_prefix_fingerprint(routable_count),
+                );
                 gg
             })
         }
@@ -522,8 +520,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         let gc = work.graph_cache.lock();
         gc.cached_eligible_pool_count()
     };
-    let catchup_due =
-        needs_rebuild || connectivity_stale || eligible_count > cached_eligible;
+    let catchup_due = needs_rebuild || connectivity_stale || eligible_count > cached_eligible;
     // Observed force-refind: skip catchup attach (pins use force_attach below).
     let scan_missing = catchup_due && !work.force_cycle_refind;
     if catchup_due && work.force_cycle_refind {
@@ -536,9 +533,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             graph.as_ref(),
             gate_ref,
         ) {
-            work.graph_cache
-                .lock()
-                .set_attach_catchup_pending(false);
+            work.graph_cache.lock().set_attach_catchup_pending(false);
         }
         crate::info!(
             "lf attach_missing defer: force_refind=true stale={connectivity_stale} eligible={eligible_count} lf_pass={}",
@@ -649,13 +644,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     .pool_metas
                     .iter()
                     .find(|m| m.pool_index == pi)
-                    .map(|_m| {
-                        match work.arena.pool_state(pi) {
-                            None => "no_state",
-                            Some(s) if !s.is_tradable() => "untradable",
-                            Some(_) if attached.contains(&pi) => "dead_after_rescore",
-                            Some(_) => "inadmissible",
-                        }
+                    .map(|_m| match work.arena.pool_state(pi) {
+                        None => "no_state",
+                        Some(s) if !s.is_tradable() => "untradable",
+                        Some(_) if attached.contains(&pi) => "dead_after_rescore",
+                        Some(_) => "inadmissible",
                     })
                     .unwrap_or("no_meta");
                 crate::info!(
@@ -773,8 +766,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 .iter()
                 .filter(|&&p| graph.pool_has_live_edges(p))
                 .count();
-            let pin: FxHashSet<PoolIndex> =
-                work.observed_pool_indices.iter().copied().collect();
+            let pin: FxHashSet<PoolIndex> = work.observed_pool_indices.iter().copied().collect();
             // Count opening Enter/Direct edges from seed tokens into pin pools.
             for &t in &obs_starts {
                 let Some(edges) = graph.adjacency.get(t.0 as usize) else {
@@ -807,11 +799,9 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         // (live: in_graph=N/N enum_touch=0 after attach).
         // Bridge-only pins (pin_covered=0) cannot form multi-pool cycles; exclusive
         // DFS always returns raw=0 and used to wipe the snap when prior was empty.
-        let pin_bridge_only = work.force_cycle_refind
-            && !work.observed_pool_indices.is_empty()
-            && pin_covered == 0;
-        let exclusive_obs =
-            work.force_cycle_refind && !obs_starts.is_empty() && !pin_bridge_only;
+        let pin_bridge_only =
+            work.force_cycle_refind && !work.observed_pool_indices.is_empty() && pin_covered == 0;
+        let exclusive_obs = work.force_cycle_refind && !obs_starts.is_empty() && !pin_bridge_only;
         let first_hop = if exclusive_obs {
             work.observed_pool_indices.as_slice()
         } else {
@@ -902,17 +892,22 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             if exclusive_obs {
                 let pin: rustc_hash::FxHashSet<PoolIndex> =
                     work.observed_pool_indices.iter().copied().collect();
-                result.extend(cached.iter().filter(|c| {
-                    c.edges.iter().any(|e| pin.contains(&e.pool_index))
-                        && c.edges.iter().all(|e| {
-                            matches!(
-                                e.protocol,
-                                crate::core::types::ProtocolType::UniswapV2
-                                    | crate::core::types::ProtocolType::UniswapV3
-                                    | crate::core::types::ProtocolType::UniswapV4
-                            )
+                result.extend(
+                    cached
+                        .iter()
+                        .filter(|c| {
+                            c.edges.iter().any(|e| pin.contains(&e.pool_index))
+                                && c.edges.iter().all(|e| {
+                                    matches!(
+                                        e.protocol,
+                                        crate::core::types::ProtocolType::UniswapV2
+                                            | crate::core::types::ProtocolType::UniswapV3
+                                            | crate::core::types::ProtocolType::UniswapV4
+                                    )
+                                })
                         })
-                }).cloned());
+                        .cloned(),
+                );
             } else {
                 result.reserve(cached.len());
                 result.extend(cached.iter().cloned());
@@ -1336,6 +1331,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                             &algebra_pools,
                             &algebra_integral_pools,
                             pinned_block,
+                            true,
                         )
                         .await;
                         v3_ticks_ms = v3_ticks_ms
@@ -1835,10 +1831,8 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     &arena,
                     &ready.edges,
                 );
-                let arena_ok = crate::pipeline::local_sim::cycle_edges_match_arena_state(
-                    &arena,
-                    &ready.edges,
-                );
+                let arena_ok =
+                    crate::pipeline::local_sim::cycle_edges_match_arena_state(&arena, &ready.edges);
                 let meta_ok = crate::pipeline::local_sim::cycle_v2_edges_match_pool_meta(
                     &arena,
                     pool_metas.as_ref(),
@@ -1847,8 +1841,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 if obs_touch {
                     static UNI_FAIL_SAMPLE: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
-                    if UNI_FAIL_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0
-                    {
+                    if UNI_FAIL_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
                         crate::info!(
                             "obs uni realign fail: hop_break={hop_break:?} arena_ok={arena_ok} meta_ok={meta_ok} hops={} edges={}",
                             ready.edge_hops(),
@@ -2067,8 +2060,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     // active_candidates=0 (dirty never landed in snap edges).
     let stream_universe: Option<Vec<_>> = ctx.config.pipeline.stream_enabled.then(|| {
         let mut addrs = Vec::with_capacity(capped.len().saturating_mul(3) + observed.len());
-        let mut seen =
-            rustc_hash::FxHashSet::with_capacity_and_hasher(capped.len() * 2, rustc_hash::FxBuildHasher);
+        let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
+            capped.len() * 2,
+            rustc_hash::FxBuildHasher,
+        );
         for cycle in &capped {
             for edge in &cycle.edges {
                 if !crate::services::partial_cache::is_streamable_protocol(edge.protocol) {

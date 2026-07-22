@@ -27,8 +27,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// RPC ping interval — keeps the WS alive when the chain is quiet.
 const WSS_PING_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Per-endpoint connect + `eth_blockNumber` probe budget.
-const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-endpoint connect + `eth_blockNumber` probe budget (fail-fast multi-URL select).
+const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS: u64 = 60_000;
 /// No Sync/Swap after arm → force LF to rotate interest set / re-seed ranking.
 const WSS_LOG_SILENCE_FORCE: Duration = Duration::from_secs(20);
@@ -144,10 +144,25 @@ impl PoolLogFeed {
     ) -> anyhow::Result<SubscriptionExit> {
         let ws = WsConnect::new(wss_url.to_string());
         // Read-only subscriptions: no RecommendedFillers.
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_ws(ws)
-            .await?;
+        // Bound connect — hung TCP handshakes blocked reconnect forever (no timeout).
+        const WSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+        let provider = match timeout(
+            WSS_CONNECT_TIMEOUT,
+            ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_ws(ws),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("WSS connect failed: {e}")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "WSS connect timed out after {}ms",
+                    WSS_CONNECT_TIMEOUT.as_millis()
+                ));
+            }
+        };
 
         // Topic-only Sync|Swap: address-filtered subs stayed armed but delivered
         // ~0 logs because predicted top-N pools were deep-but-quiet. Topic-wide

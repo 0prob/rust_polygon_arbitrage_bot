@@ -171,10 +171,7 @@ impl PartialPoolCache {
             patches: AtomicU64::new(0),
             trigger: StreamTrigger::new(),
             dirty: Mutex::new(FxHashSet::default()),
-            universe: RwLock::new(FxHashSet::with_capacity_and_hasher(
-                capacity,
-                FxBuildHasher,
-            )),
+            universe: RwLock::new(FxHashSet::with_capacity_and_hasher(capacity, FxBuildHasher)),
             observed_live: Mutex::new(FxHashSet::with_capacity_and_hasher(64, FxBuildHasher)),
             sticky_observed: Mutex::new(FxHashMap::with_capacity_and_hasher(64, FxBuildHasher)),
             edge_centrality: Mutex::new(None),

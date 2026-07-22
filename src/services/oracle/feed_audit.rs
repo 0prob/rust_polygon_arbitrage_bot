@@ -295,9 +295,7 @@ pub fn persist_runtime_demand_snapshot(path: &Path) -> anyhow::Result<()> {
         .map(|(addr, score)| DemandSnapshotRow {
             address: format!("{addr:#x}"),
             demand_score: score,
-            symbol: token_symbol_label(&addr)
-                .unwrap_or("")
-                .to_string(),
+            symbol: token_symbol_label(&addr).unwrap_or("").to_string(),
         })
         .collect();
     let file = std::fs::File::create(path)?;

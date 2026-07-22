@@ -96,9 +96,8 @@ const PG_APP_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_V
 
 /// Parse a libpq URL / key-value string (tokio-postgres `Config::from_str`) and apply bot defaults.
 fn pg_config(url: &str) -> anyhow::Result<tokio_postgres::Config> {
-    let mut config: tokio_postgres::Config = url
-        .parse()
-        .context("invalid postgres connection URL")?;
+    let mut config: tokio_postgres::Config =
+        url.parse().context("invalid postgres connection URL")?;
     // URL query params already applied by `from_str`; fill only unset knobs.
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(PG_CONNECT_TIMEOUT);
@@ -652,10 +651,8 @@ mod tests {
 
     #[test]
     fn pg_config_preserves_url_keepalive_overrides() {
-        let cfg = pg_config(
-            "postgres://127.0.0.1/db?keepalives_interval=7&keepalives_retries=9",
-        )
-        .expect("parse url");
+        let cfg = pg_config("postgres://127.0.0.1/db?keepalives_interval=7&keepalives_retries=9")
+            .expect("parse url");
         assert_eq!(cfg.get_keepalives_interval(), Some(Duration::from_secs(7)));
         assert_eq!(cfg.get_keepalives_retries(), Some(9));
     }

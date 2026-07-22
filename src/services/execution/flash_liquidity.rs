@@ -446,6 +446,13 @@ impl FlashLiquidityCache {
                         if stale.is_empty() {
                             continue;
                         }
+                        // Match HF spawn/prefetch: don't burn a multicall on 1–3 dust.
+                        let has_hub = stale
+                            .iter()
+                            .any(|addr| crate::core::constants::is_polygon_hub_token(*addr));
+                        if !has_hub && stale.len() < 4 {
+                            continue;
+                        }
                         let Some(_guard) = self.try_acquire_refresh_inflight() else {
                             continue;
                         };
@@ -465,14 +472,23 @@ impl FlashLiquidityCache {
         }
         self.track_hot_tokens(tokens);
         // Use 75% TTL stale set — full-TTL has_fresh left a 7.5s ColdCache window.
-        if self.stale_tokens(tokens).is_empty() {
+        let stale = self.stale_tokens(tokens);
+        if stale.is_empty() {
+            return;
+        }
+        // Dust-only 1–3 token batches: background loop coalesces. Live: 11
+        // refreshes/min with ~40% tokens=1 multicalls fighting TickLens for RPC.
+        let has_hub = stale
+            .iter()
+            .any(|addr| crate::core::constants::is_polygon_hub_token(*addr));
+        if !has_hub && stale.len() < 4 {
             return;
         }
         if self.refresh_inflight.load(Ordering::Acquire) {
             return;
         }
         let cache = Arc::clone(self);
-        let tokens = tokens.to_vec();
+        let tokens = stale;
         tokio::spawn(async move {
             let Some(_guard) = cache.try_acquire_refresh_inflight() else {
                 return;
@@ -1661,7 +1677,13 @@ fn reuse_or_reassess(
         && existing.gross_profit == input.evaluated.result.profit
         && assessment_flash_fee_matches(existing, source, input.evaluated.result.amount_in)
         // Direct vs Balancer both have 0 flash fee but different gas seeds — require gas match.
-        && assessment_gas_matches(existing, input.evaluated.result.total_gas, input.gas_price)
+        && assessment_gas_matches(
+            existing,
+            input.evaluated.result.total_gas,
+            input.gas_price,
+            input.gas_oracle,
+            input.route_fingerprint,
+        )
     {
         return Some(existing.clone());
     }
@@ -1684,9 +1706,14 @@ fn assessment_gas_matches(
     assessment: &ProfitAssessment,
     simulated_gas: u32,
     gas_price: U256,
+    gas_oracle: &crate::services::execution::gas_oracle::GasOracle,
+    route_fp: u64,
 ) -> bool {
-    // ponytail: gas_cost_wei = units × price; mismatch ⇒ flash/gas model drifted since HF eval.
-    match U256::from(simulated_gas).checked_mul(gas_price) {
+    // Must use the same units as assess_route_from_sim (observed/scaled), not raw
+    // hop sim gas. Raw match always failed once sim_scale>1× or route history hit
+    // → forced reassess + extra CPU on every prepare (live: never reused HF pass).
+    let units = gas_oracle.route_gas_or_heuristic(route_fp, simulated_gas);
+    match U256::from(units).checked_mul(gas_price) {
         Some(expected) => assessment.gas_cost_wei == expected,
         None => false,
     }
@@ -1788,6 +1815,44 @@ mod tests {
             &arena,
             &dodo_cycle(base_index, pool_index),
             pool_address
+        ));
+    }
+
+    #[test]
+    fn assessment_gas_matches_uses_observed_units_not_raw_sim() {
+        use crate::services::execution::gas_oracle::GasOracle;
+
+        let oracle = GasOracle::new(std::time::Duration::from_secs(1));
+        let raw_sim = 200_000u32;
+        let observed = 280_000u32; // dry-run learned
+        let fp = 42u64;
+        oracle.record_route_gas(fp, observed);
+        let price = U256::from(100u64);
+        let assessment = ProfitAssessment {
+            should_execute: true,
+            gross_profit: U256::from(1u64),
+            gas_cost_wei: U256::from(observed) * price,
+            gas_cost_in_tokens: U256::ZERO,
+            flash_loan_fee: U256::ZERO,
+            slippage_deduction: U256::ZERO,
+            revert_penalty: U256::ZERO,
+            net_profit: U256::ZERO,
+            net_profit_after_gas: U256::ZERO,
+            net_profit_after_gas_matic_wei: U256::ZERO,
+            roi: 0.0,
+            reject_reason: None,
+        };
+        // Raw sim×price mismatches (old prepare reuse bug); observed path matches.
+        assert_ne!(
+            U256::from(raw_sim).checked_mul(price).unwrap(),
+            assessment.gas_cost_wei
+        );
+        assert!(assessment_gas_matches(
+            &assessment, raw_sim, price, &oracle, fp
+        ));
+        // Wrong fp falls back to heuristic (raw at scale 1×) → mismatch.
+        assert!(!assessment_gas_matches(
+            &assessment, raw_sim, price, &oracle, 99
         ));
     }
 

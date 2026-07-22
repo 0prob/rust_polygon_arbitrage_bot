@@ -42,11 +42,15 @@ use crate::services::execution::receipt::ReceiptPoller;
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
-use crate::services::execution::submit::{resolve_submit_fees_with_profit, submit_with_recovery};
+use crate::services::execution::submit::{
+    expected_submit_gas_price, resolve_submit_fees_with_profit, submit_with_recovery,
+};
 use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
 const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
+/// eth_blockNumber hang protection (matches state_refresh head budget).
+const CHAIN_HEAD_RPC_TIMEOUT: Duration = Duration::from_millis(1_500);
 // ponytail: prepare-skip only counts for logs — quarantine was starving selected=0.
 /// Best-eval cover below this (bps of gas cost) is chronic dust — soft-quarantine
 /// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
@@ -62,10 +66,10 @@ const CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(15); // 0.00
 const CHRONIC_UNDERWATER_STRIKES: u32 = 3;
 /// Reset strike count when best-eval gaps exceed this (one-shot diversions).
 const CHRONIC_UNDERWATER_STRIKE_WINDOW: Duration = Duration::from_secs(120);
-    /// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
-    /// into selected=0). Live: cover=42/65 4-hop losers escaped the old 100 floor and
-    /// kept winning best-eval after sticky cool — cool from 25 bps with real MATIC.
-    const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 25;
+/// Ignore near-zero cover diversions (uqstrikes: cover=0/1/2 fps still cascaded
+/// into selected=0). Live: cover=42/65 4-hop losers escaped the old 100 floor and
+/// kept winning best-eval after sticky cool — cool from 25 bps with real MATIC.
+const CHRONIC_UNDERWATER_MIN_COVER_BPS: u64 = 25;
 const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 /// Start-token cooldown when vault query profit does not appear in executor balance
 /// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
@@ -511,6 +515,18 @@ impl ExecutionService {
         q.get(route_hash).is_some_and(|expiry| now < *expiry)
     }
 
+    /// Insert route quarantine and amortize expired-entry prune (live: 700+ cools/run
+    /// left stale fps forever → larger maps + slower `any_quarantined` on every select).
+    fn quarantine_insert(&self, fingerprint: u64, until: Instant) {
+        let mut q = self.quarantine.write();
+        static INSERTS: AtomicU32 = AtomicU32::new(0);
+        if INSERTS.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
+            let now = Instant::now();
+            q.retain(|_, exp| *exp > now);
+        }
+        q.insert(fingerprint, until);
+    }
+
     fn route_cooldown(&self, config: &AppConfig) -> Duration {
         if config.is_dry_run() {
             DRY_RUN_PASS_COOLDOWN
@@ -569,9 +585,7 @@ impl ExecutionService {
 
     /// Longer cooldown when vault `queryBatchSwap` disagrees with local sim.
     pub fn quarantine_batch_query_failure(&self, fingerprint: u64) {
-        self.quarantine
-            .write()
-            .insert(fingerprint, Instant::now() + BATCH_QUERY_FAIL_QUARANTINE);
+        self.quarantine_insert(fingerprint, Instant::now() + BATCH_QUERY_FAIL_QUARANTINE);
         self.prepare_skip_counts.write().remove(&fingerprint);
     }
 
@@ -623,12 +637,11 @@ impl ExecutionService {
         } else {
             ROUTE_COOLDOWN
         };
-        self.quarantine.write().insert(fp, now + cooldown);
+        self.quarantine_insert(fp, now + cooldown);
     }
 
     fn quarantine_route_soft(&self, fp: u64, now: Instant) {
-        let mut q = self.quarantine.write();
-        q.insert(fp, now + ROUTE_COOLDOWN);
+        self.quarantine_insert(fp, now + ROUTE_COOLDOWN);
     }
 
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
@@ -651,8 +664,7 @@ impl ExecutionService {
         } else {
             gas_cover_bps
         };
-        if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS).contains(&cover_bps)
-        {
+        if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS).contains(&cover_bps) {
             return false;
         }
         let now = Instant::now();
@@ -678,13 +690,12 @@ impl ExecutionService {
             return false;
         }
         self.underwater_strikes.write().remove(&fingerprint);
-        let ttl = if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
-        {
+        let ttl = if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI) {
             CHRONIC_THIN_LIQ_QUARANTINE
         } else {
             CHRONIC_UNDERWATER_QUARANTINE
         };
-        self.quarantine.write().insert(fingerprint, now + ttl);
+        self.quarantine_insert(fingerprint, now + ttl);
         true
     }
 
@@ -922,11 +933,21 @@ impl ExecutionService {
 
         let chain_head = match chain_head_hint {
             Some(head) => head,
-            None => match sim_provider.get_block_number().await {
-                Ok(block) => block,
-                Err(e) => {
+            None => match tokio::time::timeout(CHAIN_HEAD_RPC_TIMEOUT, sim_provider.get_block_number())
+                .await
+            {
+                Ok(Ok(block)) => block,
+                Ok(Err(e)) => {
                     return ExecutionOutcome::SubmitFailed {
                         reason: format!("cannot establish simulation block: {e}"),
+                    };
+                }
+                Err(_) => {
+                    return ExecutionOutcome::SubmitFailed {
+                        reason: format!(
+                            "cannot establish simulation block: eth_blockNumber timed out after {}ms",
+                            CHAIN_HEAD_RPC_TIMEOUT.as_millis()
+                        ),
                     };
                 }
             },
@@ -1026,10 +1047,13 @@ impl ExecutionService {
             }
             let reason = dry.failure_reason();
             crate::info!(
-                "dry-run failed: fp={}, route_hash={}, flash={:?}, route={}, reason={}{}",
+                "dry-run failed: fp={}, route_hash={}, flash={:?}, ain={}, profit_matic={}, hops={}, route={}, reason={}{}",
                 fp,
                 candidate.route_hash,
                 candidate.flash_loan_source,
+                candidate.amount_in,
+                candidate.expected_profit_matic_wei,
+                candidate.hop_count,
                 candidate.route_trace,
                 reason,
                 if sim_fidelity_miss {
@@ -1069,14 +1093,38 @@ impl ExecutionService {
                 candidate.simulated_gas
             );
         } else {
+            let realized = dry.realized_profit.unwrap_or_default();
+            // Executor returns profit-token units; sim is MATIC wei — convert before ratio.
+            let realized_matic = token_profit_to_matic_wei(
+                realized,
+                candidate.token_to_matic_rate,
+                candidate.token_decimals,
+            )
+            .unwrap_or(U256::ZERO);
+            let sim_matic = candidate.expected_profit_matic_wei;
+            let retain_bps = if sim_matic.is_zero() {
+                0u64
+            } else {
+                realized_matic
+                    .saturating_mul(U256::from(10_000u64))
+                    .checked_div(sim_matic)
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap_or(u64::MAX)
+            };
             crate::info!(
-                "dry-run pass: fp={}, gas_used={}, sim_gas={}, realized_profit={}",
+                "dry-run pass: fp={}, gas_used={}, sim_gas={}, ain={}, flash={:?}, hops={}, sim_profit_matic={}, realized_profit={}, realized_matic={}, retain_bps={}, route={}",
                 fp,
                 gas_used,
                 candidate.simulated_gas,
-                dry.realized_profit
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "none".into()),
+                candidate.amount_in,
+                candidate.flash_loan_source,
+                candidate.hop_count,
+                sim_matic,
+                realized,
+                realized_matic,
+                retain_bps,
+                candidate.route_trace,
             );
         }
         let gas_fallback = dry.gas_used.is_none();
@@ -1112,9 +1160,22 @@ impl ExecutionService {
             }
         };
 
+        // Tip uplift from dry-run realized profit (MATIC wei). Executor returns token
+        // units — sim expected can be 5× optimistic when used raw (live: sim 0.69 MATIC
+        // → tip~173 gwei; realized token profit misread as MATIC over/under-tips).
+        let tip_profit = realized_profit
+            .and_then(|p| {
+                token_profit_to_matic_wei(
+                    p,
+                    candidate.token_to_matic_rate,
+                    candidate.token_decimals,
+                )
+            })
+            .filter(|p| !p.is_zero())
+            .unwrap_or(candidate.expected_profit_matic_wei);
         let Some(fees) = resolve_submit_fees_with_profit(
             gas_oracle,
-            candidate.expected_profit_matic_wei,
+            tip_profit,
             config.execution.profit_priority_fee_alpha_bps,
             final_gas,
         ) else {
@@ -1126,29 +1187,28 @@ impl ExecutionService {
             }
             return outcome;
         };
-
-        // Gas-overflow fallback has no RPC gas observation — reassessing at
-        // submit max_fee × sim_gas inflates the safety floor above HF eval.
-        let reassess_gas_price = if dry.gas_used.is_none() {
-            match gas_oracle.conservative_gas_price() {
-                Some(p) => p,
-                None => {
-                    crate::warn!(
-                        "dispatch skip: fp={}, gas oracle missing snapshot for profit reassess",
-                        fp,
-                    );
-                    let outcome = ExecutionOutcome::SubmitFailed {
-                        reason: "gas oracle has no snapshot for profit reassess".into(),
-                    };
-                    if let Some(ui_hook) = ui_hook {
-                        ui_hook.on_execution_outcome(&outcome, fp);
-                    }
-                    return outcome;
-                }
+        let Some(fee_snap) = gas_oracle.loaded_snapshot() else {
+            let outcome = ExecutionOutcome::SubmitFailed {
+                reason: "gas oracle has no snapshot for fee reassess".into(),
+            };
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
             }
-        } else {
-            fees.max_fee_per_gas
+            return outcome;
         };
+        // Expected pay = base + bid tip (not max_fee ceiling / 12.5% base buffer).
+        let reassess_gas_price = expected_submit_gas_price(fee_snap.base_fee, &fees);
+        crate::info!(
+            "submit fees: fp={}, tip_profit_matic={}, base_gwei={:.3}, priority_gwei={:.3}, max_fee_gwei={:.3}, expected_gwei={:.3}, gas_limit={}",
+            fp,
+            tip_profit,
+            crate::util::u256_to_f64(fee_snap.base_fee) / 1e9,
+            crate::util::u256_to_f64(fees.max_priority_fee_per_gas) / 1e9,
+            crate::util::u256_to_f64(fees.max_fee_per_gas) / 1e9,
+            crate::util::u256_to_f64(reassess_gas_price) / 1e9,
+            final_gas,
+        );
+
         let profit_gas = profit_reassess_gas(
             prior_observed_gas,
             candidate.simulated_gas,
@@ -1156,13 +1216,14 @@ impl ExecutionService {
             gas_fallback,
             gas_oracle.sim_scale_bps(),
         );
+        // Tip already in reassess_gas_price (max_priority) — alpha=0 avoids double-count.
         let reassess = Self::reassess_assessment(
             candidate,
             profit_gas,
             reassess_gas_price,
             learned_floor,
             realized_profit,
-            config.execution.profit_priority_fee_alpha_bps,
+            0,
         );
         let dry_pass = reassess.as_ref().is_some_and(|a| a.should_execute);
         if !dry_pass {
@@ -1171,7 +1232,7 @@ impl ExecutionService {
                 .and_then(|a| a.reject_reason.as_deref())
                 .unwrap_or("unknown");
             crate::info!(
-                "dispatch skip: fp={}, unprofitable after dry-run (profit_matic={}, profit_gas={}, submit_gas={}, reassess_fee_gwei={}, submit_max_fee_gwei={}, reject={reject})",
+                "dispatch skip: fp={}, unprofitable after dry-run (profit_matic={}, profit_gas={}, submit_gas={}, expected_gwei={:.3}, max_fee_gwei={:.3}, reject={reject})",
                 fp,
                 candidate.expected_profit_matic_wei,
                 profit_gas,
@@ -1321,18 +1382,26 @@ impl ExecutionService {
 
         // Gate on head lag since dry-run started (`chain_head`), not the pinned
         // `simulation_block` (LF/HF provenance can already be 2+ behind live head).
-        match sim_provider.get_block_number().await {
-            Ok(head) if head <= chain_head.saturating_add(1) => {}
-            Ok(head) => {
+        match tokio::time::timeout(CHAIN_HEAD_RPC_TIMEOUT, sim_provider.get_block_number()).await {
+            Ok(Ok(head)) if head <= chain_head.saturating_add(1) => {}
+            Ok(Ok(head)) => {
                 return ExecutionOutcome::SubmitFailed {
                     reason: format!(
                         "candidate stale: dry-run head {chain_head} (sim block {simulation_block}), now {head}"
                     ),
                 };
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return ExecutionOutcome::SubmitFailed {
                     reason: format!("pre-submit head check failed: {e}"),
+                };
+            }
+            Err(_) => {
+                return ExecutionOutcome::SubmitFailed {
+                    reason: format!(
+                        "pre-submit head check timed out after {}ms",
+                        CHAIN_HEAD_RPC_TIMEOUT.as_millis()
+                    ),
                 };
             }
         }

@@ -2,9 +2,7 @@ use alloy::primitives::{Address, U256};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-use crate::core::constants::{
-    HOP_CAP, MAX_POOL_TOKENS, MIN_HOP_TOKEN_BALANCE, V2_MIN_RESERVE,
-};
+use crate::core::constants::{HOP_CAP, MAX_POOL_TOKENS, MIN_HOP_TOKEN_BALANCE, V2_MIN_RESERVE};
 
 const EDGE_CAP: usize = HOP_CAP as usize;
 const HOP_AMOUNT_CAP: usize = EDGE_CAP + 1;

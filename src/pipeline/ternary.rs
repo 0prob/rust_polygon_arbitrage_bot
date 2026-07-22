@@ -40,7 +40,9 @@ pub struct RouteGasCosting<'a> {
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::util::ten_pow_u256_cached;
 
-pub const BRENT_SEED_CACHE_SLOTS: usize = 24;
+/// Warm seeds + per-optimize local sim memo. Live Brent re-hit the same dust
+/// amounts hundreds of times; 24 slots thrashed under golden-section revisits.
+pub const BRENT_SEED_CACHE_SLOTS: usize = 48;
 const BRENT_CACHE_SLOTS: usize = BRENT_SEED_CACHE_SLOTS;
 const GOLDEN_RATIO: u128 = 382;
 const CONVERGENCE_DIVISOR: u128 = 1000;
@@ -531,10 +533,8 @@ fn clamp_brent_high_to_probe_seeds(
         && !ctx.gas_price.is_zero()
         && !ctx.token_to_matic_rate.is_zero()
     {
-        let gas_units = crate::services::execution::gas::scaled_simulated_gas(
-            best_gas,
-            ctx.gas_scale_bps,
-        );
+        let gas_units =
+            crate::services::execution::gas::scaled_simulated_gas(best_gas, ctx.gas_scale_bps);
         let gas_cost_matic = ctx.gas_price.saturating_mul(U256::from(gas_units));
         let scale = crate::util::ten_pow_u256(ctx.token_decimals);
         let gas_cost_start = gas_cost_matic
@@ -942,6 +942,10 @@ pub fn optimize_cycle(
         // shadow a warm probe that already simulated above that amount.
         if let Some(sim) = sim_cache.get(&amount) {
             record_brent_cache_local();
+            // Zero-profit memos: skip score math (live: ~95% of evals).
+            if sim.profit.is_zero() {
+                return U256::ZERO;
+            }
             return brent_score_matic_from_sim(sim, amount, profit_ctx);
         }
         if let Some((cache, route_state_revision, route_fp)) = route_sim_cache
@@ -950,6 +954,9 @@ pub fn optimize_cycle(
             record_brent_cache_route();
             if sim_cache.len() < BRENT_CACHE_SLOTS {
                 sim_cache.insert(amount, cached);
+            }
+            if cached.profit.is_zero() {
+                return U256::ZERO;
             }
             return brent_score_matic_from_sim(&cached, amount, profit_ctx);
         }
@@ -965,6 +972,14 @@ pub fn optimize_cycle(
                         costing.fingerprint,
                         sim.total_gas,
                     );
+                }
+                // Memoize before reject branches — zero-profit was ~95% of evals and
+                // was re-walked on every golden revisit / worker (route cache hit≈0).
+                if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
+                    cache.insert(route_state_revision, route_fp, amount, sim);
+                }
+                if sim_cache.len() < BRENT_CACHE_SLOTS {
+                    sim_cache.insert(amount, sim);
                 }
                 if sim.profit.is_zero() {
                     record_brent_eval_reject(BrentEvalReject::ZeroProfit);
@@ -982,14 +997,7 @@ pub fn optimize_cycle(
                     record_brent_eval_reject(BrentEvalReject::Sanity);
                     return U256::ZERO;
                 }
-                let score = brent_score_matic_from_sim(&sim, amount, profit_ctx);
-                if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
-                    cache.insert(route_state_revision, route_fp, amount, sim);
-                }
-                if sim_cache.len() < BRENT_CACHE_SLOTS {
-                    sim_cache.insert(amount, sim);
-                }
-                score
+                brent_score_matic_from_sim(&sim, amount, profit_ctx)
             }
             None => {
                 // Depth failures are monotonic — wall the upper band. Sampled
@@ -1046,9 +1054,8 @@ pub fn optimize_cycle(
     // search mostly re-sims dead sizes (live: eval_reject≈98% zero_profit).
     // Keep a short search in case a non-ladder size still prints profit.
     let base_iters = max_iterations.unwrap_or(DEFAULT_BRENT_ITERATIONS);
-    let all_seed_zero_gross = seed_sims.is_some_and(|s| {
-        s.is_empty() || s.iter().all(|(_, sim)| sim.profit.is_zero())
-    });
+    let all_seed_zero_gross =
+        seed_sims.is_some_and(|s| s.is_empty() || s.iter().all(|(_, sim)| sim.profit.is_zero()));
     let iterations = if all_seed_zero_gross {
         base_iters.min(6)
     } else {
@@ -1234,14 +1241,9 @@ mod tests {
                 .is_none()
         );
         // Soft-cap below 8× seed: raise (was: return None and starve gas cover).
-        let raised = clamp_brent_high_to_probe_seeds(
-            U256::from(2_000u64),
-            low,
-            floor,
-            &seeds,
-            None,
-        )
-        .expect("raise soft-cap");
+        let raised =
+            clamp_brent_high_to_probe_seeds(U256::from(2_000u64), low, floor, &seeds, None)
+                .expect("raise soft-cap");
         assert_eq!(raised, seed * U256::from(8u8));
     }
 

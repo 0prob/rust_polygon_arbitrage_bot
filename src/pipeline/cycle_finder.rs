@@ -61,8 +61,7 @@ impl SharedCycleCap {
         if den == 0 || self.max == 0 {
             return self.is_full();
         }
-        self.found.load(AtomicOrdering::Relaxed).saturating_mul(den)
-            >= self.max.saturating_mul(num)
+        self.found.load(AtomicOrdering::Relaxed).saturating_mul(den) >= self.max.saturating_mul(num)
     }
 
     /// Reserve one slot. Returns false when the global cap is already filled.
@@ -378,11 +377,9 @@ impl ActiveGraph {
             .iter()
             .copied()
             .filter(|&t| {
-                self.adjacency.get(t.0 as usize).is_some_and(|edges| {
-                    edges
-                        .iter()
-                        .any(|ge| pin.contains(&ge.edge.pool_index))
-                })
+                self.adjacency
+                    .get(t.0 as usize)
+                    .is_some_and(|edges| edges.iter().any(|ge| pin.contains(&ge.edge.pool_index)))
             })
             .collect();
         if !pin_starts.is_empty() {
@@ -405,9 +402,7 @@ impl ActiveGraph {
                 pin.contains(&ge.edge.pool_index)
                     || matches!(
                         ge.edge.protocol,
-                        ProtocolType::UniswapV2
-                            | ProtocolType::UniswapV3
-                            | ProtocolType::UniswapV4
+                        ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
                     )
             });
         }
@@ -420,11 +415,7 @@ impl ActiveGraph {
     ///   incidence even when the RoutingGraph still has the live Direct.
     ///
     /// Inject any missing pin Direct (zero-ratio → ONE filler; live ratios kept).
-    pub fn inject_unpriced_pin_directs(
-        &mut self,
-        graph: &RoutingGraph,
-        pools: &[PoolIndex],
-    ) {
+    pub fn inject_unpriced_pin_directs(&mut self, graph: &RoutingGraph, pools: &[PoolIndex]) {
         if pools.is_empty() {
             return;
         }
@@ -927,9 +918,10 @@ fn collect_cycles_dfs_single_start(
             // rarely close before budget while non-pin Uni fills the cap —
             // prefer pin via prioritize_first_hop + pin_cycles_touching_pools.
             let pin_touch = pin_touched
-                || prep.first_hop_pools.as_ref().is_some_and(|pins| {
-                    path.iter().any(|e| pins.contains(&e.pool_index))
-                });
+                || prep
+                    .first_hop_pools
+                    .as_ref()
+                    .is_some_and(|pins| path.iter().any(|e| pins.contains(&e.pool_index)));
             if !pin_touch
                 && (product_ratio <= ONE || product_ratio < min_profitable_cycle_ratio(hops))
             {
@@ -946,10 +938,7 @@ fn collect_cycles_dfs_single_start(
             }
             // Reserve half the shared cap for pin-touch closes during obs search
             // (live: non-pin Uni filled cap before pin paths returned).
-            if prep.first_hop_pools.is_some()
-                && !pin_touch
-                && global_cap.is_past_fraction(1, 2)
-            {
+            if prep.first_hop_pools.is_some() && !pin_touch && global_cap.is_past_fraction(1, 2) {
                 return;
             }
             if !global_cap.try_claim() {

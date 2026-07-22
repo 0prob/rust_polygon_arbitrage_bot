@@ -459,11 +459,9 @@ pub fn cycle_v2_edges_match_pool_meta(
             Some(m) if m.tokens.len() >= 2 => {
                 let on_meta = |want: alloy::primitives::Address| {
                     m.tokens.iter().any(|&t| {
-                        arena
-                            .token_address(t)
-                            .is_some_and(|maddr| {
-                                crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
-                            })
+                        arena.token_address(t).is_some_and(|maddr| {
+                            crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                        })
                     })
                 };
                 on_meta(tin) && on_meta(tout)
@@ -499,11 +497,9 @@ pub fn uni_cycle_has_both_foreign_edge(
             m.tokens.iter().any(|&t| t == tok)
                 || arena.token_address(tok).is_some_and(|want| {
                     m.tokens.iter().any(|&t| {
-                        arena
-                            .token_address(t)
-                            .is_some_and(|maddr| {
-                                crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
-                            })
+                        arena.token_address(t).is_some_and(|maddr| {
+                            crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                        })
                     })
                 })
         };
@@ -589,11 +585,9 @@ pub fn realign_uni_cycle_from_pool_meta(
             m.tokens.iter().position(|&t| t == tok).or_else(|| {
                 let want = arena.token_address(tok)?;
                 m.tokens.iter().position(|&t| {
-                    arena
-                        .token_address(t)
-                        .is_some_and(|maddr| {
-                            crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
-                        })
+                    arena.token_address(t).is_some_and(|maddr| {
+                        crate::core::constants::polygon_usd_stable_equivalent(maddr, want)
+                    })
                 })
             })
         };
@@ -688,7 +682,8 @@ pub fn realign_uni_cycle_from_pool_meta(
     }
     let addr_eq = |a: TokenIndex, b: TokenIndex| {
         a == b
-            || (arena.token_address(a).is_some() && arena.token_address(a) == arena.token_address(b))
+            || (arena.token_address(a).is_some()
+                && arena.token_address(a) == arena.token_address(b))
     };
     let hop_ok = |edges: &[Edge]| {
         edges
@@ -793,9 +788,7 @@ pub fn multi_token_edge_aligned(
                 && s.tokens.get(edge.token_out_idx as usize).copied() == Some(token_out)
         }
         // Meta/sim contract: idx 0 = base, 1 = quote (sellBase iff token_in_idx == 0).
-        PoolState::Dodo(s)
-            if !s.base_token.is_zero() && !s.quote_token.is_zero() =>
-        {
+        PoolState::Dodo(s) if !s.base_token.is_zero() && !s.quote_token.is_zero() => {
             let expected = [s.base_token, s.quote_token];
             expected.get(edge.token_in_idx as usize).copied() == Some(token_in)
                 && expected.get(edge.token_out_idx as usize).copied() == Some(token_out)
@@ -1148,9 +1141,9 @@ pub fn minimal_sim_failure(
 /// so they do not crowd the probe window. Includes `ZeroOutput` / Balancer
 /// `MAX_IN`, CL shallow/cap-dead at dust, any-hop `V2ReserveExhausted`
 /// (hop-0 dust V2 is also caught earlier by `first_v2_hop_below_reserve`; this
-    /// covers mid-route V2 that dies even at micro), and Balancer/Woofi/DODO
-    /// `TokenMismatch` (amount-independent vault/base-quote index skew). Leave
-    /// `ClTickless` alone — spot probe sizes can still rank those.
+/// covers mid-route V2 that dies even at micro), and Balancer/Woofi/DODO
+/// `TokenMismatch` (amount-independent vault/base-quote index skew). Leave
+/// `ClTickless` alone — spot probe sizes can still rank those.
 #[must_use]
 pub fn micro_probe_liquidity_dead(
     arena: &StateArena,
@@ -1699,21 +1692,24 @@ fn walk_route_hops(
         *amounts.first_mut()? = amount_in;
     }
 
+    // Need multi-token realign? Hoist so V2/V3 hot path skips the protocol match.
+    let needs_realign = edges.iter().any(|e| {
+        matches!(
+            e.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
+        )
+    });
+
     for (i, edge) in edges.iter().enumerate() {
         let state = arena.pool_state(edge.pool_index)?;
         if !state.is_tradable() {
             return None;
         }
         let mut edge = *edge;
-        if matches!(
-            edge.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
-        ) && !realign_multi_token_edge(arena, state, &mut edge)
-        {
+        if needs_realign && !realign_multi_token_edge(arena, state, &mut edge) {
             return None;
         }
-        let shallow_cap = shallow_caps[i];
-        let hop = simulate_hop(state, &edge, current, shallow_cap)?;
+        let hop = simulate_hop(state, &edge, current, shallow_caps[i])?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
@@ -1739,10 +1735,7 @@ pub fn first_hop_continuity_break(edges: &[Edge]) -> Option<usize> {
 /// Address-aware continuity — TokenIndex inequality false-positives aliases.
 #[inline]
 #[must_use]
-pub fn first_hop_continuity_break_in_arena(
-    arena: &StateArena,
-    edges: &[Edge],
-) -> Option<usize> {
+pub fn first_hop_continuity_break_in_arena(arena: &StateArena, edges: &[Edge]) -> Option<usize> {
     edges.windows(2).position(|pair| {
         match (
             arena.token_address(pair[0].token_out),
@@ -2206,7 +2199,11 @@ mod tests {
             fee_bps: 30,
             zero_for_one: true,
         }];
-        assert!(cycle_v2_edges_match_pool_meta(&arena, &[meta.clone()], &edges));
+        assert!(cycle_v2_edges_match_pool_meta(
+            &arena,
+            &[meta.clone()],
+            &edges
+        ));
         let cycle = Arc::new(crate::core::types::FoundCycle {
             start_token: wmatic,
             edges: crate::core::types::CycleEdges::from_slice(&edges),
@@ -2339,9 +2336,11 @@ mod tests {
             score: 0.0,
             cycle_ratio: U256::ZERO,
         });
-        let healed =
-            realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign v2");
-        assert_eq!((healed.edges[0].token_in, healed.edges[0].token_out), (t0, t1));
+        let healed = realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign v2");
+        assert_eq!(
+            (healed.edges[0].token_in, healed.edges[0].token_out),
+            (t0, t1)
+        );
         assert_eq!(
             (healed.edges[0].token_in_idx, healed.edges[0].token_out_idx),
             (0, 1)
@@ -3525,7 +3524,10 @@ mod tests {
         });
         let healed =
             realign_uni_cycle_from_pool_meta(&arena, &[meta], cycle).expect("realign dodo");
-        assert_eq!((healed.edges[0].token_in_idx, healed.edges[0].token_out_idx), (1, 0));
+        assert_eq!(
+            (healed.edges[0].token_in_idx, healed.edges[0].token_out_idx),
+            (1, 0)
+        );
         let mut fee_edge = healed.edges[0];
         sync_edge_fee_bps_from_state(&mut fee_edge, state);
         assert_eq!(fee_edge.fee_bps, 10);

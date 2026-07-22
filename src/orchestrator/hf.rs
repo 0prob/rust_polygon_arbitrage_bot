@@ -151,7 +151,11 @@ fn build_hf_candidate_ui_rows(
 const HF_ACTIVITY_WINDOW_MS: u64 = 300_000;
 const HF_SUMMARY_INTERVAL_MS: u64 = 15_000;
 const HF_BEST_EVAL_INTERVAL_MS: u64 = 60_000;
-const HF_EVAL_BUDGET: Duration = Duration::from_secs(30);
+/// Rank+Brent is CPU-local; 30s hid hung worker threads and blocked the HF semaphore.
+const HF_EVAL_BUDGET: Duration = Duration::from_millis(2_500);
+/// Absolute wall for one HF tick (prep + hydrate + eval). Live stream ticks hit
+/// 9–10s when residual TickLens ate the full prep and eval had no deadline.
+const HF_TICK_HARD_BUDGET: Duration = Duration::from_millis(3_500);
 static HF_SUMMARY_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_BEST_EVAL_LOG_AT: AtomicU64 = AtomicU64::new(0);
 static HF_ORACLE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
@@ -166,12 +170,30 @@ const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 800;
 const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
 /// Stream path already has WSS state — don't spend the full prep budget on flash.
 const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(400);
-/// Skip probe-tick hydrate when residual prep budget is below this (leave room for eval).
-const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(50);
+/// Skip probe-tick hydrate when residual prep cannot finish one pool.
+/// Must match `HF_PROBE_TICK_MS_PER_POOL` / max budget — 600ms reserve left
+/// residual < 900 after pool work → cap=0 → cl_tickless starved forever.
+const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(900);
+/// Cap so one hung TickLens cannot burn the whole prep wall (live timeout=2499ms ×53).
+const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(900);
+/// Stream HF can fire every ~100–200ms; TickLens hydrate must not.
+const PROBE_HYDRATE_MIN_GAP_MS: u64 = 1_500;
 
 #[inline]
 fn prep_remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// Carve hydrate floor out of a shared prep residual so pool/flash/recovery
+/// cannot leave < one-pool budget (live: residual 0 → hydrate skip → cl_tickless).
+#[inline]
+fn reserve_hydrate_budget(stage: Duration) -> (Duration /* work */, Duration /* hydrate */) {
+    if stage >= HF_PROBE_HYDRATE_MIN_BUDGET {
+        let hydrate = HF_PROBE_HYDRATE_MIN_BUDGET.min(HF_PROBE_HYDRATE_MAX_BUDGET);
+        (stage.saturating_sub(hydrate), hydrate)
+    } else {
+        (stage, Duration::ZERO)
+    }
 }
 
 /// Hub tokens that block probe ranking when cold (WMATIC ColdCache → empty ranks).
@@ -210,9 +232,7 @@ async fn hf_flash_prefetch_stale(
         return;
     }
     // Hub tokens first — WMATIC ColdCache emptied probe ranks while dust tokens refreshed.
-    stale.sort_by_key(|addr| {
-        u8::from(!crate::core::constants::is_polygon_hub_token(*addr))
-    });
+    stale.sort_by_key(|addr| u8::from(!crate::core::constants::is_polygon_hub_token(*addr)));
     // Share residual HF prep budget (was a hard 2500ms that bloated ticks).
     let flash_budget = if budget.is_zero() {
         Duration::from_millis(HF_FLASH_PREFETCH_BUDGET_MS)
@@ -226,6 +246,11 @@ async fn hf_flash_prefetch_stale(
     let fresh_n = flash_token_list.len().saturating_sub(stale_n);
     let blocking = flash_blocking_stale(&stale);
     let blocking_n = blocking.len();
+    // Dust-only: defer to background (live: 43× tokens=1 multicalls / 10min).
+    if blocking.is_empty() && stale_n < 4 {
+        crate::debug!("flash loan: hf_prefetch defer dust-only stale={stale_n} fresh={fresh_n}");
+        return;
+    }
     let deadline = Instant::now() + flash_budget;
     let Some(_inflight) = flash_cache.try_acquire_refresh_inflight() else {
         // Background refresh owns the multicall. Only block on hubs — live
@@ -261,17 +286,22 @@ async fn hf_flash_prefetch_stale(
         return;
     };
     // Tight budget: refresh hubs only so WMATIC lands; dust rides background.
-    let refresh_set: &[Address] = if flash_budget <= HF_FLASH_INFLIGHT_WAIT_CAP && !blocking.is_empty()
-    {
-        &blocking
-    } else {
-        &stale
-    };
+    let refresh_set: &[Address] =
+        if flash_budget <= HF_FLASH_INFLIGHT_WAIT_CAP && !blocking.is_empty() {
+            &blocking
+        } else {
+            &stale
+        };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return;
     }
-    match timeout(remaining, flash_cache.refresh_with_fallback(rpc, refresh_set)).await {
+    match timeout(
+        remaining,
+        flash_cache.refresh_with_fallback(rpc, refresh_set),
+    )
+    .await
+    {
         Ok(Ok(generation)) => {
             let wmatic = crate::core::constants::WMATIC;
             let wmatic_fresh = flash_cache.has_fresh_entry(wmatic);
@@ -475,10 +505,7 @@ fn cycle_with_reliable_start(
 /// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
 ///
 /// Batches all rotation fingerprints into one quarantine map read.
-fn quarantine_all_edge_rotations(
-    execution: &ExecutionService,
-    edges: &[crate::core::types::Edge],
-) {
+fn quarantine_all_edge_rotations(execution: &ExecutionService, edges: &[crate::core::types::Edge]) {
     let n = edges.len();
     if n == 0 {
         return;
@@ -500,7 +527,8 @@ fn cycle_edges_quarantined(
     }
     // from_slice: Copy-optimal without smallvec `specialization` (servo docs).
     let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
-    let mut fps = smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
+    let mut fps =
+        smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
     for _ in 0..n {
         fps.push(hash_cycle_edges(&rotated));
         rotated.rotate_left(1);
@@ -718,10 +746,7 @@ fn sample_proto_mismatch(
     crate::info!("proto mismatch sample: stage={stage} (no state mismatch) route=[{hops}]");
 }
 
-fn sample_multi_realign_fail(
-    arena: &crate::pipeline::arena::StateArena,
-    cycle: &FoundCycle,
-) {
+fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: &FoundCycle) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now = now_ms();
@@ -924,8 +949,7 @@ fn select_cycles_for_rescore(
     let mut live_drop_rate = 0usize;
     // Pools from live cycles culled by proto gates — keep in hot set so
     // dirty∩sel can land and stream ticks prefetch instead of skip.
-    let mut live_anchor_hot =
-        FxHashSet::with_capacity_and_hasher(32, FxBuildHasher);
+    let mut live_anchor_hot = FxHashSet::with_capacity_and_hasher(32, FxBuildHasher);
     let anchor_live = |edges: &[Edge], hot: &mut FxHashSet<Address>| {
         for edge in edges {
             if let Some(addr) = arena.pool_address(edge.pool_index) {
@@ -971,9 +995,8 @@ fn select_cycles_for_rescore(
         // Recover Balancer/Woofi vault-index skew (meta vs getPoolTokens) before
         // quarantine/micro-dead — otherwise we only prune recoverable liquidity.
         let pre_multi = Arc::clone(&ready);
-        let ready = match crate::pipeline::local_sim::realign_multi_token_found_cycle(
-            arena, ready,
-        ) {
+        let ready = match crate::pipeline::local_sim::realign_multi_token_found_cycle(arena, ready)
+        {
             Some(ready) => ready,
             None if live => {
                 // livehold: vault token absent/unroutable on cold arena wiped
@@ -1022,7 +1045,10 @@ fn select_cycles_for_rescore(
                     &healed.edges,
                 )
                 .is_none()
-                && crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &healed.edges) =>
+                && crate::pipeline::local_sim::cycle_edges_match_arena_state(
+                    arena,
+                    &healed.edges,
+                ) =>
             {
                 // ponytail: match LF obs bypass — meta TokenIndex drift with
                 // continuous arena hops (live: soft_keep pins → live_drop_proto).
@@ -1416,10 +1442,7 @@ pub async fn run_hf_tick(
     // (prefetch can heal meta for the next LF pin).
     if stream_triggered && activity_candidates == 0 {
         let dirty = ctx.partial_cache.dirty_addresses();
-        let overlap = dirty
-            .iter()
-            .filter(|a| hot_pools_set.contains(*a))
-            .count();
+        let overlap = dirty.iter().filter(|a| hot_pools_set.contains(*a)).count();
         // Observed venues land in stream_universe before they appear in the
         // sticky selected set (live: dirty_in_sel=0 while dirty∩universe>0).
         let dirty_in_universe = dirty
@@ -1599,6 +1622,8 @@ pub async fn run_hf_tick(
     // Stages used to each take HF_PREFETCH_BUDGET_MS (live: pool 194 + probe 2501 = 2.7s).
     let prep_budget = Duration::from_millis(pipeline.hf_prefetch_budget_ms.max(1));
     let prep_deadline = Instant::now() + prep_budget;
+    // Whole-tick wall (prep can be 2.5s; leave room for eval without 10s tails).
+    let tick_deadline = Instant::now() + HF_TICK_HARD_BUDGET;
     let pool_prefetch_started = now_ms();
 
     if stream_triggered && pipeline.stream_enabled {
@@ -1611,39 +1636,63 @@ pub async fn run_hf_tick(
                 "stream flush incomplete: flushed={flushed} hot_dirty_pending={} — refreshing before HF eval",
                 pending_pools.len(),
             );
-            let recovery_budget = prep_remaining(prep_deadline);
+            // Do not burn the hydrate floor on recovery (live: recovery 2.5s →
+            // residual 0 → cl_tickless, or full residual TickLens timeout 2.5s).
+            let (recovery_budget, _) = reserve_hydrate_budget(prep_remaining(prep_deadline));
+            let recovery_budget = recovery_budget.min(prep_remaining(tick_deadline));
             if recovery_budget.is_zero() {
-                crate::warn!("hf tick skipped: stream state recovery has no prep budget left");
-                return Ok(HfTickResult {
-                    cycles_considered: cycles.len(),
-                    profitable_count: 0,
-                    best_profit: U256::ZERO,
-                    elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::from([]),
-                });
-            }
-            match timeout(
-                recovery_budget,
-                ctx.refresh
-                    .refresh_pool_states_for(&pending_pools, pending_pools.len()),
-            )
-            .await
-            {
-                Ok(Ok(result)) => {
-                    let recovered = ctx
-                        .partial_cache
-                        .flush_to_state_cache(&ctx.cache, &pending_pools);
-                    let remaining = stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
-                    if remaining.is_empty() {
-                        prefetch_ok = result.prefetch_tick_succeeded();
-                        crate::info!(
-                            "stream state recovery: refreshed={} flushed={recovered}",
-                            pending_pools.len()
-                        );
-                    } else {
+                crate::warn!(
+                    "stream recovery skipped: no prep after hydrate reserve (pending={})",
+                    pending_pools.len()
+                );
+            } else {
+                match timeout(
+                    recovery_budget,
+                    ctx.refresh
+                        .refresh_pool_states_for(&pending_pools, pending_pools.len()),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        let recovered = ctx
+                            .partial_cache
+                            .flush_to_state_cache(&ctx.cache, &pending_pools);
+                        let remaining =
+                            stream_pending_pools(&ctx.partial_cache, hot_pools.as_ref());
+                        if remaining.is_empty() {
+                            prefetch_ok = result.prefetch_tick_succeeded();
+                            crate::info!(
+                                "stream state recovery: refreshed={} flushed={recovered}",
+                                pending_pools.len()
+                            );
+                        } else {
+                            crate::warn!(
+                                "hf tick skipped: stream state recovery incomplete (remaining={})",
+                                remaining.len()
+                            );
+                            return Ok(HfTickResult {
+                                cycles_considered: cycles.len(),
+                                profitable_count: 0,
+                                best_profit: U256::ZERO,
+                                elapsed_ms: now_ms().saturating_sub(start),
+                                candidates: Arc::from([]),
+                            });
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        crate::warn!("hf tick skipped: stream state recovery failed: {e:#}");
+                        return Ok(HfTickResult {
+                            cycles_considered: cycles.len(),
+                            profitable_count: 0,
+                            best_profit: U256::ZERO,
+                            elapsed_ms: now_ms().saturating_sub(start),
+                            candidates: Arc::from([]),
+                        });
+                    }
+                    Err(_) => {
                         crate::warn!(
-                            "hf tick skipped: stream state recovery incomplete (remaining={})",
-                            remaining.len()
+                            "hf tick skipped: stream state recovery timed out after {}ms",
+                            recovery_budget.as_millis()
                         );
                         return Ok(HfTickResult {
                             cycles_considered: cycles.len(),
@@ -1653,29 +1702,6 @@ pub async fn run_hf_tick(
                             candidates: Arc::from([]),
                         });
                     }
-                }
-                Ok(Err(e)) => {
-                    crate::warn!("hf tick skipped: stream state recovery failed: {e:#}");
-                    return Ok(HfTickResult {
-                        cycles_considered: cycles.len(),
-                        profitable_count: 0,
-                        best_profit: U256::ZERO,
-                        elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Arc::from([]),
-                    });
-                }
-                Err(_) => {
-                    crate::warn!(
-                        "hf tick skipped: stream state recovery timed out after {}ms",
-                        recovery_budget.as_millis()
-                    );
-                    return Ok(HfTickResult {
-                        cycles_considered: cycles.len(),
-                        profitable_count: 0,
-                        best_profit: U256::ZERO,
-                        elapsed_ms: now_ms().saturating_sub(start),
-                        candidates: Arc::from([]),
-                    });
                 }
             }
         } else if flushed > 0 {
@@ -1689,11 +1715,15 @@ pub async fn run_hf_tick(
     let rpc = Arc::clone(&ctx.rpc);
     let refresh = Arc::clone(&ctx.refresh);
     // Residual prep budget for pool/flash (shared deadline — no stage stacking).
-    let stage_budget = prep_remaining(prep_deadline);
+    let stage_budget = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
+    // Reserve hydrate floor from *both* pool and flash. Live: pool_budget used the
+    // full stage (flash alone reserved 1.4s) → residual 0 after a 1.3s multicall →
+    // hydrate skipped → cl_tickless/shallow_cl emptied probe_kept.
+    let (work_budget, _hydrate_reserved) = reserve_hydrate_budget(stage_budget);
     let flash_budget = if skip_prefetch {
-        stage_budget.min(HF_STREAM_FLASH_BUDGET_CAP)
+        work_budget.min(HF_STREAM_FLASH_BUDGET_CAP)
     } else {
-        stage_budget
+        work_budget
     };
 
     if skip_prefetch || hot_pools.is_empty() {
@@ -1707,9 +1737,9 @@ pub async fn run_hf_tick(
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
-    } else if !stage_budget.is_zero() {
+    } else if !work_budget.is_zero() {
         let hot = Arc::clone(&hot_pools);
-        let pool_budget = stage_budget;
+        let pool_budget = work_budget;
         let pool_fut = async {
             timeout(
                 pool_budget,
@@ -1727,10 +1757,7 @@ pub async fn run_hf_tick(
         match pool_out {
             Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
             Ok(Err(e)) => crate::debug!("hf prefetch failed: {e:#}"),
-            Err(_) => crate::debug!(
-                "hf prefetch timed out after {}ms",
-                pool_budget.as_millis()
-            ),
+            Err(_) => crate::debug!("hf prefetch timed out after {}ms", pool_budget.as_millis()),
         }
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
@@ -1774,7 +1801,9 @@ pub async fn run_hf_tick(
                 hot_pools = hot;
                 // Reselect can introduce start tokens absent from the prefetched set.
                 let flash_token_list = collect_hf_flash_token_list(&arena_base, &cycles).1;
-                let reselect_flash = prep_remaining(prep_deadline);
+                let (reselect_flash, _) = reserve_hydrate_budget(
+                    prep_remaining(prep_deadline).min(prep_remaining(tick_deadline)),
+                );
                 if !reselect_flash.is_zero() {
                     hf_flash_prefetch_stale(
                         flash_cache.as_ref(),
@@ -1825,12 +1854,8 @@ pub async fn run_hf_tick(
         };
         let start_rate = resolve_token_to_matic_rate(cycle.start_token, &token_to_matic_rates);
         let economic_floor = min_economic_amount_in(start_decimals, start_rate);
-        if crate::pipeline::local_sim::first_v2_hop_below_reserve(
-            &arena,
-            &cycle.edges,
-            micro_probe,
-        )
-        .is_some()
+        if crate::pipeline::local_sim::first_v2_hop_below_reserve(&arena, &cycle.edges, micro_probe)
+            .is_some()
         {
             v2_dead_skipped += 1;
             return false;
@@ -1883,17 +1908,10 @@ pub async fn run_hf_tick(
             matic_usd_for_flash_cap(raw)
         }) {
         Some(usd) => usd,
-        None => match timeout(
-            Duration::from_millis(800),
-            ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
-        )
-        .await
-        {
-            Ok(Some(usd)) => usd,
-            Ok(None) => {
-                warn_hf_oracle_skip(
-                    "hf eval skipped: MATIC/USD oracle unavailable for flash loan cap",
-                );
+        None => {
+            let oracle_budget = Duration::from_millis(400).min(prep_remaining(tick_deadline));
+            if oracle_budget.is_zero() {
+                warn_hf_oracle_skip("hf eval skipped: tick budget exhausted before MATIC/USD");
                 return Ok(HfTickResult {
                     cycles_considered: cycles.len(),
                     profitable_count: 0,
@@ -1902,31 +1920,69 @@ pub async fn run_hf_tick(
                     candidates: Arc::from([]),
                 });
             }
-            Err(_) => {
-                warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
-                return Ok(HfTickResult {
-                    cycles_considered: cycles.len(),
-                    profitable_count: 0,
-                    best_profit: U256::ZERO,
-                    elapsed_ms: now_ms().saturating_sub(start),
-                    candidates: Arc::from([]),
-                });
+            match timeout(
+                oracle_budget,
+                ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
+            )
+            .await
+            {
+                Ok(Some(usd)) => usd,
+                Ok(None) => {
+                    warn_hf_oracle_skip(
+                        "hf eval skipped: MATIC/USD oracle unavailable for flash loan cap",
+                    );
+                    return Ok(HfTickResult {
+                        cycles_considered: cycles.len(),
+                        profitable_count: 0,
+                        best_profit: U256::ZERO,
+                        elapsed_ms: now_ms().saturating_sub(start),
+                        candidates: Arc::from([]),
+                    });
+                }
+                Err(_) => {
+                    warn_hf_oracle_skip("hf eval skipped: MATIC/USD oracle refresh timed out");
+                    return Ok(HfTickResult {
+                        cycles_considered: cycles.len(),
+                        profitable_count: 0,
+                        best_profit: U256::ZERO,
+                        elapsed_ms: now_ms().saturating_sub(start),
+                        candidates: Arc::from([]),
+                    });
+                }
             }
-        },
+        }
     };
     let oracle_ms = now_ms().saturating_sub(oracle_started);
 
+    // Drop cooldown-stuck tickless cycles *before* hydrate so residual prep is not
+    // burned re-fetching pools already known empty this minute.
+    let stuck_before_hydrate =
+        drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas_for_dispatch.as_ref());
+
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
-    // Residual of shared prep_deadline — do not re-open a full HF_PREFETCH_BUDGET_MS.
-    let probe_tick_budget = prep_remaining(prep_deadline);
+    // Cap residual so rate-limited TickLens cannot eat the full prep wall.
+    let probe_tick_budget = prep_remaining(prep_deadline)
+        .min(HF_PROBE_HYDRATE_MAX_BUDGET)
+        .min(prep_remaining(tick_deadline));
     let probe_tick_started = now_ms();
     let probe_pool_cap =
         crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(probe_tick_budget);
+    static LAST_PROBE_HYDRATE_MS: AtomicU64 = AtomicU64::new(0);
+    static HYDRATE_INFO_LOG_AT: AtomicU64 = AtomicU64::new(0);
+    let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
+    let hydrate_gap_ok =
+        probe_tick_started.saturating_sub(last_hydrate) >= PROBE_HYDRATE_MIN_GAP_MS;
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
-    let hydrate_stats = if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET || probe_pool_cap == 0
-    {
+    let hydrate_stats = if !hydrate_gap_ok {
+        crate::debug!(
+            "hf probe-tick hydrate skipped: gap {}ms < {}ms",
+            probe_tick_started.saturating_sub(last_hydrate),
+            PROBE_HYDRATE_MIN_GAP_MS
+        );
+        crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
+    } else if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET || probe_pool_cap == 0 {
         crate::debug!(
             "hf probe-tick hydrate skipped: residual prep {}ms < {}ms (cap={probe_pool_cap})",
             probe_tick_budget.as_millis(),
@@ -1934,6 +1990,7 @@ pub async fn run_hf_tick(
         );
         crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
     } else {
+        LAST_PROBE_HYDRATE_MS.store(probe_tick_started, Ordering::Relaxed);
         match timeout(
             probe_tick_budget,
             hydrate_tickless_cl_for_cycles(
@@ -1952,13 +2009,12 @@ pub async fn run_hf_tick(
             Err(_) => {
                 // Cool only the budget-scaled set that was in-flight — not the
                 // full hard cap (live: cooled 20–45 pools ×10s after every timeout).
-                let cooled =
-                    crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
-                        &arena,
-                        &cycles,
-                        pool_metas_for_dispatch.as_ref(),
-                        probe_pool_cap,
-                    );
+                let cooled = crate::orchestrator::hf_execute::mark_probe_hydrate_timeout_cooldown(
+                    &arena,
+                    &cycles,
+                    pool_metas_for_dispatch.as_ref(),
+                    probe_pool_cap,
+                );
                 crate::warn!(
                     "hf probe-tick hydrate timed out after {}ms — cooled {cooled} pools (cap={probe_pool_cap})",
                     probe_tick_budget.as_millis()
@@ -1968,31 +2024,65 @@ pub async fn run_hf_tick(
         }
     };
     let probe_tick_ms = now_ms().saturating_sub(probe_tick_started);
-    if hydrate_stats.v3_total > 0
+    // Cooldown no-ops (tickless>0 but fetch=0) dominate stream ticks — INFO only on
+    // real loads or rate-limited summary (live: 1212 hydrate INFO / run).
+    let hydrate_loaded = hydrate_stats.v3_loaded > 0 || hydrate_stats.v4_loaded > 0;
+    let hydrate_did_work = hydrate_stats.v3_needed > 0
+        || hydrate_stats.v4_needed > 0
+        || hydrate_loaded
+        || hydrate_stats.cycles_tickless_after != hydrate_stats.cycles_tickless_before;
+    if hydrate_did_work {
+        let now = now_ms();
+        let last_info = HYDRATE_INFO_LOG_AT.load(Ordering::Relaxed);
+        let rate_ok = now.saturating_sub(last_info) >= 5_000;
+        if hydrate_loaded || rate_ok {
+            if rate_ok {
+                HYDRATE_INFO_LOG_AT.store(now, Ordering::Relaxed);
+            }
+            crate::info!(
+                "hf probe-tick hydrate: cycles_tickless={}->{} v3_total={} v3_fetch={} v3_loaded={} (empty={} incomplete={} algebra={} seeded={}) v4_total={} v4_fetch={} v4_loaded={} ms={}",
+                hydrate_stats.cycles_tickless_before,
+                hydrate_stats.cycles_tickless_after,
+                hydrate_stats.v3_total,
+                hydrate_stats.v3_needed,
+                hydrate_stats.v3_loaded,
+                hydrate_stats.v3_empty,
+                hydrate_stats.v3_incomplete,
+                hydrate_stats.v3_algebra_loaded,
+                hydrate_stats.v3_seeded,
+                hydrate_stats.v4_total,
+                hydrate_stats.v4_needed,
+                hydrate_stats.v4_loaded,
+                probe_tick_ms,
+            );
+        } else {
+            crate::debug!(
+                "hf probe-tick hydrate: cycles_tickless={}->{} v3_fetch={} v3_loaded={} v4_fetch={} v4_loaded={} ms={}",
+                hydrate_stats.cycles_tickless_before,
+                hydrate_stats.cycles_tickless_after,
+                hydrate_stats.v3_needed,
+                hydrate_stats.v3_loaded,
+                hydrate_stats.v4_needed,
+                hydrate_stats.v4_loaded,
+                probe_tick_ms,
+            );
+        }
+    } else if hydrate_stats.cycles_tickless_before > 0
+        || hydrate_stats.v3_total > 0
         || hydrate_stats.v4_total > 0
-        || hydrate_stats.cycles_tickless_before > 0
     {
-        crate::info!(
-            "hf probe-tick hydrate: cycles_tickless={}->{} v3_total={} v3_fetch={} v3_loaded={} (empty={} incomplete={} algebra={} seeded={}) v4_total={} v4_fetch={} v4_loaded={} ms={}",
+        crate::debug!(
+            "hf probe-tick hydrate idle: cycles_tickless={} v3_total={} v4_total={} ms={}",
             hydrate_stats.cycles_tickless_before,
-            hydrate_stats.cycles_tickless_after,
             hydrate_stats.v3_total,
-            hydrate_stats.v3_needed,
-            hydrate_stats.v3_loaded,
-            hydrate_stats.v3_empty,
-            hydrate_stats.v3_incomplete,
-            hydrate_stats.v3_algebra_loaded,
-            hydrate_stats.v3_seeded,
             hydrate_stats.v4_total,
-            hydrate_stats.v4_needed,
-            hydrate_stats.v4_loaded,
             probe_tick_ms,
         );
     }
-    // After hydrate+cooldown mark, drop cycles whose CL hops are empty and already
-    // known-dead this minute so probe/Brent budget is not spent on dust-only phantoms.
-    let stuck_tickless =
+    // After hydrate+cooldown mark, drop newly stuck empties (pre-drain handled above).
+    let stuck_after_hydrate =
         drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas_for_dispatch.as_ref());
+    let stuck_tickless = stuck_before_hydrate.saturating_add(stuck_after_hydrate);
     if stuck_tickless > 0 {
         // Stream ticks can drain the same stuck set every ~100ms — rate-limit noise.
         static TICKLESS_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
@@ -2004,7 +2094,8 @@ pub async fn run_hf_tick(
                 .is_ok()
         {
             crate::info!(
-                "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} remaining={}",
+                "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} (pre={} post={stuck_after_hydrate}) remaining={}",
+                stuck_before_hydrate,
                 cycles.len()
             );
         }
@@ -2035,8 +2126,22 @@ pub async fn run_hf_tick(
     });
     let cycles_considered = cycles.len();
     let eval_started = now_ms();
+    let eval_budget = HF_EVAL_BUDGET.min(prep_remaining(tick_deadline));
+    if eval_budget.is_zero() {
+        crate::warn!(
+            "hf eval skipped: tick hard budget exhausted (elapsed={}ms, cycles={cycles_considered})",
+            now_ms().saturating_sub(start)
+        );
+        return Ok(HfTickResult {
+            cycles_considered,
+            profitable_count: 0,
+            best_profit: U256::ZERO,
+            elapsed_ms: now_ms().saturating_sub(start),
+            candidates: Arc::from([]),
+        });
+    }
     let (eval_results, mut eval_arena, probe_kept) = match timeout(
-        HF_EVAL_BUDGET,
+        eval_budget,
         rescore_rank_and_evaluate_async(cycles, Arc::clone(&reassess_ctx), sim_cap),
     )
     .await
@@ -2046,7 +2151,7 @@ pub async fn run_hf_tick(
         Err(_) => {
             crate::warn!(
                 "hf eval timed out after {}ms (cycles={cycles_considered}, sim_cap={sim_cap})",
-                HF_EVAL_BUDGET.as_millis()
+                eval_budget.as_millis()
             );
             return Ok(HfTickResult {
                 cycles_considered,
@@ -2290,7 +2395,8 @@ pub async fn run_hf_tick(
 
     if cycles_considered > 0 {
         // Reuse the early throttle flag — a second should_log_hf_summary() would miss.
-        let log_summary = profitable_count > 0 || log_hf_summary;
+        // Always emit full timing on slow ticks (live stream 9–10s lines lacked stages).
+        let log_summary = profitable_count > 0 || log_hf_summary || elapsed_ms >= 250;
         if log_summary {
             crate::info!(
                 "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
@@ -2351,8 +2457,7 @@ pub async fn run_hf_tick(
                 let diag_available = diag
                     .gas_cost_wei
                     .saturating_sub(diag.gas_shortfall_matic_wei);
-                if (diag.gas_cover_bps >= 400
-                    && diag_available >= U256::from(10u128.pow(15)))
+                if (diag.gas_cover_bps >= 400 && diag_available >= U256::from(10u128.pow(15)))
                     || should_log_best_eval()
                 {
                     log_best_eval_diagnostic(diag);
@@ -2627,6 +2732,34 @@ mod tests {
         assert!(prep_remaining(past).is_zero());
         let future = Instant::now() + Duration::from_secs(10);
         assert!(prep_remaining(future) > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn reserve_hydrate_keeps_one_pool_floor() {
+        let stage = Duration::from_millis(2_500);
+        let (work, hydrate) = reserve_hydrate_budget(stage);
+        assert_eq!(hydrate, HF_PROBE_HYDRATE_MIN_BUDGET);
+        assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
+        assert_eq!(work + hydrate, stage);
+        // Residual after burning full work still admits one TickLens pool (cap≥1).
+        assert_eq!(
+            crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate),
+            1
+        );
+
+        let tight = Duration::from_millis(500);
+        let (work_t, hydrate_t) = reserve_hydrate_budget(tight);
+        assert!(hydrate_t.is_zero());
+        assert_eq!(work_t, tight);
+        assert_eq!(
+            crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate_t),
+            0
+        );
+
+        let exact = HF_PROBE_HYDRATE_MIN_BUDGET;
+        let (work_e, hydrate_e) = reserve_hydrate_budget(exact);
+        assert!(work_e.is_zero());
+        assert_eq!(hydrate_e, HF_PROBE_HYDRATE_MIN_BUDGET);
     }
 
     #[test]

@@ -178,26 +178,28 @@ pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 10u128.pow(18);
 /// `UniswapV2: K` under reserve drift (parity3). Assess uses the same floor.
 pub const EXECUTION_MIN_SLIPPAGE_BPS: u64 = 100;
 
-/// Per-hop gas seeds for route simulation (Polygon executor context).
-/// GasOracle.record_sim_observed calibrates global uplift; per-route
-/// fingerprint cache overrides from dry-run / receipts. Re-tune here when
-/// median sim/observed drift exceeds ~20% for a protocol.
-/// Recent: 1.87M actual vs 720k sim on dispatch -> uplift ~2.6x observed; raise bases.
-pub const GAS_V2_HOP: u32 = 110_000;
-pub const GAS_V3_BASE: u32 = 200_000;
-pub const GAS_V4_BASE: u32 = 220_000;
-pub const GAS_CURVE_HOP: u32 = 270_000;
+/// Per-hop gas seeds for route simulation (pool swap only — executor glue is
+/// [`crate::services::execution::gas::PER_HOP_EXECUTOR_GAS_OVERHEAD`] + route overhead).
+/// GasOracle.record_sim_observed calibrates global uplift; per-route fingerprint
+/// cache overrides from dry-run / receipts.
+/// Live 2×V2 flash ≈250–320k (parity dry-runs); prior 100k/hop → assess 360.8k @ 2 hops
+/// and invented ~0.03 MATIC extra shortfall at 285 gwei. 85k keeps margin vs ~250k floor.
+pub const GAS_V2_HOP: u32 = 85_000;
+/// Live Uni V3 single swap ~130–160k; 170k was top-of-band and stacked badly on 4-hop.
+pub const GAS_V3_BASE: u32 = 155_000;
+pub const GAS_V4_BASE: u32 = 170_000;
+pub const GAS_CURVE_HOP: u32 = 250_000;
 /// Per-hop seed for mixed/Aave-flash Balancer vault swaps (each hop is a separate call).
 /// parity5 dry-run Aave+BAL×2+Woofi: sim 2.41M vs gas_used 942k — 1M/hop was ~2.5× hot.
-pub const GAS_BALANCER_HOP: u32 = 450_000;
+pub const GAS_BALANCER_HOP: u32 = 420_000;
 /// All-in gas for Direct vault `batchSwap` (`executeArbDirect`, ≤4 hops → one call).
 /// Not passed through per-edge ROUTE_EXECUTION_* overhead (that double-counted hops).
 /// Live Direct BAL×3 ~244k; 320k ≈ 1.3× (safety assess). Tx gas_limit still has buffer_gas_limit.
-pub const GAS_BALANCER_DIRECT_BATCH: u32 = 320_000;
-pub const GAS_DODO_HOP: u32 = 200_000;
-pub const GAS_WOOFI_HOP: u32 = 160_000;
-/// Per-tick-crossed gas increment for V3/V4 pools.
-pub const GAS_PER_TICK_CROSSED: u32 = 28_000;
+pub const GAS_BALANCER_DIRECT_BATCH: u32 = 300_000;
+pub const GAS_DODO_HOP: u32 = 180_000;
+pub const GAS_WOOFI_HOP: u32 = 150_000;
+/// Per-tick-crossed gas increment for V3/V4 pools (~15–20k on-chain; 28k was loose).
+pub const GAS_PER_TICK_CROSSED: u32 = 20_000;
 
 /// LF graph attach / arena append batch size (growth catch-up per tick).
 pub const ATTACH_BATCH_CAP: usize = 512;

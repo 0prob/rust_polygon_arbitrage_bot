@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use reqwest::{Client, redirect::Policy};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connect budget independent of request timeout (fail-fast to next state URL).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));

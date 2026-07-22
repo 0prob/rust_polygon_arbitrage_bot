@@ -1390,10 +1390,7 @@ mod tests {
 
     #[test]
     fn normalize_pyth_feed_id_strips_0x_and_lowercases() {
-        assert_eq!(
-            normalize_pyth_feed_id("0xAaBbCc"),
-            "aabbcc"
-        );
+        assert_eq!(normalize_pyth_feed_id("0xAaBbCc"), "aabbcc");
         assert_eq!(normalize_pyth_feed_id("AABBCC"), "aabbcc");
     }
 

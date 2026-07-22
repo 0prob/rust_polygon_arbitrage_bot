@@ -32,12 +32,13 @@ fn pg_host_label(url: &str) -> &str {
 
 pub fn log_startup(config: &AppConfig) {
     crate::info!(
-        "rpbot starting (execution_mode={}, dry_run={}, cycle_finder={:?}, lf={}ms, hf={}ms)",
+        "rpbot starting (execution_mode={}, dry_run={}, cycle_finder={:?}, lf={}ms, hf={}ms, executor={:?})",
         config.execution.mode,
         config.is_dry_run(),
         config.routing.cycle_finder,
         config.lf_interval_ms,
         config.hf_interval_ms,
+        config.execution.executor_address,
     );
     crate::info!(
         "discovery (pg={}, bootstrap_batch={}, interval={}ms)",

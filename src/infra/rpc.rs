@@ -15,8 +15,12 @@ use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const STATE_URL_PENALTY: Duration = Duration::from_secs(60);
+/// Fail-fast ranking — 5s × N URLs blocked startup/periodic rank under hung public RPCs.
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Transient multicall/failover cool-off (was 60s — primary stayed deprioritized after recovery).
+const STATE_URL_PENALTY: Duration = Duration::from_secs(20);
+/// Longer cool-off when callers mark rate-limit / 429.
+const STATE_URL_RATE_LIMIT_PENALTY: Duration = Duration::from_secs(45);
 
 /// Shared RPC endpoints and HTTP client (connection-pooled via reqwest).
 #[derive(Clone)]
@@ -63,7 +67,9 @@ impl RpcPool {
         let http = build_static(
             HttpClientOpts {
                 timeout,
-                pool_max_idle_per_host: 16,
+                // Concurrent multicall + flash + hydrate share hosts; 16 idled under
+                // LF+HF burst and forced reconnects (live multi-URL state pool).
+                pool_max_idle_per_host: 32,
                 max_redirects: 0,
             },
             "rpc pool",
@@ -136,16 +142,36 @@ impl RpcPool {
         self.state_urls_ordered_slice()
     }
 
-    /// Move a rate-limited or failing endpoint to the back of the rotation.
+    /// Move a failing endpoint to the back of the rotation (transient cool-off).
     pub fn deprioritize_state_url(&self, url: &str) {
-        self.state_url_penalties
-            .write()
-            .insert(url.to_string(), Instant::now() + STATE_URL_PENALTY);
+        self.deprioritize_state_url_for(url, STATE_URL_PENALTY, "error");
+    }
+
+    /// Longer cool-off for rate-limited / 429 endpoints (avoid hammering).
+    pub fn deprioritize_state_url_rate_limited(&self, url: &str) {
+        self.deprioritize_state_url_for(url, STATE_URL_RATE_LIMIT_PENALTY, "rate_limit");
+    }
+
+    fn deprioritize_state_url_for(&self, url: &str, penalty: Duration, reason: &str) {
+        let until = Instant::now() + penalty;
+        {
+            let mut map = self.state_url_penalties.write();
+            // Never shorten an existing longer cool-off.
+            if map.get(url).is_some_and(|exp| *exp > until) {
+                return;
+            }
+            map.insert(url.to_string(), until);
+        }
         crate::debug!(
-            "state RPC deprioritized ({}) for {}s",
+            "state RPC deprioritized ({}) for {}s reason={reason}",
             rpc_host_label(url),
-            STATE_URL_PENALTY.as_secs()
+            penalty.as_secs()
         );
+    }
+
+    /// Clear cool-off after a successful probe / healthy multicall.
+    pub fn clear_state_url_penalty(&self, url: &str) {
+        self.state_url_penalties.write().remove(url);
     }
 
     /// Re-probe state URLs periodically so degraded endpoints are de-prioritized
@@ -226,6 +252,15 @@ impl RpcPool {
             return;
         }
         ranked.sort_by_key(|(_, latency)| *latency);
+        // Drop cool-offs for URLs that just answered — otherwise deprioritize(60s)
+        // overrode the new rank and `state_url()` kept serving a slower peer
+        // (live: fast primary stayed skipped after transient multicall fail).
+        {
+            let mut penalties = self.state_url_penalties.write();
+            for (url, _) in &ranked {
+                penalties.remove(url);
+            }
+        }
         let mut ordered: Vec<String> = ranked.iter().map(|(url, _)| url.clone()).collect();
         ordered.extend(failed);
         let summary: Vec<String> = ranked
@@ -239,15 +274,23 @@ impl RpcPool {
     async fn probe_http_latency(&self, url: &str) -> Option<Duration> {
         let started = Instant::now();
         let provider = self.cached_http_provider(url).ok()?;
-        let block_res = tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()).await;
-        block_res.ok().and_then(|r| r.ok())?;
-        if !self.polygon_validated_urls.lock().contains(url) {
-            let chain_res = tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()).await;
+        let need_chain = !self.polygon_validated_urls.lock().contains(url);
+        if need_chain {
+            // Parallel block + chain-id — sequential 2×2s was worst-case 4s per URL.
+            let (block_res, chain_res) = tokio::join!(
+                tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()),
+                tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_chain_id()),
+            );
+            block_res.ok().and_then(|r| r.ok())?;
             let chain_id = chain_res.ok().and_then(|r| r.ok())?;
             if chain_id != crate::core::constants::POLYGON_CHAIN_ID {
                 return None;
             }
             self.polygon_validated_urls.lock().insert(url.to_string());
+        } else {
+            let block_res =
+                tokio::time::timeout(HTTP_PROBE_TIMEOUT, provider.get_block_number()).await;
+            block_res.ok().and_then(|r| r.ok())?;
         }
         Some(started.elapsed())
     }
@@ -487,6 +530,42 @@ mod tests {
         let ordered = pool.state_url_candidates();
         assert_eq!(ordered[0], "https://slow.example");
         assert_eq!(ordered[1], "https://fast.example");
+    }
+
+    #[test]
+    fn clear_penalty_restores_primary() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://fast.example".into());
+        config.rpc.polygon_rpc_urls = vec!["https://slow.example".into()];
+        let pool = RpcPool::from_config(&config);
+        pool.deprioritize_state_url("https://fast.example");
+        assert_eq!(pool.state_url().as_deref(), Some("https://slow.example"));
+        pool.clear_state_url_penalty("https://fast.example");
+        assert_eq!(pool.state_url().as_deref(), Some("https://fast.example"));
+    }
+
+    #[test]
+    fn rate_limit_penalty_not_shortened_by_generic() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://a.example".into());
+        config.rpc.polygon_rpc_urls = vec!["https://b.example".into()];
+        let pool = RpcPool::from_config(&config);
+        pool.deprioritize_state_url_rate_limited("https://a.example");
+        let until_rl = *pool
+            .state_url_penalties
+            .read()
+            .get("https://a.example")
+            .expect("rl penalty");
+        pool.deprioritize_state_url("https://a.example");
+        let until_after = *pool
+            .state_url_penalties
+            .read()
+            .get("https://a.example")
+            .expect("still penalized");
+        assert!(
+            until_after >= until_rl,
+            "generic deprioritize must not shorten rate-limit cool-off"
+        );
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
 use crate::pipeline::local_sim::{
     self, MinimalSimFailure, first_protocol_state_mismatch, first_v2_hop_below_reserve,
     precompute_route_shallow_caps, simulate_route_detailed, simulate_route_detailed_with_caps,
-    simulate_route_minimal,
+    simulate_route_minimal_with_caps,
 };
 use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
@@ -328,6 +328,8 @@ fn minimal_rank_probe(
     let mut last_sanity: Option<SimSanityReject> = None;
     let economic_floor = min_economic_amount_in(start_decimals, rate);
     let spot_probe = crate::pipeline::spot_price::spot_probe_for_decimals(start_decimals);
+    // One shallow-cap table for the whole ladder (was rebuilt on every amount).
+    let shallow_caps = precompute_route_shallow_caps(arena, &cycle.edges);
     for_each_rank_probe_amount(start_decimals, rate, |amount| {
         // Ladder includes micro/spot below economic floor for thin V2 attribution.
         // Those dust hits were poisoning empty ranks as sanity_why(floor=…) (live
@@ -337,7 +339,9 @@ fn minimal_rank_probe(
         if amount < economic_floor && !tickless_cap_trade {
             return;
         }
-        let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
+        let Some(sim) =
+            simulate_route_minimal_with_caps(arena, &cycle.edges, amount, shallow_caps.as_ref())
+        else {
             return;
         };
         saw_simulation = true;
@@ -499,8 +503,7 @@ fn rank_one_cycle_probe(
     profit_priority_alpha_bps: u64,
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
-    let rotated =
-        prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
+    let rotated = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
     // Aave start-rotation must not admit hop-broken edges into InvalidRoute.
     let cycle = if local_sim::first_hop_continuity_break_in_arena(arena, &rotated.edges).is_some()
         && local_sim::first_hop_continuity_break_in_arena(arena, &cycle_arc.edges).is_none()
@@ -654,6 +657,11 @@ fn rank_one_cycle_probe(
 
     let depth_bps =
         depth_impact_slippage_bps_with_base(arena, &cycle.edges, probe_amount, Some(&probe));
+    // 10000 = zero/unknown base profit only (+5% miss is 5000 now).
+    if depth_bps >= 10_000 {
+        out.skip.net = 1;
+        return out;
+    }
     let effective_slip = effective_slippage_bps(slippage_bps, cycle.edge_hops(), depth_bps);
 
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
@@ -1059,6 +1067,8 @@ struct EvalFailStats {
     probe_zero_profit: AtomicU32,
     probe_fidelity: AtomicU32,
     probe_sanity: AtomicU32,
+    /// depth_impact returned ≥10000 (unknown / collapsed +5% probe).
+    depth_unknown: AtomicU32,
 }
 
 impl EvalFailStats {
@@ -1068,7 +1078,7 @@ impl EvalFailStats {
         }
         // INFO when every assessed route dies — otherwise DEBUG (hf tick already INFO).
         let msg = format!(
-            "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} missing_decimals={} opt_none={} detailed_none={} fallback_none={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
+            "route assess: in={in_count} ok={out_count} quarantine={} executor_budget={} flash={} flash_source={} missing_decimals={} opt_none={} detailed_none={} fallback_none={} depth_unknown={} probe_fail(sim_none={} zero={} fidelity={} sanity={})",
             load(&self.quarantine),
             load(&self.executor_budget),
             load(&self.flash),
@@ -1077,6 +1087,7 @@ impl EvalFailStats {
             load(&self.opt_none),
             load(&self.detailed_none),
             load(&self.fallback_none),
+            load(&self.depth_unknown),
             load(&self.probe_sim_none),
             load(&self.probe_zero_profit),
             load(&self.probe_fidelity),
@@ -1143,8 +1154,7 @@ pub async fn rescore_rank_and_evaluate_async(
         let rates = input.token_to_matic_rates.as_ref();
         let decimals = input.token_decimals.as_ref();
         let probe_window = probe_rank_window(sim_cap, cycles.len());
-        let mut spot_table =
-            crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
+        let mut spot_table = crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
         if probe_window > 0 {
             crate::pipeline::spot_price::rescore_arc_cycles_with_table_and_gas(
                 &input.arena,
@@ -1290,7 +1300,12 @@ fn probe_fallback_opt(
         .or_else(|| {
             // Seedless rescue/score-fallback: detailed caps often fail while minimal still
             // walks — without this, probe_kept>0 evaluates to all opt_none.
-            let m = local_sim::simulate_route_minimal(input.arena, &cycle.edges, amount)?;
+            let m = simulate_route_minimal_with_caps(
+                input.arena,
+                &cycle.edges,
+                amount,
+                route_shallow_caps.as_ref(),
+            )?;
             if m.profit.is_zero() {
                 return None;
             }
@@ -1429,6 +1444,7 @@ fn build_brent_probe_seeds(
     if let Some(pair) = probe_seed {
         seeds.push(pair);
     }
+    let shallow_caps = precompute_route_shallow_caps(arena, &cycle.edges);
     for_each_rank_probe_amount(start_decimals, start_rate, |amount| {
         if seeds.len() >= BRENT_SEED_CACHE_SLOTS {
             return;
@@ -1436,7 +1452,9 @@ fn build_brent_probe_seeds(
         if seeds.iter().any(|(a, _)| *a == amount) {
             return;
         }
-        let Some(sim) = simulate_route_minimal(arena, &cycle.edges, amount) else {
+        let Some(sim) =
+            simulate_route_minimal_with_caps(arena, &cycle.edges, amount, shallow_caps.as_ref())
+        else {
             return;
         };
         if sim.profit.is_zero() {
@@ -1598,7 +1616,7 @@ fn evaluate_one(
         return None;
     };
     // ponytail: single assess with depth-aware slip — no second Brent reopt.
-    let depth_bps = depth_impact_slippage_bps_with_base(
+    let mut depth_bps = depth_impact_slippage_bps_with_base(
         input.arena,
         &cycle.edges,
         opt.optimal_input,
@@ -1608,14 +1626,59 @@ fn evaluate_one(
             total_gas: sim.total_gas,
         }),
     );
+    // depth=10000 only for zero-profit base. +5% miss is now 2500 (depth_impact).
+    // Live kill-switch: depth_unknown==in, ok=0 on every route assess.
+    if depth_bps >= 10_000 {
+        inc(&stats.depth_unknown);
+        if sim.profit.is_zero() {
+            return None;
+        }
+        depth_bps = 3_000;
+    }
     let slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
     let mut assessment =
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
+    // Probe-only dust phantoms: live ain=100000 (0.1 USDC) "profit" 0.25 MATIC then
+    // dry-run TransferFailed (executor never held flash input). Require economic floor,
+    // real hop amounts (not zeroed minimal fallback), and hop fidelity for execute.
+    if assessment.should_execute {
+        let floor = min_economic_amount_in(
+            resolve_token_decimals_for_index(
+                cycle.start_token,
+                input.arena,
+                input.token_decimals,
+            ),
+            resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
+        );
+        let has_hop_amounts = sim.hop_amounts.iter().any(|a| !a.is_zero());
+        let fidelity_ok = has_hop_amounts
+            && local_sim::route_hop_fidelity_ok_after_walk(
+                input.arena,
+                &cycle.edges,
+                &sim.hop_amounts,
+            );
+        if opt.optimal_input < floor || !has_hop_amounts || !fidelity_ok {
+            assessment.should_execute = false;
+            assessment.reject_reason = Some(if opt.optimal_input < floor {
+                "below economic floor for dispatch".into()
+            } else if !has_hop_amounts {
+                "missing hop amounts for dispatch".into()
+            } else {
+                "hop fidelity failed for dispatch".into()
+            });
+            if probe_only {
+                crate::info!(
+                    "hf probe-dispatch blocked: fp={fp} input={} floor={floor} amounts={has_hop_amounts} fidelity={fidelity_ok}",
+                    opt.optimal_input,
+                );
+            }
+        }
+    }
     if probe_only && !assessment.should_execute {
         assessment.reject_reason = assessment
             .reject_reason
             .or_else(|| Some("Brent did not converge; probe-only assessment".into()));
-    } else if probe_only {
+    } else if probe_only && assessment.should_execute {
         crate::info!(
             "hf probe-dispatch: fp={fp} input={} net_matic={} (Brent fallback, probe sizing validated)",
             opt.optimal_input,
