@@ -71,26 +71,36 @@ impl RuntimeContext {
         ));
         let stream_addresses = StreamAddressSet::new();
         let snapshots = Arc::new(SnapshotStore::new());
-        let (refresh, execution) = std::thread::scope(|scope| -> anyhow::Result<_> {
-            let config_refresh = Arc::clone(&config);
-            let cache_refresh = Arc::clone(&cache);
-            let rpc_refresh = Arc::clone(&rpc);
-            let config_exec = Arc::clone(&config);
-            let refresh_handle = scope.spawn(move || {
-                StateRefreshService::new(config_refresh, cache_refresh, rpc_refresh)
-            });
-            let exec_handle = scope.spawn(move || ExecutionService::from_config(&config_exec));
-            let refresh = refresh_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("state refresh init thread panicked"))??;
-            let execution = exec_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("execution init thread panicked"))?;
-            Ok((refresh, execution))
-        })?;
+        let init_started = crate::util::now_ms();
+        let (refresh, execution, refresh_ms, execution_ms) =
+            std::thread::scope(|scope| -> anyhow::Result<_> {
+                let config_refresh = Arc::clone(&config);
+                let cache_refresh = Arc::clone(&cache);
+                let rpc_refresh = Arc::clone(&rpc);
+                let config_exec = Arc::clone(&config);
+                let refresh_handle = scope.spawn(move || {
+                    let started = crate::util::now_ms();
+                    let refresh =
+                        StateRefreshService::new(config_refresh, cache_refresh, rpc_refresh)?;
+                    Ok::<_, anyhow::Error>((refresh, crate::util::now_ms().saturating_sub(started)))
+                });
+                let exec_handle = scope.spawn(move || {
+                    let started = crate::util::now_ms();
+                    let execution = ExecutionService::from_config(&config_exec);
+                    (execution, crate::util::now_ms().saturating_sub(started))
+                });
+                let (refresh, refresh_ms) = refresh_handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("state refresh init thread panicked"))??;
+                let (execution, execution_ms) = exec_handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("execution init thread panicked"))?;
+                Ok((refresh, execution, refresh_ms, execution_ms))
+            })?;
         let refresh = Arc::new(refresh);
         let execution = Arc::new(execution);
         let gas_oracle = Arc::new(GasOracle::default());
+        let oracle_started = crate::util::now_ms();
         let price_oracle = Arc::new(PriceOracle::new(
             rpc.http().clone(),
             config.oracle.pyth_hermes_url.clone(),
@@ -98,6 +108,12 @@ impl RuntimeContext {
         ));
         register_configured_oracle_feeds(&price_oracle, &config.oracle);
         load_and_apply_auto_feeds(&price_oracle);
+        let oracle_ms = crate::util::now_ms().saturating_sub(oracle_started);
+        crate::debug!(
+            "runtime init timing: refresh={refresh_ms}ms execution={execution_ms}ms \
+             oracle_feeds={oracle_ms}ms total={}ms",
+            crate::util::now_ms().saturating_sub(init_started)
+        );
         Ok(Self {
             config,
             wallet,
@@ -188,7 +204,7 @@ pub async fn run_pass_loop(
     info!("pass loop started");
 
     let sidecar_started = crate::util::now_ms();
-    let sidecars = spawn_pass_loop_sidecars(&ctx, &shutdown).await;
+    let sidecars = spawn_pass_loop_sidecars(&ctx, &shutdown);
     let sidecar_ms = crate::util::now_ms().saturating_sub(sidecar_started);
 
     let lf_ctx = Arc::new(ctx.lf_context());
@@ -479,7 +495,7 @@ impl HfScheduler {
     }
 }
 
-async fn spawn_pass_loop_sidecars(
+fn spawn_pass_loop_sidecars(
     ctx: &Arc<RuntimeContext>,
     shutdown: &watch::Receiver<bool>,
 ) -> PassLoopSidecars {
@@ -510,15 +526,13 @@ async fn spawn_pass_loop_sidecars(
         shutdown.clone(),
     );
 
-    // Rank state RPCs before the first LF tick so multicall hits the fastest URL.
-    const RANK_TIMEOUT: Duration = Duration::from_secs(2);
-    if tokio::time::timeout(RANK_TIMEOUT, ctx.rpc.probe_and_rank_state_urls())
-        .await
-        .is_err()
+    // Rank in background — awaiting here stalled LF/HF spawn by up to ~2s.
+    // First LF may use config order until rank finishes (same as prior timeout fallback).
     {
-        crate::warn!(
-            "state RPC rank timed out after {RANK_TIMEOUT:?} — first LF may use config order"
-        );
+        let rpc = Arc::clone(&ctx.rpc);
+        tokio::spawn(async move {
+            rpc.probe_and_rank_state_urls().await;
+        });
     }
 
     ctx.rpc

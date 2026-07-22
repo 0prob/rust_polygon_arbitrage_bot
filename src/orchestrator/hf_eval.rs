@@ -501,6 +501,7 @@ fn rank_one_cycle_probe(
     flash_ttl: Duration,
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
+    execution: &ExecutionService,
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
     let rotated = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
@@ -583,43 +584,51 @@ fn rank_one_cycle_probe(
                     out.minimal_sim_reasons.record(reason);
                 }
             }
-            // Empty-rank sample was flash-only; zero_profit left sample=none.
+            // Keep sample short — long rate/route strings truncated to `sample=fp=0`.
             if out.flash_diag.is_none()
                 && matches!(
                     reject,
                     MinimalProbeReject::ZeroProfit | MinimalProbeReject::NoSimulation
                 )
             {
-                let hops: String = cycle
+                let protos: String = cycle
                     .edges
                     .iter()
                     .map(|e| format!("{:?}", e.protocol))
                     .collect::<Vec<_>>()
                     .join(">");
-                let hop_break = local_sim::first_hop_continuity_break_in_arena(arena, &cycle.edges);
-                let break_detail = match hop_break {
-                    Some(i) => {
-                        let prev = &cycle.edges[i];
-                        let next = &cycle.edges[i + 1];
-                        format!(
-                            " hop_break={i} out={:?}/{:?} in={:?}/{:?}",
-                            prev.token_out,
-                            arena.token_address(prev.token_out),
-                            next.token_in,
-                            arena.token_address(next.token_in),
-                        )
-                    }
-                    None if cycle.edges.is_empty() => " empty".to_string(),
-                    None if cycle.edges.len() > crate::core::constants::HOP_CAP_USIZE => {
-                        format!(" too_long={}", cycle.edges.len())
-                    }
-                    None => String::new(),
-                };
                 out.flash_diag = Some(format!(
-                    "fp={fp:#x} hops={} reject={reject:?} route=[{hops}]{break_detail} start_dec={start_decimals} rate={rate} start={}",
+                    "fp={fp:#x} hops={} rej={reject:?} protos={protos} ratio={} score={:.3} start={} dec={start_decimals}",
                     cycle.edges.len(),
+                    cycle.cycle_ratio,
+                    cycle.score,
                     cycle.start_token.0,
                 ));
+            }
+            // Spot-positive / walk-zero phantoms refill every tick (live: zero_profit
+            // emptied probe_kept). Cool all start-rotations so select skips them.
+            // Same for NoSimulation that is not ClTickless-only (tickless waits on
+            // hydrate; live sticky nosim fps like 0x20e0 repeated empty ranks).
+            let cool_phantoms = match reject {
+                MinimalProbeReject::ZeroProfit => true,
+                MinimalProbeReject::NoSimulation => {
+                    let fails: Vec<_> = attempt_failures.iter().flatten().copied().collect();
+                    !fails.is_empty()
+                        && !fails.iter().all(|f| {
+                            matches!(f, local_sim::MinimalSimFailure::ClTickless { .. })
+                        })
+                }
+                MinimalProbeReject::SanityReject(_) => false,
+            };
+            if cool_phantoms {
+                let n = cycle.edges.len();
+                if n > 0 {
+                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
+                    for _ in 0..n {
+                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
+                        rotated.rotate_left(1);
+                    }
+                }
             }
             if should_rescue_probe_reject(reject, &attempt_failures) {
                 out.rescue.push((fp, cycle.into_owned()));
@@ -639,6 +648,9 @@ fn rank_one_cycle_probe(
         let reason = flash_reject_reason(&flash_ctx, flash_policy, probe_amount);
         if let Some(reason) = reason {
             out.flash_loan.record_reject(reason);
+            // ponytail: do not quarantine ColdCache — flash prefetch/background
+            // warms hubs within a tick; ROUTE_COOLDOWN emptied ranks for 30s on
+            // cold-start (live: skip_flash_source=12 then sticky cools).
         }
         if out.flash_diag.is_none() {
             out.flash_diag = Some(format!(
@@ -732,6 +744,7 @@ pub fn rank_cycles_by_probe_net(
     flash_liquidity: &FlashLiquidityCache,
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
+    execution: &ExecutionService,
 ) -> (Vec<FoundCycle>, FxHashMap<u64, (U256, MinimalSimResult)>) {
     if cycles.is_empty() || max_keep == 0 {
         return (Vec::new(), FxHashMap::default());
@@ -761,6 +774,7 @@ pub fn rank_cycles_by_probe_net(
                     flash_ttl,
                     safety_multiplier_bps,
                     profit_priority_alpha_bps,
+                    execution,
                 )
             })
             .reduce(ProbeRankPartial::default, ProbeRankPartial::merge)
@@ -782,6 +796,7 @@ pub fn rank_cycles_by_probe_net(
                     flash_ttl,
                     safety_multiplier_bps,
                     profit_priority_alpha_bps,
+                    execution,
                 )
             })
             .fold(ProbeRankPartial::default(), ProbeRankPartial::merge)
@@ -1188,6 +1203,7 @@ pub async fn rescore_rank_and_evaluate_async(
             input.flash_liquidity.as_ref(),
             input.safety_multiplier_bps,
             input.profit_priority_alpha_bps,
+            input.execution.as_ref(),
         );
         if !cycles.is_empty() {
             crate::debug!("probe rank kept {} cycles for Brent", cycles.len());

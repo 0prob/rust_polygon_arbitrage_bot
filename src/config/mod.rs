@@ -295,8 +295,8 @@ fn default_hf_prefetch_count() -> usize {
     60
 }
 /// Floor for `HF_PREFETCH_BUDGET_MS` — must cover one TickLens pool
-/// (`HF_PROBE_HYDRATE_MIN_BUDGET` in orchestrator/hf.rs = 900ms).
-const HF_PREFETCH_BUDGET_MIN_MS: u64 = 900;
+/// (`HF_PROBE_HYDRATE_MIN_BUDGET` in orchestrator/hf.rs = 300ms).
+const HF_PREFETCH_BUDGET_MIN_MS: u64 = 300;
 /// Cap so a mis-set env cannot open a 60s prep wall and stall the HF semaphore.
 const HF_PREFETCH_BUDGET_MAX_MS: u64 = 8_000;
 /// Select/sim caps above this burn CPU on the HF async worker without extra profit.

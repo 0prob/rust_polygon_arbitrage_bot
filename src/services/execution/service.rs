@@ -843,6 +843,14 @@ impl ExecutionService {
         Some(assess_profit(&input))
     }
 
+    fn release_failed_submit_nonce(nonce_mgr: &NonceManager, nonce: u64, action: SubmitAction) {
+        if action == SubmitAction::AlreadyKnown {
+            nonce_mgr.mark_stale(nonce);
+        } else {
+            nonce_mgr.release(nonce);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn process_candidate<P: Provider<Ethereum>>(
         &self,
@@ -1482,10 +1490,11 @@ impl ExecutionService {
             }
             Err(e) => {
                 crate::warn!("submit failed: fp={}, nonce={}, error={e:#}", fp, nonce,);
-                nonce_mgr.release(nonce);
+                let action = classify_submit_error(&e);
+                Self::release_failed_submit_nonce(&nonce_mgr, nonce, action.clone());
                 self.invalidate_mempool_nonce_cache();
                 self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
-                match classify_submit_error(&e) {
+                match action {
                     SubmitAction::ResyncAndRetry => {
                         self.quarantine_route_soft(fp, now);
                     }
@@ -1830,6 +1839,14 @@ fn required_operator_balance(
 mod safety_tests {
     use super::*;
     use crate::services::execution::candidate::CandidateExecution;
+
+    #[test]
+    fn already_known_submit_error_keeps_nonce_stale() {
+        let nonce_mgr = NonceManager::new(Address::ZERO);
+        ExecutionService::release_failed_submit_nonce(&nonce_mgr, 7, SubmitAction::AlreadyKnown);
+        assert_eq!(nonce_mgr.stale_count(), 1);
+        assert_eq!(nonce_mgr.in_flight_count(), 0);
+    }
 
     #[test]
     fn chronic_underwater_quarantine_needs_repeated_strikes() {

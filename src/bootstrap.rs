@@ -143,8 +143,9 @@ fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
 /// installing a UI hook for TUI), and spawns the non-blocking pg + hypersync connectivity probes
 /// (their results log asynchronously).
 ///
-/// The config/wallet load (which may do filesystem reads for `.env` / `PRIVATE_KEY_FILE`)
-/// is performed via `spawn_blocking` so it does not occupy an async worker thread.
+/// Config/wallet load, hypersync client build, and `RuntimeContext::new` all run inside
+/// `spawn_blocking` (`run_blocking_bootstrap`) so filesystem / sync init does not occupy an
+/// async worker thread.
 async fn bootstrap_inner(
     ui_hook: Option<SharedUiHook>,
     #[cfg(feature = "tui")] ui_snapshot_tx: Option<

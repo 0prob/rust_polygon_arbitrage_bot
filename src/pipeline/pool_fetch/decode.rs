@@ -477,7 +477,8 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
     let tokens_bytes = plan_result(plan, results, CallKind::BalancerTokens)?;
     let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes).ok()?;
     let last_change_block = tokens.lastChangeBlock.as_limbs()[0];
-    let balances: Vec<U256> = tokens.balances.iter().map(|&b| U256::from(b)).collect();
+    // ponytail: move decoded vecs — uint256[] already is Vec<U256>.
+    let balances = tokens.balances;
     if balances.len() < 2 {
         return None;
     }
@@ -489,8 +490,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
             U256::from,
         );
     let decoded_weights = plan_result(plan, results, CallKind::BalancerWeights)
-        .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok())
-        .map(|w| w.iter().map(|&x| U256::from(x)).collect::<Vec<_>>());
+        .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok());
     let amp_from_chain = plan_result(plan, results, CallKind::BalancerAmp)
         .and_then(|b| IBalancerPool::getAmplificationParameterCall::abi_decode_returns(b).ok());
     let (amp, amp_precision, has_onchain_amp, is_updating) = match amp_from_chain {
@@ -503,8 +503,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         None => (U256::ZERO, U256::ZERO, false, false),
     };
     let scaling_factors = plan_result(plan, results, CallKind::BalancerScalingFactors)
-        .and_then(|b| IBalancerPool::getScalingFactorsCall::abi_decode_returns(b).ok())
-        .map(|sf| sf.iter().map(|&x| U256::from(x)).collect::<Vec<_>>())?;
+        .and_then(|b| IBalancerPool::getScalingFactorsCall::abi_decode_returns(b).ok())?;
     if scaling_factors.len() != n || scaling_factors.iter().any(U256::is_zero) {
         return None;
     }
@@ -531,7 +530,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
     let bpt_index = tokens.tokens.iter().position(|t| *t == plan.pool.address);
     Some(PoolState::Balancer(BalancerPoolState {
         pool_id: plan.pool.pool_id,
-        tokens: tokens.tokens.clone(),
+        tokens: tokens.tokens,
         balances,
         weights,
         scaling_factors,

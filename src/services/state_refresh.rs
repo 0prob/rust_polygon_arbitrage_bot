@@ -377,7 +377,15 @@ impl StateRefreshService {
         let force_bootstrap = is_bootstrap || (notify_pending && self.discovered_pool_count() == 0);
         let mut result = if force_bootstrap {
             crate::info!("starting postgres pool bootstrap");
-            match self.discover_bootstrap().await {
+            // Overlap token-meta PG fetch with keyset pool pages (independent queries).
+            let need_metas = !self.token_metadata_loaded.load(Ordering::Acquire);
+            let boot = if need_metas {
+                let (boot, ()) = tokio::join!(self.discover_bootstrap(), self.refresh_token_metas());
+                boot
+            } else {
+                self.discover_bootstrap().await
+            };
+            match boot {
                 Ok(r) => r,
                 Err(e) => {
                     // Restore wake so LISTEN is not lost on transient PG errors.
@@ -401,45 +409,68 @@ impl StateRefreshService {
         let pg_ms = now_ms().saturating_sub(pg_started);
         let batch_pools = result.pools.len();
 
-        let balancer_started = now_ms();
-        if let Some(endpoint) = self.config.pipeline.balancer_backend_url.as_deref() {
-            let has_balancer = result
-                .pools
-                .iter()
-                .any(|p| p.protocol == crate::core::types::ProtocolType::BalancerV2);
-            if has_balancer {
-                match enrich_polygon_balancer_pool_ids(endpoint, &mut result.pools).await {
-                    Ok((enriched, filtered)) => {
-                        if enriched > 0 {
-                            crate::info!("Balancer backend enriched {enriched} Polygon pool IDs");
-                        }
-                        if filtered > 0 {
-                            crate::info!(
-                                "Balancer backend filtered {filtered} non-tradable Polygon pools \
-                                 (swap disabled or recovery mode)"
-                            );
-                        }
-                    }
-                    Err(error) => crate::warn!(
-                        "Balancer backend enrichment failed; using on-chain fallback: {error:#}"
-                    ),
-                }
-            }
-        }
-        let balancer_ms = now_ms().saturating_sub(balancer_started);
-
         self.discovery_state.write().last_discovery_ms = now_ms();
         self.discovery_count.fetch_add(1, Ordering::Relaxed);
 
+        // Incremental path (or bootstrap that skipped the join) still needs metas once.
         if !self.token_metadata_loaded.load(Ordering::Acquire) {
             self.refresh_token_metas().await;
         }
 
-        let decimals_started = now_ms();
-        if !result.pools.is_empty() {
-            self.enrich_token_decimals_from_pools(&result.pools).await;
-        }
-        let decimals_ms = now_ms().saturating_sub(decimals_started);
+        // Snapshot missing decimals before Balancer mutates/filters pools so both can run
+        // concurrently (decimals only need token addresses).
+        let missing_decimals = if result.pools.is_empty() {
+            Vec::new()
+        } else {
+            let state = self.discovery_state.read();
+            unknown_tokens_from_pools(
+                &result.pools,
+                state.token_decimals.as_ref(),
+                DECIMALS_ENRICH_BATCH,
+            )
+        };
+
+        let enrich_started = now_ms();
+        let endpoint = self.config.pipeline.balancer_backend_url.clone();
+        let has_balancer = endpoint.is_some()
+            && result
+                .pools
+                .iter()
+                .any(|p| p.protocol == crate::core::types::ProtocolType::BalancerV2);
+        let (balancer_ms, decimals_ms) = tokio::join!(
+            async {
+                let started = now_ms();
+                if has_balancer
+                    && let Some(ref endpoint) = endpoint
+                {
+                    match enrich_polygon_balancer_pool_ids(endpoint, &mut result.pools).await {
+                        Ok((enriched, filtered)) => {
+                            if enriched > 0 {
+                                crate::info!(
+                                    "Balancer backend enriched {enriched} Polygon pool IDs"
+                                );
+                            }
+                            if filtered > 0 {
+                                crate::info!(
+                                    "Balancer backend filtered {filtered} non-tradable Polygon pools \
+                                     (swap disabled or recovery mode)"
+                                );
+                            }
+                        }
+                        Err(error) => crate::warn!(
+                            "Balancer backend enrichment failed; using on-chain fallback: {error:#}"
+                        ),
+                    }
+                }
+                now_ms().saturating_sub(started)
+            },
+            async {
+                let started = now_ms();
+                self.enrich_missing_token_decimals(missing_decimals).await;
+                now_ms().saturating_sub(started)
+            },
+        );
+        let enrich_wall_ms = now_ms().saturating_sub(enrich_started);
 
         let merge_started = now_ms();
         let (added, updated) = {
@@ -498,8 +529,8 @@ impl StateRefreshService {
         if added > 0 || updated > 0 || !result.complete || is_bootstrap {
             crate::debug!(
                 "discovery timing: bootstrap={is_bootstrap} pg_ms={pg_ms} balancer_ms={balancer_ms} \
-                 merge_ms={merge_ms} decimals_ms={decimals_ms} batch_pools={batch_pools} added={added} updated={updated} \
-                 total_ms={}",
+                 decimals_ms={decimals_ms} enrich_wall_ms={enrich_wall_ms} merge_ms={merge_ms} \
+                 batch_pools={batch_pools} added={added} updated={updated} total_ms={}",
                 now_ms().saturating_sub(tick_started)
             );
         }
@@ -527,6 +558,7 @@ impl StateRefreshService {
         let mut all_pools: Vec<DiscoveredPool> = Vec::new();
         let mut keyset = PoolMetaKeyset::default();
         let mut parse_stats = ParseStats::default();
+        let bootstrap_started = now_ms();
         loop {
             let (page, next, has_more, page_stats) =
                 self.pg.fetch_pool_meta_page(&keyset, batch as u64).await?;
@@ -540,9 +572,10 @@ impl StateRefreshService {
                 break;
             }
             crate::debug!(
-                "pg bootstrap page (batch={batch}, total={}, max_block={})",
+                "pg bootstrap page (batch={batch}, total={}, max_block={}, elapsed_ms={})",
                 all_pools.len(),
                 keyset.created_block,
+                now_ms().saturating_sub(bootstrap_started),
             );
         }
         log_index_parse_stats(&parse_stats);
@@ -630,12 +663,7 @@ impl StateRefreshService {
         }
     }
 
-    async fn enrich_token_decimals_from_pools(&self, pools: &[DiscoveredPool]) {
-        let missing = {
-            let state = self.discovery_state.read();
-            unknown_tokens_from_pools(pools, state.token_decimals.as_ref(), DECIMALS_ENRICH_BATCH)
-        };
-
+    async fn enrich_missing_token_decimals(&self, missing: Vec<Address>) {
         if missing.is_empty() {
             return;
         }

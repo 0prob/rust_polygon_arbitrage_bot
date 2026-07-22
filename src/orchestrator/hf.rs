@@ -171,10 +171,9 @@ const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
 /// Stream path already has WSS state — don't spend the full prep budget on flash.
 const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(400);
 /// Skip probe-tick hydrate when residual prep cannot finish one pool.
-/// Must match `HF_PROBE_TICK_MS_PER_POOL` / max budget — 600ms reserve left
-/// residual < 900 after pool work → cap=0 → cl_tickless starved forever.
-const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(900);
-/// Cap so one hung TickLens cannot burn the whole prep wall (live timeout=2499ms ×53).
+/// Must match `HF_PROBE_TICK_MS_PER_POOL` (300ms) — 900ms floor carved up to 3 pools.
+const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(300);
+/// Cap so TickLens cannot burn the whole prep wall; 900ms → up to 3 pools.
 const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(900);
 /// Stream HF can fire every ~100–200ms; TickLens hydrate must not.
 const PROBE_HYDRATE_MIN_GAP_MS: u64 = 1_500;
@@ -184,12 +183,13 @@ fn prep_remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-/// Carve hydrate floor out of a shared prep residual so pool/flash/recovery
+/// Carve hydrate budget out of a shared prep residual so pool/flash/recovery
 /// cannot leave < one-pool budget (live: residual 0 → hydrate skip → cl_tickless).
+/// Reserves up to MAX when the stage is large enough for multi-pool TickLens.
 #[inline]
 fn reserve_hydrate_budget(stage: Duration) -> (Duration /* work */, Duration /* hydrate */) {
     if stage >= HF_PROBE_HYDRATE_MIN_BUDGET {
-        let hydrate = HF_PROBE_HYDRATE_MIN_BUDGET.min(HF_PROBE_HYDRATE_MAX_BUDGET);
+        let hydrate = stage.min(HF_PROBE_HYDRATE_MAX_BUDGET);
         (stage.saturating_sub(hydrate), hydrate)
     } else {
         (stage, Duration::ZERO)
@@ -197,11 +197,15 @@ fn reserve_hydrate_budget(stage: Duration) -> (Duration /* work */, Duration /* 
 }
 
 /// Hub tokens that block probe ranking when cold (WMATIC ColdCache → empty ranks).
-fn flash_blocking_stale(stale: &[Address]) -> Vec<Address> {
+/// Hubs that are cold (missing / past full TTL) — soft-stale hubs (75–100% TTL)
+/// must not block HF; spawn/background refreshes them.
+fn flash_blocking_stale(stale: &[Address], flash: &FlashLiquidityCache) -> Vec<Address> {
     stale
         .iter()
         .copied()
-        .filter(|addr| crate::core::constants::is_polygon_hub_token(*addr))
+        .filter(|addr| {
+            crate::core::constants::is_polygon_hub_token(*addr) && !flash.has_fresh_entry(*addr)
+        })
         .collect()
 }
 
@@ -244,11 +248,14 @@ async fn hf_flash_prefetch_stale(
     }
     let stale_n = stale.len();
     let fresh_n = flash_token_list.len().saturating_sub(stale_n);
-    let blocking = flash_blocking_stale(&stale);
+    let blocking = flash_blocking_stale(&stale, flash_cache);
     let blocking_n = blocking.len();
-    // Dust-only: defer to background (live: 43× tokens=1 multicalls / 10min).
+    // Dust-only or soft-stale hubs: defer to spawn/background (live: 638ms
+    // timeout on tokens=1 WMATIC that was still within full TTL).
     if blocking.is_empty() && stale_n < 4 {
-        crate::debug!("flash loan: hf_prefetch defer dust-only stale={stale_n} fresh={fresh_n}");
+        crate::debug!(
+            "flash loan: hf_prefetch defer non-cold stale={stale_n} fresh={fresh_n}"
+        );
         return;
     }
     let deadline = Instant::now() + flash_budget;
@@ -1179,6 +1186,26 @@ fn select_cycles_for_rescore(
             micro_dead_skipped += 1;
             continue;
         }
+        // Walk succeeds with gross==0 at micro+floor → spot phantoms that empty
+        // probe ranks (live: zero_profit emptied scanned windows). Active path
+        // above still bypasses; probe rank cools those after first miss.
+        if let Some(micro) =
+            crate::pipeline::local_sim::simulate_route_minimal(arena, &ready.edges, micro_probe)
+        {
+            if micro.profit.is_zero() {
+                let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
+                    arena,
+                    &ready.edges,
+                    economic_floor,
+                )
+                .is_none_or(|s| s.profit.is_zero());
+                if floor_zero {
+                    micro_dead_skipped += 1;
+                    quarantine_all_edge_rotations(execution, &ready.edges);
+                    continue;
+                }
+            }
+        }
         // After rank probe skips below-floor dust, micro-only survivors fail as
         // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
         match crate::pipeline::local_sim::economic_floor_liquidity_dead(
@@ -1719,7 +1746,10 @@ pub async fn run_hf_tick(
     // Reserve hydrate floor from *both* pool and flash. Live: pool_budget used the
     // full stage (flash alone reserved 1.4s) → residual 0 after a 1.3s multicall →
     // hydrate skipped → cl_tickless/shallow_cl emptied probe_kept.
-    let (work_budget, _hydrate_reserved) = reserve_hydrate_budget(stage_budget);
+    let (work_budget, hydrate_reserved) = reserve_hydrate_budget(stage_budget);
+    // Preserve the carved floor as an absolute budget — do not re-derive from
+    // prep_deadline residual later (oracle/reselect ate it → hydrate never ran).
+    let hydrate_floor = hydrate_reserved;
     let flash_budget = if skip_prefetch {
         work_budget.min(HF_STREAM_FLASH_BUDGET_CAP)
     } else {
@@ -1961,8 +1991,9 @@ pub async fn run_hf_tick(
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
-    // Cap residual so rate-limited TickLens cannot eat the full prep wall.
-    let probe_tick_budget = prep_remaining(prep_deadline)
+    // Use the carved hydrate_floor — prep_deadline residual is often 0 here after
+    // flash/oracle even when reserve_hydrate_budget held 900ms at stage start.
+    let probe_tick_budget = hydrate_floor
         .min(HF_PROBE_HYDRATE_MAX_BUDGET)
         .min(prep_remaining(tick_deadline));
     let probe_tick_started = now_ms();
@@ -1970,6 +2001,7 @@ pub async fn run_hf_tick(
         crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(probe_tick_budget);
     static LAST_PROBE_HYDRATE_MS: AtomicU64 = AtomicU64::new(0);
     static HYDRATE_INFO_LOG_AT: AtomicU64 = AtomicU64::new(0);
+    static HYDRATE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
     let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
     let hydrate_gap_ok =
         probe_tick_started.saturating_sub(last_hydrate) >= PROBE_HYDRATE_MIN_GAP_MS;
@@ -1982,12 +2014,21 @@ pub async fn run_hf_tick(
             PROBE_HYDRATE_MIN_GAP_MS
         );
         crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
-    } else if probe_tick_budget < HF_PROBE_HYDRATE_MIN_BUDGET || probe_pool_cap == 0 {
-        crate::debug!(
-            "hf probe-tick hydrate skipped: residual prep {}ms < {}ms (cap={probe_pool_cap})",
-            probe_tick_budget.as_millis(),
-            HF_PROBE_HYDRATE_MIN_BUDGET.as_millis()
-        );
+    } else if probe_tick_budget.is_zero() || probe_pool_cap == 0 {
+        let now = now_ms();
+        let last = HYDRATE_SKIP_LOG_AT.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 5_000
+            && HYDRATE_SKIP_LOG_AT
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            crate::info!(
+                "hf probe-tick hydrate skipped: floor={}ms residual_prep={}ms cap={probe_pool_cap} (need ≥{}ms)",
+                hydrate_floor.as_millis(),
+                prep_remaining(prep_deadline).as_millis(),
+                HF_PROBE_HYDRATE_MIN_BUDGET.as_millis()
+            );
+        }
         crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
     } else {
         LAST_PROBE_HYDRATE_MS.store(probe_tick_started, Ordering::Relaxed);
@@ -2250,9 +2291,29 @@ pub async fn run_hf_tick(
         // Rank by absolute MATIC (≥0.001). Thin high-cover dust still wins when no
         // larger edge exists — chronic uq (thin floor 0.05) cools it; do not silence
         // best-eval/cover-dist logging by gating rank at 0.05 (live: zero diag ticks).
+        // Skip sub-economic sizes and sub-0.05 MATIC notional (live: USDT input=7917
+        // passed economic=1000 and won cover≈687 with gross=1620).
+        let economic_floor = crate::pipeline::sim_sanity::min_economic_amount_in(
+            start_decimals,
+            start_rate,
+        );
+        let input_matic = if start_rate >= MIN_TOKEN_TO_MATIC_RATE && !scale.is_zero() {
+            result
+                .sim
+                .amount_in
+                .checked_mul(start_rate)
+                .map(|v| v / scale)
+                .unwrap_or(U256::ZERO)
+        } else {
+            U256::ZERO
+        };
+        // Keep near-miss visibility (≥0.001 MATIC avail) but require ≥0.05 MATIC
+        // notional input so USDT dust (input≈7914) cannot monopolize best-eval.
         if better_near_breakeven
             && !assessment.gross_profit.is_zero()
             && available_matic >= U256::from(10u128.pow(15))
+            && result.sim.amount_in >= economic_floor
+            && input_matic >= U256::from(5u128 * 10u128.pow(16))
         {
             let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
             best_gross_diag = Some(BestEvalDiag {
@@ -2711,10 +2772,11 @@ mod tests {
     use crate::services::partial_cache::SlimPoolState;
 
     #[test]
-    fn flash_blocking_stale_keeps_only_hubs() {
+    fn flash_blocking_stale_keeps_only_cold_hubs() {
         let dust = Address::repeat_byte(0xab);
         let stale = vec![dust, WMATIC, Address::repeat_byte(0xcd)];
-        let blocking = flash_blocking_stale(&stale);
+        let flash = FlashLiquidityCache::new();
+        let blocking = flash_blocking_stale(&stale, &flash);
         assert_eq!(blocking, vec![WMATIC]);
         assert!(is_polygon_hub_token(WMATIC));
         assert!(!is_polygon_hub_token(dust));
@@ -2723,7 +2785,8 @@ mod tests {
     #[test]
     fn flash_blocking_stale_empty_when_only_dust() {
         let stale = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
-        assert!(flash_blocking_stale(&stale).is_empty());
+        let flash = FlashLiquidityCache::new();
+        assert!(flash_blocking_stale(&stale, &flash).is_empty());
     }
 
     #[test]
@@ -2738,16 +2801,15 @@ mod tests {
     fn reserve_hydrate_keeps_one_pool_floor() {
         let stage = Duration::from_millis(2_500);
         let (work, hydrate) = reserve_hydrate_budget(stage);
-        assert_eq!(hydrate, HF_PROBE_HYDRATE_MIN_BUDGET);
         assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
         assert_eq!(work + hydrate, stage);
-        // Residual after burning full work still admits one TickLens pool (cap≥1).
+        // Full MAX residual admits pool cap (3 × 300ms).
         assert_eq!(
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate),
-            1
+            3
         );
 
-        let tight = Duration::from_millis(500);
+        let tight = Duration::from_millis(200);
         let (work_t, hydrate_t) = reserve_hydrate_budget(tight);
         assert!(hydrate_t.is_zero());
         assert_eq!(work_t, tight);
@@ -2760,6 +2822,10 @@ mod tests {
         let (work_e, hydrate_e) = reserve_hydrate_budget(exact);
         assert!(work_e.is_zero());
         assert_eq!(hydrate_e, HF_PROBE_HYDRATE_MIN_BUDGET);
+        assert_eq!(
+            crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate_e),
+            1
+        );
     }
 
     #[test]

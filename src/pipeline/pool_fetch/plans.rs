@@ -282,6 +282,33 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
     true
 }
 
+fn plan_call_capacity(protocol: ProtocolType, token_count: usize, pool_type: Option<&str>) -> usize {
+    match protocol {
+        ProtocolType::UniswapV2 => 1,
+        // Algebra: globalState + slot0 fallback + liquidity; UniV3: slot0 + liquidity + fee.
+        ProtocolType::UniswapV3 => 3,
+        ProtocolType::UniswapV4 => 2,
+        ProtocolType::Dodo => 9,
+        ProtocolType::CurveStable => curve_balance_slots(token_count).saturating_add(3),
+        ProtocolType::CurveCrypto => curve_balance_slots(token_count).saturating_add(5),
+        ProtocolType::BalancerV2 => {
+            // tokens + fee + scaling, plus optional weights/amp/linear probes.
+            let mut n = 3usize;
+            if matches!(pool_type, Some("weighted") | None) {
+                n += 1;
+            }
+            if matches!(pool_type, Some("stable") | None) {
+                n += 1;
+            }
+            if pool_type == Some("linear") || (pool_type.is_none() && token_count >= 3) {
+                n += 4;
+            }
+            n
+        }
+        ProtocolType::Woofi => 0,
+    }
+}
+
 pub(super) fn build_plan_with_pool_id(
     pool: &DiscoveredPool,
     pool_id: Option<FixedBytes<32>>,
@@ -290,10 +317,11 @@ pub(super) fn build_plan_with_pool_id(
     if pool.protocol == ProtocolType::BalancerV2 {
         info.pool_id = pool_id;
     }
+    let cap = plan_call_capacity(pool.protocol, pool.tokens.len(), pool.pool_type.as_deref());
     let mut plan = PoolFetchPlan {
         pool: info,
-        calls: Vec::new(),
-        kinds: Vec::new(),
+        calls: Vec::with_capacity(cap),
+        kinds: Vec::with_capacity(cap),
     };
     match pool.protocol {
         ProtocolType::UniswapV2 => build_v2_plan(&mut plan),

@@ -854,10 +854,11 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
 }
 
 /// Hard cap on tick RPC targets per probe-tick hydrate.
-/// Narrow-only; max budget 900ms so one pool at a time under rate limits.
-const HF_PROBE_TICK_POOL_CAP: usize = 1;
-/// ms per tickless pool — aligned with HF_PROBE_HYDRATE_MAX_BUDGET (900ms).
-const HF_PROBE_TICK_MS_PER_POOL: u64 = 900;
+/// Live TickLens finishes in ~100–250ms; 900ms/pool capped at 1 left
+/// cycles_tickless stuck for tens of seconds (live: 16→16 with v3_fetch=1).
+const HF_PROBE_TICK_POOL_CAP: usize = 3;
+/// ms per tickless pool — matches observed hydrate ms with headroom.
+const HF_PROBE_TICK_MS_PER_POOL: u64 = 300;
 
 /// Scale the probe hydrate pool set to residual prep budget so we finish more
 /// often instead of cooling a large pending set on timeout.
