@@ -2226,6 +2226,11 @@ pub async fn run_hf_tick(
     let mut cover_sum_bps = 0u64;
     let mut cover_ge_1000 = 0u32;
     let mut cover_ge_5000 = 0u32;
+    // Peak cover even when dust gates skip best_gross_diag (live: max_bps=644 best_fp=none).
+    let mut cover_peak_fp = 0u64;
+    let mut cover_peak_avail = U256::ZERO;
+    let mut cover_peak_input_matic = U256::ZERO;
+    let mut cover_peak_edges: Option<crate::core::types::CycleEdges> = None;
 
     for result in eval_results {
         let matic = result.assessment.net_profit_after_gas_matic_wei;
@@ -2269,10 +2274,26 @@ pub async fn run_hf_tick(
                 .and_then(|v| u64::try_from(v).ok())
                 .unwrap_or(u64::MAX)
         };
+        let input_matic = if start_rate >= MIN_TOKEN_TO_MATIC_RATE && !scale.is_zero() {
+            result
+                .sim
+                .amount_in
+                .checked_mul(start_rate)
+                .map(|v| v / scale)
+                .unwrap_or(U256::ZERO)
+        } else {
+            U256::ZERO
+        };
         if !assessment.gross_profit.is_zero() {
             cover_n = cover_n.saturating_add(1);
             cover_sum_bps = cover_sum_bps.saturating_add(gas_cover_bps);
-            cover_max_bps = cover_max_bps.max(gas_cover_bps);
+            if gas_cover_bps >= cover_max_bps {
+                cover_max_bps = gas_cover_bps;
+                cover_peak_fp = result.route_fingerprint;
+                cover_peak_avail = available_matic;
+                cover_peak_input_matic = input_matic;
+                cover_peak_edges = Some(result.cycle.edges.clone());
+            }
             if gas_cover_bps >= 1_000 {
                 cover_ge_1000 = cover_ge_1000.saturating_add(1);
             }
@@ -2302,16 +2323,6 @@ pub async fn run_hf_tick(
             start_decimals,
             start_rate,
         );
-        let input_matic = if start_rate >= MIN_TOKEN_TO_MATIC_RATE && !scale.is_zero() {
-            result
-                .sim
-                .amount_in
-                .checked_mul(start_rate)
-                .map(|v| v / scale)
-                .unwrap_or(U256::ZERO)
-        } else {
-            U256::ZERO
-        };
         // Keep near-miss visibility (≥0.001 MATIC avail) but require ≥0.05 MATIC
         // notional input so USDT dust (input≈7914) cannot monopolize best-eval.
         if better_near_breakeven
@@ -2556,6 +2567,27 @@ pub async fn run_hf_tick(
                         )
                         .await;
                     }
+                }
+            } else if cover_n > 0 {
+                // Sub-diag-gate dust still ranked (live: peak_avail≈6.8e14 / cover≈77
+                // after sticky cool) — cool it so near_net stops filling the window.
+                if let Some(ref edges) = cover_peak_edges
+                    && ctx.execution.quarantine_chronic_gas_underwater(
+                        cover_peak_fp,
+                        cover_max_bps,
+                        cover_peak_avail,
+                    )
+                {
+                    quarantine_all_edge_rotations(&ctx.execution, edges);
+                    crate::info!(
+                        "hf underwater quarantine: fp={cover_peak_fp} cover_bps={cover_max_bps} avail={cover_peak_avail} (+rotations, peak-no-diag)"
+                    );
+                }
+                if should_log_best_eval() {
+                    let cover_avg = cover_sum_bps / u64::from(cover_n);
+                    crate::info!(
+                        "hf cover-dist: n={cover_n} max_bps={cover_max_bps} avg_bps={cover_avg} ge_1000={cover_ge_1000} ge_5000={cover_ge_5000} best_fp=none peak_fp={cover_peak_fp} peak_avail_matic={cover_peak_avail} peak_input_matic={cover_peak_input_matic}"
+                    );
                 }
             }
             // Rate-limit diagnostic + on-chain vault probe together. Without this,

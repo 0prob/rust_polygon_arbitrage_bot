@@ -78,6 +78,8 @@ const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800
 const KNOWN_FOT_TOKENS: &[Address] = &[
     address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01"), // LGNS
 ];
+// ponytail: process-lifetime stand-in; Instant has no forever.
+const KNOWN_FOT_SEED_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 /// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
@@ -289,7 +291,7 @@ impl ExecutionService {
     pub(crate) fn with_route_stats_path(route_stats_path: PathBuf) -> Self {
         let route_stats = Self::replay_route_stats(&route_stats_path);
         // ponytail: process-lifetime seed; TransferFailed path re-extends on hit.
-        let fot_until = Instant::now() + DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE;
+        let fot_until = Instant::now() + KNOWN_FOT_SEED_TTL;
         let direct_token_quarantine = KNOWN_FOT_TOKENS
             .iter()
             .copied()
@@ -697,7 +699,26 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        if strikes < CHRONIC_UNDERWATER_STRIKES {
+        if strikes < CHRONIC_UNDERWATER_STRIKES
+            && available_matic_wei >= U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+        {
+            return false;
+        }
+        // ponytail: thin-liq (<0.05 MATIC) cools on first strike — sticky V2 dust
+        // burned 3 best-eval ticks every cold start before the 30s/1h cool applied.
+        if strikes < CHRONIC_UNDERWATER_STRIKES
+            && available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+            && strikes < 1
+        {
+            return false;
+        }
+        // unreachable: thin path with strikes>=1 falls through; non-thin needs STRIKES.
+        if strikes < CHRONIC_UNDERWATER_STRIKES
+            && available_matic_wei >= U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+        {
+            return false;
+        }
+        if strikes < 1 {
             return false;
         }
         self.underwater_strikes.write().remove(&fingerprint);
