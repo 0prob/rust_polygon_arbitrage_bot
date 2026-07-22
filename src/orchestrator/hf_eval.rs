@@ -10,7 +10,6 @@ use rustc_hash::FxHashMap;
 
 use crate::core::types::{
     FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
-    hop_amounts_zeroed,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
@@ -516,6 +515,14 @@ fn rank_one_cycle_probe(
     let fp = hash_cycle_edges(&cycle.edges);
     if !route_fits_executor(&cycle.edges) {
         out.skip.executor_budget = 1;
+        return out;
+    }
+    // FoT / zero-realized start tokens — skip before probe ladder (live: LGNS
+    // TransferFailed dry-run still ranked until dispatch).
+    if arena
+        .token_address(cycle.start_token)
+        .is_some_and(|t| execution.is_direct_token_quarantined(t))
+    {
         return out;
     }
     if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
@@ -1297,9 +1304,6 @@ fn probe_fallback_opt(
         let seed_backed = probe_seed
             .as_ref()
             .is_some_and(|(seed_amt, seed_sim)| *seed_amt == amount && !seed_sim.profit.is_zero());
-        // Prefer capped detailed walk (matches rank/Brent). Plain detailed often None's
-        // the same amount that minimal ranked successfully.
-        let mut minimal_backed = false;
         let Some(sim) = simulate_route_detailed_with_caps(
             input.arena,
             &cycle.edges,
@@ -1312,29 +1316,6 @@ fn probe_fallback_opt(
             } else {
                 None
             }
-        })
-        .or_else(|| {
-            // Seedless rescue/score-fallback: detailed caps often fail while minimal still
-            // walks — without this, probe_kept>0 evaluates to all opt_none.
-            let m = simulate_route_minimal_with_caps(
-                input.arena,
-                &cycle.edges,
-                amount,
-                route_shallow_caps.as_ref(),
-            )?;
-            if m.profit.is_zero() {
-                return None;
-            }
-            minimal_backed = true;
-            Some(RouteSimulationResult {
-                amount_in: amount,
-                amount_out: m.amount_out,
-                profit: m.profit,
-                profitable: true,
-                hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
-                total_gas: m.total_gas,
-                hop_count: cycle.edge_hops(),
-            })
         }) else {
             psn += 1;
             continue;
@@ -1343,12 +1324,8 @@ fn probe_fallback_opt(
             pzp += 1;
             continue;
         }
-        // Ranked near_net seeds already cleared minimal+sanity; post-walk fidelity
-        // (shallow CL) must not drop them into opt_none before best-eval can see them.
-        // Minimal-synthesized hops have zeroed amounts — skip fidelity for those too.
         if !local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts)
             && !seed_backed
-            && !minimal_backed
         {
             pf += 1;
             continue;
@@ -1401,44 +1378,6 @@ fn probe_fallback_opt(
         if replace {
             best = Some(candidate);
         }
-    }
-    // Ranked near_net seeds must not become opt_none when detailed re-sim flakes.
-    // Synthesize a probe-only result from the minimal seed for assessment/best-eval.
-    if best.is_none()
-        && let Some((amount, seed)) = probe_seed
-        && !seed.profit.is_zero()
-        && !amount.is_zero()
-        && flash_cap_for_cycle(input, cycle).amount_within_cap(amount)
-        && check_sim_sanity(SimSanityInput {
-            amount_in: amount,
-            gross_profit: seed.profit,
-            search_low: U256::ZERO,
-            token_decimals: decimals,
-            token_to_matic_rate: rate,
-        })
-        .is_ok()
-    {
-        let sim = RouteSimulationResult {
-            amount_in: amount,
-            amount_out: seed.amount_out,
-            profit: seed.profit,
-            profitable: true,
-            hop_amounts: hop_amounts_zeroed(cycle.edges.len()),
-            total_gas: seed.total_gas,
-            hop_count: cycle.edge_hops(),
-        };
-        let score = brent_score_matic_from_sim(&seed, amount, &profit_ctx);
-        best = Some((
-            OptimizationResult {
-                optimal_input: amount,
-                expected_gross: seed.amount_out,
-                net_profit: seed.profit,
-                total_gas: seed.total_gas,
-                search_low: U256::ZERO,
-            },
-            sim,
-            score,
-        ));
     }
     let s = stats;
     add(&s.probe_sim_none, psn);
@@ -1506,6 +1445,14 @@ fn evaluate_one(
         return None;
     }
     if input.execution.is_route_quarantined(fp) {
+        inc(&stats.quarantine);
+        return None;
+    }
+    if input
+        .arena
+        .token_address(cycle.start_token)
+        .is_some_and(|t| input.execution.is_direct_token_quarantined(t))
+    {
         inc(&stats.quarantine);
         return None;
     }

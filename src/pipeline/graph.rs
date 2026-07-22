@@ -602,9 +602,6 @@ fn pool_has_admissible_edges(
     })
 }
 
-/// Priced or flash-borrowable — worth a capped `attach_missing` slot.
-/// Spoke-only admissibility waits for full rebuild (live: spoke attaches → dead
-/// stubs that burned the 128/tick cap while `graph_pools` barely grew).
 fn pool_worth_capped_attach(
     arena: &StateArena,
     meta: &PoolMeta,
@@ -624,11 +621,21 @@ fn pool_worth_capped_attach(
     }) {
         return true;
     }
-    meta.tokens.iter().enumerate().any(|(i, &token)| {
+    if meta.tokens.iter().enumerate().any(|(i, &token)| {
         bpt_index != Some(i)
             && arena.token_address(token).is_some_and(|addr| {
                 token_eligible_for_flash_borrow_graph(addr, gate.flash.as_ref(), gate.flash_ttl)
             })
+    }) {
+        return true;
+    }
+    gate.spoke_connectivity.as_ref().is_some_and(|conn| {
+        meta.tokens.iter().enumerate().any(|(i, &token)| {
+            bpt_index != Some(i)
+                && arena
+                    .token_address(token)
+                    .is_some_and(|addr| conn.contains(&addr))
+        })
     })
 }
 
@@ -2593,5 +2600,57 @@ mod tests {
         // Ungated build still admits the pool.
         let ungated = build_graph(&arena, &metas);
         assert!(ungated.pool_has_live_edges(pool));
+    }
+
+    #[test]
+    fn capped_attach_keeps_spoke_connected_pool() {
+        use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+        use crate::services::execution::flash_liquidity::FlashLiquiditySnapshot;
+
+        let mut arena = StateArena::default();
+        let spoke_addr = Address::from([0x41u8; 20]);
+        let spoke = arena.register_token(spoke_addr);
+        let tail = arena.register_token(Address::from([0x42u8; 20]));
+        let pool = arena.register_pool(
+            Address::from([0x43u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: TEST_FUNDED_RESERVE,
+                reserve1: TEST_FUNDED_RESERVE + U256::ONE,
+                fee: U256::from(30u8),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let meta = pool_meta_from_pair(pool, ProtocolType::UniswapV2, spoke, tail, 30);
+        let mut rates = FxHashMap::default();
+        rates.insert(
+            arena.register_token(Address::from([0x44u8; 20])),
+            MIN_TOKEN_TO_MATIC_RATE,
+        );
+        let gate = GraphBuildGate {
+            token_to_matic_rates: Arc::new(rates),
+            flash: Arc::new(FlashLiquiditySnapshot::default()),
+            flash_ttl: Duration::from_secs(60),
+            spoke_connectivity: Some(Arc::new(FxHashSet::from_iter([spoke_addr]))),
+        };
+        let mut graph = RoutingGraph::new(arena.token_count());
+
+        assert_eq!(
+            count_eligible_pools_missing_from_graph_with_gate(
+                &arena,
+                std::slice::from_ref(&meta),
+                &graph,
+                Some(&gate),
+            ),
+            1
+        );
+        let report = attach_missing_eligible_pools_with_gate(
+            &arena,
+            &mut graph,
+            std::slice::from_ref(&meta),
+            Some(&gate),
+        );
+        assert_eq!(report.attached_pools, 1);
+        assert!(graph.pool_has_live_edges(pool));
     }
 }

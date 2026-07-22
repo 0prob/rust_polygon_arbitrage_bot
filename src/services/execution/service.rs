@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy::providers::Provider;
 use tokio::sync::watch;
 
@@ -74,6 +74,10 @@ const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 /// Start-token cooldown when vault query profit does not appear in executor balance
 /// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
 const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800);
+/// Live TransferFailed on flash input (LGNS) — seed so restarts don't re-burn dry-run.
+const KNOWN_FOT_TOKENS: &[Address] = &[
+    address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01"), // LGNS
+];
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 /// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
@@ -284,13 +288,20 @@ impl ExecutionService {
 
     pub(crate) fn with_route_stats_path(route_stats_path: PathBuf) -> Self {
         let route_stats = Self::replay_route_stats(&route_stats_path);
+        // ponytail: process-lifetime seed; TransferFailed path re-extends on hit.
+        let fot_until = Instant::now() + DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE;
+        let direct_token_quarantine = KNOWN_FOT_TOKENS
+            .iter()
+            .copied()
+            .map(|t| (t, fot_until))
+            .collect();
         Self {
             last_submit: RwLock::new(FxHashMap::default()),
             last_global_submit: Mutex::new(None),
             mempool_nonce_cache: Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
-            direct_token_quarantine: RwLock::new(FxHashMap::default()),
+            direct_token_quarantine: RwLock::new(direct_token_quarantine),
             underwater_strikes: RwLock::new(FxHashMap::default()),
             global_quarantine_until: Mutex::new(None),
             fail_counts: RwLock::new(FxHashMap::default()),
@@ -1006,6 +1017,18 @@ impl ExecutionService {
             return outcome;
         }
 
+        if self.is_direct_token_quarantined(candidate.profit_token) {
+            crate::debug!(
+                "dispatch skip: fp={fp} token={} quarantined (FoT/TransferFailed)",
+                candidate.profit_token
+            );
+            let outcome = ExecutionOutcome::SkippedQuarantined;
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
+        }
+
         let route_cooldown = self.route_cooldown(config);
         if let Some(last) = self.last_submit.read().get(&fp)
             && now.saturating_duration_since(*last) < route_cooldown
@@ -1052,6 +1075,18 @@ impl ExecutionService {
                 Some(DecodedRevert::ExternalCallFailed { .. })
             ) {
                 self.quarantine_route_hash(candidate.route_hash, now);
+                // FoT / nonstandard ERC20: nested TransferFailed on flash input
+                // (live: LGNS 0xeB51… ain=1e18) — route_hash rotates so 600s hash
+                // cool alone re-burns verify; cool the start token like Direct FoT.
+                if let Some(DecodedRevert::ExternalCallFailed { reason, .. }) = &dry.decoded_revert
+                    && reason.contains("TransferFailed")
+                {
+                    self.quarantine_direct_token_zero_realized(candidate.profit_token);
+                    crate::info!(
+                        "token quarantine after TransferFailed dry-run: token={} fp={fp}",
+                        candidate.profit_token
+                    );
+                }
             }
             let reason = dry.failure_reason();
             crate::info!(
