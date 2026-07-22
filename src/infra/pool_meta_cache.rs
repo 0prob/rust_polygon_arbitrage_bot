@@ -114,6 +114,16 @@ impl PoolMetaCache {
                 if revision.load(Ordering::Acquire) != target_revision {
                     continue;
                 }
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        crate::warn!(
+                            "pool meta cache persist: cannot create {}: {e}",
+                            parent.display()
+                        );
+                        running.store(false, Ordering::Release);
+                        return;
+                    }
+                }
                 let seq = write_seq.fetch_add(1, Ordering::Relaxed);
                 let tmp = path.with_extension(format!("json.{seq}.tmp"));
                 let Ok(file) = std::fs::File::create(&tmp) else {
@@ -138,6 +148,21 @@ impl PoolMetaCache {
                     running.store(false, Ordering::Release);
                     return;
                 }
+                let file = match writer.into_inner() {
+                    Ok(file) => file,
+                    Err(e) => {
+                        crate::warn!("pool meta cache persist: finalize failed: {e}");
+                        let _ = std::fs::remove_file(&tmp);
+                        running.store(false, Ordering::Release);
+                        return;
+                    }
+                };
+                if let Err(e) = file.sync_all() {
+                    crate::warn!("pool meta cache persist: sync failed: {e}");
+                    let _ = std::fs::remove_file(&tmp);
+                    running.store(false, Ordering::Release);
+                    return;
+                }
                 if let Err(e) = std::fs::rename(&tmp, &*path) {
                     crate::warn!(
                         "pool meta cache persist: rename {} -> {} failed: {e}",
@@ -145,6 +170,8 @@ impl PoolMetaCache {
                         path.display()
                     );
                     let _ = std::fs::remove_file(&tmp);
+                } else {
+                    sync_parent_directory(&path);
                 }
                 if revision.load(Ordering::Acquire) == target_revision {
                     running.store(false, Ordering::Release);
@@ -157,5 +184,50 @@ impl PoolMetaCache {
                 }
             }
         });
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &std::path::Path) {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    if let Err(e) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        crate::warn!(
+            "pool meta cache persist: sync directory {} failed: {e}",
+            parent.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &std::path::Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persists_to_a_missing_parent_directory() {
+        let root =
+            std::env::temp_dir().join(format!("rpbot-pool-meta-cache-{}", std::process::id()));
+        let path = root.join("nested/cache.json");
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = PoolMetaCache::new(path.clone());
+        let address = Address::repeat_byte(1);
+        cache.set_balancer_pool_id(&address, FixedBytes::repeat_byte(2));
+
+        for _ in 0..100 {
+            if path.exists() && !cache.persist_running.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            PoolMetaCache::new(path.clone()).balancer_pool_id(&address),
+            Some(FixedBytes::repeat_byte(2))
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

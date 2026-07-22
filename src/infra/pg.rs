@@ -48,16 +48,16 @@ static POOL_META_INCREMENTAL_SQL: LazyLock<String> = LazyLock::new(|| {
         SELECT {POOL_META_COLUMNS}, "updatedAtBlock", "sortBlock" FROM (
             SELECT {POOL_META_COLUMNS}, NULL::integer AS "updatedAtBlock", "createdBlock" AS "sortBlock"
             FROM "PoolMeta"
-            WHERE "createdBlock" > $1
+            WHERE ("createdBlock", id) > ($1, $2)
             AND {POOL_META_VALIDITY_SQL}
             UNION ALL
             SELECT {POOL_META_COLUMNS}, "updatedAtBlock", "updatedAtBlock" AS "sortBlock"
             FROM "PoolMeta"
-            WHERE "updatedAtBlock" > $2 AND "createdBlock" <= $3
+            WHERE ("updatedAtBlock", id) > ($3, $4) AND "createdBlock" <= $5
             AND {POOL_META_VALIDITY_SQL}
         ) AS combined
-        ORDER BY "sortBlock" ASC
-        LIMIT $4
+        ORDER BY "sortBlock" ASC, id ASC
+        LIMIT $6
         "#
     )
 });
@@ -366,7 +366,7 @@ impl PgClient {
     pub async fn fetch_pool_meta_incremental(
         &self,
         cursor: &DiscoveryCursor,
-    ) -> anyhow::Result<(Vec<DiscoveredPool>, u64, u64, bool, ParseStats)> {
+    ) -> anyhow::Result<(Vec<DiscoveredPool>, DiscoveryCursor, bool, ParseStats)> {
         ensure!(
             cursor.last_block > 0,
             "pool discovery not bootstrapped — use keyset bootstrap first"
@@ -379,23 +379,22 @@ impl PgClient {
         let last_block = i32::try_from(cursor.last_block).context("cursor last_block overflow")?;
         let updated_wm_i32 =
             i32::try_from(updated_wm).context("cursor updated watermark overflow")?;
-        let initial_created = cursor.last_block;
-        let initial_updated = cursor.last_updated_block;
         let rows = pg_query_retry(
             &self.pool,
             POOL_META_INCREMENTAL_SQL.as_str(),
             &[
                 &last_block,
+                &cursor.last_block_id,
                 &updated_wm_i32,
+                &cursor.last_updated_id,
                 &last_block,
                 &POOL_META_INCREMENTAL_LIMIT,
             ],
         )
         .await?;
         let has_more = rows.len() == POOL_META_INCREMENTAL_LIMIT as usize;
-        let (pools, max_created, max_updated, stats) =
-            parse_incremental_rows(&rows, initial_created, initial_updated);
-        Ok((pools, max_created, max_updated, has_more, stats))
+        let (pools, next_cursor, stats) = parse_incremental_rows(&rows, cursor);
+        Ok((pools, next_cursor, has_more, stats))
     }
 
     pub async fn fetch_all_token_metas(&self) -> anyhow::Result<Vec<TokenMeta>> {
@@ -454,7 +453,9 @@ impl PgClient {
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryCursor {
     pub last_block: u64,
+    pub last_block_id: String,
     pub last_updated_block: u64,
+    pub last_updated_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -516,23 +517,28 @@ fn parse_rows(
 
 fn parse_incremental_rows(
     rows: &[Row],
-    initial_created: u64,
-    initial_updated: u64,
-) -> (Vec<DiscoveredPool>, u64, u64, ParseStats) {
+    initial: &DiscoveryCursor,
+) -> (Vec<DiscoveredPool>, DiscoveryCursor, ParseStats) {
     let mut pools = Vec::with_capacity(rows.len());
-    let mut max_created = initial_created;
-    let mut max_updated = initial_updated;
+    let mut cursor = initial.clone();
     let mut stats = ParseStats::default();
     for row in rows {
         let created = block_from_row(row, "createdBlock");
-        if created > max_created {
-            max_created = created;
-        }
+        let id: String = row.try_get("id").unwrap_or_default();
+        advance_cursor_pair(
+            &mut cursor.last_block,
+            &mut cursor.last_block_id,
+            created,
+            &id,
+        );
         if let Ok(updated) = row.try_get::<_, i32>("updatedAtBlock") {
             let updated = updated.max(0) as u64;
-            if updated > max_updated {
-                max_updated = updated;
-            }
+            advance_cursor_pair(
+                &mut cursor.last_updated_block,
+                &mut cursor.last_updated_id,
+                updated,
+                &id,
+            );
         }
         let protocol: String = row.try_get("protocol").unwrap_or_default();
         if let Some(pool) = parse_pg_row(row) {
@@ -542,7 +548,19 @@ fn parse_incremental_rows(
             record_pg_row(&mut stats, &protocol, false);
         }
     }
-    (pools, max_created, max_updated.max(max_created), stats)
+    if cursor.last_updated_block < cursor.last_block {
+        cursor.last_updated_block = cursor.last_block;
+        cursor.last_updated_id.clear();
+    }
+    (pools, cursor, stats)
+}
+
+fn advance_cursor_pair(block: &mut u64, id: &mut String, candidate_block: u64, candidate_id: &str) {
+    if candidate_block > *block || (candidate_block == *block && candidate_id > id.as_str()) {
+        *block = candidate_block;
+        id.clear();
+        id.push_str(candidate_id);
+    }
 }
 
 fn is_transient_pg_error(error: &anyhow::Error) -> bool {
@@ -691,7 +709,19 @@ mod tests {
             "incremental sql missing quoted columns: {incremental}"
         );
         assert!(incremental.contains("cardinality(tokens) >= 2"));
-        assert!(incremental.contains(r#"ORDER BY "sortBlock" ASC"#));
-        assert!(incremental.contains("LIMIT $4"));
+        assert!(incremental.contains(r#"("createdBlock", id) > ($1, $2)"#));
+        assert!(incremental.contains(r#"("updatedAtBlock", id) > ($3, $4)"#));
+        assert!(incremental.contains(r#"ORDER BY "sortBlock" ASC, id ASC"#));
+        assert!(incremental.contains("LIMIT $6"));
+    }
+
+    #[test]
+    fn cursor_pair_advances_within_a_block() {
+        let mut block = 100;
+        let mut id = "0x01".to_string();
+        advance_cursor_pair(&mut block, &mut id, 100, "0x02");
+        assert_eq!((block, id.as_str()), (100, "0x02"));
+        advance_cursor_pair(&mut block, &mut id, 100, "0x01");
+        assert_eq!((block, id.as_str()), (100, "0x02"));
     }
 }

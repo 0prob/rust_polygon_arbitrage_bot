@@ -507,8 +507,7 @@ impl StateRefreshService {
                 let address_index = Arc::make_mut(&mut address_index);
                 for pool in result.pools {
                     if let Some(&idx) = index.get(&pool.pool_key) {
-                        discovered[idx] = pool;
-                        address_index.insert(discovered[idx].address, idx);
+                        replace_discovered_pool(discovered, address_index, idx, pool);
                         updated += 1;
                     } else {
                         let idx = discovered.len();
@@ -591,7 +590,9 @@ impl StateRefreshService {
             pools: all_pools,
             cursor: DiscoveryCursor {
                 last_block: max_block,
+                last_block_id: keyset.id,
                 last_updated_block: max_block,
+                last_updated_id: String::new(),
             },
             complete: true,
         })
@@ -605,7 +606,7 @@ impl StateRefreshService {
         let mut pools = Vec::new();
         let mut parse_stats = ParseStats::default();
         loop {
-            let (page, last_block, last_updated_block, has_more, page_stats) =
+            let (page, next_cursor, has_more, page_stats) =
                 self.pg.fetch_pool_meta_incremental(&work_cursor).await?;
             record_index_incremental_rows(
                 u32::try_from(
@@ -616,12 +617,7 @@ impl StateRefreshService {
             );
             merge_parse_stats(&mut parse_stats, &page_stats);
             pools.extend(page.into_iter().filter_map(retain_routable_pool));
-            work_cursor = DiscoveryCursor {
-                last_block: last_block.max(work_cursor.last_block),
-                last_updated_block: last_updated_block
-                    .max(work_cursor.last_updated_block)
-                    .max(last_block),
-            };
+            work_cursor = next_cursor;
             if !has_more {
                 break;
             }
@@ -1120,6 +1116,20 @@ fn rebuild_discovery_indexes(
     (pool_key_index, Arc::new(address_index))
 }
 
+fn replace_discovered_pool(
+    discovered: &mut [DiscoveredPool],
+    address_index: &mut FxHashMap<Address, usize>,
+    idx: usize,
+    pool: DiscoveredPool,
+) {
+    let old_address = discovered[idx].address;
+    if old_address != pool.address {
+        address_index.remove(&old_address);
+    }
+    discovered[idx] = pool;
+    address_index.insert(discovered[idx].address, idx);
+}
+
 fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
     for (label, count) in &page.parsed {
         *acc.parsed.entry(label.clone()).or_default() += count;
@@ -1138,9 +1148,12 @@ fn bootstrap_cursor_block(keyset_created: i32, pool_created_max: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_sorted_addresses, refresh_batch_for};
+    use super::{dedupe_sorted_addresses, refresh_batch_for, replace_discovered_pool};
     use crate::config::AppConfig;
+    use crate::core::types::ProtocolType;
+    use crate::services::discovery::DiscoveredPool;
     use alloy::primitives::Address;
+    use rustc_hash::FxHashMap;
 
     #[test]
     fn keeps_bootstrap_batch_until_cache_is_warm() {
@@ -1194,5 +1207,34 @@ mod tests {
         assert_eq!(super::bootstrap_cursor_block(0, 0), 1);
         assert_eq!(super::bootstrap_cursor_block(12_345, 0), 12_345);
         assert_eq!(super::bootstrap_cursor_block(100, 999), 999);
+    }
+
+    #[test]
+    fn replacing_pool_removes_old_address_index() {
+        let old = Address::with_last_byte(1);
+        let new = Address::with_last_byte(2);
+        let mut pools = vec![test_pool(old)];
+        let mut index = FxHashMap::default();
+        index.insert(old, 0);
+        replace_discovered_pool(&mut pools, &mut index, 0, test_pool(new));
+        assert!(!index.contains_key(&old));
+        assert_eq!(index.get(&new), Some(&0));
+    }
+
+    fn test_pool(address: Address) -> DiscoveredPool {
+        DiscoveredPool {
+            pool_key: "pool".into(),
+            address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "UNISWAP_V2".into(),
+            tokens: vec![Address::with_last_byte(3), Address::with_last_byte(4)],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }
     }
 }

@@ -337,6 +337,10 @@ fn parse_pool_meta_impl(
         record_index_parse_reject(IndexParseReject::BadShape);
         return None;
     }
+    if fee.is_some_and(|value| value < 0) {
+        record_index_parse_reject(IndexParseReject::BadFee);
+        return None;
+    }
     if proto == ProtocolType::UniswapV4
         && (fee.is_none_or(|value| !(0..0x800000).contains(&value)) || tick_spacing.is_none())
     {
@@ -868,6 +872,29 @@ mod tests {
                 Some(&format!("0x{}", "22".repeat(32))),
                 None,
                 Some("WeightedPool"),
+                Some(1),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_negative_fee_before_unsigned_conversion() {
+        let tokens = vec![
+            "0x0000000000000000000000000000010000000001".to_string(),
+            "0x0000000000000000000000000000010000000002".to_string(),
+        ];
+        assert!(
+            parse_pool_meta_row(
+                "0x0000000000000000000000000000010000000003",
+                "curve_stable",
+                &tokens,
+                Some(-1),
+                None,
+                None,
+                None,
+                None,
                 Some(1),
                 None,
             )

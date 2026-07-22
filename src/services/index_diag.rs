@@ -11,6 +11,7 @@ pub enum IndexParseReject {
     V4Fields,
     BalancerPoolType,
     V4Hooks,
+    BadFee,
 }
 
 /// Post-parse discovery filter (parsed OK but not merged into routing index).
@@ -34,6 +35,7 @@ static REJ_BAD_SHAPE: AtomicU32 = AtomicU32::new(0);
 static REJ_V4_FIELDS: AtomicU32 = AtomicU32::new(0);
 static REJ_BALANCER_POOL_TYPE: AtomicU32 = AtomicU32::new(0);
 static REJ_V4_HOOKS: AtomicU32 = AtomicU32::new(0);
+static REJ_BAD_FEE: AtomicU32 = AtomicU32::new(0);
 
 static SKIP_NOT_FETCHABLE: AtomicU32 = AtomicU32::new(0);
 static SKIP_BAD_SHAPE: AtomicU32 = AtomicU32::new(0);
@@ -66,6 +68,7 @@ pub fn record_index_parse_reject(reason: IndexParseReject) {
         IndexParseReject::V4Fields => &REJ_V4_FIELDS,
         IndexParseReject::BalancerPoolType => &REJ_BALANCER_POOL_TYPE,
         IndexParseReject::V4Hooks => &REJ_V4_HOOKS,
+        IndexParseReject::BadFee => &REJ_BAD_FEE,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -118,7 +121,7 @@ pub fn log_index_summary() {
     }
     crate::info!(
         "index: parse_ok={} parse_reject={} bad_token={} bad_id={} unknown_proto={} unresolved={} \
-         bad_shape={} v4_fields={} balancer_type={} v4_hooks={} routable_skip={} skip_fetch={} \
+         bad_shape={} v4_fields={} balancer_type={} v4_hooks={} bad_fee={} routable_skip={} skip_fetch={} \
          skip_shape={} skip_v4_hooks={} skip_quick_v2={} skip_uni_v2={} skip_sushi_v2={} \
          pg_pages={} pg_incr_rows={} notify={} disc_skip_ticks={} stale_gated={}",
         PARSE_OK.load(Ordering::Relaxed),
@@ -131,6 +134,7 @@ pub fn log_index_summary() {
         REJ_V4_FIELDS.load(Ordering::Relaxed),
         REJ_BALANCER_POOL_TYPE.load(Ordering::Relaxed),
         REJ_V4_HOOKS.load(Ordering::Relaxed),
+        REJ_BAD_FEE.load(Ordering::Relaxed),
         routable_skips,
         SKIP_NOT_FETCHABLE.load(Ordering::Relaxed),
         SKIP_BAD_SHAPE.load(Ordering::Relaxed),

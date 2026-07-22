@@ -699,26 +699,16 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        if strikes < CHRONIC_UNDERWATER_STRIKES
-            && available_matic_wei >= U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
-        {
-            return false;
-        }
         // ponytail: thin-liq (<0.05 MATIC) cools on first strike — sticky V2 dust
-        // burned 3 best-eval ticks every cold start before the 30s/1h cool applied.
-        if strikes < CHRONIC_UNDERWATER_STRIKES
-            && available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
-            && strikes < 1
+        // burned 3 best-eval ticks every cold start before the 1h cool applied.
+        let strikes_needed = if available_matic_wei
+            < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
         {
-            return false;
-        }
-        // unreachable: thin path with strikes>=1 falls through; non-thin needs STRIKES.
-        if strikes < CHRONIC_UNDERWATER_STRIKES
-            && available_matic_wei >= U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
-        {
-            return false;
-        }
-        if strikes < 1 {
+            1
+        } else {
+            CHRONIC_UNDERWATER_STRIKES
+        };
+        if strikes < strikes_needed {
             return false;
         }
         self.underwater_strikes.write().remove(&fingerprint);
@@ -1908,36 +1898,31 @@ mod safety_tests {
     fn chronic_underwater_quarantine_needs_repeated_strikes() {
         let exec = ExecutionService::default();
         let fp = 0xdead_beef_u64;
-        let avail = U256::from(10u128.pow(16)); // 0.01 MATIC
+        let thick = U256::from(10u128.pow(17)); // 0.1 MATIC — needs 3 strikes
         // Near-zero cover never strikes (cascade guard).
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10, thick));
         assert!(!exec.is_route_quarantined(fp));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
         assert!(!exec.is_route_quarantined(fp));
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, avail));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick));
         assert!(exec.is_route_quarantined(fp));
         // Already quarantined — no re-apply signal.
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
         // One-shot diversion (different fp) stays selectable.
-        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick));
         assert!(!exec.is_route_quarantined(0xcafe_u64));
         // Sub-100 cover with real MATIC still chronic-cools (live: 42/65 best-evals).
         let low_fp = 0x1042_u64;
-        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
-        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, avail));
-        // Wei-dust with fake cover≥1000 still chronic-cools (clamped into band).
+        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
+        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
+        // Wei-dust / thin absolute MATIC cool on first strike.
         let dust_fp = 0xd057_u64;
         let dust_avail = U256::from(100u64);
-        assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
         assert!(exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
-        // Thin absolute MATIC with cover≥500 also clamps (live: USDT ~1770 / ~0.035).
         let thin_fp = 0x7e17_u64;
         let thin_avail = U256::from(35u128 * 10u128.pow(15)); // 0.035 MATIC
-        assert!(!exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
         assert!(exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
         // ≥0.05 MATIC with cover≥500 escapes chronic (real near-miss territory).
         let near_fp = 0x9ea5_u64;
