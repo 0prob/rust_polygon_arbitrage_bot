@@ -18,6 +18,17 @@ use crate::pipeline::cycle_finder::{
 use crate::pipeline::types::{CycleSearchPass, RoutingGraph};
 use crate::pipeline::weighted_graph::build_weighted_adjacency;
 
+const HUB_HEAVY_ENUM_TIME_BUDGET: Duration = Duration::from_millis(500);
+
+#[inline]
+fn hybrid_enum_budget(enum_budget: Duration, hub_heavy: bool) -> Duration {
+    if hub_heavy {
+        enum_budget.min(HUB_HEAVY_ENUM_TIME_BUDGET)
+    } else {
+        enum_budget
+    }
+}
+
 fn split_hybrid_budget(total: usize, hub_heavy: bool) -> (usize, usize) {
     if total == 0 {
         return (0, 0);
@@ -317,6 +328,7 @@ fn find_cycles_hybrid_multi_pass(
     let bf_enabled = !exclusive_starts && !hub_heavy && bf_budget.iter().any(|p| p.max_cycles > 0);
     let pool_index = index_pool_metas(pool_metas);
     let prep_dfs = Arc::clone(&prep);
+    let dfs_enum_budget = hybrid_enum_budget(enum_budget, hub_heavy);
 
     let (mut dfs_cycles, mut bf_cycles) = join(
         || {
@@ -326,7 +338,7 @@ fn find_cycles_hybrid_multi_pass(
                 &pool_index,
                 prep_dfs.as_ref(),
                 &dfs_budget,
-                enum_budget,
+                dfs_enum_budget,
             )
         },
         || {
@@ -387,5 +399,21 @@ mod tests {
     fn hub_heavy_budget_favors_dfs() {
         assert_eq!(split_hybrid_budget(500, true), (500, 0));
         assert_eq!(split_hybrid_budget(8, true), (8, 0));
+    }
+
+    #[test]
+    fn hub_heavy_search_budget_is_capped_without_shortening_normal_search() {
+        assert_eq!(
+            hybrid_enum_budget(Duration::from_millis(1_000), true),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            hybrid_enum_budget(Duration::from_millis(300), true),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            hybrid_enum_budget(Duration::from_millis(1_000), false),
+            Duration::from_millis(1_000)
+        );
     }
 }
