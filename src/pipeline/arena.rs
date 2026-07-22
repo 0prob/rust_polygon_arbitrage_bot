@@ -741,22 +741,26 @@ impl StateArena {
         // faster than attach could drain (live: 1.7k→6k/150s).
         let arena_append_cap = crate::core::constants::ATTACH_BATCH_CAP;
         let tail = &tradable[prefix_len..];
-        let append_n = tail.len().min(arena_append_cap);
-        let extra_tokens: usize = tail[..append_n]
+        let reserve_n = tail.len().min(arena_append_cap);
+        let extra_tokens: usize = tail[..reserve_n]
             .iter()
             .map(|(idx, _, _)| pools.get(*idx).map_or(2, |pool| pool.tokens.len()))
             .sum();
         {
             let inner = Arc::make_mut(&mut self.inner);
-            inner.pools.reserve(append_n);
-            inner.pool_addresses.reserve(append_n);
-            inner.address_to_pool.reserve(append_n);
+            inner.pools.reserve(reserve_n);
+            inner.pool_addresses.reserve(reserve_n);
+            inner.address_to_pool.reserve(reserve_n);
             inner.tokens.reserve(extra_tokens);
             inner.token_decimals.reserve(extra_tokens);
             inner.address_to_token.reserve(extra_tokens);
         }
 
-        for (idx, _address, state) in &tail[..append_n] {
+        let mut appended = 0usize;
+        for (idx, _address, state) in tail {
+            if appended >= arena_append_cap {
+                break;
+            }
             let Some(pool) = pools.get(*idx) else {
                 continue;
             };
@@ -769,6 +773,7 @@ impl StateArena {
                 decimal_hints,
                 /*touch_layout=*/ false,
             ));
+            appended += 1;
         }
         self.recompute_layout_fingerprint();
         metas
@@ -1725,6 +1730,82 @@ mod tests {
         assert_eq!(arena.pool_address(PoolIndex(1)), Some(pool_b));
         assert_ne!(arena.routing_layout_fingerprint(), fp_a);
         assert_eq!(arena.pool_count(), 2);
+    }
+
+    #[test]
+    fn sync_append_scans_past_graph_ineligible_tail() {
+        let address = |n: u16| {
+            let mut bytes = [0u8; 20];
+            bytes[18..].copy_from_slice(&n.to_be_bytes());
+            Address::from(bytes)
+        };
+        let pool =
+            |address: Address, token0: Address, token1: Address, created_block| DiscoveredPool {
+                pool_key: address.to_string(),
+                address,
+                protocol: ProtocolType::UniswapV2,
+                protocol_label: "V2".into(),
+                tokens: vec![token0, token1],
+                fee_bps: 30,
+                tick_spacing: None,
+                pool_id: None,
+                pool_id_verified: false,
+                hooks: None,
+                pool_type: None,
+                created_block,
+            };
+        let funded = TEST_FUNDED_RESERVE;
+        let v2 = || {
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(1u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 1,
+            })
+        };
+        let cache = StateCache::default();
+        let shared_a = address(1);
+        let shared_b = address(2);
+        let initial = address(10);
+        let target = address(11);
+        let mut discovered = vec![pool(initial, shared_a, shared_b, 1)];
+        cache.insert(initial, v2());
+
+        let mut hints = FxHashMap::default();
+        for offset in 0..crate::core::constants::ATTACH_BATCH_CAP {
+            let pool_address = address(1_000 + offset as u16);
+            let unsupported_decimals = address(2_000 + offset as u16);
+            discovered.push(pool(
+                pool_address,
+                unsupported_decimals,
+                shared_b,
+                offset as u64 + 2,
+            ));
+            cache.insert(pool_address, v2());
+            hints.insert(
+                unsupported_decimals,
+                crate::core::constants::MAX_SUPPORTED_TOKEN_DECIMALS + 1,
+            );
+        }
+        discovered.push(pool(target, shared_a, shared_b, 9_999));
+        cache.insert(target, v2());
+        let index = discovered
+            .iter()
+            .enumerate()
+            .map(|(i, pool)| (pool.address, i))
+            .collect();
+        let mut arena = StateArena::default();
+        assert_eq!(
+            arena
+                .sync_from_discovery(&cache, &discovered[..1], &index, Some(&hints))
+                .len(),
+            1
+        );
+
+        let metas = arena.sync_from_discovery(&cache, &discovered, &index, Some(&hints));
+        assert_eq!(metas.len(), 2);
+        assert_eq!(arena.pool_address(PoolIndex(1)), Some(target));
     }
 
     #[test]

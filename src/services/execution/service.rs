@@ -913,11 +913,18 @@ impl ExecutionService {
 
         if !Self::candidate_matches_state_generation(candidate, state_cache) {
             crate::debug!(
-                "dispatch generation drift: fp={}, candidate={} current={} (dry-run is authoritative)",
+                "dispatch skip: fp={}, stale state generation candidate={} current={}",
                 fp,
                 candidate.state_generation,
                 state_cache.generation(),
             );
+            let outcome = ExecutionOutcome::SubmitFailed {
+                reason: "candidate state generation mismatch".to_string(),
+            };
+            if let Some(ui_hook) = ui_hook {
+                ui_hook.on_execution_outcome(&outcome, fp);
+            }
+            return outcome;
         }
 
         if candidate.state_block != expected_state_block

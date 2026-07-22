@@ -700,11 +700,11 @@ impl AppConfig {
             .max(1);
         self.oracle.hub_path_max_hops = self.oracle.hub_path_max_hops.clamp(1, hub_hop_cap);
 
-        self.pipeline.hf_score_cap = self.pipeline.hf_score_cap.min(HF_CYCLE_CAP_MAX).max(1);
         self.pipeline.hf_sim_cap = self.pipeline.hf_sim_cap.min(HF_CYCLE_CAP_MAX).max(1);
-        if self.pipeline.hf_score_cap < self.pipeline.hf_sim_cap {
-            self.pipeline.hf_score_cap = self.pipeline.hf_sim_cap;
-        }
+        self.pipeline.hf_score_cap = self.pipeline.hf_score_cap.min(HF_CYCLE_CAP_MAX).clamp(
+            self.pipeline.hf_sim_cap,
+            self.pipeline.hf_sim_cap.saturating_mul(2),
+        );
         if self.pipeline.hf_max_dispatch > self.pipeline.hf_sim_cap {
             self.pipeline.hf_max_dispatch = self.pipeline.hf_sim_cap;
         }
@@ -1000,7 +1000,7 @@ mod tests {
             config.pipeline.hf_prefetch_budget_ms,
             HF_PREFETCH_BUDGET_MIN_MS
         );
-        assert_eq!(config.pipeline.hf_score_cap, HF_CYCLE_CAP_MAX);
+        assert_eq!(config.pipeline.hf_score_cap, default_hf_sim_cap() * 2);
         assert_eq!(config.rpc.request_timeout_ms, 1_000);
 
         config.pipeline.hf_prefetch_budget_ms = 99_000;
@@ -1111,6 +1111,9 @@ mod tests {
         assert_eq!(config.rpc.polygon_rpc_urls.len(), 2);
         assert_eq!(config.pipeline.hf_prefetch_count, 100);
         assert_eq!(config.pipeline.hf_score_cap, 100);
+        config.pipeline.hf_score_cap = 500;
+        config.normalize();
+        assert_eq!(config.pipeline.hf_score_cap, 200);
         config.pipeline.hf_max_dispatch = 200;
         config.normalize();
         assert_eq!(config.pipeline.hf_max_dispatch, 100);

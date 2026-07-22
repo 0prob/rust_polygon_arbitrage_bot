@@ -15,6 +15,7 @@ use crate::orchestrator::hf_eval::{
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
+use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
@@ -38,6 +39,9 @@ use crate::services::execution::balancer_verify::{
 };
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
+use crate::services::execution::impact_slippage::{
+    depth_impact_slippage_bps_with_base, effective_slippage_bps,
+};
 use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
@@ -62,6 +66,41 @@ enum RoutePoolRefreshAbort {
 #[must_use]
 fn route_pool_refresh_failed(result: &PoolRefreshResult) -> bool {
     result.attempted && result.updated == 0
+}
+
+fn effective_slippage_after_resim(
+    arena: &StateArena,
+    edges: &[crate::core::types::Edge],
+    sim: &crate::core::types::RouteSimulationResult,
+    configured_per_hop_bps: u64,
+) -> u64 {
+    let depth_bps = depth_impact_slippage_bps_with_base(
+        arena,
+        edges,
+        sim.amount_in,
+        Some(&MinimalSimResult {
+            profit: sim.profit,
+            amount_out: sim.amount_out,
+            total_gas: sim.total_gas,
+        }),
+    );
+    effective_slippage_after_resim_depth(configured_per_hop_bps, sim.hop_count, depth_bps)
+}
+
+fn effective_slippage_after_resim_depth(
+    configured_per_hop_bps: u64,
+    hop_count: u32,
+    depth_bps: u64,
+) -> u64 {
+    effective_slippage_bps(
+        configured_per_hop_bps,
+        hop_count,
+        if depth_bps >= 10_000 {
+            3_000
+        } else {
+            depth_bps
+        },
+    )
 }
 
 async fn refresh_route_pools_into_arena(
@@ -588,6 +627,12 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
         // Resim changed the economics — force prepare to reassess with planned flash source.
         prior_assessment = None;
+        evaluated.effective_slippage_bps = effective_slippage_after_resim(
+            arena,
+            &evaluated.cycle.edges,
+            &refreshed,
+            base_slippage_bps,
+        );
         refreshed
     } else {
         evaluated.sim
@@ -1788,6 +1833,14 @@ mod tests {
     use super::*;
     use crate::core::types::{PoolState, V3PoolState, V3Tick};
     use crate::services::state_refresh::PoolRefreshResult;
+
+    #[test]
+    fn resim_depth_replaces_pre_refresh_slippage() {
+        let initial = effective_slippage_after_resim_depth(25, 2, 100);
+        let refreshed = effective_slippage_after_resim_depth(25, 2, 900);
+
+        assert!(refreshed > initial);
+    }
 
     #[test]
     fn route_pool_refresh_failed_only_when_attempted_zero_updates() {

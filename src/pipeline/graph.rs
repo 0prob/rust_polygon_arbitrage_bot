@@ -1144,9 +1144,8 @@ pub fn attach_missing_eligible_pools_with_gate(
             && pool_has_admissible_edges(arena, meta, gate)
         {
             let state = arena.pool_state(meta.pool_index);
-            let (state_protocol, state_tokens, leg0, leg1) = state.map_or(
-                (meta.protocol, 0, None, None),
-                |state| {
+            let (state_protocol, state_tokens, leg0, leg1) =
+                state.map_or((meta.protocol, 0, None, None), |state| {
                     (
                         crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
                         match state {
@@ -1157,8 +1156,7 @@ pub fn attach_missing_eligible_pools_with_gate(
                         routing_token_at_leg(arena, state, meta, 0),
                         routing_token_at_leg(arena, state, meta, 1),
                     )
-                },
-            );
+                });
             crate::debug!(
                 "graph attach no adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} legs={:?}/{:?}",
                 meta.pool_index.0,
@@ -1196,9 +1194,8 @@ pub fn attach_missing_eligible_pools_with_gate(
         && let Some(meta) = pools.iter().find(|meta| meta.pool_index == pool_index)
     {
         let state = arena.pool_state(pool_index);
-        let (state_protocol, state_tokens, leg0, leg1) = state.map_or(
-            (meta.protocol, 0, None, None),
-            |state| {
+        let (state_protocol, state_tokens, leg0, leg1) =
+            state.map_or((meta.protocol, 0, None, None), |state| {
                 (
                     crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
                     match state {
@@ -1209,8 +1206,7 @@ pub fn attach_missing_eligible_pools_with_gate(
                     routing_token_at_leg(arena, state, meta, 0),
                     routing_token_at_leg(arena, state, meta, 1),
                 )
-            },
-        );
+            });
         crate::debug!(
             "graph missing adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} hub_spoke={} edges={} live={} legs={:?}/{:?}",
             pool_index.0,
@@ -1521,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn thin_parallel_edges_keeps_top_two_by_ratio() {
+    fn thin_parallel_edges_stubs_non_top_edges() {
         let mut adj = vec![
             direct_ge(1, 4, 5, ProtocolType::BalancerV2, 1_010_000_000_000_000_000),
             direct_ge(2, 4, 5, ProtocolType::BalancerV2, 1_020_000_000_000_000_000),
@@ -1530,12 +1526,20 @@ mod tests {
             direct_ge(10, 4, 6, ProtocolType::UniswapV3, 1_010_000_000_000_000_000),
         ];
         thin_parallel_edges_in_place(&mut adj, 2);
-        assert_eq!(adj.len(), 3);
-        let pools: Vec<u32> = adj.iter().map(|e| e.edge.pool_index.0).collect();
-        assert!(pools.contains(&2));
-        assert!(pools.contains(&3));
-        assert!(!pools.contains(&4));
-        assert!(pools.contains(&10));
+        let live_pools: Vec<u32> = adj
+            .iter()
+            .filter(|edge| crate::pipeline::cycle_finder::is_live_graph_edge(edge))
+            .map(|edge| edge.edge.pool_index.0)
+            .collect();
+        assert_eq!(live_pools.len(), 3);
+        assert!(live_pools.contains(&2));
+        assert!(live_pools.contains(&3));
+        assert!(live_pools.contains(&10));
+        assert_eq!(adj.len(), 5);
+        assert!(
+            adj.iter()
+                .any(|edge| edge.edge.pool_index.0 == 4 && edge.ratio.is_zero())
+        );
     }
 
     #[test]

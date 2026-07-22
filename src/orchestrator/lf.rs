@@ -516,14 +516,15 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
     // Dirty pools are rescored above; observed pins use force_attach below.
     // Skip catchup attach on observed force-refind — it burned 256 slots + graph
     // churn before exclusive DFS (live: attached=256 dfs=0 enum_ms≈2).
-    let cached_eligible = {
+    let (cached_eligible, attach_catchup_pending) = {
         let gc = work.graph_cache.lock();
-        gc.cached_eligible_pool_count()
+        (gc.cached_eligible_pool_count(), gc.attach_catchup_pending())
     };
     let catchup_due = needs_rebuild || connectivity_stale || eligible_count > cached_eligible;
     // Observed force-refind: skip catchup attach (pins use force_attach below).
     let scan_missing = catchup_due && !work.force_cycle_refind;
-    if catchup_due && work.force_cycle_refind {
+    // Only a capped attach can leave this latch stale; ordinary force ticks skip the O(pool) scan.
+    if catchup_due && work.force_cycle_refind && attach_catchup_pending {
         // If nothing is actually missing, drop the latch — otherwise freeze-era
         // defer left catchup_pending stuck across force ticks (arena growth halted
         // when freeze was on; latch still poisons connectivity_stale).
