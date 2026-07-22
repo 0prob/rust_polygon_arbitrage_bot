@@ -93,6 +93,24 @@ pub fn normalize_balancer_pool_type(pool_type: Option<&str>) -> Option<String> {
 }
 
 #[must_use]
+pub fn is_curve_stableswap_ng_pool_type(pool_type: Option<&str>) -> bool {
+    let Some(pool_type) = pool_type else {
+        return false;
+    };
+    let compact: Vec<u8> = pool_type
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect();
+    compact
+        .windows(b"stableng".len())
+        .any(|part| part == b"stableng")
+        || compact
+            .windows(b"stableswapng".len())
+            .any(|part| part == b"stableswapng")
+}
+
+#[must_use]
 pub fn is_algebra_protocol_label(raw: &str) -> bool {
     is_algebra_integral_protocol_label(raw)
         || contains_ignore_case(raw, "algebra")
@@ -266,5 +284,13 @@ mod tests {
         );
         assert_eq!(normalize_balancer_pool_type(Some("GyroECLPPool")), None);
         assert_eq!(normalize_balancer_pool_type(None), None);
+    }
+
+    #[test]
+    fn curve_ng_pool_type_is_separator_independent() {
+        for label in ["stable_ng", "StableSwapNG", "stable-swap-ng"] {
+            assert!(is_curve_stableswap_ng_pool_type(Some(label)), "{label}");
+        }
+        assert!(!is_curve_stableswap_ng_pool_type(Some("stable")));
     }
 }

@@ -280,11 +280,11 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
 }
 
 fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
-    pool_type.is_some_and(|t| {
-        let b = t.as_bytes();
-        b.windows(9).any(|w| w.eq_ignore_ascii_case(b"stable_ng"))
-            || b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
-    })
+    crate::core::protocol::is_curve_stableswap_ng_pool_type(pool_type)
+        || pool_type.is_some_and(|t| {
+            let b = t.as_bytes();
+            b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
+        })
 }
 
 fn decode_curve_stored_rates(
@@ -327,11 +327,7 @@ fn decode_curve_crypto_rates(
 fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let balances = decode_curve_balances(plan, results)?;
     let n_fetched = balances.len();
-    if plan
-        .pool
-        .pool_type
-        .as_deref()
-        .is_some_and(|pool_type| pool_type.to_ascii_lowercase().contains("stable_ng"))
+    if crate::core::protocol::is_curve_stableswap_ng_pool_type(plan.pool.pool_type.as_deref())
         && n_fetched != 2
     {
         return None;

@@ -198,7 +198,7 @@ pub const ROUTE_EXECUTION_GAS_OVERHEAD: u32 = 100_000;
 /// Per-hop Huff dispatch/callback glue on top of protocol hop gas.
 pub const PER_HOP_EXECUTOR_GAS_OVERHEAD: u32 = 18_000;
 /// Floor tip for assess + submit (Polygon MEV); shared so ranking matches live fees.
-pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([30_000_000_000, 0, 0, 0]);
+pub const MIN_PRIORITY_FEE_PER_GAS: U256 = U256::from_limbs([25_000_000_000, 0, 0, 0]);
 /// Raised post-revert (actual 1.87M vs sim 720k on BAL-ish ~2.6x); 25% buffer + fallback 50% for headroom w/o inflating sim gas used in net calc.
 pub const GAS_LIMIT_BUFFER_BPS: u64 = 2500;
 /// Extra headroom when RPC cannot return `estimate_gas` (Balancer batchSwap overflow).

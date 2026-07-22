@@ -45,7 +45,7 @@ pub fn resolve_balancer_pool_id(
 
 #[must_use]
 pub fn curve_uses_receiver(pool_type: Option<&str>) -> bool {
-    pool_type.is_some_and(|t| ic(t, "stable_ng"))
+    crate::core::protocol::is_curve_stableswap_ng_pool_type(pool_type)
 }
 
 // ponytail: lookup table if new protocol variants become frequent.

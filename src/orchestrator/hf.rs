@@ -148,7 +148,7 @@ fn build_hf_candidate_ui_rows(
     out
 }
 
-const HF_ACTIVITY_WINDOW_MS: u64 = 300_000;
+const HF_ACTIVITY_WINDOW_MS: u64 = 15_000;
 const HF_SUMMARY_INTERVAL_MS: u64 = 15_000;
 const HF_BEST_EVAL_INTERVAL_MS: u64 = 60_000;
 /// Rank+Brent is CPU-local; 30s hid hung worker threads and blocked the HF semaphore.
@@ -649,9 +649,11 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
 }
 
 /// Max HF slots for activity-hot cycles; remainder stays for quality inactive.
+/// Hard ceiling 16: rescore_cap=150 used to admit 50 live slots and leave
+/// inactive_selected=0 (live: 187 actives, probe window all WSS dust).
 #[must_use]
 fn hf_activity_slot_cap(rescore_cap: usize) -> usize {
-    rescore_cap.saturating_div(3).max(8).min(rescore_cap)
+    rescore_cap.saturating_div(5).max(4).min(16).min(rescore_cap)
 }
 
 fn sample_proto_mismatch(
@@ -1147,6 +1149,29 @@ fn select_cycles_for_rescore(
         };
         let start_rate = resolve_token_to_matic_rate(ready.start_token, token_to_matic_rates);
         let economic_floor = min_economic_amount_in(start_decimals, start_rate);
+        // Walk succeeds with gross==0 at micro+floor → spot phantoms. Apply before
+        // the live bypass so WSS-touched zero_profit cannot fill the probe window
+        // (live: active_selected=50 inactive=0 with 187 actives). Skip 1-hop
+        // stubs (tests / incomplete cycles) — need a closed path to judge profit.
+        if ready.edges.len() >= 2 {
+            if let Some(micro) =
+                crate::pipeline::local_sim::simulate_route_minimal(arena, &ready.edges, micro_probe)
+            {
+                if micro.profit.is_zero() {
+                    let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
+                        arena,
+                        &ready.edges,
+                        economic_floor,
+                    )
+                    .is_none_or(|s| s.profit.is_zero());
+                    if floor_zero {
+                        micro_dead_skipped += 1;
+                        quarantine_all_edge_rotations(execution, &ready.edges);
+                        continue;
+                    }
+                }
+            }
+        }
         if score > 0 {
             // Live WSS: do not micro/bal-floor prune. Stale local sim looked shallow
             // and wiped live_touch→active (live: touch=38 active=0). Proto/heal gates
@@ -1185,26 +1210,6 @@ fn select_cycles_for_rescore(
         {
             micro_dead_skipped += 1;
             continue;
-        }
-        // Walk succeeds with gross==0 at micro+floor → spot phantoms that empty
-        // probe ranks (live: zero_profit emptied scanned windows). Active path
-        // above still bypasses; probe rank cools those after first miss.
-        if let Some(micro) =
-            crate::pipeline::local_sim::simulate_route_minimal(arena, &ready.edges, micro_probe)
-        {
-            if micro.profit.is_zero() {
-                let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
-                    arena,
-                    &ready.edges,
-                    economic_floor,
-                )
-                .is_none_or(|s| s.profit.is_zero());
-                if floor_zero {
-                    micro_dead_skipped += 1;
-                    quarantine_all_edge_rotations(execution, &ready.edges);
-                    continue;
-                }
-            }
         }
         // After rank probe skips below-floor dust, micro-only survivors fail as
         // v2_reserve/shallow_cl/bal_max_in — prune at economic floor here.
@@ -1255,10 +1260,10 @@ fn select_cycles_for_rescore(
         };
     }
 
-    // Activity desc, then cycle quality. Only sort the active partition.
+    // Prefer cycle quality among live routes so the 16-slot cap surfaces
+    // high cycle_ratio WSS edges instead of highest activity_count dust.
     active.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| compare_cycle_score(a.0.as_ref(), b.0.as_ref()))
+        compare_cycle_score(a.0.as_ref(), b.0.as_ref()).then_with(|| b.1.cmp(&a.1))
     });
     // Inactive: quality order so rotation windows still prefer stronger cycle_ratio first.
     inactive.sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
@@ -2964,8 +2969,9 @@ mod tests {
 
     #[test]
     fn hf_activity_slot_cap_leaves_inactive_room() {
-        assert_eq!(hf_activity_slot_cap(12), 8); // max(8, 12/3)
-        assert_eq!(hf_activity_slot_cap(30), 10);
+        assert_eq!(hf_activity_slot_cap(12), 4); // max(4, 12/5)
+        assert_eq!(hf_activity_slot_cap(30), 6);
+        assert_eq!(hf_activity_slot_cap(150), 16); // hard ceiling
         assert_eq!(hf_activity_slot_cap(3), 3); // floor clamped by cap
         assert_eq!(hf_activity_slot_cap(0), 0);
     }
