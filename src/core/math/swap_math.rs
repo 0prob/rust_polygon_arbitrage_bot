@@ -84,10 +84,12 @@ pub fn compute_swap_step(
         (actual_in, actual_out)
     };
 
+    // Rounding can make actual_in slightly exceed amount_remaining; wrapping
+    // subtraction would invent a ~2^256 fee and corrupt multi-step V3 walks.
     let fee_amount = if target_reached {
         mul_div_rounding_up(actual_in, fee_pips, FEE_PIPS_SCALE - fee_pips)?
     } else {
-        amount_remaining - actual_in
+        amount_remaining.saturating_sub(actual_in)
     };
 
     Some(SwapStepResult {

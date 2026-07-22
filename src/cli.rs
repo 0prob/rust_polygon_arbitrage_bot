@@ -12,8 +12,23 @@ where
 
 pub fn print_help(bin_name: &str) -> io::Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
+    // Keep help self-contained: no dotenv / log / network side effects.
     let usage = format!(
-        "{bin_name} - Polygon arbitrage runtime\n\nUsage: {bin_name}\n\nOptions:\n  -h, --help    Show this help and exit\n"
+        "\
+{bin_name} - Polygon mainnet MEV arbitrage runtime
+
+Usage:
+  {bin_name}
+  {bin_name} -h | --help
+
+Options:
+  -h, --help    Show this help and exit
+
+Config:
+  Loads `.env` (or DOTENV_PATH) then process env. See .env.example.
+  Concurrent rpbot/tui processes are replaced on startup unless
+  RPBOT_ALLOW_MULTIPLE is set. Logs: RPBOT_LOG / RPBOT_LOG_DIR.
+"
     );
     stdout.write_all(usage.as_bytes())?;
     stdout.flush()

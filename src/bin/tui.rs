@@ -9,6 +9,8 @@ async fn main() -> anyhow::Result<()> {
     }
     rpbot::config::load_dotenv();
     rpbot::log::init()?;
+    // Flush/join log worker on every exit path (bootstrap fail, TUI error, success).
+    let _log_guard = rpbot::log::LogShutdownGuard;
     // Kill any other rpbot/tui (debug/release/bolt) before we open RPC/PG/WSS.
     rpbot::single_instance::ensure_single_instance();
     rpbot::log::set_stdout_enabled(false);
@@ -20,13 +22,11 @@ async fn main() -> anyhow::Result<()> {
     let hook = bridge.hook();
     let snapshot_tx = bridge.snapshot_sender();
 
-    let result = run_tui(
+    run_tui(
         bridge,
         rx,
         snapshot_rx,
         bootstrap(Some(hook), Some(snapshot_tx)),
     )
-    .await;
-    rpbot::log::shutdown();
-    result
+    .await
 }

@@ -1,9 +1,21 @@
 use crate::core::types::ProtocolType;
 
+/// ASCII case-insensitive substring search (protocol labels are ASCII).
+#[inline]
 fn contains_ignore_case(s: &str, needle: &str) -> bool {
     let s = s.as_bytes();
     let n = needle.as_bytes();
-    s.len() >= n.len() && s.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    if n.is_empty() {
+        return true;
+    }
+    if s.len() < n.len() {
+        return false;
+    }
+    // Exact / common uppercase labels: O(1) when equal ignoring case (full match).
+    if s.len() == n.len() {
+        return s.eq_ignore_ascii_case(n);
+    }
+    s.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// Map PostgreSQL `protocol` + optional `poolType` to a simulation protocol family.
@@ -167,6 +179,20 @@ mod tests {
             normalize_protocol("UNISWAP_V2"),
             Some(ProtocolType::UniswapV2)
         );
+        // Full-string case fold path (len == needle).
+        assert_eq!(normalize_protocol("uniswap_v2"), Some(ProtocolType::UniswapV2));
+    }
+
+    #[test]
+    fn fetch_slots_match_protocol_discriminants() {
+        assert_eq!(ProtocolType::UniswapV2.fetch_slot(), Some(0));
+        assert_eq!(ProtocolType::UniswapV3.fetch_slot(), Some(1));
+        assert_eq!(ProtocolType::UniswapV4.fetch_slot(), Some(2));
+        assert_eq!(ProtocolType::BalancerV2.fetch_slot(), Some(3));
+        assert_eq!(ProtocolType::CurveStable.fetch_slot(), Some(4));
+        assert_eq!(ProtocolType::CurveCrypto.fetch_slot(), Some(5));
+        assert_eq!(ProtocolType::Dodo.fetch_slot(), Some(6));
+        assert_eq!(ProtocolType::Woofi.fetch_slot(), Some(7));
     }
 
     #[test]

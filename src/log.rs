@@ -95,6 +95,16 @@ pub fn shutdown() {
     }
 }
 
+/// Joins the log worker on drop so bin `main` paths always flush (incl. `?` / early return).
+#[must_use]
+pub struct LogShutdownGuard;
+
+impl Drop for LogShutdownGuard {
+    fn drop(&mut self) {
+        shutdown();
+    }
+}
+
 pub fn log(level: &'static str, module: &'static str, mut message: String) {
     let Some(logger) = LOGGER.get() else {
         return;

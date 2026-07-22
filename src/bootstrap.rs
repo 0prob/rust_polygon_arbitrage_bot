@@ -188,11 +188,14 @@ async fn bootstrap_inner(
     Ok(ctx)
 }
 
+/// Headless bin entry (`rpbot`). UI hook is optional for tests / custom drivers.
 #[cfg(not(feature = "tui"))]
 pub async fn bootstrap(ui_hook: Option<SharedUiHook>) -> anyhow::Result<Arc<RuntimeContext>> {
     bootstrap_inner(ui_hook).await
 }
 
+/// Shared by `tui` bin and headless `rpbot` when built with `--features tui`.
+/// Pass `None, None` for headless; TUI supplies hook + snapshot channel.
 #[cfg(feature = "tui")]
 pub async fn bootstrap(
     ui_hook: Option<SharedUiHook>,
@@ -201,6 +204,20 @@ pub async fn bootstrap(
     >,
 ) -> anyhow::Result<Arc<RuntimeContext>> {
     bootstrap_inner(ui_hook, ui_snapshot_tx).await
+}
+
+/// Production headless bootstrap (no UI hook / snapshot channel).
+///
+/// Hides the `tui` feature's dual `bootstrap` signature from `src/main.rs`.
+pub async fn bootstrap_headless() -> anyhow::Result<Arc<RuntimeContext>> {
+    #[cfg(feature = "tui")]
+    {
+        bootstrap(None, None).await
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        bootstrap(None).await
+    }
 }
 
 #[cfg(test)]

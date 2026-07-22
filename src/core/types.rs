@@ -20,9 +20,9 @@ pub type PoolTokenAddrs = SmallVec<[Address; POOL_TOKEN_CAP]>;
 #[inline]
 #[must_use]
 pub fn hop_amounts_zeroed(hop_count: usize) -> HopAmounts {
-    let len = hop_count + 1;
-    let mut amounts = HopAmounts::with_capacity(len);
-    amounts.resize(len, U256::ZERO);
+    // SmallVec::new keeps ≤HOP_AMOUNT_CAP on the stack; resize fills zeros.
+    let mut amounts = HopAmounts::new();
+    amounts.resize(hop_count.saturating_add(1), U256::ZERO);
     amounts
 }
 
@@ -32,16 +32,18 @@ pub struct TokenIndex(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PoolIndex(pub u32);
 
+/// Compact protocol discriminant (fits in one byte; denser `Edge` / graph storage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum ProtocolType {
-    UniswapV2,
-    UniswapV3,
-    UniswapV4,
-    BalancerV2,
-    CurveStable,
-    CurveCrypto,
-    Dodo,
-    Woofi,
+    UniswapV2 = 0,
+    UniswapV3 = 1,
+    UniswapV4 = 2,
+    BalancerV2 = 3,
+    CurveStable = 4,
+    CurveCrypto = 5,
+    Dodo = 6,
+    Woofi = 7,
 }
 
 impl ProtocolType {
@@ -49,16 +51,8 @@ impl ProtocolType {
     #[inline]
     #[must_use]
     pub const fn fetch_slot(self) -> Option<usize> {
-        match self {
-            Self::UniswapV2 => Some(0),
-            Self::UniswapV3 => Some(1),
-            Self::UniswapV4 => Some(2),
-            Self::BalancerV2 => Some(3),
-            Self::CurveStable => Some(4),
-            Self::CurveCrypto => Some(5),
-            Self::Dodo => Some(6),
-            Self::Woofi => Some(7),
-        }
+        // Discriminant order matches the fetch queue (see `#[repr(u8)]` values).
+        Some(self as u8 as usize)
     }
 }
 
@@ -392,6 +386,13 @@ impl FoundCycle {
     #[must_use]
     pub fn edge_hops(&self) -> u32 {
         u32::try_from(self.edges.len()).unwrap_or(self.hop_count)
+    }
+
+    /// Prefer `edges.len()`; keep `hop_count` in sync when present.
+    #[inline]
+    #[must_use]
+    pub fn hops_consistent(&self) -> bool {
+        self.hop_count as usize == self.edges.len()
     }
 }
 

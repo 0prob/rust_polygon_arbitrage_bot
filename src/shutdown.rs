@@ -7,7 +7,12 @@ use tokio::signal;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub const PASS_LOOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Outer join budget after SIGINT/SIGTERM (headless main and TUI quit).
+///
+/// `run_pass_loop` drains HF (≤10s) then LF (≤10s) and may await nonce resync;
+/// the previous 10s outer cap aborted mid-drain and skipped `shutdown_resync`.
+/// Keep under typical k8s `terminationGracePeriodSeconds` (30).
+pub const PASS_LOOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Wait for Ctrl+C or (on Unix) SIGTERM.
 pub async fn wait_for_os_shutdown() {
@@ -41,20 +46,39 @@ pub async fn run_pass_loop_until_signal(
     let outcome = tokio::select! {
         biased;
         () = wait_for_os_shutdown() => {
+            // Drop the sender after signaling so receivers see closed if they
+            // only watch for lag (defensive; primary path is the bool flag).
             let _ = shutdown_tx.send(true);
+            drop(shutdown_tx);
             tokio::select! {
                 res = &mut pass_handle => res,
                 _ = tokio::time::sleep(PASS_LOOP_SHUTDOWN_TIMEOUT) => {
                     pass_handle.abort();
-                    let _ = pass_handle.await;
-                    crate::warn!(
-                        "pass loop shutdown timed out after {PASS_LOOP_SHUTDOWN_TIMEOUT:?}; aborted"
-                    );
-                    Ok(Ok(()))
+                    // Join after abort so we never leave a detached JoinHandle
+                    // (leaks the task until process exit and can panic on drop
+                    // in future tokio versions).
+                    match pass_handle.await {
+                        Ok(Ok(())) | Err(_) => {
+                            crate::warn!(
+                                "pass loop shutdown timed out after {PASS_LOOP_SHUTDOWN_TIMEOUT:?}; aborted"
+                            );
+                            Ok(Ok(()))
+                        }
+                        Ok(Err(e)) => {
+                            crate::warn!(
+                                "pass loop shutdown timed out after {PASS_LOOP_SHUTDOWN_TIMEOUT:?}; aborted with error: {e:#}"
+                            );
+                            Ok(Ok(()))
+                        }
+                    }
                 }
             }
         }
-        res = &mut pass_handle => res,
+        res = &mut pass_handle => {
+            // Pass loop exited without OS signal — drop unused sender.
+            drop(shutdown_tx);
+            res
+        }
     };
 
     match outcome {
@@ -62,6 +86,10 @@ pub async fn run_pass_loop_until_signal(
         Ok(Err(e)) => {
             crate::error!("pass loop failed: {e:#}");
             Err(e).context("pass loop failed")
+        }
+        Err(e) if e.is_cancelled() => {
+            // Abort path already logged; treat as clean stop.
+            Ok(())
         }
         Err(e) => {
             crate::error!("pass loop task panicked: {e}");
@@ -80,6 +108,7 @@ pub async fn join_pass_loop_after_shutdown(
             crate::warn!("pass loop failed during shutdown: {e:#}");
             Ok(())
         }
+        Ok(Err(e)) if e.is_cancelled() => Ok(()),
         Ok(Err(e)) => {
             crate::warn!("pass loop panicked during shutdown: {e:#}");
             Ok(())
@@ -90,5 +119,24 @@ pub async fn join_pass_loop_after_shutdown(
             crate::warn!("pass loop shutdown timed out after {PASS_LOOP_SHUTDOWN_TIMEOUT:?}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_budget_covers_pass_loop_task_drains() {
+        // pass_loop: HF join ≤10s + LF join ≤10s (+ resync). Outer must be larger.
+        const PASS_LOOP_INNER_DRAIN: Duration = Duration::from_secs(20);
+        assert!(
+            PASS_LOOP_SHUTDOWN_TIMEOUT > PASS_LOOP_INNER_DRAIN,
+            "PASS_LOOP_SHUTDOWN_TIMEOUT={PASS_LOOP_SHUTDOWN_TIMEOUT:?} must exceed inner HF+LF drains ({PASS_LOOP_INNER_DRAIN:?})"
+        );
+        assert!(
+            PASS_LOOP_SHUTDOWN_TIMEOUT <= Duration::from_secs(30),
+            "keep outer budget within typical 30s termination grace"
+        );
     }
 }

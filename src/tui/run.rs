@@ -121,9 +121,14 @@ where
     // Let the pass loop observe shutdown before we tear down UI I/O.
     tokio::task::yield_now().await;
 
+    // Close the UI channel so the input thread's poll loop exits (≤ INPUT_POLL_TIMEOUT).
     drop(tx);
-    // Never block the tokio runtime on join — that prevents pass_loop from exiting.
-    drop(input_thread);
+    // Join before restore: dropping the JoinHandle used to detach, racing crossterm
+    // event::poll/read against leave-raw-mode and leaving a broken TTY on quit.
+    // block_in_place so we do not stall other worker threads while waiting ≤~100ms.
+    tokio::task::block_in_place(|| {
+        let _ = input_thread.join();
+    });
     terminal.restore().ok();
 
     join_pass_loop_after_shutdown(pass_handle).await
