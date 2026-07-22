@@ -333,12 +333,15 @@ fn select_fetch_targets_indexed<'a>(
 
     let scan_budget = NEVER_FETCH_SCAN_CHUNK.min(pools.len());
     let start = never_scan_cursor.fetch_add(scan_budget, Ordering::Relaxed) % pools.len();
+    let missing = cache.missing_addresses(
+        (0..scan_budget).map(|offset| pools[(start + offset) % pools.len()].address),
+    );
     for offset in 0..scan_budget {
         let pool = &pools[(start + offset) % pools.len()];
         if !is_fetchable_protocol(pool.protocol) {
             continue;
         }
-        if cache.has_any_entry(&pool.address) {
+        if !missing.contains(&pool.address) {
             continue;
         }
         enqueue_fetch_candidate(

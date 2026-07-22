@@ -200,6 +200,18 @@ impl StateCache {
         self.inner.read().contains_key(address)
     }
 
+    #[must_use]
+    pub fn missing_addresses<I>(&self, addresses: I) -> FxHashSet<Address>
+    where
+        I: IntoIterator<Item = Address>,
+    {
+        let guard = self.inner.read();
+        addresses
+            .into_iter()
+            .filter(|address| !guard.contains_key(address))
+            .collect()
+    }
+
     fn lookup_pool_state(&self, address: &Address) -> Option<Arc<PoolState>> {
         let guard = self.inner.read();
         let entry = guard.get(address)?;
@@ -576,6 +588,17 @@ mod tests {
         // not invalid, because the global TTL check fires before the invalid check.
         assert!(invalid.is_empty());
         assert_eq!(stale, vec![&expired]);
+    }
+
+    #[test]
+    fn missing_addresses_keeps_expired_entries_out_of_never_fetched_scan() {
+        let cache = StateCache::new(10, Duration::ZERO);
+        let expired = Address::with_last_byte(1);
+        let unseen = Address::with_last_byte(2);
+        cache.insert(expired, PoolState::Invalid);
+
+        let missing = cache.missing_addresses([expired, unseen]);
+        assert_eq!(missing, FxHashSet::from_iter([unseen]));
     }
 
     #[test]

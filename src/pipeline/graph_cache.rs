@@ -142,22 +142,17 @@ impl GraphCache {
         dirty_pool_count: usize,
         arena_pool_count: usize,
     ) -> bool {
-        let _ = (
-            routable_pool_count,
-            layout_fingerprint,
-            dirty_pool_count,
-            arena_pool_count,
-        );
+        let _ = (routable_pool_count, layout_fingerprint);
         // Connectivity rebuild is handled by LF via `(needs_rebuild && !cycle_cache_valid)`.
         // Coupling rebuild→refind here defeated keep_cycles on growth/interval rebuilds.
         if self.cycles.as_ref().is_none_or(|c| c.is_empty()) {
             return true;
         }
-        // A sparse pool update can invalidate the only cached profitable route.
-        // Rescoring prices existing edges, but it cannot discover a newly negative
-        // cycle, so never reuse cycles from an older state generation.
+        // Rescoring applies sparse state deltas to cached routes. Refind immediately
+        // only when a strict majority changed; the periodic refind discovers new
+        // sparse cycles without paying full DFS on every hot-pool update.
         if state_generation != self.cached_state_generation {
-            return true;
+            return dirty_pool_count.saturating_mul(2) > arena_pool_count;
         }
         // LF rescoring reflects pool-state deltas; full enumeration is periodic.
         self.lf_pass_count
@@ -436,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_forces_cycle_refind() {
+    fn sparse_state_generation_change_defers_cycle_refind() {
         let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
@@ -449,7 +444,7 @@ mod tests {
             0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 5, 0, 1_000));
-        assert!(cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 0, 1_000));
     }
 
     #[test]
@@ -465,7 +460,7 @@ mod tests {
             800,
             0,
         );
-        assert!(cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 6, 10, 100));
         assert!(cache.needs_cycle_refind(1_000, 1, 6, 51, 100));
     }
 
@@ -607,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn state_generation_change_forces_refind_without_interval() {
+    fn half_dirty_state_generation_change_defers_refind() {
         let mut cache = GraphCache::with_intervals(60, 8);
         cache.advance_pass();
         cache.store(
@@ -620,6 +615,6 @@ mod tests {
             0,
         );
         assert!(!cache.needs_cycle_refind(1_000, 1, 7, 0, 1_000));
-        assert!(cache.needs_cycle_refind(1_000, 1, 8, 0, 1_000));
+        assert!(!cache.needs_cycle_refind(1_000, 1, 8, 50, 100));
     }
 }

@@ -7,6 +7,12 @@ use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
 use crate::core::math::tick_math::{MAX_TICK, MIN_TICK};
 use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 
+type V4TickSpan = (PoolIndex, FixedBytes<32>, i32, i32, usize, usize, u128);
+
+fn sort_v4_tick_spans_by_liquidity(spans: &mut [V4TickSpan]) {
+    spans.sort_unstable_by(|a, b| b.6.cmp(&a.6));
+}
+
 /// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
 /// this deadline. Live LF was re-fetching ~30–40 empty pools every pass.
 pub const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
@@ -844,7 +850,15 @@ pub async fn enrich_v4_ticks<
                 data: encode_extsload(slot),
             });
         }
-        spans.push((idx, pool_id, spacing, word_min, start, bitmap_calls.len()));
+        spans.push((
+            idx,
+            pool_id,
+            spacing,
+            word_min,
+            start,
+            bitmap_calls.len(),
+            s.liquidity,
+        ));
     }
     if bitmap_calls.is_empty() {
         return TickEnrichment::default();
@@ -866,20 +880,13 @@ pub async fn enrich_v4_ticks<
 
     // Dense spacing=1 pools can exhaust the tick-info budget; hydrate high-liquidity
     // pools first so the cap does not starve the routes that matter.
-    let mut spans = spans;
-    spans.sort_unstable_by(|a, b| {
-        let liq = |idx: PoolIndex| match arena.pool_state(idx) {
-            Some(crate::core::types::PoolState::V4(s)) => s.liquidity,
-            _ => 0,
-        };
-        liq(b.0).cmp(&liq(a.0))
-    });
+    sort_v4_tick_spans_by_liquidity(&mut spans);
 
     let mut tick_calls = Vec::new();
     let mut tick_owners = Vec::new();
     let mut incomplete_pools = FxHashSet::default();
     let mut capped = false;
-    for (idx, pool_id, spacing, word_min, start, end) in spans {
+    for (idx, pool_id, spacing, word_min, start, end, _) in spans {
         let mut complete = true;
         let mut pool_capped = false;
         // Center-out word order: when capped, keep ticks nearest the current price.
@@ -1418,6 +1425,22 @@ mod tests {
         assert_eq!(seen[0], 10);
         seen.sort_unstable();
         assert_eq!(seen, (0..21).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn v4_tick_spans_prioritize_liquidity_descending() {
+        let mut spans = vec![
+            (PoolIndex(0), FixedBytes::ZERO, 1, 0, 0, 1, 10),
+            (PoolIndex(1), FixedBytes::ZERO, 1, 0, 1, 2, 30),
+            (PoolIndex(2), FixedBytes::ZERO, 1, 0, 2, 3, 20),
+        ];
+
+        sort_v4_tick_spans_by_liquidity(&mut spans);
+
+        assert_eq!(
+            spans.iter().map(|span| span.0).collect::<Vec<_>>(),
+            vec![PoolIndex(1), PoolIndex(2), PoolIndex(0)]
+        );
     }
 
     #[test]

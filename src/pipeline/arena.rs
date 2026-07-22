@@ -429,22 +429,30 @@ impl StateArena {
 
     /// Overlay fresh pool states from cache (HF hot-path; Arc clone only).
     pub fn apply_hot_cache(&mut self, cache: &StateCache, addresses: &[Address]) -> u64 {
-        if addresses.is_empty() {
-            return cache.generation();
-        }
-        self.ensure_hot_storage();
         let mut unique: Vec<Address> = addresses.to_vec();
         if unique.len() > 1 {
             unique.sort_unstable();
             unique.dedup();
         }
-        let (states, generation) = cache.get_arcs_with_generation(&unique);
+        self.apply_hot_cache_unique(cache, &unique)
+    }
+
+    pub(crate) fn apply_hot_cache_unique(
+        &mut self,
+        cache: &StateCache,
+        addresses: &[Address],
+    ) -> u64 {
+        if addresses.is_empty() {
+            return cache.generation();
+        }
+        self.ensure_hot_storage();
+        let (states, generation) = cache.get_arcs_with_generation(addresses);
         let mut fresh: FxHashMap<Address, (Arc<PoolState>, u64)> =
             FxHashMap::with_capacity_and_hasher(states.len(), FxBuildHasher);
         for (address, state, revision) in states {
             fresh.insert(address, (state, revision));
         }
-        for address in unique {
+        for &address in addresses {
             let Some(&idx) = self.inner.address_to_pool.get(&address) else {
                 continue;
             };
@@ -1245,6 +1253,43 @@ mod tests {
         };
         assert_eq!(s.reserve0, U256::from(42_000u64));
         assert_eq!(s.block_timestamp_last, 2);
+    }
+
+    #[test]
+    fn apply_hot_cache_unique_matches_duplicate_safe_path() {
+        let addr = Address::from([6u8; 20]);
+        let mut duplicate_safe = StateArena::default();
+        let duplicate_idx = duplicate_safe.register_pool(addr, v2_state());
+        let mut unique = StateArena::default();
+        let unique_idx = unique.register_pool(addr, v2_state());
+        let cache = StateCache::default();
+        cache.insert(
+            addr,
+            PoolState::V2(V2PoolState {
+                reserve0: U256::from(43_000u64),
+                reserve1: U256::from(2_000u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 3,
+            }),
+        );
+
+        duplicate_safe.apply_hot_cache(&cache, &[addr, addr]);
+        unique.apply_hot_cache_unique(&cache, &[addr]);
+
+        let PoolState::V2(duplicate_state) = duplicate_safe
+            .pool_state(duplicate_idx)
+            .expect("duplicate-safe overlay state")
+        else {
+            panic!("expected V2 overlay");
+        };
+        let PoolState::V2(unique_state) =
+            unique.pool_state(unique_idx).expect("unique overlay state")
+        else {
+            panic!("expected V2 overlay");
+        };
+        assert_eq!(duplicate_state.reserve0, unique_state.reserve0);
+        assert_eq!(unique_state.reserve0, U256::from(43_000u64));
     }
 
     #[test]

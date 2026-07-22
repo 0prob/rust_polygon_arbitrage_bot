@@ -1741,7 +1741,8 @@ pub async fn run_hf_tick(
         }
     }
 
-    let flash_prefetch_started = now_ms();
+    let mut pool_prefetch_ms = 0;
+    let mut flash_prefetch_ms = 0;
     let flash_token_list = collect_hf_flash_token_list(&arena_base, &cycles).1;
     let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
     let rpc = Arc::clone(&ctx.rpc);
@@ -1762,6 +1763,7 @@ pub async fn run_hf_tick(
     };
 
     if skip_prefetch || hot_pools.is_empty() {
+        let flash_prefetch_started = now_ms();
         hf_flash_prefetch_stale(
             flash_cache.as_ref(),
             rpc.as_ref(),
@@ -1769,6 +1771,7 @@ pub async fn run_hf_tick(
             flash_budget,
         )
         .await;
+        flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
@@ -1776,19 +1779,28 @@ pub async fn run_hf_tick(
         let hot = Arc::clone(&hot_pools);
         let pool_budget = work_budget;
         let pool_fut = async {
-            timeout(
+            let pool_prefetch_started = now_ms();
+            let result = timeout(
                 pool_budget,
                 hf_pool_prefetch(refresh.as_ref(), hot.as_ref(), prefetch_count),
             )
-            .await
+            .await;
+            (result, now_ms().saturating_sub(pool_prefetch_started))
         };
-        let flash_fut = hf_flash_prefetch_stale(
-            flash_cache.as_ref(),
-            rpc.as_ref(),
-            &flash_token_list,
-            flash_budget,
-        );
-        let (pool_out, _) = tokio::join!(pool_fut, flash_fut);
+        let flash_fut = async {
+            let flash_prefetch_started = now_ms();
+            hf_flash_prefetch_stale(
+                flash_cache.as_ref(),
+                rpc.as_ref(),
+                &flash_token_list,
+                flash_budget,
+            )
+            .await;
+            now_ms().saturating_sub(flash_prefetch_started)
+        };
+        let ((pool_out, pool_ms), flash_ms) = tokio::join!(pool_fut, flash_fut);
+        pool_prefetch_ms = pool_ms;
+        flash_prefetch_ms = flash_ms;
         match pool_out {
             Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
             Ok(Err(e)) => crate::debug!("hf prefetch failed: {e:#}"),
@@ -1799,8 +1811,7 @@ pub async fn run_hf_tick(
         }
     }
 
-    let pool_prefetch_ms = now_ms().saturating_sub(pool_prefetch_started);
-    let flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
+    let prefetch_wall_ms = now_ms().saturating_sub(pool_prefetch_started);
 
     if ctx.snapshots.generation() != selection_generation {
         crate::debug!(
@@ -1875,7 +1886,7 @@ pub async fn run_hf_tick(
     }
 
     let mut arena = arena_base;
-    let evaluation_state_generation = arena.apply_hot_cache(&ctx.cache, hot_pools.as_ref());
+    let evaluation_state_generation = arena.apply_hot_cache_unique(&ctx.cache, hot_pools.as_ref());
     // Select used the LF snapshot arena; hot overlay can empty V2 reserves /
     // Balancer maxIn — drop those before hydrate/probe burns the window.
     let before_hot_filter = cycles.len();
@@ -2476,7 +2487,7 @@ pub async fn run_hf_tick(
         let log_summary = profitable_count > 0 || log_hf_summary || elapsed_ms >= 250;
         if log_summary {
             crate::info!(
-                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
+                "hf tick: {profitable_count} profitable of {cycles_considered} cycles ({elapsed_ms}ms, best_profit_matic={best_profit_matic}, probe_kept={probe_kept}, evaluated={eval_count}, timing_ms=prefetch_wall:{prefetch_wall_ms},pool:{pool_prefetch_ms},flash:{flash_prefetch_ms},oracle:{oracle_ms},probe:{probe_tick_ms},eval:{eval_ms},verify:{verify_ms}, stream_triggered={stream_triggered}, pool_prefetch_ok={prefetch_ok})"
             );
         } else if stream_triggered {
             // INFO not debug — at RPBOT_LOG=info, debug hid all stream completions
