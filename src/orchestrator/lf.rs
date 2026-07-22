@@ -1094,18 +1094,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         hot.sort_unstable();
         hot.dedup();
         ctx.refresh.set_hot_addresses(hot);
-        match ctx
-            .refresh
-            .refresh_pool_states_for(&observed, observed.len().min(64))
-            .await
-        {
-            Ok(result) => crate::debug!(
-                "stream observed-live: refresh matched={} targeted_updated={}",
-                result.matched,
-                result.updated
-            ),
-            Err(e) => crate::warn!("stream observed-live targeted refresh failed: {e:#}"),
-        }
     }
 
     let refresh_started = crate::util::now_ms();
