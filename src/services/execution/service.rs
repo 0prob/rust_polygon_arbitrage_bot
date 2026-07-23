@@ -1978,9 +1978,8 @@ fn transfer_failed_token_to_quarantine(
             }
             // Nested executor error carries the failing ERC-20; UniV2 string
             // "TRANSFER_FAILED" does not — only cool start token on hop 0.
-            parse_nested_transfer_failed_token(reason).or_else(|| {
-                (*index == 0).then_some(profit_token)
-            })
+            parse_nested_transfer_failed_token(reason)
+                .or_else(|| (*index == 0).then_some(profit_token))
         }
         _ => None,
     }?;
@@ -1993,10 +1992,7 @@ fn transfer_failed_token_to_quarantine(
 /// Parse `token=0x…` from `TransferFailed: token=0x…, to=…, amount=…`.
 fn parse_nested_transfer_failed_token(reason: &str) -> Option<Address> {
     let rest = reason.split("token=").nth(1)?;
-    let addr = rest
-        .split([',', ' ', '\n', '\t'])
-        .next()?
-        .trim();
+    let addr = rest.split([',', ' ', '\n', '\t']).next()?.trim();
     if addr.is_empty() {
         return None;
     }

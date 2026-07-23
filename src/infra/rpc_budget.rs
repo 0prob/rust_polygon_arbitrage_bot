@@ -237,9 +237,10 @@ mod tests {
 
     #[test]
     fn rank_prefers_paid_over_public() {
-        assert!(host_rank_class("https://rpc.ankr.com/polygon/x") < host_rank_class(
-            "https://polygon-bor-rpc.publicnode.com"
-        ));
+        assert!(
+            host_rank_class("https://rpc.ankr.com/polygon/x")
+                < host_rank_class("https://polygon-bor-rpc.publicnode.com")
+        );
     }
 
     #[tokio::test]

@@ -187,7 +187,8 @@ pub struct DodoPoolState {
     pub i: U256,
     pub k: U256,
     pub lp_fee_rate: U256,
-    /// Maintainer fee on gross PMM output (1e18 scale); from on-chain `_MT_FEE_RATE_()`.
+    /// Maintainer fee on gross PMM output (1e18 scale). From `_MT_FEE_RATE_()` when that
+    /// view succeeds; `0` when it reverts (common on Polygon DVM/DPP/DSP fee-model pools).
     pub mt_fee_rate: U256,
 }
 

@@ -1610,11 +1610,8 @@ fn evaluate_one(
     // then dry-run TransferFailed/IIA. MATIC economic floor alone is ~0.008 USDC at
     // $0.08/MATIC — too low. Require ≥1 whole start token plus hop fidelity.
     if assessment.should_execute {
-        let start_decimals = resolve_token_decimals_for_index(
-            cycle.start_token,
-            input.arena,
-            input.token_decimals,
-        );
+        let start_decimals =
+            resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
         let economic = min_economic_amount_in(
             start_decimals,
             resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),

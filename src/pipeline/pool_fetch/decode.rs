@@ -124,48 +124,33 @@ fn decode_v3_head(
         })
 }
 
-fn decode_v3_head_from_results(
-    plan: &PoolFetchPlan,
-    results: &[Option<Bytes>],
-) -> Option<(U256, i32, bool, Option<U256>, u32, u16)> {
+fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
+    // One pass over kinds — no repeated linear scans for head/liq/fee.
     let mut global_bytes = None;
     let mut slot0_bytes = None;
+    let mut liq_bytes = None;
+    let mut fee_bytes = None;
     for (result, kind) in results.iter().zip(plan.kinds.iter()) {
         match kind {
             CallKind::V3GlobalState => global_bytes = result.as_ref(),
             CallKind::V3Slot0 => slot0_bytes = result.as_ref(),
+            CallKind::V3Liquidity => liq_bytes = result.as_ref(),
+            CallKind::V3Fee => fee_bytes = result.as_ref(),
             _ => {}
         }
     }
-    if let Some(bytes) = global_bytes
-        && let Some(head) = decode_v3_head(bytes, true)
-    {
-        return Some(head);
-    }
-    slot0_bytes.and_then(|bytes| decode_v3_head(bytes, false))
-}
-
-fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let (sqrt, tick, unlocked, algebra_fee, fee_protocol, obs_card) =
-        decode_v3_head_from_results(plan, results)?;
-    let liq_idx = plan
-        .kinds
-        .iter()
-        .position(|k| *k == CallKind::V3Liquidity)
-        .unwrap_or(1);
-    let liq_bytes = results.get(liq_idx)?.as_ref()?;
-    let liquidity = decode_u256(liq_bytes)?.as_limbs()[0] as u128;
+    let (sqrt, tick, unlocked, algebra_fee, fee_protocol, obs_card) = global_bytes
+        .and_then(|b| decode_v3_head(b, true))
+        .or_else(|| slot0_bytes.and_then(|b| decode_v3_head(b, false)))?;
+    let liquidity = decode_u256(liq_bytes?)?.as_limbs()[0] as u128;
     if sqrt.is_zero() || liquidity == 0 {
         return None;
     }
-    let fee_idx = plan.kinds.iter().position(|k| *k == CallKind::V3Fee);
     let fee_pips = algebra_fee
         .or_else(|| {
-            fee_idx
-                .and_then(|idx| results.get(idx))
-                .and_then(|b| b.as_ref())
-                .and_then(|b| decode_u256(b).map(|v| v.as_limbs()[0] as u32))
-                .map(U256::from)
+            fee_bytes
+                .and_then(decode_u256)
+                .map(|v| U256::from(v.as_limbs()[0] as u32))
         })
         .unwrap_or_else(|| U256::from(plan.pool.fee_bps) * U256::from(100u32));
     Some(PoolState::V3(V3PoolState {
@@ -208,28 +193,45 @@ fn decode_v4(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
 }
 
 fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let by_kind = |kind: CallKind| -> Option<&Bytes> {
-        let idx = plan.kinds.iter().position(|k| *k == kind)?;
-        results.get(idx)?.as_ref()
+    let mut base_b = None;
+    let mut quote_b = None;
+    let mut base_token_b = None;
+    let mut quote_token_b = None;
+    let mut i_b = None;
+    let mut k_b = None;
+    let mut lp_fee_b = None;
+    let mut mt_fee_b: Option<Option<&Bytes>> = None;
+    let mut pmm_b = None;
+    for (result, kind) in results.iter().zip(plan.kinds.iter()) {
+        match kind {
+            CallKind::DodoBase => base_b = result.as_ref(),
+            CallKind::DodoQuote => quote_b = result.as_ref(),
+            CallKind::DodoBaseToken => base_token_b = result.as_ref(),
+            CallKind::DodoQuoteToken => quote_token_b = result.as_ref(),
+            CallKind::DodoI => i_b = result.as_ref(),
+            CallKind::DodoK => k_b = result.as_ref(),
+            CallKind::DodoLpFee => lp_fee_b = result.as_ref(),
+            // Distinguish "call not in plan" from "call failed" (None result).
+            CallKind::DodoMtFee => mt_fee_b = Some(result.as_ref()),
+            CallKind::DodoPmmState => pmm_b = result.as_ref(),
+            _ => {}
+        }
+    }
+    let base = decode_u256(base_b?)?;
+    let quote = decode_u256(quote_b?)?;
+    let base_token = decode_address(base_token_b?)?;
+    let quote_token = decode_address(quote_token_b?)?;
+    let i = decode_u256(i_b?)?;
+    let k = decode_u256(k_b?)?;
+    let lp_fee_rate = decode_u256(lp_fee_b?)?;
+    // Polygon DVM/DPP/DSP: `_MT_FEE_RATE_()` reverts (fee lives on `_MT_FEE_RATE_MODEL_`).
+    // Soft-fail → mt=0 rather than dropping the pool from the arena/TUI.
+    // When the view succeeds (some private pools), keep the live rate.
+    let mt_fee_rate = match mt_fee_b {
+        Some(Some(bytes)) => decode_u256(bytes).unwrap_or(U256::ZERO),
+        _ => U256::ZERO,
     };
-    let base = decode_u256(by_kind(CallKind::DodoBase)?)?;
-    let quote = decode_u256(by_kind(CallKind::DodoQuote)?)?;
-    let base_token = decode_address(by_kind(CallKind::DodoBaseToken)?)?;
-    let quote_token = decode_address(by_kind(CallKind::DodoQuoteToken)?)?;
-    let i = decode_u256(by_kind(CallKind::DodoI)?)?;
-    let k = decode_u256(by_kind(CallKind::DodoK)?)?;
-    let lp_fee_rate = decode_u256(by_kind(CallKind::DodoLpFee)?)?;
-    // Production plans always include DodoMtFee — require a successful decode.
-    // Legacy fixtures without the call keep mt=0.
-    let mt_fee_rate = if plan.kinds.contains(&CallKind::DodoMtFee) {
-        decode_u256(by_kind(CallKind::DodoMtFee)?)?
-    } else {
-        U256::ZERO
-    };
-    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(by_kind(
-        CallKind::DodoPmmState,
-    )?)
-    .ok()?;
+    let pmm = IDodoPoolState::getPMMStateForCallCall::abi_decode_returns(pmm_b?).ok()?;
     let pmm_i = U256::from(pmm.i);
     let pmm_k = U256::from(pmm.K);
     let r_state = match pmm.R {
@@ -390,20 +392,19 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
 
 fn decode_balancer_linear(
     vault_tokens: &[Address],
-    linear_results: Option<&[Option<Bytes>]>,
+    main_bytes: Option<&Bytes>,
+    wrapped_bytes: Option<&Bytes>,
+    targets_bytes: Option<&Bytes>,
+    rate_bytes: Option<&Bytes>,
 ) -> Option<BalancerLinearState> {
-    let results = linear_results?;
     let main =
-        IBalancerLinearPool::getMainTokenCall::abi_decode_returns(results.first()?.as_ref()?)
-            .ok()?;
+        IBalancerLinearPool::getMainTokenCall::abi_decode_returns(main_bytes?).ok()?;
     let wrapped =
-        IBalancerLinearPool::getWrappedTokenCall::abi_decode_returns(results.get(1)?.as_ref()?)
-            .ok()?;
+        IBalancerLinearPool::getWrappedTokenCall::abi_decode_returns(wrapped_bytes?).ok()?;
     let targets =
-        IBalancerLinearPool::getTargetsCall::abi_decode_returns(results.get(2)?.as_ref()?).ok()?;
+        IBalancerLinearPool::getTargetsCall::abi_decode_returns(targets_bytes?).ok()?;
     let rate =
-        IBalancerLinearPool::getWrappedTokenRateCall::abi_decode_returns(results.get(3)?.as_ref()?)
-            .ok()?;
+        IBalancerLinearPool::getWrappedTokenRateCall::abi_decode_returns(rate_bytes?).ok()?;
     let main_index = vault_tokens.iter().position(|t| *t == main)?;
     let wrapped_index = vault_tokens.iter().position(|t| *t == wrapped)?;
     if main_index == wrapped_index
@@ -431,13 +432,10 @@ fn classify_balancer_pool(
         return Some(BalancerPoolKind::Linear);
     }
     match pool_type {
-        Some("linear") | Some("stable") | Some("weighted") if !has_linear_state => {
-            match pool_type {
-                Some("stable") if amp_valid => Some(BalancerPoolKind::Stable),
-                Some("weighted") if weights_valid => Some(BalancerPoolKind::Weighted),
-                _ => None,
-            }
-        }
+        Some("stable") if amp_valid => Some(BalancerPoolKind::Stable),
+        Some("weighted") if weights_valid => Some(BalancerPoolKind::Weighted),
+        // Labeled linear but probes failed, or unknown family label.
+        Some(_) => None,
         None => {
             if weights_valid && !amp_valid {
                 Some(BalancerPoolKind::Weighted)
@@ -450,10 +448,11 @@ fn classify_balancer_pool(
                 None
             }
         }
-        _ => None,
     }
 }
 
+// Test-only helpers for isolated fee decode checks.
+#[cfg(test)]
 fn plan_result<'a>(
     plan: &PoolFetchPlan,
     results: &'a [Option<Bytes>],
@@ -463,12 +462,7 @@ fn plan_result<'a>(
     results.get(idx)?.as_ref()
 }
 
-/// Build a compact kind→index map for O(1) decode lookups (avoids repeated linear scans).
-#[inline]
-fn kind_index_map(kinds: &[CallKind]) -> impl Fn(CallKind) -> Option<usize> + '_ {
-    move |target| kinds.iter().position(|k| *k == target)
-}
-
+#[cfg(test)]
 fn decode_balancer_swap_fee(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<U256> {
     plan_result(plan, results, CallKind::BalancerSwapFee)
         .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
@@ -476,12 +470,33 @@ fn decode_balancer_swap_fee(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> 
 }
 
 fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    // Build one index map — avoids 6 separate O(N) linear scans of plan.kinds.
-    let kind_idx = kind_index_map(&plan.kinds);
-    let get = |k: CallKind| -> Option<&Bytes> { results.get(kind_idx(k)?)?.as_ref() };
+    // Single pass over kinds — true O(N), not N×K linear scans.
+    let mut tokens_bytes = None;
+    let mut swap_fee_bytes = None;
+    let mut weights_bytes = None;
+    let mut amp_bytes = None;
+    let mut scaling_bytes = None;
+    let mut linear_main = None;
+    let mut linear_wrapped = None;
+    let mut linear_targets = None;
+    let mut linear_rate = None;
+    for (result, kind) in results.iter().zip(plan.kinds.iter()) {
+        match kind {
+            CallKind::BalancerTokens => tokens_bytes = result.as_ref(),
+            CallKind::BalancerSwapFee => swap_fee_bytes = result.as_ref(),
+            CallKind::BalancerWeights => weights_bytes = result.as_ref(),
+            CallKind::BalancerAmp => amp_bytes = result.as_ref(),
+            CallKind::BalancerScalingFactors => scaling_bytes = result.as_ref(),
+            CallKind::BalancerLinearMainToken => linear_main = result.as_ref(),
+            CallKind::BalancerLinearWrappedToken => linear_wrapped = result.as_ref(),
+            CallKind::BalancerLinearTargets => linear_targets = result.as_ref(),
+            CallKind::BalancerLinearRate => linear_rate = result.as_ref(),
+            _ => {}
+        }
+    }
 
-    let tokens_bytes = get(CallKind::BalancerTokens)?;
-    let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes).ok()?;
+    let tokens =
+        IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes?).ok()?;
     let last_change_block = tokens.lastChangeBlock.as_limbs()[0];
     // ponytail: move decoded vecs — uint256[] already is Vec<U256>.
     let balances = tokens.balances;
@@ -489,12 +504,12 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         return None;
     }
     let n = balances.len();
-    let swap_fee = get(CallKind::BalancerSwapFee)
-        .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
+    let swap_fee = IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(swap_fee_bytes?)
+        .ok()
         .map(U256::from)?;
-    let decoded_weights = get(CallKind::BalancerWeights)
+    let decoded_weights = weights_bytes
         .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok());
-    let amp_from_chain = get(CallKind::BalancerAmp)
+    let amp_from_chain = amp_bytes
         .and_then(|b| IBalancerPool::getAmplificationParameterCall::abi_decode_returns(b).ok());
     let (amp, amp_precision, has_onchain_amp, is_updating) = match amp_from_chain {
         Some(t) => (
@@ -505,17 +520,19 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         ),
         None => (U256::ZERO, U256::ZERO, false, false),
     };
-    let scaling_factors = get(CallKind::BalancerScalingFactors)
-        .and_then(|b| IBalancerPool::getScalingFactorsCall::abi_decode_returns(b).ok())?;
+    let scaling_factors =
+        IBalancerPool::getScalingFactorsCall::abi_decode_returns(scaling_bytes?).ok()?;
     if scaling_factors.len() != n || scaling_factors.iter().any(U256::is_zero) {
         return None;
     }
-    let linear_start = kind_idx(CallKind::BalancerLinearMainToken);
-    let linear = if let Some(start) = linear_start {
-        decode_balancer_linear(&tokens.tokens, results.get(start..))
-    } else {
-        None
-    };
+    // Kind-keyed linear fields — independent of call order / contiguity.
+    let linear = decode_balancer_linear(
+        &tokens.tokens,
+        linear_main,
+        linear_wrapped,
+        linear_targets,
+        linear_rate,
+    );
     let amp_valid = has_onchain_amp && !amp.is_zero() && !amp_precision.is_zero();
     let weights_valid = decoded_weights
         .as_ref()
@@ -746,7 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn dodo_decode_rejects_missing_mt_fee_when_planned() {
+    fn dodo_decode_soft_fails_mt_fee_when_planned_call_reverts() {
+        // Live Polygon DVM/DPP/DSP: `_MT_FEE_RATE_()` reverts; pool must still decode.
         let plan = PoolFetchPlan {
             pool: super::super::plans::FetchPoolInfo {
                 address: Address::ZERO,
@@ -792,10 +810,14 @@ mod tests {
             Some(Bytes::copy_from_slice(&abi_word(values[0]))),
             Some(Bytes::copy_from_slice(&abi_word(values[1]))),
             Some(Bytes::copy_from_slice(&abi_word(10_000_000_000_000_000))),
-            None, // planned MT fee call failed
+            None, // planned MT fee call reverted (Polygon DODO)
             Some(Bytes::from(pmm)),
         ];
-        assert!(decode_plan(&plan, &results).is_none());
+        let Some(PoolState::Dodo(state)) = decode_plan(&plan, &results) else {
+            panic!("DODO should decode when MT fee view reverts");
+        };
+        assert!(state.mt_fee_rate.is_zero());
+        assert_eq!(state.base_reserve, U256::from(values[2]));
     }
 
     #[test]
@@ -1134,5 +1156,107 @@ mod tests {
             ),
             Some(U256::from(3_000_000_000_000_000u64))
         );
+    }
+
+    #[test]
+    fn decode_balancer_weighted_single_pass_kind_order_independent() {
+        let t0 = Address::with_last_byte(1);
+        let t1 = Address::with_last_byte(2);
+        let pool = Address::with_last_byte(9);
+        // Deliberately non-plan order to prove kind-keyed single-pass decode.
+        let kinds = vec![
+            CallKind::BalancerScalingFactors,
+            CallKind::BalancerSwapFee,
+            CallKind::BalancerWeights,
+            CallKind::BalancerTokens,
+        ];
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: pool,
+                protocol: ProtocolType::BalancerV2,
+                tokens: vec![t0, t1],
+                fee_bps: 30,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("weighted".into()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds,
+        };
+        let half = ONE / U256::from(2u64);
+        let tokens_ret = IBalancerVaultRead::getPoolTokensCall::abi_encode_returns(
+            &IBalancerVaultRead::getPoolTokensReturn {
+                tokens: vec![t0, t1],
+                balances: vec![U256::from(1_000u64), U256::from(2_000u64)],
+                lastChangeBlock: U256::from(99u64),
+            },
+        );
+        let fee_ret = IBalancerPool::getSwapFeePercentageCall::abi_encode_returns(
+            &U256::from(3_000_000_000_000_000u64),
+        );
+        let weights_ret =
+            IBalancerPool::getNormalizedWeightsCall::abi_encode_returns(&vec![half, half]);
+        let scaling_ret =
+            IBalancerPool::getScalingFactorsCall::abi_encode_returns(&vec![ONE, ONE]);
+        let results = vec![
+            Some(Bytes::from(scaling_ret)),
+            Some(Bytes::from(fee_ret)),
+            Some(Bytes::from(weights_ret)),
+            Some(Bytes::from(tokens_ret)),
+        ];
+        let Some(PoolState::Balancer(state)) = decode_plan(&plan, &results) else {
+            panic!("weighted Balancer pool should decode regardless of kind order");
+        };
+        assert_eq!(state.pool_type, BalancerPoolKind::Weighted);
+        assert_eq!(state.balances, vec![U256::from(1_000u64), U256::from(2_000u64)]);
+        assert_eq!(state.fee, U256::from(3_000_000_000_000_000u64));
+        assert_eq!(state.last_change_block, 99);
+        assert!(state.linear.is_none());
+        assert!(state.bpt_index.is_none());
+    }
+
+    #[test]
+    fn decode_balancer_rejects_missing_swap_fee() {
+        let t0 = Address::with_last_byte(1);
+        let t1 = Address::with_last_byte(2);
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::BalancerV2,
+                tokens: vec![t0, t1],
+                fee_bps: 30,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("weighted".into()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::BalancerTokens,
+                CallKind::BalancerSwapFee,
+                CallKind::BalancerWeights,
+                CallKind::BalancerScalingFactors,
+            ],
+        };
+        let tokens_ret = IBalancerVaultRead::getPoolTokensCall::abi_encode_returns(
+            &IBalancerVaultRead::getPoolTokensReturn {
+                tokens: vec![t0, t1],
+                balances: vec![U256::from(1u64), U256::from(1u64)],
+                lastChangeBlock: U256::ZERO,
+            },
+        );
+        let half = ONE / U256::from(2u64);
+        let results = vec![
+            Some(Bytes::from(tokens_ret)),
+            None, // swap fee required live
+            Some(Bytes::from(
+                IBalancerPool::getNormalizedWeightsCall::abi_encode_returns(&vec![half, half]),
+            )),
+            Some(Bytes::from(
+                IBalancerPool::getScalingFactorsCall::abi_encode_returns(&vec![ONE, ONE]),
+            )),
+        ];
+        assert!(decode_plan(&plan, &results).is_none());
     }
 }

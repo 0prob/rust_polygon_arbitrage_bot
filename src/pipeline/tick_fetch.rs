@@ -13,10 +13,10 @@ fn sort_v4_tick_spans_by_liquidity(spans: &mut [V4TickSpan]) {
     spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.6));
 }
 
-	/// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
-	/// this deadline. Iter2: 65% of probe TickLens fetches were empty and recycled
-	/// into the cap within 45s while cycles_tickless stayed stuck.
-	pub const EMPTY_TICK_COOLDOWN_MS: u64 = 90_000;
+/// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
+/// this deadline. Iter2: 65% of probe TickLens fetches were empty and recycled
+/// into the cap within 45s while cycles_tickless stayed stuck.
+pub const EMPTY_TICK_COOLDOWN_MS: u64 = 90_000;
 /// After hydrate timeout (fetch never completed). Live: 30s under rate-limit left
 /// high-priority pools stuck tickless while residual prep re-burned elsewhere.
 pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 12_000;

@@ -248,8 +248,7 @@ fn reverse_bfs_parents(
                 // a different intermediate. (Was: any already-reached next → 1-hop vs 2-hop
                 // dual false positives; and same-next dual DEX never recorded as alt.)
                 if alt[pi].is_none()
-                    && parent[pi]
-                        .is_some_and(|(_, pe)| pe.pool_index != edge.pool_index)
+                    && parent[pi].is_some_and(|(_, pe)| pe.pool_index != edge.pool_index)
                     && depth[curr.0 as usize].saturating_add(1) == depth[pi]
                 {
                     alt[pi] = Some((curr, edge));

@@ -203,9 +203,13 @@ pub fn get_dodo_gross_amount_out(
                     )
             }
         }
-        (DodoRState::AboveOne, false) => {
-            solve_quadratic_function_for_trade(state.base_target, b, amount_in, reciprocal_floor(i), k)
-        }
+        (DodoRState::AboveOne, false) => solve_quadratic_function_for_trade(
+            state.base_target,
+            b,
+            amount_in,
+            reciprocal_floor(i),
+            k,
+        ),
         (DodoRState::BelowOne, true) => {
             solve_quadratic_function_for_trade(state.quote_target, q, amount_in, i, k)
         }
