@@ -1123,7 +1123,9 @@ impl ExecutionService {
             }
             if candidate.flash_loan_source == FlashLoanSource::Direct
                 && dry.realized_profit.is_some_and(|p| p.is_zero())
+                && !crate::core::constants::is_polygon_hub_token(candidate.profit_token)
             {
+                // Direct FoT/reflective start tokens only — never cool WMATIC/USDT hubs.
                 self.quarantine_direct_token_zero_realized(candidate.profit_token);
             }
             if sim_fidelity_miss {
@@ -1134,21 +1136,25 @@ impl ExecutionService {
             if matches!(
                 dry.decoded_revert,
                 Some(DecodedRevert::ExternalCallFailed { .. })
+                    | Some(DecodedRevert::TransferFailed { .. })
             ) {
-                self.quarantine_route_hash(candidate.route_hash, now);
-                // FoT / nonstandard ERC20: nested TransferFailed on flash input
-                // (live: LGNS 0xeB51… ain=1e18) — route_hash rotates so 600s hash
-                // cool alone re-burns verify; cool the start token like Direct FoT.
-                if let Some(DecodedRevert::ExternalCallFailed { reason, .. }) = &dry.decoded_revert
-                    && (reason.contains("TransferFailed")
-                        || reason.contains("TRANSFER_FAILED"))
+                if matches!(
+                    dry.decoded_revert,
+                    Some(DecodedRevert::ExternalCallFailed { .. })
+                ) {
+                    self.quarantine_route_hash(candidate.route_hash, now);
+                }
+                // FoT / nonstandard ERC20 TransferFailed: cool the *failing* token.
+                // Live bug: hop-2 TransferFailed on long-tail token quarantined
+                // profit_token=WMATIC for 30m (hub arbs blackholed). Prefer nested
+                // `token=0x…` from the executor error; only fall back to start token
+                // for hop-0 UniV2 TRANSFER_FAILED strings without an address.
+                if let Some(token) =
+                    transfer_failed_token_to_quarantine(&dry.decoded_revert, candidate.profit_token)
                 {
-                    // UniV2 string revert is "TRANSFER_FAILED"; executor custom is TransferFailed.
-                    // Iter7: Aave+V2 route failed hop1 with UniswapV2: TRANSFER_FAILED — no token cool.
-                    self.quarantine_direct_token_zero_realized(candidate.profit_token);
+                    self.quarantine_direct_token_zero_realized(token);
                     crate::info!(
-                        "token quarantine after TransferFailed dry-run: token={} fp={fp}",
-                        candidate.profit_token
+                        "token quarantine after TransferFailed dry-run: token={token} fp={fp}"
                     );
                 }
             }
@@ -1955,6 +1961,48 @@ fn min_operator_balance_wei(config: &AppConfig) -> Option<U256> {
         .filter(|v| !v.is_zero())
 }
 
+/// Resolve which token (if any) should enter the FoT/TransferFailed cool-down.
+///
+/// Live bug (tui-bolt-optimized run): hop-2
+/// `TransferFailed: token=0xd93f…` on a long-tail leg cooled
+/// `profit_token=WMATIC` for 30m because this path always used the flash start.
+fn transfer_failed_token_to_quarantine(
+    decoded: &Option<DecodedRevert>,
+    profit_token: Address,
+) -> Option<Address> {
+    let token = match decoded {
+        Some(DecodedRevert::TransferFailed { token, .. }) => Some(*token),
+        Some(DecodedRevert::ExternalCallFailed { index, reason, .. }) => {
+            if !(reason.contains("TransferFailed") || reason.contains("TRANSFER_FAILED")) {
+                return None;
+            }
+            // Nested executor error carries the failing ERC-20; UniV2 string
+            // "TRANSFER_FAILED" does not — only cool start token on hop 0.
+            parse_nested_transfer_failed_token(reason).or_else(|| {
+                (*index == 0).then_some(profit_token)
+            })
+        }
+        _ => None,
+    }?;
+    if crate::core::constants::is_polygon_hub_token(token) {
+        return None;
+    }
+    Some(token)
+}
+
+/// Parse `token=0x…` from `TransferFailed: token=0x…, to=…, amount=…`.
+fn parse_nested_transfer_failed_token(reason: &str) -> Option<Address> {
+    let rest = reason.split("token=").nth(1)?;
+    let addr = rest
+        .split([',', ' ', '\n', '\t'])
+        .next()?
+        .trim();
+    if addr.is_empty() {
+        return None;
+    }
+    addr.parse::<Address>().ok()
+}
+
 fn required_operator_balance(
     config: &AppConfig,
     transaction_value: U256,
@@ -2409,5 +2457,66 @@ mod safety_tests {
         assert_eq!(stats.adaptive_flash_loan_usd, Some(25_000));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transfer_failed_quarantines_nested_token_not_hub_profit_token() {
+        // Live: hop-2 TransferFailed on 0xd93f… while profit_token was WMATIC.
+        let failing = address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912");
+        let wmatic = crate::core::constants::WMATIC;
+        let decoded = Some(DecodedRevert::ExternalCallFailed {
+            index: 2,
+            target: address!("0x28056401Bb178061950b5Db21fEEED261b808E6C"),
+            reason: format!(
+                "TransferFailed: token={failing}, to=0x28056401Bb178061950b5Db21fEEED261b808E6C, amount=1648989"
+            ),
+        });
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&decoded, wmatic),
+            Some(failing)
+        );
+        // Never cool WMATIC even if nested token is missing and hop==0.
+        let hop0_string = Some(DecodedRevert::ExternalCallFailed {
+            index: 0,
+            target: Address::ZERO,
+            reason: "UniswapV2: TRANSFER_FAILED".into(),
+        });
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&hop0_string, wmatic),
+            None
+        );
+        // Non-hub FoT start on hop-0 UniV2 string still cools start token.
+        let lgns = address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01");
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&hop0_string, lgns),
+            Some(lgns)
+        );
+        // Mid-hop UniV2 string without token address must not cool start.
+        let hop1_string = Some(DecodedRevert::ExternalCallFailed {
+            index: 1,
+            target: Address::ZERO,
+            reason: "UniswapV2: TRANSFER_FAILED".into(),
+        });
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&hop1_string, lgns),
+            None
+        );
+        // Top-level TransferFailed on a hub token is ignored.
+        let top_hub = Some(DecodedRevert::TransferFailed {
+            token: wmatic,
+            to: Address::ZERO,
+            amount: U256::from(1u64),
+        });
+        assert_eq!(transfer_failed_token_to_quarantine(&top_hub, lgns), None);
+        // Top-level TransferFailed on long-tail cools that token.
+        let top_tail = Some(DecodedRevert::TransferFailed {
+            token: failing,
+            to: Address::ZERO,
+            amount: U256::from(1u64),
+        });
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&top_tail, wmatic),
+            Some(failing)
+        );
     }
 }
