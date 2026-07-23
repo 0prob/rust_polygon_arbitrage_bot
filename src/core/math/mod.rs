@@ -87,7 +87,10 @@ mod mul_div_tests {
     #[test]
     fn floor_allows_dust_zero_quotient() {
         // 1*1 / 2 = 0 — valid for amount deltas, rejected by mul_div.
-        assert_eq!(mul_div_floor(U256::from(1), U256::from(1), U256::from(2)), Some(U256::ZERO));
+        assert_eq!(
+            mul_div_floor(U256::from(1), U256::from(1), U256::from(2)),
+            Some(U256::ZERO)
+        );
         assert!(mul_div(U256::from(1), U256::from(1), U256::from(2)).is_none());
     }
 

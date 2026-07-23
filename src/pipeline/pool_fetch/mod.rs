@@ -617,10 +617,11 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
             }
             Err(_e) => {
                 crate::warn!(
-                    "multicall batch failed for pool {} ({} calls)",
+                    "multicall batch failed for pool {} ({} calls); marking state invalid",
                     slice[0].pool.address,
                     slice[0].calls.len()
                 );
+                mark_plans_invalid(cache, slice);
             }
         }
     }
@@ -657,15 +658,34 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
                 );
             })?;
 
+    Ok(apply_plan_results(cache, &spans, &results, item_count))
+}
+
+fn mark_plans_invalid(cache: &StateCache, plans: &[PoolFetchPlan]) {
+    for plan in plans {
+        cache.insert(plan.pool.address, PoolState::Invalid);
+    }
+}
+
+fn apply_plan_results(
+    cache: &StateCache,
+    spans: &[(&PoolFetchPlan, usize, usize)],
+    results: &[Option<alloy::primitives::Bytes>],
+    item_count: usize,
+) -> usize {
+    if results.len() < item_count {
+        crate::warn!(
+            "multicall batch returned {} results for {} requested items; marking incomplete pools invalid",
+            results.len(),
+            item_count
+        );
+    }
+
     let mut updated = 0usize;
     for (plan, start, end) in spans {
-        let Some(slice) = results.get(start..end) else {
-            crate::warn!(
-                "multicall batch returned {} results for {} requested items",
-                results.len(),
-                item_count
-            );
-            return Ok(updated);
+        let Some(slice) = results.get(*start..*end) else {
+            cache.insert(plan.pool.address, PoolState::Invalid);
+            continue;
         };
         if let Some(state) = decode_plan(plan, slice) {
             cache.insert(plan.pool.address, state);
@@ -674,5 +694,77 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
             cache.insert(plan.pool.address, PoolState::Invalid);
         }
     }
-    Ok(updated)
+    updated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_plan_results, mark_plans_invalid};
+    use crate::core::types::{PoolState, ProtocolType};
+    use crate::pipeline::pool_fetch::plans::build_plan_with_pool_id;
+    use crate::services::discovery::DiscoveredPool;
+    use crate::services::state_cache::StateCache;
+    use alloy::primitives::Address;
+
+    fn test_pool(address: Address) -> DiscoveredPool {
+        DiscoveredPool {
+            pool_key: format!("pool-{address}"),
+            address,
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "UNISWAP_V2".into(),
+            tokens: vec![Address::with_last_byte(3), Address::with_last_byte(4)],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        }
+    }
+
+    #[test]
+    fn incomplete_multicall_marks_unprocessed_pool_invalid() -> Result<(), &'static str> {
+        let first = build_plan_with_pool_id(&test_pool(Address::with_last_byte(1)), None)
+            .ok_or("test V2 pool must produce a fetch plan")?;
+        let second = build_plan_with_pool_id(&test_pool(Address::with_last_byte(2)), None)
+            .ok_or("test V2 pool must produce a fetch plan")?;
+        let spans = [
+            (&first, 0, first.calls.len()),
+            (
+                &second,
+                first.calls.len(),
+                first.calls.len() + second.calls.len(),
+            ),
+        ];
+        let cache = StateCache::default();
+
+        assert_eq!(
+            apply_plan_results(&cache, &spans, &[], first.calls.len() + second.calls.len()),
+            0
+        );
+        assert!(matches!(
+            cache.get(&first.pool.address),
+            Some(PoolState::Invalid)
+        ));
+        assert!(matches!(
+            cache.get(&second.pool.address),
+            Some(PoolState::Invalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_plan_failure_marks_pool_invalid() -> Result<(), &'static str> {
+        let plan = build_plan_with_pool_id(&test_pool(Address::with_last_byte(1)), None)
+            .ok_or("test V2 pool must produce a fetch plan")?;
+        let cache = StateCache::default();
+
+        mark_plans_invalid(&cache, std::slice::from_ref(&plan));
+        assert!(matches!(
+            cache.get(&plan.pool.address),
+            Some(PoolState::Invalid)
+        ));
+        Ok(())
+    }
 }

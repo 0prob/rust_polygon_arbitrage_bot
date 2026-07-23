@@ -766,10 +766,10 @@ fn pool_direct_edges_match_meta(graph: &RoutingGraph, arena: &StateArena, meta: 
     let mut ok: smallvec::SmallVec<[TokenIndex; 8]> = smallvec::SmallVec::from_slice(&meta.tokens);
     if let Some(state) = arena.pool_state(meta.pool_index) {
         for leg in 0..2 {
-            if let Some(t) = routing_token_at_leg(arena, state, meta, leg) {
-                if !ok.contains(&t) {
-                    ok.push(t);
-                }
+            if let Some(t) = routing_token_at_leg(arena, state, meta, leg)
+                && !ok.contains(&t)
+            {
+                ok.push(t);
             }
         }
     }
@@ -1124,7 +1124,10 @@ pub fn attach_missing_eligible_pools_with_gate(
         {
             static STALE_META_EDGES: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
-            if STALE_META_EDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 == 0 {
+            if STALE_META_EDGES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(16)
+            {
                 crate::info!(
                     "graph rebuild stale meta edges: pool_index={} tokens={}",
                     meta.pool_index.0,

@@ -533,7 +533,7 @@ impl ExecutionService {
     fn quarantine_insert(&self, fingerprint: u64, until: Instant) {
         let mut q = self.quarantine.write();
         static INSERTS: AtomicU32 = AtomicU32::new(0);
-        if INSERTS.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
+        if INSERTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(32) {
             let now = Instant::now();
             q.retain(|_, exp| *exp > now);
         }

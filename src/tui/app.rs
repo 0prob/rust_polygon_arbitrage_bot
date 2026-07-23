@@ -992,7 +992,11 @@ mod tests {
         assert_eq!(app.route_sort_indices.as_ptr(), sort_ptr);
         assert_eq!(app.route_view_indices.as_ptr(), view_ptr);
         assert_eq!(
-            app.snapshot.as_ref().unwrap().opportunities[0].status,
+            app.snapshot
+                .as_ref()
+                .expect("test snapshot must be present")
+                .opportunities[0]
+                .status,
             RouteStatus::Executed
         );
         // Keep the shared Arc alive so make_mut actually COW'd.
@@ -1106,7 +1110,12 @@ mod tests {
         assert!(app.hf_candidates[0].should_execute);
         app.tab = Tab::Simulations;
         assert_eq!(app.current_rows_len(), 1);
-        let status = app.snapshot.as_ref().unwrap().opportunities[0].status;
+        let status = app
+            .snapshot
+            .as_ref()
+            .expect("test snapshot must be present")
+            .opportunities[0]
+            .status;
         assert_eq!(status, RouteStatus::Hot);
 
         app.register_trade_outcome(ExecutionOutcome::DryRunPassed { gas_used: 200_000 }, 0xabc);

@@ -838,27 +838,44 @@ fn submit_probe_url<'a>(
 fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig) {
     use alloy::primitives::Address;
 
+    let mut malformed_pyth = 0usize;
     for pair in config.pyth_feeds.split(',').filter(|s| !s.is_empty()) {
         let Some((token_str, feed_id)) = pair.split_once('=') else {
+            malformed_pyth = malformed_pyth.saturating_add(1);
             continue;
         };
         let Ok(token) = token_str.trim().parse::<Address>() else {
+            malformed_pyth = malformed_pyth.saturating_add(1);
             continue;
         };
+        if feed_id.trim().is_empty() {
+            malformed_pyth = malformed_pyth.saturating_add(1);
+            continue;
+        }
         oracle.register_pyth_feed(token, feed_id.trim().to_string());
     }
+    if malformed_pyth > 0 {
+        crate::warn!("ignored {malformed_pyth} malformed configured Pyth feed entries");
+    }
 
+    let mut malformed_chainlink = 0usize;
     for pair in config.chainlink_feeds.split(',').filter(|s| !s.is_empty()) {
         let Some((token_str, feed_str)) = pair.split_once('=') else {
+            malformed_chainlink = malformed_chainlink.saturating_add(1);
             continue;
         };
         let Ok(token) = token_str.trim().parse::<Address>() else {
+            malformed_chainlink = malformed_chainlink.saturating_add(1);
             continue;
         };
         let Ok(feed) = feed_str.trim().parse::<Address>() else {
+            malformed_chainlink = malformed_chainlink.saturating_add(1);
             continue;
         };
         oracle.register_chainlink_feed(token, feed);
+    }
+    if malformed_chainlink > 0 {
+        crate::warn!("ignored {malformed_chainlink} malformed configured Chainlink feed entries");
     }
 }
 

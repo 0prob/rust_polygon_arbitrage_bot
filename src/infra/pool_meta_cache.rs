@@ -114,15 +114,15 @@ impl PoolMetaCache {
                 if revision.load(Ordering::Acquire) != target_revision {
                     continue;
                 }
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        crate::warn!(
-                            "pool meta cache persist: cannot create {}: {e}",
-                            parent.display()
-                        );
-                        running.store(false, Ordering::Release);
-                        return;
-                    }
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    crate::warn!(
+                        "pool meta cache persist: cannot create {}: {e}",
+                        parent.display()
+                    );
+                    running.store(false, Ordering::Release);
+                    return;
                 }
                 let seq = write_seq.fetch_add(1, Ordering::Relaxed);
                 let tmp = path.with_extension(format!("json.{seq}.tmp"));

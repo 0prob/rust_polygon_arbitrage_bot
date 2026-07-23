@@ -22,6 +22,7 @@ pub enum NonceRecoveryOutcome {
 }
 
 /// After a receipt timeout, attempt to determine tx fate and cancel if still pending.
+#[allow(clippy::too_many_arguments)]
 pub async fn recover_after_receipt_timeout<P: Provider<Ethereum>>(
     provider: &P,
     nonce_mgr: &NonceManager,

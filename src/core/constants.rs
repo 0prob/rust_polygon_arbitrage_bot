@@ -268,14 +268,14 @@ mod tests {
         assert_eq!(BPS_SCALE, U256::from(10_000u64));
         assert_eq!(DEFAULT_FEE_NUMERATOR, U256::from(997u64));
         assert!(DEFAULT_FEE_NUMERATOR < FEE_DENOMINATOR);
-        assert!(MAX_SANE_PROFIT_RATIO_BPS > 10_000);
+        const { assert!(MAX_SANE_PROFIT_RATIO_BPS > 10_000) };
         assert_eq!(EXECUTION_MIN_SLIPPAGE_BPS, 100);
     }
 
     #[test]
     fn hop_cap_matches_usize_mirror() {
         assert_eq!(HOP_CAP_USIZE, HOP_CAP as usize);
-        assert!(DEFAULT_HUB_PATH_MAX_HOPS <= HOP_CAP);
+        const { assert!(DEFAULT_HUB_PATH_MAX_HOPS <= HOP_CAP) };
         assert_eq!(MAX_POOL_TOKENS, 8);
     }
 }

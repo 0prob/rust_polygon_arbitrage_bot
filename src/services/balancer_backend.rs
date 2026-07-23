@@ -141,10 +141,7 @@ fn apply_backend_pools(pools: &mut Vec<DiscoveredPool>, backend: &[BackendPool])
         if pool.protocol != ProtocolType::BalancerV2 {
             return true;
         }
-        match by_address.get(&pool.address) {
-            Some((_, false)) => false,
-            _ => true,
-        }
+        !matches!(by_address.get(&pool.address), Some((_, false)))
     });
     let filtered = before.saturating_sub(pools.len());
 

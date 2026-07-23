@@ -43,6 +43,7 @@ pub fn pool_tokens_from_hop(hop: &CalldataHop) -> (Address, Address) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn derive_tight_v3_price_limit(
     state: &V3PoolState,
     amount_in: U256,

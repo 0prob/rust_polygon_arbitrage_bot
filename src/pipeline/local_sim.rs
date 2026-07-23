@@ -494,7 +494,7 @@ pub fn uni_cycle_has_both_foreign_edge(
             return false;
         }
         let on_meta = |tok: TokenIndex| {
-            m.tokens.iter().any(|&t| t == tok)
+            m.tokens.contains(&tok)
                 || arena.token_address(tok).is_some_and(|want| {
                     m.tokens.iter().any(|&t| {
                         arena.token_address(t).is_some_and(|maddr| {
@@ -883,9 +883,7 @@ pub fn realign_multi_token_found_cycle(
         ) {
             continue;
         }
-        let Some(state) = arena.pool_state(edge.pool_index) else {
-            return None;
-        };
+        let state = arena.pool_state(edge.pool_index)?;
         // Family skew (Balancer tag × V3 state) — heal rewrites protocol; vault
         // realign here false-fails (live: obs multi-fail sample state=v3).
         if !protocol_matches_pool_state(edge.protocol, state) {
@@ -2014,7 +2012,10 @@ mod tests {
             fee_bps: 30, // stale discovery
             zero_for_one: true,
         };
-        sync_edge_fee_bps_from_state(&mut edge, arena.pool_state(pool).unwrap());
+        sync_edge_fee_bps_from_state(
+            &mut edge,
+            arena.pool_state(pool).expect("test pool state must exist"),
+        );
         assert_eq!(edge.fee_bps, 0);
     }
 
@@ -2201,7 +2202,7 @@ mod tests {
         }];
         assert!(cycle_v2_edges_match_pool_meta(
             &arena,
-            &[meta.clone()],
+            std::slice::from_ref(&meta),
             &edges
         ));
         let cycle = Arc::new(crate::core::types::FoundCycle {
@@ -2406,7 +2407,10 @@ mod tests {
         assert_eq!(healed.edges[0].token_out_idx, 1);
         assert!(healed.edges[0].zero_for_one);
         let mut edge = healed.edges[0];
-        sync_edge_fee_bps_from_state(&mut edge, arena.pool_state(pool).unwrap());
+        sync_edge_fee_bps_from_state(
+            &mut edge,
+            arena.pool_state(pool).expect("test pool state must exist"),
+        );
         assert_eq!(edge.fee_bps, 5);
     }
 
@@ -3499,7 +3503,7 @@ mod tests {
             fee_bps: 30,
             zero_for_one: true,
         };
-        let state = arena.pool_state(pool).unwrap();
+        let state = arena.pool_state(pool).expect("test pool state must exist");
         assert!(realign_multi_token_edge(&arena, state, &mut edge));
         assert_eq!((edge.token_in_idx, edge.token_out_idx), (1, 0));
 
@@ -3587,7 +3591,7 @@ mod tests {
             fee_bps: 30,
             zero_for_one: true,
         };
-        let state = arena.pool_state(pool).unwrap();
+        let state = arena.pool_state(pool).expect("test pool state must exist");
         assert!(realign_multi_token_edge(&arena, state, &mut edge));
         assert_eq!((edge.token_in_idx, edge.token_out_idx), (1, 0));
 

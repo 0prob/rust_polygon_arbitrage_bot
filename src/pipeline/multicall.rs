@@ -80,6 +80,14 @@ fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
     calls
 }
 
+fn ensure_result_count(expected: usize, actual: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual == expected,
+        "multicall result count mismatch: expected {expected}, got {actual}"
+    );
+    Ok(())
+}
+
 async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
     provider: &P,
     items: &[MulticallItem],
@@ -146,6 +154,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
         }
         match call.call().await {
             Ok(results) => {
+                ensure_result_count(items.len(), results.len())?;
                 return Ok(results
                     .into_iter()
                     .map(|r| {
@@ -315,6 +324,13 @@ mod tests {
     }
 
     #[test]
+    fn result_count_mismatch_fails_closed() {
+        assert!(super::ensure_result_count(2, 1).is_err());
+        assert!(super::ensure_result_count(2, 3).is_err());
+        assert!(super::ensure_result_count(2, 2).is_ok());
+    }
+
+    #[test]
     fn retries_transient_rpc_responses_only() {
         for message in [
             "error code -32000: header not found",
@@ -338,7 +354,7 @@ mod tests {
     fn default_chunk_matches_config_default() {
         assert_eq!(MULTICALL_CHUNK, 200);
         assert_eq!(super::TICK_LENS_MULTICALL_CHUNK, 12);
-        assert!(super::TICK_LENS_MULTICALL_CHUNK < MULTICALL_CHUNK);
+        const { assert!(super::TICK_LENS_MULTICALL_CHUNK < MULTICALL_CHUNK) };
     }
 
     #[test]

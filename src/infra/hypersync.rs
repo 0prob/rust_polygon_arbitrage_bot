@@ -237,8 +237,10 @@ mod tests {
 
     #[test]
     fn from_config_trims_api_token_and_custom_url() {
-        let mut rpc = RpcConfig::default();
-        rpc.hyper_sync_url = Some("  https://polygon.hypersync.xyz  ".into());
+        let rpc = RpcConfig {
+            hyper_sync_url: Some("  https://polygon.hypersync.xyz  ".into()),
+            ..Default::default()
+        };
         // ClientConfig validates api_token as a UUID; whitespace must be trimmed first.
         let service =
             HyperSyncService::from_config(&rpc, "  a3cbea70-ad7d-4308-a4be-b14e095ce169  ")

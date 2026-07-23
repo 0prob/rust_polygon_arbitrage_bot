@@ -78,7 +78,7 @@ pub fn balancer_flash_fee_pct_to_bps(pct_1e18: u64) -> u64 {
         return 0;
     }
     let num = (pct_1e18 as u128).saturating_mul(10_000);
-    ((num + BALANCER_FP_ONE - 1) / BALANCER_FP_ONE) as u64
+    num.div_ceil(BALANCER_FP_ONE) as u64
 }
 
 /// Flash premium in token units.
@@ -1167,7 +1167,8 @@ mod safety_tests {
         // aave-v3-core: (value * bps + 5000) / 10000 — differs from floor at small sizes.
         set_aave_flash_loan_fee_bps(5);
         let amount = U256::from(1_000u64);
-        let fee = flash_loan_fee_amount(FlashLoanSource::AaveV3, amount).unwrap();
+        let fee = flash_loan_fee_amount(FlashLoanSource::AaveV3, amount)
+            .expect("Aave flash fee must be representable");
         assert_eq!(fee, U256::from(1u64)); // floor would be 0
         assert_eq!(
             aave_percent_mul(U256::from(10_000u64), 5),
@@ -1184,11 +1185,11 @@ mod safety_tests {
         );
         // 1 bps = 1e14 in 1e18 FixedPoint
         set_balancer_flash_loan_fee_pct(100_000_000_000_000);
-        let fee =
-            flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64)).unwrap();
+        let fee = flash_loan_fee_amount(FlashLoanSource::Balancer, U256::from(1_000_000u64))
+            .expect("Balancer flash fee must be representable");
         assert_eq!(fee, U256::from(100u64));
         assert_eq!(balancer_flash_fee_pct_to_bps(100_000_000_000_000), 1);
-        assert!(!DODO_EXTERNAL_FLASH_ENABLED);
+        const { assert!(!DODO_EXTERNAL_FLASH_ENABLED) };
         assert_eq!(
             flash_loan_fee_amount(FlashLoanSource::Dodo, U256::from(1_000_000u64)),
             Some(U256::ZERO)

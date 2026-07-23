@@ -159,6 +159,7 @@ impl GraphCache {
             .is_multiple_of(self.cycle_refind_interval)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         graph: Arc<crate::pipeline::types::RoutingGraph>,

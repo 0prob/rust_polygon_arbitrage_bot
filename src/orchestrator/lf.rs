@@ -1832,7 +1832,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 if obs_touch {
                     static UNI_FAIL_SAMPLE: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
-                    if UNI_FAIL_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+                    if UNI_FAIL_SAMPLE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .is_multiple_of(8)
+                    {
                         crate::info!(
                             "obs uni realign fail: hop_break={hop_break:?} arena_ok={arena_ok} meta_ok={meta_ok} hops={} edges={}",
                             ready.edge_hops(),

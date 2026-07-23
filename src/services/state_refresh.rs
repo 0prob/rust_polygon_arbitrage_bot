@@ -19,9 +19,7 @@ use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::infra::pg::{DiscoveryCursor, DiscoveryResult, PgClient, PoolMetaKeyset};
 use crate::infra::pool_meta_cache::PoolMetaCache;
 use crate::infra::rpc::RpcPool;
-use crate::pipeline::fetcher::{
-    fetch_missing_pool_states_indexed, fetch_pool_states_at_addresses,
-};
+use crate::pipeline::fetcher::{fetch_missing_pool_states_indexed, fetch_pool_states_at_addresses};
 use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
@@ -382,7 +380,8 @@ impl StateRefreshService {
             // Overlap token-meta PG fetch with keyset pool pages (independent queries).
             let need_metas = !self.token_metadata_loaded.load(Ordering::Acquire);
             let boot = if need_metas {
-                let (boot, ()) = tokio::join!(self.discover_bootstrap(), self.refresh_token_metas());
+                let (boot, ()) =
+                    tokio::join!(self.discover_bootstrap(), self.refresh_token_metas());
                 boot
             } else {
                 self.discover_bootstrap().await
@@ -442,9 +441,7 @@ impl StateRefreshService {
         let (balancer_ms, decimals_ms) = tokio::join!(
             async {
                 let started = now_ms();
-                if has_balancer
-                    && let Some(ref endpoint) = endpoint
-                {
+                if has_balancer && let Some(ref endpoint) = endpoint {
                     match enrich_polygon_balancer_pool_ids(endpoint, &mut result.pools).await {
                         Ok((enriched, filtered)) => {
                             if enriched > 0 {
@@ -475,7 +472,7 @@ impl StateRefreshService {
         let enrich_wall_ms = now_ms().saturating_sub(enrich_started);
 
         let merge_started = now_ms();
-        let (added, updated) = {
+        let (added, updated, replaced_addresses) = {
             if result.pools.is_empty() && result.complete {
                 {
                     let mut state = self.discovery_state.write();
@@ -499,6 +496,7 @@ impl StateRefreshService {
             let mut state = self.discovery_state.write();
             let mut added = 0usize;
             let mut updated = 0usize;
+            let mut replaced_addresses = Vec::new();
             // Move indexes out (no data clone) first.
             let mut index = std::mem::take(&mut state.pool_key_index);
             let mut address_index = std::mem::take(&mut state.address_index);
@@ -509,7 +507,11 @@ impl StateRefreshService {
                 let address_index = Arc::make_mut(&mut address_index);
                 for pool in result.pools {
                     if let Some(&idx) = index.get(&pool.pool_key) {
-                        replace_discovered_pool(discovered, address_index, idx, pool);
+                        if let Some(old_address) =
+                            replace_discovered_pool(discovered, address_index, idx, pool)
+                        {
+                            replaced_addresses.push(old_address);
+                        }
                         updated += 1;
                     } else {
                         let idx = discovered.len();
@@ -523,8 +525,11 @@ impl StateRefreshService {
             state.pool_key_index = index;
             state.address_index = address_index;
             state.discovery_cursor = result.cursor.clone();
-            (added, updated)
+            (added, updated, replaced_addresses)
         };
+        for address in replaced_addresses {
+            self.cache.remove(&address);
+        }
         let merge_ms = now_ms().saturating_sub(merge_started);
 
         if added > 0 || updated > 0 || !result.complete || is_bootstrap {
@@ -1110,13 +1115,15 @@ fn replace_discovered_pool(
     address_index: &mut FxHashMap<Address, usize>,
     idx: usize,
     pool: DiscoveredPool,
-) {
+) -> Option<Address> {
     let old_address = discovered[idx].address;
-    if old_address != pool.address {
+    let replaced_address = (old_address != pool.address).then_some(old_address);
+    if replaced_address.is_some() {
         address_index.remove(&old_address);
     }
     discovered[idx] = pool;
     address_index.insert(discovered[idx].address, idx);
+    replaced_address
 }
 
 fn merge_parse_stats(acc: &mut ParseStats, page: &ParseStats) {
@@ -1205,7 +1212,10 @@ mod tests {
         let mut pools = vec![test_pool(old)];
         let mut index = FxHashMap::default();
         index.insert(old, 0);
-        replace_discovered_pool(&mut pools, &mut index, 0, test_pool(new));
+        assert_eq!(
+            replace_discovered_pool(&mut pools, &mut index, 0, test_pool(new)),
+            Some(old)
+        );
         assert!(!index.contains_key(&old));
         assert_eq!(index.get(&new), Some(&0));
     }

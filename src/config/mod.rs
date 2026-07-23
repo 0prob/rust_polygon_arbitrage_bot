@@ -696,11 +696,10 @@ impl AppConfig {
         let hub_hop_cap = self
             .routing
             .max_hops
-            .min(crate::core::constants::HOP_CAP)
-            .max(1);
+            .clamp(1, crate::core::constants::HOP_CAP);
         self.oracle.hub_path_max_hops = self.oracle.hub_path_max_hops.clamp(1, hub_hop_cap);
 
-        self.pipeline.hf_sim_cap = self.pipeline.hf_sim_cap.min(HF_CYCLE_CAP_MAX).max(1);
+        self.pipeline.hf_sim_cap = self.pipeline.hf_sim_cap.clamp(1, HF_CYCLE_CAP_MAX);
         self.pipeline.hf_score_cap = self.pipeline.hf_score_cap.min(HF_CYCLE_CAP_MAX).clamp(
             self.pipeline.hf_sim_cap,
             self.pipeline.hf_sim_cap.saturating_mul(2),
@@ -765,11 +764,7 @@ impl AppConfig {
             );
         }
         if self.pipeline.stream_enabled {
-            let has_wss = self
-                .rpc
-                .wss_url
-                .as_deref()
-                .is_some_and(|u| !u.is_empty())
+            let has_wss = self.rpc.wss_url.as_deref().is_some_and(|u| !u.is_empty())
                 || !self.rpc.polygon_wss_urls.is_empty();
             if !has_wss {
                 crate::warn!(
@@ -1020,10 +1015,7 @@ mod tests {
         assert_eq!(c.pipeline.hf_prefetch_count, 60);
         assert_eq!(c.oracle.tick_word_range, 6);
         assert_eq!(c.execution.profit_safety_multiplier_bps, 15_000);
-        assert_eq!(
-            c.execution.min_profit_matic_wei,
-            "10000000000000000"
-        );
+        assert_eq!(c.execution.min_profit_matic_wei, "10000000000000000");
     }
 
     #[test]

@@ -12,13 +12,11 @@ pub const U256_AMT_MAX: u128 = 10u128.pow(36);
 /// Fixed-point ONE (1e18) used by Balancer/DODO/WOOFi weights and coeffs.
 pub const FP18_ONE: u128 = 1_000_000_000_000_000_000;
 
-#[must_use]
 pub fn u256_nonzero() -> impl Strategy<Value = U256> {
     (1u128..=U256_AMT_MAX).prop_map(U256::from)
 }
 
 /// Values in `(0, 1e18]` — fixed-point weights / k / spread coeffs.
-#[must_use]
 pub fn u256_fp18() -> impl Strategy<Value = U256> {
     (1u128..=FP18_ONE).prop_map(U256::from)
 }

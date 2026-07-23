@@ -10,7 +10,7 @@ use crate::core::types::{FoundCycle, PoolIndex, ProtocolType, V3Tick};
 type V4TickSpan = (PoolIndex, FixedBytes<32>, i32, i32, usize, usize, u128);
 
 fn sort_v4_tick_spans_by_liquidity(spans: &mut [V4TickSpan]) {
-    spans.sort_unstable_by(|a, b| b.6.cmp(&a.6));
+    spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.6));
 }
 
 /// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
@@ -361,6 +361,7 @@ pub fn collect_v4_tick_targets<C: AsRef<FoundCycle>>(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn enrich_v3_ticks<
     P: alloy::providers::Provider<alloy::network::Ethereum> + Clone + Send + 'static,
 >(
@@ -556,7 +557,7 @@ pub async fn enrich_v3_ticks<
     let mut wide_attempted: FxHashSet<Address> = FxHashSet::default();
     let widen_available = allow_widen && word_range < 48;
     if updated < pool_addresses.len() && widen_available {
-        let wide_range = word_range.saturating_mul(3).max(24).min(48);
+        let wide_range = word_range.saturating_mul(3).clamp(24, 48);
         let mut still_empty: Vec<(Address, u128)> = Vec::new();
         let mut seen: FxHashSet<Address> = FxHashSet::default();
         for &pool in pool_addresses {
@@ -571,7 +572,7 @@ pub async fn enrich_v3_ticks<
             }
         }
         if !still_empty.is_empty() {
-            still_empty.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            still_empty.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
             let wide_targets: Vec<Address> = still_empty
                 .into_iter()
                 .take(MAX_WIDE_TICK_POOLS)
@@ -647,9 +648,10 @@ pub async fn enrich_v3_ticks<
     if !still_tickless.is_empty() && !needs_url_fallback {
         if allow_widen {
             // LF/dispatch: EMPTY cool only after wide attempt, or word_range already maxed.
-            let cool = still_tickless.iter().copied().filter(|p| {
-                word_range >= 48 || wide_attempted.contains(p)
-            });
+            let cool = still_tickless
+                .iter()
+                .copied()
+                .filter(|p| word_range >= 48 || wide_attempted.contains(p));
             mark_empty_tick_cooldown(cool);
         } else {
             // HF probe narrow-only: complete empty is *not* a full-empty proof.
@@ -1016,7 +1018,7 @@ pub async fn enrich_v4_ticks<
     let mut wide_attempted: FxHashSet<FixedBytes<32>> = FxHashSet::default();
     let widen_available = word_range < 48;
     if updated < targets.len() && widen_available {
-        let wide_range = word_range.saturating_mul(3).max(24).min(48);
+        let wide_range = word_range.saturating_mul(3).clamp(24, 48);
         let mut still: Vec<(PoolIndex, FixedBytes<32>, u128)> = targets
             .iter()
             .copied()
@@ -1028,7 +1030,7 @@ pub async fn enrich_v4_ticks<
             })
             .collect();
         if !still.is_empty() {
-            still.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+            still.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
             let wide_targets: Vec<_> = still
                 .into_iter()
                 .take(MAX_WIDE_TICK_POOLS)
@@ -1149,7 +1151,6 @@ async fn enrich_v4_ticks_once<
             ..TickEnrichment::default()
         };
     };
-    let mut spans = spans;
     spans.sort_unstable_by(|a, b| {
         let liq = |idx: PoolIndex| match arena.pool_state(idx) {
             Some(crate::core::types::PoolState::V4(s)) => s.liquidity,
@@ -1289,7 +1290,7 @@ async fn enrich_algebra_ticks<
             (pool, idx, spacing, word_min, word_max, liq)
         })
         .collect();
-    ranked.sort_unstable_by(|a, b| b.5.cmp(&a.5));
+    ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.5));
     let truncated = ranked.len() > MAX_ALGEBRA_TICK_POOLS;
     ranked.truncate(MAX_ALGEBRA_TICK_POOLS);
 
@@ -1404,14 +1405,11 @@ async fn enrich_algebra_ticks<
         // Prefer labeled ABI, then fall back to the other Algebra ticks() layout.
         // Mis-labeled QuickSwap Integral pools otherwise stay permanently tickless.
         let prefer_integral = integral_pools.contains(&pool);
-        let tick_entry = match decode_algebra_tick_entry(&bytes, tick, prefer_integral)
+        let Some(tick_entry) = decode_algebra_tick_entry(&bytes, tick, prefer_integral)
             .or_else(|| decode_algebra_tick_entry(&bytes, tick, !prefer_integral))
-        {
-            Some(entry) => entry,
-            None => {
-                decode_rejects += 1;
-                continue;
-            }
+        else {
+            decode_rejects += 1;
+            continue;
         };
         grouped.entry(idx).or_default().push(tick_entry);
     }

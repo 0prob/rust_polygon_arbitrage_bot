@@ -150,6 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::panic)]
     async fn shutdown_join_propagates_pass_loop_panic() {
         let handle = tokio::spawn(async { panic!("expected pass-loop panic") });
         let error = join_pass_loop_after_shutdown(handle)

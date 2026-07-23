@@ -253,9 +253,7 @@ async fn hf_flash_prefetch_stale(
     // Dust-only or soft-stale hubs: defer to spawn/background (live: 638ms
     // timeout on tokens=1 WMATIC that was still within full TTL).
     if blocking.is_empty() && stale_n < 4 {
-        crate::debug!(
-            "flash loan: hf_prefetch defer non-cold stale={stale_n} fresh={fresh_n}"
-        );
+        crate::debug!("flash loan: hf_prefetch defer non-cold stale={stale_n} fresh={fresh_n}");
         return;
     }
     let deadline = Instant::now() + flash_budget;
@@ -653,7 +651,7 @@ fn log_best_eval_diagnostic(diag: &BestEvalDiag) {
 /// inactive_selected=0 (live: 187 actives, probe window all WSS dust).
 #[must_use]
 fn hf_activity_slot_cap(rescore_cap: usize) -> usize {
-    rescore_cap.saturating_div(5).max(4).min(16).min(rescore_cap)
+    rescore_cap.saturating_div(5).clamp(4, 16).min(rescore_cap)
 }
 
 fn sample_proto_mismatch(
@@ -709,8 +707,8 @@ fn sample_proto_mismatch(
                 .iter()
                 .filter_map(|&t| arena.token_address(t))
                 .collect();
-            let tin_ok = tin.is_some_and(|a| meta.iter().any(|&m| m == a));
-            let tout_ok = tout.is_some_and(|a| meta.iter().any(|&m| m == a));
+            let tin_ok = tin.is_some_and(|a| meta.contains(&a));
+            let tout_ok = tout.is_some_and(|a| meta.contains(&a));
             // Address continuity — TokenIndex inequality false-positives aliases.
             let hop_break = hop > 0
                 && cycle.edges.get(hop - 1).is_some_and(|prev| {
@@ -904,6 +902,7 @@ struct RescoreSelection {
     inactive_selected: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_cycles_for_rescore(
     snap_cycles: &[Arc<FoundCycle>],
     arena: &crate::pipeline::arena::StateArena,
@@ -1153,23 +1152,21 @@ fn select_cycles_for_rescore(
         // the live bypass so WSS-touched zero_profit cannot fill the probe window
         // (live: active_selected=50 inactive=0 with 187 actives). Skip 1-hop
         // stubs (tests / incomplete cycles) — need a closed path to judge profit.
-        if ready.edges.len() >= 2 {
-            if let Some(micro) =
+        if ready.edges.len() >= 2
+            && let Some(micro) =
                 crate::pipeline::local_sim::simulate_route_minimal(arena, &ready.edges, micro_probe)
-            {
-                if micro.profit.is_zero() {
-                    let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
-                        arena,
-                        &ready.edges,
-                        economic_floor,
-                    )
-                    .is_none_or(|s| s.profit.is_zero());
-                    if floor_zero {
-                        micro_dead_skipped += 1;
-                        quarantine_all_edge_rotations(execution, &ready.edges);
-                        continue;
-                    }
-                }
+            && micro.profit.is_zero()
+        {
+            let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
+                arena,
+                &ready.edges,
+                economic_floor,
+            )
+            .is_none_or(|s| s.profit.is_zero());
+            if floor_zero {
+                micro_dead_skipped += 1;
+                quarantine_all_edge_rotations(execution, &ready.edges);
+                continue;
             }
         }
         if score > 0 {
@@ -2330,10 +2327,8 @@ pub async fn run_hf_tick(
         // best-eval/cover-dist logging by gating rank at 0.05 (live: zero diag ticks).
         // Skip sub-economic sizes and sub-0.05 MATIC notional (live: USDT input=7917
         // passed economic=1000 and won cover≈687 with gross=1620).
-        let economic_floor = crate::pipeline::sim_sanity::min_economic_amount_in(
-            start_decimals,
-            start_rate,
-        );
+        let economic_floor =
+            crate::pipeline::sim_sanity::min_economic_amount_in(start_decimals, start_rate);
         // Keep near-miss visibility (≥0.001 MATIC avail) but require ≥0.05 MATIC
         // notional input so USDT dust (input≈7914) cannot monopolize best-eval.
         if better_near_breakeven

@@ -621,9 +621,9 @@ fn rank_one_cycle_probe(
                 MinimalProbeReject::NoSimulation => {
                     let fails: Vec<_> = attempt_failures.iter().flatten().copied().collect();
                     !fails.is_empty()
-                        && !fails.iter().all(|f| {
-                            matches!(f, local_sim::MinimalSimFailure::ClTickless { .. })
-                        })
+                        && !fails
+                            .iter()
+                            .all(|f| matches!(f, local_sim::MinimalSimFailure::ClTickless { .. }))
                 }
                 MinimalProbeReject::SanityReject(_) => false,
             };
@@ -1606,11 +1606,7 @@ fn evaluate_one(
     // real hop amounts (not zeroed minimal fallback), and hop fidelity for execute.
     if assessment.should_execute {
         let floor = min_economic_amount_in(
-            resolve_token_decimals_for_index(
-                cycle.start_token,
-                input.arena,
-                input.token_decimals,
-            ),
+            resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals),
             resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
         );
         let has_hop_amounts = sim.hop_amounts.iter().any(|a| !a.is_zero());

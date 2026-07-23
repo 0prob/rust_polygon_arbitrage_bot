@@ -982,15 +982,12 @@ pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
 ) -> bool {
     let mut saw_tickless = false;
     for edge in &cycle.edges {
-        let tickless = match (arena.pool_state(edge.pool_index), edge.protocol) {
+        let tickless = matches!(
+            (arena.pool_state(edge.pool_index), edge.protocol),
             (Some(PoolState::V3(s)), crate::core::types::ProtocolType::UniswapV3)
             | (Some(PoolState::V4(s)), crate::core::types::ProtocolType::UniswapV4)
-                if s.ticks.is_empty() =>
-            {
-                true
-            }
-            _ => false,
-        };
+                if s.ticks.is_empty()
+        );
         if !tickless {
             continue;
         }
@@ -1625,6 +1622,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
     verified
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     execution: &crate::services::execution::ExecutionService,
     job: BalancerVerifyJob,

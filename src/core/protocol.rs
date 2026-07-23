@@ -198,7 +198,10 @@ mod tests {
             Some(ProtocolType::UniswapV2)
         );
         // Full-string case fold path (len == needle).
-        assert_eq!(normalize_protocol("uniswap_v2"), Some(ProtocolType::UniswapV2));
+        assert_eq!(
+            normalize_protocol("uniswap_v2"),
+            Some(ProtocolType::UniswapV2)
+        );
     }
 
     #[test]

@@ -282,7 +282,11 @@ fn build_balancer_plan(plan: &mut PoolFetchPlan) -> bool {
     true
 }
 
-fn plan_call_capacity(protocol: ProtocolType, token_count: usize, pool_type: Option<&str>) -> usize {
+fn plan_call_capacity(
+    protocol: ProtocolType,
+    token_count: usize,
+    pool_type: Option<&str>,
+) -> usize {
     match protocol {
         ProtocolType::UniswapV2 => 1,
         // Algebra: globalState + slot0 fallback + liquidity; UniV3: slot0 + liquidity + fee.

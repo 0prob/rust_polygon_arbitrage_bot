@@ -374,9 +374,10 @@ impl PriceOracle {
         let custom = self.custom_pyth.read();
         let mut out: FxHashMap<String, Vec<Address>> = FxHashMap::default();
         for token in tokens {
-            let id = pyth_feed(token)
-                .map(normalize_pyth_feed_id)
-                .or_else(|| custom.get(token).map(|s| normalize_pyth_feed_id(s)));
+            let id = custom
+                .get(token)
+                .map(|s| normalize_pyth_feed_id(s))
+                .or_else(|| pyth_feed(token).map(normalize_pyth_feed_id));
             let Some(id) = id else {
                 continue;
             };
@@ -585,7 +586,10 @@ impl PriceOracle {
             let custom_cl = self.custom_chainlink.read();
             let mut feed_map: FxHashMap<Address, Vec<Address>> = FxHashMap::default();
             for token in tokens {
-                let feed = chainlink_feed(token).or_else(|| custom_cl.get(token).copied());
+                let feed = custom_cl
+                    .get(token)
+                    .copied()
+                    .or_else(|| chainlink_feed(token));
                 if let Some(feed) = feed {
                     feed_map.entry(feed).or_default().push(*token);
                 }
@@ -726,7 +730,7 @@ impl PriceOracle {
                 need.iter()
                     .copied()
                     .filter(|token| {
-                        chainlink_feed(token).is_some() || custom_cl.contains_key(token)
+                        custom_cl.contains_key(token) || chainlink_feed(token).is_some()
                     })
                     .collect()
             };
@@ -1392,6 +1396,20 @@ mod tests {
     fn normalize_pyth_feed_id_strips_0x_and_lowercases() {
         assert_eq!(normalize_pyth_feed_id("0xAaBbCc"), "aabbcc");
         assert_eq!(normalize_pyth_feed_id("AABBCC"), "aabbcc");
+    }
+
+    #[test]
+    fn configured_pyth_feed_overrides_builtin_mapping() {
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".to_string(),
+            DEFAULT_CACHE_TTL_MS,
+        );
+        oracle.register_pyth_feed(WMATIC, "0xcustom".to_string());
+
+        let groups = oracle.collect_pyth_id_groups(&[WMATIC]);
+        assert_eq!(groups.get("custom"), Some(&vec![WMATIC]));
+        assert_eq!(groups.len(), 1);
     }
 
     #[test]

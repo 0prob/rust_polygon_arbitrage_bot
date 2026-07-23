@@ -274,6 +274,7 @@ fn direct_confirm_deadline() -> U256 {
 /// zero — those phantoms previously passed the batch filter and failed dry-run later.
 ///
 /// Err is a short reject reason for logging (revert decode / zero / timeout).
+#[allow(clippy::too_many_arguments)]
 pub async fn confirm_direct_batch_realized_profit<P: Provider<Ethereum>>(
     provider: &P,
     executor: Address,

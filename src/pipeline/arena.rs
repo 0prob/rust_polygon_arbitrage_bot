@@ -661,8 +661,12 @@ impl StateArena {
         let existing = self.inner.pools.len();
         // Fast path: arena prefix still aligns with tradable order.
         let mut prefix = 0usize;
-        for i in 0..existing.min(tradable.len()) {
-            if self.inner.pool_addresses.get(i) != Some(&tradable[i].1) {
+        for (i, (_, address, _)) in tradable
+            .iter()
+            .enumerate()
+            .take(existing.min(tradable.len()))
+        {
+            if self.inner.pool_addresses.get(i) != Some(address) {
                 break;
             }
             prefix += 1;

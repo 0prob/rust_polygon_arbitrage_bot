@@ -297,14 +297,21 @@ impl FlashLiquidityCache {
         if hot.len() <= MAX_HOT_FLASH_TOKENS {
             return;
         }
-        let current: FxHashSet<Address> = tokens.iter().copied().collect();
-        hot.retain(|t| current.contains(t));
-        if hot.len() > MAX_HOT_FLASH_TOKENS {
-            hot.clear();
-            for token in tokens.iter().take(MAX_HOT_FLASH_TOKENS) {
-                hot.insert(*token);
-            }
-        }
+        let mut current: Vec<Address> = tokens.to_vec();
+        current.sort_unstable();
+        current.dedup();
+        current.truncate(MAX_HOT_FLASH_TOKENS);
+        let remaining = MAX_HOT_FLASH_TOKENS.saturating_sub(current.len());
+        let mut prior: Vec<Address> = hot
+            .iter()
+            .copied()
+            .filter(|token| !current.contains(token))
+            .collect();
+        prior.sort_unstable();
+        prior.truncate(remaining);
+        hot.clear();
+        hot.extend(current);
+        hot.extend(prior);
     }
 
     /// One in-flight flash liquidity multicall (HF prefetch, background tick, dispatch spawn).
@@ -541,7 +548,7 @@ impl FlashLiquidityCache {
                 Ok(()) => return Ok(self.generation()),
                 Err(e) => {
                     if is_rpc_rate_limited(&e) {
-                        rpc.deprioritize_state_url(url);
+                        rpc.deprioritize_state_url_rate_limited(url);
                         crate::debug!(
                             "flash liquidity refresh rate-limited on {}",
                             rpc_host_label(url)
@@ -1844,15 +1851,25 @@ mod tests {
         };
         // Raw sim×price mismatches (old prepare reuse bug); observed path matches.
         assert_ne!(
-            U256::from(raw_sim).checked_mul(price).unwrap(),
+            U256::from(raw_sim)
+                .checked_mul(price)
+                .expect("test gas multiplication must not overflow"),
             assessment.gas_cost_wei
         );
         assert!(assessment_gas_matches(
-            &assessment, raw_sim, price, &oracle, fp
+            &assessment,
+            raw_sim,
+            price,
+            &oracle,
+            fp
         ));
         // Wrong fp falls back to heuristic (raw at scale 1×) → mismatch.
         assert!(!assessment_gas_matches(
-            &assessment, raw_sim, price, &oracle, 99
+            &assessment,
+            raw_sim,
+            price,
+            &oracle,
+            99
         ));
     }
 
@@ -2095,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn track_hot_tokens_overflow_retains_current_tick() {
+    fn track_hot_tokens_overflow_retains_current_and_prior_coverage() {
         let cache = FlashLiquidityCache::new();
         let mut old = Vec::with_capacity(400);
         for i in 0..400u32 {
@@ -2117,8 +2134,9 @@ mod tests {
         for addr in &new_batch {
             assert!(hot.contains(addr), "missing current-tick token {addr}");
         }
+        assert!(hot.contains(&old[0]), "lost all prior hot-token coverage");
         let mut evicted = [0u8; 20];
-        evicted[..4].copy_from_slice(&1u32.to_be_bytes());
+        evicted[..4].copy_from_slice(&399u32.to_be_bytes());
         assert!(
             !hot.contains(&Address::from(evicted)),
             "evicted token from prior tick should not remain"

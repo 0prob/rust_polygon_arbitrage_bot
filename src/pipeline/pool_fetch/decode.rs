@@ -6,7 +6,6 @@ use crate::abis::{
     IBalancerLinearPool, IBalancerPool, IBalancerVaultRead, ICurveCryptoPool, ICurvePool,
     IDodoPoolState,
 };
-use crate::core::math::balancer::balancer_swap_fee_from_pool_meta_fee;
 use crate::core::math::fixed_point::ONE;
 
 use crate::core::types::{
@@ -212,7 +211,7 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
     let lp_fee_rate = decode_u256(by_kind(CallKind::DodoLpFee)?)?;
     // Production plans always include DodoMtFee — require a successful decode.
     // Legacy fixtures without the call keep mt=0.
-    let mt_fee_rate = if plan.kinds.iter().any(|k| *k == CallKind::DodoMtFee) {
+    let mt_fee_rate = if plan.kinds.contains(&CallKind::DodoMtFee) {
         decode_u256(by_kind(CallKind::DodoMtFee)?)?
     } else {
         U256::ZERO
@@ -279,35 +278,25 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
     Some(balances)
 }
 
-fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
-    crate::core::protocol::is_curve_stableswap_ng_pool_type(pool_type)
-        || pool_type.is_some_and(|t| {
-            let b = t.as_bytes();
-            b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
-        })
+fn decode_curve_fee(results: &[Option<Bytes>], fee_idx: usize) -> Option<U256> {
+    decode_u256(results.get(fee_idx)?.as_ref()?)
 }
 
 fn decode_curve_stored_rates(
-    plan: &PoolFetchPlan,
     results: &[Option<Bytes>],
     n_fetched: usize,
     rates_idx: usize,
 ) -> Option<Vec<U256>> {
-    let decoded = results
+    let rates = results
         .get(rates_idx)
         .and_then(|b| b.as_ref())
         .and_then(|b| ICurvePool::stored_ratesCall::abi_decode_returns(b).ok())
         .map(|r| r.iter().map(|&x| U256::from(x)).collect::<Vec<_>>());
-    if let Some(decoded) = decoded
-        && decoded.len() == n_fetched
-        && !decoded.iter().any(U256::is_zero)
-    {
-        return Some(decoded);
-    }
-    if curve_pool_requires_stored_rates(plan.pool.pool_type.as_deref()) {
+    let rates = rates?;
+    if rates.len() != n_fetched || rates.iter().any(U256::is_zero) {
         return None;
     }
-    Some(vec![ONE; n_fetched])
+    Some(rates)
 }
 
 fn decode_curve_crypto_rates(
@@ -331,8 +320,8 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
     let a_raw = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
-    let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
+    let fee = decode_curve_fee(results, fee_idx)?;
+    let rates = decode_curve_stored_rates(results, n_fetched, rates_idx)?;
     if a_raw.is_zero() {
         return None;
     }
@@ -360,7 +349,7 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let price_scale_idx = n_fetched + 3;
     let precisions_idx = n_fetched + 4;
     let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_u256(results.get(fee_idx)?.as_ref()?).unwrap_or(U256::from(4_000_000u64));
+    let fee = decode_curve_fee(results, fee_idx)?;
     let gamma = results
         .get(gamma_idx)
         .and_then(|b| b.as_ref())
@@ -464,6 +453,12 @@ fn plan_result<'a>(
     results.get(idx)?.as_ref()
 }
 
+fn decode_balancer_swap_fee(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<U256> {
+    plan_result(plan, results, CallKind::BalancerSwapFee)
+        .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
+        .map(U256::from)
+}
+
 fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let tokens_bytes = plan_result(plan, results, CallKind::BalancerTokens)?;
     let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes).ok()?;
@@ -474,12 +469,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         return None;
     }
     let n = balances.len();
-    let swap_fee = plan_result(plan, results, CallKind::BalancerSwapFee)
-        .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
-        .map_or_else(
-            || balancer_swap_fee_from_pool_meta_fee(plan.pool.fee_bps as u64),
-            U256::from,
-        );
+    let swap_fee = decode_balancer_swap_fee(plan, results)?;
     let decoded_weights = plan_result(plan, results, CallKind::BalancerWeights)
         .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok());
     let amp_from_chain = plan_result(plan, results, CallKind::BalancerAmp)
@@ -1011,6 +1001,19 @@ mod tests {
     }
 
     #[test]
+    fn curve_fee_requires_a_successful_multicall_result() {
+        assert_eq!(decode_curve_fee(&[None], 0), None);
+        assert_eq!(
+            decode_curve_fee(&[Some(Bytes::from_static(&[0u8; 31]))], 0),
+            None
+        );
+        assert_eq!(
+            decode_curve_fee(&[Some(Bytes::copy_from_slice(&abi_word(4_000_000)))], 0),
+            Some(U256::from(4_000_000u64))
+        );
+    }
+
+    #[test]
     fn stable_ng_with_more_than_two_coins_fails_closed() {
         let plan = PoolFetchPlan {
             pool: super::super::plans::FetchPoolInfo {
@@ -1040,29 +1043,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_curve_pool_without_stored_rates_uses_unit_rates() {
-        let mut plan = PoolFetchPlan {
+    fn curve_stored_rates_must_be_live_and_complete() {
+        let missing = vec![None];
+        assert_eq!(decode_curve_stored_rates(&missing, 2, 0), None);
+
+        let zero_rates = ICurvePool::stored_ratesCall::abi_encode_returns(&vec![ONE, U256::ZERO]);
+        assert_eq!(
+            decode_curve_stored_rates(&[Some(Bytes::from(zero_rates))], 2, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn balancer_swap_fee_must_be_live() {
+        let plan = PoolFetchPlan {
             pool: super::super::plans::FetchPoolInfo {
                 address: Address::ZERO,
-                protocol: ProtocolType::CurveStable,
-                tokens: vec![Address::ZERO, Address::with_last_byte(1)],
-                fee_bps: 4,
+                protocol: ProtocolType::BalancerV2,
+                tokens: Vec::new(),
+                fee_bps: 30,
                 tick_spacing: None,
                 pool_id: None,
-                pool_type: Some("stable".to_string()),
+                pool_type: None,
                 protocol_label: None,
             },
             calls: Vec::new(),
-            kinds: Vec::new(),
+            kinds: vec![CallKind::BalancerSwapFee],
         };
-        let missing = vec![None];
-
+        assert_eq!(decode_balancer_swap_fee(&plan, &[None]), None);
         assert_eq!(
-            decode_curve_stored_rates(&plan, &missing, 2, 0),
-            Some(vec![ONE, ONE])
+            decode_balancer_swap_fee(
+                &plan,
+                &[Some(Bytes::copy_from_slice(&abi_word(
+                    3_000_000_000_000_000
+                )))],
+            ),
+            Some(U256::from(3_000_000_000_000_000u64))
         );
-
-        plan.pool.pool_type = Some("stable_ng".to_string());
-        assert_eq!(decode_curve_stored_rates(&plan, &missing, 2, 0), None);
     }
 }
