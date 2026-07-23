@@ -21,7 +21,7 @@ use crate::pipeline::local_sim::{
 use crate::pipeline::route_calls::route_fits_executor;
 use crate::pipeline::sim_sanity::{
     FlashBorrowCapParams, SimSanityInput, SimSanityReject, check_sim_sanity, check_sim_sanity_fast,
-    check_sim_sanity_for_dispatch, min_economic_amount_in,
+    check_sim_sanity_for_dispatch, min_economic_amount_in, min_final_profit_matic_wei,
 };
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
 use crate::pipeline::ternary::{BRENT_SEED_CACHE_SLOTS, RouteGasCosting, optimize_cycle};
@@ -1685,7 +1685,7 @@ fn assess_route_for_cycle(
 ) -> Option<ProfitAssessment> {
     let risk_bps = input.execution.route_risk_multiplier_bps(fp);
     let thresholds = route_profit_thresholds(
-        input.min_profit_matic,
+        min_final_profit_matic_wei(input.matic_usd, input.matic_usd_chainlink).unwrap_or(U256::MAX),
         input.min_profit_roi_bps,
         input.safety_multiplier_bps,
         input.profit_priority_alpha_bps,

@@ -15,6 +15,7 @@ use crate::orchestrator::hf_eval::{
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
+use crate::pipeline::sim_sanity::min_final_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
@@ -287,7 +288,6 @@ pub(crate) async fn dispatch_profitable_candidates(
         .collect();
 
     let operator = ctx.wallet.operator_address(executor);
-    let min_profit_matic = ctx.config.min_profit_matic;
 
     dispatch_with_provider(
         ctx,
@@ -296,7 +296,6 @@ pub(crate) async fn dispatch_profitable_candidates(
         &sim_provider,
         operator,
         executor,
-        min_profit_matic,
         inputs.pool_metas,
         &pool_metas_by_pool,
         inputs.token_to_matic_rates,
@@ -322,7 +321,6 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     sim_provider: &P,
     operator: alloy::primitives::Address,
     executor: alloy::primitives::Address,
-    min_profit_matic: U256,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     pool_metas_by_pool: &FxHashMap<
         crate::core::types::PoolIndex,
@@ -356,6 +354,14 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
         return;
     };
+    let min_profit_matic =
+        min_final_profit_matic_wei(matic_usd, ctx.price_oracle.fresh_matic_usd_chainlink_raw())
+            .unwrap_or(U256::MAX);
+    // ponytail: one line per dispatch batch — verify $0.01 floor + wired executor
+    crate::info!(
+        "dispatch floor: min_profit_matic_wei={min_profit_matic} matic_usd={matic_usd:.6} executor={executor} candidates={}",
+        profitable.len()
+    );
     let deadline_secs = ctx.config.execution.deadline_secs;
 
     let profitable: Vec<_> = profitable

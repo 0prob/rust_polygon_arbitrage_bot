@@ -25,7 +25,9 @@ use crate::infra::rpc::{RpcPool, rpc_host_label};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
-use crate::pipeline::sim_sanity::{FlashBorrowCapParams, SimSanityInput};
+use crate::pipeline::sim_sanity::{
+    FlashBorrowCapParams, SimSanityInput, min_final_profit_matic_wei,
+};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::aave::{
@@ -1572,7 +1574,7 @@ fn prepare_profit_thresholds(
     input: &PrepareDispatchInput<'_>,
 ) -> crate::services::execution::profit::ProfitThresholds {
     route_profit_thresholds(
-        input.min_profit_matic,
+        min_final_profit_matic_wei(input.matic_usd, input.matic_usd_chainlink).unwrap_or(U256::MAX),
         input.min_profit_roi_bps,
         input.safety_multiplier_bps,
         input.profit_priority_alpha_bps,

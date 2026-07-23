@@ -243,9 +243,7 @@ fn default_execution_mode() -> String {
     "dry-run".to_string()
 }
 fn default_min_profit_matic_wei() -> String {
-    // 0.01 MATIC — 0.1 MATIC default starved dry-run/live funnel while best-eval
-    // gross sat at ~0.007 MATIC (cover ≪ gas). Live .env uses this floor.
-    "10000000000000000".to_string()
+    "0".to_string()
 }
 fn default_slippage_bps() -> u64 {
     0
@@ -269,8 +267,7 @@ fn default_profit_priority_fee_alpha_bps() -> u64 {
     1_000
 }
 fn default_profit_safety_multiplier_bps() -> u64 {
-    // 1.5× gas floor. 2.5× rejected near-misses that clear at tip; live often uses 1.0×.
-    15_000
+    10_000
 }
 fn default_min_operator_matic_wei() -> String {
     "500000000000000000".to_string()
@@ -1014,8 +1011,8 @@ mod tests {
         assert_eq!(c.rpc.request_timeout_ms, 12_000);
         assert_eq!(c.pipeline.hf_prefetch_count, 60);
         assert_eq!(c.oracle.tick_word_range, 6);
-        assert_eq!(c.execution.profit_safety_multiplier_bps, 15_000);
-        assert_eq!(c.execution.min_profit_matic_wei, "10000000000000000");
+        assert_eq!(c.execution.profit_safety_multiplier_bps, 10_000);
+        assert_eq!(c.execution.min_profit_matic_wei, "0");
     }
 
     #[test]

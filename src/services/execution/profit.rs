@@ -1151,6 +1151,21 @@ mod safety_tests {
     }
 
     #[test]
+    fn live_gas_floor_accepts_breakeven_cover_and_rejects_less() {
+        let mut i = input();
+        i.flash_loan_source = FlashLoanSource::Direct;
+        i.slippage_bps = 0;
+        i.gas_units = 1;
+        i.gas_price_wei = U256::from(100u64);
+        i.gross_profit = U256::from(200u64);
+        i.amount_in = U256::from(200u64);
+        i.min_profit_matic_wei = U256::from(1u64);
+        assert!(assess_profit(&i).should_execute);
+        i.gross_profit = U256::from(199u64);
+        assert!(!assess_profit(&i).should_execute);
+    }
+
+    #[test]
     fn zero_slippage_preserves_full_profit() {
         let mut i = input();
         i.slippage_bps = 0;

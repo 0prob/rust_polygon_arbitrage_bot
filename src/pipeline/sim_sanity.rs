@@ -53,6 +53,41 @@ pub fn matic_usd_for_flash_cap(matic_usd: f64) -> Option<f64> {
     (matic_usd.is_finite() && matic_usd > 0.0).then_some(matic_usd)
 }
 
+pub const MIN_FINAL_PROFIT_USD_CENTS: u64 = 1;
+
+#[must_use]
+pub fn min_final_profit_matic_wei(
+    matic_usd: f64,
+    matic_usd_chainlink: Option<I256>,
+) -> Option<U256> {
+    let (price, scale) = match matic_usd_chainlink {
+        Some(raw) => {
+            let Ok(raw) = i128::try_from(raw) else {
+                return None;
+            };
+            if raw <= 0 {
+                return None;
+            }
+            (U256::from(raw as u128), 100_000_000u64)
+        }
+        None => {
+            let micros = (matic_usd_for_flash_cap(matic_usd)? * 1_000_000.0).floor();
+            if !micros.is_finite() || micros <= 0.0 {
+                return None;
+            }
+            (
+                U256::from(u64::try_from(micros as u128).ok()?),
+                1_000_000u64,
+            )
+        }
+    };
+    let numerator = U256::from(MIN_FINAL_PROFIT_USD_CENTS)
+        .checked_mul(ONE)?
+        .checked_mul(U256::from(scale))?;
+    let denominator = price.checked_mul(U256::from(100u64))?;
+    Some(numerator.checked_add(denominator.checked_sub(U256::from(1u64))?)? / denominator)
+}
+
 /// USD notional cap → MATIC wei from a Chainlink MATIC/USD answer (8 decimals).
 #[must_use]
 pub fn max_flash_loan_matic_wei_from_usd_chainlink_8(
@@ -494,5 +529,14 @@ mod tests {
         let float_cap = max_flash_borrow_wei(50_000, 18, rate, 0.5, None).expect("float");
         let chain_cap = max_flash_borrow_wei(50_000, 18, rate, 0.0, Some(matic_raw)).expect("cl");
         assert_eq!(float_cap, chain_cap);
+    }
+
+    #[test]
+    fn final_profit_floor_is_one_usd_cent_and_rounds_up() {
+        let floor = min_final_profit_matic_wei(0.5, None).expect("float floor");
+        assert_eq!(floor, U256::from(2u64 * 10u64.pow(16)));
+        let raw = I256::from(U256::from(33_333_333u64));
+        let floor = min_final_profit_matic_wei(0.0, Some(raw)).expect("chainlink floor");
+        assert_eq!(floor, U256::from(30_000_000_300_000_004u64));
     }
 }
