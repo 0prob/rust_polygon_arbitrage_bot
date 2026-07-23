@@ -61,9 +61,17 @@ pub fn is_plausible_contract_address(addr: Address) -> bool {
 #[must_use]
 pub fn is_supported_v4_pool(protocol: ProtocolType, hooks: Option<Address>) -> bool {
     match protocol {
-        ProtocolType::UniswapV4 => hooks.is_none_or(|h| h.is_zero()),
+        ProtocolType::UniswapV4 => hooks.is_none_or(is_supported_v4_hook),
         _ => true,
     }
+}
+
+#[must_use]
+pub fn is_supported_v4_hook(hook: Address) -> bool {
+    const SWAP_HOOK_BLOCKLIST_MASK: u16 = 0x00cc;
+    let bytes = hook.as_slice();
+    let flags = u16::from_be_bytes([bytes[18], bytes[19]]);
+    hook.is_zero() || flags & SWAP_HOOK_BLOCKLIST_MASK == 0
 }
 
 /// Read env var once; defaults to enabled (no change from current behaviour).
@@ -539,10 +547,18 @@ mod tests {
             ProtocolType::UniswapV4,
             Some(Address::ZERO)
         ));
+        assert!(is_supported_v4_pool(
+            ProtocolType::UniswapV4,
+            Some(
+                "0x0000000000000000000000000000000000000100"
+                    .parse()
+                    .expect("test pool address should parse")
+            )
+        ));
         assert!(!is_supported_v4_pool(
             ProtocolType::UniswapV4,
             Some(
-                "0x00000000000000000000000000000000000000ab"
+                "0x0000000000000000000000000000000000000088"
                     .parse()
                     .expect("test pool address should parse")
             )

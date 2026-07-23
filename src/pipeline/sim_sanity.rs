@@ -88,6 +88,16 @@ pub fn min_final_profit_matic_wei(
     Some(numerator.checked_add(denominator.checked_sub(U256::from(1u64))?)? / denominator)
 }
 
+#[must_use]
+pub fn required_profit_matic_wei(
+    configured_min_profit: U256,
+    matic_usd: f64,
+    matic_usd_chainlink: Option<I256>,
+) -> Option<U256> {
+    min_final_profit_matic_wei(matic_usd, matic_usd_chainlink)
+        .map(|final_floor| final_floor.max(configured_min_profit))
+}
+
 /// USD notional cap → MATIC wei from a Chainlink MATIC/USD answer (8 decimals).
 #[must_use]
 pub fn max_flash_loan_matic_wei_from_usd_chainlink_8(
@@ -538,5 +548,14 @@ mod tests {
         let raw = I256::from(U256::from(33_333_333u64));
         let floor = min_final_profit_matic_wei(0.0, Some(raw)).expect("chainlink floor");
         assert_eq!(floor, U256::from(30_000_000_300_000_004u64));
+    }
+
+    #[test]
+    fn required_profit_floor_honors_configured_minimum() {
+        let configured = U256::from(30_000_000_000_000_000u64);
+        assert_eq!(
+            required_profit_matic_wei(configured, 1.0, None),
+            Some(configured)
+        );
     }
 }

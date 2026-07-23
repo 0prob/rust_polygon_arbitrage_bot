@@ -1262,8 +1262,14 @@ fn select_cycles_for_rescore(
     active.sort_by(|a, b| {
         compare_cycle_score(a.0.as_ref(), b.0.as_ref()).then_with(|| b.1.cmp(&a.1))
     });
-    // Inactive: quality order so rotation windows still prefer stronger cycle_ratio first.
-    inactive.sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
+    // Inactive: non-CL first (V2/BAL/CRV don't need TickLens), then quality.
+    // Iter3: stream CL noise left best-eval V2 count at 3 vs 2371 in a prior
+    // profitable window — hydrate/tickless burned inactive slots.
+    inactive.sort_by(|a, b| {
+        cycle_needs_cl_ticks(a.as_ref())
+            .cmp(&cycle_needs_cl_ticks(b.as_ref()))
+            .then_with(|| compare_cycle_score(a.as_ref(), b.as_ref()))
+    });
 
     // Cap live/active slots — actscore filled rescore_cap with seed-stamped
     // zero_profit cycles (probe_kept=0 on 30/31) and starved quality inactive
@@ -2675,6 +2681,16 @@ pub async fn run_hf_tick(
     }
 
     Ok(tick_result)
+}
+
+/// True when any hop needs concentrated-liquidity tick hydration.
+fn cycle_needs_cl_ticks(cycle: &FoundCycle) -> bool {
+    cycle.edges.iter().any(|e| {
+        matches!(
+            e.protocol,
+            ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+        )
+    })
 }
 
 fn protocol_tag(protocol: ProtocolType) -> &'static str {

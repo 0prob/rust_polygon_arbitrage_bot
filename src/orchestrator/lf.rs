@@ -1307,48 +1307,64 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     ctx.rpc.deprioritize_state_url(url);
                     continue;
                 };
-                if v3_pending {
-                    let needed = still_tickless_v3(&arena, &tick_pools_needed);
-                    if needed.is_empty() {
-                        v3_pending = false;
-                    } else {
-                        let v3_ticks_started = crate::util::now_ms();
-                        v3 = enrich_v3_ticks(
-                            &provider,
-                            &mut arena,
-                            &needed,
-                            ctx.config.oracle.tick_word_range,
-                            &algebra_pools,
-                            &algebra_integral_pools,
-                            pinned_block,
-                            true,
-                        )
-                        .await;
-                        v3_ticks_ms = v3_ticks_ms
-                            .saturating_add(crate::util::now_ms().saturating_sub(v3_ticks_started));
-                        v3_ticks_loaded = v3_ticks_loaded.saturating_add(v3.loaded);
-                        v3_pending = v3.rpc_failed;
+                let (v3_new, v4_new) = crate::infra::rpc_budget::scope_rpc_budget(url, async {
+                    let mut v3_new = None;
+                    let mut v4_new = None;
+                    if v3_pending {
+                        let needed = still_tickless_v3(&arena, &tick_pools_needed);
+                        if needed.is_empty() {
+                            v3_pending = false;
+                        } else {
+                            let v3_ticks_started = crate::util::now_ms();
+                            let res = enrich_v3_ticks(
+                                &provider,
+                                &mut arena,
+                                &needed,
+                                ctx.config.oracle.tick_word_range,
+                                &algebra_pools,
+                                &algebra_integral_pools,
+                                pinned_block,
+                                true,
+                            )
+                            .await;
+                            v3_ticks_ms = v3_ticks_ms.saturating_add(
+                                crate::util::now_ms().saturating_sub(v3_ticks_started),
+                            );
+                            v3_new = Some(res);
+                        }
                     }
+                    if v4_pending {
+                        let needed = still_tickless_v4(&arena, &v4_tick_pools_needed);
+                        if needed.is_empty() {
+                            v4_pending = false;
+                        } else {
+                            let v4_ticks_started = crate::util::now_ms();
+                            let res = enrich_v4_ticks(
+                                &provider,
+                                &mut arena,
+                                &needed,
+                                ctx.config.oracle.tick_word_range,
+                                pinned_block,
+                            )
+                            .await;
+                            v4_ticks_ms = v4_ticks_ms.saturating_add(
+                                crate::util::now_ms().saturating_sub(v4_ticks_started),
+                            );
+                            v4_new = Some(res);
+                        }
+                    }
+                    (v3_new, v4_new)
+                })
+                .await;
+                if let Some(res) = v3_new {
+                    v3_ticks_loaded = v3_ticks_loaded.saturating_add(res.loaded);
+                    v3_pending = res.rpc_failed;
+                    v3 = res;
                 }
-                if v4_pending {
-                    let needed = still_tickless_v4(&arena, &v4_tick_pools_needed);
-                    if needed.is_empty() {
-                        v4_pending = false;
-                    } else {
-                        let v4_ticks_started = crate::util::now_ms();
-                        v4 = enrich_v4_ticks(
-                            &provider,
-                            &mut arena,
-                            &needed,
-                            ctx.config.oracle.tick_word_range,
-                            pinned_block,
-                        )
-                        .await;
-                        v4_ticks_ms = v4_ticks_ms
-                            .saturating_add(crate::util::now_ms().saturating_sub(v4_ticks_started));
-                        v4_ticks_loaded = v4_ticks_loaded.saturating_add(v4.loaded);
-                        v4_pending = v4.rpc_failed;
-                    }
+                if let Some(res) = v4_new {
+                    v4_ticks_loaded = v4_ticks_loaded.saturating_add(res.loaded);
+                    v4_pending = res.rpc_failed;
+                    v4 = res;
                 }
                 if !v3_pending && !v4_pending {
                     if url_index > 0 {

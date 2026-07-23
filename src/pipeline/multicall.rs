@@ -148,6 +148,8 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("global multicall admission closed"))?;
+        // Per-host token bucket (task-local URL from `scope_rpc_budget`).
+        crate::infra::rpc_budget::admit_rpc_request().await;
         let mut call = contract.aggregate3(std::mem::take(&mut calls));
         if let Some(number) = block_number {
             call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));
@@ -170,6 +172,9 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
                 let e: anyhow::Error = e.into();
                 drop(_permit);
                 if is_rate_limited_rpc_error(&e) {
+                    if let Some(url) = crate::infra::rpc_budget::current_budget_url() {
+                        crate::infra::rpc_budget::note_rate_limited(&url);
+                    }
                     return Err(e);
                 }
                 if is_retryable_rpc_error(&e) && attempt < 4 {
@@ -270,6 +275,8 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
         MAX_CONCURRENT_CHUNKS.min(num_chunks).max(1),
     ));
 
+    // JoinSet tasks do not inherit task-locals — re-scope the budget URL per chunk.
+    let budget_url = crate::infra::rpc_budget::current_budget_url();
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..num_chunks {
         let start = i * max_chunk;
@@ -278,12 +285,19 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
         let p = provider.clone();
         let bn = block_number;
         let items = Arc::clone(&items);
+        let budget_url = budget_url.clone();
         tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire().await else {
-                return (i, Err(anyhow::anyhow!("multicall semaphore closed")));
+            let run = async {
+                let Ok(_permit) = sem.acquire().await else {
+                    return (i, Err(anyhow::anyhow!("multicall semaphore closed")));
+                };
+                let res = execute_multicall_chunk_resilient(&p, &items[start..end], bn).await;
+                (i, res)
             };
-            let res = execute_multicall_chunk_resilient(&p, &items[start..end], bn).await;
-            (i, res)
+            match budget_url {
+                Some(url) => crate::infra::rpc_budget::scope_rpc_budget(&url, run).await,
+                None => run.await,
+            }
         });
     }
 

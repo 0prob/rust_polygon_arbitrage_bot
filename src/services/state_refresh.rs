@@ -943,35 +943,42 @@ impl StateRefreshService {
             }
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
-            let fetch_result = if let Some(ref addrs) = retry_addrs {
-                fetch_pool_states_at_addresses(
-                    provider,
-                    Arc::clone(&self.cache),
-                    pools,
-                    &address_index,
-                    addrs,
-                    self.config.max_multicall_calls as usize,
-                    self.config.rpc.batch_pace_ms,
-                    pinned_block,
-                    &self.pool_meta_cache,
-                )
-                .await
-            } else {
-                fetch_missing_pool_states_indexed(
-                    provider,
-                    Arc::clone(&self.cache),
-                    pools,
-                    &address_index,
-                    &self.fetch_never_scan_offset,
-                    max_pools,
-                    self.config.max_multicall_calls as usize,
-                    self.config.rpc.batch_pace_ms,
-                    hot,
-                    pinned_block,
-                    &self.pool_meta_cache,
-                )
-                .await
-            };
+            let pace = crate::infra::rpc_budget::effective_batch_pace_ms(
+                url,
+                self.config.rpc.batch_pace_ms,
+            );
+            let fetch_result = crate::infra::rpc_budget::scope_rpc_budget(url, async {
+                if let Some(ref addrs) = retry_addrs {
+                    fetch_pool_states_at_addresses(
+                        provider,
+                        Arc::clone(&self.cache),
+                        pools,
+                        &address_index,
+                        addrs,
+                        self.config.max_multicall_calls as usize,
+                        pace,
+                        pinned_block,
+                        &self.pool_meta_cache,
+                    )
+                    .await
+                } else {
+                    fetch_missing_pool_states_indexed(
+                        provider,
+                        Arc::clone(&self.cache),
+                        pools,
+                        &address_index,
+                        &self.fetch_never_scan_offset,
+                        max_pools,
+                        self.config.max_multicall_calls as usize,
+                        pace,
+                        hot,
+                        pinned_block,
+                        &self.pool_meta_cache,
+                    )
+                    .await
+                }
+            })
+            .await;
             fetch_ms = fetch_ms.saturating_add(now_ms().saturating_sub(fetch_started));
             let updated = fetch_result.updated;
             total_updated = total_updated.saturating_add(updated);

@@ -24,7 +24,16 @@ const POOL_META_VALIDITY_SQL: &str = r#"
         AND cardinality(tokens) >= 2
         AND (
             protocol <> 'UNISWAP_V4'
-            OR (fee IS NOT NULL AND "tickSpacing" IS NOT NULL AND "poolId" IS NOT NULL AND hooks IS NOT NULL)
+            OR (
+                fee IS NOT NULL
+                AND "tickSpacing" IS NOT NULL
+                AND "poolId" IS NOT NULL
+                AND hooks IS NOT NULL
+                AND (
+                    lower(hooks) = '0x0000000000000000000000000000000000000000'
+                    OR ((('x' || right(lower(hooks), 4))::bit(16)::int & 204) = 0)
+                )
+            )
         )
         AND (
             protocol <> 'BALANCER_V2'
@@ -701,6 +710,7 @@ mod tests {
         assert!(page.contains(r#"("createdBlock", id) >"#));
         assert!(page.contains("cardinality(tokens) >= 2"));
         assert!(page.contains("protocol <> 'UNISWAP_V4'"));
+        assert!(page.contains("right(lower(hooks), 4)"));
         assert!(!page.contains("OFFSET"));
 
         let incremental = POOL_META_INCREMENTAL_SQL.as_str();

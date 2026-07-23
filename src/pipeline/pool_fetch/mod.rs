@@ -448,8 +448,15 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
         let provider = provider.clone();
         let cache = Arc::clone(&cache);
+        let budget_url = crate::infra::rpc_budget::current_budget_url();
         tasks.spawn(async move {
-            execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
+            let run = async {
+                execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
+            };
+            match budget_url {
+                Some(url) => crate::infra::rpc_budget::scope_rpc_budget(&url, run).await,
+                None => run.await,
+            }
         });
     }
     // Stop in-flight RPCs once any batch is rate-limited (JoinSet drop alone waits).

@@ -546,7 +546,11 @@ impl FlashLiquidityCache {
                     continue;
                 }
             };
-            match self.fetch_and_publish(&provider, &to_fetch).await {
+            match crate::infra::rpc_budget::scope_rpc_budget(url, async {
+                self.fetch_and_publish(&provider, &to_fetch).await
+            })
+            .await
+            {
                 Ok(()) => return Ok(self.generation()),
                 Err(e) => {
                     if is_rpc_rate_limited(&e) {

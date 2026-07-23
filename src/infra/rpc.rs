@@ -104,17 +104,24 @@ impl RpcPool {
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
         let mut healthy = Vec::with_capacity(urls.len());
+        let mut budget_tight = Vec::new();
         let mut penalized = Vec::new();
         for url in urls.iter() {
             if penalties
                 .get(url.as_str())
                 .is_none_or(|until| now >= *until)
             {
-                healthy.push(url.clone());
+                // Demote hosts nearly out of tokens so fallback can absorb load.
+                if crate::infra::rpc_budget::approx_tokens(url) >= 1.0 {
+                    healthy.push(url.clone());
+                } else {
+                    budget_tight.push(url.clone());
+                }
             } else {
                 penalized.push(url.clone());
             }
         }
+        healthy.extend(budget_tight);
         healthy.extend(penalized);
         healthy
     }
@@ -149,6 +156,7 @@ impl RpcPool {
 
     /// Longer cool-off for rate-limited / 429 endpoints (avoid hammering).
     pub fn deprioritize_state_url_rate_limited(&self, url: &str) {
+        crate::infra::rpc_budget::note_rate_limited(url);
         self.deprioritize_state_url_for(url, STATE_URL_RATE_LIMIT_PENALTY, "rate_limit");
     }
 
@@ -251,7 +259,13 @@ impl RpcPool {
             crate::warn!("state RPC probe found no healthy endpoints — keeping configured order");
             return;
         }
-        ranked.sort_by_key(|(_, latency)| *latency);
+        // Paid/keyed hosts before free public (Allnodes 1200/min) even if public is
+        // a few ms faster — live: publicnode ranked first then burned the free cap.
+        ranked.sort_by(|(a, la), (b, lb)| {
+            crate::infra::rpc_budget::host_rank_class(a)
+                .cmp(&crate::infra::rpc_budget::host_rank_class(b))
+                .then_with(|| la.cmp(lb))
+        });
         // Drop cool-offs for URLs that just answered — otherwise deprioritize(60s)
         // overrode the new rank and `state_url()` kept serving a slower peer
         // (live: fast primary stayed skipped after transient multicall fail).

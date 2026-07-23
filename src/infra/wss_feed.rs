@@ -30,6 +30,9 @@ const WSS_PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Per-endpoint connect + `eth_blockNumber` probe budget (fail-fast multi-URL select).
 const WSS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS: u64 = 60_000;
+/// Free-plan / 429 subscription failures need longer cool-off (live: dRPC code 15
+/// every ~60s when rotated back too soon).
+const WSS_RATE_LIMIT_COOLDOWN_MS: u64 = 120_000;
 /// No Sync/Swap after arm → force LF to rotate interest set / re-seed ranking.
 const WSS_LOG_SILENCE_FORCE: Duration = Duration::from_secs(20);
 
@@ -98,7 +101,7 @@ impl PoolLogFeed {
                         {
                             Err(e) => {
                                 warn!("WSS subscription error ({}): {e}", rpc_host_label(&url));
-                                self.cool_down_subscription_endpoint(&url);
+                                self.cool_down_subscription_from_error(&url, &e);
                                 *self.sticky_url.lock() = None;
                             }
                             Ok(SubscriptionExit::AddressChange) => {
@@ -322,14 +325,27 @@ impl PoolLogFeed {
     }
 
     fn cool_down_subscription_endpoint(&self, url: &str) {
-        let until_ms = now_ms().saturating_add(WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS);
+        self.cool_down_subscription_endpoint_for(url, WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS);
+    }
+
+    fn cool_down_subscription_endpoint_for(&self, url: &str, cooldown_ms: u64) {
+        let until_ms = now_ms().saturating_add(cooldown_ms);
         self.subscription_cooldowns
             .lock()
             .insert(url.to_string(), until_ms);
         warn!(
-            "WSS endpoint subscription cooldown ({}, cooldown_ms={WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS})",
+            "WSS endpoint subscription cooldown ({}, cooldown_ms={cooldown_ms})",
             rpc_host_label(url)
         );
+    }
+
+    fn cool_down_subscription_from_error(&self, url: &str, err: &impl std::fmt::Display) {
+        let cooldown = if crate::services::execution::rpc_errors::is_rpc_rate_limited(err) {
+            WSS_RATE_LIMIT_COOLDOWN_MS
+        } else {
+            WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS
+        };
+        self.cool_down_subscription_endpoint_for(url, cooldown);
     }
 }
 

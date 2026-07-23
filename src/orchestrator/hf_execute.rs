@@ -15,7 +15,7 @@ use crate::orchestrator::hf_eval::{
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{self, simulate_route_detailed};
-use crate::pipeline::sim_sanity::min_final_profit_matic_wei;
+use crate::pipeline::sim_sanity::required_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
@@ -355,9 +355,12 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
         return;
     };
-    let min_profit_matic =
-        min_final_profit_matic_wei(matic_usd, ctx.price_oracle.fresh_matic_usd_chainlink_raw())
-            .unwrap_or(U256::MAX);
+    let min_profit_matic = required_profit_matic_wei(
+        ctx.config.min_profit_matic,
+        matic_usd,
+        ctx.price_oracle.fresh_matic_usd_chainlink_raw(),
+    )
+    .unwrap_or(U256::MAX);
     // ponytail: one line per dispatch batch — verify $0.01 floor + wired executor
     crate::info!(
         "dispatch floor: min_profit_matic_wei={min_profit_matic} matic_usd={matic_usd:.6} executor={executor} candidates={}",
@@ -1216,41 +1219,53 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
             rpc.deprioritize_state_url(url);
             continue;
         };
-        if v3_pending {
-            let needed = still_tickless_v3(arena, &v3);
-            if needed.is_empty() {
-                v3_pending = false;
-            } else {
-                let res = enrich_v3_ticks(
-                    &provider,
-                    arena,
-                    &needed,
-                    probe_word_range,
-                    &algebra_pools,
-                    &algebra_integral_pools,
-                    block_number,
-                    false, // probe residual budget — narrow only
-                )
-                .await;
-                stats.v3_loaded = stats.v3_loaded.saturating_add(res.loaded);
-                stats.v3_empty = res.empty_pools;
-                stats.v3_incomplete = res.incomplete_pools;
-                stats.v3_algebra_loaded =
-                    stats.v3_algebra_loaded.saturating_add(res.algebra_loaded);
-                stats.v3_seeded = res.seeded_pools;
-                v3_pending = res.rpc_failed;
+        let (v3_res, v4_res) = crate::infra::rpc_budget::scope_rpc_budget(url, async {
+            let mut v3_res = None;
+            let mut v4_res = None;
+            if v3_pending {
+                let needed = still_tickless_v3(arena, &v3);
+                if needed.is_empty() {
+                    v3_pending = false;
+                } else {
+                    v3_res = Some(
+                        enrich_v3_ticks(
+                            &provider,
+                            arena,
+                            &needed,
+                            probe_word_range,
+                            &algebra_pools,
+                            &algebra_integral_pools,
+                            block_number,
+                            false, // probe residual budget — narrow only
+                        )
+                        .await,
+                    );
+                }
             }
+            if v4_pending {
+                let needed = still_tickless_v4(arena, &v4);
+                if needed.is_empty() {
+                    v4_pending = false;
+                } else {
+                    v4_res =
+                        Some(enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await);
+                }
+            }
+            (v3_res, v4_res)
+        })
+        .await;
+        if let Some(res) = v3_res {
+            stats.v3_loaded = stats.v3_loaded.saturating_add(res.loaded);
+            stats.v3_empty = res.empty_pools;
+            stats.v3_incomplete = res.incomplete_pools;
+            stats.v3_algebra_loaded =
+                stats.v3_algebra_loaded.saturating_add(res.algebra_loaded);
+            stats.v3_seeded = res.seeded_pools;
+            v3_pending = res.rpc_failed;
         }
-        if v4_pending {
-            let needed = still_tickless_v4(arena, &v4);
-            if needed.is_empty() {
-                v4_pending = false;
-            } else {
-                let res =
-                    enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
-                stats.v4_loaded = stats.v4_loaded.saturating_add(res.loaded);
-                v4_pending = res.rpc_failed;
-            }
+        if let Some(res) = v4_res {
+            stats.v4_loaded = stats.v4_loaded.saturating_add(res.loaded);
+            v4_pending = res.rpc_failed;
         }
         if !v3_pending && !v4_pending {
             if url_index > 0 {
@@ -1303,36 +1318,48 @@ async fn enrich_dispatch_cl_ticks(
             rpc.deprioritize_state_url(url);
             continue;
         };
-        if v3_pending {
-            let needed = still_tickless_v3(arena, &tick_pools);
-            if needed.is_empty() {
-                v3_pending = false;
-            } else {
-                let res = enrich_v3_ticks(
-                    &provider,
-                    arena,
-                    &needed,
-                    word_range,
-                    &algebra_pools,
-                    &algebra_integral_pools,
-                    block_number,
-                    true, // dispatch path can afford widen
-                )
-                .await;
-                v3_loaded = v3_loaded.saturating_add(res.loaded);
-                v3_pending = res.rpc_failed;
+        let (v3_res, v4_res) = crate::infra::rpc_budget::scope_rpc_budget(url, async {
+            let mut v3_res = None;
+            let mut v4_res = None;
+            if v3_pending {
+                let needed = still_tickless_v3(arena, &tick_pools);
+                if needed.is_empty() {
+                    v3_pending = false;
+                } else {
+                    v3_res = Some(
+                        enrich_v3_ticks(
+                            &provider,
+                            arena,
+                            &needed,
+                            word_range,
+                            &algebra_pools,
+                            &algebra_integral_pools,
+                            block_number,
+                            true, // dispatch path can afford widen
+                        )
+                        .await,
+                    );
+                }
             }
+            if v4_pending {
+                let needed = still_tickless_v4(arena, &v4_targets);
+                if needed.is_empty() {
+                    v4_pending = false;
+                } else {
+                    v4_res =
+                        Some(enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await);
+                }
+            }
+            (v3_res, v4_res)
+        })
+        .await;
+        if let Some(res) = v3_res {
+            v3_loaded = v3_loaded.saturating_add(res.loaded);
+            v3_pending = res.rpc_failed;
         }
-        if v4_pending {
-            let needed = still_tickless_v4(arena, &v4_targets);
-            if needed.is_empty() {
-                v4_pending = false;
-            } else {
-                let res =
-                    enrich_v4_ticks(&provider, arena, &needed, word_range, block_number).await;
-                v4_loaded = v4_loaded.saturating_add(res.loaded);
-                v4_pending = res.rpc_failed;
-            }
+        if let Some(res) = v4_res {
+            v4_loaded = v4_loaded.saturating_add(res.loaded);
+            v4_pending = res.rpc_failed;
         }
         if !v3_pending && !v4_pending {
             if url_index > 0 {

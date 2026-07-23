@@ -22,8 +22,8 @@ pub fn encode_v4_hop(
     let pool_manager: Address = UNISWAP_V4_POOL_MANAGER;
     let (fee, tick_spacing, hooks) = v4_static_fields(arena, hop);
 
-    if hooks != Address::ZERO {
-        anyhow::bail!("v4 hook pools are not supported");
+    if !crate::services::discovery::is_supported_v4_hook(hooks) {
+        anyhow::bail!("v4 swap-hook pools are blocked");
     }
     if hop.edge.zero_for_one != (hop.token_in < hop.token_out) {
         anyhow::bail!("v4 zero_for_one must match sorted currency0 (token_in < token_out)");
@@ -229,5 +229,23 @@ mod tests {
         assert_eq!(&inner[12..32], t0.as_slice()); // currency0
         assert_eq!(&inner[44..64], t1.as_slice()); // currency1
         assert_eq!(inner[191], 1u8); // zeroForOne (word 5, last byte)
+    }
+
+    #[test]
+    fn passive_hook_is_encoded_in_pool_key() {
+        let passive_hook: Address = "0x0000000000000000000000000000000000000100"
+            .parse()
+            .expect("passive hook address");
+        let (key, _) = build_v4_pool_key(
+            Address::with_last_byte(1),
+            Address::with_last_byte(2),
+            3_000,
+            60,
+            passive_hook,
+        );
+        assert_eq!(key.hooks, passive_hook);
+        assert!(crate::services::discovery::is_supported_v4_hook(
+            passive_hook
+        ));
     }
 }
