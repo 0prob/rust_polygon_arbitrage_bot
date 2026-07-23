@@ -64,6 +64,24 @@ fn is_retryable_rpc_error(e: &anyhow::Error) -> bool {
         .any(|pat| b.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
 }
 
+fn is_non_bisectable_rpc_error(e: &anyhow::Error) -> bool {
+    if crate::services::execution::rpc_errors::is_rpc_rate_limited(e) {
+        return true;
+    }
+    let msg = format!("{e:#}");
+    let b = msg.as_bytes();
+    const PATTERNS: &[&[u8]] = &[
+        b"error code -32601",
+        b"method eth_call does not exist",
+        b"http error 401",
+        b"api key disabled",
+        b"invalid account id",
+    ];
+    PATTERNS
+        .iter()
+        .any(|pat| b.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)))
+}
+
 fn build_calls(items: &[MulticallItem]) -> Vec<IMulticall3::Call3> {
     let mut calls = Vec::with_capacity(items.len());
     for item in items {
@@ -102,7 +120,7 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                     out[start + i] = result;
                 }
             }
-            Err(e) if crate::services::execution::rpc_errors::is_rpc_rate_limited(&e) => {
+            Err(e) if is_non_bisectable_rpc_error(&e) => {
                 return Err(e);
             }
             Err(_e) if slice.len() > 1 => {
@@ -326,8 +344,8 @@ pub fn encode_call<C: SolCall>(call: &C) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        MULTICALL_CHUNK, global_multicall_available_permits, is_retryable_rpc_error,
-        plan_batch_call_budget,
+        MULTICALL_CHUNK, global_multicall_available_permits, is_non_bisectable_rpc_error,
+        is_retryable_rpc_error, plan_batch_call_budget,
     };
 
     #[test]
@@ -386,8 +404,25 @@ mod tests {
     #[test]
     fn rate_limited_errors_are_not_bisected() {
         let err = anyhow::anyhow!("429 Too Many Requests");
-        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(
+            &err
+        ));
         assert!(!is_retryable_rpc_error(&err));
+        assert!(is_non_bisectable_rpc_error(&err));
+    }
+
+    #[test]
+    fn permanent_endpoint_errors_are_not_bisected() {
+        for message in [
+            "error code -32601: the method eth_call does not exist/is not available",
+            "HTTP error 401 with body: API key disabled",
+            "Invalid account ID",
+        ] {
+            assert!(is_non_bisectable_rpc_error(&anyhow::anyhow!(message)));
+        }
+        assert!(!is_non_bisectable_rpc_error(&anyhow::anyhow!(
+            "execution reverted"
+        )));
     }
 
     #[test]
@@ -396,11 +431,15 @@ mod tests {
         // and plain Display only shows the outer layer — bisect storms followed.
         let err = anyhow::anyhow!("error code 15: Too many request, try again later")
             .context("chunk multicall failed");
-        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(
+            &err
+        ));
         assert!(!is_retryable_rpc_error(&err));
         let err429 = anyhow::anyhow!("HTTP error 429 with body: Rate limit (1200rqs/60s) reached")
             .context("chunk multicall failed");
-        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err429));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(
+            &err429
+        ));
         assert!(!is_retryable_rpc_error(&err429));
     }
 
