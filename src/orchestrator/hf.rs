@@ -39,7 +39,7 @@ use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::services::partial_cache::PartialPoolCache;
 use crate::services::state_cache::StateCache;
-use crate::services::state_refresh::{PoolRefreshResult, StateRefreshService};
+use crate::services::state_refresh::{HF_POOL_STATE_FRESH, PoolRefreshResult, StateRefreshService};
 use crate::util::now_ms;
 use crate::util::ten_pow_u256;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -208,13 +208,31 @@ fn flash_blocking_stale(stale: &[Address], flash: &FlashLiquidityCache) -> Vec<A
         .collect()
 }
 
+fn hf_pool_prefetch_targets(
+    cache: &StateCache,
+    hot_pools: &[Address],
+    prefetch_count: usize,
+) -> Vec<Address> {
+    hot_pools
+        .iter()
+        .copied()
+        .filter(|pool| !cache.is_fresh_within(pool, HF_POOL_STATE_FRESH))
+        .take(prefetch_count)
+        .collect()
+}
+
 async fn hf_pool_prefetch(
     refresh: &StateRefreshService,
+    cache: &StateCache,
     hot_pools: &[Address],
     prefetch_count: usize,
 ) -> anyhow::Result<PoolRefreshResult> {
+    let pending = hf_pool_prefetch_targets(cache, hot_pools, prefetch_count);
+    if pending.is_empty() {
+        return Ok(PoolRefreshResult::default());
+    }
     refresh
-        .refresh_pool_states_for(hot_pools, prefetch_count)
+        .refresh_pool_states_for(&pending, pending.len())
         .await
 }
 
@@ -1749,6 +1767,7 @@ pub async fn run_hf_tick(
     let flash_cache = Arc::clone(&ctx.execution.flash_liquidity);
     let rpc = Arc::clone(&ctx.rpc);
     let refresh = Arc::clone(&ctx.refresh);
+    let state_cache = Arc::clone(&ctx.cache);
     // Residual prep budget for pool/flash (shared deadline — no stage stacking).
     let stage_budget = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
     // Reserve hydrate floor from *both* pool and flash. Live: pool_budget used the
@@ -1784,7 +1803,12 @@ pub async fn run_hf_tick(
             let pool_prefetch_started = now_ms();
             let result = timeout(
                 pool_budget,
-                hf_pool_prefetch(refresh.as_ref(), hot.as_ref(), prefetch_count),
+                hf_pool_prefetch(
+                    refresh.as_ref(),
+                    state_cache.as_ref(),
+                    hot.as_ref(),
+                    prefetch_count,
+                ),
             )
             .await;
             (result, now_ms().saturating_sub(pool_prefetch_started))
@@ -2832,6 +2856,19 @@ mod tests {
         let stale = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
         let flash = FlashLiquidityCache::new();
         assert!(flash_blocking_stale(&stale, &flash).is_empty());
+    }
+
+    #[test]
+    fn hf_pool_prefetch_skips_recent_entries_before_applying_cap() {
+        let fresh = Address::repeat_byte(0x11);
+        let missing = Address::repeat_byte(0x22);
+        let cache = StateCache::new(8, Duration::from_secs(30));
+        cache.insert(fresh, Arc::unwrap_or_clone(v2_state()));
+
+        assert_eq!(
+            hf_pool_prefetch_targets(&cache, &[fresh, missing], 1),
+            vec![missing]
+        );
     }
 
     #[test]

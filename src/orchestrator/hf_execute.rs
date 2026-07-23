@@ -51,7 +51,7 @@ use crate::services::execution::{
 };
 use crate::services::oracle::resolve_matic_usd_for_flash_dispatch;
 use crate::services::oracle::resolve_token_to_matic_rate_or_bootstrap;
-use crate::services::state_refresh::PoolRefreshResult;
+use crate::services::state_refresh::{HF_POOL_STATE_FRESH, PoolRefreshResult};
 
 enum RoutePoolRefreshAbort {
     NotIndexed {
@@ -118,9 +118,8 @@ async fn refresh_route_pools_into_arena(
     // Keep tradable entries fresher than ~1.5s (same HF tick / prefetch). Blind
     // remove + 429 left dispatch with tickless arena and aborted the candidate.
     // Fresh Invalid is not kept — `is_fresh_within` requires tradable.
-    const DISPATCH_CACHE_FRESH: std::time::Duration = std::time::Duration::from_millis(1_500);
     for pool in pools {
-        if !cache.is_fresh_within(pool, DISPATCH_CACHE_FRESH) {
+        if !cache.is_fresh_within(pool, HF_POOL_STATE_FRESH) {
             cache.remove(pool);
         }
     }

@@ -85,7 +85,7 @@ impl Ord for RankedPool<'_> {
 
 fn fetch_rank(pool: &DiscoveredPool, class: u8) -> FetchRank {
     FetchRank(
-        class,
+        if class == 3 { 0 } else { class },
         !pool.tokens.iter().any(|token| is_polygon_hub_token(*token)),
         Reverse(pool.created_block),
     )
@@ -484,6 +484,13 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].address, pools[2].address);
+    }
+
+    #[test]
+    fn stale_fetch_rank_precedes_never_fetched() {
+        let candidate = pool(1, 1);
+
+        assert!(fetch_rank(&candidate, 3) < fetch_rank(&candidate, 1));
     }
 
     #[test]

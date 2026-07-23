@@ -8,7 +8,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 
 ## Features
 
-- **Dual-frequency loop** — LF pass (code default 1s): pool discovery, state refresh, graph build, cycle enumeration. HF pass (code default 150ms): prefetch, Brent input sizing, local simulation, dry-run or live execution.
+- **Dual-frequency loop** — LF pass (code default 1s): pool discovery, state refresh, graph build, cycle enumeration. HF pass (code default 200ms): prefetch, Brent input sizing, local simulation, dry-run or live execution.
 - **Multi-protocol routing** — Uniswap V2/V3/V4 (hookless pools via `unlock`/`unlockCallback`), QuickSwap Algebra V3/Integral, Balancer V2, Curve (stable & crypto), DODO, WooFi.
 - **Cycle search** — Hybrid parallel DFS + Bellman-Ford (default), or `dfs` / `bellman-ford` alone (`johnson` is an env alias for Bellman-Ford); spot-weighted adjacency graph, atomic probe prefilter, graph/cycle caching.
 - **Pool discovery** — PostgreSQL direct SQL feed from HyperIndex; periodic refresh and dead-pool pruning. Optional V2 protocol toggles: `QUICKSWAP_V2_ENABLED`, `UNISWAP_V2_ENABLED`, `SUSHISWAP_V2_ENABLED` (unset = enabled).

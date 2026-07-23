@@ -199,6 +199,7 @@ pub struct ArenaSyncReport {
     pub metas: Vec<crate::pipeline::types::PoolMeta>,
     /// TokenIndex/PoolIndex were reassigned — cached cycles are poison.
     pub indices_rebuilt: bool,
+    pub invalidated_pool_indices: Vec<PoolIndex>,
 }
 
 impl StateArena {
@@ -518,6 +519,7 @@ impl StateArena {
                 return ArenaSyncReport {
                     metas: self.sync_tradable_inplace(&tradable, pools, decimal_hints),
                     indices_rebuilt: false,
+                    invalidated_pool_indices: Vec::new(),
                 };
             }
             ArenaReuse::Prefix { prefix_len } => {
@@ -530,30 +532,29 @@ impl StateArena {
                             decimal_hints,
                         ),
                         indices_rebuilt: false,
+                        invalidated_pool_indices: Vec::new(),
                     };
                 }
                 return ArenaSyncReport {
                     metas: self.sync_tradable_append(&tradable, pools, decimal_hints, prefix_len),
                     indices_rebuilt: false,
+                    invalidated_pool_indices: Vec::new(),
                 };
             }
             ArenaReuse::Rebuild if !self.inner.pools.is_empty() => {
-                let tradable_addresses: rustc_hash::FxHashSet<_> =
-                    tradable.iter().map(|(_, address, _)| *address).collect();
                 if self
                     .inner
                     .pool_addresses
                     .iter()
-                    .all(|address| tradable_addresses.contains(address))
+                    .all(|address| address_index.contains_key(address))
                 {
-                    // Prefer index-stable refresh over wipe+reassign. Live: 12 full
-                    // rebuilds/150s cleared cycle cache (proto_mismatch storms).
-                    let _ = freeze_append;
-                    let mut metas = self.sync_frozen_membership(&tradable, pools, decimal_hints);
+                    let (mut metas, invalidated_pool_indices) =
+                        self.sync_frozen_membership(&tradable, pools, address_index, decimal_hints);
                     self.append_novel_tradable(&tradable, pools, decimal_hints, &mut metas);
                     return ArenaSyncReport {
                         metas,
                         indices_rebuilt: false,
+                        invalidated_pool_indices,
                     };
                 }
             }
@@ -611,6 +612,7 @@ impl StateArena {
         ArenaSyncReport {
             metas,
             indices_rebuilt: true,
+            invalidated_pool_indices: Vec::new(),
         }
     }
 
@@ -656,73 +658,35 @@ impl StateArena {
         &mut self,
         tradable: &[(usize, Address, Arc<PoolState>)],
         pools: &[DiscoveredPool],
+        address_index: &FxHashMap<Address, usize>,
         decimal_hints: Option<&FxHashMap<Address, u8>>,
-    ) -> Vec<crate::pipeline::types::PoolMeta> {
+    ) -> (Vec<crate::pipeline::types::PoolMeta>, Vec<PoolIndex>) {
         let existing = self.inner.pools.len();
-        // Fast path: arena prefix still aligns with tradable order.
-        let mut prefix = 0usize;
-        for (i, (_, address, _)) in tradable
-            .iter()
-            .enumerate()
-            .take(existing.min(tradable.len()))
-        {
-            if self.inner.pool_addresses.get(i) != Some(address) {
-                break;
-            }
-            prefix += 1;
-        }
-        if prefix == existing {
-            return self.sync_tradable_inplace(&tradable[..prefix], pools, decimal_hints);
-        }
         let by_addr: rustc_hash::FxHashMap<Address, (usize, Arc<PoolState>)> = tradable
             .iter()
             .map(|(idx, addr, state)| (*addr, (*idx, Arc::clone(state))))
             .collect();
         let mut ordered = Vec::with_capacity(existing);
+        let mut invalidated_pool_indices = Vec::new();
         for i in 0..existing {
             let addr = self.inner.pool_addresses[i];
             if let Some((idx, state)) = by_addr.get(&addr) {
                 ordered.push((*idx, addr, Arc::clone(state)));
                 continue;
             }
-            // Still in arena but dropped from tradable — keep prior state.
-            let Some(idx) = pools.iter().position(|p| p.address == addr) else {
-                // Discovery row gone: cannot safely rebuild metas — keep prior
-                // states and rematerialize from whatever discovery rows remain.
-                ordered.clear();
-                break;
-            };
-            ordered.push((idx, addr, Arc::clone(&self.inner.pools[i])));
+            let idx = address_index[&addr];
+            let prior = &self.inner.pools[i];
+            if matches!(prior.as_ref(), PoolState::Invalid) {
+                ordered.push((idx, addr, Arc::clone(prior)));
+            } else {
+                ordered.push((idx, addr, Arc::new(PoolState::Invalid)));
+                invalidated_pool_indices.push(PoolIndex(i as u32));
+            }
         }
-        if ordered.len() == existing {
-            return self.sync_tradable_inplace(&ordered, pools, decimal_hints);
-        }
-        // Last resort: refresh the longest still-aligned prefix only.
-        if prefix > 0 {
-            return self.sync_tradable_inplace(&tradable[..prefix], pools, decimal_hints);
-        }
-        // Membership unreadable vs discovery — return metas from current slots
-        // without growing (states untouched).
-        let mut metas = Vec::with_capacity(existing);
-        for i in 0..existing {
-            let addr = self.inner.pool_addresses[i];
-            let Some(idx) = pools.iter().position(|p| p.address == addr) else {
-                continue;
-            };
-            let Some(pool) = pools.get(idx) else {
-                continue;
-            };
-            let state = Arc::clone(&self.inner.pools[i]);
-            let token_indices =
-                self.token_indices_for_pool(state.as_ref(), pool, decimal_hints, false);
-            metas.push(pool_meta_from_synced(
-                pool,
-                PoolIndex(i as u32),
-                &token_indices,
-                state.as_ref(),
-            ));
-        }
-        metas
+        (
+            self.sync_tradable_inplace(&ordered, pools, decimal_hints),
+            invalidated_pool_indices,
+        )
     }
 
     /// Prefix-stable growth: refresh existing pools in place, append new ones.
@@ -1956,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_rebuilds_when_tradable_pool_becomes_ineligible() {
+    fn sync_invalidates_ineligible_pool_without_reassigning_index() {
         let pool_address = Address::with_last_byte(60);
         let token_a = Address::with_last_byte(61);
         let token_b = Address::with_last_byte(62);
@@ -1992,12 +1956,9 @@ mod tests {
             .map(|(i, p)| (p.address, i))
             .collect();
         let mut arena = StateArena::default();
-        assert_eq!(
-            arena
-                .sync_from_discovery(&cache, &discovered, &address_index, None)
-                .len(),
-            1
-        );
+        let initial = arena.sync_from_discovery(&cache, &discovered, &address_index, None);
+        assert_eq!(initial.len(), 1);
+        let pool_index = initial[0].pool_index;
         cache.insert(
             pool_address,
             PoolState::V2(V2PoolState {
@@ -2008,12 +1969,37 @@ mod tests {
                 block_timestamp_last: 2,
             }),
         );
-        assert!(
-            arena
-                .sync_from_discovery(&cache, &discovered, &address_index, None)
-                .is_empty()
+        let report =
+            arena.sync_from_discovery_gated(&cache, &discovered, &address_index, None, false);
+        assert_eq!(report.metas.len(), 1);
+        assert!(!report.indices_rebuilt);
+        assert_eq!(report.invalidated_pool_indices, vec![pool_index]);
+        assert_eq!(arena.pool_count(), 1);
+        assert_eq!(arena.pool_address(pool_index), Some(pool_address));
+        assert!(matches!(
+            arena.pool_state(pool_index),
+            Some(PoolState::Invalid)
+        ));
+
+        cache.insert(
+            pool_address,
+            PoolState::V2(V2PoolState {
+                reserve0: funded,
+                reserve1: funded + U256::from(3u64),
+                fee: U256::from(997u64),
+                fee_denominator: U256::from(1_000u64),
+                block_timestamp_last: 3,
+            }),
         );
-        assert_eq!(arena.pool_count(), 0);
+        let recovered =
+            arena.sync_from_discovery_gated(&cache, &discovered, &address_index, None, false);
+        assert!(!recovered.indices_rebuilt);
+        assert!(recovered.invalidated_pool_indices.is_empty());
+        assert_eq!(recovered.metas[0].pool_index, pool_index);
+        assert!(matches!(
+            arena.pool_state(pool_index),
+            Some(PoolState::V2(_))
+        ));
     }
 
     #[test]

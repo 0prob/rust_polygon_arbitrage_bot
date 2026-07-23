@@ -1101,6 +1101,14 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     let refresh_result = ctx.refresh.refresh_pool_states(refresh_batch).await?;
     let refreshed_pools = refresh_result.updated;
     let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
+    if lf_pass <= 2 || lf_pass.is_multiple_of(10) {
+        crate::info!(
+            "lf refresh result: pass={lf_pass} batch={refresh_batch} updated={} attempted={} refresh_ms={refresh_ms} routable_pools={}",
+            refresh_result.updated,
+            refresh_result.attempted,
+            ctx.refresh.routable_pool_count()
+        );
+    }
     ctx.refresh.prune_dead_pools_if_due(lf_pass);
 
     let pools = ctx.refresh.discovered_pools();
@@ -1145,6 +1153,14 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             arena_sync.metas.len()
         );
     }
+    if !arena_sync.invalidated_pool_indices.is_empty() {
+        crate::info!(
+            "lf arena sync: invalidated={} preserved_indices=true arena_pools={}",
+            arena_sync.invalidated_pool_indices.len(),
+            arena.pool_count()
+        );
+    }
+    let invalidated_pool_indices = arena_sync.invalidated_pool_indices;
     let pool_metas = Arc::new(arena_sync.metas);
     let arena_sync_ms = crate::util::now_ms().saturating_sub(arena_sync_started);
     if lf_pass <= 2 || lf_pass.is_multiple_of(30) {
@@ -1164,7 +1180,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
 
     let state_provider = ctx.rpc.connect_state().ok();
     let state_generation = ctx.cache.generation();
-    let dirty_pools = ctx.cache.take_dirty_pool_indices(arena.address_to_pool());
+    let dirty_pools = merge_dirty_pool_indices(
+        ctx.cache.take_dirty_pool_indices(arena.address_to_pool()),
+        invalidated_pool_indices,
+    );
     let gas_price_wei = ctx.gas_oracle.conservative_gas_price();
     if gas_price_wei.is_none() && lf_pass <= 2 {
         crate::debug!("lf cycle prefilter: gas oracle not warm yet (no gas floor at enumeration)");
