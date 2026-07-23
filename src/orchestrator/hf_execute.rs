@@ -20,7 +20,8 @@ use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
-    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, mark_tick_hydrate_timeout_cooldown,
+    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, is_probe_narrow_miss_on_cooldown,
+    mark_tick_hydrate_timeout_cooldown,
     mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
 };
 use crate::services::execution::aave::{
@@ -1078,7 +1079,10 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
                 Some(PoolState::V3(st)) => (st.ticks.is_empty(), st.liquidity),
                 _ => (false, 0),
             };
-            if !tickless || is_empty_tick_on_cooldown(addr) {
+            if !tickless
+                || is_empty_tick_on_cooldown(addr)
+                || is_probe_narrow_miss_on_cooldown(addr)
+            {
                 continue;
             }
             if in_cycle.insert(addr) {
@@ -1144,8 +1148,8 @@ pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     v3.len() + v4.len()
 }
 
-/// Split `pool_cap` across V3+V4 (prefer V3). Using the full cap for each family
-/// doubled RPC work under one residual-prep timeout.
+/// Split `pool_cap` across V3+V4. Prefer V3 but reserve ≥1 V4 slot when both
+/// families need work (live iter2: v4_total>0 while v4_fetch=0 under full V3 cap).
 fn tickless_cl_targets_shared_cap<C: AsRef<FoundCycle>>(
     arena: &StateArena,
     cycles: &[C],
@@ -1158,10 +1162,10 @@ fn tickless_cl_targets_shared_cap<C: AsRef<FoundCycle>>(
     Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>,
 ) {
     let (v3_total, mut v3) = tickless_v3_addresses_prioritized(arena, cycles, pool_cap);
-    v3.truncate(pool_cap);
-    let v4_cap = pool_cap.saturating_sub(v3.len());
-    // Cap arg only bounds the fetch vec; `v4_total` is the uncapped tickless count.
     let (v4_total, mut v4) = tickless_v4_targets_prioritized(arena, cycles, pool_metas, pool_cap);
+    let v4_reserve = usize::from(v4_total > 0 && v3_total > 0 && pool_cap >= 2);
+    v3.truncate(pool_cap.saturating_sub(v4_reserve));
+    let v4_cap = pool_cap.saturating_sub(v3.len());
     v4.truncate(v4_cap);
     (v3_total, v3, v4_total, v4)
 }
@@ -1869,6 +1873,22 @@ mod tests {
             attempted: false,
             matched: 10,
         }));
+    }
+
+    #[test]
+    fn probe_tick_cap_reserves_v4_when_both_families_need_work() {
+        // Mirror tickless_cl_targets_shared_cap reservation math.
+        let split = |pool_cap: usize, v3_total: usize, v4_total: usize| {
+            let v4_reserve = usize::from(v4_total > 0 && v3_total > 0 && pool_cap >= 2);
+            let v3_cap = pool_cap.saturating_sub(v4_reserve);
+            let v3_take = v3_total.min(v3_cap);
+            let v4_cap = pool_cap.saturating_sub(v3_take);
+            (v3_take, v4_cap.min(v4_total))
+        };
+        assert_eq!(split(6, 8, 3), (5, 1));
+        assert_eq!(split(1, 8, 3), (1, 0)); // cap=1: no reserve
+        assert_eq!(split(6, 8, 0), (6, 0));
+        assert_eq!(split(6, 0, 3), (0, 3));
     }
 
     #[test]

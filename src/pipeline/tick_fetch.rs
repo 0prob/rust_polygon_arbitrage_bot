@@ -13,23 +13,29 @@ fn sort_v4_tick_spans_by_liquidity(spans: &mut [V4TickSpan]) {
     spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.6));
 }
 
-/// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
-/// this deadline. Live LF was re-fetching ~30–40 empty pools every pass.
-pub const EMPTY_TICK_COOLDOWN_MS: u64 = 45_000;
+	/// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
+	/// this deadline. Iter2: 65% of probe TickLens fetches were empty and recycled
+	/// into the cap within 45s while cycles_tickless stayed stuck.
+	pub const EMPTY_TICK_COOLDOWN_MS: u64 = 90_000;
 /// After hydrate timeout (fetch never completed). Live: 30s under rate-limit left
 /// high-priority pools stuck tickless while residual prep re-burned elsewhere.
 pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 12_000;
 /// After a successful tick load, suppress re-hydrate. Preserve-on-price-move
 /// already keeps arrays; 8s cuts redundant TickLens when stream patches land.
 pub const RECENT_HYDRATE_COOLDOWN_MS: u64 = 8_000;
-/// HF probe narrow-only empty miss — not a full-empty proof (no widen). Short
-/// suppress only; 45s EMPTY cool was pinning probe misses until LF widen.
-pub const PROBE_NARROW_EMPTY_COOLDOWN_MS: u64 = 5_000;
+/// HF probe narrow-only empty miss — not a full-empty proof (no widen).
+/// Lives in a separate map so LF can still widen; shared EMPTY cool was either
+/// pinning LF (45s) or letting HF re-burn the probe cap every 5s (live iter2:
+/// same miss pools ×10–16 while load_rate≈31%).
+pub const PROBE_NARROW_MISS_COOLDOWN_MS: u64 = 30_000;
 /// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
 /// dominate LF under rate limits.
 const MAX_WIDE_TICK_POOLS: usize = 24;
 
 static EMPTY_TICK_UNTIL_MS: LazyLock<Mutex<FxHashMap<Address, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+/// Probe-narrow misses only — checked by HF probe target selection, not LF.
+static PROBE_NARROW_MISS_UNTIL_MS: LazyLock<Mutex<FxHashMap<Address, u64>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// True when this pool recently stayed tickless after a full hydrate attempt.
@@ -40,6 +46,28 @@ pub fn is_empty_tick_on_cooldown(pool: Address) -> bool {
         .lock()
         .get(&pool)
         .is_some_and(|&until| now < until)
+}
+
+/// True when HF probe recently saw a narrow-only empty (skip re-fetch in probe).
+#[must_use]
+pub fn is_probe_narrow_miss_on_cooldown(pool: Address) -> bool {
+    let now = crate::util::now_ms();
+    PROBE_NARROW_MISS_UNTIL_MS
+        .lock()
+        .get(&pool)
+        .is_some_and(|&until| now < until)
+}
+
+fn mark_probe_narrow_miss(pools: impl IntoIterator<Item = Address>) {
+    let now = crate::util::now_ms();
+    let until = now.saturating_add(PROBE_NARROW_MISS_COOLDOWN_MS);
+    let mut map = PROBE_NARROW_MISS_UNTIL_MS.lock();
+    map.retain(|_, u| *u > now);
+    for pool in pools {
+        map.entry(pool)
+            .and_modify(|deadline| *deadline = (*deadline).max(until))
+            .or_insert(until);
+    }
 }
 
 fn mark_tick_cooldown_addresses(pools: impl IntoIterator<Item = Address>, cooldown_ms: u64) {
@@ -66,6 +94,7 @@ pub fn mark_tick_hydrate_timeout_cooldown(pools: impl IntoIterator<Item = Addres
 /// Clear address-keyed hydrate cooldown (e.g. after ticks load).
 pub fn clear_tick_hydrate_cooldown(pool: Address) {
     clear_empty_tick_cooldown(pool);
+    PROBE_NARROW_MISS_UNTIL_MS.lock().remove(&pool);
 }
 
 fn clear_empty_tick_cooldown(pool: Address) {
@@ -639,7 +668,12 @@ pub async fn enrich_v3_ticks<
         }
     }
     if !loaded_ok.is_empty() {
-        mark_tick_cooldown_addresses(loaded_ok, RECENT_HYDRATE_COOLDOWN_MS);
+        mark_tick_cooldown_addresses(loaded_ok.iter().copied(), RECENT_HYDRATE_COOLDOWN_MS);
+        // Loaded via widen/algebra — drop probe-narrow miss so HF can re-touch if ticks drop.
+        let mut miss = PROBE_NARROW_MISS_UNTIL_MS.lock();
+        for pool in &loaded_ok {
+            miss.remove(pool);
+        }
     }
     // URL fallback when empties remain after hard RPC fail or incomplete words.
     // Genuinely empty (complete probe) gets cooldown instead — not another URL.
@@ -654,12 +688,9 @@ pub async fn enrich_v3_ticks<
                 .filter(|p| word_range >= 48 || wide_attempted.contains(p));
             mark_empty_tick_cooldown(cool);
         } else {
-            // HF probe narrow-only: complete empty is *not* a full-empty proof.
-            // Live: treated like full empty → 45s cool → cl_tickless stuck until LF.
-            mark_tick_cooldown_addresses(
-                still_tickless.iter().copied(),
-                PROBE_NARROW_EMPTY_COOLDOWN_MS,
-            );
+            // HF probe narrow-only: not a full-empty proof — don't touch shared
+            // EMPTY (blocks LF widen). Deprioritize for probe selection only.
+            mark_probe_narrow_miss(still_tickless.iter().copied());
         }
     } else if !still_tickless.is_empty() && incomplete_pools > 0 {
         // Incomplete words without finishing URL fallback — short suppress so the
