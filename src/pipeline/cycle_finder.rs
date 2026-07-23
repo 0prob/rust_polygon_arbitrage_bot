@@ -757,6 +757,29 @@ fn hub_exit_legs(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// O(1) pool-reuse bitset for DFS. Sized to arena/graph slots and grown if a
+/// stale edge carries a higher `pool_index` (never treat OOB as "already used").
+#[inline]
+fn pool_mark(used: &mut Vec<bool>, pool_id: u32) -> bool {
+    let idx = pool_id as usize;
+    if idx >= used.len() {
+        used.resize(idx + 1, false);
+    }
+    if used[idx] {
+        false
+    } else {
+        used[idx] = true;
+        true
+    }
+}
+
+#[inline]
+fn pool_unmark(used: &mut Vec<bool>, pool_id: u32) {
+    if let Some(slot) = used.get_mut(pool_id as usize) {
+        *slot = false;
+    }
+}
+
 fn collect_cycles_dfs_single_start(
     graph: &RoutingGraph,
     arena: &StateArena,
@@ -770,31 +793,18 @@ fn collect_cycles_dfs_single_start(
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
     let token_count = graph.token_count as usize;
-    let mut used_pools = vec![false; graph.pool_edge_positions.len()];
+    // Dense arena indices are usually the tight upper bound; positions may lag
+    // after partial attach, so take the max and grow on demand in `pool_mark`.
+    let pool_slots = graph
+        .pool_edge_positions
+        .len()
+        .max(arena.pool_count())
+        .max(1);
+    let mut used_pools = vec![false; pool_slots];
     let mut used_tokens = vec![false; token_count];
     let mut path = Vec::with_capacity(hop_cap as usize);
     let mut cycles = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
-
-    fn pool_mark(used: &mut [bool], pool_id: u32) -> bool {
-        let idx = pool_id as usize;
-        if idx >= used.len() {
-            return false;
-        }
-        if used[idx] {
-            false
-        } else {
-            used[idx] = true;
-            true
-        }
-    }
-
-    fn pool_unmark(used: &mut [bool], pool_id: u32) {
-        let idx = pool_id as usize;
-        if idx < used.len() {
-            used[idx] = false;
-        }
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
@@ -807,7 +817,7 @@ fn collect_cycles_dfs_single_start(
         pending: Option<PendingHubSwap>,
         path: &mut Vec<Edge>,
         path_hop_calls: u16,
-        used_pools: &mut [bool],
+        used_pools: &mut Vec<bool>,
         used_tokens: &mut [bool],
         hops: u32,
         log_w: f64,
@@ -1160,11 +1170,10 @@ fn collect_cycles_dfs_single_start(
                     continue;
                 }
                 let pool_id = ge.edge.pool_index.0;
-                let next_ratio_preview = mul_ratio_saturating(ONE, ge.ratio);
                 let next_pin = edge_is_pin(prep, ge.edge.pool_index);
                 if !can_still_find_profitable_cycle(
                     ge.log_weight,
-                    next_ratio_preview,
+                    ge.ratio,
                     1,
                     hop_cap,
                     ge.edge.token_out,
@@ -1177,7 +1186,10 @@ fn collect_cycles_dfs_single_start(
                 if route_hop_budget_exceeded(hop_calls) {
                     continue;
                 }
-                pool_mark(&mut used_pools, pool_id);
+                // Same mark semantics as mid-path Direct — never walk unmarked OOB.
+                if !pool_mark(&mut used_pools, pool_id) {
+                    continue;
+                }
                 path.push(ge.edge);
                 dfs(
                     graph,
@@ -1268,12 +1280,24 @@ fn collect_cycles_dfs_parallel(
                 .collect()
         };
 
-    let mut merged = merge_shard_cycles(&shard_cycles);
-
     // A flat per-start quota strands most of the global budget when many start
     // tokens are sparse. Reallocate unused capacity to starts that saturated
     // their quota. Two bounded retries recover productive hubs without letting
     // one hub monopolize the first parallel pass.
+    let any_saturated = shard_cycles
+        .iter()
+        .zip(&shard_caps)
+        .any(|(cycles, cap)| cycles.len() >= *cap);
+    // Common path: no hub saturated its quota — one move-merge, no retry clones.
+    if !any_saturated || budget.tick() {
+        let mut merged = merge_shard_cycles_owned(shard_cycles);
+        if merged.len() > max_cycles {
+            merged.truncate(max_cycles);
+        }
+        return merged;
+    }
+
+    let mut merged = merge_shard_cycles(&shard_cycles);
     for _ in 0..2 {
         if merged.len() >= max_cycles || budget.tick() {
             break;
@@ -1352,6 +1376,7 @@ fn collect_cycles_dfs_parallel(
     merged
 }
 
+/// Merge parallel DFS shards, keeping the best score per cycle key.
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
     use std::collections::hash_map::Entry;
 
@@ -1370,6 +1395,33 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
             }
             Entry::Vacant(e) => {
                 e.insert(cycle.clone());
+            }
+        }
+    }
+    let mut out: Vec<FoundCycle> = best.into_values().collect();
+    out.sort_unstable_by(compare_cycle_score);
+    out
+}
+
+/// Final merge that consumes shards — vacant inserts move, no clone on first win.
+fn merge_shard_cycles_owned(shard_cycles: Vec<Vec<FoundCycle>>) -> Vec<FoundCycle> {
+    use std::collections::hash_map::Entry;
+
+    use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
+
+    let total: usize = shard_cycles.iter().map(Vec::len).sum();
+    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
+    best.reserve(total);
+    for cycle in shard_cycles.into_iter().flatten() {
+        let key = cycle_key(&cycle.edges);
+        match best.entry(key) {
+            Entry::Occupied(mut e) => {
+                if cycle_prefers_candidate(&cycle, e.get()) {
+                    *e.get_mut() = cycle;
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(cycle);
             }
         }
     }
@@ -1778,6 +1830,18 @@ mod tests {
         assert!(can_still_find_profitable_cycle(
             dead_log, ONE, 1, 3, a, &prep, true,
         ));
+    }
+
+    #[test]
+    fn pool_mark_grows_for_high_pool_index_instead_of_false_reuse() {
+        // Recent O(1) bitset sized only to pool_edge_positions.len(); high pool
+        // indices used to look "already used" and silently drop Direct edges.
+        let mut used = vec![false; 1];
+        assert!(pool_mark(&mut used, 9));
+        assert_eq!(used.len(), 10);
+        assert!(!pool_mark(&mut used, 9));
+        pool_unmark(&mut used, 9);
+        assert!(pool_mark(&mut used, 9));
     }
 
     #[test]
