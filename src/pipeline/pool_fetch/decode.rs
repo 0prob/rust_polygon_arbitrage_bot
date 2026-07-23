@@ -463,6 +463,12 @@ fn plan_result<'a>(
     results.get(idx)?.as_ref()
 }
 
+/// Build a compact kind→index map for O(1) decode lookups (avoids repeated linear scans).
+#[inline]
+fn kind_index_map(kinds: &[CallKind]) -> impl Fn(CallKind) -> Option<usize> + '_ {
+    move |target| kinds.iter().position(|k| *k == target)
+}
+
 fn decode_balancer_swap_fee(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<U256> {
     plan_result(plan, results, CallKind::BalancerSwapFee)
         .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
@@ -470,7 +476,11 @@ fn decode_balancer_swap_fee(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> 
 }
 
 fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let tokens_bytes = plan_result(plan, results, CallKind::BalancerTokens)?;
+    // Build one index map — avoids 6 separate O(N) linear scans of plan.kinds.
+    let kind_idx = kind_index_map(&plan.kinds);
+    let get = |k: CallKind| -> Option<&Bytes> { results.get(kind_idx(k)?)?.as_ref() };
+
+    let tokens_bytes = get(CallKind::BalancerTokens)?;
     let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes).ok()?;
     let last_change_block = tokens.lastChangeBlock.as_limbs()[0];
     // ponytail: move decoded vecs — uint256[] already is Vec<U256>.
@@ -479,10 +489,12 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         return None;
     }
     let n = balances.len();
-    let swap_fee = decode_balancer_swap_fee(plan, results)?;
-    let decoded_weights = plan_result(plan, results, CallKind::BalancerWeights)
+    let swap_fee = get(CallKind::BalancerSwapFee)
+        .and_then(|b| IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(b).ok())
+        .map(U256::from)?;
+    let decoded_weights = get(CallKind::BalancerWeights)
         .and_then(|b| IBalancerPool::getNormalizedWeightsCall::abi_decode_returns(b).ok());
-    let amp_from_chain = plan_result(plan, results, CallKind::BalancerAmp)
+    let amp_from_chain = get(CallKind::BalancerAmp)
         .and_then(|b| IBalancerPool::getAmplificationParameterCall::abi_decode_returns(b).ok());
     let (amp, amp_precision, has_onchain_amp, is_updating) = match amp_from_chain {
         Some(t) => (
@@ -493,15 +505,12 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         ),
         None => (U256::ZERO, U256::ZERO, false, false),
     };
-    let scaling_factors = plan_result(plan, results, CallKind::BalancerScalingFactors)
+    let scaling_factors = get(CallKind::BalancerScalingFactors)
         .and_then(|b| IBalancerPool::getScalingFactorsCall::abi_decode_returns(b).ok())?;
     if scaling_factors.len() != n || scaling_factors.iter().any(U256::is_zero) {
         return None;
     }
-    let linear_start = plan
-        .kinds
-        .iter()
-        .position(|k| *k == CallKind::BalancerLinearMainToken);
+    let linear_start = kind_idx(CallKind::BalancerLinearMainToken);
     let linear = if let Some(start) = linear_start {
         decode_balancer_linear(&tokens.tokens, results.get(start..))
     } else {

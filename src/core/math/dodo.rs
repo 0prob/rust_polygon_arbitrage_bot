@@ -140,7 +140,12 @@ fn general_integrate(v0: U256, v1: U256, v2: U256, i: U256, k: U256) -> U256 {
     if k.is_zero() {
         return u512_to_u256(fair_amount / ONE_U512);
     }
-    let ratio = U512::from(ONE) * U512::from(v0) * U512::from(v0) / U512::from(v1) / U512::from(v2);
+    let denom = U512::from(v1) * U512::from(v2);
+    let ratio = if denom.is_zero() {
+        U512::ZERO
+    } else {
+        U512::from(ONE) * U512::from(v0) * U512::from(v0) / denom
+    };
     let penalty = U512::from(k) * ratio / ONE_U512;
     let factor = U512::from(ONE - k) + penalty;
     u512_to_u256(factor * fair_amount / U512::from(ONE2))
@@ -165,7 +170,6 @@ pub fn get_dodo_gross_amount_out(
         return U256::ZERO;
     }
 
-    let inverse_i = reciprocal_floor(i);
     match (state.r_state, base_to_quote) {
         (DodoRState::One, true) => solve_quadratic_function_for_trade(
             state.quote_target,
@@ -178,7 +182,7 @@ pub fn get_dodo_gross_amount_out(
             state.base_target,
             state.base_target,
             amount_in,
-            inverse_i,
+            reciprocal_floor(i),
             k,
         ),
         (DodoRState::AboveOne, true) => {
@@ -200,7 +204,7 @@ pub fn get_dodo_gross_amount_out(
             }
         }
         (DodoRState::AboveOne, false) => {
-            solve_quadratic_function_for_trade(state.base_target, b, amount_in, inverse_i, k)
+            solve_quadratic_function_for_trade(state.base_target, b, amount_in, reciprocal_floor(i), k)
         }
         (DodoRState::BelowOne, true) => {
             solve_quadratic_function_for_trade(state.quote_target, q, amount_in, i, k)
@@ -208,8 +212,9 @@ pub fn get_dodo_gross_amount_out(
         (DodoRState::BelowOne, false) => {
             let back_in = state.quote_target.saturating_sub(q);
             let back_out = b.saturating_sub(state.base_target);
+            let inv_i = reciprocal_floor(i);
             if amount_in < back_in {
-                general_integrate(state.quote_target, q + amount_in, q, inverse_i, k).min(back_out)
+                general_integrate(state.quote_target, q + amount_in, q, inv_i, k).min(back_out)
             } else if amount_in == back_in {
                 back_out
             } else {
@@ -218,7 +223,7 @@ pub fn get_dodo_gross_amount_out(
                         state.base_target,
                         state.base_target,
                         amount_in - back_in,
-                        inverse_i,
+                        inv_i,
                         k,
                     )
             }

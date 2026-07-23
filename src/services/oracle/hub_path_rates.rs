@@ -209,7 +209,11 @@ fn build_reverse_hops(
 }
 
 /// One reverse BFS from WMATIC: `parent[token] = (next_toward_wmatic, edge token→next)`.
-/// `alt` keeps one second-choice first hop when the shortest path fails probe sim.
+/// `alt` keeps one second-choice **same-depth** first hop (dual-DEX sanity / rescue).
+///
+/// Longer detours are intentionally excluded: comparing a 1-hop liquid path to a 2-hop
+/// via an intermediate (live: WETH→WMATIC vs WETH→DAI→WMATIC) yields >>2% dual_reject
+/// even when the primary rate is fine.
 fn reverse_bfs_parents(
     rev: &[Vec<RevHop>],
     wmatic: TokenIndex,
@@ -239,10 +243,14 @@ fn reverse_bfs_parents(
                 continue;
             }
             if depth[pi] != u32::MAX {
-                // Second hop toward WMATIC — only when next already has a path.
+                // Same-length alternate first hop only: next must sit at depth[pi]-1.
+                // Allow a different pool into the same next (two WETH→WMATIC pools) — not only
+                // a different intermediate. (Was: any already-reached next → 1-hop vs 2-hop
+                // dual false positives; and same-next dual DEX never recorded as alt.)
                 if alt[pi].is_none()
-                    && parent[pi].is_some_and(|(n, _)| n != curr)
-                    && depth[curr.0 as usize] < max_hops
+                    && parent[pi]
+                        .is_some_and(|(_, pe)| pe.pool_index != edge.pool_index)
+                    && depth[curr.0 as usize].saturating_add(1) == depth[pi]
                 {
                     alt[pi] = Some((curr, edge));
                 }
@@ -331,6 +339,7 @@ pub fn hub_path_matic_rates_batch(
     let mut sim_fail = 0u32;
     let mut alt_rescue = 0u32;
     let mut dual_reject = 0u32;
+    let mut dual_samples = Vec::with_capacity(3);
     let mut priced = 0u32;
     for token in need {
         if out.contains_key(&token) {
@@ -346,19 +355,59 @@ pub fn hub_path_matic_rates_batch(
         }
         let primary = matic_rate_from_probe_sim_with_decimals(arena, token, &path, token_decimals);
         // Alternate first-hop path when present (rescue + dual-DEX sanity).
-        let alt_rate = alt
+        let alt_path = alt
             .get(token.0 as usize)
             .copied()
             .flatten()
             .and_then(|first| reconstruct_path_with_first(&parent, token, wmatic, Some(first)))
-            .filter(|p| !p.is_empty())
-            .and_then(|p| {
-                matic_rate_from_probe_sim_with_decimals(arena, token, &p, token_decimals)
-            });
+            .filter(|p| !p.is_empty());
+        let alt_rate = alt_path
+            .as_deref()
+            .and_then(|p| matic_rate_from_probe_sim_with_decimals(arena, token, p, token_decimals));
         match (primary, alt_rate) {
             (Some(a), Some(b)) if rates_diverge_bps(a, b) > HUB_DUAL_PATH_MAX_DIVERGE_BPS => {
                 // ponytail: >2% across two first hops → skip (flash / thin-pool risk).
                 dual_reject += 1;
+                if dual_samples.len() < 3 {
+                    let primary_first = path.first().and_then(|edge| {
+                        arena
+                            .pool_address(edge.pool_index)
+                            .map(|pool| (pool, edge.protocol))
+                    });
+                    let alt_first = alt_path.as_deref().and_then(|p| {
+                        p.first().and_then(|edge| {
+                            arena
+                                .pool_address(edge.pool_index)
+                                .map(|pool| (pool, edge.protocol))
+                        })
+                    });
+                    let describe_path = |edges: &[Edge]| {
+                        edges
+                            .iter()
+                            .map(|edge| {
+                                format!(
+                                    "{:?}:{} {}>{} zf1={}",
+                                    edge.protocol,
+                                    arena.pool_address(edge.pool_index).unwrap_or_default(),
+                                    arena.token_address(edge.token_in).unwrap_or_default(),
+                                    arena.token_address(edge.token_out).unwrap_or_default(),
+                                    edge.zero_for_one,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    dual_samples.push(format!(
+                        "token={} bps={} primary={:?}@{:?} alt={:?}@{:?} rates={a}/{b} paths={:?}/{:?}",
+                        arena.token_address(token).unwrap_or_default(),
+                        rates_diverge_bps(a, b),
+                        primary_first.map(|(_, protocol)| protocol),
+                        primary_first.map(|(pool, _)| pool),
+                        alt_first.map(|(_, protocol)| protocol),
+                        alt_first.map(|(pool, _)| pool),
+                        describe_path(&path),
+                        alt_path.as_deref().map(describe_path),
+                    ));
+                }
             }
             (Some(a), Some(b)) => {
                 out.insert(token, a.min(b));
@@ -381,7 +430,7 @@ pub fn hub_path_matic_rates_batch(
     let ms = crate::util::now_ms().saturating_sub(started);
     if path_miss > 0 || sim_fail > 0 || alt_rescue > 0 || dual_reject > 0 || need_n > 32 {
         crate::info!(
-            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} ms={ms} max_hops={}",
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} dual_samples={dual_samples:?} ms={ms} max_hops={}",
             params.max_hops
         );
     } else if need_n > 0 {
@@ -608,5 +657,100 @@ mod tests {
         );
         assert!(rates.contains_key(&a));
         assert!(rates.contains_key(&b));
+    }
+
+    /// Live dual_reject false positive: liquid 1-hop primary + longer detour alt.
+    /// Alt must only be a same-depth first hop, so the detour must not dual-reject.
+    #[test]
+    fn longer_detour_does_not_dual_reject_one_hop_primary() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let mid = arena.register_token(Address::from([0x11u8; 20]));
+        let spoke = arena.register_token(Address::from([0x22u8; 20]));
+        // Deep equal-reserve direct spoke↔WMATIC (~1e18 rate).
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let direct = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep,
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        // Skewed mid leg so 2-hop rate diverges well past HUB_DUAL_PATH_MAX_DIVERGE_BPS.
+        let skew = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep / U256::from(10u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        let p_direct = arena.register_pool(Address::from([0xd1u8; 20]), direct);
+        let p_mid_w = arena.register_pool(Address::from([0xd2u8; 20]), v2_pool());
+        let p_spoke_mid = arena.register_pool(Address::from([0xd3u8; 20]), skew);
+        let metas = [
+            pool_meta_from_pair(p_direct, ProtocolType::UniswapV2, wmatic, spoke, 30),
+            pool_meta_from_pair(p_mid_w, ProtocolType::UniswapV2, wmatic, mid, 30),
+            pool_meta_from_pair(p_spoke_mid, ProtocolType::UniswapV2, mid, spoke, 30),
+        ];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[spoke],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        let rate = rates
+            .get(&spoke)
+            .copied()
+            .expect("1-hop primary must price; longer detour must not dual-reject");
+        assert!(
+            rate > U256::from(9u128 * 10u128.pow(17)) && rate < U256::from(11u128 * 10u128.pow(17)),
+            "expected ~1e18 direct rate, got {rate}"
+        );
+    }
+
+    /// Two same-depth direct pools that disagree hard → still dual-reject (fail closed).
+    #[test]
+    fn same_depth_divergent_first_hops_dual_reject() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x33u8; 20]));
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let fair = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep,
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        // ~10× skew → >>200 bps vs fair pool.
+        let bad = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep / U256::from(10u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        let p1 = arena.register_pool(Address::from([0xe1u8; 20]), fair);
+        let p2 = arena.register_pool(Address::from([0xe2u8; 20]), bad);
+        let metas = [
+            pool_meta_from_pair(p1, ProtocolType::UniswapV2, wmatic, spoke, 30),
+            pool_meta_from_pair(p2, ProtocolType::UniswapV2, wmatic, spoke, 30),
+        ];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[spoke],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        assert!(
+            !rates.contains_key(&spoke),
+            "same-depth divergent first hops must dual-reject"
+        );
     }
 }

@@ -1682,21 +1682,18 @@ fn walk_route_hops(
         *amounts.first_mut()? = amount_in;
     }
 
-    // Need multi-token realign? Hoist so V2/V3 hot path skips the protocol match.
-    let needs_realign = edges.iter().any(|e| {
-        matches!(
-            e.protocol,
-            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
-        )
-    });
-
     for (i, edge) in edges.iter().enumerate() {
         let state = arena.pool_state(edge.pool_index)?;
         if !state.is_tradable() {
             return None;
         }
         let mut edge = *edge;
-        if needs_realign && !realign_multi_token_edge(arena, state, &mut edge) {
+        // Only realign multi-token hops — V2/V3/V4 do not need it.
+        if matches!(
+            edge.protocol,
+            ProtocolType::BalancerV2 | ProtocolType::Woofi | ProtocolType::Dodo
+        ) && !realign_multi_token_edge(arena, state, &mut edge)
+        {
             return None;
         }
         let hop = simulate_hop(state, &edge, current, shallow_caps[i])?;

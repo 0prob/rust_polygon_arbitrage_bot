@@ -770,18 +770,30 @@ fn collect_cycles_dfs_single_start(
 ) -> Vec<FoundCycle> {
     let hop_cap = hop_limit.min(HOP_CAP);
     let token_count = graph.token_count as usize;
-    let mut used_pools: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut used_pools = vec![false; graph.pool_edge_positions.len()];
     let mut used_tokens = vec![false; token_count];
     let mut path = Vec::with_capacity(hop_cap as usize);
     let mut cycles = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
 
-    fn pool_mark(used: &mut rustc_hash::FxHashSet<u32>, pool_id: u32) -> bool {
-        used.insert(pool_id)
+    fn pool_mark(used: &mut [bool], pool_id: u32) -> bool {
+        let idx = pool_id as usize;
+        if idx >= used.len() {
+            return false;
+        }
+        if used[idx] {
+            false
+        } else {
+            used[idx] = true;
+            true
+        }
     }
 
-    fn pool_unmark(used: &mut rustc_hash::FxHashSet<u32>, pool_id: u32) {
-        used.remove(&pool_id);
+    fn pool_unmark(used: &mut [bool], pool_id: u32) {
+        let idx = pool_id as usize;
+        if idx < used.len() {
+            used[idx] = false;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -795,7 +807,7 @@ fn collect_cycles_dfs_single_start(
         pending: Option<PendingHubSwap>,
         path: &mut Vec<Edge>,
         path_hop_calls: u16,
-        used_pools: &mut rustc_hash::FxHashSet<u32>,
+        used_pools: &mut [bool],
         used_tokens: &mut [bool],
         hops: u32,
         log_w: f64,
