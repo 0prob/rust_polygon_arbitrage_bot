@@ -838,7 +838,7 @@ impl StateRefreshService {
             hot.len(),
             max_pools
         );
-        self.refresh_pools_impl(pools.as_ref(), max_pools, hot.as_ref(), address_index)
+        self.refresh_pools_impl(pools.as_ref(), max_pools, hot.as_ref(), address_index, None)
             .await
     }
 
@@ -850,29 +850,22 @@ impl StateRefreshService {
         if addresses.is_empty() || max_pools == 0 {
             return Ok(PoolRefreshResult::default());
         }
-        let (addrs, selected_pools, address_index) = {
+        // ponytail: Arc-clone discovery + address-only fetch — no DiscoveredPool clones.
+        let (discovered, address_index) = {
             let state = self.discovery_state.read();
-            let address_index = state.address_index.as_ref();
-            // ponytail: sort+dedupe addresses once, then do direct discovery-index lookups.
-            // That keeps targeted refresh bounded by requested addresses instead of
-            // scanning the full discovery list on every call.
-            let addrs = dedupe_sorted_addresses(addresses);
-            let mut selected_pools: Vec<DiscoveredPool> = Vec::with_capacity(addrs.len());
-            for addr in &addrs {
-                let Some(&idx) = address_index.get(addr) else {
-                    continue;
-                };
-                let Some(pool) = state.discovered.get(idx) else {
-                    continue;
-                };
-                selected_pools.push(pool.clone());
-            }
-            (addrs, selected_pools, Arc::clone(&state.address_index))
+            (
+                Arc::clone(&state.discovered),
+                Arc::clone(&state.address_index),
+            )
         };
-        if selected_pools.is_empty() {
+        let mut addrs = dedupe_sorted_addresses(addresses);
+        addrs.retain(|addr| address_index.contains_key(addr));
+        addrs.truncate(max_pools);
+        if addrs.is_empty() {
             return Ok(PoolRefreshResult::default());
         }
-        self.refresh_pools_impl(&selected_pools, max_pools, &addrs, address_index)
+        // `hot` unused when `initial_addrs` seeds address-only fetch.
+        self.refresh_pools_impl(discovered.as_ref(), max_pools, &[], address_index, Some(addrs))
             .await
     }
 
@@ -882,8 +875,9 @@ impl StateRefreshService {
         max_pools: usize,
         hot: &[Address],
         address_index: Arc<FxHashMap<Address, usize>>,
+        initial_addrs: Option<Vec<Address>>,
     ) -> anyhow::Result<PoolRefreshResult> {
-        let matched = pools.len();
+        let matched = initial_addrs.as_ref().map_or(pools.len(), Vec::len);
         let candidates = self.rpc.state_url_candidates();
         if candidates.is_empty() {
             crate::warn!("no state RPC configured — skipping pool state refresh");
@@ -914,7 +908,8 @@ impl StateRefreshService {
         let mut pinned_block: Option<u64> = None;
         // After a partial/rate-limited attempt, retry only still-needed addresses
         // from that batch — do not re-select a fresh max_pools window.
-        let mut retry_addrs: Option<Vec<Address>> = None;
+        // Targeted refresh seeds this so the first pass is address-only (no clone of pools).
+        let mut retry_addrs: Option<Vec<Address>> = initial_addrs;
         for (idx, url) in candidates.iter().enumerate() {
             let provider = match self.rpc.connect_state_at(url) {
                 Ok(p) => p,

@@ -454,7 +454,7 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
                 execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
             };
             match budget_url {
-                Some(url) => crate::infra::rpc_budget::scope_rpc_budget(&url, run).await,
+                Some(url) => crate::infra::rpc_budget::scope_rpc_budget_arc(url, run).await,
                 None => run.await,
             }
         });

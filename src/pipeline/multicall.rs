@@ -50,13 +50,9 @@ async fn retry_sleep(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(250u64 << attempt)).await;
 }
 
-fn is_rate_limited_rpc_error(e: &anyhow::Error) -> bool {
-    crate::services::execution::rpc_errors::is_rpc_rate_limited(e)
-}
-
 fn is_retryable_rpc_error(e: &anyhow::Error) -> bool {
     // Rate limits must not retry or bisect — that amplifies 429s (see is_rpc_rate_limited).
-    if is_rate_limited_rpc_error(e) {
+    if crate::services::execution::rpc_errors::is_rpc_rate_limited(e) {
         return false;
     }
     // Prefer alternate Display so nested anyhow contexts still match.
@@ -106,7 +102,9 @@ async fn execute_multicall_chunk_resilient<P: Provider<Ethereum>>(
                     out[start + i] = result;
                 }
             }
-            Err(e) if is_rate_limited_rpc_error(&e) => return Err(e),
+            Err(e) if crate::services::execution::rpc_errors::is_rpc_rate_limited(&e) => {
+                return Err(e);
+            }
             Err(_e) if slice.len() > 1 => {
                 let mid = start + slice.len() / 2;
                 pending.push((mid, end));
@@ -171,7 +169,7 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
             Err(e) => {
                 let e: anyhow::Error = e.into();
                 drop(_permit);
-                if is_rate_limited_rpc_error(&e) {
+                if crate::services::execution::rpc_errors::is_rpc_rate_limited(&e) {
                     if let Some(url) = crate::infra::rpc_budget::current_budget_url() {
                         crate::infra::rpc_budget::note_rate_limited(&url);
                     }
@@ -295,7 +293,7 @@ pub async fn execute_multicall_at_chunked<P: Provider<Ethereum> + Clone + Send +
                 (i, res)
             };
             match budget_url {
-                Some(url) => crate::infra::rpc_budget::scope_rpc_budget(&url, run).await,
+                Some(url) => crate::infra::rpc_budget::scope_rpc_budget_arc(url, run).await,
                 None => run.await,
             }
         });
@@ -388,7 +386,7 @@ mod tests {
     #[test]
     fn rate_limited_errors_are_not_bisected() {
         let err = anyhow::anyhow!("429 Too Many Requests");
-        assert!(super::is_rate_limited_rpc_error(&err));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err));
         assert!(!is_retryable_rpc_error(&err));
     }
 
@@ -398,11 +396,11 @@ mod tests {
         // and plain Display only shows the outer layer — bisect storms followed.
         let err = anyhow::anyhow!("error code 15: Too many request, try again later")
             .context("chunk multicall failed");
-        assert!(super::is_rate_limited_rpc_error(&err));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err));
         assert!(!is_retryable_rpc_error(&err));
         let err429 = anyhow::anyhow!("HTTP error 429 with body: Rate limit (1200rqs/60s) reached")
             .context("chunk multicall failed");
-        assert!(super::is_rate_limited_rpc_error(&err429));
+        assert!(crate::services::execution::rpc_errors::is_rpc_rate_limited(&err429));
         assert!(!is_retryable_rpc_error(&err429));
     }
 

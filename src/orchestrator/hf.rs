@@ -231,7 +231,7 @@ async fn hf_flash_prefetch_stale(
     flash_cache.track_hot_tokens(flash_token_list);
     // Must match flash_liquidity::stale_tokens (75% TTL). Full-TTL has_fresh_entry
     // skipped refresh in the last 7.5s → probe ColdCache on WMATIC (live).
-    let mut stale = flash_cache.tokens_needing_refresh(flash_token_list);
+    let mut stale = flash_cache.stale_tokens(flash_token_list);
     if stale.is_empty() {
         return;
     }

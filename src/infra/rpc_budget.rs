@@ -4,7 +4,6 @@
 //! latency-ranked primary was hammered with multicall fan-out. Token buckets pace
 //! admits before each RPC round-trip; 429s temporarily tighten the refill rate.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use tokio::task_local;
 
 task_local! {
     /// Active state/execution URL for the current async task (and scoped children).
-    static RPC_BUDGET_URL: String;
+    static RPC_BUDGET_URL: Arc<str>;
 }
 
 static HOST_BUDGETS: LazyLock<Mutex<FxHashMap<String, Arc<Mutex<TokenBucket>>>>> =
@@ -24,12 +23,20 @@ pub async fn scope_rpc_budget<F>(url: &str, fut: F) -> F::Output
 where
     F: std::future::Future,
 {
-    RPC_BUDGET_URL.scope(url.to_string(), fut).await
+    scope_rpc_budget_arc(Arc::<str>::from(url), fut).await
+}
+
+/// Like [`scope_rpc_budget`] but reuses an existing `Arc<str>` (JoinSet re-scope).
+pub async fn scope_rpc_budget_arc<F>(url: Arc<str>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RPC_BUDGET_URL.scope(url, fut).await
 }
 
 #[must_use]
-pub fn current_budget_url() -> Option<String> {
-    RPC_BUDGET_URL.try_with(|u| u.clone()).ok()
+pub fn current_budget_url() -> Option<Arc<str>> {
+    RPC_BUDGET_URL.try_with(Arc::clone).ok()
 }
 
 /// Block until this task's scoped URL (if any) has a request token.
@@ -155,8 +162,6 @@ struct TokenBucket {
     last: Instant,
     /// Until this instant, refill stays at the punished rate.
     punish_until: Option<Instant>,
-    /// Recent admit timestamps for optional diagnostics (bounded).
-    recent: VecDeque<Instant>,
 }
 
 impl TokenBucket {
@@ -169,7 +174,6 @@ impl TokenBucket {
             base_refill_per_sec: rps,
             last: Instant::now(),
             punish_until: None,
-            recent: VecDeque::with_capacity(64),
         }
     }
 
@@ -194,11 +198,6 @@ impl TokenBucket {
         self.refill();
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            let now = Instant::now();
-            self.recent.push_back(now);
-            while self.recent.len() > 64 {
-                self.recent.pop_front();
-            }
             return None;
         }
         let need = 1.0 - self.tokens;

@@ -48,6 +48,12 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
 const MAX_HOT_FLASH_TOKENS: usize = 384;
 
+/// Dust-only 1–3 token batches: defer to background coalesce (hubs always refresh).
+#[inline]
+fn should_defer_dust_flash_refresh(stale: &[Address]) -> bool {
+    stale.len() < 4 && !stale.iter().any(|addr| is_polygon_hub_token(*addr))
+}
+
 /// Clears [`FlashLiquidityCache::refresh_inflight`] on drop so only one multicall batch runs at a time.
 pub(crate) struct RefreshInflightGuard<'a>(&'a AtomicBool);
 
@@ -456,10 +462,7 @@ impl FlashLiquidityCache {
                             continue;
                         }
                         // Match HF spawn/prefetch: don't burn a multicall on 1–3 dust.
-                        let has_hub = stale
-                            .iter()
-                            .any(|addr| crate::core::constants::is_polygon_hub_token(*addr));
-                        if !has_hub && stale.len() < 4 {
+                        if should_defer_dust_flash_refresh(&stale) {
                             continue;
                         }
                         let Some(_guard) = self.try_acquire_refresh_inflight() else {
@@ -487,10 +490,7 @@ impl FlashLiquidityCache {
         }
         // Dust-only 1–3 token batches: background loop coalesces. Live: 11
         // refreshes/min with ~40% tokens=1 multicalls fighting TickLens for RPC.
-        let has_hub = stale
-            .iter()
-            .any(|addr| crate::core::constants::is_polygon_hub_token(*addr));
-        if !has_hub && stale.len() < 4 {
+        if should_defer_dust_flash_refresh(&stale) {
             return;
         }
         if self.refresh_inflight.load(Ordering::Acquire) {
@@ -572,11 +572,7 @@ impl FlashLiquidityCache {
 
     /// Tokens missing or past 75% of TTL — shared by HF prefetch + background refresh.
     #[must_use]
-    pub fn tokens_needing_refresh(&self, tokens: &[Address]) -> Vec<Address> {
-        self.stale_tokens(tokens)
-    }
-
-    fn stale_tokens(&self, tokens: &[Address]) -> Vec<Address> {
+    pub fn stale_tokens(&self, tokens: &[Address]) -> Vec<Address> {
         // Short stack borrow — `load()` not `load_full()` (arc-swap performance docs).
         // Refresh at 75% TTL so HF doesn't probe into ColdCache at the 30s edge
         // (live: wmatic_fresh=true then ColdCache ~30s later on stream ticks).

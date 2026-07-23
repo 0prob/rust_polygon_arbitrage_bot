@@ -86,8 +86,26 @@ impl PoolLogFeed {
                 backoff_ms = BASE_RECONNECT_DELAY_MS;
             } else {
                 let sticky = self.sticky_url.lock().clone();
-                let cooldowns = self.subscription_cooldowns.lock().clone();
-                match select_wss_url(&self.wss_urls, sticky.as_deref(), &cooldowns).await {
+                // Order under the lock; only clone candidate URLs (not the cooldown map).
+                let selection = {
+                    let cooldowns = self.subscription_cooldowns.lock();
+                    let now = now_ms();
+                    let sticky_eligible = sticky
+                        .as_deref()
+                        .filter(|url| cooldowns.get(*url).is_none_or(|until| *until <= now));
+                    match sticky_eligible {
+                        Some(url) if self.wss_urls.iter().any(|u| u == url) => {
+                            WssUrlPick::Sticky(url.to_string())
+                        }
+                        sticky_for_order => WssUrlPick::Probe(ordered_wss_urls(
+                            &self.wss_urls,
+                            sticky_for_order,
+                            &cooldowns,
+                            now,
+                        )),
+                    }
+                };
+                match selection.resolve().await {
                     Some(url) => {
                         backoff_ms = BASE_RECONNECT_DELAY_MS;
                         match self
@@ -461,35 +479,35 @@ async fn probe_wss_urls(urls: &[String]) -> Option<(String, Duration)> {
     best
 }
 
-async fn select_wss_url(
-    urls: &[String],
-    sticky: Option<&str>,
-    cooldowns: &rustc_hash::FxHashMap<String, u64>,
-) -> Option<String> {
-    if urls.is_empty() {
-        return None;
-    }
-    let now = now_ms();
-    let sticky_eligible =
-        sticky.filter(|url| cooldowns.get(*url).is_none_or(|until| *until <= now));
-    if sticky_eligible.is_some()
-        && let Some(url) = sticky_eligible.filter(|s| urls.iter().any(|u| u == *s))
-    {
-        crate::debug!(
-            "WSS sticky reconnect ({}, probe skipped)",
-            rpc_host_label(url)
-        );
-        return Some(url.to_string());
-    }
+enum WssUrlPick {
+    Sticky(String),
+    Probe(Vec<String>),
+}
 
-    let candidates = ordered_wss_urls(urls, sticky_eligible, cooldowns, now);
-    let (url, latency) = probe_wss_urls(&candidates).await?;
-    info!(
-        "WSS endpoint selected ({}, probe_ms={})",
-        rpc_host_label(&url),
-        latency.as_millis()
-    );
-    Some(url)
+impl WssUrlPick {
+    async fn resolve(self) -> Option<String> {
+        match self {
+            Self::Sticky(url) => {
+                crate::debug!(
+                    "WSS sticky reconnect ({}, probe skipped)",
+                    rpc_host_label(&url)
+                );
+                Some(url)
+            }
+            Self::Probe(candidates) => {
+                if candidates.is_empty() {
+                    return None;
+                }
+                let (url, latency) = probe_wss_urls(&candidates).await?;
+                info!(
+                    "WSS endpoint selected ({}, probe_ms={})",
+                    rpc_host_label(&url),
+                    latency.as_millis()
+                );
+                Some(url)
+            }
+        }
+    }
 }
 
 fn http_to_wss(url: &str) -> Option<String> {
