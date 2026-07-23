@@ -3,6 +3,11 @@
 //! Accumulates new unmapped addresses; when [`AUTO_FEED_SCAN_BATCH`] are pending,
 //! Hermes-scans them, registers verified USD feeds, and marks the rest as no-feed.
 //! State persists under `target/run-logs/oracle-auto-feeds.json`.
+//!
+//! **Safety:** only human-reviewed addresses ([`CURATED_POLYGON_TOKEN_HINTS`] /
+//! hub tokens) may receive a Pyth feed. `token_labels` includes symbol clones
+//! (fake USDC/LUNA/USDT, …); mapping those to Hermes majors overvalues dust and
+//! caused live gas burns (LUNA profit dust priced as real Terra LUNA).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -16,10 +21,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 
 use super::feed_audit::{
-    UsdFeedScanStatus, hint_label, scan_addresses_for_usd_feeds, token_symbol_label,
+    CURATED_POLYGON_TOKEN_HINTS, UsdFeedScanStatus, hint_label, scan_addresses_for_usd_feeds,
+    token_symbol_label,
 };
 use super::price_oracle::PriceOracle;
-use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, is_polygon_hub_token};
 
 /// New unmapped tokens before a Hermes USD scan runs.
 pub const AUTO_FEED_SCAN_BATCH: usize = 20;
@@ -29,6 +35,17 @@ static STORE: LazyLock<Mutex<AutoFeedStore>> =
 static PENDING: LazyLock<Mutex<FxHashSet<Address>>> =
     LazyLock::new(|| Mutex::new(FxHashSet::default()));
 static SCAN_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// True when address is human-reviewed for a major-asset Pyth mapping.
+#[must_use]
+pub fn is_auto_feed_address_allowed(addr: Address) -> bool {
+    if is_polygon_hub_token(addr) {
+        return true;
+    }
+    CURATED_POLYGON_TOKEN_HINTS
+        .iter()
+        .any(|(_, a, _)| *a == addr)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AutoFeedStore {
@@ -54,14 +71,45 @@ pub fn default_auto_feeds_path() -> PathBuf {
 }
 
 /// Load persisted auto-feeds, register into the oracle, seed no-feed set.
+///
+/// Drops persisted feeds for non-curated addresses (symbol-clone poison) and
+/// rewrites the store so a restart does not re-apply junk→major Pyth maps.
 pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
     let path = default_auto_feeds_path();
     let store = load_store(&path).unwrap_or_default();
     let mut feeds_n = 0u32;
+    let mut purged = 0u32;
     let no_n;
     {
         let mut guard = STORE.lock();
         *guard = store;
+        let mut keep = Vec::with_capacity(guard.feeds.len());
+        for entry in std::mem::take(&mut guard.feeds) {
+            let Ok(addr) = entry.address.parse::<Address>() else {
+                purged += 1;
+                continue;
+            };
+            if !is_auto_feed_address_allowed(addr) {
+                // Poison: token_labels symbol hit Hermes major (LUNA/USDC/…).
+                let key = format!("{addr:#x}");
+                if !guard
+                    .no_feed
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&key))
+                {
+                    guard.no_feed.push(key);
+                }
+                purged += 1;
+                crate::warn!(
+                    "oracle auto-feeds: purged non-curated feed {} → {} (symbol clone risk)",
+                    entry.address,
+                    entry.symbol
+                );
+                continue;
+            }
+            keep.push(entry);
+        }
+        guard.feeds = keep;
         for entry in &guard.feeds {
             let Ok(addr) = entry.address.parse::<Address>() else {
                 continue;
@@ -74,9 +122,14 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
         }
         no_n = guard.no_feed.len() as u32;
     }
-    if feeds_n > 0 || no_n > 0 {
+    if purged > 0 {
+        if let Err(e) = persist_store(&path) {
+            crate::warn!("oracle auto-feeds: purge persist failed: {e}");
+        }
+    }
+    if feeds_n > 0 || no_n > 0 || purged > 0 {
         crate::info!(
-            "oracle auto-feeds: loaded feeds={feeds_n} no_feed={no_n} path={}",
+            "oracle auto-feeds: loaded feeds={feeds_n} purged={purged} no_feed={no_n} path={}",
             path.display()
         );
     }
@@ -200,6 +253,18 @@ async fn run_auto_feed_batch(
                     marked += 1;
                     continue;
                 };
+                // Symbol-only Hermes hits on non-curated addresses are poison
+                // (live: fake LUNA @ 0x9cd6… → Crypto.LUNA/USD → dust "0.4 MATIC" arbs).
+                if !is_auto_feed_address_allowed(r.address) {
+                    mark_no_feed(r.address);
+                    marked += 1;
+                    crate::info!(
+                        "oracle auto-feeds: reject non-curated {} → {} — marked no_feed",
+                        r.address,
+                        r.symbol.as_deref().unwrap_or("?")
+                    );
+                    continue;
+                }
                 if try_register_verified(oracle, r.address, &feed_id, r.symbol.as_deref()).await {
                     persist_feed(r.address, &feed_id, r.symbol.as_deref().unwrap_or(""));
                     added += 1;
@@ -318,9 +383,28 @@ fn persist_store(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
 
     #[test]
     fn batch_constant_is_twenty() {
         assert_eq!(AUTO_FEED_SCAN_BATCH, 20);
+    }
+
+    #[test]
+    fn curated_sol_allowed_fake_luna_rejected() {
+        // Human-reviewed Wormhole SOL (feed_audit curated list).
+        let real_sol = address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912");
+        assert!(is_auto_feed_address_allowed(real_sol));
+        // Live poison: junk "LUNA" that was mapped to Crypto.LUNA/USD.
+        let fake_luna = address!("0x9cd6746665D9557e1B9a775819625711d0693439");
+        assert!(!is_auto_feed_address_allowed(fake_luna));
+        // Fake USDC (not USDC.e / native).
+        let fake_usdc = address!("0x576cf361711cd940cd9c397bb98c4c896cbd38de");
+        assert!(!is_auto_feed_address_allowed(fake_usdc));
+    }
+
+    #[test]
+    fn hub_wmatic_allowed() {
+        assert!(is_auto_feed_address_allowed(crate::core::constants::WMATIC));
     }
 }
