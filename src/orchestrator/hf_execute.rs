@@ -652,6 +652,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     let calldata_slippage_bps =
         base_slippage_bps.max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
     let search_low = evaluated.opt.search_low;
+    let adaptive_flash_cap_bound = evaluated.adaptive_flash_cap_bound;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
         evaluated.cycle,
         evaluated.sim,
@@ -672,7 +673,9 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         min_profit_roi_bps,
         gas_price,
         slippage_bps: route_slippage_bps,
-        max_flash_loan_usd,
+        max_flash_loan_usd: ctx
+            .execution
+            .adaptive_flash_loan_usd(fp, max_flash_loan_usd),
         matic_usd,
         matic_usd_chainlink: ctx.price_oracle.fresh_matic_usd_chainlink_raw(),
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
@@ -683,6 +686,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
         existing_assessment: prior_assessment,
         log_skips: log_prepare_skip,
+        adaptive_flash_cap_bound,
     }) else {
         skipped.record("prepare_plan");
         if log_prepare_skip {
@@ -807,6 +811,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         flash_liquidity: liquidity,
         has_dodo_pool: dodo_base_flash_pool_for_cycle(arena, &prepared.evaluated.cycle).is_some(),
         trust_prepared_flash: true,
+        adaptive_flash_cap_bound: prepared.adaptive_flash_cap_bound,
+        adaptive_flash_loan_usd_limit: max_flash_loan_usd,
     };
 
     let mut candidate =
@@ -905,11 +911,11 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
 }
 
 /// Hard cap on tick RPC targets per probe-tick hydrate.
-/// Live TickLens finishes in ~100–250ms; 900ms/pool capped at 1 left
-/// cycles_tickless stuck for tens of seconds (live: 16→16 with v3_fetch=1).
-const HF_PROBE_TICK_POOL_CAP: usize = 3;
-/// ms per tickless pool — matches observed hydrate ms with headroom.
-const HF_PROBE_TICK_MS_PER_POOL: u64 = 300;
+/// Live TickLens finishes in ~100–250ms; cap=3 left v3_total=7–8 with
+/// cycles_tickless stuck (iter1: 221 cl_tickless → NoSimulation).
+const HF_PROBE_TICK_POOL_CAP: usize = 6;
+/// ms per tickless pool — observed hydrate often 100–250ms; keep headroom.
+const HF_PROBE_TICK_MS_PER_POOL: u64 = 250;
 
 /// Scale the probe hydrate pool set to residual prep budget so we finish more
 /// often instead of cooling a large pending set on timeout.

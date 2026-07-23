@@ -477,6 +477,8 @@ mod tests {
             state_block: 1,
             state_hash: None,
             route_trace: String::new(),
+            adaptive_flash_cap_bound: false,
+            adaptive_flash_loan_usd_limit: 50_000,
         };
 
         let tx = build_tx(&candidate, Address::repeat_byte(3), None);

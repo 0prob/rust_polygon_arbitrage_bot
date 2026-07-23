@@ -301,6 +301,7 @@ pub struct HfEvalResult {
     pub flash_source: FlashLoanSource,
     /// Set when `filter_balancer_onchain_verified` already ran `queryBatchSwap`.
     pub balancer_batch_verified: bool,
+    pub adaptive_flash_cap_bound: bool,
 }
 
 /// Economic / spot / size-ladder probes for ranking. Deliberate probe sizes must not use
@@ -1235,7 +1236,7 @@ fn probe_fallback_amounts(
     input: &HfEvalInput<'_>,
     probe_seed: Option<(U256, MinimalSimResult)>,
 ) -> Vec<U256> {
-    let flash_cap = flash_cap_for_cycle(input, cycle);
+    let flash_cap = flash_cap_for_cycle(input, cycle, hash_cycle_edges(&cycle.edges));
     let dec = flash_cap.token_decimals;
     let rate = flash_cap.token_to_matic_rate;
     let mut amounts = Vec::with_capacity(5);
@@ -1522,7 +1523,11 @@ fn evaluate_one(
         cycle,
         input.token_to_matic_rates,
         input.token_decimals,
-        Some(input.max_flash_loan_usd),
+        Some(
+            input
+                .execution
+                .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd),
+        ),
         input.matic_usd,
         input.matic_usd_chainlink,
         Some(input.brent_iters),
@@ -1645,6 +1650,10 @@ fn evaluate_one(
         );
     }
 
+    let adaptive_flash_cap_bound = flash_cap_for_cycle(input, cycle, fp)
+        .cap_wei()
+        .is_some_and(|cap| opt.optimal_input == cap);
+
     Some(HfEvalResult {
         route_fingerprint: fp,
         cycle: cycle.clone(),
@@ -1654,6 +1663,7 @@ fn evaluate_one(
         effective_slippage_bps: slippage_bps,
         flash_source,
         balancer_batch_verified: false,
+        adaptive_flash_cap_bound,
     })
 }
 
@@ -1713,9 +1723,15 @@ fn assess_route_for_cycle(
     }))
 }
 
-fn flash_cap_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> FlashBorrowCapParams {
+fn flash_cap_for_cycle(
+    input: &HfEvalInput<'_>,
+    cycle: &FoundCycle,
+    fp: u64,
+) -> FlashBorrowCapParams {
     FlashBorrowCapParams {
-        max_flash_loan_usd: input.max_flash_loan_usd,
+        max_flash_loan_usd: input
+            .execution
+            .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd),
         token_decimals: resolve_token_decimals_for_index(
             cycle.start_token,
             input.arena,
@@ -1737,7 +1753,7 @@ fn validate_optimized_sim(
     optimal_input: U256,
     search_low: U256,
 ) -> bool {
-    let flash_cap = flash_cap_for_cycle(input, cycle);
+    let flash_cap = flash_cap_for_cycle(input, cycle, hash_cycle_edges(&cycle.edges));
     let token_to_matic_rate = flash_cap.token_to_matic_rate;
     let token_decimals = flash_cap.token_decimals;
 

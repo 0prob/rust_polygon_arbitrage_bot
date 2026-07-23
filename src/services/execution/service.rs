@@ -92,6 +92,7 @@ const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
 const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 5u128 * 10u128.pow(16); // 0.05 MATIC
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+const ADAPTIVE_FLASH_CAP_START_DIVISOR: u64 = 4;
 
 #[derive(Debug, Clone, Default)]
 struct RouteStats {
@@ -102,6 +103,7 @@ struct RouteStats {
     receipt_timeouts: u64,
     reverts: u64,
     realized_losses: u64,
+    adaptive_flash_loan_usd: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,6 +375,10 @@ impl ExecutionService {
                     let entry: &mut RouteStats = stats.entry(fp).or_default();
                     match tag {
                         "s" => entry.successes += 1,
+                        "c" => {
+                            entry.adaptive_flash_loan_usd =
+                                parts.next().and_then(|value| value.parse().ok())
+                        }
                         "f" => {
                             entry.failures += 1;
                             match parts.next() {
@@ -430,6 +436,42 @@ impl ExecutionService {
         10_000u64
             .saturating_add(weighted_failures.saturating_mul(20_000) / attempts)
             .min(30_000)
+    }
+
+    #[must_use]
+    pub fn adaptive_flash_loan_usd(&self, fp: u64, configured_max_usd: u64) -> u64 {
+        let initial = configured_max_usd.saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
+            / ADAPTIVE_FLASH_CAP_START_DIVISOR;
+        self.route_stats
+            .read()
+            .get(&fp)
+            .and_then(|stats| stats.adaptive_flash_loan_usd)
+            .unwrap_or(initial)
+            .min(configured_max_usd)
+    }
+
+    fn promote_adaptive_flash_loan_cap(
+        &self,
+        fp: u64,
+        configured_max_usd: u64,
+    ) -> Option<(u64, u64)> {
+        let mut stats = self.route_stats.write();
+        let current = stats
+            .get(&fp)
+            .and_then(|stats| stats.adaptive_flash_loan_usd)
+            .unwrap_or_else(|| {
+                configured_max_usd.saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
+                    / ADAPTIVE_FLASH_CAP_START_DIVISOR
+            })
+            .min(configured_max_usd);
+        let next = current.saturating_mul(2).min(configured_max_usd);
+        if next == current {
+            return None;
+        }
+        stats.entry(fp).or_default().adaptive_flash_loan_usd = Some(next);
+        drop(stats);
+        self.write_route_event(format!("{fp} c {next}"));
+        Some((current, next))
     }
     pub fn pnl_snapshot(&self) -> (i128, i128) {
         let mut pnl = self.pnl.lock();
@@ -1802,6 +1844,16 @@ impl ExecutionService {
             self.record_realized(profit_matic_wei, gas_cost);
             if profit_matic_wei > gas_cost {
                 self.clear_fail_count(fp);
+                if candidate.adaptive_flash_cap_bound
+                    && let Some((previous, next)) = self.promote_adaptive_flash_loan_cap(
+                        fp,
+                        candidate.adaptive_flash_loan_usd_limit,
+                    )
+                {
+                    crate::info!(
+                        "flash cap promoted: fp={fp} usd={previous}->{next} after profitable confirmed receipt"
+                    );
+                }
             } else {
                 self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
             }
@@ -2112,6 +2164,8 @@ mod safety_tests {
             state_block: 1,
             state_hash: None,
             route_trace: String::new(),
+            adaptive_flash_cap_bound: false,
+            adaptive_flash_loan_usd_limit: 50_000,
         };
         assert!(
             ExecutionService::reassess_assessment(
@@ -2152,6 +2206,8 @@ mod safety_tests {
             state_block: 1,
             state_hash: None,
             route_trace: String::new(),
+            adaptive_flash_cap_bound: false,
+            adaptive_flash_loan_usd_limit: 50_000,
         };
 
         let assessment = ExecutionService::reassess_assessment(
@@ -2195,6 +2251,8 @@ mod safety_tests {
             state_block: 1,
             state_hash: None,
             route_trace: String::new(),
+            adaptive_flash_cap_bound: false,
+            adaptive_flash_loan_usd_limit: 50_000,
         };
         let gas_price = U256::from(314_608_528_420u64);
         let realized = U256::from(300_000_000_000_000_000u128);
@@ -2248,6 +2306,33 @@ mod safety_tests {
     }
 
     #[test]
+    fn adaptive_flash_cap_starts_conservatively_and_promotes_to_configured_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "rpbot-adaptive-flash-cap-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let service = ExecutionService::with_route_stats_path(path.clone());
+        assert_eq!(service.adaptive_flash_loan_usd(7, 50_000), 12_500);
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            Some((12_500, 25_000))
+        );
+        assert_eq!(service.adaptive_flash_loan_usd(7, 50_000), 25_000);
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            Some((25_000, 50_000))
+        );
+        assert_eq!(service.promote_adaptive_flash_loan_cap(7, 50_000), None);
+        assert_eq!(service.adaptive_flash_loan_usd(7, 10_000), 10_000);
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn candidate_generation_tracks_state_cache_at_build_time() {
         let cache = StateCache::new(8, std::time::Duration::from_secs(60));
         let candidate = CandidateExecution {
@@ -2274,6 +2359,8 @@ mod safety_tests {
             state_block: 0,
             state_hash: None,
             route_trace: String::new(),
+            adaptive_flash_cap_bound: false,
+            adaptive_flash_loan_usd_limit: 50_000,
         };
 
         assert!(ExecutionService::candidate_matches_state_generation(
@@ -2305,6 +2392,10 @@ mod safety_tests {
             service.record_route_success(7);
         }
         service.record_route_failure(7, RouteFailureKind::DryRun);
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            Some((12_500, 25_000))
+        );
         service.route_stats_writer.flush();
 
         let saved = ExecutionService::replay_route_stats(&path);
@@ -2312,6 +2403,7 @@ mod safety_tests {
         assert_eq!(stats.successes, 100);
         assert_eq!(stats.failures, 1);
         assert_eq!(stats.dry_run_failures, 1);
+        assert_eq!(stats.adaptive_flash_loan_usd, Some(25_000));
 
         let _ = std::fs::remove_file(&path);
     }

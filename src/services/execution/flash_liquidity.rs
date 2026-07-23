@@ -1333,6 +1333,7 @@ pub struct PrepareDispatchInput<'a> {
     pub existing_assessment: Option<crate::core::types::ProfitAssessment>,
     /// Emit prepare reject reason at INFO (rate-limited by caller).
     pub log_skips: bool,
+    pub adaptive_flash_cap_bound: bool,
 }
 
 #[inline]
@@ -1348,6 +1349,7 @@ pub struct PreparedDispatch {
     pub evaluated: EvaluatedRoute,
     pub flash_source: FlashLoanSource,
     pub liquidity_cap_applied: bool,
+    pub adaptive_flash_cap_bound: bool,
 }
 
 #[must_use]
@@ -1464,6 +1466,7 @@ pub fn prepare_evaluated_route(input: &PrepareDispatchInput<'_>) -> Option<Prepa
                 },
                 flash_source: plan.source,
                 liquidity_cap_applied: false,
+                adaptive_flash_cap_bound: input.adaptive_flash_cap_bound,
             })
         }
         FlashPlanAction::CapAndReoptimize => {
@@ -1567,6 +1570,7 @@ fn reoptimize_capped(
         },
         flash_source: source,
         liquidity_cap_applied: true,
+        adaptive_flash_cap_bound: false,
     })
 }
 

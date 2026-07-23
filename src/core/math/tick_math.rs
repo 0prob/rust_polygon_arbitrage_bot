@@ -4,11 +4,19 @@ pub const MIN_TICK: i32 = -887_272;
 pub const MAX_TICK: i32 = 887_272;
 pub const MIN_SQRT_RATIO: U256 = U256::from_limbs([4_295_128_739, 0, 0, 0]);
 /// Uniswap V3 `TickMath.MAX_SQRT_RATIO` (fits uint160). Prior limbs were wrong (220-bit).
-pub const MAX_SQRT_RATIO: U256 =
-    U256::from_limbs([6_743_328_256_752_651_558, 17_280_870_778_742_802_505, 4_294_805_859, 0]);
+pub const MAX_SQRT_RATIO: U256 = U256::from_limbs([
+    6_743_328_256_752_651_558,
+    17_280_870_778_742_802_505,
+    4_294_805_859,
+    0,
+]);
 /// `MAX_SQRT_RATIO - 1` — the exclusion bound for non-zero-for-one swaps.
-pub const MAX_SQRT_RATIO_EXCLUSIVE: U256 =
-    U256::from_limbs([6_743_328_256_752_651_557, 17_280_870_778_742_802_505, 4_294_805_859, 0]);
+pub const MAX_SQRT_RATIO_EXCLUSIVE: U256 = U256::from_limbs([
+    6_743_328_256_752_651_557,
+    17_280_870_778_742_802_505,
+    4_294_805_859,
+    0,
+]);
 
 const LOW_32_MASK: U256 = U256::from_limbs([u32::MAX as u64, 0, 0, 0]);
 
@@ -176,7 +184,10 @@ mod tests {
         assert_eq!(MAX_SQRT_RATIO, at_max);
         assert_eq!(MAX_SQRT_RATIO_EXCLUSIVE, MAX_SQRT_RATIO - U256::ONE);
         assert!(MAX_SQRT_RATIO.bit_len() <= 160);
-        assert_eq!(MIN_SQRT_RATIO, get_sqrt_ratio_at_tick(MIN_TICK).expect("MIN_TICK"));
+        assert_eq!(
+            MIN_SQRT_RATIO,
+            get_sqrt_ratio_at_tick(MIN_TICK).expect("MIN_TICK")
+        );
     }
 }
 

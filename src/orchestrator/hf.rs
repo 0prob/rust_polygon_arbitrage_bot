@@ -171,10 +171,10 @@ const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
 /// Stream path already has WSS state — don't spend the full prep budget on flash.
 const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(400);
 /// Skip probe-tick hydrate when residual prep cannot finish one pool.
-/// Must match `HF_PROBE_TICK_MS_PER_POOL` (300ms) — 900ms floor carved up to 3 pools.
-const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(300);
-/// Cap so TickLens cannot burn the whole prep wall; 900ms → up to 3 pools.
-const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(900);
+/// Must match `HF_PROBE_TICK_MS_PER_POOL` (250ms).
+const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(250);
+/// Cap so TickLens cannot burn the whole prep wall; 1500ms → up to 6 pools.
+const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(1_500);
 /// Stream HF can fire every ~100–200ms; TickLens hydrate must not.
 const PROBE_HYDRATE_MIN_GAP_MS: u64 = 1_500;
 
@@ -2005,7 +2005,7 @@ pub async fn run_hf_tick(
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
     // Use the carved hydrate_floor — prep_deadline residual is often 0 here after
-    // flash/oracle even when reserve_hydrate_budget held 900ms at stage start.
+    // flash/oracle even when reserve_hydrate_budget held MAX at stage start.
     let probe_tick_budget = hydrate_floor
         .min(HF_PROBE_HYDRATE_MAX_BUDGET)
         .min(prep_remaining(tick_deadline));
@@ -2846,10 +2846,10 @@ mod tests {
         let (work, hydrate) = reserve_hydrate_budget(stage);
         assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
         assert_eq!(work + hydrate, stage);
-        // Full MAX residual admits pool cap (3 × 300ms).
+        // Full MAX residual admits hard pool cap (6 × 250ms).
         assert_eq!(
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate),
-            3
+            6
         );
 
         let tight = Duration::from_millis(200);

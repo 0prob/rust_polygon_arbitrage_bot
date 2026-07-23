@@ -45,6 +45,8 @@ pub struct CandidateExecution {
     pub state_hash: Option<alloy::primitives::B256>,
     /// Human-readable hop trace for dry-run / submit failure logs.
     pub route_trace: String,
+    pub adaptive_flash_cap_bound: bool,
+    pub adaptive_flash_loan_usd_limit: u64,
 }
 
 pub struct CandidateBuildConfig {
@@ -65,6 +67,8 @@ pub struct CandidateBuildConfig {
     pub has_dodo_pool: bool,
     /// Skip liquidity re-alignment when `prepare_evaluated_route` already validated the plan.
     pub trust_prepared_flash: bool,
+    pub adaptive_flash_cap_bound: bool,
+    pub adaptive_flash_loan_usd_limit: u64,
 }
 
 #[must_use]
@@ -268,6 +272,8 @@ pub fn build_execution_candidate(
         state_block: config.state_block,
         state_hash: config.state_hash,
         route_trace,
+        adaptive_flash_cap_bound: config.adaptive_flash_cap_bound,
+        adaptive_flash_loan_usd_limit: config.adaptive_flash_loan_usd_limit,
     })
 }
 
