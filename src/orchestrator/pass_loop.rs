@@ -26,7 +26,6 @@ use crate::pipeline::graph_cache::GraphCache;
 use crate::services::execution::ExecutionService;
 use crate::services::execution::GasOracle;
 use crate::services::hf_snapshot::SnapshotStore;
-use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{load_and_apply_auto_feeds, spawn_auto_feed_sidecar};
 use crate::services::partial_cache::{PartialPoolCache, StreamAddressSet};
@@ -698,7 +697,11 @@ fn spawn_daily_loss_guard(
 async fn warm_matic_usd_oracle(ctx: &RuntimeContext) {
     let provider = ctx.rpc.connect_state().ok();
     let provider_ref = provider.as_ref();
-    match ensure_matic_usd_for_flash_cap(&ctx.price_oracle, provider_ref).await {
+    match ctx
+        .price_oracle
+        .ensure_matic_usd_for_flash_cap(provider_ref)
+        .await
+    {
         Some(usd) => crate::info!("matic/usd oracle ready for HF (usd={usd:.4})"),
         None => crate::warn!(
             "matic/usd oracle unavailable at startup — HF eval may skip until Pyth/Chainlink responds"
@@ -730,7 +733,10 @@ fn spawn_matic_usd_oracle_background(
             }
             let provider = rpc.connect_state().ok();
             let provider_ref = provider.as_ref();
-            match ensure_matic_usd_for_flash_cap(&price_oracle, provider_ref).await {
+            match price_oracle
+                .ensure_matic_usd_for_flash_cap(provider_ref)
+                .await
+            {
                 Some(_) => MATIC_USD_FAILS.store(0, Ordering::Relaxed),
                 None => {
                     let n = MATIC_USD_FAILS.fetch_add(1, Ordering::Relaxed) + 1;

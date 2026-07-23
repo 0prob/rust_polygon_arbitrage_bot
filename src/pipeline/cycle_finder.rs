@@ -1367,24 +1367,6 @@ fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
 }
 
 #[must_use]
-pub fn find_cycles_multi_pass_with_prep(
-    graph: &RoutingGraph,
-    arena: &StateArena,
-    pool_metas: &PoolMetaIndex<'_>,
-    prep: &ActiveGraph,
-    passes: &[CycleSearchPass],
-) -> Vec<FoundCycle> {
-    find_cycles_multi_pass_with_prep_budget(
-        graph,
-        arena,
-        pool_metas,
-        prep,
-        passes,
-        CYCLE_ENUM_TIME_BUDGET,
-    )
-}
-
-#[must_use]
 pub fn find_cycles_multi_pass_with_prep_budget(
     graph: &RoutingGraph,
     arena: &StateArena,
@@ -1428,21 +1410,6 @@ pub fn find_cycles_multi_pass_with_prep_budget(
     }
     // Final dedupe happens in `finalize_cycles` after hybrid DFS+BF merge.
     all
-}
-
-#[must_use]
-pub fn find_cycles_multi_pass(
-    graph: &RoutingGraph,
-    arena: &StateArena,
-    pool_metas: &[PoolMeta],
-    passes: &[CycleSearchPass],
-) -> Vec<FoundCycle> {
-    if passes.is_empty() {
-        return Vec::new();
-    }
-    let prep = prepare_active_graph(graph);
-    let pool_metas = index_pool_metas(pool_metas);
-    find_cycles_multi_pass_with_prep(graph, arena, &pool_metas, &prep, passes)
 }
 
 #[inline]
@@ -1600,8 +1567,8 @@ mod tests {
         let hub = TokenIndex(0);
         let spoke = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(hub, graph_edge(0, hub, spoke));
-        graph.add_edge(spoke, graph_edge(1, spoke, hub));
+        graph.add_direct_edge(hub, graph_edge(0, hub, spoke));
+        graph.add_direct_edge(spoke, graph_edge(1, spoke, hub));
         let mut prep = prepare_active_graph(&graph);
         assert!(prep.start_tokens.contains(&hub));
         prep.prefer_start_tokens(&[spoke], false);
@@ -1613,12 +1580,12 @@ mod tests {
         let hub = TokenIndex(0);
         let tail = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(hub, graph_edge(0, hub, tail));
+        graph.add_direct_edge(hub, graph_edge(0, hub, tail));
         let mut dead = graph_edge(1, tail, hub);
         dead.log_weight = DEAD_EDGE_LOG_WEIGHT;
         dead.ratio = U256::ZERO;
-        graph.add_edge(tail, dead);
-        graph.add_edge(tail, graph_edge(2, tail, hub));
+        graph.add_direct_edge(tail, dead);
+        graph.add_direct_edge(tail, graph_edge(2, tail, hub));
 
         let order = prioritize_cycle_start_tokens(&graph);
         assert_eq!(order, vec![hub, tail]);
@@ -1637,9 +1604,9 @@ mod tests {
         let b = TokenIndex(1);
         let dead_end = TokenIndex(2);
         let mut graph = RoutingGraph::new(3);
-        graph.add_edge(a, graph_edge(0, a, b));
-        graph.add_edge(b, graph_edge(1, b, a));
-        graph.add_edge(b, graph_edge(2, b, dead_end));
+        graph.add_direct_edge(a, graph_edge(0, a, b));
+        graph.add_direct_edge(b, graph_edge(1, b, a));
+        graph.add_direct_edge(b, graph_edge(2, b, dead_end));
 
         let coverage = cycle_capable_coverage(&graph);
         assert!(coverage.pool_indices.contains(&0));
@@ -1658,11 +1625,11 @@ mod tests {
         let a = TokenIndex(0);
         let b = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(a, graph_edge(0, a, b));
+        graph.add_direct_edge(a, graph_edge(0, a, b));
         let mut dead_return = graph_edge(1, b, a);
         dead_return.log_weight = DEAD_EDGE_LOG_WEIGHT;
         dead_return.ratio = U256::ZERO;
-        graph.add_edge(b, dead_return);
+        graph.add_direct_edge(b, dead_return);
 
         let coverage = cycle_capable_coverage(&graph);
         assert!(coverage.pool_indices.is_empty());
@@ -1674,8 +1641,8 @@ mod tests {
         let a = TokenIndex(0);
         let b = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(a, graph_edge(0, a, b));
-        graph.add_edge(b, graph_edge(0, b, a));
+        graph.add_direct_edge(a, graph_edge(0, a, b));
+        graph.add_direct_edge(b, graph_edge(0, b, a));
 
         let coverage = cycle_capable_coverage(&graph);
         assert!(coverage.pool_indices.is_empty());
@@ -1687,7 +1654,7 @@ mod tests {
         let a = TokenIndex(0);
         let b = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(
+        graph.add_direct_edge(
             a,
             GraphEdge {
                 edge: Edge {
@@ -1706,7 +1673,7 @@ mod tests {
                 ratio: U256::from(1_000_000_000_000_000_000u64),
             },
         );
-        graph.add_edge(
+        graph.add_direct_edge(
             b,
             GraphEdge {
                 edge: Edge {
@@ -1785,8 +1752,8 @@ mod tests {
         let a = TokenIndex(0);
         let b = TokenIndex(1);
         let mut graph = RoutingGraph::new(2);
-        graph.add_edge(a, graph_edge(0, a, b));
-        graph.add_edge(b, graph_edge(1, b, a));
+        graph.add_direct_edge(a, graph_edge(0, a, b));
+        graph.add_direct_edge(b, graph_edge(1, b, a));
         let mut prep = prepare_active_graph(&graph);
         prep.prioritize_first_hop_pools(&[PoolIndex(0)]);
         let dead_log = 50.0;
@@ -1847,14 +1814,14 @@ mod tests {
         let dead = TokenIndex(0);
         let hub = TokenIndex(1);
         let mut graph = RoutingGraph::new(5);
-        graph.add_edge(dead, edge(0, dead, TokenIndex(4)));
+        graph.add_direct_edge(dead, edge(0, dead, TokenIndex(4)));
         for (branch, token) in [TokenIndex(2), TokenIndex(3), TokenIndex(4)]
             .into_iter()
             .enumerate()
         {
             let pool = 1 + (branch as u32 * 2);
-            graph.add_edge(hub, edge(pool, hub, token));
-            graph.add_edge(token, edge(pool + 1, token, hub));
+            graph.add_direct_edge(hub, edge(pool, hub, token));
+            graph.add_direct_edge(token, edge(pool + 1, token, hub));
         }
 
         let arena = StateArena::default();

@@ -70,7 +70,7 @@ mod tests {
     fn weighted_adjacency_ignores_virtual_hub_slots() {
         let mut graph = RoutingGraph::new(2);
         let live = graph_edge(-0.1);
-        graph.add_edge(TokenIndex(0), live);
+        graph.add_direct_edge(TokenIndex(0), live);
         graph
             .virtual_hubs
             .push(crate::pipeline::types::VirtualPoolHub {
@@ -89,10 +89,10 @@ mod tests {
         let mut graph = RoutingGraph::new(2);
         let mut live = graph_edge(-0.1);
         live.ratio = U256::from(1_000_000_000_000_000_000u64);
-        graph.add_edge(TokenIndex(0), live);
+        graph.add_direct_edge(TokenIndex(0), live);
         let mut dead = graph_edge(DEAD_EDGE_LOG_WEIGHT);
         dead.ratio = U256::ZERO;
-        graph.add_edge(TokenIndex(1), dead);
+        graph.add_direct_edge(TokenIndex(1), dead);
         let adj = build_weighted_adjacency(&graph);
         assert_eq!(adj[0].len(), 1);
         assert!(adj[1].is_empty());
@@ -105,7 +105,7 @@ mod tests {
         live.ratio = U256::from(1_000_000_000_000_000_000u64);
         live.edge.token_out = TokenIndex(1839);
         live.target_node = 1839;
-        graph.add_edge(TokenIndex(0), live);
+        graph.add_direct_edge(TokenIndex(0), live);
         let adj = build_weighted_adjacency(&graph);
         assert!(adj[0].is_empty());
     }

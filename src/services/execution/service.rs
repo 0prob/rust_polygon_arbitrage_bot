@@ -1140,8 +1140,11 @@ impl ExecutionService {
                 // (live: LGNS 0xeB51… ain=1e18) — route_hash rotates so 600s hash
                 // cool alone re-burns verify; cool the start token like Direct FoT.
                 if let Some(DecodedRevert::ExternalCallFailed { reason, .. }) = &dry.decoded_revert
-                    && reason.contains("TransferFailed")
+                    && (reason.contains("TransferFailed")
+                        || reason.contains("TRANSFER_FAILED"))
                 {
+                    // UniV2 string revert is "TRANSFER_FAILED"; executor custom is TransferFailed.
+                    // Iter7: Aave+V2 route failed hop1 with UniswapV2: TRANSFER_FAILED — no token cool.
                     self.quarantine_direct_token_zero_realized(candidate.profit_token);
                     crate::info!(
                         "token quarantine after TransferFailed dry-run: token={} fp={fp}",

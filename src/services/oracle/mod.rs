@@ -53,17 +53,6 @@ use self::price_oracle::{PriceOracle, token_usd_to_matic_rate_per_unit};
 use crate::pipeline::sim_sanity::matic_usd_for_flash_cap;
 use crate::pipeline::types::RoutingGraph;
 
-/// MATIC/USD for flash borrow caps — see [`PriceOracle::ensure_matic_usd_for_flash_cap`].
-pub async fn ensure_matic_usd_for_flash_cap<P>(
-    oracle: &PriceOracle,
-    state_provider: Option<&P>,
-) -> Option<f64>
-where
-    P: Provider<Ethereum> + Clone + Send + 'static,
-{
-    oracle.ensure_matic_usd_for_flash_cap(state_provider).await
-}
-
 /// Hint from HF eval, else live oracle refresh — for dispatch flash-cap sizing.
 pub async fn resolve_matic_usd_for_flash_dispatch<P>(
     oracle: &PriceOracle,
@@ -83,7 +72,7 @@ where
             return Some(hint);
         }
     }
-    ensure_matic_usd_for_flash_cap(oracle, Some(provider)).await
+    oracle.ensure_matic_usd_for_flash_cap(Some(provider)).await
 }
 
 #[inline]
@@ -556,7 +545,7 @@ fn insert_missing_wmatic_self_rates(
 
 /// Relative divergence in bps: `|a - b| * 10_000 / max(a, b)`.
 #[must_use]
-fn rates_diverge_bps(a: U256, b: U256) -> u64 {
+pub(crate) fn rates_diverge_bps(a: U256, b: U256) -> u64 {
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
     if hi.is_zero() {
         return 0;

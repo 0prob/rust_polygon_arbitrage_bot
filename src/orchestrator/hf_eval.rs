@@ -1606,14 +1606,21 @@ fn evaluate_one(
     let slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
     let mut assessment =
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
-    // Probe-only dust phantoms: live ain=100000 (0.1 USDC) "profit" 0.25 MATIC then
-    // dry-run TransferFailed (executor never held flash input). Require economic floor,
-    // real hop amounts (not zeroed minimal fallback), and hop fidelity for execute.
+    // Probe-only dust phantoms: live ain=100000 (0.1 USDC) "profit" 0.25–0.40 MATIC
+    // then dry-run TransferFailed/IIA. MATIC economic floor alone is ~0.008 USDC at
+    // $0.08/MATIC — too low. Require ≥1 whole start token plus hop fidelity.
     if assessment.should_execute {
-        let floor = min_economic_amount_in(
-            resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals),
+        let start_decimals = resolve_token_decimals_for_index(
+            cycle.start_token,
+            input.arena,
+            input.token_decimals,
+        );
+        let economic = min_economic_amount_in(
+            start_decimals,
             resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
         );
+        let one_token = crate::util::ten_pow_u256(start_decimals);
+        let floor = economic.max(one_token);
         let has_hop_amounts = sim.hop_amounts.iter().any(|a| !a.is_zero());
         let fidelity_ok = has_hop_amounts
             && local_sim::route_hop_fidelity_ok_after_walk(

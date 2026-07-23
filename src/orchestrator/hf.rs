@@ -34,7 +34,6 @@ use crate::services::execution::{
     rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
-use crate::services::oracle::ensure_matic_usd_for_flash_cap;
 use crate::services::oracle::has_reliable_matic_rate;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
@@ -1971,7 +1970,8 @@ pub async fn run_hf_tick(
             }
             match timeout(
                 oracle_budget,
-                ensure_matic_usd_for_flash_cap(&ctx.price_oracle, state_provider_ref),
+                ctx.price_oracle
+                    .ensure_matic_usd_for_flash_cap(state_provider_ref),
             )
             .await
             {
@@ -2100,7 +2100,7 @@ pub async fn run_hf_tick(
                 HYDRATE_INFO_LOG_AT.store(now, Ordering::Relaxed);
             }
             crate::info!(
-                "hf probe-tick hydrate: cycles_tickless={}->{} v3_total={} v3_fetch={} v3_loaded={} (empty={} incomplete={} algebra={} seeded={}) v4_total={} v4_fetch={} v4_loaded={} ms={}",
+                "hf probe-tick hydrate: cycles_tickless={}->{} v3_total={} v3_fetch={} v3_loaded={} (empty={} incomplete={} algebra={}) v4_total={} v4_fetch={} v4_loaded={} ms={}",
                 hydrate_stats.cycles_tickless_before,
                 hydrate_stats.cycles_tickless_after,
                 hydrate_stats.v3_total,
@@ -2109,7 +2109,6 @@ pub async fn run_hf_tick(
                 hydrate_stats.v3_empty,
                 hydrate_stats.v3_incomplete,
                 hydrate_stats.v3_algebra_loaded,
-                hydrate_stats.v3_seeded,
                 hydrate_stats.v4_total,
                 hydrate_stats.v4_needed,
                 hydrate_stats.v4_loaded,
@@ -2693,19 +2692,6 @@ fn cycle_needs_cl_ticks(cycle: &FoundCycle) -> bool {
     })
 }
 
-fn protocol_tag(protocol: ProtocolType) -> &'static str {
-    match protocol {
-        ProtocolType::UniswapV2 => "V2",
-        ProtocolType::UniswapV3 => "V3",
-        ProtocolType::UniswapV4 => "V4",
-        ProtocolType::BalancerV2 => "BAL",
-        ProtocolType::CurveStable => "CRV-S",
-        ProtocolType::CurveCrypto => "CRV-C",
-        ProtocolType::Dodo => "DODO",
-        ProtocolType::Woofi => "WOOFI",
-    }
-}
-
 fn best_eval_pools_summary(arena: &StateArena, cycle: &FoundCycle) -> String {
     use std::fmt::Write;
     let mut buf = String::with_capacity(cycle.edges.len().saturating_mul(80).max(80));
@@ -2750,8 +2736,8 @@ fn near_miss_route_summary(
     }
     for edge in &cycle.edges {
         let tag = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
-            .map(|m| protocol_tag(m.protocol))
-            .unwrap_or_else(|| protocol_tag(edge.protocol));
+            .map(|m| m.protocol.tag())
+            .unwrap_or_else(|| edge.protocol.tag());
         let _ = write!(buf, "->{tag}:");
         // Pool address (was token_out — live sticky diag looked like WMATIC↔token loops).
         if let Some(addr) = arena.pool_address(edge.pool_index) {

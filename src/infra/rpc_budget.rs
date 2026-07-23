@@ -4,9 +4,10 @@
 //! latency-ranked primary was hammered with multicall fan-out. Token buckets pace
 //! admits before each RPC round-trip; 429s temporarily tighten the refill rate.
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use tokio::task_local;
 
@@ -51,7 +52,7 @@ pub async fn admit_url(url: &str) {
     let bucket = bucket_for_url(url);
     loop {
         let wait = {
-            let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = bucket.lock();
             b.try_take()
         };
         match wait {
@@ -64,7 +65,7 @@ pub async fn admit_url(url: &str) {
 /// After a 429 / free-plan limit: cool the host and cut refill for a while.
 pub fn note_rate_limited(url: &str) {
     let bucket = bucket_for_url(url);
-    let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = bucket.lock();
     b.punish();
     crate::debug!(
         "rpc budget punished ({}) refill={:.1}/s",
@@ -77,7 +78,7 @@ pub fn note_rate_limited(url: &str) {
 #[must_use]
 pub fn approx_tokens(url: &str) -> f64 {
     let bucket = bucket_for_url(url);
-    let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = bucket.lock();
     b.refill();
     b.tokens
 }
@@ -145,7 +146,7 @@ fn default_rps(url: &str) -> f64 {
 
 fn bucket_for_url(url: &str) -> Arc<Mutex<TokenBucket>> {
     let host = crate::infra::rpc::rpc_host_label(url);
-    let mut map = HOST_BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = HOST_BUDGETS.lock();
     map.entry(host)
         .or_insert_with(|| {
             let rps = default_rps(url);

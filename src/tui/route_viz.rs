@@ -1,22 +1,10 @@
 use alloy::primitives::Address;
 
-use crate::core::types::{Edge, ProtocolType};
+use crate::core::types::Edge;
 use crate::services::execution::candidate::hash_cycle_edges;
 use crate::util::truncate_str;
 
-#[must_use]
-pub fn protocol_tag(protocol: ProtocolType) -> &'static str {
-    match protocol {
-        ProtocolType::UniswapV2 => "V2",
-        ProtocolType::UniswapV3 => "V3",
-        ProtocolType::UniswapV4 => "V4",
-        ProtocolType::BalancerV2 => "BAL",
-        ProtocolType::CurveStable => "CRV-S",
-        ProtocolType::CurveCrypto => "CRV-C",
-        ProtocolType::Dodo => "DODO",
-        ProtocolType::Woofi => "WOOFI",
-    }
-}
+pub use crate::core::types::protocol_tag;
 
 #[must_use]
 pub fn short_address(address: Address) -> String {

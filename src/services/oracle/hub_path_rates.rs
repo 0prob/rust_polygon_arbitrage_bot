@@ -21,6 +21,8 @@ use crate::pipeline::spot_price::spot_probe_for_decimals;
 use crate::pipeline::types::{GraphHopPhase, PoolMeta, RoutingGraph};
 use crate::util::ten_pow_u256_cached;
 
+use super::rates_diverge_bps;
+
 #[derive(Debug, Clone, Copy)]
 pub struct HubPathRateParams {
     pub enabled: bool,
@@ -394,45 +396,13 @@ pub fn hub_path_matic_rates_batch(
 /// Max relative divergence (bps) between shortest and alt first-hop rates.
 const HUB_DUAL_PATH_MAX_DIVERGE_BPS: u64 = 200;
 
-#[inline]
-fn rates_diverge_bps(a: U256, b: U256) -> u64 {
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    if hi.is_zero() {
-        return 0;
-    }
-    let delta = hi - lo;
-    u64::try_from((delta * U256::from(10_000u64) / hi).min(U256::from(10_000u64))).unwrap_or(10_000)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{PoolIndex, PoolState, ProtocolType, V2PoolState};
-    use crate::pipeline::graph::build_graph;
-    use crate::pipeline::types::PoolMeta;
+    use crate::core::types::{PoolState, ProtocolType, V2PoolState};
+    use crate::pipeline::graph::{build_graph, pool_meta_from_pair};
     use alloy::primitives::Address;
     use std::sync::Arc;
-
-    fn pool_meta_from_pair(
-        pool: PoolIndex,
-        protocol: ProtocolType,
-        a: TokenIndex,
-        b: TokenIndex,
-        fee_bps: u32,
-    ) -> PoolMeta {
-        PoolMeta {
-            pool_index: pool,
-            protocol,
-            tokens: vec![a, b],
-            fee_bps,
-            bpt_index: None,
-            pool_id: None,
-            protocol_label: None,
-            pool_type: None,
-            hooks: None,
-            tick_spacing: None,
-        }
-    }
 
     /// V2 `fee` is the **keep numerator** (9970/10000 = 30 bps), not the bps fee itself.
     fn v2_pool() -> Arc<PoolState> {

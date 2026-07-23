@@ -12,7 +12,7 @@ use alloy::sol_types::SolCall;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, RATE_PRECISION};
+use crate::core::constants::{MATIC_X, MIN_TOKEN_TO_MATIC_RATE, RATE_PRECISION, ST_MATIC};
 use crate::core::types::TokenIndex;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
@@ -29,10 +29,6 @@ sol! {
     function convertSharesToTokens(uint256 shares) external view returns (uint256);
 }
 
-/// Canonical Lido stMATIC (Polygon) — view lives on the token.
-const STMATIC: Address = address!("0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4");
-/// Canonical Stader MaticX (Polygon).
-const MATICX: Address = address!("0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6");
 /// Stader Labs Child Pool (`convertSharesToTokens`).
 const STADER_CHILD_POOL: Address = address!("0xfd225c9e6601c9d38d8f98d8731bf59efcf8c0e3");
 
@@ -43,7 +39,7 @@ static UNSUPPORTED_LST_VIEWS: AtomicU8 = AtomicU8::new(0);
 #[inline]
 #[must_use]
 pub fn is_lst_priced_token(addr: Address) -> bool {
-    addr == STMATIC || addr == MATICX
+    addr == ST_MATIC || addr == MATIC_X
 }
 
 /// Fetch LST→MATIC rates for tokens present in `tokens` (keyed by TokenIndex).
@@ -61,9 +57,9 @@ where
         let Some(addr) = arena.token_address(idx) else {
             continue;
         };
-        if addr == STMATIC {
+        if addr == ST_MATIC {
             want_stmatic.push(idx);
-        } else if addr == MATICX {
+        } else if addr == MATIC_X {
             want_maticx.push(idx);
         }
     }
@@ -76,7 +72,7 @@ where
     let unsupported = UNSUPPORTED_LST_VIEWS.load(Ordering::Relaxed);
     if !want_stmatic.is_empty() && unsupported & LstKind::StMatic.bit() == 0 {
         items.push(MulticallItem {
-            target: STMATIC,
+            target: ST_MATIC,
             data: encode_call(&convertStMaticToMaticCall {
                 amountInStMatic: ONE_18,
             }),
@@ -195,8 +191,8 @@ mod tests {
 
     #[test]
     fn lst_token_recognition() {
-        assert!(is_lst_priced_token(STMATIC));
-        assert!(is_lst_priced_token(MATICX));
+        assert!(is_lst_priced_token(ST_MATIC));
+        assert!(is_lst_priced_token(MATIC_X));
         assert!(!is_lst_priced_token(crate::core::constants::WMATIC));
     }
 

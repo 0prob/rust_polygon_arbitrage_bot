@@ -165,8 +165,6 @@ pub struct TickEnrichment {
     pub algebra_loaded: usize,
     pub algebra_no_tick_calls: usize,
     pub algebra_decode_rejects: usize,
-    /// Deprecated: probe sentinel seeding removed (phantom depth). Always 0.
-    pub seeded_pools: usize,
 }
 
 impl TickEnrichment {
@@ -184,7 +182,6 @@ impl TickEnrichment {
             algebra_decode_rejects: self
                 .algebra_decode_rejects
                 .saturating_add(other.algebra_decode_rejects),
-            seeded_pools: self.seeded_pools.saturating_add(other.seeded_pools),
         }
     }
 }
@@ -303,23 +300,25 @@ fn cl_bitmap_center_out_offsets(word_count: usize) -> Vec<usize> {
     out
 }
 
-/// Collect (algebra, algebra_integral) pool address sets from metas for tick enrichment.
-/// Integral pools are also algebra (use special tick path) but require different decode ABI.
+/// Algebra / Algebra-Integral labels for pools in `addresses` only (hydrate targets).
 #[must_use]
 pub fn collect_algebra_pools(
     arena: &StateArena,
     pool_metas: &[PoolMeta],
+    addresses: &[Address],
 ) -> (FxHashSet<Address>, FxHashSet<Address>) {
     let mut algebra_pools = FxHashSet::default();
     let mut algebra_integral_pools = FxHashSet::default();
-    // ponytail: pre-size for common case - most pools aren't algebra
-    algebra_pools.reserve(32);
-    algebra_integral_pools.reserve(16);
-    for meta in pool_metas {
-        let Some(label) = meta.protocol_label.as_deref() else {
+    algebra_pools.reserve(addresses.len().min(32));
+    algebra_integral_pools.reserve(addresses.len().min(16));
+    for &addr in addresses {
+        let Some(&idx) = arena.address_to_pool().get(&addr) else {
             continue;
         };
-        let Some(addr) = arena.pool_address(meta.pool_index) else {
+        let Some(meta) = crate::pipeline::types::pool_meta_at(pool_metas, idx) else {
+            continue;
+        };
+        let Some(label) = meta.protocol_label.as_deref() else {
             continue;
         };
         if crate::core::protocol::is_algebra_integral_protocol_label(label) {
@@ -373,7 +372,6 @@ pub fn collect_v4_tick_targets<C: AsRef<FoundCycle>>(
             if !seen.insert(edge.pool_index) {
                 continue;
             }
-            // pool_metas is indexable by PoolIndex — no HashMap needed.
             let Some(meta) = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
             else {
                 continue;
@@ -388,6 +386,125 @@ pub fn collect_v4_tick_targets<C: AsRef<FoundCycle>>(
         }
     }
     out
+}
+
+/// Shared state-RPC fallback loop for LF / HF probe / dispatch CL tick hydration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClTickHydratePass {
+    pub v3_loaded: usize,
+    pub v3_empty: usize,
+    pub v3_incomplete: usize,
+    pub v3_algebra_loaded: usize,
+    pub v4_loaded: usize,
+    pub v3_pending: bool,
+    pub v4_pending: bool,
+    pub v3_ms: u64,
+    pub v4_ms: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn hydrate_cl_ticks_with_rpc_fallback(
+    rpc: &crate::infra::rpc::RpcPool,
+    arena: &mut StateArena,
+    v3: &[Address],
+    v4: &[(PoolIndex, FixedBytes<32>)],
+    algebra_pools: &FxHashSet<Address>,
+    algebra_integral_pools: &FxHashSet<Address>,
+    v3_word_range: i16,
+    v4_word_range: i16,
+    allow_widen: bool,
+    block_number: Option<u64>,
+    log_label: &str,
+) -> ClTickHydratePass {
+    let mut pass = ClTickHydratePass {
+        v3_pending: !v3.is_empty(),
+        v4_pending: !v4.is_empty(),
+        ..ClTickHydratePass::default()
+    };
+    for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
+        let Ok(provider) = rpc.connect_state_at(url) else {
+            rpc.deprioritize_state_url(url);
+            continue;
+        };
+        let mut v3_pending = pass.v3_pending;
+        let mut v4_pending = pass.v4_pending;
+        let (v3_res, v4_res, v3_ms_add, v4_ms_add) =
+            crate::infra::rpc_budget::scope_rpc_budget(url, async {
+                let mut v3_res = None;
+                let mut v4_res = None;
+                let mut v3_ms_add = 0u64;
+                let mut v4_ms_add = 0u64;
+                if v3_pending {
+                    let needed = still_tickless_v3(arena, v3);
+                    if needed.is_empty() {
+                        v3_pending = false;
+                    } else {
+                        let started = crate::util::now_ms();
+                        v3_res = Some(
+                            enrich_v3_ticks(
+                                &provider,
+                                arena,
+                                &needed,
+                                v3_word_range,
+                                algebra_pools,
+                                algebra_integral_pools,
+                                block_number,
+                                allow_widen,
+                            )
+                            .await,
+                        );
+                        v3_ms_add = crate::util::now_ms().saturating_sub(started);
+                    }
+                }
+                if v4_pending {
+                    let needed = still_tickless_v4(arena, v4);
+                    if needed.is_empty() {
+                        v4_pending = false;
+                    } else {
+                        let started = crate::util::now_ms();
+                        v4_res = Some(
+                            enrich_v4_ticks(&provider, arena, &needed, v4_word_range, block_number)
+                                .await,
+                        );
+                        v4_ms_add = crate::util::now_ms().saturating_sub(started);
+                    }
+                }
+                (v3_res, v4_res, v3_ms_add, v4_ms_add)
+            })
+            .await;
+        pass.v3_ms = pass.v3_ms.saturating_add(v3_ms_add);
+        pass.v4_ms = pass.v4_ms.saturating_add(v4_ms_add);
+        pass.v3_pending = v3_pending;
+        pass.v4_pending = v4_pending;
+        if let Some(res) = v3_res {
+            pass.v3_loaded = pass.v3_loaded.saturating_add(res.loaded);
+            pass.v3_empty = res.empty_pools;
+            pass.v3_incomplete = res.incomplete_pools;
+            pass.v3_algebra_loaded = pass.v3_algebra_loaded.saturating_add(res.algebra_loaded);
+            pass.v3_pending = res.rpc_failed;
+        }
+        if let Some(res) = v4_res {
+            pass.v4_loaded = pass.v4_loaded.saturating_add(res.loaded);
+            pass.v4_pending = res.rpc_failed;
+        }
+        if !pass.v3_pending && !pass.v4_pending {
+            if url_index > 0 {
+                crate::info!(
+                    "{log_label} fallback ok (url_index={url_index}, v3_loaded={}, v4_loaded={})",
+                    pass.v3_loaded,
+                    pass.v4_loaded,
+                );
+            }
+            return pass;
+        }
+        rpc.deprioritize_state_url(url);
+        crate::warn!(
+            "{log_label} RPC failed — trying fallback (url_index={url_index}, v3_pending={}, v4_pending={})",
+            pass.v3_pending,
+            pass.v4_pending,
+        );
+    }
+    pass
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -749,7 +866,6 @@ pub async fn enrich_v3_ticks<
         algebra_loaded: algebra.loaded,
         algebra_no_tick_calls,
         algebra_decode_rejects,
-        ..TickEnrichment::default()
     }
 }
 

@@ -29,8 +29,7 @@ use crate::pipeline::spot_price::{
     SpotTable, finalize_enumerated_cycles, rescore_cycles_with_table,
 };
 use crate::pipeline::tick_fetch::{
-    TickEnrichment, collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks,
-    enrich_v4_ticks, still_tickless_v3, still_tickless_v4,
+    collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
 };
 use crate::pipeline::types::CycleSearchPass;
 use crate::services::execution::GasOracle;
@@ -1255,8 +1254,6 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         let v4_tick_pools = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
         let state_block = ctx.refresh.last_state_block();
         let pinned_block = (state_block > 0).then_some(state_block);
-        let (algebra_pools, algebra_integral_pools) =
-            crate::pipeline::tick_fetch::collect_algebra_pools(&arena, pool_metas.as_ref());
         // Only hydrate pools missing ticks — arena sync now preserves CL ticks
         // when sqrt_price/liquidity/tick are unchanged, so most LF passes skip RPC.
         let tick_pools_needed: Vec<Address> = tick_pools
@@ -1294,93 +1291,34 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         v3_tick_targets = tick_pools_needed.len();
         v4_tick_targets = v4_tick_pools_needed.len();
         if !tick_pools_needed.is_empty() || !v4_tick_pools_needed.is_empty() {
+            let (algebra_pools, algebra_integral_pools) =
+                crate::pipeline::tick_fetch::collect_algebra_pools(
+                    &arena,
+                    pool_metas.as_ref(),
+                    &tick_pools_needed,
+                );
             // Clear once before URL fallback — retry must not wipe a family that
             // already hydrated when the other family's RPC failed.
             crate::pipeline::tick_fetch::clear_v3_pool_ticks(&mut arena, &tick_pools_needed);
             crate::pipeline::tick_fetch::clear_v4_pool_ticks(&mut arena, &v4_tick_pools_needed);
-            let mut v3_pending = !tick_pools_needed.is_empty();
-            let mut v4_pending = !v4_tick_pools_needed.is_empty();
-            let mut v3 = TickEnrichment::default();
-            let mut v4 = TickEnrichment::default();
-            for (url_index, url) in ctx.rpc.state_url_candidates().iter().enumerate() {
-                let Ok(provider) = ctx.rpc.connect_state_at(url) else {
-                    ctx.rpc.deprioritize_state_url(url);
-                    continue;
-                };
-                let (v3_new, v4_new) = crate::infra::rpc_budget::scope_rpc_budget(url, async {
-                    let mut v3_new = None;
-                    let mut v4_new = None;
-                    if v3_pending {
-                        let needed = still_tickless_v3(&arena, &tick_pools_needed);
-                        if needed.is_empty() {
-                            v3_pending = false;
-                        } else {
-                            let v3_ticks_started = crate::util::now_ms();
-                            let res = enrich_v3_ticks(
-                                &provider,
-                                &mut arena,
-                                &needed,
-                                ctx.config.oracle.tick_word_range,
-                                &algebra_pools,
-                                &algebra_integral_pools,
-                                pinned_block,
-                                true,
-                            )
-                            .await;
-                            v3_ticks_ms = v3_ticks_ms.saturating_add(
-                                crate::util::now_ms().saturating_sub(v3_ticks_started),
-                            );
-                            v3_new = Some(res);
-                        }
-                    }
-                    if v4_pending {
-                        let needed = still_tickless_v4(&arena, &v4_tick_pools_needed);
-                        if needed.is_empty() {
-                            v4_pending = false;
-                        } else {
-                            let v4_ticks_started = crate::util::now_ms();
-                            let res = enrich_v4_ticks(
-                                &provider,
-                                &mut arena,
-                                &needed,
-                                ctx.config.oracle.tick_word_range,
-                                pinned_block,
-                            )
-                            .await;
-                            v4_ticks_ms = v4_ticks_ms.saturating_add(
-                                crate::util::now_ms().saturating_sub(v4_ticks_started),
-                            );
-                            v4_new = Some(res);
-                        }
-                    }
-                    (v3_new, v4_new)
-                })
-                .await;
-                if let Some(res) = v3_new {
-                    v3_ticks_loaded = v3_ticks_loaded.saturating_add(res.loaded);
-                    v3_pending = res.rpc_failed;
-                    v3 = res;
-                }
-                if let Some(res) = v4_new {
-                    v4_ticks_loaded = v4_ticks_loaded.saturating_add(res.loaded);
-                    v4_pending = res.rpc_failed;
-                    v4 = res;
-                }
-                if !v3_pending && !v4_pending {
-                    if url_index > 0 {
-                        crate::info!(
-                            "LF tick hydration fallback succeeded (url_index={url_index}, v3_loaded={}, v4_loaded={})",
-                            v3.loaded,
-                            v4.loaded
-                        );
-                    }
-                    break;
-                }
-                ctx.rpc.deprioritize_state_url(url);
-                crate::warn!(
-                    "LF tick hydration RPC failed — trying fallback (url_index={url_index}, v3_pending={v3_pending}, v4_pending={v4_pending})"
-                );
-            }
+            let pass = hydrate_cl_ticks_with_rpc_fallback(
+                &ctx.rpc,
+                &mut arena,
+                &tick_pools_needed,
+                &v4_tick_pools_needed,
+                &algebra_pools,
+                &algebra_integral_pools,
+                ctx.config.oracle.tick_word_range,
+                ctx.config.oracle.tick_word_range,
+                true,
+                pinned_block,
+                "LF tick hydration",
+            )
+            .await;
+            v3_ticks_loaded = pass.v3_loaded;
+            v4_ticks_loaded = pass.v4_loaded;
+            v3_ticks_ms = pass.v3_ms;
+            v4_ticks_ms = pass.v4_ms;
         } // tick_pools_needed non-empty
     }
     let ticks_ms = crate::util::now_ms().saturating_sub(ticks_started);

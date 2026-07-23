@@ -219,11 +219,6 @@ impl RoutingGraph {
         self.pool_edge_positions[pool_idx].push((idx, pos));
     }
 
-    /// Legacy helper — direct token edges only.
-    pub fn add_edge(&mut self, from: TokenIndex, graph_edge: GraphEdge) {
-        self.add_direct_edge(from, graph_edge);
-    }
-
     /// Pools with at least one live (tradable) directed edge in adjacency.
     #[must_use]
     pub fn active_pool_count(&self) -> usize {
@@ -271,7 +266,12 @@ pub fn pool_metas_by_index(pool_metas: &[PoolMeta]) -> rustc_hash::FxHashMap<Poo
 #[inline]
 #[must_use]
 pub fn pool_meta_at(pool_metas: &[PoolMeta], index: PoolIndex) -> Option<&PoolMeta> {
-    pool_metas.iter().find(|meta| meta.pool_index == index)
+    let i = index.0 as usize;
+    // Arena-synced metas are dense: metas[i].pool_index == PoolIndex(i).
+    match pool_metas.get(i) {
+        Some(meta) if meta.pool_index == index => Some(meta),
+        _ => pool_metas.iter().find(|meta| meta.pool_index == index),
+    }
 }
 
 /// True when `candidate` ranks strictly ahead of `incumbent` (lower is better for `score`).

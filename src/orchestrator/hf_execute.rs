@@ -19,10 +19,10 @@ use crate::pipeline::sim_sanity::required_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
-    collect_v3_pool_addresses, collect_v4_tick_targets, enrich_v3_ticks, enrich_v4_ticks,
+    collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
     is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, is_probe_narrow_miss_on_cooldown,
-    mark_tick_hydrate_timeout_cooldown,
-    mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
+    mark_tick_hydrate_timeout_cooldown, mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3,
+    still_tickless_v4,
 };
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
@@ -959,7 +959,6 @@ pub(crate) struct ProbeTickHydrateStats {
     pub v3_empty: usize,
     pub v3_incomplete: usize,
     pub v3_algebra_loaded: usize,
-    pub v3_seeded: usize,
     pub v4_total: usize,
     pub v4_needed: usize,
     pub v4_loaded: usize,
@@ -1206,7 +1205,7 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
         return stats;
     }
     let (algebra_pools, algebra_integral_pools) =
-        crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
+        crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas, &v3);
     // Targets are already tickless — skip clear (was a no-op for empty; keep
     // any partial ticks from incomplete prior loads if we ever expand selection).
     // Probe: fewer bitmap words finish inside residual (default word_range=10 → 21
@@ -1230,7 +1229,6 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     stats.v3_empty = pass.v3_empty;
     stats.v3_incomplete = pass.v3_incomplete;
     stats.v3_algebra_loaded = pass.v3_algebra_loaded;
-    stats.v3_seeded = pass.v3_seeded;
     stats.v4_loaded = pass.v4_loaded;
     stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
     stats
@@ -1255,7 +1253,7 @@ async fn enrich_dispatch_cl_ticks(
     }
     let snapshots = dispatch_cl_tick_snapshot(arena, &tick_pools, &v4_targets);
     let (algebra_pools, algebra_integral_pools) =
-        crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas);
+        crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas, &tick_pools);
     crate::pipeline::tick_fetch::clear_v3_pool_ticks(arena, &tick_pools);
     crate::pipeline::tick_fetch::clear_v4_pool_ticks(arena, &v4_targets);
     let pass = hydrate_cl_ticks_with_rpc_fallback(
@@ -1278,117 +1276,6 @@ async fn enrich_dispatch_cl_ticks(
             "dispatch tick hydration failed on all state RPCs — retained prior ticks for still-empty pools"
         );
     }
-}
-
-/// Shared state-RPC fallback loop for probe + dispatch CL tick hydration.
-struct ClTickHydratePass {
-    v3_loaded: usize,
-    v3_empty: usize,
-    v3_incomplete: usize,
-    v3_algebra_loaded: usize,
-    v3_seeded: usize,
-    v4_loaded: usize,
-    v3_pending: bool,
-    v4_pending: bool,
-}
-
-async fn hydrate_cl_ticks_with_rpc_fallback(
-    rpc: &RpcPool,
-    arena: &mut StateArena,
-    v3: &[Address],
-    v4: &[(crate::core::types::PoolIndex, alloy::primitives::FixedBytes<32>)],
-    algebra_pools: &rustc_hash::FxHashSet<Address>,
-    algebra_integral_pools: &rustc_hash::FxHashSet<Address>,
-    v3_word_range: i16,
-    v4_word_range: i16,
-    allow_widen: bool,
-    block_number: Option<u64>,
-    log_label: &str,
-) -> ClTickHydratePass {
-    let mut pass = ClTickHydratePass {
-        v3_loaded: 0,
-        v3_empty: 0,
-        v3_incomplete: 0,
-        v3_algebra_loaded: 0,
-        v3_seeded: 0,
-        v4_loaded: 0,
-        v3_pending: !v3.is_empty(),
-        v4_pending: !v4.is_empty(),
-    };
-    for (url_index, url) in rpc.state_url_candidates().iter().enumerate() {
-        let Ok(provider) = rpc.connect_state_at(url) else {
-            rpc.deprioritize_state_url(url);
-            continue;
-        };
-        let mut v3_pending = pass.v3_pending;
-        let mut v4_pending = pass.v4_pending;
-        let (v3_res, v4_res) = crate::infra::rpc_budget::scope_rpc_budget(url, async {
-            let mut v3_res = None;
-            let mut v4_res = None;
-            if v3_pending {
-                let needed = still_tickless_v3(arena, v3);
-                if needed.is_empty() {
-                    v3_pending = false;
-                } else {
-                    v3_res = Some(
-                        enrich_v3_ticks(
-                            &provider,
-                            arena,
-                            &needed,
-                            v3_word_range,
-                            algebra_pools,
-                            algebra_integral_pools,
-                            block_number,
-                            allow_widen,
-                        )
-                        .await,
-                    );
-                }
-            }
-            if v4_pending {
-                let needed = still_tickless_v4(arena, v4);
-                if needed.is_empty() {
-                    v4_pending = false;
-                } else {
-                    v4_res =
-                        Some(enrich_v4_ticks(&provider, arena, &needed, v4_word_range, block_number).await);
-                }
-            }
-            (v3_res, v4_res)
-        })
-        .await;
-        pass.v3_pending = v3_pending;
-        pass.v4_pending = v4_pending;
-        if let Some(res) = v3_res {
-            pass.v3_loaded = pass.v3_loaded.saturating_add(res.loaded);
-            pass.v3_empty = res.empty_pools;
-            pass.v3_incomplete = res.incomplete_pools;
-            pass.v3_algebra_loaded = pass.v3_algebra_loaded.saturating_add(res.algebra_loaded);
-            pass.v3_seeded = res.seeded_pools;
-            pass.v3_pending = res.rpc_failed;
-        }
-        if let Some(res) = v4_res {
-            pass.v4_loaded = pass.v4_loaded.saturating_add(res.loaded);
-            pass.v4_pending = res.rpc_failed;
-        }
-        if !pass.v3_pending && !pass.v4_pending {
-            if url_index > 0 {
-                crate::info!(
-                    "{log_label} fallback ok (url_index={url_index}, v3_loaded={}, v4_loaded={})",
-                    pass.v3_loaded,
-                    pass.v4_loaded,
-                );
-            }
-            return pass;
-        }
-        rpc.deprioritize_state_url(url);
-        crate::warn!(
-            "{log_label} RPC failed — trying fallback (url_index={url_index}, v3_pending={}, v4_pending={})",
-            pass.v3_pending,
-            pass.v4_pending,
-        );
-    }
-    pass
 }
 
 /// Refresh route pools and re-sim before vault verification (stale BAL state → phantom profit).

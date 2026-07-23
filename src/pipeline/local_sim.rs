@@ -863,7 +863,7 @@ pub fn realign_multi_token_edge(arena: &StateArena, state: &PoolState, edge: &mu
 #[must_use]
 pub fn realign_multi_token_found_cycle(
     arena: &StateArena,
-    cycle: std::sync::Arc<crate::core::types::FoundCycle>,
+    mut cycle: std::sync::Arc<crate::core::types::FoundCycle>,
 ) -> Option<std::sync::Arc<crate::core::types::FoundCycle>> {
     let needs_scan = cycle.edges.iter().any(|edge| {
         matches!(
@@ -874,8 +874,8 @@ pub fn realign_multi_token_found_cycle(
     if !needs_scan {
         return Some(cycle);
     }
-    let mut owned = (*cycle).clone();
-    let mut changed = false;
+    // ponytail: make_mut clones only when Arc is shared (HF pre_multi path).
+    let owned = std::sync::Arc::make_mut(&mut cycle);
     for edge in &mut owned.edges {
         if !matches!(
             edge.protocol,
@@ -889,19 +889,11 @@ pub fn realign_multi_token_found_cycle(
         if !protocol_matches_pool_state(edge.protocol, state) {
             continue;
         }
-        let before = (edge.token_in_idx, edge.token_out_idx);
         if !realign_multi_token_edge(arena, state, edge) {
             return None;
         }
-        if (edge.token_in_idx, edge.token_out_idx) != before {
-            changed = true;
-        }
     }
-    if changed {
-        Some(std::sync::Arc::new(owned))
-    } else {
-        Some(cycle)
-    }
+    Some(cycle)
 }
 
 /// Align `edge.fee_bps` with live pool fee when the arena has a usable on-chain fee.
@@ -964,57 +956,57 @@ pub fn sync_edge_fee_bps_from_state(edge: &mut Edge, state: &PoolState) {
 #[must_use]
 pub fn heal_cycle_edge_protocols(
     arena: &StateArena,
-    cycle: std::sync::Arc<crate::core::types::FoundCycle>,
+    mut cycle: std::sync::Arc<crate::core::types::FoundCycle>,
 ) -> Option<std::sync::Arc<crate::core::types::FoundCycle>> {
-    let mut owned = (*cycle).clone();
     let mut changed = false;
-    for edge in &mut owned.edges {
-        let state = arena.pool_state(edge.pool_index)?;
-        if matches!(state, PoolState::Invalid) {
-            return None;
-        }
-        if !protocol_matches_pool_state(edge.protocol, state) {
-            let corrected = protocol_from_pool_state(state, edge.protocol);
-            if corrected == edge.protocol {
+    {
+        let owned = std::sync::Arc::make_mut(&mut cycle);
+        for edge in &mut owned.edges {
+            let state = arena.pool_state(edge.pool_index)?;
+            if matches!(state, PoolState::Invalid) {
                 return None;
             }
-            // ponytail: pair↔multi heal leaves vault idxs (4/0) on Uni edges —
-            // uni_realign then culls every live_touch (live: drop_proto=touch).
-            if protocol_is_pair(edge.protocol) != protocol_is_pair(corrected) {
-                return None;
-            }
-            edge.protocol = corrected;
-            changed = true;
-        }
-        let fee_before = edge.fee_bps;
-        sync_edge_fee_bps_from_state(edge, state);
-        if edge.fee_bps != fee_before {
-            changed = true;
-        }
-        // ponytail: same rule as graph::apply_cl_zero_for_one
-        if matches!(
-            edge.protocol,
-            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
-        ) && let (Some(a_in), Some(a_out)) = (
-            arena.token_address(edge.token_in),
-            arena.token_address(edge.token_out),
-        ) {
-            let zfo = a_in < a_out;
-            if edge.zero_for_one != zfo {
-                edge.zero_for_one = zfo;
+            if !protocol_matches_pool_state(edge.protocol, state) {
+                let corrected = protocol_from_pool_state(state, edge.protocol);
+                if corrected == edge.protocol {
+                    return None;
+                }
+                // ponytail: pair↔multi heal leaves vault idxs (4/0) on Uni edges —
+                // uni_realign then culls every live_touch (live: drop_proto=touch).
+                if protocol_is_pair(edge.protocol) != protocol_is_pair(corrected) {
+                    return None;
+                }
+                edge.protocol = corrected;
                 changed = true;
             }
+            let fee_before = edge.fee_bps;
+            sync_edge_fee_bps_from_state(edge, state);
+            if edge.fee_bps != fee_before {
+                changed = true;
+            }
+            // ponytail: same rule as graph::apply_cl_zero_for_one
+            if matches!(
+                edge.protocol,
+                ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ) && let (Some(a_in), Some(a_out)) = (
+                arena.token_address(edge.token_in),
+                arena.token_address(edge.token_out),
+            ) {
+                let zfo = a_in < a_out;
+                if edge.zero_for_one != zfo {
+                    edge.zero_for_one = zfo;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            owned.cumulative_fee_bps = owned
+                .edges
+                .iter()
+                .fold(0u32, |acc, e| acc.saturating_add(e.fee_bps));
         }
     }
-    if changed {
-        owned.cumulative_fee_bps = owned
-            .edges
-            .iter()
-            .fold(0u32, |acc, e| acc.saturating_add(e.fee_bps));
-        Some(std::sync::Arc::new(owned))
-    } else {
-        Some(cycle)
-    }
+    Some(cycle)
 }
 
 #[must_use]

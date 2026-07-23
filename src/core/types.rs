@@ -54,6 +54,29 @@ impl ProtocolType {
         // Discriminant order matches the fetch queue (see `#[repr(u8)]` values).
         Some(self as u8 as usize)
     }
+
+    /// Short tag for logs / TUI route viz.
+    #[inline]
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::UniswapV2 => "V2",
+            Self::UniswapV3 => "V3",
+            Self::UniswapV4 => "V4",
+            Self::BalancerV2 => "BAL",
+            Self::CurveStable => "CRV-S",
+            Self::CurveCrypto => "CRV-C",
+            Self::Dodo => "DODO",
+            Self::Woofi => "WOOFI",
+        }
+    }
+}
+
+/// Short protocol tag for logs / TUI (see [`ProtocolType::tag`]).
+#[inline]
+#[must_use]
+pub const fn protocol_tag(protocol: ProtocolType) -> &'static str {
+    protocol.tag()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
