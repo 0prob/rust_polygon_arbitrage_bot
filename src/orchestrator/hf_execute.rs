@@ -14,7 +14,7 @@ use crate::orchestrator::hf_eval::{
     HfEvalInput, HfEvalInputOwned, HfEvalResult, reassess_hf_eval_result,
 };
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::local_sim::{self, simulate_route_detailed};
+use crate::pipeline::local_sim::{self, simulate_route_detailed_with_caps};
 use crate::pipeline::sim_sanity::required_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
@@ -576,8 +576,12 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
 
     let sim = if pools_refreshed {
         let amount_in = evaluated.sim.amount_in;
-        let Some(refreshed) = simulate_route_detailed(arena, &evaluated.cycle.edges, amount_in)
-        else {
+        let Some(refreshed) = simulate_route_detailed_with_caps(
+            arena,
+            &evaluated.cycle.edges,
+            amount_in,
+            hop_fidelity_caps.as_ref(),
+        ) else {
             skipped.record("resim_fail");
             crate::debug!("dispatch skip: fp={fp} resim failed after pool refresh");
             return None;
@@ -1330,6 +1334,7 @@ pub(crate) async fn refresh_and_resim_profitable(
     let flash = reassess.flash_liquidity.load();
     let flash_ttl = reassess.flash_liquidity.ttl();
     let mut resim_unprofitable = 0usize;
+    let mut resim_failed = 0usize;
     let mut resim_profit_drift = 0usize;
     let mut resim_hop_fidelity = 0usize;
     let mut reassess_reject = 0usize;
@@ -1339,7 +1344,16 @@ pub(crate) async fn refresh_and_resim_profitable(
             let baseline = result.sim;
             let amount = result.opt.optimal_input;
             let hop_caps = local_sim::precompute_route_shallow_caps(arena, &result.cycle.edges);
-            let refreshed = simulate_route_detailed(arena, &result.cycle.edges, amount)?;
+            let Some(refreshed) = simulate_route_detailed_with_caps(
+                arena,
+                &result.cycle.edges,
+                amount,
+                hop_caps.as_ref(),
+            ) else {
+                resim_failed += 1;
+                crate::debug!("resim gate sim: fp={} failed", result.route_fingerprint);
+                return None;
+            };
             if refreshed.profit.is_zero() {
                 resim_unprofitable += 1;
                 return None;
@@ -1399,7 +1413,7 @@ pub(crate) async fn refresh_and_resim_profitable(
     if in_count > 0 && out_count < in_count {
         crate::info!(
             "resim gate: in={in_count} out={out_count} pools={pool_count} refreshed={pools_refreshed} refresh_ms={refresh_ms} \
-             unprofitable={resim_unprofitable} profit_drift={resim_profit_drift} hop_fidelity={resim_hop_fidelity} reassess={reassess_reject} total_ms={total_ms}"
+             sim_failed={resim_failed} unprofitable={resim_unprofitable} profit_drift={resim_profit_drift} hop_fidelity={resim_hop_fidelity} reassess={reassess_reject} total_ms={total_ms}"
         );
     } else if in_count > 0 {
         crate::debug!(

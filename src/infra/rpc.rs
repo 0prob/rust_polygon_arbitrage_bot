@@ -26,7 +26,7 @@ const STATE_URL_RATE_LIMIT_PENALTY: Duration = Duration::from_secs(45);
 #[derive(Clone)]
 pub struct RpcPool {
     http: Client,
-    state_urls: Arc<RwLock<Vec<String>>>,
+    state_urls: Arc<RwLock<Vec<Arc<str>>>>,
     execution_url: Option<String>,
     private_url: Option<String>,
     require_private_submit: bool,
@@ -75,7 +75,11 @@ impl RpcPool {
             "rpc pool",
         );
 
-        let state_urls = config.state_read_urls();
+        let state_urls = config
+            .state_read_urls()
+            .into_iter()
+            .map(Arc::<str>::from)
+            .collect();
 
         Self {
             http,
@@ -99,7 +103,7 @@ impl RpcPool {
         }
     }
 
-    fn state_urls_ordered_slice(&self) -> Vec<String> {
+    fn state_urls_ordered_slice(&self) -> Vec<Arc<str>> {
         let urls = self.state_urls.read();
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
@@ -108,7 +112,7 @@ impl RpcPool {
         let mut penalized = Vec::new();
         for url in urls.iter() {
             if penalties
-                .get(url.as_str())
+                .get(url.as_ref())
                 .is_none_or(|until| now >= *until)
             {
                 // Demote hosts nearly out of tokens so fallback can absorb load.
@@ -130,22 +134,22 @@ impl RpcPool {
         // Fast path for common single-URL case — avoids allocating the full partition vecs.
         let urls = self.state_urls.read();
         if urls.len() <= 1 {
-            return urls.first().cloned();
+            return urls.first().map(ToString::to_string);
         }
         let penalties = self.state_url_penalties.read();
         let now = Instant::now();
         urls.iter()
             .find(|url| {
                 penalties
-                    .get(url.as_str())
+                    .get(url.as_ref())
                     .is_none_or(|until| now >= *until)
             })
             .or_else(|| urls.first())
-            .cloned()
+            .map(ToString::to_string)
     }
 
     #[must_use]
-    pub fn state_url_candidates(&self) -> Vec<String> {
+    pub fn state_url_candidates(&self) -> Vec<Arc<str>> {
         self.state_urls_ordered_slice()
     }
 
@@ -242,11 +246,17 @@ impl RpcPool {
                 (url, latency)
             });
         }
-        let mut ranked: Vec<(String, Duration)> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
+        let mut ranked: Vec<(Arc<str>, Duration)> = Vec::new();
+        let mut failed: Vec<Arc<str>> = Vec::new();
         while let Some(result) = probes.join_next().await {
-            let Ok((url, latency)) = result else {
-                continue;
+            let (url, latency) = match result {
+                Ok(result) => result,
+                Err(e) => {
+                    crate::warn!(
+                        "state RPC probe task failed ({e}) — preserving configured endpoint"
+                    );
+                    continue;
+                }
             };
             if let Some(latency) = latency {
                 ranked.push((url, latency));
@@ -272,11 +282,16 @@ impl RpcPool {
         {
             let mut penalties = self.state_url_penalties.write();
             for (url, _) in &ranked {
-                penalties.remove(url);
+                penalties.remove(url.as_ref());
             }
         }
-        let mut ordered: Vec<String> = ranked.iter().map(|(url, _)| url.clone()).collect();
+        let mut ordered: Vec<Arc<str>> = ranked.iter().map(|(url, _)| Arc::clone(url)).collect();
         ordered.extend(failed);
+        for url in urls {
+            if !ordered.iter().any(|candidate| candidate == &url) {
+                ordered.push(url);
+            }
+        }
         let summary: Vec<String> = ranked
             .iter()
             .map(|(url, latency)| format!("{}={}ms", rpc_host_label(url), latency.as_millis()))
@@ -523,7 +538,21 @@ mod tests {
         let pool = RpcPool::from_config(&config);
         let urls = pool.state_url_candidates();
         assert_eq!(urls.len(), 2);
-        assert!(!urls.contains(&"https://exec.example".to_string()));
+        assert!(
+            urls.iter()
+                .all(|url| url.as_ref() != "https://exec.example")
+        );
+    }
+
+    #[test]
+    fn state_url_candidates_reuse_endpoint_allocations() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://state.example".into());
+        let pool = RpcPool::from_config(&config);
+
+        let first = pool.state_url_candidates();
+        let second = pool.state_url_candidates();
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
     }
 
     #[test]
@@ -542,8 +571,8 @@ mod tests {
         let pool = RpcPool::from_config(&config);
         pool.deprioritize_state_url("https://fast.example");
         let ordered = pool.state_url_candidates();
-        assert_eq!(ordered[0], "https://slow.example");
-        assert_eq!(ordered[1], "https://fast.example");
+        assert_eq!(ordered[0].as_ref(), "https://slow.example");
+        assert_eq!(ordered[1].as_ref(), "https://fast.example");
     }
 
     #[test]
