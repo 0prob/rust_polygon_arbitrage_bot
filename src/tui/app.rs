@@ -588,14 +588,14 @@ impl App {
         let (severity, outcome_label, gas_used, tx_hash, profit_wei) = match outcome {
             ExecutionOutcome::DryRunPassed { gas_used } => (
                 Severity::Info,
-                "dry-run passed".to_string(),
+                "simulation passed (not submitted yet)".to_string(),
                 Some(gas_used),
                 None,
                 None,
             ),
             ExecutionOutcome::DryRunFailed { reason } => (
                 Severity::Error,
-                format!("dry-run failed: {reason}"),
+                format!("simulation rejected (not submitted): {reason}"),
                 None,
                 None,
                 None,
@@ -609,7 +609,7 @@ impl App {
             ),
             ExecutionOutcome::SkippedQuarantined => (
                 Severity::Warn,
-                "skipped quarantined".to_string(),
+                "quarantined (no simulation)".to_string(),
                 None,
                 None,
                 None,
@@ -700,8 +700,10 @@ impl App {
             severity,
         });
         self.apply_outcome_to_routes(route_fingerprint, &outcome_label, severity, route_status);
-        // ponytail: outcome_label only; fingerprint visible in Trade History panel
-        self.push_activity(severity, outcome_label);
+        self.push_activity(
+            severity,
+            format!("fp={route_fingerprint:016x} {outcome_label}"),
+        );
     }
 
     fn apply_outcome_to_routes(
@@ -1121,7 +1123,12 @@ mod tests {
         app.register_trade_outcome(ExecutionOutcome::DryRunPassed { gas_used: 200_000 }, 0xabc);
         assert_eq!(
             app.hf_candidates[0].outcome.as_deref(),
-            Some("dry-run passed")
+            Some("simulation passed (not submitted yet)")
+        );
+        assert!(
+            app.activity
+                .back()
+                .is_some_and(|item| item.message.contains("fp=0000000000000abc"))
         );
     }
 }
