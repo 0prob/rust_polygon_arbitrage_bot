@@ -2184,8 +2184,6 @@ pub fn spawn_lf_background(
     tokio::spawn(async move {
         let mut timer = interval(Duration::from_millis(lf_interval_ms.max(1)));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // interval fires immediately — discard so startup warm LF isn't doubled.
-        timer.tick().await;
 
         loop {
             tokio::select! {

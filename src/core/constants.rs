@@ -194,7 +194,7 @@ pub const GAS_CURVE_HOP: u32 = 250_000;
 pub const GAS_BALANCER_HOP: u32 = 420_000;
 /// All-in gas for Direct vault `batchSwap` (`executeArbDirect`, ≤4 hops → one call).
 /// Not passed through per-edge ROUTE_EXECUTION_* overhead (that double-counted hops).
-/// Live Direct BAL×3 ~244k; 320k ≈ 1.3× (safety assess). Tx gas_limit still has buffer_gas_limit.
+/// Live Direct BAL×3 ~244k; 300k ≈ 1.23× (safety assess). Tx gas_limit still has buffer_gas_limit.
 pub const GAS_BALANCER_DIRECT_BATCH: u32 = 300_000;
 pub const GAS_DODO_HOP: u32 = 180_000;
 pub const GAS_WOOFI_HOP: u32 = 150_000;

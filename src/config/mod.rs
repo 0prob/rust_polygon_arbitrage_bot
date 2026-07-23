@@ -210,7 +210,7 @@ fn default_discovery_bootstrap_batch() -> usize {
     20_000
 }
 fn default_lf_interval_ms() -> u64 {
-    1_000
+    4_000
 }
 fn default_hf_interval_ms() -> u64 {
     // 150ms + 3.5s hard ticks piled pending stream work (live runs 200ms).

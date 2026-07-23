@@ -866,8 +866,14 @@ impl StateRefreshService {
             return Ok(PoolRefreshResult::default());
         }
         // `hot` unused when `initial_addrs` seeds address-only fetch.
-        self.refresh_pools_impl(discovered.as_ref(), max_pools, &[], address_index, Some(addrs))
-            .await
+        self.refresh_pools_impl(
+            discovered.as_ref(),
+            max_pools,
+            &[],
+            address_index,
+            Some(addrs),
+        )
+        .await
     }
 
     async fn refresh_pools_impl(
@@ -980,8 +986,6 @@ impl StateRefreshService {
             total_updated = total_updated.saturating_add(updated);
             fetch_attempted |= fetch_result.attempted;
             if updated > 0 {
-                // Healthy responses clear cool-off so rank/primary recover after transient fails.
-                self.rpc.clear_state_url_penalty(url);
                 if let Some(block) = pinned_block {
                     self.last_state_block.store(block, Ordering::Release);
                     let need_hash = prior_hash.is_none() || block != prior_block;
@@ -1004,9 +1008,10 @@ impl StateRefreshService {
                         "state RPC fallback succeeded (url_index={idx}, updated={updated})"
                     );
                 }
-                if !fetch_result.requires_provider_fallback() {
-                    break;
-                }
+            }
+            if !fetch_result.requires_provider_fallback() {
+                self.rpc.clear_state_url_penalty(url);
+                break;
             }
             if !fetch_result.attempted {
                 break;

@@ -9,6 +9,8 @@ use crate::pipeline::types::MinimalSimResult;
 /// Sized for zero-profit memos too (Brent now inserts those; was thrashing at 4k
 /// with only profitable inserts and hit_rate≈0).
 const ROUTE_SIM_CACHE_CAPACITY: usize = 8192;
+const ROUTE_SIM_CACHE_SHARDS: usize = 16;
+const ROUTE_SIM_CACHE_SHARD_CAPACITY: usize = ROUTE_SIM_CACHE_CAPACITY / ROUTE_SIM_CACHE_SHARDS;
 const ROUTE_SIM_LOG_INTERVAL: u64 = 10_000;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -39,11 +41,9 @@ impl RouteSimCacheStats {
     }
 }
 
-/// Shared across rayon Brent workers. One mutex avoids DashMap `len`/`retain`/`clear`
-/// stampedes (docs: those lock every shard; parallel callers wipe each other).
 #[derive(Debug, Default)]
 pub struct RouteSimCache {
-    entries: Mutex<FxHashMap<RouteSimKey, MinimalSimResult>>,
+    entries: [Mutex<FxHashMap<RouteSimKey, MinimalSimResult>>; ROUTE_SIM_CACHE_SHARDS],
     pub stats: RouteSimCacheStats,
     last_logged_traffic: AtomicU64,
 }
@@ -52,13 +52,20 @@ impl RouteSimCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(FxHashMap::with_capacity_and_hasher(
-                ROUTE_SIM_CACHE_CAPACITY,
-                FxBuildHasher,
-            )),
+            entries: std::array::from_fn(|_| {
+                Mutex::new(FxHashMap::with_capacity_and_hasher(
+                    ROUTE_SIM_CACHE_SHARD_CAPACITY,
+                    FxBuildHasher,
+                ))
+            }),
             stats: RouteSimCacheStats::default(),
             last_logged_traffic: AtomicU64::new(0),
         }
+    }
+
+    #[inline]
+    const fn shard_index(route_fp: u64) -> usize {
+        route_fp as usize & (ROUTE_SIM_CACHE_SHARDS - 1)
     }
 
     #[must_use]
@@ -73,7 +80,11 @@ impl RouteSimCache {
             route_fp,
             amount,
         };
-        if let Some(entry) = self.entries.lock().get(&key).copied() {
+        if let Some(entry) = self.entries[Self::shard_index(route_fp)]
+            .lock()
+            .get(&key)
+            .copied()
+        {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Some(entry);
         }
@@ -88,12 +99,12 @@ impl RouteSimCache {
         amount: U256,
         sim: MinimalSimResult,
     ) {
-        let mut entries = self.entries.lock();
-        if entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+        let mut entries = self.entries[Self::shard_index(route_fp)].lock();
+        if entries.len() >= ROUTE_SIM_CACHE_SHARD_CAPACITY {
             // Drop stale revisions first; hard-clear if still full.
             let before = entries.len();
             entries.retain(|k, _| k.route_state_revision == route_state_revision);
-            if entries.len() >= ROUTE_SIM_CACHE_CAPACITY {
+            if entries.len() >= ROUTE_SIM_CACHE_SHARD_CAPACITY {
                 entries.clear();
             }
             let removed = before.saturating_sub(entries.len());
@@ -127,7 +138,10 @@ impl RouteSimCache {
             self.stats.hit_rate_bps(),
             self.stats.inserts.load(Ordering::Relaxed),
             self.stats.evictions.load(Ordering::Relaxed),
-            self.entries.lock().len()
+            self.entries
+                .iter()
+                .map(|entries| entries.lock().len())
+                .sum::<usize>()
         );
     }
 
@@ -143,7 +157,10 @@ impl RouteSimCache {
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
-        self.entries.lock().len()
+        self.entries
+            .iter()
+            .map(|entries| entries.lock().len())
+            .sum()
     }
 }
 
@@ -180,6 +197,11 @@ mod tests {
         assert!(cache.get(1, 10, U256::from(100u64)).is_some());
         assert!(cache.get(2, 10, U256::from(100u64)).is_some());
         assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn route_fingerprints_use_independent_shards() {
+        assert_ne!(RouteSimCache::shard_index(1), RouteSimCache::shard_index(2));
     }
 
     #[test]

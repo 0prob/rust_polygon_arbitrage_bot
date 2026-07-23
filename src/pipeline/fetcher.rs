@@ -29,6 +29,7 @@ pub struct FetchTargetsResult {
     pub updated: usize,
     pub attempted: bool,
     pub rate_limited: bool,
+    pub rpc_failed: bool,
     /// Addresses selected for this attempt (for incremental URL fallback).
     pub targeted: Vec<Address>,
 }
@@ -36,7 +37,7 @@ pub struct FetchTargetsResult {
 impl FetchTargetsResult {
     #[must_use]
     pub fn requires_provider_fallback(&self) -> bool {
-        self.attempted && (self.updated == 0 || self.rate_limited)
+        self.attempted && (self.rate_limited || self.rpc_failed)
     }
 }
 
@@ -265,6 +266,7 @@ async fn run_fetch_targets<P: Provider<Ethereum> + Clone + Send + 'static>(
         updated: updated_v2.saturating_add(updated_other),
         attempted: true,
         rate_limited: v2_fetch.rate_limited || other_fetch.rate_limited,
+        rpc_failed: v2_fetch.rpc_failed || other_fetch.rpc_failed,
         targeted: targets.iter().map(|t| t.address).collect(),
     }
 }
@@ -515,6 +517,27 @@ mod tests {
         };
 
         assert!(!result.requires_provider_fallback());
+    }
+
+    #[test]
+    fn valid_zero_update_does_not_require_provider_fallback() {
+        let result = FetchTargetsResult {
+            attempted: true,
+            ..FetchTargetsResult::default()
+        };
+
+        assert!(!result.requires_provider_fallback());
+    }
+
+    #[test]
+    fn rpc_failure_requires_provider_fallback() {
+        let result = FetchTargetsResult {
+            attempted: true,
+            rpc_failed: true,
+            ..FetchTargetsResult::default()
+        };
+
+        assert!(result.requires_provider_fallback());
     }
 
     #[test]

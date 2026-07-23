@@ -28,6 +28,7 @@ use plans::{PoolFetchPlan, build_plan_with_pool_id};
 pub struct PoolFetchResult {
     pub updated: usize,
     pub rate_limited: bool,
+    pub rpc_failed: bool,
 }
 
 impl PoolFetchResult {
@@ -35,6 +36,7 @@ impl PoolFetchResult {
         Self {
             updated: self.updated.saturating_add(other.updated),
             rate_limited: self.rate_limited || other.rate_limited,
+            rpc_failed: self.rpc_failed || other.rpc_failed,
         }
     }
 }
@@ -47,15 +49,27 @@ struct WoofiMeta {
     wooracle: Address,
 }
 
+#[derive(Default)]
+struct WoofiFetchResult {
+    states: Vec<(Address, Option<PoolState>)>,
+    rpc_failed: bool,
+}
+
+#[derive(Default)]
+struct BalancerPoolIds {
+    ids: rustc_hash::FxHashMap<Address, FixedBytes<32>>,
+    rpc_failed: bool,
+}
+
 async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: &P,
     pools: &[&DiscoveredPool],
     block_number: Option<u64>,
     max_chunk: usize,
     meta_cache: &PoolMetaCache,
-) -> Vec<(Address, Option<PoolState>)> {
+) -> WoofiFetchResult {
     if pools.is_empty() {
-        return Vec::new();
+        return WoofiFetchResult::default();
     }
 
     let mut phase1 = Vec::with_capacity(pools.len() * 2);
@@ -101,7 +115,10 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             Ok(r) => r,
             Err(error) => {
                 crate::debug!("woofi state phase1 failed: {error:#}");
-                return owners.into_iter().map(|addr| (addr, None)).collect();
+                return WoofiFetchResult {
+                    states: owners.into_iter().map(|addr| (addr, None)).collect(),
+                    rpc_failed: true,
+                };
             }
         }
     };
@@ -143,7 +160,10 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     }
 
     if metas.is_empty() {
-        return owners.into_iter().map(|addr| (addr, None)).collect();
+        return WoofiFetchResult {
+            states: owners.into_iter().map(|addr| (addr, None)).collect(),
+            rpc_failed: false,
+        };
     }
 
     let mut phase2 = Vec::new();
@@ -194,7 +214,10 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
         Ok(results) => results,
         Err(error) => {
             crate::debug!("woofi state phase2 failed: {error:#}");
-            return owners.into_iter().map(|addr| (addr, None)).collect();
+            return WoofiFetchResult {
+                states: owners.into_iter().map(|addr| (addr, None)).collect(),
+                rpc_failed: true,
+            };
         }
     };
 
@@ -283,7 +306,10 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
             entry.1 = state;
         }
     }
-    out
+    WoofiFetchResult {
+        states: out,
+        rpc_failed: false,
+    }
 }
 
 async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'static>(
@@ -291,14 +317,14 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
     pools: &[&DiscoveredPool],
     block_number: Option<u64>,
     meta_cache: &PoolMetaCache,
-) -> rustc_hash::FxHashMap<Address, FixedBytes<32>> {
+) -> BalancerPoolIds {
     let unverified: Vec<&DiscoveredPool> = pools
         .iter()
         .copied()
         .filter(|p| p.protocol == ProtocolType::BalancerV2 && !p.pool_id_verified)
         .collect();
 
-    let mut out = rustc_hash::FxHashMap::with_capacity_and_hasher(
+    let mut ids = rustc_hash::FxHashMap::with_capacity_and_hasher(
         unverified.len(),
         rustc_hash::FxBuildHasher,
     );
@@ -306,18 +332,21 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
 
     for pool in &unverified {
         if let Some(id) = meta_cache.balancer_pool_id(&pool.address) {
-            out.insert(pool.address, id);
+            ids.insert(pool.address, id);
         } else if let Some(id) = pool.pool_id {
             // Discovery already has an ID (PG) — seed cache, skip getPoolId RPC.
             meta_cache.set_balancer_pool_id(&pool.address, id);
-            out.insert(pool.address, id);
+            ids.insert(pool.address, id);
         } else {
             needs_rpc.push(pool);
         }
     }
 
     if needs_rpc.is_empty() {
-        return out;
+        return BalancerPoolIds {
+            ids,
+            rpc_failed: false,
+        };
     }
 
     let items: Vec<MulticallItem> = needs_rpc
@@ -342,7 +371,10 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
                 "balancer pool_id multicall failed for {} pools: {e:#}",
                 needs_rpc.len()
             );
-            return out;
+            return BalancerPoolIds {
+                ids,
+                rpc_failed: true,
+            };
         }
     };
 
@@ -352,10 +384,13 @@ async fn hydrate_balancer_pool_ids<P: Provider<Ethereum> + Clone + Send + 'stati
         };
         if let Ok(id) = IBalancerPool::getPoolIdCall::abi_decode_returns(bytes) {
             meta_cache.set_balancer_pool_id(&pool.address, id);
-            out.insert(pool.address, id);
+            ids.insert(pool.address, id);
         }
     }
-    out
+    BalancerPoolIds {
+        ids,
+        rpc_failed: false,
+    }
 }
 
 fn balancer_pool_id<'a>(
@@ -372,25 +407,29 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     chunk_size: usize,
     cache: &StateCache,
     meta_cache: &PoolMetaCache,
-) -> usize {
+) -> PoolFetchResult {
     if woofi_pools.is_empty() {
-        return 0;
+        return PoolFetchResult::default();
     }
-    let mut updated = 0usize;
-    for (addr, state) in
-        fetch_woofi_pools_batched(provider, woofi_pools, block_number, chunk_size, meta_cache).await
-    {
+    let fetched =
+        fetch_woofi_pools_batched(provider, woofi_pools, block_number, chunk_size, meta_cache)
+            .await;
+    let mut result = PoolFetchResult {
+        rpc_failed: fetched.rpc_failed,
+        ..PoolFetchResult::default()
+    };
+    for (addr, state) in fetched.states {
         match state {
             Some(s) => {
                 cache.insert(addr, s);
-                updated += 1;
+                result.updated += 1;
             }
             None => {
                 cache.insert(addr, PoolState::Invalid);
             }
         }
     }
-    updated
+    result
 }
 
 /// Concurrent plan-batch RPCs (bounded) — complements per-chunk multicall parallelism.
@@ -439,7 +478,10 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
                         break;
                     }
                 }
-                Some(Err(e)) => crate::warn!("plan batch task failed: {e:#}"),
+                Some(Err(e)) => {
+                    crate::warn!("plan batch task failed: {e:#}");
+                    result.rpc_failed = true;
+                }
                 None => break,
             }
         }
@@ -451,7 +493,8 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         let budget_url = crate::infra::rpc_budget::current_budget_url();
         tasks.spawn(async move {
             let run = async {
-                execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size).await
+                execute_plan_batch(&provider, &batch, cache.as_ref(), block_number, chunk_size)
+                    .await
             };
             match budget_url {
                 Some(url) => crate::infra::rpc_budget::scope_rpc_budget_arc(url, run).await,
@@ -467,7 +510,10 @@ async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
         match res {
             Ok(batch_result) => result = result.combine(batch_result),
             Err(e) if e.is_cancelled() => {}
-            Err(e) => crate::warn!("plan batch task failed: {e:#}"),
+            Err(e) => {
+                crate::warn!("plan batch task failed: {e:#}");
+                result.rpc_failed = true;
+            }
         }
     }
     result
@@ -491,7 +537,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     let balancer_ids = if needs_balancer_hydrate {
         hydrate_balancer_pool_ids(&provider, pools, block_number, meta_cache).await
     } else {
-        rustc_hash::FxHashMap::default()
+        BalancerPoolIds::default()
     };
     let balancer_hydrate_ms = crate::util::now_ms().saturating_sub(hydrate_started);
 
@@ -503,7 +549,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
             woofi_pools.push(*pool);
             continue;
         }
-        let pool_id = balancer_pool_id(pool, &balancer_ids);
+        let pool_id = balancer_pool_id(pool, &balancer_ids.ids);
         if let Some(plan) = build_plan_with_pool_id(pool, pool_id) {
             let entry = protocol_work
                 .entry(pool.protocol)
@@ -546,7 +592,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
     let (woofi_result, plan_result) = tokio::join!(
         async {
             let started = crate::util::now_ms();
-            let updated = apply_woofi_results(
+            let result = apply_woofi_results(
                 &provider_woofi,
                 &woofi_pools,
                 block_number,
@@ -555,7 +601,7 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
                 meta_cache,
             )
             .await;
-            (updated, crate::util::now_ms().saturating_sub(started))
+            (result, crate::util::now_ms().saturating_sub(started))
         },
         async {
             let started = crate::util::now_ms();
@@ -572,19 +618,21 @@ pub async fn fetch_pools_batched<P: Provider<Ethereum> + Clone + Send + 'static>
         },
     );
 
-    let (woofi_updated, woofi_ms) = woofi_result;
+    let (woofi_result, woofi_ms) = woofi_result;
     let (plan_result, plan_ms) = plan_result;
     let plan_updated = plan_result.updated;
     crate::debug!(
-        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={woofi_updated} woofi_ms={woofi_ms} balancer_hydrate={needs_balancer_hydrate} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_rate_limited={} plan_ms={plan_ms}",
+        "pool fetch work: pools={} protocol_work={protocol_work:?} woofi_pools={} woofi_updated={} woofi_ms={woofi_ms} balancer_hydrate={needs_balancer_hydrate} balancer_hydrate_ms={balancer_hydrate_ms} plans={plan_count} plan_calls={plan_calls} plan_batches={plan_batches} expected_chunks={expected_chunks} plan_updated={plan_updated} plan_rate_limited={} plan_ms={plan_ms}",
         pools.len(),
         woofi_pools.len(),
+        woofi_result.updated,
         plan_result.rate_limited,
     );
 
     PoolFetchResult {
-        updated: woofi_updated.saturating_add(plan_updated),
+        updated: woofi_result.updated.saturating_add(plan_updated),
         rate_limited: plan_result.rate_limited,
+        rpc_failed: balancer_ids.rpc_failed || woofi_result.rpc_failed || plan_result.rpc_failed,
     }
 }
 
@@ -599,22 +647,24 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
         return PoolFetchResult::default();
     }
     let mut work: Vec<(usize, usize)> = vec![(0, plans.len())];
-    let mut updated = 0usize;
+    let mut result = PoolFetchResult::default();
     while let Some((start, end)) = work.pop() {
         if start >= end {
             continue;
         }
         let slice = &plans[start..end];
         match execute_plan_batch_inner(provider, slice, cache, block_number, chunk_size).await {
-            Ok(n) => updated += n,
+            Ok(batch_result) => result = result.combine(batch_result),
             Err(e) if is_rpc_rate_limited(&e) => {
                 crate::warn!(
-                    "plan batch abort: rate limited (updated={updated}, remaining_pools={})",
+                    "plan batch abort: rate limited (updated={}, remaining_pools={})",
+                    result.updated,
                     end.saturating_sub(start)
                 );
                 return PoolFetchResult {
-                    updated,
+                    updated: result.updated,
                     rate_limited: true,
+                    rpc_failed: result.rpc_failed,
                 };
             }
             Err(_e) if slice.len() > 1 => {
@@ -629,13 +679,11 @@ async fn execute_plan_batch<P: Provider<Ethereum> + Clone + Send + 'static>(
                     slice[0].calls.len()
                 );
                 mark_plans_invalid(cache, slice);
+                result.rpc_failed = true;
             }
         }
     }
-    PoolFetchResult {
-        updated,
-        rate_limited: false,
-    }
+    result
 }
 
 async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static>(
@@ -644,7 +692,7 @@ async fn execute_plan_batch_inner<P: Provider<Ethereum> + Clone + Send + 'static
     cache: &StateCache,
     block_number: Option<u64>,
     chunk_size: usize,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<PoolFetchResult> {
     let total_calls: usize = plans.iter().map(|p| p.calls.len()).sum();
     let mut items = Vec::with_capacity(total_calls);
     let mut spans: Vec<(&PoolFetchPlan, usize, usize)> = Vec::with_capacity(plans.len());
@@ -679,7 +727,7 @@ fn apply_plan_results(
     spans: &[(&PoolFetchPlan, usize, usize)],
     results: &[Option<alloy::primitives::Bytes>],
     item_count: usize,
-) -> usize {
+) -> PoolFetchResult {
     if results.len() < item_count {
         crate::warn!(
             "multicall batch returned {} results for {} requested items; marking incomplete pools invalid",
@@ -688,7 +736,10 @@ fn apply_plan_results(
         );
     }
 
-    let mut updated = 0usize;
+    let mut result = PoolFetchResult {
+        rpc_failed: results.len() < item_count,
+        ..PoolFetchResult::default()
+    };
     for (plan, start, end) in spans {
         let Some(slice) = results.get(*start..*end) else {
             cache.insert(plan.pool.address, PoolState::Invalid);
@@ -696,12 +747,12 @@ fn apply_plan_results(
         };
         if let Some(state) = decode_plan(plan, slice) {
             cache.insert(plan.pool.address, state);
-            updated += 1;
+            result.updated += 1;
         } else {
             cache.insert(plan.pool.address, PoolState::Invalid);
         }
     }
-    updated
+    result
 }
 
 #[cfg(test)]
@@ -746,10 +797,10 @@ mod tests {
         ];
         let cache = StateCache::default();
 
-        assert_eq!(
-            apply_plan_results(&cache, &spans, &[], first.calls.len() + second.calls.len()),
-            0
-        );
+        let result =
+            apply_plan_results(&cache, &spans, &[], first.calls.len() + second.calls.len());
+        assert_eq!(result.updated, 0);
+        assert!(result.rpc_failed);
         assert!(matches!(
             cache.get(&first.pool.address),
             Some(PoolState::Invalid)
