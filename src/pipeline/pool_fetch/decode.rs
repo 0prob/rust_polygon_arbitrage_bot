@@ -100,25 +100,34 @@ fn v2_stored_fee_from_bps(fee_bps: u32) -> (U256, U256) {
 fn decode_v3_head(
     bytes: &Bytes,
     prefer_algebra: bool,
-) -> Option<(U256, i32, bool, Option<U256>, u16)> {
+) -> Option<(U256, i32, bool, Option<U256>, u32, u16)> {
     if prefer_algebra {
         // Do not fall back to Uni slot0 on the same globalState bytes — a ≥224B
         // Algebra payload can look like a plausible slot0 and skip the real slot0 result.
         return decode_algebra_global_state(bytes)
-            .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0u16));
+            .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0, 0));
     }
     decode_v3_slot0(bytes)
-        .map(|(sqrt, tick, unlocked, _, obs_card)| (sqrt, tick, unlocked, None, obs_card))
+        .map(|(sqrt, tick, unlocked, fee_protocol, obs_card)| {
+            (
+                sqrt,
+                tick,
+                unlocked,
+                None,
+                u32::from(fee_protocol),
+                obs_card,
+            )
+        })
         .or_else(|| {
             decode_algebra_global_state(bytes)
-                .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0u16))
+                .map(|(sqrt, tick, unlocked, fee)| (sqrt, tick, unlocked, Some(fee), 0, 0))
         })
 }
 
 fn decode_v3_head_from_results(
     plan: &PoolFetchPlan,
     results: &[Option<Bytes>],
-) -> Option<(U256, i32, bool, Option<U256>, u16)> {
+) -> Option<(U256, i32, bool, Option<U256>, u32, u16)> {
     let mut global_bytes = None;
     let mut slot0_bytes = None;
     for (result, kind) in results.iter().zip(plan.kinds.iter()) {
@@ -137,7 +146,8 @@ fn decode_v3_head_from_results(
 }
 
 fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
-    let (sqrt, tick, unlocked, algebra_fee, obs_card) = decode_v3_head_from_results(plan, results)?;
+    let (sqrt, tick, unlocked, algebra_fee, fee_protocol, obs_card) =
+        decode_v3_head_from_results(plan, results)?;
     let liq_idx = plan
         .kinds
         .iter()
@@ -166,7 +176,7 @@ fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
         tick_spacing: plan.pool.tick_spacing.unwrap_or(60),
         ticks: Arc::from([] as [crate::core::types::V3Tick; 0]),
         unlocked,
-        fee_protocol: 0,
+        fee_protocol,
         observation_cardinality: obs_card,
     }))
 }
@@ -583,6 +593,41 @@ mod tests {
         assert!(unlocked);
         assert_eq!(fee_proto, 6);
         assert_eq!(obs_card, 17);
+    }
+
+    #[test]
+    fn decode_v3_keeps_slot0_protocol_fee_in_pool_state() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::UniswapV3,
+                tokens: Vec::new(),
+                fee_bps: 30,
+                tick_spacing: Some(60),
+                pool_id: None,
+                pool_type: None,
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![CallKind::V3Slot0, CallKind::V3Liquidity, CallKind::V3Fee],
+        };
+        let mut slot0 = vec![0u8; 224];
+        slot0[0..32].copy_from_slice(&abi_word(1 << 20));
+        slot0[160..192].copy_from_slice(&abi_word(0x42));
+        slot0[192..224].copy_from_slice(&abi_word(1));
+        let state = decode_plan(
+            &plan,
+            &[
+                Some(Bytes::from(slot0)),
+                Some(Bytes::copy_from_slice(&abi_word(1_000))),
+                Some(Bytes::copy_from_slice(&abi_word(3_000))),
+            ],
+        )
+        .expect("V3 state should decode");
+        let PoolState::V3(state) = state else {
+            panic!("expected V3 state");
+        };
+        assert_eq!(state.fee_protocol, 0x42);
     }
 
     #[test]

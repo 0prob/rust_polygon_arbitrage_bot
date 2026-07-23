@@ -96,10 +96,17 @@ pub fn derive_tight_v3_price_limit(
 
     let denom = U256::from(20_000u64);
     let slip = U256::from(slippage_bps);
+    // Slippage bump near MAX_SQRT_RATIO can exceed uint160 / protocol exclusive bound.
     Ok(if zero_for_one {
-        (sim.sqrt_price_x96_after * (denom - slip)) / denom
+        let limit = (sim.sqrt_price_x96_after * (denom - slip)) / denom;
+        limit.max(MIN_SQRT_RATIO + U256::ONE)
     } else {
-        (sim.sqrt_price_x96_after * (denom + slip)) / denom
+        let limit = (sim.sqrt_price_x96_after * (denom + slip)) / denom;
+        if limit > MAX_SQRT_RATIO_EXCLUSIVE {
+            MAX_SQRT_RATIO_EXCLUSIVE
+        } else {
+            limit
+        }
     })
 }
 
@@ -182,6 +189,42 @@ mod tests {
         )
         .expect("tickless one_for_zero should encode");
         assert_eq!(one_for_zero, MAX_SQRT_RATIO_EXCLUSIVE);
+    }
+
+    #[test]
+    fn price_limit_one_for_zero_slippage_clamps_to_max_exclusive() {
+        use crate::core::math::tick_math::MAX_SQRT_RATIO_EXCLUSIVE;
+
+        // Near-ceiling after-price: 2.5% bump would exceed exclusive max / uint160.
+        let after = MAX_SQRT_RATIO_EXCLUSIVE - U256::from(100u64);
+        let bumped = (after * U256::from(20_500u64)) / U256::from(20_000u64);
+        assert!(bumped > MAX_SQRT_RATIO_EXCLUSIVE);
+
+        let state = V3PoolState {
+            sqrt_price_x96: after - U256::from(1u64),
+            liquidity: u128::MAX / 4,
+            tick: 887_200,
+            fee: U256::from(100u32),
+            tick_spacing: 1,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            // Empty ticks → tickless path returns exclusive max (already clamped).
+            ticks: Arc::from(Vec::new()),
+        };
+        let limit = derive_tight_v3_price_limit(
+            &state,
+            U256::from(1u64),
+            U256::from(1u64),
+            false,
+            1,
+            500,
+            Some(100),
+            false,
+        )
+        .expect("tickless clamp");
+        assert_eq!(limit, MAX_SQRT_RATIO_EXCLUSIVE);
+        assert!(limit.bit_len() <= 160);
     }
 
     #[test]

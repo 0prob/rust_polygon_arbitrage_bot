@@ -3,11 +3,12 @@ use alloy::primitives::U256;
 pub const MIN_TICK: i32 = -887_272;
 pub const MAX_TICK: i32 = 887_272;
 pub const MIN_SQRT_RATIO: U256 = U256::from_limbs([4_295_128_739, 0, 0, 0]);
+/// Uniswap V3 `TickMath.MAX_SQRT_RATIO` (fits uint160). Prior limbs were wrong (220-bit).
 pub const MAX_SQRT_RATIO: U256 =
-    U256::from_limbs([3_402_823_669, 2_147_483_647, 2_147_483_647, 146_144_670]);
+    U256::from_limbs([6_743_328_256_752_651_558, 17_280_870_778_742_802_505, 4_294_805_859, 0]);
 /// `MAX_SQRT_RATIO - 1` — the exclusion bound for non-zero-for-one swaps.
 pub const MAX_SQRT_RATIO_EXCLUSIVE: U256 =
-    U256::from_limbs([3_402_823_668, 2_147_483_647, 2_147_483_647, 146_144_670]);
+    U256::from_limbs([6_743_328_256_752_651_557, 17_280_870_778_742_802_505, 4_294_805_859, 0]);
 
 const LOW_32_MASK: U256 = U256::from_limbs([u32::MAX as u64, 0, 0, 0]);
 
@@ -167,6 +168,15 @@ mod tests {
     #[test]
     fn test_get_sqrt_ratio_at_tick_zero() {
         assert!(get_sqrt_ratio_at_tick(0).is_some());
+    }
+
+    #[test]
+    fn max_sqrt_ratio_matches_max_tick_and_fits_uint160() {
+        let at_max = get_sqrt_ratio_at_tick(MAX_TICK).expect("MAX_TICK");
+        assert_eq!(MAX_SQRT_RATIO, at_max);
+        assert_eq!(MAX_SQRT_RATIO_EXCLUSIVE, MAX_SQRT_RATIO - U256::ONE);
+        assert!(MAX_SQRT_RATIO.bit_len() <= 160);
+        assert_eq!(MIN_SQRT_RATIO, get_sqrt_ratio_at_tick(MIN_TICK).expect("MIN_TICK"));
     }
 }
 

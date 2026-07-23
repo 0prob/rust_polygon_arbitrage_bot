@@ -78,8 +78,10 @@ pub fn simulate_v3_swap(
 ) -> V3SwapResult {
     let fallback_tick = state.tick;
     let mut fee_pips = resolve_v3_fee_pips(state.fee, edge_fee_bps, allow_zero_pool_fee);
-    // V4 packs directional protocol fee into `fee_protocol`; V3 leaves it 0.
-    if state.fee_protocol != 0 {
+    // Only V4's packed directional protocol fee changes the swap fee paid by the trader.
+    // V3's slot0 protocol-fee nibbles allocate the already-charged LP fee, so preserve them
+    // in state without applying V4 semantics to a V3 quote.
+    if allow_zero_pool_fee && state.fee_protocol != 0 {
         let proto = crate::core::v4_storage::v4_direction_protocol_fee_pips(
             state.fee_protocol,
             zero_for_one,
@@ -311,6 +313,33 @@ mod tests {
         let r = simulate_v3_swap(&state, U256::from(10u64), true, Some(30), false);
         assert!(r.shallow);
         assert!(r.amount_out > U256::ZERO);
+    }
+
+    #[test]
+    fn v3_protocol_fee_nibbles_do_not_change_quote_fee() {
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(Vec::new()),
+        };
+        let quote = simulate_v3_swap(&state, U256::from(10u64), true, Some(30), false);
+        let with_protocol_fee = simulate_v3_swap(
+            &V3PoolState {
+                fee_protocol: 0x42,
+                ..state
+            },
+            U256::from(10u64),
+            true,
+            Some(30),
+            false,
+        );
+        assert_eq!(with_protocol_fee.amount_out, quote.amount_out);
     }
 }
 

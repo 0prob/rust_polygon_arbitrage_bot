@@ -95,7 +95,7 @@ pub struct ConcentratedLiquidityPoolState {
     pub ticks: Arc<[V3Tick]>,
     /// False = pool is paused (slot0.unlocked == 0).
     pub unlocked: bool,
-    /// V3: unused (always 0). V4: packed directional protocol fee from slot0 (`uint24`).
+    /// V3: slot0 protocol-fee nibbles (`uint8`). V4: packed directional protocol fee (`uint24`).
     pub fee_protocol: u32,
     /// Cardinality of oracle observations (0 = never observed, pool likely dead).
     pub observation_cardinality: u16,
