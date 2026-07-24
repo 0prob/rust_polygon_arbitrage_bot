@@ -58,9 +58,14 @@ fn matic_rate_from_probe_sim_with_decimals(
     if edges.is_empty() {
         return None;
     }
+    // When discovery hints are wired, refuse the 18-decimal guess — wrong scale
+    // for USDC/USDT/etc. inflates hub MATIC rates by 1e12 and poisons gas/profit.
     let decimals = match token_decimals {
         Some(hints) => {
-            crate::services::oracle::resolve_token_decimals_for_index(token, arena, hints)
+            match crate::services::oracle::explicit_decimals_for_index(token, arena, hints) {
+                Some(d) => d,
+                None => return None,
+            }
         }
         None => arena.token_decimals(token),
     };
@@ -547,6 +552,46 @@ mod tests {
         assert!(
             rate > U256::from(9u128 * 10u128.pow(17)) && rate < U256::from(11u128 * 10u128.pow(17)),
             "direct 1:1 rate expected ~1e18, got {rate}"
+        );
+    }
+
+    #[test]
+    fn probe_sim_fail_closed_when_hints_lack_token_decimals() {
+        use crate::core::types::Edge;
+        use rustc_hash::FxHashMap;
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x66u8; 20]));
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let p = arena.register_pool(
+            Address::from([0xd2u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: deep,
+                reserve1: deep,
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let edge = Edge {
+            pool_index: p,
+            token_in: spoke,
+            token_out: wmatic,
+            token_in_idx: 1,
+            token_out_idx: 0,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: false,
+        };
+        let empty: FxHashMap<Address, u8> = FxHashMap::default();
+        assert!(
+            matic_rate_from_probe_sim_with_decimals(&arena, spoke, &[edge], Some(&empty)).is_none(),
+            "missing discovery decimals must not assume 18"
+        );
+        let mut known = FxHashMap::default();
+        known.insert(Address::from([0x66u8; 20]), 18);
+        assert!(
+            matic_rate_from_probe_sim_with_decimals(&arena, spoke, &[edge], Some(&known)).is_some()
         );
     }
 

@@ -3,13 +3,18 @@ use alloy::primitives::U256;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 
+use crate::core::constants::{
+    DAI, MATIC_X, ST_MATIC, USDT, WETH, WMATIC, is_polygon_hub_token, is_polygon_usd_stable,
+};
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{Edge, FoundCycle, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{precompute_route_shallow_caps, simulate_route_minimal_with_caps};
 use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::spot_price::spot_probe_for_decimals;
-use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
+use crate::pipeline::types::{
+    compare_cycle_execution, compare_cycle_score, cycle_prefers_candidate,
+};
 use crate::services::execution::flash_liquidity::rotate_cycle_to_start;
 use crate::services::oracle::has_reliable_matic_rate;
 
@@ -31,35 +36,101 @@ fn cycle_spot_negative(cycle: &FoundCycle) -> bool {
     cycle.cycle_ratio.is_zero() && cycle.score < 0.0
 }
 
-/// Drop cycles with no oracle-priced start; rotate to the first priced hop when possible.
+/// Flash/oracle start preference (lower = better). Hubs first so FX bounds and
+/// flash liquidity size against real majors, not hub-path long-tails.
+#[inline]
+fn flash_start_preference_rank(addr: Address) -> u8 {
+    if addr == WMATIC {
+        0
+    } else if is_polygon_usd_stable(addr) {
+        1
+    } else if addr == USDT || addr == DAI {
+        2
+    } else if addr == WETH {
+        3
+    } else if addr == ST_MATIC || addr == MATIC_X {
+        4
+    } else if is_polygon_hub_token(addr) {
+        10
+    } else {
+        100
+    }
+}
+
+/// Best oracle-priced hop to borrow as cycle start (hub majors preferred).
+///
+/// When `arena` is `None`, falls back to first priced hop (legacy behavior).
+#[must_use]
+pub fn best_priced_cycle_start(
+    cycle: &FoundCycle,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+    arena: Option<&StateArena>,
+) -> Option<TokenIndex> {
+    let mut best: Option<(u8, usize, TokenIndex)> = None;
+    for (hop_i, edge) in cycle.edges.iter().enumerate() {
+        if !has_reliable_matic_rate(edge.token_in, token_to_matic_rates) {
+            continue;
+        }
+        let rank = arena
+            .and_then(|a| a.token_address(edge.token_in))
+            .map(flash_start_preference_rank)
+            .unwrap_or(100);
+        let candidate = (rank, hop_i, edge.token_in);
+        match best {
+            None => best = Some(candidate),
+            Some((br, bi, _)) if (rank, hop_i) < (br, bi) => best = Some(candidate),
+            _ => {}
+        }
+    }
+    best.map(|(_, _, t)| t)
+}
+
+/// Drop cycles with no oracle-priced start; rotate to the best priced hop when needed.
+///
+/// Pass `arena` so hub majors (WMATIC/USDC/…) win over long-tail hub-path rates.
+/// After rotations, re-dedupes: two orientations of the same route can collapse to
+/// one ordered edge list once they share a start token.
 pub fn retain_cycles_with_priced_start(
     cycles: &mut Vec<FoundCycle>,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) {
+    retain_cycles_with_priced_start_in(cycles, token_to_matic_rates, None);
+}
+
+/// Arena-aware variant — prefer hub flash starts when rotating.
+pub fn retain_cycles_with_priced_start_in(
+    cycles: &mut Vec<FoundCycle>,
+    token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+    arena: Option<&StateArena>,
+) {
     if token_to_matic_rates.is_empty() {
         return;
     }
-    cycles.retain_mut(|cycle| normalize_cycle_to_priced_start(cycle, token_to_matic_rates));
+    cycles.retain_mut(|cycle| normalize_cycle_to_priced_start(cycle, token_to_matic_rates, arena));
+    // Rotations change hop order → same undirected route can collide on key.
+    if cycles.len() > 1 {
+        *cycles = dedupe_cycles_by_edges(std::mem::take(cycles));
+    }
 }
 
 #[must_use]
 fn normalize_cycle_to_priced_start(
     cycle: &mut FoundCycle,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
+    arena: Option<&StateArena>,
 ) -> bool {
-    if has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+    let Some(best) = best_priced_cycle_start(cycle, token_to_matic_rates, arena) else {
+        return false;
+    };
+    if best == cycle.start_token {
         return true;
     }
-    for edge in &cycle.edges {
-        if !has_reliable_matic_rate(edge.token_in, token_to_matic_rates) {
-            continue;
-        }
-        if let Some(rotated) = rotate_cycle_to_start(cycle, edge.token_in) {
-            *cycle = rotated;
-            return true;
-        }
+    if let Some(rotated) = rotate_cycle_to_start(cycle, best) {
+        *cycle = rotated;
+        return true;
     }
-    false
+    // Rotation failed (open path) — keep only if current start is already priced.
+    has_reliable_matic_rate(cycle.start_token, token_to_matic_rates)
 }
 
 /// Token metadata for per-cycle probe sizing during atomic prefilter.
@@ -245,17 +316,18 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         return (Vec::new(), diag);
     }
 
-    // Survivors cap at max_keep — only probe that many best-by-score candidates.
-    // (was max_keep + rescue_cap with rescue_cap=max_keep → 2× dust sims, same keep.)
+    // Survivors cap at max_keep — only probe that many best-by-**execution** candidates.
+    // Ratio-primary `compare_cycle_score` filled the window with deep high-ratio dust
+    // while 2-hop near-misses that clear gas sat outside (live: probe_kept junk).
     let rescue_cap = max_keep;
     let sim_window = simulable.len().min(max_keep);
     diag.sim_window = sim_window;
     // Partial select then sort only the sim window — avoid O(n log n) on the tail.
     if simulable.len() > sim_window {
-        simulable.select_nth_unstable_by(sim_window - 1, compare_cycle_score);
+        simulable.select_nth_unstable_by(sim_window - 1, compare_cycle_execution);
         simulable.truncate(sim_window);
     }
-    simulable.sort_unstable_by(compare_cycle_score);
+    simulable.sort_unstable_by(compare_cycle_execution);
     let candidates = simulable;
     let verdicts: Vec<PrefilterVerdict> = if crate::util::should_use_rayon(candidates.len()) {
         candidates
@@ -483,6 +555,69 @@ mod tests {
         let mut restored = vec![cycle(1.0, false)];
         retain_cycles_with_priced_start(&mut restored, &merged);
         assert_eq!(restored.len(), 1, "post-enrich merged rates retain cycle");
+    }
+
+    #[test]
+    fn priced_start_prefers_hub_over_long_tail() {
+        use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, WMATIC};
+        use crate::core::types::{CycleEdges, PoolIndex, ProtocolType};
+
+        let mut arena = StateArena::default();
+        let junk = arena.register_token(Address::from([0x11u8; 20]));
+        let hub = arena.register_token(WMATIC);
+        let mut rates = FxHashMap::default();
+        rates.insert(junk, MIN_TOKEN_TO_MATIC_RATE);
+        rates.insert(hub, MIN_TOKEN_TO_MATIC_RATE);
+        let cycle = FoundCycle {
+            start_token: junk,
+            edges: CycleEdges::from_slice(&[
+                Edge {
+                    pool_index: PoolIndex(0),
+                    token_in: junk,
+                    token_out: hub,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                Edge {
+                    pool_index: PoolIndex(1),
+                    token_in: hub,
+                    token_out: junk,
+                    token_in_idx: 1,
+                    token_out_idx: 0,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: false,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: -0.01,
+            cumulative_fee_bps: 60,
+            score: -0.01,
+            cycle_ratio: ONE + ONE / U256::from(100u64),
+        };
+        let mut cycles = vec![cycle];
+        retain_cycles_with_priced_start_in(&mut cycles, &rates, Some(&arena));
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].start_token, hub, "WMATIC must win flash start");
+        assert_eq!(cycles[0].edges[0].token_in, hub);
+    }
+
+    #[test]
+    fn priced_start_rotates_and_dedupes_orientations() {
+        use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
+
+        // Only token 0 is priced: reverse single-edge (start=1) cannot rotate → drop.
+        let a = cycle(-0.1, false);
+        let b = cycle(-0.2, true);
+        let mut rates = FxHashMap::default();
+        rates.insert(TokenIndex(0), MIN_TOKEN_TO_MATIC_RATE);
+        let mut cycles = vec![a, b];
+        retain_cycles_with_priced_start(&mut cycles, &rates);
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].start_token, TokenIndex(0));
     }
 
     #[test]

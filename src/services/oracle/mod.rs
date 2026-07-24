@@ -157,6 +157,36 @@ pub fn arena_tokens_without_decimal_hints(
     missing
 }
 
+/// Addresses in the arena lacking discovery/on-chain decimal metadata (capped).
+#[must_use]
+pub fn arena_missing_decimal_addresses(
+    arena: &StateArena,
+    hints: &FxHashMap<Address, u8>,
+    limit: usize,
+) -> Vec<Address> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    let mut hubs = Vec::new();
+    for i in 0..arena.token_count() {
+        let Some(addr) = arena.token_address(TokenIndex(i)) else {
+            continue;
+        };
+        if hints.contains_key(&addr) {
+            continue;
+        }
+        if crate::core::constants::is_polygon_hub_token(addr) {
+            hubs.push(addr);
+        } else {
+            missing.push(addr);
+        }
+    }
+    hubs.extend(missing);
+    hubs.truncate(limit);
+    hubs
+}
+
 #[must_use]
 pub fn resolve_token_decimals_for_index(
     token: TokenIndex,

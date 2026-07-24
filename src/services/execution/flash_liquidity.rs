@@ -1509,6 +1509,11 @@ fn reoptimize_capped(
     profit_ctx.gas_scale_bps = 10_000;
     profit_ctx.hop_count = input.evaluated.cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
+    profit_ctx.charged_priority_fee_per_gas = input
+        .gas_oracle
+        .loaded_snapshot()
+        .map(|s| s.priority_fee.max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS))
+        .unwrap_or(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS);
     let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
         input.gas_oracle,
         [input.route_fingerprint],

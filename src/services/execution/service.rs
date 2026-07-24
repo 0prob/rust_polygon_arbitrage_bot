@@ -418,8 +418,18 @@ impl ExecutionService {
         self.write_route_event(format!("{} s", fp));
     }
 
+    /// Dry-run reassess pass (semantic + profit gate) — counts as success for risk
+    /// so chronic dry-run fail streaks can recover without waiting for a mined receipt.
+    /// Without this, `route_risk_multiplier` only ratchets up until an on-chain win.
+    fn record_route_dry_run_pass(&self, fp: u64) {
+        self.record_route_success(fp);
+    }
+
     /// Learned minimum-profit uplift. With fewer than three outcomes there is
     /// no penalty; afterwards failure probability can raise the floor to 3x.
+    ///
+    /// `failures` already counts every bad outcome once. Hard kinds (revert /
+    /// realized loss) get **+1 weight** (2× total); timeouts get **+½**.
     pub fn route_risk_multiplier_bps(&self, fp: u64) -> u64 {
         let stats = self.route_stats.read();
         let Some(stats) = stats.get(&fp) else {
@@ -429,19 +439,28 @@ impl ExecutionService {
         if attempts < 3 {
             return 10_000;
         }
+        let hard_extra = stats
+            .reverts
+            .saturating_add(stats.realized_losses);
         let weighted_failures = stats
             .failures
-            .saturating_add(stats.reverts)
+            .saturating_add(hard_extra)
             .saturating_add(stats.receipt_timeouts / 2);
         10_000u64
             .saturating_add(weighted_failures.saturating_mul(20_000) / attempts)
             .min(30_000)
     }
 
+    #[inline]
+    fn adaptive_flash_cap_initial(configured_max_usd: u64) -> u64 {
+        configured_max_usd
+            .saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
+            / ADAPTIVE_FLASH_CAP_START_DIVISOR
+    }
+
     #[must_use]
     pub fn adaptive_flash_loan_usd(&self, fp: u64, configured_max_usd: u64) -> u64 {
-        let initial = configured_max_usd.saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
-            / ADAPTIVE_FLASH_CAP_START_DIVISOR;
+        let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
         self.route_stats
             .read()
             .get(&fp)
@@ -456,16 +475,38 @@ impl ExecutionService {
         configured_max_usd: u64,
     ) -> Option<(u64, u64)> {
         let mut stats = self.route_stats.write();
+        let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
         let current = stats
             .get(&fp)
             .and_then(|stats| stats.adaptive_flash_loan_usd)
-            .unwrap_or_else(|| {
-                configured_max_usd.saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
-                    / ADAPTIVE_FLASH_CAP_START_DIVISOR
-            })
+            .unwrap_or(initial)
             .min(configured_max_usd);
         let next = current.saturating_mul(2).min(configured_max_usd);
         if next == current {
+            return None;
+        }
+        stats.entry(fp).or_default().adaptive_flash_loan_usd = Some(next);
+        drop(stats);
+        self.write_route_event(format!("{fp} c {next}"));
+        Some((current, next))
+    }
+
+    /// Halve learned flash USD cap after size-bound dry-run failures (BAL#528 / flash cash).
+    /// Floor is the conservative start (`configured/4`) so we do not collapse to zero.
+    fn demote_adaptive_flash_loan_cap(
+        &self,
+        fp: u64,
+        configured_max_usd: u64,
+    ) -> Option<(u64, u64)> {
+        let mut stats = self.route_stats.write();
+        let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
+        let current = stats
+            .get(&fp)
+            .and_then(|s| s.adaptive_flash_loan_usd)
+            .unwrap_or(initial)
+            .min(configured_max_usd);
+        let next = (current / 2).max(initial).min(configured_max_usd);
+        if next >= current {
             return None;
         }
         stats.entry(fp).or_default().adaptive_flash_loan_usd = Some(next);
@@ -1159,6 +1200,18 @@ impl ExecutionService {
                 }
             }
             let reason = dry.failure_reason();
+            // Adaptive USD flash cap was the binding constraint — size-fail demotes
+            // so the next assess starts smaller instead of replaying BAL#528 at cap.
+            if candidate.adaptive_flash_cap_bound && flash_size_failure_reason(&reason) {
+                if let Some((previous, next)) = self.demote_adaptive_flash_loan_cap(
+                    fp,
+                    candidate.adaptive_flash_loan_usd_limit,
+                ) {
+                    crate::info!(
+                        "flash cap demoted: fp={fp} usd={previous}->{next} after size dry-run fail"
+                    );
+                }
+            }
             crate::info!(
                 "dry-run failed: fp={}, route_hash={}, flash={:?}, ain={}, profit_matic={}, hops={}, route={}, reason={}{}",
                 fp,
@@ -1286,11 +1339,18 @@ impl ExecutionService {
             })
             .filter(|p| !p.is_zero())
             .unwrap_or(candidate.expected_profit_matic_wei);
+        // Tip intensity uses execution gas (sim/dry-run), not buffered tx limit.
+        let tip_gas_units = dry
+            .gas_used
+            .filter(|&g| g > 0)
+            .or(prior_observed_gas.map(u64::from).filter(|&g| g > 0))
+            .unwrap_or(u64::from(candidate.simulated_gas.max(1)))
+            .max(1);
         let Some(fees) = resolve_submit_fees_with_profit(
             gas_oracle,
             tip_profit,
             config.execution.profit_priority_fee_alpha_bps,
-            final_gas,
+            tip_gas_units,
         ) else {
             let outcome = ExecutionOutcome::SubmitFailed {
                 reason: "gas oracle has no snapshot for fee resolution".into(),
@@ -1359,6 +1419,9 @@ impl ExecutionService {
             }
             return outcome;
         }
+
+        // Sim+profit gate passed — lower learned risk floor for this fingerprint.
+        self.record_route_dry_run_pass(fp);
 
         if config.is_dry_run() {
             self.last_submit.write().insert(fp, now);
@@ -1999,6 +2062,18 @@ fn parse_nested_transfer_failed_token(reason: &str) -> Option<Address> {
     addr.parse::<Address>().ok()
 }
 
+/// Dry-run failure text that indicates the flash borrow size was too large.
+#[must_use]
+fn flash_size_failure_reason(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("bal#528")
+        || r.contains("insufficient balancer flash")
+        || r.contains("flash-loan balance")
+        || r.contains("flash loan amount")
+        || r.contains("borrow amount exceeds")
+        || r.contains("amount exceeds available")
+}
+
 fn required_operator_balance(
     config: &AppConfig,
     transaction_value: U256,
@@ -2353,6 +2428,31 @@ mod safety_tests {
     }
 
     #[test]
+    fn dry_run_pass_lowers_risk_floor_without_mined_receipt() {
+        let service = ExecutionService::new();
+        service.route_stats.write().insert(
+            11,
+            RouteStats {
+                successes: 0,
+                failures: 4,
+                dry_run_failures: 4,
+                ..RouteStats::default()
+            },
+        );
+        let elevated = service.route_risk_multiplier_bps(11);
+        assert!(elevated > 10_000);
+        // Four semantic+profit dry-run passes should dilute failure rate.
+        for _ in 0..4 {
+            service.record_route_dry_run_pass(11);
+        }
+        let cooled = service.route_risk_multiplier_bps(11);
+        assert!(
+            cooled < elevated,
+            "dry-run pass must recover risk: elevated={elevated} cooled={cooled}"
+        );
+    }
+
+    #[test]
     fn adaptive_flash_cap_starts_conservatively_and_promotes_to_configured_limit() {
         let path = std::env::temp_dir().join(format!(
             "rpbot-adaptive-flash-cap-{}-{}.log",
@@ -2375,6 +2475,44 @@ mod safety_tests {
         );
         assert_eq!(service.promote_adaptive_flash_loan_cap(7, 50_000), None);
         assert_eq!(service.adaptive_flash_loan_usd(7, 10_000), 10_000);
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn adaptive_flash_cap_demotes_on_size_failure_to_start_floor() {
+        let path = std::env::temp_dir().join(format!(
+            "rpbot-adaptive-flash-demote-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let service = ExecutionService::with_route_stats_path(path.clone());
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(9, 50_000),
+            Some((12_500, 25_000))
+        );
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(9, 50_000),
+            Some((25_000, 50_000))
+        );
+        assert_eq!(
+            service.demote_adaptive_flash_loan_cap(9, 50_000),
+            Some((50_000, 25_000))
+        );
+        assert_eq!(
+            service.demote_adaptive_flash_loan_cap(9, 50_000),
+            Some((25_000, 12_500))
+        );
+        // Floor at configured/4 — further demote is a no-op.
+        assert_eq!(service.demote_adaptive_flash_loan_cap(9, 50_000), None);
+        assert_eq!(service.adaptive_flash_loan_usd(9, 50_000), 12_500);
+        assert!(flash_size_failure_reason(
+            "execution reverted: BAL#528 (insufficient Balancer flash-loan balance)"
+        ));
+        assert!(!flash_size_failure_reason("execution reverted: InsufficientProfit"));
         drop(service);
         let _ = std::fs::remove_file(path);
     }

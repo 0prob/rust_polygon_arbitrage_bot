@@ -463,17 +463,32 @@ pub fn unknown_tokens_from_pools(
         return Vec::new();
     }
     let mut missing = FxHashSet::default();
-    'outer: for pool in pools {
+    for pool in pools {
         for addr in &pool.tokens {
             if !known.contains_key(addr) {
                 missing.insert(*addr);
-                if missing.len() >= limit {
-                    break 'outer;
-                }
             }
         }
     }
-    missing.into_iter().collect()
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    // Prefer hub majors so a 512-cap batch under free-tier RPC does not starve
+    // WMATIC/USDC/etc. decimals while long-tail clones fill the multicall.
+    let mut hubs: Vec<Address> = Vec::new();
+    let mut rest: Vec<Address> = Vec::new();
+    for addr in missing {
+        if crate::core::constants::is_polygon_hub_token(addr) {
+            hubs.push(addr);
+        } else {
+            rest.push(addr);
+        }
+    }
+    hubs.sort_unstable();
+    rest.sort_unstable();
+    hubs.extend(rest);
+    hubs.truncate(limit);
+    hubs
 }
 
 /// Log protocol distribution of discovered pools for routing health.
@@ -538,6 +553,30 @@ mod tests {
         let missing = unknown_tokens_from_pools(&[pool], &known, 1);
         assert_eq!(missing.len(), 1);
         assert!(missing.contains(&token_b) || missing.contains(&token_c));
+
+        // Hub majors win the enrich batch over long-tail when limit is tight.
+        let wmatic = crate::core::constants::WMATIC;
+        let junk: Address = "0x00000000000000000000000000000000000000ff"
+            .parse()
+            .expect("addr");
+        let hub_pool = DiscoveredPool {
+            pool_key: "hub".into(),
+            address: "0x00000000000000000000000000000000000000bb"
+                .parse()
+                .expect("addr"),
+            protocol: ProtocolType::UniswapV2,
+            protocol_label: "UNISWAP_V2".into(),
+            tokens: vec![junk, wmatic],
+            fee_bps: 30,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: None,
+            created_block: 1,
+        };
+        let missing_hub = unknown_tokens_from_pools(&[hub_pool], &FxHashMap::default(), 1);
+        assert_eq!(missing_hub, vec![wmatic]);
     }
 
     #[test]

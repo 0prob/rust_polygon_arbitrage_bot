@@ -53,7 +53,10 @@ impl RouteGasCosting<'_> {
         }
     }
 }
-use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
+use crate::services::oracle::{
+    explicit_decimals_for_index, resolve_token_decimals_for_index,
+    resolve_token_to_matic_rate_or_bootstrap,
+};
 use crate::util::ten_pow_u256_cached;
 
 /// Warm seeds + per-optimize local sim memo. Live Brent re-hit the same dust
@@ -389,15 +392,24 @@ fn compute_ternary_search_bounds(
         if edge.token_in == cycle.start_token {
             // Capacity already denominated in the search token.
         } else {
-            let token_in_rate = resolve_token_to_matic_rate(edge.token_in, token_to_matic_rates);
+            // Fail-closed: bootstrap is ZERO when MATIC cold; never invent FX with
+            // 18-decimal guesses for USDC-scale hop tokens (1e12 poison).
+            let Some(token_in_rate) =
+                resolve_token_to_matic_rate_or_bootstrap(edge.token_in, token_to_matic_rates)
+            else {
+                can_normalize_all = false;
+                continue;
+            };
             if token_in_rate.is_zero() || start_rate.is_zero() {
-                // Path-aware `clamp_high_to_balancer_max_in` still constrains Balancer
-                // after bounds; skipping here only loses the soft-cap contribution.
                 can_normalize_all = false;
                 continue;
             }
-            let token_in_decimals =
-                resolve_token_decimals_for_index(edge.token_in, arena, token_decimals);
+            let Some(token_in_decimals) =
+                explicit_decimals_for_index(edge.token_in, arena, token_decimals)
+            else {
+                can_normalize_all = false;
+                continue;
+            };
             let token_in_scale = ten_pow_u256_cached(token_in_decimals);
             // U512 widening prevents overflow when capacity * token_in_rate * start_scale
             // exceeds U256::MAX — common for 18-decimal tokens with large reserves.
@@ -768,8 +780,28 @@ pub fn optimize_cycle(
     route_sim_cache: Option<(&RouteSimCache, u64, u64)>,
 ) -> Option<OptimizationResult> {
     record_brent_attempt();
-    let start_rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-    let start_decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
+    // Unpriced / bootstrap-zero start: FX bounds and MATIC scoring are nonsense.
+    let Some(start_rate) =
+        resolve_token_to_matic_rate_or_bootstrap(cycle.start_token, token_to_matic_rates)
+    else {
+        record_brent_reject(BrentOptimizeReject::BoundsEmpty);
+        return None;
+    };
+    if start_rate.is_zero() {
+        record_brent_reject(BrentOptimizeReject::BoundsEmpty);
+        return None;
+    }
+    let Some(start_decimals) =
+        explicit_decimals_for_index(cycle.start_token, arena, token_decimals).or_else(|| {
+            // Fall back only when map is empty (tests); production always has hints.
+            token_decimals
+                .is_empty()
+                .then(|| resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals))
+        })
+    else {
+        record_brent_reject(BrentOptimizeReject::BoundsEmpty);
+        return None;
+    };
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
@@ -1294,6 +1326,103 @@ mod tests {
             }
         }
         assert!(seed >= low2 && seed <= high2, "seed must sit in window");
+    }
+
+    #[test]
+    fn fx_hop_capacity_skips_unknown_decimals() {
+        use crate::core::constants::{MIN_TOKEN_TO_MATIC_RATE, RATE_PRECISION, WMATIC};
+        use crate::core::types::{CycleEdges, ProtocolType, V2PoolState};
+        use std::sync::Arc;
+
+        let mut arena = StateArena::default();
+        let start = arena.register_token(WMATIC);
+        let mid = arena.register_token(Address::from([0x22u8; 20]));
+        let deep = ONE * U256::from(1_000u64);
+        let p0 = arena.register_pool(
+            Address::from([0xa1u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: deep,
+                reserve1: deep,
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let p1 = arena.register_pool(
+            Address::from([0xa2u8; 20]),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: deep,
+                reserve1: deep,
+                fee: U256::from(9970u64),
+                fee_denominator: U256::from(10_000u64),
+                block_timestamp_last: 1,
+            })),
+        );
+        let cycle = FoundCycle {
+            start_token: start,
+            edges: CycleEdges::from_slice(&[
+                Edge {
+                    pool_index: p0,
+                    token_in: start,
+                    token_out: mid,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                Edge {
+                    pool_index: p1,
+                    token_in: mid,
+                    token_out: start,
+                    token_in_idx: 1,
+                    token_out_idx: 0,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: false,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: -0.01,
+            cumulative_fee_bps: 60,
+            score: -0.01,
+            cycle_ratio: ONE + ONE / U256::from(100u64),
+        };
+        let mut rates = FxHashMap::default();
+        rates.insert(start, RATE_PRECISION);
+        rates.insert(mid, MIN_TOKEN_TO_MATIC_RATE * U256::from(10u64));
+        // Empty decimals map → mid-hop FX skipped (fail-closed).
+        let empty = FxHashMap::default();
+        let bounds = compute_ternary_search_bounds(
+            &cycle,
+            &arena,
+            &rates,
+            &empty,
+            RATE_PRECISION,
+            18,
+            50_000,
+            0.5,
+            None,
+            None,
+        );
+        assert!(bounds.is_some(), "start-hop capacity alone still yields bounds");
+        // With known 18-dec mid, FX normalize contributes (not only start hop).
+        let mut known = FxHashMap::default();
+        known.insert(WMATIC, 18u8);
+        known.insert(Address::from([0x22u8; 20]), 18u8);
+        let bounds2 = compute_ternary_search_bounds(
+            &cycle,
+            &arena,
+            &rates,
+            &known,
+            RATE_PRECISION,
+            18,
+            50_000,
+            0.5,
+            None,
+            None,
+        );
+        assert!(bounds2.is_some());
     }
 
     #[test]

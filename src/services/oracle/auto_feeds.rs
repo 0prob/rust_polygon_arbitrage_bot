@@ -92,6 +92,7 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
     let mut purged = 0u32;
     let no_n;
     let unblocked;
+    let cleared_no_feed;
     {
         let mut guard = STORE.lock();
         *guard = store;
@@ -103,14 +104,6 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
             };
             if !is_auto_feed_address_allowed(addr) {
                 // Poison: token_labels symbol hit Hermes major (LUNA/USDC/…).
-                let key = format!("{addr:#x}");
-                if !guard
-                    .no_feed
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&key))
-                {
-                    guard.no_feed.push(key);
-                }
                 purged += 1;
                 crate::warn!(
                     "oracle auto-feeds: purged non-curated feed {} → {} (symbol clone risk)",
@@ -131,7 +124,15 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
                 .unwrap_or(true)
         });
         unblocked = before_no.saturating_sub(guard.no_feed.len()) as u32;
-        trim_no_feed(&mut guard.no_feed);
+        // Non-curated are never Hermes-queued; historical no_feed of junk clones
+        // is pure disk bloat (live: 2048 soft-cap, feeds=0). Drop it.
+        cleared_no_feed = guard.no_feed.len() as u32;
+        if cleared_no_feed > 0 {
+            crate::info!(
+                "oracle auto-feeds: clearing {cleared_no_feed} obsolete no_feed entries (curated-only queue)"
+            );
+            guard.no_feed.clear();
+        }
         for entry in &guard.feeds {
             let Ok(addr) = entry.address.parse::<Address>() else {
                 continue;
@@ -144,20 +145,24 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
         }
         no_n = guard.no_feed.len() as u32;
     }
-    if purged > 0 || unblocked > 0 {
+    if purged > 0 || unblocked > 0 || cleared_no_feed > 0 {
         if let Err(e) = persist_store(&path) {
             crate::warn!("oracle auto-feeds: purge persist failed: {e}");
         }
     }
-    if feeds_n > 0 || no_n > 0 || purged > 0 || unblocked > 0 {
+    if feeds_n > 0 || no_n > 0 || purged > 0 || unblocked > 0 || cleared_no_feed > 0 {
         crate::info!(
-            "oracle auto-feeds: loaded feeds={feeds_n} purged={purged} unblocked_curated={unblocked} no_feed={no_n} path={}",
+            "oracle auto-feeds: loaded feeds={feeds_n} purged={purged} unblocked_curated={unblocked} cleared_no_feed={cleared_no_feed} no_feed={no_n} path={}",
             path.display()
         );
     }
 }
 
 /// Note unmapped addresses for a future batch scan (skips configured / known no-feed).
+///
+/// Only curated/hub/builtin-feed addresses enter the Hermes queue. Long-tail junk
+/// is hub-path priced and must never fill `no_feed` via failed major-symbol matches
+/// (live store: feeds=0, no_feed=2048 of clones burning Hermes and disk).
 pub fn note_unmapped_addresses(oracle: &PriceOracle, addrs: impl IntoIterator<Item = Address>) {
     let store = STORE.lock();
     let no_feed: FxHashSet<Address> = store
@@ -175,7 +180,8 @@ pub fn note_unmapped_addresses(oracle: &PriceOracle, addrs: impl IntoIterator<It
     let mut pending = PENDING.lock();
     let before = pending.len();
     for addr in addrs {
-        if oracle.has_configured_feed(&addr)
+        if !is_auto_feed_address_allowed(addr)
+            || oracle.has_configured_feed(&addr)
             || no_feed.contains(&addr)
             || known_feeds.contains(&addr)
         {
@@ -184,12 +190,13 @@ pub fn note_unmapped_addresses(oracle: &PriceOracle, addrs: impl IntoIterator<It
         pending.insert(addr);
     }
     let after = pending.len();
-    let ready = after >= AUTO_FEED_SCAN_BATCH;
+    let added = after.saturating_sub(before);
     drop(pending);
-    if after > before {
-        crate::debug!("oracle auto-feeds: pending_new={after} (batch={AUTO_FEED_SCAN_BATCH})");
-    }
-    if ready {
+    if added > 0 {
+        crate::debug!(
+            "oracle auto-feeds: pending_new={after} (+{added}, batch={AUTO_FEED_SCAN_BATCH})"
+        );
+        // Curated set is small — notify on any new allowed token (do not wait for 20).
         SCAN_NOTIFY.notify_one();
     }
 }
@@ -199,7 +206,7 @@ pub fn pending_auto_feed_count() -> usize {
     PENDING.lock().len()
 }
 
-/// Background sidecar: scan when ≥20 new unmapped tokens accumulate.
+/// Background sidecar: scan curated unmapped tokens (notify or 30s ticker).
 pub fn spawn_auto_feed_sidecar(
     oracle: Arc<PriceOracle>,
     http: Client,
@@ -222,7 +229,9 @@ pub fn spawn_auto_feed_sidecar(
             if *shutdown.borrow() {
                 return;
             }
-            if pending_auto_feed_count() < AUTO_FEED_SCAN_BATCH {
+            // Curated-only queue: scan as soon as anything is pending (batch was 20
+            // for junk flood; with allow-list, waiting forever left EURS/MAI unmapped).
+            if pending_auto_feed_count() == 0 {
                 continue;
             }
             if let Err(e) = run_auto_feed_batch(&oracle, &http, &hermes_url).await {
@@ -239,15 +248,25 @@ async fn run_auto_feed_batch(
 ) -> anyhow::Result<()> {
     let batch: Vec<Address> = {
         let mut pending = PENDING.lock();
-        if pending.len() < AUTO_FEED_SCAN_BATCH {
+        if pending.is_empty() {
             return Ok(());
         }
-        let take: Vec<Address> = pending.iter().copied().take(AUTO_FEED_SCAN_BATCH).collect();
+        let take: Vec<Address> = pending
+            .iter()
+            .copied()
+            .filter(|a| is_auto_feed_address_allowed(*a))
+            .take(AUTO_FEED_SCAN_BATCH)
+            .collect();
+        // Drop disallowed leftovers (legacy pending from pre-allow-list runs).
+        pending.retain(|a| is_auto_feed_address_allowed(*a));
         for addr in &take {
             pending.remove(addr);
         }
         take
     };
+    if batch.is_empty() {
+        return Ok(());
+    }
     let rows: Vec<(Address, Option<&'static str>)> = batch
         .iter()
         .map(|&addr| {
@@ -490,5 +509,31 @@ mod tests {
         }
         mark_no_feed(junk);
         assert!(STORE.lock().no_feed.len() <= NO_FEED_SOFT_CAP);
+    }
+
+    #[test]
+    fn note_unmapped_only_queues_allowed_addresses() {
+        PENDING.lock().clear();
+        {
+            let mut store = STORE.lock();
+            store.no_feed.clear();
+            store.feeds.clear();
+        }
+        // EURS is curated but not a builtin TOKEN_FEEDS major (live verify target).
+        let curated = address!("0xE111178A87A3BFf0c8d18DECBa5798827539Ae99");
+        let junk = address!("0x9cd6746665D9557e1B9a775819625711d0693439");
+        assert!(is_auto_feed_address_allowed(curated));
+        assert!(!is_auto_feed_address_allowed(junk));
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "https://hermes.pyth.network".into(),
+            10_000,
+        );
+        assert!(!oracle.has_configured_feed(&curated));
+        note_unmapped_addresses(&oracle, [curated, junk, curated]);
+        let pending = PENDING.lock().clone();
+        assert!(pending.contains(&curated), "curated must queue");
+        assert!(!pending.contains(&junk), "junk must never Hermes-queue");
+        PENDING.lock().clear();
     }
 }

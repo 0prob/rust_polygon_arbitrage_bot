@@ -289,6 +289,8 @@ impl CandidateExecution {
             amount_in: self.amount_in,
             gas_units,
             gas_price_wei,
+            // Reassess after dry-run uses full tip in gas_price (alpha=0) — no uplift.
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             token_to_matic_rate: self.token_to_matic_rate,
             token_decimals: self.token_decimals,
             hop_count: self.hop_count,

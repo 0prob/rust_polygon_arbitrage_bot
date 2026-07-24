@@ -15,7 +15,7 @@ use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::{ProbeContext, cycle_key, retain_cycles_with_priced_start};
+use crate::pipeline::cycle_filter::{ProbeContext, cycle_key};
 use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
 use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
 use crate::pipeline::graph::{
@@ -38,9 +38,10 @@ use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::hf_snapshot::SnapshotStore;
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{
-    HubPathRateParams, RateEnrichContext, arena_tokens_without_decimal_hints,
-    enrich_token_to_matic_rates, enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable,
-    has_reliable_matic_rate, hub_path_matic_rates_batch, merge_token_rates, resolvable_token_set,
+    HubPathRateParams, RateEnrichContext, arena_missing_decimal_addresses,
+    arena_tokens_without_decimal_hints, enrich_token_to_matic_rates,
+    enrich_token_to_matic_rates_offline, expand_hub_spoke_resolvable, has_reliable_matic_rate,
+    hub_path_matic_rates_batch, merge_token_rates, resolvable_token_set,
 };
 use crate::services::partial_cache::{
     PartialPoolCache, StreamAddressSet, select_stream_targets_with_epoch,
@@ -1133,7 +1134,18 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         pools.len(),
         ctx.cache.len()
     );
-    let decimals = ctx.refresh.token_decimals_map();
+    let mut decimals = ctx.refresh.token_decimals_map();
+    // Backfill decimals for tokens already in the arena (discovery only enriches
+    // the current PG batch). Hub-first cap keeps free-tier multicall productive.
+    if lf_pass == 1 || lf_pass.is_multiple_of(5) {
+        let gap = arena_missing_decimal_addresses(&arena, decimals.as_ref(), 256);
+        if !gap.is_empty() {
+            let n = gap.len();
+            ctx.refresh.enrich_token_decimals(gap).await;
+            decimals = ctx.refresh.token_decimals_map();
+            crate::debug!("token decimals lf backfill: requested={n} map={}", decimals.len());
+        }
+    }
     let arena_sync_started = crate::util::now_ms();
     // ponytail: no freeze_append — latch+force_refind defer stuck arena at 1019
     // forever (live cycle97). ARENA_APPEND_CAP paces growth vs attach.
@@ -1679,11 +1691,19 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             }
         });
     }
-    retain_cycles_with_priced_start(&mut capped, rates.as_ref());
+    crate::pipeline::cycle_filter::retain_cycles_with_priced_start_in(
+        &mut capped,
+        rates.as_ref(),
+        Some(&arena),
+    );
     // Observed pins: try rotate/priced-start but keep unpriced survivors so
     // stream_universe / dirty_in_sel can see the live venue.
     let live_unpriced_backup = live_for_rates.clone();
-    retain_cycles_with_priced_start(&mut live_for_rates, rates.as_ref());
+    crate::pipeline::cycle_filter::retain_cycles_with_priced_start_in(
+        &mut live_for_rates,
+        rates.as_ref(),
+        Some(&arena),
+    );
     if live_for_rates.is_empty() && !live_unpriced_backup.is_empty() {
         crate::info!(
             "stream observed-live: priced_start dropped all {} live pins — restoring unpriced lf_pass={lf_pass}",

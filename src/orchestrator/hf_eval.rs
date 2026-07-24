@@ -26,7 +26,7 @@ use crate::pipeline::sim_sanity::{
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
 use crate::pipeline::ternary::{BRENT_SEED_CACHE_SLOTS, RouteGasCosting, optimize_cycle};
 use crate::pipeline::types::OptimizationResult;
-use crate::pipeline::types::{MinimalSimResult, compare_cycle_execution, compare_cycle_score};
+use crate::pipeline::types::{MinimalSimResult, compare_cycle_execution};
 use crate::services::execution::candidate::hash_cycle_edges;
 use crate::services::execution::flash_liquidity::{
     FlashLiquidityCache, FlashLoanDiagnostics, balancer_route_flash_feasible,
@@ -229,6 +229,8 @@ pub struct HfEvalInput<'a> {
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
     pub gas_price: U256,
+    /// Priority already inside `gas_price` (oracle tip floored at min).
+    pub charged_priority_fee_per_gas: U256,
     pub slippage_bps: u64,
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
@@ -252,6 +254,7 @@ pub struct HfEvalInputOwned {
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
     pub gas_price: U256,
+    pub charged_priority_fee_per_gas: U256,
     pub slippage_bps: u64,
     pub flash_policy: FlashLoanPolicy,
     pub max_flash_loan_usd: u64,
@@ -276,6 +279,7 @@ impl HfEvalInputOwned {
             min_profit_matic: self.min_profit_matic,
             min_profit_roi_bps: self.min_profit_roi_bps,
             gas_price: self.gas_price,
+            charged_priority_fee_per_gas: self.charged_priority_fee_per_gas,
             slippage_bps: self.slippage_bps,
             flash_policy: self.flash_policy,
             max_flash_loan_usd: self.max_flash_loan_usd,
@@ -454,7 +458,7 @@ fn simulatable_score_fallback(
             }
         })
         .collect();
-    fallback.sort_by(compare_cycle_score);
+    fallback.sort_by(compare_cycle_execution);
     fallback.truncate(max_keep);
     fallback
 }
@@ -465,7 +469,11 @@ fn select_probe_survivors(
     max_keep: usize,
     rescue_cap: usize,
 ) -> Vec<(u64, FoundCycle)> {
-    profitable.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| compare_cycle_score(&a.2, &b.2)));
+    // Primary: cover MATIC; secondary: gas-aware execution rank (not raw ratio).
+    profitable.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| compare_cycle_execution(&a.2, &b.2))
+    });
     let mut kept: Vec<(u64, FoundCycle)> = profitable
         .into_iter()
         .take(max_keep)
@@ -473,7 +481,7 @@ fn select_probe_survivors(
         .collect();
 
     if kept.len() < max_keep {
-        rescue.sort_by(|a, b| compare_cycle_score(&a.1, &b.1));
+        rescue.sort_by(|a, b| compare_cycle_execution(&a.1, &b.1));
         let remaining = max_keep - kept.len();
         kept.extend(rescue.into_iter().take(rescue_cap.min(remaining)));
     }
@@ -494,6 +502,7 @@ fn rank_one_cycle_probe(
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
     token_decimals: &FxHashMap<Address, u8>,
     gas_price: U256,
+    charged_priority_fee_per_gas: U256,
     slippage_bps: u64,
     flash_policy: FlashLoanPolicy,
     gas_oracle: &GasOracle,
@@ -698,6 +707,7 @@ fn rank_one_cycle_probe(
     ctx.gas_scale_bps = 10_000;
     ctx.hop_count = cycle.edge_hops();
     ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
+    ctx.charged_priority_fee_per_gas = charged_priority_fee_per_gas;
     let mut ranked_probe = probe;
     // Direct batch seeds are live-calibrated all-in; do not apply mixed-route sim_scale.
     ranked_probe.total_gas = assessment_gas_units(
@@ -749,6 +759,7 @@ pub fn rank_cycles_by_probe_net(
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
     token_decimals: &FxHashMap<Address, u8>,
     gas_price: U256,
+    charged_priority_fee_per_gas: U256,
     slippage_bps: u64,
     flash_policy: FlashLoanPolicy,
     max_keep: usize,
@@ -779,6 +790,7 @@ pub fn rank_cycles_by_probe_net(
                     token_to_matic_rates,
                     token_decimals,
                     gas_price,
+                    charged_priority_fee_per_gas,
                     slippage_bps,
                     flash_policy,
                     gas_oracle,
@@ -801,6 +813,7 @@ pub fn rank_cycles_by_probe_net(
                     token_to_matic_rates,
                     token_decimals,
                     gas_price,
+                    charged_priority_fee_per_gas,
                     slippage_bps,
                     flash_policy,
                     gas_oracle,
@@ -848,7 +861,10 @@ pub fn rank_cycles_by_probe_net(
     let near_net_count = near_net.len();
     if kept.len() < max_keep && !scanned.is_empty() {
         if near_net_count > 0 {
-            near_net.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| compare_cycle_score(&a.2, &b.2)));
+            near_net.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| compare_cycle_execution(&a.2, &b.2))
+            });
             for (fp, _, cycle) in near_net.drain(..) {
                 if kept.len() >= max_keep {
                     break;
@@ -869,7 +885,7 @@ pub fn rank_cycles_by_probe_net(
             }
         }
         if kept.len() < max_keep && !rescue.is_empty() {
-            rescue.sort_by(|a, b| compare_cycle_score(&a.1, &b.1));
+            rescue.sort_by(|a, b| compare_cycle_execution(&a.1, &b.1));
             let remaining = max_keep - kept.len();
             for (fp, cycle) in rescue.into_iter().take(rescue_cap.min(remaining)) {
                 if seen.insert(fp) {
@@ -1210,6 +1226,7 @@ pub async fn rescore_rank_and_evaluate_async(
             rates,
             decimals,
             input.gas_price,
+            input.charged_priority_fee_per_gas,
             input.slippage_bps,
             input.flash_policy,
             sim_cap,
@@ -1302,6 +1319,7 @@ fn probe_fallback_opt(
     profit_ctx.gas_scale_bps = 10_000;
     profit_ctx.hop_count = cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
+    profit_ctx.charged_priority_fee_per_gas = input.charged_priority_fee_per_gas;
     let (mut psn, mut pzp, mut pf, mut ps) = (0u32, 0u32, 0u32, 0u32);
     let mut best: Option<(OptimizationResult, RouteSimulationResult, U256)> = None;
     let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
@@ -1514,6 +1532,7 @@ fn evaluate_one(
     profit_ctx.gas_scale_bps = 10_000;
     profit_ctx.hop_count = cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
+    profit_ctx.charged_priority_fee_per_gas = input.charged_priority_fee_per_gas;
     let route_gas_costing = RouteGasCosting {
         lookup: input.route_gas,
         oracle: input.gas_oracle,
@@ -1708,7 +1727,7 @@ fn assess_route_for_cycle(
     flash_source: FlashLoanSource,
 ) -> Option<ProfitAssessment> {
     let risk_bps = input.execution.route_risk_multiplier_bps(fp);
-    let thresholds = route_profit_thresholds(
+    let mut thresholds = route_profit_thresholds(
         required_profit_matic_wei(
             input.min_profit_matic,
             input.matic_usd,
@@ -1720,6 +1739,7 @@ fn assess_route_for_cycle(
         input.profit_priority_alpha_bps,
         risk_bps,
     );
+    thresholds.charged_priority_fee_per_gas = input.charged_priority_fee_per_gas;
     // Global MAX_SANE_PROFIT_MATIC_WEI already applied in assess_route_from_sim.
     Some(assess_route_from_sim(&RouteAssessRequest {
         cycle_start: cycle.start_token,

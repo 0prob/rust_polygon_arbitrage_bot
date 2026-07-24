@@ -34,7 +34,7 @@ use crate::services::execution::{
     rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
-use crate::services::oracle::has_reliable_matic_rate;
+
 use crate::services::oracle::price_oracle::PriceOracle;
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::services::partial_cache::PartialPoolCache;
@@ -506,20 +506,21 @@ fn stream_pending_pools(partial_cache: &PartialPoolCache, hot_pools: &[Address])
         .collect()
 }
 
-/// Prefer `start_token` when priced; otherwise rotate to the first hop token with a rate.
+/// Prefer hub-priced start when possible; drop if no hop has a reliable rate.
 fn cycle_with_reliable_start(
     cycle: &Arc<FoundCycle>,
     token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+    arena: &crate::pipeline::arena::StateArena,
 ) -> Option<Arc<FoundCycle>> {
-    if has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
+    let best = crate::pipeline::cycle_filter::best_priced_cycle_start(
+        cycle,
+        token_to_matic_rates,
+        Some(arena),
+    )?;
+    if best == cycle.start_token {
         return Some(Arc::clone(cycle));
     }
-    for edge in &cycle.edges {
-        if has_reliable_matic_rate(edge.token_in, token_to_matic_rates) {
-            return rotate_cycle_to_start(cycle, edge.token_in).map(Arc::new);
-        }
-    }
-    None
+    rotate_cycle_to_start(cycle, best).map(Arc::new)
 }
 
 /// True when any start-rotation of `edges` is quarantined. Assess may Aave-rotate
@@ -1010,7 +1011,7 @@ fn select_cycles_for_rescore(
             }
             continue;
         }
-        let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates) else {
+        let Some(ready) = cycle_with_reliable_start(cycle, token_to_matic_rates, arena) else {
             rate_skipped += 1;
             if live {
                 live_drop_rate += 1;
@@ -1610,6 +1611,9 @@ pub async fn run_hf_tick(
     };
     // Spot tip for ranking/assess; submit still uses compute_conservative_gas_price.
     let gas_price = compute_assessment_gas_price(gas_snapshot);
+    let charged_priority_fee_per_gas = gas_snapshot
+        .priority_fee
+        .max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS);
     let gas_snapshot_age_ms = ctx.gas_oracle.snapshot_age_ms();
 
     if ctx.snapshots.generation() != selection_generation {
@@ -2197,6 +2201,7 @@ pub async fn run_hf_tick(
         min_profit_matic: ctx.config.min_profit_matic,
         min_profit_roi_bps: ctx.config.execution.min_profit_roi_bps,
         gas_price,
+        charged_priority_fee_per_gas,
         slippage_bps: ctx.config.execution.slippage_bps,
         flash_policy,
         max_flash_loan_usd: ctx.config.execution.max_flash_loan_usd,

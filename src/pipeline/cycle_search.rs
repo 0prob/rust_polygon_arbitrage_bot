@@ -9,7 +9,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
 use crate::pipeline::cycle_filter::{
     PrefilterDiagnostics, ProbeContext, dedupe_cycles_by_edges,
-    prefilter_cycles_by_atomic_sim_with_context_and_diag, retain_cycles_with_priced_start,
+    prefilter_cycles_by_atomic_sim_with_context_and_diag, retain_cycles_with_priced_start_in,
 };
 use crate::pipeline::cycle_finder::{
     CYCLE_ENUM_TIME_BUDGET, find_cycles_multi_pass_with_prep_budget, index_pool_metas,
@@ -95,7 +95,7 @@ fn finalize_cycles(
     diag.post_dedupe = merged.len();
     if let Some(rates) = probe_ctx.and_then(|c| c.token_to_matic_rates) {
         let before = merged.len();
-        retain_cycles_with_priced_start(&mut merged, rates);
+        retain_cycles_with_priced_start_in(&mut merged, rates, Some(arena));
         let pruned = before.saturating_sub(merged.len());
         if pruned > 0 {
             crate::debug!("cycle search: pruned_unpriced={pruned}");

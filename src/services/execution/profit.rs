@@ -188,6 +188,9 @@ pub fn on_chain_min_profit_from_assessment(assessment: &ProfitAssessment) -> Opt
 
 /// Absolute priority tip (wei/gas) from profit × alpha, capped at [`MAX_PROFIT_PRIORITY_FEE_WEI`].
 /// Used by submit to set `max_priority_fee_per_gas = max(oracle_tip, this)`.
+///
+/// `gas_units` must be the **execution** estimate (sim / dry-run), not the tx gas_limit
+/// buffer — dividing by a padded limit under-bids tip intensity by the buffer factor.
 #[must_use]
 pub fn profit_priority_tip_per_gas(
     expected_profit_matic_wei: U256,
@@ -202,21 +205,24 @@ pub fn profit_priority_tip_per_gas(
     per_gas.min(U256::from(MAX_PROFIT_PRIORITY_FEE_WEI))
 }
 
-/// MATIC-wei **incremental** tip cost above the floor already priced into assess `gas_price_wei`.
+/// MATIC-wei **incremental** tip cost above the priority already priced into assess
+/// `gas_price_wei` (base + `charged_priority_per_gas`).
 ///
-/// HF gas_price = base + [`crate::services::execution::MIN_PRIORITY_FEE_PER_GAS`] (25 gwei).
-/// Submit bids `max(floor, profit_tip)`. Charging the full profit tip again double-counted
-/// the floor (live: +25 gwei × ~1M gas ≈ 0.025 MATIC phantom shortfall on every near-miss).
+/// Submit bids `max(charged_priority, profit_tip)`. Using a fixed 25 gwei floor when the
+/// oracle tip was already 40 gwei double-counted the gap (phantom shortfall on near-misses).
 #[must_use]
 pub fn profit_priority_uplift_wei(
     expected_profit_matic_wei: U256,
     alpha_bps: u64,
     gas_units: u32,
+    charged_priority_per_gas: U256,
 ) -> U256 {
-    use super::support::MIN_PRIORITY_FEE_PER_GAS;
+    use crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS;
     let tip = profit_priority_tip_per_gas(expected_profit_matic_wei, alpha_bps, gas_units);
-    let incremental = tip.saturating_sub(MIN_PRIORITY_FEE_PER_GAS);
-    incremental.saturating_mul(U256::from(gas_units))
+    // Floor is whatever assess already included (never below network min tip).
+    let floor = charged_priority_per_gas.max(MIN_PRIORITY_FEE_PER_GAS);
+    tip.saturating_sub(floor)
+        .saturating_mul(U256::from(gas_units))
 }
 
 /// Safety floor in native MATIC wei (`revert_penalty × safety_bps / 10_000`).
@@ -285,7 +291,10 @@ pub struct AssessProfitInput {
     pub gross_profit: U256,
     pub amount_in: U256,
     pub gas_units: u32,
+    /// Effective gas price used for cost: typically `base + charged_priority_fee_per_gas`.
     pub gas_price_wei: U256,
+    /// Priority component already inside `gas_price_wei` (oracle tip floored at min).
+    pub charged_priority_fee_per_gas: U256,
     pub token_to_matic_rate: U256,
     pub token_decimals: u8,
     pub hop_count: u32,
@@ -305,6 +314,8 @@ pub struct AssessProfitInput {
 #[derive(Debug, Clone, Copy)]
 pub struct ProfitEvalContext {
     pub gas_price: U256,
+    /// Priority already included in `gas_price` (for tip uplift without double-count).
+    pub charged_priority_fee_per_gas: U256,
     pub flash_source: FlashLoanSource,
     /// Route-level slippage bps for Brent / probe assess (same convention as [`AssessProfitInput`]).
     pub slippage_bps: u64,
@@ -361,6 +372,9 @@ impl ProfitEvalContext {
         );
         Self {
             gas_price,
+            // Callers that know the oracle tip should set this; default min avoids
+            // under-charging uplift when only gas_price was supplied.
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             flash_source,
             slippage_bps,
             token_to_matic_rate,
@@ -388,6 +402,8 @@ pub struct ProfitThresholds {
     pub min_profit_roi_bps: u64,
     pub safety_multiplier_bps: u64,
     pub profit_priority_alpha_bps: u64,
+    /// Priority already inside assess gas_price (oracle tip floored at min).
+    pub charged_priority_fee_per_gas: U256,
 }
 
 #[must_use]
@@ -404,6 +420,7 @@ pub fn route_profit_thresholds(
         min_profit_roi_bps,
         safety_multiplier_bps,
         profit_priority_alpha_bps,
+        charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
     }
 }
 
@@ -533,6 +550,7 @@ pub fn assess_route_profit(
         amount_in: route.amount_in,
         gas_units: route.gas_units,
         gas_price_wei: gas_price,
+        charged_priority_fee_per_gas: thresholds.charged_priority_fee_per_gas,
         token_to_matic_rate: resolve_token_to_matic_rate(cycle_start, token_to_matic_rates),
         token_decimals: crate::services::oracle::resolve_token_decimals_for_index(
             cycle_start,
@@ -564,6 +582,7 @@ fn probe_assess_input(
         amount_in,
         gas_units,
         gas_price_wei: ctx.gas_price,
+        charged_priority_fee_per_gas: ctx.charged_priority_fee_per_gas,
         token_to_matic_rate: ctx.token_to_matic_rate,
         token_decimals: ctx.token_decimals,
         hop_count: ctx.hop_count,
@@ -629,11 +648,12 @@ fn probe_matic_parts(
         .map(|v| v / scale)?;
     let flash_matic = flash_loan_fee
         .checked_mul(input.token_to_matic_rate)
-        .map(|v| v / scale)?;
+        .and_then(|v| ceil_div(v, scale))?;
     let priority_uplift = profit_priority_uplift_wei(
         gross_matic,
         input.profit_priority_alpha_bps,
         input.gas_units,
+        input.charged_priority_fee_per_gas,
     );
     Some(ProbeMaticParts {
         gross_matic,
@@ -727,11 +747,15 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     } else {
         U256::ZERO
     };
+    // Ceil flash fee in MATIC so we never under-cost the premium vs gas floor.
     let flash_fee_matic_wei = if rate_ok {
-        let Some(native_fee) = flash_loan_fee.checked_mul(input.token_to_matic_rate) else {
+        let Some(scaled_fee) = flash_loan_fee.checked_mul(input.token_to_matic_rate) else {
             return rejected_arithmetic(input, "flash fee MATIC conversion overflow");
         };
-        native_fee / scale
+        let Some(fee) = ceil_div(scaled_fee, scale) else {
+            return rejected_arithmetic(input, "flash fee MATIC conversion overflow");
+        };
+        fee
     } else {
         U256::ZERO
     };
@@ -745,6 +769,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         estimated_matic,
         input.profit_priority_alpha_bps,
         input.gas_units,
+        input.charged_priority_fee_per_gas,
     );
     let net_after_priority = net_profit_after_gas_matic_wei.saturating_sub(priority_uplift);
 
@@ -872,6 +897,7 @@ mod safety_tests {
             amount_in: U256::from(1_000_000u64),
             gas_units: 1,
             gas_price_wei: U256::from(1u8),
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             token_to_matic_rate: RATE_PRECISION,
             token_decimals: 18,
             hop_count: 1,
@@ -930,6 +956,7 @@ mod safety_tests {
             amount_in,
             gas_units: 0,
             gas_price_wei: U256::ZERO,
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             token_to_matic_rate: RATE_PRECISION,
             token_decimals: 18,
             hop_count: 1,
@@ -967,6 +994,7 @@ mod safety_tests {
             amount_in,
             gas_units: 0,
             gas_price_wei: U256::ZERO,
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             token_to_matic_rate: RATE_PRECISION,
             token_decimals: 18,
             hop_count: 3,
@@ -1024,9 +1052,9 @@ mod safety_tests {
             with.net_profit_after_gas_matic_wei,
             without.net_profit_after_gas_matic_wei
         );
-        // Full tip charged would be tip*gas; we only charge tip-floor (no double-count).
+        // Full tip charged would be tip*gas; we only charge tip − charged floor.
         let tip = profit_priority_tip_per_gas(U256::from(5u128 * 10u128.pow(17)), 5_000, 100_000);
-        let floor = super::super::support::MIN_PRIORITY_FEE_PER_GAS;
+        let floor = crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS;
         assert!(tip > floor);
         let charged = without
             .net_profit_after_gas_matic_wei
@@ -1036,12 +1064,35 @@ mod safety_tests {
     }
 
     #[test]
+    fn priority_uplift_uses_oracle_tip_already_in_gas_price() {
+        // Oracle tip 40 gwei already in gas_price; profit tip 50 gwei → uplift 10 not 25.
+        let floor = U256::from(40_000_000_000u64);
+        let profit = U256::from(5u128 * 10u128.pow(17)); // 0.5 MATIC
+        let gas = 100_000u32;
+        // 50% of 0.5 / 1e5 gas = 2.5e12 wei/gas = 2500 gwei, capped at 200 gwei.
+        let tip = profit_priority_tip_per_gas(profit, 5_000, gas);
+        assert!(tip > floor);
+        let uplift = profit_priority_uplift_wei(profit, 5_000, gas, floor);
+        assert_eq!(uplift, tip.saturating_sub(floor) * U256::from(gas));
+        // Wrong MIN-only floor would over-charge by (40-25)*gas.
+        let wrong = profit_priority_uplift_wei(
+            profit,
+            5_000,
+            gas,
+            crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+        );
+        assert!(wrong > uplift);
+    }
+
+    #[test]
     fn priority_uplift_zero_when_tip_at_or_below_floor() {
         // 0.01 MATIC × 10% / 1e6 gas = 1 gwei tip << 25 gwei floor → incremental 0.
-        let uplift = profit_priority_uplift_wei(U256::from(10u128.pow(16)), 1_000, 1_000_000);
+        let floor = crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS;
+        let uplift =
+            profit_priority_uplift_wei(U256::from(10u128.pow(16)), 1_000, 1_000_000, floor);
         assert!(uplift.is_zero());
         let tip = profit_priority_tip_per_gas(U256::from(10u128.pow(16)), 1_000, 1_000_000);
-        assert!(tip < super::super::support::MIN_PRIORITY_FEE_PER_GAS);
+        assert!(tip < floor);
     }
 
     #[test]
@@ -1067,6 +1118,7 @@ mod safety_tests {
         // Gas ≈ 0.2 MATIC; both sizes underwater, larger gross must score higher.
         let ctx = ProfitEvalContext {
             gas_price: U256::from(300_000_000_000u64), // 300 gwei
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             flash_source: FlashLoanSource::Balancer,
             slippage_bps: 0,
             token_to_matic_rate: RATE_PRECISION,
@@ -1107,6 +1159,7 @@ mod safety_tests {
         // Fat: 10× gross, higher gas → larger shortfall, better cover for Brent.
         let ctx = ProfitEvalContext {
             gas_price: U256::from(280_000_000_000u64), // 280 gwei
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
             flash_source: FlashLoanSource::Balancer,
             slippage_bps: 0,
             token_to_matic_rate: RATE_PRECISION,
@@ -1349,6 +1402,7 @@ mod proptests {
                 amount_in,
                 gas_units: 0,
                 gas_price_wei: U256::ZERO,
+                charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
                 token_to_matic_rate: RATE_PRECISION,
                 token_decimals: 18,
                 hop_count: 1,
@@ -1373,6 +1427,7 @@ mod proptests {
                 amount_in: U256::from(amount_in),
                 gas_units: 1,
                 gas_price_wei: U256::from(1u8),
+                charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
                 token_to_matic_rate: RATE_PRECISION,
                 token_decimals: 18,
                 hop_count: 1,

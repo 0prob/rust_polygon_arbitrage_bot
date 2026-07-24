@@ -672,24 +672,19 @@ impl StateRefreshService {
             return;
         }
 
-        let Some(url) = self.rpc.state_url() else {
+        use crate::abis::IERC20Metadata;
+        use crate::pipeline::abi_cache::ERC20_DECIMALS;
+        use crate::pipeline::multicall::{MulticallItem, execute_multicall};
+
+        let candidates = self.rpc.state_url_candidates();
+        if candidates.is_empty() {
             crate::warn!(
                 "token decimals enrich skipped: state RPC unavailable (missing={})",
                 missing.len()
             );
             return;
-        };
-        let Ok(provider) = self.rpc.connect_state_at(&url) else {
-            crate::warn!(
-                "token decimals enrich skipped: state RPC connect failed (missing={})",
-                missing.len()
-            );
-            return;
-        };
+        }
 
-        use crate::abis::IERC20Metadata;
-        use crate::pipeline::abi_cache::ERC20_DECIMALS;
-        use crate::pipeline::multicall::{MulticallItem, execute_multicall};
         let batch: Vec<MulticallItem> = missing
             .iter()
             .map(|addr| MulticallItem {
@@ -698,16 +693,42 @@ impl StateRefreshService {
             })
             .collect();
 
-        // Scope host budget — unscoped multicall bypassed free-tier pacing.
-        let Ok(results) = crate::infra::rpc_budget::scope_rpc_budget(&url, async {
-            execute_multicall(&provider, &batch).await
-        })
-        .await
-        else {
-            crate::warn!(
-                "token decimals enrich multicall failed (missing={})",
-                missing.len()
-            );
+        let mut results = None;
+        for (idx, url) in candidates.iter().enumerate() {
+            let Ok(provider) = self.rpc.connect_state_at(url) else {
+                crate::warn!(
+                    "token decimals enrich connect failed (url_index={idx}, missing={})",
+                    missing.len()
+                );
+                self.rpc.deprioritize_state_url(url);
+                continue;
+            };
+            // Scope host budget — unscoped multicall bypassed free-tier pacing.
+            match crate::infra::rpc_budget::scope_rpc_budget(url, async {
+                execute_multicall(&provider, &batch).await
+            })
+            .await
+            {
+                Ok(r) => {
+                    results = Some(r);
+                    if idx > 0 {
+                        crate::info!(
+                            "token decimals enrich fallback ok (url_index={idx}, missing={})",
+                            missing.len()
+                        );
+                    }
+                    break;
+                }
+                Err(_) => {
+                    crate::warn!(
+                        "token decimals enrich multicall failed (url_index={idx}, missing={})",
+                        missing.len()
+                    );
+                    self.rpc.deprioritize_state_url(url);
+                }
+            }
+        }
+        let Some(results) = results else {
             return;
         };
 
@@ -801,6 +822,14 @@ impl StateRefreshService {
 
     pub fn token_metas(&self) -> Arc<Vec<TokenMeta>> {
         Arc::clone(&self.discovery_state.read().token_metas)
+    }
+
+    /// On-chain decimals for addresses not yet in the discovery map (multi-URL).
+    ///
+    /// Used by LF when arena tokens lack PG/on-chain metadata — without this,
+    /// hub-path rates and sizing fall back to 18-decimal guesses.
+    pub async fn enrich_token_decimals(&self, missing: Vec<Address>) {
+        self.enrich_missing_token_decimals(missing).await;
     }
 
     pub fn token_decimals_map(&self) -> Arc<FxHashMap<Address, u8>> {

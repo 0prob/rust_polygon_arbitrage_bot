@@ -25,6 +25,12 @@ const ROUTE_GAS_HISTORY: usize = 256;
 /// re-inflated every V2/V3 near-miss (~2× gas phantom). Per-route `record_route_gas`
 /// still learns outliers; 1.5× is enough for mild hop-seed underestimates.
 const MAX_SIM_SCALE_BPS: u32 = 15_000;
+/// Stored global scale never goes below 1.0× (heuristic is a lower bound).
+const MIN_SIM_SCALE_BPS: u32 = 10_000;
+/// Floor for the *observation* blended into the EMA. Allow sub-1.0 ratios so
+/// accurate dry-runs can pull a poisoned scale back toward 1.0× (prior clamp at
+/// 10k left scale sticky at 1.4–1.5× forever).
+const MIN_OBS_RATIO_BPS: u32 = 8_000;
 /// Ratios above this are protocol/route outliers — teach fingerprint only, not global EMA.
 const GLOBAL_SCALE_OUTLIER_BPS: u32 = 18_000;
 const SNAPSHOT_LOG_CHANGE_BPS: u64 = 500;
@@ -189,13 +195,23 @@ impl GasOracle {
     }
 
     /// Record on-chain or dry-run gas for a route fingerprint.
+    ///
+    /// Updates use mild EMA + LRU touch so hot routes are not FIFO-evicted while
+    /// cold fingerprints sit at the tail (live: re-hit fps lost after 256 inserts).
     pub fn record_route_gas(&self, route_fp: u64, gas: u32) {
         if gas == 0 {
             return;
         }
         let mut hist = self.route_gas.lock();
         if let Some(entry) = hist.map.get_mut(&route_fp) {
-            *entry = gas;
+            // 75% prior + 25% observation — dampens estimate_gas thrash.
+            let blended = (u64::from(*entry).saturating_mul(3) + u64::from(gas)) / 4;
+            *entry = u32::try_from(blended).unwrap_or(u32::MAX).max(1);
+            // LRU: move to back so active fps survive the 256-cap.
+            if let Some(pos) = hist.order.iter().position(|&fp| fp == route_fp) {
+                hist.order.remove(pos);
+                hist.order.push_back(route_fp);
+            }
             return;
         }
         while hist.order.len() >= ROUTE_GAS_HISTORY {
@@ -218,6 +234,9 @@ impl GasOracle {
     /// Extreme ratios (BAL/callback underestimates) are ignored for the **global**
     /// scale — those routes already get an accurate fingerprint via
     /// [`Self::record_route_gas`]. Blending them here starved V2/V3 cold edges.
+    ///
+    /// Sub-1.0× observations are blended (floor [`MIN_OBS_RATIO_BPS`]) so scale can
+    /// decay back toward 1.0×; the stored scale still never goes below 1.0×.
     pub fn record_sim_observed(&self, simulated: u32, observed: u64) {
         if simulated == 0 || observed == 0 {
             return;
@@ -228,11 +247,15 @@ impl GasOracle {
         if raw_ratio_bps > GLOBAL_SCALE_OUTLIER_BPS {
             return;
         }
-        let ratio_bps = raw_ratio_bps.clamp(10_000, MAX_SIM_SCALE_BPS);
-        let prev = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000);
-        let blended = ((u64::from(prev) * 3 + u64::from(ratio_bps)) / 4) as u32;
-        self.sim_scale_bps
-            .store(blended.clamp(10_000, MAX_SIM_SCALE_BPS), Ordering::Relaxed);
+        let ratio_bps = raw_ratio_bps.clamp(MIN_OBS_RATIO_BPS, MAX_SIM_SCALE_BPS);
+        // CAS loop so concurrent dry-runs do not drop intermediate blends.
+        let _ = self
+            .sim_scale_bps
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                let prev = prev.max(MIN_SIM_SCALE_BPS);
+                let blended = ((u64::from(prev) * 3 + u64::from(ratio_bps)) / 4) as u32;
+                Some(blended.clamp(MIN_SIM_SCALE_BPS, MAX_SIM_SCALE_BPS))
+            });
     }
 
     /// Single arc-swap read; prefer this over separate `snapshot` +
@@ -551,14 +574,48 @@ mod tests {
             oracle.record_route_gas(fp, 100 + fp as u32);
         }
         assert_eq!(oracle.route_gas_tracked(), ROUTE_GAS_HISTORY);
+        // Touch fp=0: EMA + LRU refresh (not last-write only, not FIFO-sticky).
         oracle.record_route_gas(0, 9_999);
-        assert_eq!(oracle.observed_route_gas(0), Some(9_999));
+        let after_touch = oracle.observed_route_gas(0).expect("hot fp");
+        assert!(
+            after_touch > 100 && after_touch < 9_999,
+            "EMA blend prior+obs, got {after_touch}"
+        );
         oracle.record_route_gas(ROUTE_GAS_HISTORY as u64, 42);
         assert!(oracle.route_gas_tracked() <= ROUTE_GAS_HISTORY);
         assert_eq!(
             oracle.observed_route_gas(ROUTE_GAS_HISTORY as u64),
             Some(42)
         );
+        // Hot fp=0 must survive eviction of the FIFO head (was: update left order[0]=0).
+        assert_eq!(
+            oracle.observed_route_gas(0),
+            Some(after_touch),
+            "LRU touch must keep active fingerprint under cap pressure"
+        );
+        // Oldest untouched (fp=1) is the eviction victim.
+        assert!(oracle.observed_route_gas(1).is_none());
+    }
+
+    #[test]
+    fn sim_scale_decays_toward_one_on_accurate_observations() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        // Train up with mild underestimates.
+        for _ in 0..16 {
+            oracle.record_sim_observed(100_000, 140_000);
+        }
+        let elevated = oracle.sim_scale_bps();
+        assert!(elevated > 12_000, "precondition elevated scale, got {elevated}");
+        // Accurate dry-runs (obs ≈ sim) must pull scale down (not sticky at 1.4×).
+        for _ in 0..32 {
+            oracle.record_sim_observed(100_000, 100_000);
+        }
+        let cooled = oracle.sim_scale_bps();
+        assert!(
+            cooled < elevated,
+            "scale should decay: elevated={elevated} cooled={cooled}"
+        );
+        assert!(cooled >= 10_000);
     }
 
     #[test]

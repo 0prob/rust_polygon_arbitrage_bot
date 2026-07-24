@@ -44,11 +44,14 @@ pub fn resolve_submit_fees(gas_oracle: &GasOracle) -> Option<SubmitFees> {
 }
 
 /// Blend oracle fees with a profit-proportional priority fee boost (wei per gas).
+///
+/// `tip_gas_units` must be the **execution** estimate (dry-run / sim), not the buffered
+/// tx gas_limit — padding the divisor under-bids tip intensity by the buffer factor.
 pub fn resolve_submit_fees_with_profit(
     gas_oracle: &GasOracle,
     expected_profit_matic_wei: U256,
     alpha_bps: u64,
-    gas_limit: u64,
+    tip_gas_units: u64,
 ) -> Option<SubmitFees> {
     let snap = gas_oracle.loaded_snapshot()?;
     let max_fee_per_gas = compute_conservative_gas_price(snap);
@@ -58,7 +61,7 @@ pub fn resolve_submit_fees_with_profit(
         max_priority_fee_per_gas: priority_fee,
     };
 
-    if expected_profit_matic_wei.is_zero() || alpha_bps == 0 || gas_limit == 0 {
+    if expected_profit_matic_wei.is_zero() || alpha_bps == 0 || tip_gas_units == 0 {
         return Some(fees);
     }
 
@@ -66,7 +69,7 @@ pub fn resolve_submit_fees_with_profit(
     let tip = profit_priority_tip_per_gas(
         expected_profit_matic_wei,
         alpha_bps,
-        gas_limit.min(u64::from(u32::MAX)) as u32,
+        tip_gas_units.min(u64::from(u32::MAX)) as u32,
     );
     fees.max_priority_fee_per_gas = fees.max_priority_fee_per_gas.max(tip);
 
