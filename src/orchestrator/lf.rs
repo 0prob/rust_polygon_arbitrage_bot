@@ -26,7 +26,8 @@ use crate::pipeline::graph::{
 };
 use crate::pipeline::graph_cache::GraphCache;
 use crate::pipeline::spot_price::{
-    SpotTable, finalize_enumerated_cycles, rescore_cycles_with_table,
+    SpotTable, finalize_enumerated_cycles, min_profitable_cycle_ratio,
+    rescore_cycles_with_table_and_gas,
 };
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
@@ -1379,32 +1380,52 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     };
     let mut table = SpotTable::new(arena.pool_count());
     table.populate_from_graph(&routing_graph);
-    rescore_cycles_with_table(&arena, &mut table, &mut capped);
-    // Prune any that became unroutable due to dirty state updates (prevents
-    // polluting HF candidate pool with now-dead cycles kept from graph cache).
+    // Spot gas for ranking (no 12.5% submit buffer) so near-miss 2-hops aren't
+    // crowded out by deep ratio-only dust that cannot clear live gas.
+    let rank_gas = ctx
+        .gas_oracle
+        .loaded_snapshot()
+        .map(crate::services::execution::gas::compute_assessment_gas_price)
+        .or(gas_price_wei);
+    rescore_cycles_with_table_and_gas(
+        &arena,
+        &table,
+        &mut capped,
+        rank_gas,
+        Some(prior_rates.as_ref()),
+        Some(decimals.as_ref()),
+        None,
+    );
+    // Prune dead / underwater / fee-drag losers (hop-scaled floor for 3+ hops).
     capped.retain(|c| {
-        c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT
-            && (c.cycle_ratio.is_zero() || c.cycle_ratio > ONE)
+        if c.score >= crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT {
+            return false;
+        }
+        if c.cycle_ratio.is_zero() {
+            return false;
+        }
+        c.cycle_ratio >= min_profitable_cycle_ratio(c.edge_hops())
     });
-    // Priced-cycle filter runs after enrich+merge below so newly configured feeds
-    // (batch mints) can rotate/retain cycles on the same LF tick.
-    // ponytail: rescore reorders by score and would undo enumeration-time protocol
-    // diversity; re-apply so Balancer multi-token hubs cannot refill the cap.
+    // Protocol diversity (buckets ranked by gas-aware execution score).
     capped = finalize_enumerated_cycles(capped, max_paths.saturating_sub(live_held.len()));
     if !live_held.is_empty() {
         // Rescore held pins with post-hydrate weights; still skip dead-prune so WSS
         // topic-live cycles survive a transient zero after tick hydrate.
-        rescore_cycles_with_table(&arena, &mut table, &mut live_held);
+        rescore_cycles_with_table_and_gas(
+            &arena,
+            &table,
+            &mut live_held,
+            rank_gas,
+            Some(prior_rates.as_ref()),
+            Some(decimals.as_ref()),
+            None,
+        );
         let held_gt_one = live_held.iter().filter(|c| c.cycle_ratio > ONE).count();
         crate::info!(
             "stream observed-live: live_held_ratio_gt_one={held_gt_one}/{} lf_pass={lf_pass}",
             live_held.len()
         );
-        live_held.sort_by(|a, b| {
-            (b.cycle_ratio > ONE)
-                .cmp(&(a.cycle_ratio > ONE))
-                .then_with(|| crate::pipeline::types::compare_cycle_score(a, b))
-        });
+        live_held.sort_by(crate::pipeline::types::compare_cycle_execution);
         live_held.truncate(32);
         let mut seen: rustc_hash::FxHashSet<u64> = live_held
             .iter()

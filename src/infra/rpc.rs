@@ -105,8 +105,21 @@ impl RpcPool {
 
     fn state_urls_ordered_slice(&self) -> Vec<Arc<str>> {
         let urls = self.state_urls.read();
-        let penalties = self.state_url_penalties.read();
         let now = Instant::now();
+        // Opportunistic prune: only take the write lock when something expired
+        // (hot path is read-only; long runs still cannot accumulate dead cool-offs).
+        {
+            let needs_prune = {
+                let penalties = self.state_url_penalties.read();
+                !penalties.is_empty() && penalties.values().any(|until| *until <= now)
+            };
+            if needs_prune {
+                self.state_url_penalties
+                    .write()
+                    .retain(|_, until| *until > now);
+            }
+        }
+        let penalties = self.state_url_penalties.read();
         let mut healthy = Vec::with_capacity(urls.len());
         let mut budget_tight = Vec::new();
         let mut penalized = Vec::new();
@@ -132,19 +145,17 @@ impl RpcPool {
 
     pub fn state_url(&self) -> Option<String> {
         // Fast path for common single-URL case — avoids allocating the full partition vecs.
-        let urls = self.state_urls.read();
-        if urls.len() <= 1 {
-            return urls.first().map(ToString::to_string);
+        {
+            let urls = self.state_urls.read();
+            if urls.len() <= 1 {
+                return urls.first().map(ToString::to_string);
+            }
         }
-        let penalties = self.state_url_penalties.read();
-        let now = Instant::now();
-        urls.iter()
-            .find(|url| {
-                penalties
-                    .get(url.as_ref())
-                    .is_none_or(|until| now >= *until)
-            })
-            .or_else(|| urls.first())
+        // Multi-URL: same budget/penalty order as [`Self::state_url_candidates`].
+        // Prior path only skipped penalties, so a free-tier primary at 0 tokens kept
+        // winning `connect_state()` while candidates had already demoted it (live 429s).
+        self.state_urls_ordered_slice()
+            .first()
             .map(ToString::to_string)
     }
 
@@ -395,8 +406,9 @@ impl RpcPool {
     }
 
     fn cached_http_provider(&self, url: &str) -> anyhow::Result<DynProvider> {
-        let mut guard = self.http_providers.lock();
-        if let Some(provider) = guard.get(url) {
+        // Double-checked: build outside the map lock so concurrent LF/HF
+        // `connect_state` calls do not serialize on ProviderBuilder.
+        if let Some(provider) = self.http_providers.lock().get(url) {
             return Ok(provider.clone());
         }
         let endpoint = rpc_host_label(url);
@@ -410,6 +422,11 @@ impl RpcPool {
                     .with_context(|| format!("invalid RPC URL: {endpoint}"))?,
             )
             .erased();
+        let mut guard = self.http_providers.lock();
+        // Another task may have inserted while we built — reuse theirs.
+        if let Some(existing) = guard.get(url) {
+            return Ok(existing.clone());
+        }
         guard.insert(url.to_string(), provider.clone());
         Ok(provider)
     }
@@ -585,6 +602,40 @@ mod tests {
         assert_eq!(pool.state_url().as_deref(), Some("https://slow.example"));
         pool.clear_state_url_penalty("https://fast.example");
         assert_eq!(pool.state_url().as_deref(), Some("https://fast.example"));
+    }
+
+    #[test]
+    fn state_url_matches_candidates_primary() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://fast.example".into());
+        config.rpc.polygon_rpc_urls = vec!["https://slow.example".into()];
+        let pool = RpcPool::from_config(&config);
+        pool.deprioritize_state_url("https://fast.example");
+        let primary = pool.state_url().expect("primary");
+        let candidates = pool.state_url_candidates();
+        assert_eq!(primary.as_str(), candidates[0].as_ref());
+        assert_eq!(primary.as_str(), "https://slow.example");
+    }
+
+    #[test]
+    fn expired_penalty_is_pruned_on_order() {
+        let mut config = AppConfig::default();
+        config.rpc.state_rpc_url = Some("https://a.example".into());
+        config.rpc.polygon_rpc_urls = vec!["https://b.example".into()];
+        let pool = RpcPool::from_config(&config);
+        pool.state_url_penalties.write().insert(
+            "https://a.example".into(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        let _ = pool.state_url_candidates();
+        assert!(
+            !pool
+                .state_url_penalties
+                .read()
+                .contains_key("https://a.example"),
+            "expired cool-off must be dropped"
+        );
+        assert_eq!(pool.state_url().as_deref(), Some("https://a.example"));
     }
 
     #[test]

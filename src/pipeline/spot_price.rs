@@ -12,6 +12,7 @@ use crate::pipeline::sim_sanity::min_economic_amount_in;
 use crate::pipeline::types::RoutingGraph;
 use crate::util::{ten_pow_u256_cached, u256_to_f64, u512_to_u256_checked};
 use alloy::primitives::{Address, U256, U512};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -339,6 +340,15 @@ impl SpotTable {
         self.set_ratio(edge, r);
         r
     }
+
+    /// Read-only ratio: table hit, else live compute (no insert — safe for parallel rescore).
+    #[inline]
+    #[must_use]
+    pub fn ratio_or_compute(&self, arena: &StateArena, edge: &Edge) -> U256 {
+        self.get_ratio(edge)
+            .filter(|r| !r.is_zero())
+            .unwrap_or_else(|| compute_edge_ratio(arena, edge))
+    }
 }
 
 #[must_use]
@@ -428,7 +438,7 @@ pub fn gas_log_penalty_for_cycle(
 
 pub fn rescore_cycles_with_table(
     arena: &StateArena,
-    table: &mut SpotTable,
+    table: &SpotTable,
     cycles: &mut [FoundCycle],
 ) {
     rescore_cycles_with_table_and_gas(arena, table, cycles, None, None, None, None);
@@ -437,7 +447,7 @@ pub fn rescore_cycles_with_table(
 #[allow(clippy::too_many_arguments)]
 fn rescore_one_cycle(
     arena: &StateArena,
-    table: &mut SpotTable,
+    table: &SpotTable,
     cycle: &mut FoundCycle,
     gas_price_wei: Option<U256>,
     token_to_matic_rates: Option<&FxHashMap<TokenIndex, U256>>,
@@ -463,7 +473,8 @@ fn rescore_one_cycle(
             dead = true;
             break;
         }
-        let ratio = table.get_or_compute_ratio(arena, edge);
+        // Read-only table lookup — parallel-safe after `populate_from_graph`.
+        let ratio = table.ratio_or_compute(arena, edge);
         if ratio.is_zero() {
             dead = true;
             break;
@@ -498,45 +509,74 @@ fn rescore_one_cycle(
 
 pub fn rescore_cycles_with_table_and_gas(
     arena: &StateArena,
-    table: &mut SpotTable,
+    table: &SpotTable,
     cycles: &mut [FoundCycle],
     gas_price_wei: Option<U256>,
     token_to_matic_rates: Option<&FxHashMap<TokenIndex, U256>>,
     token_decimals: Option<&FxHashMap<Address, u8>>,
     flash_source: Option<FlashLoanSource>,
 ) {
-    for cycle in cycles.iter_mut() {
-        rescore_one_cycle(
-            arena,
-            table,
-            cycle,
-            gas_price_wei,
-            token_to_matic_rates,
-            token_decimals,
-            flash_source,
-        );
+    // Table is read-only (callers pre-fill via `populate_from_graph`) — parallel-safe.
+    if crate::util::should_use_rayon(cycles.len()) {
+        cycles.par_iter_mut().for_each(|cycle| {
+            rescore_one_cycle(
+                arena,
+                table,
+                cycle,
+                gas_price_wei,
+                token_to_matic_rates,
+                token_decimals,
+                flash_source,
+            );
+        });
+    } else {
+        for cycle in cycles.iter_mut() {
+            rescore_one_cycle(
+                arena,
+                table,
+                cycle,
+                gas_price_wei,
+                token_to_matic_rates,
+                token_decimals,
+                flash_source,
+            );
+        }
     }
 }
 
 pub fn rescore_arc_cycles_with_table_and_gas(
     arena: &StateArena,
-    table: &mut SpotTable,
+    table: &SpotTable,
     cycles: &mut [Arc<FoundCycle>],
     gas_price_wei: Option<U256>,
     token_to_matic_rates: Option<&FxHashMap<TokenIndex, U256>>,
     token_decimals: Option<&FxHashMap<Address, u8>>,
     flash_source: Option<FlashLoanSource>,
 ) {
-    for cycle in cycles {
-        rescore_one_cycle(
-            arena,
-            table,
-            Arc::make_mut(cycle),
-            gas_price_wei,
-            token_to_matic_rates,
-            token_decimals,
-            flash_source,
-        );
+    if crate::util::should_use_rayon(cycles.len()) {
+        cycles.par_iter_mut().for_each(|cycle| {
+            rescore_one_cycle(
+                arena,
+                table,
+                Arc::make_mut(cycle),
+                gas_price_wei,
+                token_to_matic_rates,
+                token_decimals,
+                flash_source,
+            );
+        });
+    } else {
+        for cycle in cycles {
+            rescore_one_cycle(
+                arena,
+                table,
+                Arc::make_mut(cycle),
+                gas_price_wei,
+                token_to_matic_rates,
+                token_decimals,
+                flash_source,
+            );
+        }
     }
 }
 

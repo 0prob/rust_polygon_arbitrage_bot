@@ -1,6 +1,6 @@
 use crate::core::constants::{
-    GAS_BALANCER_DIRECT_BATCH, GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP,
-    GAS_V3_BASE, GAS_V4_BASE, GAS_WOOFI_HOP, HOP_CAP_USIZE,
+    GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP, GAS_V3_BASE, GAS_V4_BASE,
+    GAS_WOOFI_HOP, HOP_CAP_USIZE, balancer_direct_batch_gas,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
 use crate::core::math::dodo::get_dodo_amount_out;
@@ -34,7 +34,7 @@ pub fn estimate_hop_gas(protocol: ProtocolType) -> u32 {
 #[must_use]
 pub fn route_hop_gas_budget(edges: &[Edge]) -> u32 {
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
-        return GAS_BALANCER_DIRECT_BATCH;
+        return balancer_direct_batch_gas(edges.len());
     }
     edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum()
 }
@@ -48,7 +48,7 @@ fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
     }
     // Direct batchSwap is one vault call; seed is all-in (do not pile ROUTE_EXECUTION_* × edges).
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
-        return GAS_BALANCER_DIRECT_BATCH;
+        return balancer_direct_batch_gas(hop_count);
     }
     let hop_budget = route_hop_gas_budget(edges);
     let static_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
@@ -75,7 +75,7 @@ pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
     }
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
-        return GAS_BALANCER_DIRECT_BATCH;
+        return balancer_direct_batch_gas(edges.len());
     }
     let hop_gas = route_hop_gas_budget(edges);
     let cold_slots = edges.len() as u32;
@@ -2761,7 +2761,7 @@ mod tests {
 
     #[test]
     fn balancer_direct_batch_uses_single_batch_gas_not_per_hop_sum() {
-        use crate::core::constants::GAS_BALANCER_DIRECT_BATCH;
+        use crate::core::constants::balancer_direct_batch_gas;
         use crate::services::execution::gas::estimate_route_gas_from_hops_evm;
 
         let edges = [
@@ -2786,11 +2786,15 @@ mod tests {
                 zero_for_one: true,
             },
         ];
+        let expected = balancer_direct_batch_gas(2);
         let batch = estimate_route_gas(&edges);
         let per_hop = estimate_route_gas_from_hops_evm(GAS_BALANCER_HOP * 2, 2, 2);
-        assert_eq!(route_hop_gas_budget(&edges), GAS_BALANCER_DIRECT_BATCH);
-        assert_eq!(batch, GAS_BALANCER_DIRECT_BATCH);
+        assert_eq!(route_hop_gas_budget(&edges), expected);
+        assert_eq!(batch, expected);
         assert!(batch < per_hop);
+        // Hop scale: 3-hop seed above 2-hop, still under per-hop flash sum.
+        assert!(balancer_direct_batch_gas(3) > expected);
+        assert!(balancer_direct_batch_gas(3) < per_hop);
     }
 
     #[test]

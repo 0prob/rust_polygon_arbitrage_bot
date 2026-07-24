@@ -8,6 +8,9 @@ use rustc_hash::FxBuildHasher;
 
 use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
+use crate::tui::route_viz::{
+    format_token_path, polygonscan_address_url, polygonscan_tx_url,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -230,10 +233,18 @@ impl HfPipelineRow {
 pub struct TradeRow {
     pub at: Instant,
     pub fingerprint: u64,
+    /// Token path when known (e.g. `WMATIC → USDC → WMATIC`).
+    pub tokens: String,
+    /// Route summary from HF/opportunities (protocols + addresses).
+    pub route: String,
     pub outcome: String,
     pub tx_hash: Option<String>,
     pub gas_used: Option<u64>,
     pub profit_wei: Option<U256>,
+    /// Polygonscan tx URL for confirmed swaps.
+    pub explorer_tx: Option<String>,
+    /// Polygonscan executor contract URL on confirmed success.
+    pub explorer_contract: Option<String>,
     pub severity: Severity,
 }
 
@@ -286,6 +297,8 @@ pub struct App {
     pub snapshot_refresh_pending: bool,
     pub show_help: bool,
     pub last_input_at: Option<Instant>,
+    /// Executor contract (for Polygonscan links on confirmed trades).
+    pub executor_address: Option<Address>,
     search_lower: String,
     route_view_key: Option<RouteViewKey>,
     route_view_indices: Vec<usize>,
@@ -338,6 +351,7 @@ impl App {
             snapshot_refresh_pending: false,
             show_help: false,
             last_input_at: None,
+            executor_address: None,
             search_lower: String::new(),
             route_view_key: None,
             route_view_indices: Vec::new(),
@@ -690,20 +704,68 @@ impl App {
             ),
         };
 
+        let (tokens, route) = self.resolve_trade_route(route_fingerprint);
+        // Explorer links only for confirmed (successful) swaps.
+        let (explorer_tx, explorer_contract) = if severity == Severity::Good {
+            let tx = tx_hash
+                .as_deref()
+                .map(polygonscan_tx_url);
+            let contract = self
+                .executor_address
+                .map(polygonscan_address_url);
+            (tx, contract)
+        } else {
+            (None, None)
+        };
+
         self.push_trade(TradeRow {
             at: Instant::now(),
             fingerprint: route_fingerprint,
+            tokens: tokens.clone(),
+            route,
             outcome: outcome_label.clone(),
             tx_hash,
             gas_used,
             profit_wei,
+            explorer_tx,
+            explorer_contract,
             severity,
         });
         self.apply_outcome_to_routes(route_fingerprint, &outcome_label, severity, route_status);
+        let token_part = if tokens.is_empty() {
+            String::new()
+        } else {
+            format!(" {tokens}")
+        };
         self.push_activity(
             severity,
-            format!("fp={route_fingerprint:016x} {outcome_label}"),
+            format!("fp={route_fingerprint:016x}{token_part} {outcome_label}"),
         );
+    }
+
+    /// Prefer opportunity token path + route; fall back to HF candidate route string.
+    fn resolve_trade_route(&self, fingerprint: u64) -> (String, String) {
+        if let Some(snap) = self.snapshot.as_ref()
+            && let Some(opp) = snap
+                .opportunities
+                .iter()
+                .find(|r| r.fingerprint == fingerprint)
+        {
+            let tokens = if opp.tokens.is_empty() {
+                String::new()
+            } else {
+                format_token_path(&opp.tokens)
+            };
+            return (tokens, opp.route.clone());
+        }
+        if let Some(hf) = self
+            .hf_candidates
+            .iter()
+            .find(|r| r.fingerprint == fingerprint)
+        {
+            return (String::new(), hf.route.clone());
+        }
+        (String::new(), String::new())
     }
 
     fn apply_outcome_to_routes(
@@ -1074,9 +1136,12 @@ mod tests {
         use crate::orchestrator::hf::HfCandidateUiRow;
         use alloy::primitives::U256;
 
+        use crate::core::constants::{USDC_NATIVE, WMATIC};
+
         let mut app = App::new();
         let mut route = test_route(0xabc, "a->b");
         route.protocols = "V2".into();
+        route.tokens = vec![WMATIC, USDC_NATIVE, WMATIC];
         route.amount_in_token = "1".into();
         route.amount_in_matic = 1.0;
         route.amount_out_token = "1".into();
@@ -1129,6 +1194,36 @@ mod tests {
             app.activity
                 .back()
                 .is_some_and(|item| item.message.contains("fp=0000000000000abc"))
+        );
+        let dry = app.trade_history.back().expect("dry-run trade row");
+        assert_eq!(dry.tokens, "WMATIC → USDC → WMATIC");
+        assert!(dry.explorer_tx.is_none());
+        assert!(dry.explorer_contract.is_none());
+
+        app.executor_address = Some(Address::repeat_byte(0x11));
+        app.register_trade_outcome(
+            ExecutionOutcome::Confirmed {
+                tx_hash: "0xdeadbeef".into(),
+                gas_used: 210_000,
+                profit_wei: U256::from(1u64),
+            },
+            0xabc,
+        );
+        let ok = app.trade_history.back().expect("confirmed trade row");
+        assert_eq!(ok.tokens, "WMATIC → USDC → WMATIC");
+        assert_eq!(
+            ok.explorer_tx.as_deref(),
+            Some("https://polygonscan.com/tx/0xdeadbeef")
+        );
+        let expected_contract = format!(
+            "https://polygonscan.com/address/{}",
+            Address::repeat_byte(0x11)
+        );
+        assert_eq!(ok.explorer_contract.as_deref(), Some(expected_contract.as_str()));
+        assert!(
+            app.activity
+                .back()
+                .is_some_and(|item| item.message.contains("WMATIC → USDC → WMATIC"))
         );
     }
 }

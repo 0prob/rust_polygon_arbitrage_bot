@@ -87,10 +87,12 @@ pub fn pyth_symbol_matches_hint(symbol: &str, hint: &str) -> bool {
 
 #[must_use]
 pub fn pick_best_usd_candidate(candidates: &[PythFeedCandidate]) -> Option<&PythFeedCandidate> {
+    // Prefer shorter Crypto.TICKER/USD (exact majors) over longer wrappers (WFRAGSOL vs SOL).
+    // Prior max-by-len preferred wrappers and mis-mapped auto-feed proposals.
     candidates
         .iter()
         .filter(|c| c.usd_spot && c.asset_type.eq_ignore_ascii_case("Crypto"))
-        .max_by_key(|c| c.symbol.len())
+        .min_by_key(|c| c.symbol.len())
         .or_else(|| candidates.iter().find(|c| c.usd_spot))
 }
 
@@ -160,6 +162,13 @@ mod tests {
     fn hint_picker_prefers_exact_shorter_ticker() {
         let candidates = [cand("Crypto.WFRAGSOL/USD"), cand("Crypto.SOL/USD")];
         let best = pick_best_usd_candidate_for_hint(&candidates, "SOL").expect("SOL feed");
+        assert_eq!(best.symbol, "Crypto.SOL/USD");
+    }
+
+    #[test]
+    fn unhinted_picker_prefers_shorter_crypto_usd() {
+        let candidates = [cand("Crypto.WFRAGSOL/USD"), cand("Crypto.SOL/USD")];
+        let best = pick_best_usd_candidate(&candidates).expect("usd");
         assert_eq!(best.symbol, "Crypto.SOL/USD");
     }
 }

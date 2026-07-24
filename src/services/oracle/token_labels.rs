@@ -82,8 +82,9 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         "GNS",
     ),
     (
+        // Aavegotchi GHST (not Gains GNS — that is 0xE5417…).
         &address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
-        "GNS",
+        "GHST",
     ),
     (
         &address!("0x03b54A6e9a984069379fae1a4fC4dBAE93B3bCCD"),

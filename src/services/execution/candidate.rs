@@ -208,9 +208,8 @@ pub fn build_execution_candidate(
         encode_cfg,
         dispatch_flash_source,
     )?;
-    // minProfit must match the route-level assessment (already compound+depth slip + flash fee).
-    // Rebuilding via per-hop `on_chain_min_profit_for_route` double-compounds slip and can
-    // set a floor above what prepare/reassess modeled — dry-run InsufficientProfit ghosts.
+    // minProfit must match the route-level assessment (compound+depth slip + flash fee).
+    // Prefer assessment net — do not rebuild from raw per-hop bps (double haircut).
     let min_profit = on_chain_min_profit_from_assessment(assessment)
         .ok_or_else(|| anyhow::anyhow!("invalid or overflowing on-chain profit calculation"))?;
 

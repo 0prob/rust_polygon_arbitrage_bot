@@ -26,7 +26,7 @@ use crate::pipeline::sim_sanity::{
 use crate::pipeline::spot_price::for_each_rank_probe_amount;
 use crate::pipeline::ternary::{BRENT_SEED_CACHE_SLOTS, RouteGasCosting, optimize_cycle};
 use crate::pipeline::types::OptimizationResult;
-use crate::pipeline::types::{MinimalSimResult, compare_cycle_score};
+use crate::pipeline::types::{MinimalSimResult, compare_cycle_execution, compare_cycle_score};
 use crate::services::execution::candidate::hash_cycle_edges;
 use crate::services::execution::flash_liquidity::{
     FlashLiquidityCache, FlashLoanDiagnostics, balancer_route_flash_feasible,
@@ -39,7 +39,8 @@ use crate::services::execution::impact_slippage::{
     depth_impact_slippage_bps_with_base, effective_slippage_bps,
 };
 use crate::services::execution::profit::{
-    AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
+    ProfitEvalContext, RouteAssessRequest, assessment_gas_for_edges, assessment_gas_units,
+    assess_route_from_sim,
     brent_score_matic_from_sim, cover_matic_from_sim, net_profit_matic_from_sim,
     route_profit_thresholds,
 };
@@ -698,7 +699,11 @@ fn rank_one_cycle_probe(
     ctx.hop_count = cycle.edge_hops();
     ctx.profit_priority_alpha_bps = profit_priority_alpha_bps;
     let mut ranked_probe = probe;
-    ranked_probe.total_gas = route_gas.route_gas_or_heuristic(gas_oracle, fp, probe.total_gas);
+    // Direct batch seeds are live-calibrated all-in; do not apply mixed-route sim_scale.
+    ranked_probe.total_gas = assessment_gas_units(
+        probe.total_gas,
+        &assessment_gas_for_edges(&cycle.edges, Some(route_gas), gas_oracle, fp),
+    );
     let net_matic = net_profit_matic_from_sim(&ranked_probe, probe_amount, &ctx);
     out.seeds.insert(fp, (probe_amount, probe));
     if net_matic.is_zero() {
@@ -1177,18 +1182,20 @@ pub async fn rescore_rank_and_evaluate_async(
         let rates = input.token_to_matic_rates.as_ref();
         let decimals = input.token_decimals.as_ref();
         let probe_window = probe_rank_window(sim_cap, cycles.len());
-        let mut spot_table = crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
+        let spot_table = crate::pipeline::spot_price::SpotTable::new(input.arena.pool_count());
         if probe_window > 0 {
             crate::pipeline::spot_price::rescore_arc_cycles_with_table_and_gas(
                 &input.arena,
-                &mut spot_table,
+                &spot_table,
                 &mut cycles[..probe_window],
                 Some(input.gas_price),
                 Some(rates),
                 Some(decimals),
                 None,
             );
-            cycles[..probe_window].sort_by(|a, b| compare_cycle_score(a.as_ref(), b.as_ref()));
+            // Gas-aware score primary among profitable (not raw ratio).
+            cycles[..probe_window]
+                .sort_by(|a, b| compare_cycle_execution(a.as_ref(), b.as_ref()));
         }
         let route_gas = RouteGasLookup::for_fingerprints(
             &input.gas_oracle,
@@ -1511,6 +1518,9 @@ fn evaluate_one(
         lookup: input.route_gas,
         oracle: input.gas_oracle,
         fingerprint: fp,
+        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(
+            &cycle.edges,
+        ),
     };
     let brent_seeds =
         build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
@@ -1720,11 +1730,12 @@ fn assess_route_for_cycle(
         hop_count: cycle.edge_hops(),
         slippage_bps,
         flash_source,
-        gas: AssessmentGas::TickRoute {
-            lookup: input.route_gas,
-            oracle: input.gas_oracle,
-            route_fp: fp,
-        },
+        gas: assessment_gas_for_edges(
+            &cycle.edges,
+            Some(input.route_gas),
+            input.gas_oracle,
+            fp,
+        ),
         thresholds,
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,

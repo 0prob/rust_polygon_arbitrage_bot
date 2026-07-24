@@ -18,7 +18,8 @@ use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::types::{
-    CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_score,
+    CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_execution,
+    compare_cycle_score,
 };
 
 pub use crate::pipeline::spot_price::hop_penalty;
@@ -1519,9 +1520,11 @@ pub fn primary_protocol(edges: &[Edge]) -> ProtocolType {
 }
 
 /// Selects up to `max_cycles` opportunities with better protocol distribution.
-/// For each protocol that appears, takes its best-scoring cycles in round-robin
-/// fashion so that if good opportunities exist in V2/V3/Curve/Dodo/Woofi/etc.
-/// they are not crowded out by high-degree Balancer subgraphs (common for 3-hop).
+///
+/// For each protocol that appears, takes its best cycles (via
+/// [`compare_cycle_execution`]) in round-robin so V2/V3/Curve/etc. are not
+/// crowded out by high-degree Balancer subgraphs. Prefer gas-aware score among
+/// profitable routes after LF rescore; safe at enum-time too (score = log-weight).
 #[must_use]
 pub fn apply_protocol_diverse_selection(
     cycles: Vec<FoundCycle>,
@@ -1538,10 +1541,10 @@ pub fn apply_protocol_diverse_selection(
         groups[slot].push(c);
     }
 
-    // Best-first sort, then reverse so `pop()` is O(1) best remaining.
+    // Best-first sort (gas-aware when rescored), reverse so `pop()` is O(1) best.
     for g in &mut groups {
         if g.len() > 1 {
-            g.sort_by(compare_cycle_score);
+            g.sort_by(compare_cycle_execution);
             g.reverse();
         }
     }
@@ -1597,7 +1600,7 @@ pub fn apply_protocol_diverse_selection(
         }
     }
 
-    selected.sort_by(compare_cycle_score);
+    selected.sort_by(compare_cycle_execution);
     selected
 }
 

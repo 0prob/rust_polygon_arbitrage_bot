@@ -672,9 +672,16 @@ impl StateRefreshService {
             return;
         }
 
-        let Ok(provider) = self.rpc.connect_state() else {
+        let Some(url) = self.rpc.state_url() else {
             crate::warn!(
                 "token decimals enrich skipped: state RPC unavailable (missing={})",
+                missing.len()
+            );
+            return;
+        };
+        let Ok(provider) = self.rpc.connect_state_at(&url) else {
+            crate::warn!(
+                "token decimals enrich skipped: state RPC connect failed (missing={})",
                 missing.len()
             );
             return;
@@ -691,7 +698,12 @@ impl StateRefreshService {
             })
             .collect();
 
-        let Ok(results) = execute_multicall(&provider, &batch).await else {
+        // Scope host budget — unscoped multicall bypassed free-tier pacing.
+        let Ok(results) = crate::infra::rpc_budget::scope_rpc_budget(&url, async {
+            execute_multicall(&provider, &batch).await
+        })
+        .await
+        else {
             crate::warn!(
                 "token decimals enrich multicall failed (missing={})",
                 missing.len()

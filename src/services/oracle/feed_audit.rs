@@ -39,12 +39,8 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
     ),
     (
         "GRT",
-        address!("0x5fe2b58a29225b59dadf811f5c49472a056ebff0"),
-        "GRT",
-    ),
-    (
-        "GRT (alt PoS)",
-        address!("0x5fe2B58c013d7601147DcdD68C143A77499f5531"),
+        // Must match `core::constants::GRT` (was typo 0x5fe2b58a… — dead digests).
+        address!("0x5fe2b58c013d7601147dcdd68c143a77499f5531"),
         "GRT",
     ),
     (
@@ -118,12 +114,8 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
         "SHIB",
     ),
     (
+        // Gains Network GNS — not GHST (0x385Ee… is Aavegotchi).
         "GNS",
-        address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
-        "GNS",
-    ),
-    (
-        "GNS (alt)",
         address!("0xE5417Af564e4bFDA1c483642db72007871397896"),
         "GNS",
     ),
@@ -372,12 +364,20 @@ pub enum UsdFeedScanStatus {
 }
 
 /// Hermes-check addresses for a USD spot feed.
+///
+/// Catalog GETs run concurrently via JoinSet (cap 8) — sequential 20× scan was seconds of
+/// wall time on every auto-feed batch.
 pub async fn scan_addresses_for_usd_feeds(
     http: &reqwest::Client,
     hermes_url: &str,
     rows: &[(Address, Option<&'static str>)],
 ) -> anyhow::Result<Vec<UsdFeedScanRow>> {
+    const HERMES_SCAN_CONCURRENCY: usize = 8;
+
     let mut out = Vec::with_capacity(rows.len());
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut inflight = 0usize;
+
     for &(address, label) in rows {
         let query = hermes_query_for_addr(address, label);
         let Some(query) = query else {
@@ -391,40 +391,59 @@ pub async fn scan_addresses_for_usd_feeds(
             });
             continue;
         };
-        match pyth_catalog::search_pyth_feeds(http, hermes_url, &query).await {
-            Ok(candidates) => {
-                if let Some(best) =
-                    pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, &query)
-                {
-                    out.push(UsdFeedScanRow {
-                        address,
-                        label,
-                        query: Some(query),
-                        status: UsdFeedScanStatus::UsdMatch,
-                        feed_id: Some(best.id.clone()),
-                        symbol: Some(best.symbol.clone()),
-                    });
-                } else {
-                    out.push(UsdFeedScanRow {
-                        address,
-                        label,
-                        query: Some(query),
-                        status: UsdFeedScanStatus::NoUsd,
-                        feed_id: None,
-                        symbol: None,
-                    });
+        // Bound concurrency without futures-util buffer_unordered.
+        while inflight >= HERMES_SCAN_CONCURRENCY {
+            if let Some(joined) = tasks.join_next().await {
+                inflight = inflight.saturating_sub(1);
+                match joined {
+                    Ok(row) => out.push(row),
+                    Err(e) => crate::warn!("oracle hermes scan task join failed: {e}"),
                 }
             }
-            Err(_) => {
-                out.push(UsdFeedScanRow {
+        }
+        let http = http.clone();
+        let hermes = hermes_url.to_string();
+        tasks.spawn(async move {
+            match pyth_catalog::search_pyth_feeds(&http, &hermes, &query).await {
+                Ok(candidates) => {
+                    if let Some(best) =
+                        pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, &query)
+                    {
+                        UsdFeedScanRow {
+                            address,
+                            label,
+                            query: Some(query),
+                            status: UsdFeedScanStatus::UsdMatch,
+                            feed_id: Some(best.id.clone()),
+                            symbol: Some(best.symbol.clone()),
+                        }
+                    } else {
+                        UsdFeedScanRow {
+                            address,
+                            label,
+                            query: Some(query),
+                            status: UsdFeedScanStatus::NoUsd,
+                            feed_id: None,
+                            symbol: None,
+                        }
+                    }
+                }
+                Err(_) => UsdFeedScanRow {
                     address,
                     label,
                     query: Some(query),
                     status: UsdFeedScanStatus::Error,
                     feed_id: None,
                     symbol: None,
-                });
+                },
             }
+        });
+        inflight = inflight.saturating_add(1);
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(row) => out.push(row),
+            Err(e) => crate::warn!("oracle hermes scan task join failed: {e}"),
         }
     }
     Ok(out)

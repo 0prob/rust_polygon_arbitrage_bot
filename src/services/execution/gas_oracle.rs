@@ -20,8 +20,13 @@ use super::gas::{
 };
 
 const ROUTE_GAS_HISTORY: usize = 256;
-/// Cap sim→observed uplift so one outlier receipt cannot dominate Brent ranking.
-const MAX_SIM_SCALE_BPS: u32 = 30_000;
+/// Cap sim→observed uplift for cold heuristics (unseen fingerprints).
+/// 3.0× let BAL/mixed underestimates (live 1.87M vs 720k) train a global scale that
+/// re-inflated every V2/V3 near-miss (~2× gas phantom). Per-route `record_route_gas`
+/// still learns outliers; 1.5× is enough for mild hop-seed underestimates.
+const MAX_SIM_SCALE_BPS: u32 = 15_000;
+/// Ratios above this are protocol/route outliers — teach fingerprint only, not global EMA.
+const GLOBAL_SCALE_OUTLIER_BPS: u32 = 18_000;
 const SNAPSHOT_LOG_CHANGE_BPS: u64 = 500;
 
 /// Prefetch observed route gas for an HF tick's fingerprints (always — was gated at 48,
@@ -94,6 +99,28 @@ impl RouteGasLookup {
         }
         scaled_simulated_gas(heuristic, self.scale_bps)
     }
+
+    /// Observed gas if known; otherwise the seed **without** global sim_scale.
+    ///
+    /// Use for all-in calibrated seeds ([`crate::core::constants::balancer_direct_batch_gas`])
+    /// so mixed-route underestimates cannot re-inflate Direct near-miss gas.
+    #[must_use]
+    pub fn route_gas_observed_or_seed(
+        &self,
+        oracle: &GasOracle,
+        route_fp: u64,
+        seed: u32,
+    ) -> u32 {
+        if let Some(&gas) = self.observed.get(&route_fp) {
+            return gas;
+        }
+        if !self.preloaded {
+            return oracle.route_gas_observed_or_seed(route_fp, seed);
+        }
+        oracle
+            .observed_route_gas(route_fp)
+            .unwrap_or(seed)
+    }
 }
 
 /// Bounded route-fp → observed gas with FIFO eviction (≤[`ROUTE_GAS_HISTORY`]).
@@ -149,6 +176,13 @@ impl GasOracle {
         scaled_simulated_gas(heuristic, scale)
     }
 
+    /// Prefer dry-run / on-chain gas; else return `seed` without global sim_scale.
+    /// For live-calibrated Direct batch seeds — see [`RouteGasLookup::route_gas_observed_or_seed`].
+    #[must_use]
+    pub fn route_gas_observed_or_seed(&self, route_fp: u64, seed: u32) -> u32 {
+        self.observed_route_gas(route_fp).unwrap_or(seed)
+    }
+
     /// Current global sim→observed gas scale in bps (10_000 = 1.0×).
     pub fn sim_scale_bps(&self) -> u64 {
         self.sim_scale_bps.load(Ordering::Relaxed).max(10_000) as u64
@@ -180,12 +214,21 @@ impl GasOracle {
     }
 
     /// Calibrate heuristic gas from estimate_gas / dry-run observations.
+    ///
+    /// Extreme ratios (BAL/callback underestimates) are ignored for the **global**
+    /// scale — those routes already get an accurate fingerprint via
+    /// [`Self::record_route_gas`]. Blending them here starved V2/V3 cold edges.
     pub fn record_sim_observed(&self, simulated: u32, observed: u64) {
         if simulated == 0 || observed == 0 {
             return;
         }
-        let ratio_bps = ((observed.saturating_mul(10_000)) / u64::from(simulated))
-            .clamp(10_000, u64::from(MAX_SIM_SCALE_BPS)) as u32;
+        let raw_ratio_bps =
+            ((observed.saturating_mul(10_000)) / u64::from(simulated)).min(u64::from(u32::MAX))
+                as u32;
+        if raw_ratio_bps > GLOBAL_SCALE_OUTLIER_BPS {
+            return;
+        }
+        let ratio_bps = raw_ratio_bps.clamp(10_000, MAX_SIM_SCALE_BPS);
         let prev = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000);
         let blended = ((u64::from(prev) * 3 + u64::from(ratio_bps)) / 4) as u32;
         self.sim_scale_bps
@@ -430,24 +473,56 @@ mod tests {
     }
 
     #[test]
-    fn sim_scale_caps_outlier_observations() {
+    fn sim_scale_caps_mild_uplift_and_ignores_outliers() {
         let oracle = GasOracle::new(Duration::from_secs(1));
+        // 10× outlier must not train global scale (fingerprint-only).
         for _ in 0..32 {
             oracle.record_sim_observed(100_000, 1_000_000);
         }
+        assert_eq!(oracle.sim_scale_bps(), 10_000);
+        // Mild 1.4× observations blend toward the 1.5× cap.
+        for _ in 0..32 {
+            oracle.record_sim_observed(100_000, 140_000);
+        }
         let scale = oracle.sim_scale_bps();
         assert!(scale <= u64::from(MAX_SIM_SCALE_BPS));
-        assert!(scale >= 29_900);
+        assert!(
+            scale >= 13_500,
+            "expected mild uplift toward 1.4×, got {scale}"
+        );
+    }
+
+    #[test]
+    fn calibrated_seed_ignores_global_sim_scale() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        // Mild underestimates train global scale (1.5× obs → 1.125× blend).
+        oracle.record_sim_observed(100_000, 150_000);
+        assert_eq!(oracle.sim_scale_bps(), 11_250);
+        let direct_seed = 220_000u32; // balancer_direct_batch_gas(2)
+        // Scaled path re-inflates; calibrated path must not.
+        assert_eq!(oracle.route_gas_or_heuristic(99, direct_seed), 247_500);
+        assert_eq!(
+            oracle.route_gas_observed_or_seed(99, direct_seed),
+            direct_seed
+        );
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64]);
+        assert_eq!(
+            lookup.route_gas_observed_or_seed(&oracle, 99, direct_seed),
+            direct_seed
+        );
+        // Observed still wins over seed.
+        oracle.record_route_gas(7, 210_000);
+        assert_eq!(oracle.route_gas_observed_or_seed(7, direct_seed), 210_000);
     }
 
     #[test]
     fn mined_gas_calibrates_heuristic_uplift() {
         let oracle = GasOracle::new(Duration::from_secs(1));
-        oracle.record_sim_observed(100_000, 200_000);
+        oracle.record_sim_observed(100_000, 150_000);
 
-        // 75% prior (1.0x) + 25% observation (2.0x).
-        assert_eq!(oracle.sim_scale_bps(), 12_500);
-        assert_eq!(oracle.route_gas_or_heuristic(99, 100_000), 125_000);
+        // 75% prior (1.0x) + 25% observation (1.5x) → 1.125×.
+        assert_eq!(oracle.sim_scale_bps(), 11_250);
+        assert_eq!(oracle.route_gas_or_heuristic(99, 100_000), 112_500);
     }
 
     #[test]

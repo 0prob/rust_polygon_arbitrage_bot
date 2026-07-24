@@ -281,15 +281,9 @@ pub fn cycle_prefers_candidate(candidate: &FoundCycle, incumbent: &FoundCycle) -
     compare_cycle_score(candidate, incumbent) == std::cmp::Ordering::Less
 }
 
-#[must_use]
-pub fn compare_cycle_score(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering {
-    // Primary key: U256 cycle_ratio (exact fixed-point). Higher ratio = more profitable at margin.
-    // This eliminates f64 precision loss from score-based ranking.
-    // When both cycle_ratio are U256::ZERO (cache restore path), fall back to f64 score.
-    b.cycle_ratio
-        .cmp(&a.cycle_ratio)
-        .then_with(|| a.score.total_cmp(&b.score))
-        .then_with(|| a.edge_hops().cmp(&b.edge_hops()))
+fn cycle_tie_break(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering {
+    a.edge_hops()
+        .cmp(&b.edge_hops())
         .then_with(|| a.start_token.0.cmp(&b.start_token.0))
         .then_with(|| {
             a.edges
@@ -308,4 +302,76 @@ pub fn compare_cycle_score(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering
                 })
                 .unwrap_or_else(|| a.edges.len().cmp(&b.edges.len()))
         })
+}
+
+#[must_use]
+pub fn compare_cycle_score(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering {
+    // Primary key: U256 cycle_ratio (exact fixed-point). Higher ratio = more profitable at margin.
+    // This eliminates f64 precision loss from score-based ranking.
+    // When both cycle_ratio are U256::ZERO (cache restore path), fall back to f64 score.
+    b.cycle_ratio
+        .cmp(&a.cycle_ratio)
+        .then_with(|| a.score.total_cmp(&b.score))
+        .then_with(|| cycle_tie_break(a, b))
+}
+
+/// Post-rescore ranking for HF handoff: after gas/hop penalties live in `score`.
+///
+/// Prefer profitable (`cycle_ratio > ONE`), then lower score (cheaper gas / fewer hops),
+/// then higher ratio. Ratio-primary ranking alone let 4-hop dust with tiny edge beat
+/// 2-hop near-misses that actually clear gas (live: probe window filled with deep junk).
+#[must_use]
+pub fn compare_cycle_execution(a: &FoundCycle, b: &FoundCycle) -> std::cmp::Ordering {
+    use crate::core::math::fixed_point::ONE;
+    let a_ok = a.cycle_ratio > ONE;
+    let b_ok = b.cycle_ratio > ONE;
+    b_ok.cmp(&a_ok)
+        .then_with(|| a.score.total_cmp(&b.score))
+        .then_with(|| b.cycle_ratio.cmp(&a.cycle_ratio))
+        .then_with(|| cycle_tie_break(a, b))
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+    use crate::core::math::fixed_point::ONE;
+    use crate::core::types::{CycleEdges, ProtocolType};
+
+    fn cycle(ratio: U256, score: f64, hops: u32) -> FoundCycle {
+        let mut edges = Vec::with_capacity(hops as usize);
+        for i in 0..hops {
+            edges.push(Edge {
+                pool_index: PoolIndex(i),
+                token_in: TokenIndex(i),
+                token_out: TokenIndex(i + 1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            });
+        }
+        FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_slice(&edges),
+            hop_count: hops,
+            log_weight: score,
+            cumulative_fee_bps: 30 * hops,
+            score,
+            cycle_ratio: ratio,
+        }
+    }
+
+    #[test]
+    fn execution_rank_prefers_lower_gas_score_over_raw_ratio() {
+        // Tiny 4-hop edge with worse (higher) score loses to 2-hop near-miss.
+        let deep = cycle(ONE + U256::from(2_000u64), -0.001, 4);
+        let shallow = cycle(ONE + U256::from(1_000u64), -0.05, 2);
+        assert!(
+            compare_cycle_execution(&shallow, &deep) == std::cmp::Ordering::Less,
+            "gas-aware score should prefer shallow near-miss"
+        );
+        // Ratio-primary still used by DFS merge (unchanged).
+        assert!(compare_cycle_score(&deep, &shallow) == std::cmp::Ordering::Less);
+    }
 }

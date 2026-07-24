@@ -9,7 +9,7 @@ use crate::tui::theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let [table_area, detail_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(8)]).areas(area);
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(12)]).areas(area);
 
     let len = app.trade_history.len();
     let table_block = theme::table_block("Trades");
@@ -24,9 +24,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .skip(start)
         .take(end.saturating_sub(start))
     {
+        let tokens = if trade.tokens.is_empty() {
+            trade.route.as_str()
+        } else {
+            trade.tokens.as_str()
+        };
+        let tokens = if tokens.is_empty() { "-" } else { tokens };
         rows.push(
             Row::new(vec![
                 Cell::from(format!("{:x}", trade.fingerprint)),
+                Cell::from(tokens.to_string()),
                 Cell::from(trade.outcome.clone()),
                 Cell::from(
                     trade
@@ -53,15 +60,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             rows,
             [
                 Constraint::Length(12),
-                Constraint::Length(22),
+                Constraint::Percentage(28),
+                Constraint::Length(18),
                 Constraint::Length(10),
-                Constraint::Length(20),
-                Constraint::Percentage(40),
+                Constraint::Length(16),
+                Constraint::Percentage(24),
             ],
         )
         .header(
             Row::new(vec![
                 Cell::from("fingerprint"),
+                Cell::from("tokens"),
                 Cell::from("outcome"),
                 Cell::from("gas"),
                 Cell::from("profit"),
@@ -76,11 +85,29 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     let detail = if let Some(row) = app.selected_trade() {
-        vec![
+        let mut lines = vec![
             theme::label_value("latest", row.outcome.clone(), row.severity),
             theme::label_value(
                 "fingerprint",
                 format!("{:x}", row.fingerprint),
+                Severity::Info,
+            ),
+            theme::label_value(
+                "tokens",
+                if row.tokens.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.tokens.clone()
+                },
+                Severity::Info,
+            ),
+            theme::label_value(
+                "route",
+                if row.route.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.route.clone()
+                },
                 Severity::Info,
             ),
             theme::label_value(
@@ -100,7 +127,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 row.tx_hash.clone().unwrap_or_else(|| "-".to_string()),
                 Severity::Info,
             ),
-        ]
+        ];
+        if let Some(url) = row.explorer_tx.as_ref() {
+            lines.push(theme::label_value("swap", url.clone(), Severity::Good));
+        }
+        if let Some(url) = row.explorer_contract.as_ref() {
+            lines.push(theme::label_value("contract", url.clone(), Severity::Good));
+        }
+        lines
     } else {
         vec![Line::from("no trade history yet")]
     };

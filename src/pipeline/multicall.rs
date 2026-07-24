@@ -160,12 +160,14 @@ async fn execute_multicall_chunk<P: Provider<Ethereum>>(
 
     let mut attempt = 0u32;
     loop {
+        // Budget wait first — holding the global concurrency permit while the
+        // free-tier token bucket sleeps (up to ~2s) starved other hosts' multicalls
+        // under LF+HF fan-out (live: 4 permits stuck on one depleted PublicNode).
+        crate::infra::rpc_budget::admit_rpc_request().await;
         let _permit = GLOBAL_MULTICALL_ADMISSION
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("global multicall admission closed"))?;
-        // Per-host token bucket (task-local URL from `scope_rpc_budget`).
-        crate::infra::rpc_budget::admit_rpc_request().await;
         let mut call = contract.aggregate3(std::mem::take(&mut calls));
         if let Some(number) = block_number {
             call = call.block(BlockId::Number(BlockNumberOrTag::Number(number)));

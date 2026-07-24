@@ -2381,11 +2381,22 @@ pub async fn run_hf_tick(
                 search_low: result.opt.search_low,
                 raw_sim_gas: result.sim.total_gas,
                 assessed_gas: observed_gas.unwrap_or_else(|| {
-                    ctx.gas_oracle
-                        .route_gas_or_heuristic(result.route_fingerprint, result.sim.total_gas)
+                    crate::services::execution::profit::assessment_gas_units(
+                        result.sim.total_gas,
+                        &crate::services::execution::profit::assessment_gas_for_edges(
+                            &result.cycle.edges,
+                            None,
+                            ctx.gas_oracle.as_ref(),
+                            result.route_fingerprint,
+                        ),
+                    )
                 }),
                 gas_basis: if observed_gas.is_some() {
                     "observed_route"
+                } else if crate::pipeline::route_calls::balancer_direct_batch_eligible(
+                    &result.cycle.edges,
+                ) {
+                    "calibrated_direct_seed"
                 } else {
                     "scaled_heuristic"
                 },

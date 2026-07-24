@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -86,18 +87,19 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         pyth_id: Some("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"),
     },
     TokenFeed {
-        token: address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"),
-        chainlink: None,
+        token: address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"), // DAI
+        // Polygon DAI/USD proxy (docs.chain.link data-feeds polygon).
+        chainlink: Some(address!("0x4746DeC9e833A82EC7C2C1356372CcF2cfcD2F3D")),
         pyth_id: Some("b0948a5e5313200c632b51bb5ca32f6de0d36e9950a942d19751e833f70dabfd"),
     },
     TokenFeed {
-        token: address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"),
-        chainlink: None,
+        token: address!("0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"), // LINK
+        chainlink: Some(address!("0xd9FFdb71EbE7496cC440152d43986Aae0AB76665")),
         pyth_id: Some("8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221"),
     },
     TokenFeed {
-        token: address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"),
-        chainlink: None,
+        token: address!("0xd6df932a45c0f255f85145f286ea0b292b21c90b"), // AAVE
+        chainlink: Some(address!("0x72484B12719E23115761D5DA1646945632979bB6")),
         pyth_id: Some("2b9ab1e972a281585084148ba1389800799bd4be63b957507db1349314e47445"),
     },
     TokenFeed {
@@ -190,11 +192,6 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         pyth_id: Some("4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478"),
     },
     TokenFeed {
-        token: address!("0x5fe2B58c013d7601147DcdD68C143A77499f5531"),
-        chainlink: None,
-        pyth_id: Some("4d1f8dae0d96236fb98e8f47471a366ec3b1732b47041781934ca3a9bb2f35e7"),
-    },
-    TokenFeed {
         token: address!("0x2C89bbc92BD86F8075d1DEcc58C7F4E0107f286b"),
         chainlink: None,
         pyth_id: Some("93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7"),
@@ -220,11 +217,7 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("f0d57deca57b3da2fe63a493f4c25925fdfd8edf834b20f93e1f84dbd1504d4a"),
     },
-    TokenFeed {
-        token: address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
-        chainlink: None,
-        pyth_id: Some("5a5d5f7fb72cc84b579d74d1c06d258d751962e9a010c0b1cce7e6023aacb71b"),
-    },
+    // Gains GNS only — do not map GHST (0x385Ee…) to GNS/USD (live feed-id poison).
     TokenFeed {
         token: address!("0xE5417Af564e4bFDA1c483642db72007871397896"),
         chainlink: None,
@@ -1151,20 +1144,35 @@ pub fn builtin_pyth_feed_id(token: &Address) -> Option<&'static str> {
     pyth_feed(token)
 }
 
+/// O(1) feed maps — first TOKEN_FEEDS entry wins on address collisions (do not last-write GNS over GHST).
+static CHAINLINK_BY_TOKEN: LazyLock<FxHashMap<Address, Address>> = LazyLock::new(|| {
+    let mut m = FxHashMap::with_capacity_and_hasher(TOKEN_FEEDS.len(), FxBuildHasher);
+    for entry in TOKEN_FEEDS {
+        if let Some(feed) = entry.chainlink {
+            m.entry(entry.token).or_insert(feed);
+        }
+    }
+    m
+});
+
+static PYTH_BY_TOKEN: LazyLock<FxHashMap<Address, &'static str>> = LazyLock::new(|| {
+    let mut m = FxHashMap::with_capacity_and_hasher(TOKEN_FEEDS.len(), FxBuildHasher);
+    for entry in TOKEN_FEEDS {
+        if let Some(id) = entry.pyth_id {
+            m.entry(entry.token).or_insert(id);
+        }
+    }
+    m
+});
+
 #[inline]
 fn chainlink_feed(token: &Address) -> Option<Address> {
-    TOKEN_FEEDS
-        .iter()
-        .find(|entry| entry.token == *token)
-        .and_then(|entry| entry.chainlink)
+    CHAINLINK_BY_TOKEN.get(token).copied()
 }
 
 #[inline]
 fn pyth_feed(token: &Address) -> Option<&'static str> {
-    TOKEN_FEEDS
-        .iter()
-        .find(|entry| entry.token == *token)
-        .and_then(|entry| entry.pyth_id)
+    PYTH_BY_TOKEN.get(token).copied()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1585,6 +1593,10 @@ mod tests {
             chainlink_feed(&uni),
             Some(address!("0xdf0Fb4e4F928d2dCB76f438575fDD8682386e13C"))
         );
+        // Hub majors that used to be Pyth-only now have Polygon CL proxies.
+        assert!(chainlink_feed(&crate::core::constants::DAI).is_some());
+        assert!(chainlink_feed(&crate::core::constants::LINK).is_some());
+        assert!(chainlink_feed(&crate::core::constants::AAVE).is_some());
     }
 
     #[test]
@@ -1609,7 +1621,12 @@ mod tests {
                 "SHIB",
             ),
             (
+                // GHST hub — must keep GHST/USD, not GNS/USD.
                 address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"),
+                "GHST",
+            ),
+            (
+                address!("0xE5417Af564e4bFDA1c483642db72007871397896"),
                 "GNS",
             ),
             (
@@ -1631,6 +1648,14 @@ mod tests {
                 "{label} missing configured oracle feed"
             );
         }
+        // GHST must not resolve to the Gains GNS Pyth id.
+        let ghst = address!("0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7");
+        let gns = address!("0xE5417Af564e4bFDA1c483642db72007871397896");
+        assert_ne!(
+            builtin_pyth_feed_id(&ghst),
+            builtin_pyth_feed_id(&gns),
+            "GHST and GNS must not share a Pyth feed id"
+        );
     }
 
     #[test]

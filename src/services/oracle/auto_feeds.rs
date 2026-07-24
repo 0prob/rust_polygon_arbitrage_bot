@@ -36,10 +36,19 @@ static PENDING: LazyLock<Mutex<FxHashSet<Address>>> =
     LazyLock::new(|| Mutex::new(FxHashSet::default()));
 static SCAN_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+/// Soft cap on persisted `no_feed` keys (live store hit 15k+ junk clones).
+const NO_FEED_SOFT_CAP: usize = 2_048;
+
 /// True when address is human-reviewed for a major-asset Pyth mapping.
 #[must_use]
 pub fn is_auto_feed_address_allowed(addr: Address) -> bool {
     if is_polygon_hub_token(addr) {
+        return true;
+    }
+    // Built-in TOKEN_FEEDS majors are already mapped; allow re-verify if needed.
+    if crate::services::oracle::price_oracle::builtin_pyth_feed_id(&addr).is_some()
+        || crate::services::oracle::price_oracle::builtin_chainlink_feed(&addr).is_some()
+    {
         return true;
     }
     CURATED_POLYGON_TOKEN_HINTS
@@ -74,12 +83,15 @@ pub fn default_auto_feeds_path() -> PathBuf {
 ///
 /// Drops persisted feeds for non-curated addresses (symbol-clone poison) and
 /// rewrites the store so a restart does not re-apply junk→major Pyth maps.
+/// Also un-blacklists curated/hub addresses that were no_feed'd by a prior
+/// verify miss (e.g. MATIC not warm) so they can be re-scanned.
 pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
     let path = default_auto_feeds_path();
     let store = load_store(&path).unwrap_or_default();
     let mut feeds_n = 0u32;
     let mut purged = 0u32;
     let no_n;
+    let unblocked;
     {
         let mut guard = STORE.lock();
         *guard = store;
@@ -110,6 +122,16 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
             keep.push(entry);
         }
         guard.feeds = keep;
+        // Curated/hub must not stay permanently no_feed (live: EURS/MAI blocked after
+        // verify without MATIC warm → never re-scanned).
+        let before_no = guard.no_feed.len();
+        guard.no_feed.retain(|s| {
+            s.parse::<Address>()
+                .map(|a| !is_auto_feed_address_allowed(a))
+                .unwrap_or(true)
+        });
+        unblocked = before_no.saturating_sub(guard.no_feed.len()) as u32;
+        trim_no_feed(&mut guard.no_feed);
         for entry in &guard.feeds {
             let Ok(addr) = entry.address.parse::<Address>() else {
                 continue;
@@ -122,14 +144,14 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
         }
         no_n = guard.no_feed.len() as u32;
     }
-    if purged > 0 {
+    if purged > 0 || unblocked > 0 {
         if let Err(e) = persist_store(&path) {
             crate::warn!("oracle auto-feeds: purge persist failed: {e}");
         }
     }
-    if feeds_n > 0 || no_n > 0 || purged > 0 {
+    if feeds_n > 0 || no_n > 0 || purged > 0 || unblocked > 0 {
         crate::info!(
-            "oracle auto-feeds: loaded feeds={feeds_n} purged={purged} no_feed={no_n} path={}",
+            "oracle auto-feeds: loaded feeds={feeds_n} purged={purged} unblocked_curated={unblocked} no_feed={no_n} path={}",
             path.display()
         );
     }
@@ -274,6 +296,15 @@ async fn run_auto_feed_batch(
                         r.symbol.as_deref().unwrap_or("?"),
                         feed_id
                     );
+                } else if is_auto_feed_address_allowed(r.address) {
+                    // Curated miss is usually MATIC/Hermes transient — retry, never permanent ban.
+                    PENDING.lock().insert(r.address);
+                    retry += 1;
+                    crate::info!(
+                        "oracle auto-feeds: verify failed curated {} ({}) — retry later",
+                        r.address,
+                        r.symbol.as_deref().unwrap_or("?")
+                    );
                 } else {
                     mark_no_feed(r.address);
                     marked += 1;
@@ -285,8 +316,14 @@ async fn run_auto_feed_batch(
                 }
             }
             UsdFeedScanStatus::NoUsd | UsdFeedScanStatus::NoSymbol => {
-                mark_no_feed(r.address);
-                marked += 1;
+                if is_auto_feed_address_allowed(r.address) {
+                    // Keep curated pending so a later Hermes catalog hit can register.
+                    PENDING.lock().insert(r.address);
+                    retry += 1;
+                } else {
+                    mark_no_feed(r.address);
+                    marked += 1;
+                }
             }
             UsdFeedScanStatus::Error => {
                 // Transient Hermes failure — retry later.
@@ -311,6 +348,9 @@ async fn try_register_verified(
     feed_id: &str,
     _symbol: Option<&str>,
 ) -> bool {
+    // Integer token/MATIC needs WMATIC raw in cache — warm MATIC first (live: curated
+    // EURS/MAI verify failed without this and were permanently no_feed'd).
+    let _ = oracle.get_matic_usd_offline().await;
     oracle.register_pyth_feed(token, feed_id.to_string());
     oracle
         .prefetch_token_usd_offline(std::slice::from_ref(&token))
@@ -329,17 +369,31 @@ async fn try_register_verified(
 }
 
 fn mark_no_feed(addr: Address) {
+    // Never permanent-ban curated/hub — leave room for retry scans.
+    if is_auto_feed_address_allowed(addr) {
+        return;
+    }
     let mut store = STORE.lock();
     let key = format!("{addr:#x}");
     if !store.no_feed.iter().any(|s| s.eq_ignore_ascii_case(&key)) {
         store.no_feed.push(key);
     }
+    trim_no_feed(&mut store.no_feed);
     store.feeds.retain(|e| {
         e.address
             .parse::<Address>()
             .map(|a| a != addr)
             .unwrap_or(true)
     });
+}
+
+fn trim_no_feed(no_feed: &mut Vec<String>) {
+    if no_feed.len() <= NO_FEED_SOFT_CAP {
+        return;
+    }
+    // Drop oldest excess (push-order ≈ scan order).
+    let drop_n = no_feed.len() - NO_FEED_SOFT_CAP;
+    no_feed.drain(0..drop_n);
 }
 
 fn persist_feed(addr: Address, feed_id: &str, symbol: &str) {
@@ -406,5 +460,35 @@ mod tests {
     #[test]
     fn hub_wmatic_allowed() {
         assert!(is_auto_feed_address_allowed(crate::core::constants::WMATIC));
+    }
+
+    #[test]
+    fn mark_no_feed_skips_curated_and_trims_cap() {
+        let curated = address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912");
+        // Clear and re-seed under lock for unit isolation.
+        {
+            let mut store = STORE.lock();
+            store.no_feed.clear();
+            store.feeds.clear();
+        }
+        mark_no_feed(curated);
+        assert!(
+            !STORE
+                .lock()
+                .no_feed
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&format!("{curated:#x}"))),
+            "curated must not enter no_feed"
+        );
+        let junk = address!("0x9cd6746665D9557e1B9a775819625711d0693439");
+        for i in 0..NO_FEED_SOFT_CAP + 50 {
+            let mut bytes = [0u8; 20];
+            bytes[16..].copy_from_slice(&(i as u32).to_be_bytes());
+            // Keep junk distinct from curated allow-list.
+            bytes[0] = 0x9c;
+            mark_no_feed(Address::from(bytes));
+        }
+        mark_no_feed(junk);
+        assert!(STORE.lock().no_feed.len() <= NO_FEED_SOFT_CAP);
     }
 }

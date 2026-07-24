@@ -36,7 +36,7 @@ use crate::services::execution::aave::{
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::profit::{
-    AssessmentGas, ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
+    ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
     route_profit_thresholds,
 };
 use crate::services::execution::rpc_errors::is_rpc_rate_limited;
@@ -1517,6 +1517,9 @@ fn reoptimize_capped(
         lookup: &route_gas,
         oracle: input.gas_oracle,
         fingerprint: input.route_fingerprint,
+        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(
+            &input.evaluated.cycle.edges,
+        ),
     };
     let opt = optimize_cycle(
         input.arena,
@@ -1551,10 +1554,12 @@ fn reoptimize_capped(
         hop_count: input.evaluated.cycle.edge_hops(),
         slippage_bps: input.slippage_bps,
         flash_source: source,
-        gas: AssessmentGas::Route {
-            oracle: input.gas_oracle,
-            route_fp: input.route_fingerprint,
-        },
+        gas: crate::services::execution::profit::assessment_gas_for_edges(
+            &input.evaluated.cycle.edges,
+            None,
+            input.gas_oracle,
+            input.route_fingerprint,
+        ),
         thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
@@ -1665,10 +1670,12 @@ fn reassess_route(
         hop_count: input.evaluated.cycle.edge_hops(),
         slippage_bps: input.slippage_bps,
         flash_source: source,
-        gas: AssessmentGas::Route {
-            oracle: input.gas_oracle,
-            route_fp: input.route_fingerprint,
-        },
+        gas: crate::services::execution::profit::assessment_gas_for_edges(
+            &input.evaluated.cycle.edges,
+            None,
+            input.gas_oracle,
+            input.route_fingerprint,
+        ),
         thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
@@ -1696,6 +1703,7 @@ fn reuse_or_reassess(
             input.gas_price,
             input.gas_oracle,
             input.route_fingerprint,
+            &input.evaluated.cycle.edges,
         )
     {
         return Some(existing.clone());
@@ -1721,11 +1729,17 @@ fn assessment_gas_matches(
     gas_price: U256,
     gas_oracle: &crate::services::execution::gas_oracle::GasOracle,
     route_fp: u64,
+    edges: &[crate::core::types::Edge],
 ) -> bool {
-    // Must use the same units as assess_route_from_sim (observed/scaled), not raw
+    // Must use the same units as assess_route_from_sim (observed/scaled/calibrated), not raw
     // hop sim gas. Raw match always failed once sim_scale>1× or route history hit
     // → forced reassess + extra CPU on every prepare (live: never reused HF pass).
-    let units = gas_oracle.route_gas_or_heuristic(route_fp, simulated_gas);
+    let units = crate::services::execution::profit::assessment_gas_units(
+        simulated_gas,
+        &crate::services::execution::profit::assessment_gas_for_edges(
+            edges, None, gas_oracle, route_fp,
+        ),
+    );
     match U256::from(units).checked_mul(gas_price) {
         Some(expected) => assessment.gas_cost_wei == expected,
         None => false,
@@ -1862,12 +1876,15 @@ mod tests {
                 .expect("test gas multiplication must not overflow"),
             assessment.gas_cost_wei
         );
+        // Non-Direct edges → observed/scaled path (not calibrated seed).
+        let edges: &[crate::core::types::Edge] = &[];
         assert!(assessment_gas_matches(
             &assessment,
             raw_sim,
             price,
             &oracle,
-            fp
+            fp,
+            edges,
         ));
         // Wrong fp falls back to heuristic (raw at scale 1×) → mismatch.
         assert!(!assessment_gas_matches(
@@ -1875,7 +1892,8 @@ mod tests {
             raw_sim,
             price,
             &oracle,
-            99
+            99,
+            edges,
         ));
     }
 

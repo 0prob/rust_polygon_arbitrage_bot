@@ -36,6 +36,22 @@ pub struct RouteGasCosting<'a> {
     pub lookup: &'a RouteGasLookup,
     pub oracle: &'a GasOracle,
     pub fingerprint: u64,
+    /// True for Direct `batchSwap` all-in seeds — skip global sim_scale uplift.
+    pub calibrated_seed: bool,
+}
+
+impl RouteGasCosting<'_> {
+    #[inline]
+    #[must_use]
+    pub fn resolve(self, simulated_gas: u32) -> u32 {
+        if self.calibrated_seed {
+            self.lookup
+                .route_gas_observed_or_seed(self.oracle, self.fingerprint, simulated_gas)
+        } else {
+            self.lookup
+                .route_gas_or_heuristic(self.oracle, self.fingerprint, simulated_gas)
+        }
+    }
 }
 use crate::services::oracle::{resolve_token_decimals_for_index, resolve_token_to_matic_rate};
 use crate::util::ten_pow_u256_cached;
@@ -912,11 +928,7 @@ pub fn optimize_cycle(
             }
             let mut seeded = *sim;
             if let Some(costing) = route_gas {
-                seeded.total_gas = costing.lookup.route_gas_or_heuristic(
-                    costing.oracle,
-                    costing.fingerprint,
-                    seeded.total_gas,
-                );
+                seeded.total_gas = costing.resolve(seeded.total_gas);
             }
             sim_cache.insert(*amount, seeded);
         }
@@ -967,11 +979,7 @@ pub fn optimize_cycle(
         match simulate_route_minimal_with_caps(arena, edges, amount, brent_shallow_caps.as_ref()) {
             Some(mut sim) => {
                 if let Some(costing) = route_gas {
-                    sim.total_gas = costing.lookup.route_gas_or_heuristic(
-                        costing.oracle,
-                        costing.fingerprint,
-                        sim.total_gas,
-                    );
+                    sim.total_gas = costing.resolve(sim.total_gas);
                 }
                 // Memoize before reject branches — zero-profit was ~95% of evals and
                 // was re-walked on every golden revisit / worker (route cache hit≈0).
@@ -1081,11 +1089,7 @@ pub fn optimize_cycle(
             simulate_route_minimal_with_caps(arena, edges, optimal, brent_shallow_caps.as_ref())
         })?;
     if let Some(costing) = route_gas {
-        sim.total_gas = costing.lookup.route_gas_or_heuristic(
-            costing.oracle,
-            costing.fingerprint,
-            sim.total_gas,
-        );
+        sim.total_gas = costing.resolve(sim.total_gas);
     }
     if sim.profit.is_zero() {
         record_brent_reject(BrentOptimizeReject::ZeroProfit);

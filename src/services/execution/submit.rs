@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn profit_tip_raises_priority_but_not_beyond_cap() {
         let oracle = GasOracle::default();
-        // Floor tip 30 gwei; large profit should lift tip but stay ≤ 200 gwei.
+        // Floor tip 25 gwei; large profit should lift tip but stay ≤ 200 gwei.
         oracle.set_fee_snapshot_for_test(FeeSnapshot {
             base_fee: U256::from(250_000_000_000u64),
             priority_fee: MIN_PRIORITY_FEE_PER_GAS,

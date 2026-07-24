@@ -148,39 +148,36 @@ pub fn on_chain_min_profit(token_profit: U256) -> Option<U256> {
 }
 
 /// Token-denominated net profit after slippage and flash fee (matches `assess_profit` basis).
+///
+/// `slippage_bps` is **route-level** (same as `assess_profit` / `effective_slippage_bps`) —
+/// already compounded for per-hop config and/or carrying full-route depth. Do not pass
+/// raw per-hop config expecting a hop re-compound (that double-cuts minProfit).
 #[must_use]
 pub fn modeled_net_profit_tokens(
     gross_profit: U256,
     amount_in: U256,
     slippage_bps: u64,
-    hop_count: u32,
     flash_source: FlashLoanSource,
 ) -> Option<U256> {
-    // Callers pass **per-hop** config bps (calldata minOut); compound for the route haircut.
-    let route_slippage = compound_slippage_bps(slippage_bps, hop_count);
     let amount_out = gross_profit.checked_add(amount_in)?;
-    let adjusted_out = slippage_adjusted(amount_out, route_slippage)?;
+    let adjusted_out = slippage_adjusted(amount_out, slippage_bps)?;
     let adjusted_gross = adjusted_out.saturating_sub(amount_in);
     let flash_fee = flash_loan_fee_amount(flash_source, amount_in)?;
     Some(adjusted_gross.saturating_sub(flash_fee))
 }
 
 /// On-chain `minProfit` aligned with off-chain modeled net (95% floor).
+///
+/// `slippage_bps` is route-level — see [`modeled_net_profit_tokens`]. Prefer
+/// [`on_chain_min_profit_from_assessment`] when an assessment already exists.
 #[must_use]
 pub fn on_chain_min_profit_for_route(
     gross_profit: U256,
     amount_in: U256,
     slippage_bps: u64,
-    hop_count: u32,
     flash_source: FlashLoanSource,
 ) -> Option<U256> {
-    let net = modeled_net_profit_tokens(
-        gross_profit,
-        amount_in,
-        slippage_bps,
-        hop_count,
-        flash_source,
-    )?;
+    let net = modeled_net_profit_tokens(gross_profit, amount_in, slippage_bps, flash_source)?;
     on_chain_min_profit(net)
 }
 
@@ -207,9 +204,9 @@ pub fn profit_priority_tip_per_gas(
 
 /// MATIC-wei **incremental** tip cost above the floor already priced into assess `gas_price_wei`.
 ///
-/// HF gas_price = base + [`crate::services::execution::MIN_PRIORITY_FEE_PER_GAS`] (30 gwei).
+/// HF gas_price = base + [`crate::services::execution::MIN_PRIORITY_FEE_PER_GAS`] (25 gwei).
 /// Submit bids `max(floor, profit_tip)`. Charging the full profit tip again double-counted
-/// the floor (live: +30 gwei × ~1M gas ≈ 0.03 MATIC phantom shortfall on every near-miss).
+/// the floor (live: +25 gwei × ~1M gas ≈ 0.025 MATIC phantom shortfall on every near-miss).
 #[must_use]
 pub fn profit_priority_uplift_wei(
     expected_profit_matic_wei: U256,
@@ -412,7 +409,7 @@ pub fn route_profit_thresholds(
 
 /// How to resolve simulated gas into assessment gas units (single source of truth).
 pub enum AssessmentGas<'a> {
-    /// HF eval: per-tick prefetch table, then oracle fallback.
+    /// HF eval: per-tick prefetch table, then oracle fallback (applies global sim_scale).
     TickRoute {
         lookup: &'a RouteGasLookup,
         oracle: &'a GasOracle,
@@ -420,6 +417,13 @@ pub enum AssessmentGas<'a> {
     },
     /// Dispatch / capped re-opt: direct oracle lookup by route fingerprint.
     Route {
+        oracle: &'a GasOracle,
+        route_fp: u64,
+    },
+    /// Live-calibrated all-in seed (Direct `batchSwap`) — observed or seed, no sim_scale.
+    /// Global scale is trained on mixed-route underestimates and must not re-inflate Direct.
+    CalibratedSeed {
+        lookup: Option<&'a RouteGasLookup>,
         oracle: &'a GasOracle,
         route_fp: u64,
     },
@@ -437,6 +441,41 @@ pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 
         AssessmentGas::Route { oracle, route_fp } => {
             oracle.route_gas_or_heuristic(*route_fp, simulated_gas)
         }
+        AssessmentGas::CalibratedSeed {
+            lookup,
+            oracle,
+            route_fp,
+        } => match lookup {
+            Some(lookup) => {
+                lookup.route_gas_observed_or_seed(oracle, *route_fp, simulated_gas)
+            }
+            None => oracle.route_gas_observed_or_seed(*route_fp, simulated_gas),
+        },
+    }
+}
+
+/// HF/dispatch gas resolution: Direct `batchSwap` seeds skip global sim_scale.
+#[must_use]
+pub fn assessment_gas_for_edges<'a>(
+    edges: &[crate::core::types::Edge],
+    lookup: Option<&'a RouteGasLookup>,
+    oracle: &'a GasOracle,
+    route_fp: u64,
+) -> AssessmentGas<'a> {
+    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+        AssessmentGas::CalibratedSeed {
+            lookup,
+            oracle,
+            route_fp,
+        }
+    } else if let Some(lookup) = lookup {
+        AssessmentGas::TickRoute {
+            lookup,
+            oracle,
+            route_fp,
+        }
+    } else {
+        AssessmentGas::Route { oracle, route_fp }
     }
 }
 
@@ -765,8 +804,9 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
     } else if gate_net_matic.is_zero() || gate_net_tokens.is_zero() {
         Some("non-positive net profit after gas".into())
     } else if !meets_safety_ratio {
+        // Safety compares pre-tip net; tip is charged only on the absolute min gate.
         Some(format!(
-            "net profit {gate_net_matic} MATIC wei below safety floor {required_net_matic} (incl priority uplift {priority_uplift})"
+            "net profit {net_profit_after_gas_matic_wei} MATIC wei below safety floor {required_net_matic} (priority uplift {priority_uplift} not in safety floor)"
         ))
     } else if !meets_absolute_min {
         Some("below min profit threshold".into())
@@ -874,7 +914,6 @@ mod safety_tests {
                 U256::from(10u8),
                 U256::from(100u8),
                 10_000,
-                1,
                 FlashLoanSource::Balancer,
             )
             .is_none()
@@ -907,15 +946,14 @@ mod safety_tests {
                 gross,
                 amount_in,
                 slippage_bps,
-                1,
                 FlashLoanSource::Balancer
             ),
             on_chain_min_profit_from_assessment(&assessment)
         );
     }
 
-    /// Depth-inflated route slip is already route-level on assessment; re-compounding
-    /// per-hop config would set a higher minProfit than assess_profit modeled.
+    /// Depth-inflated route slip is already route-level on assessment; `on_chain_min_profit_for_route`
+    /// must apply the same bps once (no hop re-compound), matching assess net.
     #[test]
     fn on_chain_min_profit_from_assessment_respects_route_level_depth_slip() {
         let gross = U256::from(1_000_000u64);
@@ -942,21 +980,29 @@ mod safety_tests {
         assert!(assessment.net_profit > U256::ZERO);
         let from_assessment =
             on_chain_min_profit_from_assessment(&assessment).expect("assessment min profit");
-        // Wrong path: treat base 50 as per-hop and compound (ignores depth 500).
-        let from_per_hop =
-            on_chain_min_profit_for_route(gross, amount_in, 50, 3, FlashLoanSource::Balancer)
-                .expect("per-hop min profit");
-        // Assessment uses higher slip → lower net → lower minProfit (matches on-chain reality).
+        // Same route-level slip via for_route — hop_count ignored, must match assessment.
+        let from_route = on_chain_min_profit_for_route(
+            gross,
+            amount_in,
+            route_level_slip,
+            FlashLoanSource::Balancer,
+        )
+        .expect("route min profit");
+        assert_eq!(from_assessment, from_route);
+        // Under-applying only config 50 (no depth) would set a higher minProfit floor.
+        let from_config_only =
+            on_chain_min_profit_for_route(gross, amount_in, 50, FlashLoanSource::Balancer)
+                .expect("config-only min profit");
         assert!(
-            from_assessment < from_per_hop,
-            "assessment minProfit {from_assessment} should be < per-hop rebuild {from_per_hop}"
+            from_assessment < from_config_only,
+            "assessment minProfit {from_assessment} should be < config-only {from_config_only}"
         );
     }
 
     #[test]
     fn priority_uplift_above_floor_reduces_reported_net() {
         let mut i = input();
-        // Large gross so profit tip per gas exceeds 30 gwei floor → incremental uplift > 0.
+        // Large gross so profit tip per gas exceeds 25 gwei floor → incremental uplift > 0.
         i.gross_profit = U256::from(5u128 * 10u128.pow(17)); // 0.5 MATIC gross
         i.amount_in = U256::from(5u128 * 10u128.pow(17));
         i.gas_units = 100_000;
@@ -991,7 +1037,7 @@ mod safety_tests {
 
     #[test]
     fn priority_uplift_zero_when_tip_at_or_below_floor() {
-        // 0.01 MATIC × 10% / 1e6 gas = 1 gwei tip << 30 gwei floor → incremental 0.
+        // 0.01 MATIC × 10% / 1e6 gas = 1 gwei tip << 25 gwei floor → incremental 0.
         let uplift = profit_priority_uplift_wei(U256::from(10u128.pow(16)), 1_000, 1_000_000);
         assert!(uplift.is_zero());
         let tip = profit_priority_tip_per_gas(U256::from(10u128.pow(16)), 1_000, 1_000_000);
@@ -1212,6 +1258,34 @@ mod safety_tests {
     }
 
     #[test]
+    fn calibrated_seed_assessment_skips_sim_scale() {
+        use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
+
+        let oracle = crate::services::execution::gas_oracle::GasOracle::default();
+        oracle.record_sim_observed(100_000, 150_000); // → 1.125×
+        let bal_edge = Edge {
+            pool_index: PoolIndex(0),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            fee_bps: 30,
+            zero_for_one: true,
+            protocol: ProtocolType::BalancerV2,
+        };
+        let edges = [bal_edge, bal_edge];
+        let gas = assessment_gas_for_edges(&edges, None, &oracle, 1);
+        assert_eq!(assessment_gas_units(220_000, &gas), 220_000);
+        // Mixed (V2) still takes global scale.
+        let v2 = Edge {
+            protocol: ProtocolType::UniswapV2,
+            ..bal_edge
+        };
+        let mixed = assessment_gas_for_edges(&[v2, v2], None, &oracle, 2);
+        assert_eq!(assessment_gas_units(200_000, &mixed), 225_000);
+    }
+
+    #[test]
     fn route_and_tick_route_gas_match_for_single_fingerprint() {
         let oracle = crate::services::execution::gas_oracle::GasOracle::default();
         oracle.record_route_gas(0xABCD, 250_000);
@@ -1234,8 +1308,9 @@ mod safety_tests {
     #[test]
     fn scaled_heuristic_gas_matches_oracle_route_lookup() {
         let oracle = crate::services::execution::gas_oracle::GasOracle::default();
+        // Mild 1.5× underestimates (2×+ is ignored as global outlier).
         for _ in 0..8 {
-            oracle.record_sim_observed(100_000, 200_000);
+            oracle.record_sim_observed(100_000, 150_000);
         }
         let lookup = RouteGasLookup::for_fingerprints(&oracle, [0xBEEF]);
         let tick = AssessmentGas::TickRoute {
@@ -1268,7 +1343,7 @@ mod proptests {
         ) {
             let gross = U256::from(gross);
             let amount_in = U256::from(amount_in);
-            let modeled = modeled_net_profit_tokens(gross, amount_in, slippage, 1, FlashLoanSource::Balancer);
+            let modeled = modeled_net_profit_tokens(gross, amount_in, slippage, FlashLoanSource::Balancer);
             let assessment = assess_profit(&AssessProfitInput {
                 gross_profit: gross,
                 amount_in,

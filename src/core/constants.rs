@@ -190,12 +190,28 @@ pub const GAS_V3_BASE: u32 = 155_000;
 pub const GAS_V4_BASE: u32 = 170_000;
 pub const GAS_CURVE_HOP: u32 = 250_000;
 /// Per-hop seed for mixed/Aave-flash Balancer vault swaps (each hop is a separate call).
-/// parity5 dry-run Aave+BAL×2+Woofi: sim 2.41M vs gas_used 942k — 1M/hop was ~2.5× hot.
-pub const GAS_BALANCER_HOP: u32 = 420_000;
+/// parity5 dry-run Aave+BAL×2+Woofi: gas_used 942k → ~315k/BAL after overhead/Woofi.
+/// 420k was still ~1.33× hot and stacked badly with sim_scale on mixed near-misses.
+pub const GAS_BALANCER_HOP: u32 = 340_000;
 /// All-in gas for Direct vault `batchSwap` (`executeArbDirect`, ≤4 hops → one call).
 /// Not passed through per-edge ROUTE_EXECUTION_* overhead (that double-counted hops).
-/// Live Direct BAL×3 ~244k; 300k ≈ 1.23× (safety assess). Tx gas_limit still has buffer_gas_limit.
-pub const GAS_BALANCER_DIRECT_BATCH: u32 = 300_000;
+/// Prefer [`balancer_direct_batch_gas`] (hop-scaled). This constant is the 2-hop seed
+/// used by tests / callers that do not know hop count.
+/// Live Direct BAL×2 ~200–220k; flat 300k killed near-miss edges (net 0.054 vs floor 0.083).
+pub const GAS_BALANCER_DIRECT_BATCH: u32 = 220_000;
+
+/// Hop-scaled Direct `batchSwap` gas seed for assess/rank (tx limit still buffers).
+/// Live: BAL×2 ~200–220k, BAL×3 ~244k. Prior flat 300k overstated 2-hop by ~1.4×.
+#[inline]
+#[must_use]
+pub const fn balancer_direct_batch_gas(hop_count: usize) -> u32 {
+    match hop_count {
+        0 | 1 => 180_000,
+        2 => 220_000,
+        3 => 250_000,
+        _ => 280_000, // 4-hop Direct cap
+    }
+}
 pub const GAS_DODO_HOP: u32 = 180_000;
 pub const GAS_WOOFI_HOP: u32 = 150_000;
 /// Per-tick-crossed gas increment for V3/V4 pools (~15–20k on-chain; 28k was loose).

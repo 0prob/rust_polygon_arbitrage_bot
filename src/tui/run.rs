@@ -40,6 +40,7 @@ where
     let mut terminal = TerminalGuard::enter().context("failed to initialize terminal")?;
 
     let mut app = App::new();
+    app.executor_address = ctx.config.execution.executor_address;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let pass_handle = tokio::spawn(run_pass_loop(Arc::clone(&ctx), shutdown_rx));

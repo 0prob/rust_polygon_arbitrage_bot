@@ -212,8 +212,8 @@ fn build_reverse_hops(
 /// `alt` keeps one second-choice **same-depth** first hop (dual-DEX sanity / rescue).
 ///
 /// Longer detours are intentionally excluded: comparing a 1-hop liquid path to a 2-hop
-/// via an intermediate (live: WETH→WMATIC vs WETH→DAI→WMATIC) yields >>2% dual_reject
-/// even when the primary rate is fine.
+/// via an intermediate (live: WETH→WMATIC vs WETH→DAI→WMATIC) yields >> dual-diverge
+/// threshold even when the primary rate is fine.
 fn reverse_bfs_parents(
     rev: &[Vec<RevHop>],
     wmatic: TokenIndex,
@@ -364,53 +364,57 @@ pub fn hub_path_matic_rates_batch(
             .as_deref()
             .and_then(|p| matic_rate_from_probe_sim_with_decimals(arena, token, p, token_decimals));
         match (primary, alt_rate) {
-            (Some(a), Some(b)) if rates_diverge_bps(a, b) > HUB_DUAL_PATH_MAX_DIVERGE_BPS => {
-                // ponytail: >2% across two first hops → skip (flash / thin-pool risk).
-                dual_reject += 1;
-                if dual_samples.len() < 3 {
-                    let primary_first = path.first().and_then(|edge| {
-                        arena
-                            .pool_address(edge.pool_index)
-                            .map(|pool| (pool, edge.protocol))
-                    });
-                    let alt_first = alt_path.as_deref().and_then(|p| {
-                        p.first().and_then(|edge| {
+            (Some(a), Some(b)) => {
+                let diverge = rates_diverge_bps(a, b);
+                // Live: 2% dual_reject dropped ~40% of hub prices (12–19% DEX basis on
+                // V3 vs Balancer first hops is normal; only poison ~10× legs need fail-closed).
+                if diverge > HUB_DUAL_PATH_MAX_DIVERGE_BPS {
+                    dual_reject += 1;
+                    if dual_samples.len() < 3 {
+                        let primary_first = path.first().and_then(|edge| {
                             arena
                                 .pool_address(edge.pool_index)
                                 .map(|pool| (pool, edge.protocol))
-                        })
-                    });
-                    let describe_path = |edges: &[Edge]| {
-                        edges
-                            .iter()
-                            .map(|edge| {
-                                format!(
-                                    "{:?}:{} {}>{} zf1={}",
-                                    edge.protocol,
-                                    arena.pool_address(edge.pool_index).unwrap_or_default(),
-                                    arena.token_address(edge.token_in).unwrap_or_default(),
-                                    arena.token_address(edge.token_out).unwrap_or_default(),
-                                    edge.zero_for_one,
-                                )
+                        });
+                        let alt_first = alt_path.as_deref().and_then(|p| {
+                            p.first().and_then(|edge| {
+                                arena
+                                    .pool_address(edge.pool_index)
+                                    .map(|pool| (pool, edge.protocol))
                             })
-                            .collect::<Vec<_>>()
-                    };
-                    dual_samples.push(format!(
-                        "token={} bps={} primary={:?}@{:?} alt={:?}@{:?} rates={a}/{b} paths={:?}/{:?}",
-                        arena.token_address(token).unwrap_or_default(),
-                        rates_diverge_bps(a, b),
-                        primary_first.map(|(_, protocol)| protocol),
-                        primary_first.map(|(pool, _)| pool),
-                        alt_first.map(|(_, protocol)| protocol),
-                        alt_first.map(|(pool, _)| pool),
-                        describe_path(&path),
-                        alt_path.as_deref().map(describe_path),
-                    ));
+                        });
+                        let describe_path = |edges: &[Edge]| {
+                            edges
+                                .iter()
+                                .map(|edge| {
+                                    format!(
+                                        "{:?}:{} {}>{} zf1={}",
+                                        edge.protocol,
+                                        arena.pool_address(edge.pool_index).unwrap_or_default(),
+                                        arena.token_address(edge.token_in).unwrap_or_default(),
+                                        arena.token_address(edge.token_out).unwrap_or_default(),
+                                        edge.zero_for_one,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        dual_samples.push(format!(
+                            "token={} bps={} primary={:?}@{:?} alt={:?}@{:?} rates={a}/{b} paths={:?}/{:?}",
+                            arena.token_address(token).unwrap_or_default(),
+                            diverge,
+                            primary_first.map(|(_, protocol)| protocol),
+                            primary_first.map(|(pool, _)| pool),
+                            alt_first.map(|(_, protocol)| protocol),
+                            alt_first.map(|(pool, _)| pool),
+                            describe_path(&path),
+                            alt_path.as_deref().map(describe_path),
+                        ));
+                    }
+                } else {
+                    // Conservative: thinner first hop (lower MATIC/token) for gas/profit.
+                    out.insert(token, a.min(b));
+                    priced += 1;
                 }
-            }
-            (Some(a), Some(b)) => {
-                out.insert(token, a.min(b));
-                priced += 1;
             }
             (Some(a), None) => {
                 out.insert(token, a);
@@ -441,8 +445,10 @@ pub fn hub_path_matic_rates_batch(
     out
 }
 
-/// Max relative divergence (bps) between shortest and alt first-hop rates.
-const HUB_DUAL_PATH_MAX_DIVERGE_BPS: u64 = 200;
+/// Max relative divergence (bps) between same-depth first-hop rates before hard reject.
+/// 20%: live V3 vs Balancer hub legs routinely sit 10–19% apart; 2% (old) dual_rejected
+/// ~40% of need=53 batches. Poison 10× legs still land >>2000 bps.
+const HUB_DUAL_PATH_MAX_DIVERGE_BPS: u64 = 2_000;
 
 #[cfg(test)]
 mod tests {
@@ -675,7 +681,7 @@ mod tests {
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 1,
         }));
-        // Skewed mid leg so 2-hop rate diverges well past HUB_DUAL_PATH_MAX_DIVERGE_BPS.
+        // Skewed mid leg so a 2-hop detour would diverge hard if it were treated as alt.
         let skew = Arc::new(PoolState::V2(V2PoolState {
             reserve0: deep,
             reserve1: deep / U256::from(10u64),
@@ -710,7 +716,7 @@ mod tests {
         );
     }
 
-    /// Two same-depth direct pools that disagree hard → still dual-reject (fail closed).
+    /// Two same-depth direct pools that disagree hard (~10×) → dual-reject (fail closed).
     #[test]
     fn same_depth_divergent_first_hops_dual_reject() {
         let mut arena = StateArena::default();
@@ -724,7 +730,7 @@ mod tests {
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 1,
         }));
-        // ~10× skew → >>200 bps vs fair pool.
+        // ~10× skew → >> HUB_DUAL_PATH_MAX_DIVERGE_BPS vs fair pool.
         let bad = Arc::new(PoolState::V2(V2PoolState {
             reserve0: deep,
             reserve1: deep / U256::from(10u64),
@@ -749,7 +755,55 @@ mod tests {
         );
         assert!(
             !rates.contains_key(&spoke),
-            "same-depth divergent first hops must dual-reject"
+            "same-depth poison first hops must dual-reject"
+        );
+    }
+
+    /// Moderate same-depth basis (~15%) prices via min — live duals sit here often.
+    #[test]
+    fn same_depth_moderate_basis_uses_min_rate() {
+        let mut arena = StateArena::default();
+        let wmatic = arena.register_token(WMATIC);
+        let spoke = arena.register_token(Address::from([0x44u8; 20]));
+        let deep = crate::pipeline::spot_price::spot_probe_for_decimals(18) * U256::from(10_000u64);
+        let fair = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep,
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        // ~1.15× reserve skew → ~13% rate basis (under 2000 bps, over old 200).
+        let mild = Arc::new(PoolState::V2(V2PoolState {
+            reserve0: deep,
+            reserve1: deep * U256::from(115u64) / U256::from(100u64),
+            fee: U256::from(9970u64),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 1,
+        }));
+        let p1 = arena.register_pool(Address::from([0xf1u8; 20]), fair);
+        let p2 = arena.register_pool(Address::from([0xf2u8; 20]), mild);
+        let metas = [
+            pool_meta_from_pair(p1, ProtocolType::UniswapV2, wmatic, spoke, 30),
+            pool_meta_from_pair(p2, ProtocolType::UniswapV2, wmatic, spoke, 30),
+        ];
+        let graph = build_graph(&arena, &metas);
+        let rates = hub_path_matic_rates_batch(
+            &arena,
+            &graph,
+            &[spoke],
+            HubPathRateParams::default(),
+            None,
+            Some(&metas),
+        );
+        let rate = rates
+            .get(&spoke)
+            .copied()
+            .expect("moderate dual basis must still price");
+        // min of fair(~1e18) and mild(~0.87e18) → conservative side of fair.
+        assert!(
+            rate > U256::from(8u128 * 10u128.pow(17)) && rate < U256::from(11u128 * 10u128.pow(17)),
+            "expected ~0.85–1.0e18 min rate, got {rate}"
         );
     }
 }
