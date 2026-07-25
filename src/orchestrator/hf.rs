@@ -166,7 +166,9 @@ const HF_FLASH_PREFETCH_BUDGET_MS: u64 = 800;
 /// `HF_PREFETCH_BUDGET_MS` (2.5s) waiting for dust tokens while WMATIC was fresh.
 const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
 /// Stream path already has WSS state — don't spend the full prep budget on flash.
-const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(400);
+/// 400ms left hubs cold under Alchemy multicall (live: timeout stale=10 fresh=10);
+/// 700ms covers a full hub batch without eating the tick wall.
+const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(700);
 /// Skip probe-tick hydrate when residual prep cannot finish one pool.
 /// Must match `HF_PROBE_TICK_MS_PER_POOL` (250ms).
 const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(250);
@@ -174,6 +176,9 @@ const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(250);
 const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(1_500);
 /// Stream HF can fire every ~100–200ms; TickLens hydrate must not.
 const PROBE_HYDRATE_MIN_GAP_MS: u64 = 1_500;
+/// Last successful probe-tick hydrate attempt (ms). Module-level so prep can skip
+/// carving hydrate budget when the gap gate will no-op (was starving pool/flash).
+static LAST_PROBE_HYDRATE_MS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn prep_remaining(deadline: Instant) -> Duration {
@@ -1756,10 +1761,21 @@ pub async fn run_hf_tick(
     let state_cache = Arc::clone(&ctx.cache);
     // Residual prep budget for pool/flash (shared deadline — no stage stacking).
     let stage_budget = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
+    // Only carve hydrate when the 1.5s gap will allow it. Live: every HF tick
+    // reserved up to 1.5s hydrate floor then skipped on gap → pool/flash starved
+    // and residual 0 for the rare tick that *could* hydrate.
+    let hydrate_gap_will_allow = {
+        let last = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
+        now_ms().saturating_sub(last) >= PROBE_HYDRATE_MIN_GAP_MS
+    };
     // Reserve hydrate floor from *both* pool and flash. Live: pool_budget used the
     // full stage (flash alone reserved 1.4s) → residual 0 after a 1.3s multicall →
     // hydrate skipped → cl_tickless/shallow_cl emptied probe_kept.
-    let (work_budget, hydrate_reserved) = reserve_hydrate_budget(stage_budget);
+    let (work_budget, hydrate_reserved) = if hydrate_gap_will_allow {
+        reserve_hydrate_budget(stage_budget)
+    } else {
+        (stage_budget, Duration::ZERO)
+    };
     // Preserve the carved floor as an absolute budget — do not re-derive from
     // prep_deadline residual later (oracle/reselect ate it → hydrate never ran).
     let hydrate_floor = hydrate_reserved;
@@ -2028,7 +2044,6 @@ pub async fn run_hf_tick(
     let probe_tick_started = now_ms();
     let probe_pool_cap =
         crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(probe_tick_budget);
-    static LAST_PROBE_HYDRATE_MS: AtomicU64 = AtomicU64::new(0);
     static HYDRATE_INFO_LOG_AT: AtomicU64 = AtomicU64::new(0);
     static HYDRATE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
     let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);

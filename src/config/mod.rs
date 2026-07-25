@@ -895,20 +895,25 @@ impl AppConfig {
     }
 
     /// Ordered state-read endpoints used for multicall pool refresh (matches [`RpcPool`]).
-    /// Never includes [`RpcConfig::execution_rpc_url`] so execution quota is not spent on multicall.
+    ///
+    /// Explicit [`RpcConfig::state_rpc_url`] is always first (even when it equals
+    /// `EXECUTION_RPC` — operators often share one Alchemy key). Other list entries
+    /// that merely duplicate `EXECUTION_RPC` are still skipped so an unscoped
+    /// `POLYGON_RPC_URLS` dump does not burn execution quota by accident.
+    /// [`Self::warn_suboptimal`] still flags shared-quota setups.
     #[must_use]
     pub fn state_read_urls(&self) -> Vec<String> {
         let exec = self.rpc.execution_rpc_url.trim();
         let mut urls = Vec::with_capacity(1 + self.rpc.polygon_rpc_urls.len());
-        if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty())
-            && (exec.is_empty() || url != exec)
-        {
+        if let Some(url) = self.rpc.state_rpc_url.as_deref().filter(|u| !u.is_empty()) {
             urls.push(url.to_string());
         }
         for url in &self.rpc.polygon_rpc_urls {
             if url.is_empty() || urls.iter().any(|u| u == url) {
                 continue;
             }
+            // Skip bare execution URL from the poly list only when it was not
+            // also set as the explicit state endpoint (already pushed above).
             if !exec.is_empty() && url.as_str() == exec {
                 continue;
             }
@@ -1065,6 +1070,25 @@ mod tests {
             vec![
                 "https://state.example".to_string(),
                 "https://poly.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn state_read_urls_keeps_explicit_state_even_when_equal_to_execution() {
+        // Free public endpoints rate-limit TickLens; operators share one Alchemy key.
+        let mut config = AppConfig::default();
+        config.rpc.execution_rpc_url = "https://alchemy.example/v2/key".into();
+        config.rpc.state_rpc_url = Some("https://alchemy.example/v2/key".into());
+        config.rpc.polygon_rpc_urls = vec![
+            "https://alchemy.example/v2/key".into(),
+            "https://publicnode.example".into(),
+        ];
+        assert_eq!(
+            config.state_read_urls(),
+            vec![
+                "https://alchemy.example/v2/key".to_string(),
+                "https://publicnode.example".to_string(),
             ]
         );
     }

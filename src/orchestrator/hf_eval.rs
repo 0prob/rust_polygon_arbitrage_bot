@@ -725,7 +725,24 @@ fn rank_one_cycle_probe(
             // Prefer absolute MATIC cover over brent shortfall so low-gas dust
             // (tiny gross, cheap gas) does not crowd out larger-edge near-misses.
             let cover_matic = cover_matic_from_sim(&ranked_probe, probe_amount, &ctx);
-            out.near_net.push((fp, cover_matic, cycle.into_owned()));
+            let economic_floor = min_economic_amount_in(start_decimals, rate);
+            // Tickless/micro phantoms only "profit" below the economic floor; Brent
+            // then pins at floor with zero sim profit (live: same fps ×10k/hour).
+            // Economic-sized underwater edges still go to near_net so Brent can
+            // size up (deep pool, thin probe ROI is not a dust reject).
+            if probe_amount < economic_floor {
+                let n = cycle.edges.len();
+                if n > 0 {
+                    let mut rotated =
+                        crate::core::types::CycleEdges::from_slice(&cycle.edges);
+                    for _ in 0..n {
+                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
+                        rotated.rotate_left(1);
+                    }
+                }
+            } else {
+                out.near_net.push((fp, cover_matic, cycle.into_owned()));
+            }
         }
         out.skip.net = 1;
         if probe.profit.is_zero() {
@@ -866,8 +883,17 @@ pub fn rank_cycles_by_probe_net(
                 b.1.cmp(&a.1)
                     .then_with(|| compare_cycle_execution(&a.2, &b.2))
             });
+            // When nothing clears gas yet, only a few best near-misses deserve Brent.
+            // Filling max_keep with underwater dust starved real stream/active routes
+            // (live: probe_kept=15 skip_net=12 near_net=12 had_net=false every tick).
+            let near_net_slots = if had_net_ranked {
+                max_keep
+            } else {
+                max_keep.min(4).max(1)
+            };
+            let mut near_net_kept = 0usize;
             for (fp, _, cycle) in near_net.drain(..) {
-                if kept.len() >= max_keep {
+                if kept.len() >= max_keep || near_net_kept >= near_net_slots {
                     break;
                 }
                 if seen.insert(fp)
@@ -882,6 +908,7 @@ pub fn rank_cycles_by_probe_net(
                     )
                 {
                     kept.push((fp, cycle));
+                    near_net_kept += 1;
                 }
             }
         }
@@ -895,6 +922,14 @@ pub fn rank_cycles_by_probe_net(
             }
         }
         if kept.len() < max_keep {
+            // Without any gas-clearing probe, cap total admissions so score-fallback
+            // cannot re-flood Brent with the same underwater dust (live: kept=34 of
+            // 35 with near_net_slots=4 then fallback filled the rest).
+            let total_cap = if had_net_ranked {
+                max_keep
+            } else {
+                max_keep.min(6).max(kept.len().max(1))
+            };
             let fallback = simulatable_score_fallback(
                 &scanned,
                 arena,
@@ -902,10 +937,10 @@ pub fn rank_cycles_by_probe_net(
                 token_to_matic_rates,
                 flash_liquidity,
                 flash_policy,
-                max_keep,
+                total_cap,
             );
             for cycle in fallback {
-                if kept.len() >= max_keep {
+                if kept.len() >= total_cap {
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
@@ -919,6 +954,13 @@ pub fn rank_cycles_by_probe_net(
                 let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
                 match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
                     Ok((amount, sim)) if !sim.profit.is_zero() => {
+                        let economic_floor = min_economic_amount_in(start_decimals, rate);
+                        // Same dust reject as near_net — below-floor seeds only feed
+                        // AmountBelowEconomicFloor / zero-at-floor Brent loops.
+                        if amount < economic_floor {
+                            seen.remove(&fp);
+                            continue;
+                        }
                         probe_seeds.insert(fp, (amount, sim));
                         kept.push((fp, cycle));
                     }
