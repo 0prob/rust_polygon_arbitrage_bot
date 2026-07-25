@@ -12,7 +12,6 @@ use crate::config::WalletSecrets;
 use crate::core::constants::BPS_SCALE;
 use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 use crate::core::types::{Edge, FlashLoanSource, FoundCycle, ProtocolType};
-use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
@@ -55,7 +54,6 @@ pub struct HfContext {
     pub price_oracle: Arc<PriceOracle>,
     pub wallet: Arc<WalletSecrets>,
     pub rpc: Arc<RpcPool>,
-    pub hypersync: Option<Arc<HyperSyncService>>,
     pub shutdown: watch::Receiver<bool>,
     pub ui_hook: SharedUiHook,
     pub inactive_rotation: Mutex<InactiveCycleRotation>,

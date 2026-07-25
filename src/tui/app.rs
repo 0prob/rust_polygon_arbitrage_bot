@@ -141,7 +141,6 @@ pub struct GraphHealth {
     pub top_out_degree: usize,
     pub protocol_count: usize,
     pub indexer_lag_blocks: u64,
-    pub hypersync_height: Option<u64>,
     pub stale_indexer: bool,
 }
 
@@ -976,7 +975,6 @@ mod tests {
                     top_out_degree: 0,
                     protocol_count: 0,
                     indexer_lag_blocks: 0,
-                    hypersync_height: None,
                     stale_indexer: false,
                 },
                 protocol_counts: Vec::new(),

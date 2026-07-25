@@ -18,7 +18,6 @@ use tokio::sync::watch;
 use crate::config::AppConfig;
 use crate::config::WalletSecrets;
 use crate::core::types::FlashLoanSource;
-use crate::infra::hypersync::HyperSyncService;
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::services::execution::candidate::CandidateExecution;
@@ -1011,7 +1010,6 @@ impl ExecutionService {
         state_cache: &StateCache,
         expected_state_block: u64,
         expected_state_hash: Option<alloy::primitives::B256>,
-        hypersync: Option<&HyperSyncService>,
         ui_hook: Option<&SharedUiHook>,
         shutdown: Option<&watch::Receiver<bool>>,
         _metrics: Option<&()>,
@@ -1744,7 +1742,7 @@ impl ExecutionService {
         let tx_hash_str = tx_hash.to_string();
 
         let poll_outcome = poller
-            .wait_with_hypersync(sim_provider, tx_hash, hypersync, shutdown)
+            .wait(sim_provider, tx_hash, shutdown)
             .await;
         let Some(receipt) = (match poll_outcome {
             ReceiptPollOutcome::Received(receipt) => Some(receipt),
@@ -1814,7 +1812,6 @@ impl ExecutionService {
                             config,
                             operator,
                             private_cfg.as_ref(),
-                            hypersync,
                             shutdown,
                         )
                         .await;
@@ -1868,7 +1865,6 @@ impl ExecutionService {
             config,
             operator,
             private_cfg.as_ref(),
-            hypersync,
             shutdown,
         )
         .await
@@ -1892,7 +1888,6 @@ impl ExecutionService {
         config: &AppConfig,
         operator: Address,
         private: Option<&PrivateSubmitConfig>,
-        hypersync: Option<&HyperSyncService>,
         shutdown: Option<&watch::Receiver<bool>>,
     ) -> ExecutionOutcome {
         let outcome = self.finalize_receipt(
@@ -1919,7 +1914,6 @@ impl ExecutionService {
                 candidate,
                 operator,
                 private,
-                hypersync,
                 shutdown,
             )
             .await

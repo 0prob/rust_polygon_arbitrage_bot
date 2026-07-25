@@ -233,22 +233,14 @@ async fn build_ui_snapshot(
             snap.arena.clone()
         };
 
-    let hypersync_height = ctx.hypersync.as_ref().and_then(|hs| hs.latest_height());
     let graph = graph_snapshot_for_poll(
         route_cache,
         &snap,
-        hypersync_height,
         ctx.refresh.indexer_lag_blocks(),
         ctx.refresh.is_indexer_stale(),
     );
 
-    let diagnostics = build_diagnostics(
-        &ctx.config,
-        &ctx.refresh,
-        gas_gwei,
-        matic_usd,
-        hypersync_height,
-    );
+    let diagnostics = build_diagnostics(&ctx.config, &ctx.refresh, gas_gwei, matic_usd);
     let config_rows = build_config_rows(&ctx.config);
 
     let execution_trades = ctx
@@ -270,7 +262,6 @@ async fn build_ui_snapshot(
         execution_losses,
         daily_pnl_wei,
         gas_gwei,
-        hypersync_height,
         matic_usd,
         portfolio_rows: Arc::clone(&portfolio_rows),
         diagnostics,

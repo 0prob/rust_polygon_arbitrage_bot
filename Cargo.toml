@@ -18,19 +18,14 @@ path = "src/bin/tui.rs"
 required-features = ["tui"]
 
 [features]
-# Headless production path. `hypersync` is on by default (receipt/height acceleration).
-# Drop it for faster compiles: `cargo build --no-default-features` (skips arrow/parquet).
-# Optional TUI: `--features tui` (or `--no-default-features --features tui`).
-default = ["hypersync"]
-hypersync = ["dep:hypersync-client"]
+# Optional TUI: `--features tui`.
+default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:libc"]
 
 [dependencies]
 # Defaults already include essentials + `reqwest`/`reqwest-rustls-tls` (alloy feature
 # names; those map to reqwest's `rustls`). Add only WS/pubsub.
 alloy = { version = "2.2.0", features = ["pubsub", "provider-ws"] }
-# Optional: pulls arrow + parquet (~minutes of release compile). Feature `hypersync`.
-hypersync-client = { version = "1.4.0", optional = true }
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
 dashmap = "6.2.1"
@@ -55,6 +50,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "
 tokio-postgres = "0.7.18"
 # Statement-cached pool for tokio-postgres; Runtime::Tokio1 + Verified recycle in infra::pg.
 deadpool-postgres = "0.14.1"
+
 [dev-dependencies]
 figment = { version = "0.10", features = ["test"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

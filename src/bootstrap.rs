@@ -3,7 +3,6 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use crate::config::{AppConfig, WalletSecrets};
-use crate::infra::hypersync::{HyperSyncService, try_from_env};
 use crate::orchestrator::{RuntimeContext, SharedUiHook};
 use crate::services::state_refresh::StateRefreshService;
 
@@ -78,36 +77,20 @@ pub fn spawn_pg_probe(refresh: Arc<StateRefreshService>) {
     StateRefreshService::spawn_connectivity_probe(refresh);
 }
 
-/// Non-blocking connectivity probe; does not delay runtime startup.
-/// If `hypersync` is `None`, the caller is expected to have logged the disabled state.
-pub fn spawn_hypersync_probe(hypersync: Option<Arc<HyperSyncService>>) {
-    if let Some(hs) = hypersync {
-        tokio::spawn(async move {
-            match hs.probe_height().await {
-                Ok(height) => crate::info!("hypersync connected height={height}"),
-                Err(e) => crate::warn!("hypersync height probe failed: {e}"),
-            }
-        });
-    }
-}
-
 pub fn build_runtime(
     config: AppConfig,
     wallet: WalletSecrets,
-    hypersync: Option<HyperSyncService>,
 ) -> anyhow::Result<RuntimeContext> {
-    RuntimeContext::new(config, wallet, hypersync).context("failed to initialize runtime context")
+    RuntimeContext::new(config, wallet).context("failed to initialize runtime context")
 }
 
 struct BlockingBootstrap {
     runtime: RuntimeContext,
-    hypersync_built: bool,
-    envio_token_present: bool,
     config_ms: u64,
     runtime_ms: u64,
 }
 
-/// Config load, startup logs, hypersync client build, and runtime init on a blocking thread.
+/// Config load, startup logs, and runtime init on a blocking thread.
 fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
     let config_started = crate::util::now_ms();
     crate::debug!("bootstrap: loading config and wallet");
@@ -117,35 +100,25 @@ fn run_blocking_bootstrap() -> anyhow::Result<BlockingBootstrap> {
 
     log_startup(&config);
 
-    let envio_token_present = std::env::var("ENVIO_API_TOKEN")
-        .ok()
-        .is_some_and(|t| !t.trim().is_empty());
-    let hypersync = try_from_env(&config.rpc);
-    let hypersync_built = hypersync.is_some();
-
     let runtime_started = crate::util::now_ms();
     crate::debug!("bootstrap: building runtime context");
-    let runtime = build_runtime(config, wallet, hypersync)?;
+    let runtime = build_runtime(config, wallet)?;
     let runtime_ms = crate::util::now_ms().saturating_sub(runtime_started);
     crate::debug!("bootstrap: runtime built in {runtime_ms}ms");
 
     Ok(BlockingBootstrap {
         runtime,
-        hypersync_built,
-        envio_token_present,
         config_ms,
         runtime_ms,
     })
 }
 
 /// Common bootstrap for both the rpbot and tui binaries.
-/// Logs startup summary (including hypersync status), builds the runtime context (optionally
-/// installing a UI hook for TUI), and spawns the non-blocking pg + hypersync connectivity probes
-/// (their results log asynchronously).
+/// Logs startup summary, builds the runtime context (optionally installing a UI hook for TUI),
+/// and spawns the non-blocking pg connectivity probe (result logs asynchronously).
 ///
-/// Config/wallet load, hypersync client build, and `RuntimeContext::new` all run inside
-/// `spawn_blocking` (`run_blocking_bootstrap`) so filesystem / sync init does not occupy an
-/// async worker thread.
+/// Config/wallet load and `RuntimeContext::new` run inside `spawn_blocking`
+/// (`run_blocking_bootstrap`) so filesystem / sync init does not occupy an async worker thread.
 async fn bootstrap_inner(
     ui_hook: Option<SharedUiHook>,
     #[cfg(feature = "tui")] ui_snapshot_tx: Option<
@@ -156,19 +129,6 @@ async fn bootstrap_inner(
     let block = tokio::task::spawn_blocking(run_blocking_bootstrap)
         .await
         .context("bootstrap task panicked")??;
-
-    match (block.hypersync_built, block.envio_token_present) {
-        (false, true) => {
-            #[cfg(feature = "hypersync")]
-            crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled");
-            #[cfg(not(feature = "hypersync"))]
-            crate::warn!(
-                "ENVIO_API_TOKEN set but binary built without `hypersync` feature — rebuild with default features"
-            );
-        }
-        (false, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
-        _ => {}
-    }
 
     let mut runtime = block.runtime;
     if let Some(hook) = ui_hook {
@@ -189,7 +149,6 @@ async fn bootstrap_inner(
     );
 
     spawn_pg_probe(Arc::clone(&ctx.refresh));
-    spawn_hypersync_probe(ctx.hypersync.clone());
 
     Ok(ctx)
 }

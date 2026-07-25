@@ -17,7 +17,6 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Learned route risk** — Per-route success/failure history at `ROUTE_STATS_PATH` (default `.rpbot-route-stats.json`); unreliable routes need proportionally more expected net profit before preflight.
 - **Flash-loan routing** — `FLASH_LOAN_SOURCE=auto` (default) picks a provider per cycle from live liquidity + Vault reentrancy rules (see [Flash loans](#flash-loans)). Aave V3 premium and Balancer protocol flash fee are RPC-refreshed.
 - **Execution** — Dry-run simulation or live submit via Huff `ArbExecutor`; optional MEV-protected `PRIVATE_RPC_URL` and/or bloXroute (`BLOXROUTE_AUTH_HEADER`), profit-scaled priority fees, nonce management, route cooldown/quarantine, receipt polling.
-- **HyperSync** (optional) — Block head feed and receipt lookups when `ENVIO_API_TOKEN` is set. Cargo feature `hypersync` is **on by default** (pulls arrow/parquet); use `--no-default-features` for faster compiles without it.
 - **TUI dashboard** (optional) — Ratatui UI behind `--features tui`; headless `rpbot` is the production path.
 
 ## Binaries
@@ -78,10 +77,9 @@ OWNER=<bot_wallet> PRIVATE_KEY=0x... ./script/deploy_mainnet.sh
 ## Run
 
 ```bash
-cargo run --release                    # headless bot (default bin: rpbot; includes hypersync)
+cargo run --release                    # headless bot (default bin: rpbot)
 cargo run --release --features tui --bin tui
 cargo build --profile release-fast     # thinner LTO, faster link for local iteration
-cargo check --no-default-features      # skip hypersync/arrow/parquet for quick compile
 ```
 
 Unmapped tokens accumulate at runtime; every 20 **new** addresses trigger a Hermes USD-spot scan. Verified feeds are registered and persisted to `target/run-logs/oracle-auto-feeds.json` (override with `RPBOT_ORACLE_AUTO_FEEDS`); misses are marked `no_feed` so they are not rescanned.
@@ -92,14 +90,12 @@ Help: `cargo run -- --help` (or `rpbot --help` after build). Concurrent `rpbot`/
 
 ```bash
 cargo test
-cargo test --no-default-features   # faster when HyperSync client is not under test
 cargo bench --bench routing        # v2/v3 swap, route sim, graph rescore, cycle find, optimize
 cargo build --profile release-fast # near-prod binary without full fat LTO wall time
 ```
 
 | Feature | Default | Notes |
 |---|---|---|
-| `hypersync` | on | `hypersync-client` + arrow/parquet; disable for compile speed |
 | `tui` | off | Ratatui dashboard binary |
 
 Integration tests live under `tests/` (`oracle_feed_proposal_test`, `oracle_live_test`). Clippy deny-list includes `unwrap_used`, `panic`, `todo`, and `unimplemented` (see `Cargo.toml` / `clippy.toml`).

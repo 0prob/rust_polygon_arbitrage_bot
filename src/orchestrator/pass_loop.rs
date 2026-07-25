@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -6,13 +5,10 @@ use alloy::primitives::U256;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, MissedTickBehavior, Sleep, interval};
-
-use alloy::providers::Provider;
+use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::{AppConfig, OracleConfig, WalletSecrets};
 use crate::info;
-use crate::infra::hypersync::HyperSyncService;
 use crate::infra::pg::PgClient;
 use crate::infra::rpc::RpcPool;
 use crate::infra::wss_feed::spawn_pool_log_feed;
@@ -44,7 +40,6 @@ pub struct RuntimeContext {
     pub execution: Arc<ExecutionService>,
     pub gas_oracle: Arc<GasOracle>,
     pub price_oracle: Arc<PriceOracle>,
-    pub hypersync: Option<Arc<HyperSyncService>>,
     pub graph_cache: Arc<ParkingMutex<GraphCache>>,
     pub arena: Arc<ParkingMutex<StateArena>>,
     pub lf_tick_lock: Arc<Mutex<()>>,
@@ -54,11 +49,7 @@ pub struct RuntimeContext {
 }
 
 impl RuntimeContext {
-    pub fn new(
-        config: AppConfig,
-        wallet: WalletSecrets,
-        hypersync: Option<HyperSyncService>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(config: AppConfig, wallet: WalletSecrets) -> anyhow::Result<Self> {
         let rebuild_interval = config.pipeline.graph_rebuild_interval;
         let cycle_refind_interval = config.pipeline.cycle_refind_interval;
         let config = Arc::new(config);
@@ -125,7 +116,6 @@ impl RuntimeContext {
             execution,
             gas_oracle,
             price_oracle,
-            hypersync: hypersync.map(Arc::new),
             graph_cache: Arc::new(ParkingMutex::new(GraphCache::with_intervals(
                 rebuild_interval,
                 cycle_refind_interval,
@@ -187,7 +177,6 @@ impl RuntimeContext {
             price_oracle: Arc::clone(&self.price_oracle),
             wallet: Arc::clone(&self.wallet),
             rpc: Arc::clone(&self.rpc),
-            hypersync: self.hypersync.clone(),
             shutdown,
             ui_hook: Arc::clone(&self.ui_hook),
             inactive_rotation: ParkingMutex::new(InactiveCycleRotation::default()),
@@ -211,12 +200,6 @@ pub async fn run_pass_loop(
 
     let mut hf_scheduler = HfScheduler::new(hf_ctx, ctx.config.hf_interval_ms.max(1));
 
-    let mut height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
-    let mut hs_reconnect_log_at = 0u64;
-    let mut hs_height_fallback_at = 0u64;
-    let mut hs_restart_backoff = Duration::from_secs(2);
-    let mut hs_reconnect_sleep: Option<Pin<Box<Sleep>>> = None;
-
     let lf_shutdown = shutdown.clone();
     let mut lf_handle = spawn_lf_background(lf_ctx, ctx.config.lf_interval_ms, lf_shutdown);
 
@@ -234,11 +217,10 @@ pub async fn run_pass_loop(
     };
 
     info!(
-        "pass loop ready (sidecars={sidecar_ms}ms, lf={}ms, hf={}ms, stream={}, hypersync={}, startup={}ms)",
+        "pass loop ready (sidecars={sidecar_ms}ms, lf={}ms, hf={}ms, stream={}, startup={}ms)",
         ctx.config.lf_interval_ms,
         ctx.config.hf_interval_ms,
         ctx.config.pipeline.stream_enabled,
-        ctx.hypersync.is_some(),
         crate::util::now_ms().saturating_sub(loop_started),
     );
 
@@ -254,76 +236,6 @@ pub async fn run_pass_loop(
                 // select races (live: stream=true, patches/activity advance, but
                 // stream_triggered stayed false for whole captures).
                 hf_scheduler.schedule_timer_tick();
-            }
-            event = async {
-                match height_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if height_rx.is_some() => {
-                use crate::infra::hypersync::HeightStreamEvent;
-                match event {
-                    Some(HeightStreamEvent::Height(height)) => {
-                        hs_restart_backoff = Duration::from_secs(2);
-                        if let Some(hs) = ctx.hypersync.as_ref() {
-                            hs.record_height(height);
-                        }
-                        hf_scheduler.schedule_timer_tick();
-                    }
-                    Some(HeightStreamEvent::Reconnecting { delay, error_msg }) => {
-                        let now = crate::util::now_ms();
-                        if delay >= Duration::from_secs(5)
-                            && now.saturating_sub(hs_height_fallback_at) >= 15_000
-                            && let Ok(provider) = ctx.rpc.connect_state()
-                            && let Ok(height) = provider.get_block_number().await
-                        {
-                            if let Some(hs) = ctx.hypersync.as_ref() {
-                                hs.record_height(height);
-                            }
-                            hs_height_fallback_at = now;
-                            crate::debug!("hypersync height fallback from RPC: {height}");
-                        }
-                        let reason = error_msg
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty() && !line.starts_with("Caused by:"))
-                            .unwrap_or(error_msg.as_str());
-                        if now.saturating_sub(hs_reconnect_log_at) >= 300_000
-                            || (delay.as_millis() == 0 && now.saturating_sub(hs_reconnect_log_at) >= 30_000)
-                        {
-                            crate::warn!(
-                                "hypersync height stream reconnecting in {}ms: {reason}",
-                                delay.as_millis()
-                            );
-                            hs_reconnect_log_at = now;
-                        }
-                    }
-                    Some(HeightStreamEvent::Connected) => {
-                        hs_restart_backoff = Duration::from_secs(2);
-                        crate::debug!("hypersync height stream connected");
-                    }
-                    None => {
-                        crate::warn!(
-                            "hypersync height stream closed, restarting in {}ms",
-                            hs_restart_backoff.as_millis()
-                        );
-                        height_rx = None;
-                        hs_reconnect_sleep =
-                            Some(Box::pin(tokio::time::sleep(hs_restart_backoff)));
-                        hs_restart_backoff =
-                            (hs_restart_backoff * 2).min(Duration::from_secs(30));
-                    }
-                }
-            }
-            _ = async {
-                match hs_reconnect_sleep.as_mut() {
-                    Some(sleep) => sleep.as_mut().await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if hs_reconnect_sleep.is_some() => {
-                hs_reconnect_sleep = None;
-                height_rx = ctx.hypersync.as_ref().map(|hs| hs.stream_height());
-                hs_restart_backoff = Duration::from_secs(2);
             }
             result = async {
                 match stream_rx.as_mut() {
@@ -357,7 +269,6 @@ pub async fn run_pass_loop(
     }
 
     info!("pass loop shutting down");
-    drop(height_rx);
     if let Some(handle) = stream_feed {
         handle.abort();
         let _ = handle.await;

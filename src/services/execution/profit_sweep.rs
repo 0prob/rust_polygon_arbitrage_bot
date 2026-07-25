@@ -9,7 +9,6 @@ use tokio::sync::watch;
 
 use crate::abis::IArbExecutor;
 use crate::config::AppConfig;
-use crate::infra::hypersync::HyperSyncService;
 use crate::services::execution::candidate::CandidateExecution;
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::nonce::NonceManager;
@@ -55,7 +54,6 @@ pub async fn sweep_profit_to_recipient<P: Provider<Ethereum>, S: Provider<Ethere
     candidate: &CandidateExecution,
     operator: Address,
     private: Option<&PrivateSubmitConfig>,
-    hypersync: Option<&HyperSyncService>,
     shutdown: Option<&watch::Receiver<bool>>,
 ) -> Result<()> {
     let Some(recipient) = resolve_profit_recipient(
@@ -107,10 +105,7 @@ pub async fn sweep_profit_to_recipient<P: Provider<Ethereum>, S: Provider<Ethere
         std::time::Duration::from_millis(config.execution.receipt_timeout_ms),
         std::time::Duration::from_millis(config.execution.receipt_poll_ms),
     );
-    match poller
-        .wait_with_hypersync(receipt_provider, tx_hash, hypersync, shutdown)
-        .await
-    {
+    match poller.wait(receipt_provider, tx_hash, shutdown).await {
         ReceiptPollOutcome::Received(receipt) => {
             nonce_mgr.confirm(nonce);
             if receipt.success {

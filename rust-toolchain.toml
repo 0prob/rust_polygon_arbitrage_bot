@@ -1,0 +1,5 @@
+# Pin: rustc ICE compiling tokio@1.53+ at opt-level=3 on nightly 2026-07-23+.
+# https://github.com/rust-lang/rust/issues/159815 (fix: #159825, not merged yet).
+# Bump to latest nightly once that PR lands on nightly.
+[toolchain]
+channel = "nightly-2026-07-20"

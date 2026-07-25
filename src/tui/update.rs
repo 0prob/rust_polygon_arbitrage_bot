@@ -164,7 +164,6 @@ pub struct RuntimeSnapshotInput {
     pub execution_losses: u64,
     pub daily_pnl_wei: i128,
     pub gas_gwei: Option<f64>,
-    pub hypersync_height: Option<u64>,
     pub matic_usd: f64,
     pub portfolio_rows: Arc<Vec<PortfolioRow>>,
     pub diagnostics: Vec<KeyValueRow>,
@@ -201,7 +200,6 @@ impl Default for RouteBuildCache {
 pub fn graph_snapshot_for_poll(
     cache: &mut RouteBuildCache,
     snap: &HfSnapshot,
-    hypersync_height: Option<u64>,
     indexer_lag_blocks: u64,
     stale_indexer: bool,
 ) -> Arc<GraphSnapshot> {
@@ -211,18 +209,12 @@ pub fn graph_snapshot_for_poll(
         {
             let graph = Arc::make_mut(&mut cached);
             graph.health.indexer_lag_blocks = indexer_lag_blocks;
-            graph.health.hypersync_height = hypersync_height;
             graph.health.stale_indexer = stale_indexer;
         }
         cache.graph = Some(Arc::clone(&cached));
         return cached;
     }
-    let graph = Arc::new(build_graph_snapshot(
-        snap,
-        hypersync_height,
-        indexer_lag_blocks,
-        stale_indexer,
-    ));
+    let graph = Arc::new(build_graph_snapshot(snap, indexer_lag_blocks, stale_indexer));
     cache.graph_generation = snap.generation;
     cache.graph = Some(Arc::clone(&graph));
     graph
@@ -308,7 +300,6 @@ fn bump_label_count(counts: &mut BTreeMap<String, usize>, label: &str) {
 
 fn build_graph_snapshot(
     snap: &HfSnapshot,
-    hypersync_height: Option<u64>,
     indexer_lag_blocks: u64,
     stale_indexer: bool,
 ) -> GraphSnapshot {
@@ -393,7 +384,6 @@ fn build_graph_snapshot(
             top_out_degree: hubs.first().map_or(0, |h| h.out_degree),
             protocol_count,
             indexer_lag_blocks,
-            hypersync_height,
             stale_indexer,
         },
         protocol_counts,
@@ -775,7 +765,6 @@ pub fn build_diagnostics(
     refresh: &StateRefreshService,
     gas_gwei: Option<f64>,
     matic_usd: f64,
-    hypersync_height: Option<u64>,
 ) -> Vec<KeyValueRow> {
     vec![
         kv(
@@ -809,11 +798,6 @@ pub fn build_diagnostics(
             } else {
                 "n/a".to_string()
             },
-            Severity::Info,
-        ),
-        kv(
-            "hypersync height",
-            hypersync_height.map_or_else(|| "n/a".to_string(), |h| h.to_string()),
             Severity::Info,
         ),
         kv(

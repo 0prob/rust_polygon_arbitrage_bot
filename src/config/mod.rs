@@ -26,8 +26,6 @@ pub struct RpcConfig {
     #[serde(default)]
     pub state_rpc_url: Option<String>,
     #[serde(default)]
-    pub hyper_sync_url: Option<String>,
-    #[serde(default)]
     pub wss_url: Option<String>,
     #[serde(default)]
     pub polygon_wss_urls: Vec<String>,
@@ -352,7 +350,6 @@ impl Default for RpcConfig {
             execution_rpc_url: String::default(),
             request_timeout_ms: default_request_timeout_ms(),
             state_rpc_url: Option::default(),
-            hyper_sync_url: Option::default(),
             wss_url: Option::default(),
             polygon_wss_urls: Vec::default(),
             private_rpc_url: Option::default(),
@@ -579,7 +576,6 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("executor_address") => "execution.executor_address",
         k if k.eq_ignore_ascii_case("profit_recipient") => "execution.profit_recipient",
         k if k.eq_ignore_ascii_case("private_key") => "execution.private_key",
-        k if k.eq_ignore_ascii_case("hyper_sync_url") => "rpc.hyper_sync_url",
         k if k.eq_ignore_ascii_case("wss_url") => "rpc.wss_url",
         k if k.eq_ignore_ascii_case("polygon_wss_url") => "rpc.wss_url",
         // POLYGON_*_URLS / POLYGON_RPC_URL: CSV → Vec. *_MATIC_WEI: keep as String

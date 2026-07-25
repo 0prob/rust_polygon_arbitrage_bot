@@ -870,7 +870,6 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &ctx.cache,
             state_block,
             state_hash,
-            ctx.hypersync.as_deref(),
             Some(&ctx.ui_hook),
             Some(&ctx.shutdown),
             None,
