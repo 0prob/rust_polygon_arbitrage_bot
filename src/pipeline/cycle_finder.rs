@@ -125,10 +125,38 @@ pub fn is_live_graph_edge(ge: &GraphEdge) -> bool {
 /// participate in a route cycle only when at least two of its token incidences
 /// are non-bridges. This correctly excludes an isolated bidirectional AMM pool:
 /// returning through the same pool is forbidden by route enumeration.
+/// Dense bitmask over token indices for cycle-capable coverage.
+/// 64 tokens per `u64` word — set and test are single bitwise instructions,
+/// and 2 000 tokens consume just 32 cache lines vs. 2 000 with `Vec<bool>`.
 #[derive(Debug, Default, Clone)]
 pub struct CycleCapableCoverage {
-    token_mask: Vec<bool>,
+    /// Packed token membership: bit `i % 64` of word `i / 64`.
+    token_mask: Vec<u64>,
+    /// Number of tokens the mask was built for (needed by is_token_capable).
+    token_count: usize,
     pub pool_indices: rustc_hash::FxHashSet<u32>,
+}
+
+impl CycleCapableCoverage {
+    #[inline]
+    fn mask_set(words: &mut Vec<u64>, idx: usize) {
+        let word = idx / 64;
+        let bit = idx % 64;
+        if word < words.len() {
+            words[word] |= 1u64 << bit;
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_token_capable(&self, token_idx: usize) -> bool {
+        if token_idx >= self.token_count {
+            return false;
+        }
+        let word = token_idx / 64;
+        let bit = token_idx % 64;
+        word < self.token_mask.len() && (self.token_mask[word] >> bit) & 1 == 1
+    }
 }
 
 #[must_use]
@@ -240,15 +268,18 @@ pub fn cycle_capable_coverage(graph: &RoutingGraph) -> CycleCapableCoverage {
         }
     }
     let mut pool_indices = rustc_hash::FxHashSet::default();
-    let mut token_mask = vec![false; token_count];
+    // Dense bitmask: token_count bits packed into ceil(token_count/64) u64 words.
+    let words = token_count.div_ceil(64);
+    let mut token_mask = vec![0u64; words];
     for (pool, token) in incidence_edges {
         if participating[pool] {
             pool_indices.insert(pool as u32);
-            token_mask[token] = true;
+            CycleCapableCoverage::mask_set(&mut token_mask, token);
         }
     }
     CycleCapableCoverage {
         token_mask,
+        token_count,
         pool_indices,
     }
 }
@@ -465,7 +496,7 @@ fn prep_node(
     coverage: &CycleCapableCoverage,
 ) -> NodePrep {
     let edges = graph.adjacency.get(index).map(Vec::as_slice).unwrap_or(&[]);
-    if index < token_count && !coverage.token_mask.get(index).copied().unwrap_or(false) {
+    if index < token_count && !coverage.is_token_capable(index) {
         return NodePrep {
             live: Vec::new(),
             protos: 0,
@@ -781,6 +812,36 @@ fn pool_unmark(used: &mut [bool], pool_id: u32) {
     }
 }
 
+#[derive(Default)]
+pub struct DfsScratch {
+    pub used_pools: Vec<bool>,
+    pub used_tokens: Vec<bool>,
+    pub path: Vec<Edge>,
+}
+
+impl DfsScratch {
+    pub fn prepare(&mut self, pool_slots: usize, token_count: usize, hop_cap: usize) {
+        if self.used_pools.len() < pool_slots {
+            self.used_pools.resize(pool_slots, false);
+        } else {
+            self.used_pools[..pool_slots].fill(false);
+        }
+        if self.used_tokens.len() < token_count {
+            self.used_tokens.resize(token_count, false);
+        } else {
+            self.used_tokens[..token_count].fill(false);
+        }
+        self.path.clear();
+        if self.path.capacity() < hop_cap {
+            self.path.reserve(hop_cap.saturating_sub(self.path.capacity()));
+        }
+    }
+}
+
+thread_local! {
+    static DFS_SCRATCH: std::cell::RefCell<DfsScratch> = std::cell::RefCell::new(DfsScratch::default());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_cycles_dfs_single_start(
     graph: &RoutingGraph,
@@ -802,11 +863,18 @@ fn collect_cycles_dfs_single_start(
         .len()
         .max(arena.pool_count())
         .max(1);
-    let mut used_pools = vec![false; pool_slots];
-    let mut used_tokens = vec![false; token_count];
-    let mut path = Vec::with_capacity(hop_cap as usize);
-    let mut cycles = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
+
+    DFS_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        scratch.prepare(pool_slots, token_count, hop_cap as usize);
+        let DfsScratch {
+            used_pools,
+            used_tokens,
+            path,
+        } = &mut *scratch;
+
+        let mut cycles = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
@@ -1150,10 +1218,10 @@ fn collect_cycles_dfs_single_start(
                     start,
                     ge.target_node,
                     Some(pending),
-                    &mut path,
+                    path,
                     0,
-                    &mut used_pools,
-                    &mut used_tokens,
+                    used_pools,
+                    used_tokens,
                     0,
                     0.0,
                     ONE,
@@ -1189,7 +1257,7 @@ fn collect_cycles_dfs_single_start(
                     continue;
                 }
                 // Same mark semantics as mid-path Direct — never walk unmarked OOB.
-                if !pool_mark(&mut used_pools, pool_id) {
+                if !pool_mark(used_pools, pool_id) {
                     continue;
                 }
                 path.push(ge.edge);
@@ -1201,10 +1269,10 @@ fn collect_cycles_dfs_single_start(
                     start,
                     ge.target_node,
                     None,
-                    &mut path,
+                    path,
                     hop_calls,
-                    &mut used_pools,
-                    &mut used_tokens,
+                    used_pools,
+                    used_tokens,
                     1,
                     ge.log_weight,
                     ge.ratio,
@@ -1218,13 +1286,14 @@ fn collect_cycles_dfs_single_start(
                     next_pin,
                 );
                 path.pop();
-                pool_unmark(&mut used_pools, pool_id);
+                pool_unmark(used_pools, pool_id);
             }
             GraphHopPhase::ExitPool => {}
         }
     }
     used_tokens[start.0 as usize] = false;
     cycles
+    })
 }
 
 fn collect_cycles_dfs_parallel(

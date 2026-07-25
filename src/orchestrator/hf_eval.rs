@@ -889,7 +889,7 @@ pub fn rank_cycles_by_probe_net(
             let near_net_slots = if had_net_ranked {
                 max_keep
             } else {
-                max_keep.min(4).max(1)
+                max_keep.clamp(1, 4)
             };
             let mut near_net_kept = 0usize;
             for (fp, _, cycle) in near_net.drain(..) {

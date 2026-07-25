@@ -31,6 +31,9 @@ pub fn edge_log_weight_from_ratio(ratio: U256) -> f64 {
 
 #[inline(always)]
 pub fn mul_down(a: U256, b: U256) -> U256 {
+    if let Some(product) = a.checked_mul(b) {
+        return product / ONE;
+    }
     // U512 widening prevents silent ZERO on intermediate overflow.
     // Critical for Balancer weighted pools with large balances.
     let product = U512::from(a) * U512::from(b);
@@ -39,6 +42,14 @@ pub fn mul_down(a: U256, b: U256) -> U256 {
 
 #[inline(always)]
 pub fn mul_up(a: U256, b: U256) -> U256 {
+    if let Some(product) = a.checked_mul(b) {
+        let q = product / ONE;
+        if !(product % ONE).is_zero() {
+            return q.saturating_add(U256::from(1));
+        } else {
+            return q;
+        }
+    }
     let product = U512::from(a) * U512::from(b);
     let quotient = u512_to_u256(product / ONE_U512);
     if product % ONE_U512 > U512::ZERO {

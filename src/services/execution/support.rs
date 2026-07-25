@@ -496,10 +496,8 @@ pub fn effective_slippage_bps_for_flash(
 ) -> u64 {
     if flash_source == FlashLoanSource::Direct {
         let _ = hop_count;
-        let floor = configured_per_hop_bps
-            .max(DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS)
-            .min(9_999);
-        return floor.max(depth_route_bps).min(9_999);
+        let floor = configured_per_hop_bps.clamp(DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS, 9_999);
+        return floor.clamp(depth_route_bps, 9_999);
     }
     effective_slippage_bps(configured_per_hop_bps, hop_count, depth_route_bps)
 }

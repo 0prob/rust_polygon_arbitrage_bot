@@ -89,6 +89,7 @@ Help: `cargo run -- --help` (or `rpbot --help` after build). Concurrent `rpbot`/
 ## Development
 
 ```bash
+python3 scripts/health_check.py    # end-to-end endpoint & connectivity health check (.env)
 cargo test
 cargo bench --bench routing        # v2/v3 swap, route sim, graph rescore, cycle find, optimize
 cargo build --profile release-fast # near-prod binary without full fat LTO wall time

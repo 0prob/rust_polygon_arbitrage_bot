@@ -303,3 +303,34 @@ mod tests {
         assert!((fbig - F64_2_POW_192).abs() < F64_2_POW_192 * 1e-10);
     }
 }
+
+/// Parse JSON bytes using SIMD-accelerated simd-json with a serde_json fallback.
+///
+/// simd-json processes JSON with SIMD instructions (AVX2/NEON) and writes a tape
+/// into the buffer in-place, so this function clones the input once. The clone is
+/// still cheaper than serde_json's recursive descent on large payloads.
+///
+/// # Errors
+/// Returns a serde_json error if both parsers fail.
+pub fn simd_json_parse<T>(bytes: &[u8]) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut buf = bytes.to_vec();
+    // simd-json fallback path: on error, re-parse with serde_json for better diagnostics.
+    simd_json::serde::from_slice::<T>(&mut buf).or_else(|_| serde_json::from_slice(bytes))
+}
+
+/// Borrow-preserving SIMD parse for zero-copy `Cow<'a, str>` / `&'a str` fields.
+///
+/// The caller provides a `&mut Vec<u8>` that simd-json writes its tape into.
+/// The returned value borrows from `buf`. No extra heap allocation is performed.
+///
+/// # Errors
+/// Returns a serde_json error if both parsers fail.
+pub fn simd_json_parse_borrowed<'de, T>(buf: &'de mut Vec<u8>) -> Result<T, serde_json::Error>
+where
+    T: serde::de::Deserialize<'de>,
+{
+    simd_json::serde::from_slice::<T>(buf).or_else(|_| serde_json::from_slice(buf))
+}

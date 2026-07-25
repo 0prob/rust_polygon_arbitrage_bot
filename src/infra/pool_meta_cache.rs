@@ -42,7 +42,7 @@ impl PoolMetaCache {
                 crate::warn!("pool meta cache read failed ({}): {e}", path.display());
                 PoolMetaData::default()
             }
-            Ok(raw) => match serde_json::from_slice(&raw) {
+            Ok(raw) => match crate::util::simd_json_parse(&raw) {
                 Ok(d) => d,
                 Err(e) => {
                     crate::warn!("pool meta cache parse failed ({}): {e}", path.display());

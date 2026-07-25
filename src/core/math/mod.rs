@@ -33,7 +33,10 @@ pub(crate) fn mul_div_floor(a: U256, b: U256, denominator: U256) -> Option<U256>
     if denominator.is_zero() {
         return None;
     }
-    // U512 widening: a*b may exceed U256::MAX while the quotient still fits.
+    if let Some(product) = a.checked_mul(b) {
+        return Some(product / denominator);
+    }
+    // U512 widening fallback: a*b may exceed U256::MAX while the quotient still fits.
     let product = U512::from(a) * U512::from(b);
     u512_to_u256_checked(product / U512::from(denominator))
 }
@@ -54,6 +57,14 @@ pub(crate) fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Option
 pub(crate) fn mul_div_ceil(a: U256, b: U256, denominator: U256) -> Option<U256> {
     if denominator.is_zero() {
         return None;
+    }
+    if let Some(product) = a.checked_mul(b) {
+        let q = product / denominator;
+        if !(product % denominator).is_zero() {
+            return q.checked_add(U256::from(1));
+        } else {
+            return Some(q);
+        }
     }
     let product = U512::from(a) * U512::from(b);
     let den = U512::from(denominator);

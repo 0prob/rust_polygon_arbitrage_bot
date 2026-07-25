@@ -440,7 +440,7 @@ fn load_store(path: &Path) -> anyhow::Result<AutoFeedStore> {
         return Ok(AutoFeedStore::default());
     }
     let raw = std::fs::read(path)?;
-    Ok(serde_json::from_slice(&raw)?)
+    Ok(crate::util::simd_json_parse(&raw)?)
 }
 
 fn persist_store(path: &Path) -> anyhow::Result<()> {

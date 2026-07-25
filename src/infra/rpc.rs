@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use crate::config::AppConfig;
 use crate::info;
 use crate::infra::http::{HttpClientOpts, build_static};
@@ -26,7 +27,7 @@ const STATE_URL_RATE_LIMIT_PENALTY: Duration = Duration::from_secs(45);
 #[derive(Clone)]
 pub struct RpcPool {
     http: Client,
-    state_urls: Arc<RwLock<Vec<Arc<str>>>>,
+    state_urls: Arc<ArcSwap<Vec<Arc<str>>>>,
     execution_url: Option<String>,
     private_url: Option<String>,
     require_private_submit: bool,
@@ -44,7 +45,7 @@ pub struct RpcPool {
 impl std::fmt::Debug for RpcPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RpcPool")
-            .field("state_url_count", &self.state_urls.read().len())
+            .field("state_url_count", &self.state_urls.load().len())
             .field("execution_configured", &self.execution_url.is_some())
             .field("private_configured", &self.private_url.is_some())
             .field("require_private_submit", &self.require_private_submit)
@@ -75,7 +76,7 @@ impl RpcPool {
             "rpc pool",
         );
 
-        let state_urls = config
+        let state_urls: Vec<Arc<str>> = config
             .state_read_urls()
             .into_iter()
             .map(Arc::<str>::from)
@@ -83,7 +84,7 @@ impl RpcPool {
 
         Self {
             http,
-            state_urls: Arc::new(RwLock::new(state_urls)),
+            state_urls: Arc::new(ArcSwap::from_pointee(state_urls)),
             execution_url: if config.rpc.execution_rpc_url.is_empty() {
                 None
             } else {
@@ -104,7 +105,7 @@ impl RpcPool {
     }
 
     fn state_urls_ordered_slice(&self) -> Vec<Arc<str>> {
-        let urls = self.state_urls.read();
+        let urls = self.state_urls.load();
         let now = Instant::now();
         // Opportunistic prune: only take the write lock when something expired
         // (hot path is read-only; long runs still cannot accumulate dead cool-offs).
@@ -146,7 +147,7 @@ impl RpcPool {
     pub fn state_url(&self) -> Option<String> {
         // Fast path for common single-URL case — avoids allocating the full partition vecs.
         {
-            let urls = self.state_urls.read();
+            let urls = self.state_urls.load();
             if urls.len() <= 1 {
                 return urls.first().map(ToString::to_string);
             }
@@ -244,13 +245,13 @@ impl RpcPool {
     }
 
     async fn probe_and_rank_state_urls_inner(&self) {
-        let urls = self.state_urls.read().clone();
+        let urls = self.state_urls.load();
         if urls.len() <= 1 {
             return;
         }
         let pool = self.clone();
         let mut probes = tokio::task::JoinSet::new();
-        for url in urls.iter().cloned() {
+        for url in urls.iter().map(Arc::clone) {
             let pool = pool.clone();
             probes.spawn(async move {
                 let latency = pool.probe_http_latency(&url).await;
@@ -298,9 +299,9 @@ impl RpcPool {
         }
         let mut ordered: Vec<Arc<str>> = ranked.iter().map(|(url, _)| Arc::clone(url)).collect();
         ordered.extend(failed);
-        for url in urls {
-            if !ordered.iter().any(|candidate| candidate == &url) {
-                ordered.push(url);
+        for url in urls.iter() {
+            if !ordered.iter().any(|candidate| candidate == url) {
+                ordered.push(url.clone());
             }
         }
         let summary: Vec<String> = ranked
@@ -308,7 +309,7 @@ impl RpcPool {
             .map(|(url, latency)| format!("{}={}ms", rpc_host_label(url), latency.as_millis()))
             .collect();
         info!("state RPC order: {}", summary.join(", "));
-        *self.state_urls.write() = ordered;
+        self.state_urls.store(Arc::new(ordered));
     }
 
     async fn probe_http_latency(&self, url: &str) -> Option<Duration> {

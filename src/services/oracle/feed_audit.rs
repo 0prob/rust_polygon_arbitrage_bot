@@ -297,7 +297,7 @@ pub fn persist_runtime_demand_snapshot(path: &Path) -> anyhow::Result<()> {
 
 pub fn load_runtime_demand_snapshot(path: &Path) -> anyhow::Result<FxHashMap<Address, u64>> {
     let raw = std::fs::read(path)?;
-    let rows: Vec<DemandSnapshotRow> = serde_json::from_slice(&raw)?;
+    let rows: Vec<DemandSnapshotRow> = crate::util::simd_json_parse(&raw)?;
     let mut out = FxHashMap::default();
     for row in rows {
         let Ok(addr) = row.address.parse::<Address>() else {
