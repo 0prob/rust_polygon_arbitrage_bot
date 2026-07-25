@@ -653,8 +653,12 @@ fn probe_matic_parts(
     let flash_matic = flash_loan_fee
         .checked_mul(input.token_to_matic_rate)
         .and_then(|v| ceil_div(v, scale))?;
+    // Match assess_profit: tip from net-after-gas, not gross.
+    let net_after_gas = gross_matic
+        .saturating_sub(flash_matic)
+        .saturating_sub(gas_cost_wei);
     let priority_uplift = profit_priority_uplift_wei(
-        gross_matic,
+        net_after_gas,
         input.profit_priority_alpha_bps,
         input.gas_units,
         input.charged_priority_fee_per_gas,
@@ -768,9 +772,11 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         .saturating_sub(gas_cost_wei);
 
     let required_net_matic = safety_floor_matic_wei(revert_penalty, input.safety_multiplier_bps);
-    let estimated_matic = gross_profit_matic_wei;
+    // Tip from **net after gas**, not slip-adjusted gross. Gross×alpha over-bids
+    // priority on large notional / thin-edge routes (live: ~0.0044 MATIC uplift from
+    // 0.12 MATIC gross while true post-gas net was ~0.05 — phantom shortfall vs $0.01).
     let priority_uplift = profit_priority_uplift_wei(
-        estimated_matic,
+        net_profit_after_gas_matic_wei,
         input.profit_priority_alpha_bps,
         input.gas_units,
         input.charged_priority_fee_per_gas,
@@ -1056,8 +1062,10 @@ mod safety_tests {
             with.net_profit_after_gas_matic_wei,
             without.net_profit_after_gas_matic_wei
         );
-        // Full tip charged would be tip*gas; we only charge tip − charged floor.
-        let tip = profit_priority_tip_per_gas(U256::from(5u128 * 10u128.pow(17)), 5_000, 100_000);
+        // Tip is derived from net-after-gas (not gross); only incremental above floor.
+        let gas_cost = U256::from(100_000u64) * U256::from(280_000_000_000u64);
+        let net_after_gas = U256::from(5u128 * 10u128.pow(17)).saturating_sub(gas_cost);
+        let tip = profit_priority_tip_per_gas(net_after_gas, 5_000, 100_000);
         let floor = crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS;
         assert!(tip > floor);
         let charged = without

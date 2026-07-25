@@ -2544,6 +2544,40 @@ pub async fn run_hf_tick(
             // whenever any tiny positive-net reject existed in the same tick.
             // Also ignore best_profit_matic: positive_net rejects bump it above zero
             // even when profitable_count==0, which previously skipped quarantine.
+            //
+            // Positive-net rejects (net_matic > 0, should_execute=false) were only counted
+            // in assess summary — best-eval logged a different underwater cover peak, so
+            // live ~0.78 MATIC nets never showed their reject reason (safety/min/fidelity).
+            if let Some(ref near) = best_near_miss {
+                let a = &near.assessment;
+                let reason = a.reject_reason.as_deref().unwrap_or("none");
+                crate::info!(
+                    "hf positive-net reject: fp={} hops={} net_matic={} gas_cost_wei={} reject={}",
+                    near.route_fingerprint,
+                    near.cycle.edge_hops(),
+                    a.net_profit_after_gas_matic_wei,
+                    a.gas_cost_wei,
+                    reason,
+                );
+                // Sticky positive-net rejects re-fill every HF tick (live: min-profit
+                // net 0.123 vs floor 0.130; safety-floor net 0.008 vs gas 0.070 — same
+                // fp many times). Cool so the window rotates; 300s = probe-below-floor.
+                let sticky = reason.contains("below min profit")
+                    || reason.contains("below safety floor");
+                if sticky
+                    && ctx
+                        .execution
+                        .quarantine_probe_below_dispatch_floor(near.route_fingerprint)
+                {
+                    quarantine_all_edge_rotations(&ctx.execution, &near.cycle.edges);
+                    crate::info!(
+                        "hf positive-net near-miss cool: fp={} net_matic={} reject={} (+rotations, 300s)",
+                        near.route_fingerprint,
+                        a.net_profit_after_gas_matic_wei,
+                        reason,
+                    );
+                }
+            }
             if let Some(ref diag) = best_gross_diag {
                 let available_matic = diag
                     .gas_cost_wei

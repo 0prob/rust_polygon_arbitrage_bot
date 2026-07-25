@@ -42,7 +42,10 @@ pub mod gas {
     };
 }
 pub mod impact_slippage {
-    pub use super::support::{depth_impact_slippage_bps_with_base, effective_slippage_bps};
+    pub use super::support::{
+        depth_impact_slippage_bps_with_base, effective_slippage_bps,
+        effective_slippage_bps_for_flash,
+    };
 }
 pub mod nonce;
 

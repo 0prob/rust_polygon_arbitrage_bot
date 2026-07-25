@@ -448,7 +448,7 @@ pub fn depth_impact_slippage_bps_with_base(
     marginal_shortfall_bps(base_out, amount_in, probe.amount_out, probe_in)
 }
 
-/// Route-level slippage for profit assessment / Brent.
+/// Route-level slippage for profit assessment / Brent (multi-call hop paths).
 ///
 /// - `configured_per_hop_bps` is the per-hop floor used in calldata `minOut` → compound
 ///   across `hop_count` so the profit haircut matches multi-hop execution.
@@ -459,6 +459,9 @@ pub fn depth_impact_slippage_bps_with_base(
 ///
 /// Prior bug: `max(config, depth)` then `compound(…, hops)` treated depth as per-hop and
 /// roughly ×hops over-penalized multi-hop routes (e.g. 229 bps depth → ~672 bps on 3 hops).
+///
+/// For [`FlashLoanSource::Direct`] use [`effective_slippage_bps_for_flash`] — Direct
+/// `batchSwap` has no per-hop minOut (only executor minProfit).
 #[must_use]
 pub fn effective_slippage_bps(
     configured_per_hop_bps: u64,
@@ -469,6 +472,36 @@ pub fn effective_slippage_bps(
     let per_hop = configured_per_hop_bps.max(EXECUTION_MIN_SLIPPAGE_BPS);
     let config_route = compound_slippage_bps(per_hop, hop_count);
     config_route.max(depth_route_bps).min(9_999)
+}
+
+/// Single-shot state-drift floor for Direct `batchSwap` routes (not per-hop).
+///
+/// `encode_balancer_batch_route` sets open vault limits; profit is gated by executor
+/// `minProfit` only. Compounding [`EXECUTION_MIN_SLIPPAGE_BPS`] × hops (e.g. 298 bps
+/// on 3-hop) was a phantom haircut — live: vault `queryBatchSwap` matched sim while
+/// assess rejected at cover≈1.7× gas / safety floor.
+const DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS: u64 = 50;
+
+/// Route-level slippage aware of flash entrypoint semantics.
+///
+/// Direct vault `batchSwap` does **not** apply per-hop `minOut` — only a small
+/// reserve-drift floor + full-route depth impact. Multi-call flash paths keep
+/// hop-compounded encode floors via [`effective_slippage_bps`].
+#[must_use]
+pub fn effective_slippage_bps_for_flash(
+    configured_per_hop_bps: u64,
+    hop_count: u32,
+    depth_route_bps: u64,
+    flash_source: FlashLoanSource,
+) -> u64 {
+    if flash_source == FlashLoanSource::Direct {
+        let _ = hop_count;
+        let floor = configured_per_hop_bps
+            .max(DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS)
+            .min(9_999);
+        return floor.max(depth_route_bps).min(9_999);
+    }
+    effective_slippage_bps(configured_per_hop_bps, hop_count, depth_route_bps)
 }
 
 #[cfg(test)]
@@ -603,6 +636,34 @@ mod tests {
         // Config 0 floors to encode min (100) so 2-hop → 199 route bps.
         assert_eq!(effective_slippage_bps(0, 2, 0), 199);
         assert_eq!(effective_slippage_bps(0, 1, 0), 100);
+    }
+
+    #[test]
+    fn direct_slippage_is_not_hop_compounded() {
+        // Multi-call path still compounds 100×3 → 298.
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 0, FlashLoanSource::AaveV3),
+            298
+        );
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 0, FlashLoanSource::Balancer),
+            298
+        );
+        // Direct: single drift floor (50), not 298 — matches open batchSwap limits.
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 0, FlashLoanSource::Direct),
+            DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS
+        );
+        // Depth still wins when larger than the Direct floor.
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 200, FlashLoanSource::Direct),
+            200
+        );
+        // Explicit config above floor is honored once (not × hops).
+        assert_eq!(
+            effective_slippage_bps_for_flash(80, 3, 0, FlashLoanSource::Direct),
+            80
+        );
     }
 
     #[test]

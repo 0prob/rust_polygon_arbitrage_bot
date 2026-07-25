@@ -335,12 +335,17 @@ impl ExecutionService {
 }
 
 impl ExecutionService {
+    /// True when the candidate is still eligible for dry-run given current cache gen.
+    ///
+    /// Exact equality was too strict: gen advances on every unrelated pool write
+    /// (LF attach / stream), so multi-candidate batches died before eth_call.
+    /// Monotonic gen never goes backward; block+hash provenance is the real pin.
     #[must_use]
     fn candidate_matches_state_generation(
         candidate: &CandidateExecution,
         state_cache: &StateCache,
     ) -> bool {
-        candidate.state_generation == state_cache.generation()
+        state_cache.generation() >= candidate.state_generation
     }
 
     fn write_route_event(&self, line: String) {
@@ -1035,9 +1040,11 @@ impl ExecutionService {
 
         let now = Instant::now();
 
+        // Generation may advance (unrelated pool writes); only reject if cache
+        // regressed (should not happen). Block+hash below is the real pin.
         if !Self::candidate_matches_state_generation(candidate, state_cache) {
-            crate::debug!(
-                "dispatch skip: fp={}, stale state generation candidate={} current={}",
+            crate::info!(
+                "dispatch skip: fp={}, state generation regressed candidate={} current={}",
                 fp,
                 candidate.state_generation,
                 state_cache.generation(),
@@ -1054,7 +1061,7 @@ impl ExecutionService {
         if candidate.state_block != expected_state_block
             || candidate.state_hash != expected_state_hash
         {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={}, stale state provenance candidate(block={}, hash={:?}) != expected(block={}, hash={:?})",
                 fp,
                 candidate.state_block,
@@ -1077,7 +1084,7 @@ impl ExecutionService {
             .saturating_mul(U256::from(risk_multiplier))
             / U256::from(10_000u64);
         if candidate.expected_profit_matic_wei < learned_floor {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={}, profit {} below learned floor {} (risk_mult={})",
                 fp,
                 candidate.expected_profit_matic_wei,
@@ -1136,7 +1143,7 @@ impl ExecutionService {
         if let Some(expiry) = self.quarantine.read().get(&fp)
             && now < *expiry
         {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={}, route quarantined until {expiry:?}",
                 fp
             );
@@ -1148,7 +1155,7 @@ impl ExecutionService {
         }
 
         if self.is_route_hash_quarantined(&candidate.route_hash) {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={}, route_hash={} quarantined (structural dry-run failure)",
                 fp,
                 candidate.route_hash,
@@ -1161,7 +1168,7 @@ impl ExecutionService {
         }
 
         if self.is_direct_token_quarantined(candidate.profit_token) {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={fp} token={} quarantined (FoT/TransferFailed)",
                 candidate.profit_token
             );
@@ -1176,7 +1183,7 @@ impl ExecutionService {
         if let Some(last) = self.last_submit.read().get(&fp)
             && now.saturating_duration_since(*last) < route_cooldown
         {
-            crate::debug!(
+            crate::info!(
                 "dispatch skip: fp={}, route cooldown active ({route_cooldown:?}, last={last:?})",
                 fp
             );
@@ -1225,6 +1232,12 @@ impl ExecutionService {
                     Some(DecodedRevert::ExternalCallFailed { .. })
                 ) {
                     self.quarantine_route_hash(candidate.route_hash, now);
+                    // Structural vault/router rejects (BAL#327, etc.) re-burn every
+                    // ROUTE_COOLDOWN (30s) with new route_hash from re-sizing
+                    // (live: same 2 fps failed BAL#327 three times in ~3m).
+                    // Upgrade fp cool to structural TTL so mixed Aave phantoms
+                    // stop crowding Direct profitable candidates.
+                    self.quarantine_insert(fp, now + STRUCTURAL_DRY_RUN_QUARANTINE);
                 }
                 // FoT / nonstandard ERC20 TransferFailed: cool the *failing* token.
                 // Live bug: hop-2 TransferFailed on long-tail token quarantined
@@ -2648,7 +2661,7 @@ mod safety_tests {
     #[test]
     fn candidate_generation_tracks_state_cache_at_build_time() {
         let cache = StateCache::new(8, std::time::Duration::from_secs(60));
-        let candidate = CandidateExecution {
+        let mut candidate = CandidateExecution {
             route_fingerprint: 1,
             calldata: Default::default(),
             target_address: Address::ZERO,
@@ -2683,6 +2696,12 @@ mod safety_tests {
             Address::repeat_byte(1),
             crate::core::types::PoolState::Invalid,
         );
+        // Generation advanced on unrelated write — still eligible (block pin is the gate).
+        assert!(ExecutionService::candidate_matches_state_generation(
+            &candidate, &cache
+        ));
+        // Candidate from the future is rejected (cache regressed / inconsistent snapshot).
+        candidate.state_generation = cache.generation() + 10;
         assert!(!ExecutionService::candidate_matches_state_generation(
             &candidate, &cache
         ));

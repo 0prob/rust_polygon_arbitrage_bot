@@ -88,9 +88,12 @@ impl AaveRefreshStats {
         if self.listed_viable == 0 && ineligible == 0 {
             return;
         }
-        // Routine refresh: debug. Elevate to warn when RPC/config collapses viability.
+        // Routine: debug. WARN only for RPC failures or listed-but-unusable reserves
+        // (inactive/paused/flash_off). Pure no_atoken on long-tail start tokens is
+        // expected for Direct/Balancer routes (live: spam WARN every HF gen).
         let fee_bps = aave_flash_loan_fee_bps_cached();
-        if self.rpc_error > 0 || (self.listed_viable == 0 && tokens_fetched > 0) {
+        let listed_unusable = self.inactive + self.paused + self.flash_disabled;
+        if self.rpc_error > 0 || listed_unusable > 0 {
             crate::warn!(
                 "aave refresh: tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
                  (rpc_err={} no_atoken={} inactive={} paused={} flash_off={} pinned={}) fee_bps={fee_bps} \

@@ -138,8 +138,9 @@ fn default_rps(url: &str) -> f64 {
     match host_tier(url) {
         // Allnodes free: 1200/60s = 20 rps — stay under with headroom for WSS/other.
         HostTier::FreePublic => 16.0,
-        // dRPC free plan trips "error code 15" under LF+HF fan-out.
-        HostTier::Drpc => 20.0,
+        // dRPC free plan trips "error code 15" well below 20 rps under LF+HF fan-out
+        // (live: code 15 during bootstrap + HF prefetch while publicnode stayed healthy).
+        HostTier::Drpc => 10.0,
         HostTier::Paid => 40.0,
     }
 }

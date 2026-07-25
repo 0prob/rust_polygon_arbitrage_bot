@@ -42,7 +42,7 @@ use crate::services::execution::balancer_verify::{
 use crate::services::execution::calldata::build_calldata_hops;
 use crate::services::execution::flash_liquidity::route_is_balancer_only;
 use crate::services::execution::impact_slippage::{
-    depth_impact_slippage_bps_with_base, effective_slippage_bps,
+    depth_impact_slippage_bps_with_base, effective_slippage_bps_for_flash,
 };
 use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 use crate::services::execution::{
@@ -75,6 +75,7 @@ fn effective_slippage_after_resim(
     edges: &[crate::core::types::Edge],
     sim: &crate::core::types::RouteSimulationResult,
     configured_per_hop_bps: u64,
+    flash_source: FlashLoanSource,
 ) -> u64 {
     let depth_bps = depth_impact_slippage_bps_with_base(
         arena,
@@ -86,15 +87,21 @@ fn effective_slippage_after_resim(
             total_gas: sim.total_gas,
         }),
     );
-    effective_slippage_after_resim_depth(configured_per_hop_bps, sim.hop_count, depth_bps)
+    effective_slippage_after_resim_depth(
+        configured_per_hop_bps,
+        sim.hop_count,
+        depth_bps,
+        flash_source,
+    )
 }
 
 fn effective_slippage_after_resim_depth(
     configured_per_hop_bps: u64,
     hop_count: u32,
     depth_bps: u64,
+    flash_source: FlashLoanSource,
 ) -> u64 {
-    effective_slippage_bps(
+    effective_slippage_bps_for_flash(
         configured_per_hop_bps,
         hop_count,
         if depth_bps >= 10_000 {
@@ -102,7 +109,18 @@ fn effective_slippage_after_resim_depth(
         } else {
             depth_bps
         },
+        flash_source,
     )
+}
+
+/// Pure Balancer routes use Direct `batchSwap` (no per-hop minOut); mixed use multi-call.
+#[inline]
+fn resim_flash_source_for_slip(cycle: &FoundCycle) -> FlashLoanSource {
+    if route_is_balancer_only(cycle) {
+        FlashLoanSource::Direct
+    } else {
+        FlashLoanSource::AaveV3
+    }
 }
 
 async fn refresh_route_pools_into_arena(
@@ -645,6 +663,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &evaluated.cycle.edges,
             &refreshed,
             base_slippage_bps,
+            resim_flash_source_for_slip(&evaluated.cycle),
         );
         refreshed
     } else {
@@ -1635,11 +1654,27 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 Ok(v) => v,
                 Err(reason) => {
                     execution.quarantine_batch_query_failure(fp);
-                    execution.quarantine_direct_token_zero_realized(start_token);
-                    record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
-                    crate::info!(
-                        "balancer: batch_filter fp={fp} reject=zero_realized token={start_token} query_profit={on_chain_profit} min_profit={min_profit} reason={reason}"
-                    );
+                    // Only FoT-cool the start token on semantic zero/transfer failure.
+                    // Live poison: RPC "header not found" / timeout was recorded as
+                    // zero_realized and blackholed a proven Direct profit token for 30m
+                    // right after multiple confirms on the same token.
+                    if confirm_reason_is_semantic_fot(&reason) {
+                        execution.quarantine_direct_token_zero_realized(start_token);
+                        record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
+                        crate::info!(
+                            "balancer: batch_filter fp={fp} reject=zero_realized token={start_token} query_profit={on_chain_profit} min_profit={min_profit} reason={reason}"
+                        );
+                    } else if reason.contains("confirm_timeout") || reason.contains("timeout") {
+                        record_balancer_batch_reject(BalancerBatchReject::Timeout);
+                        crate::info!(
+                            "balancer: batch_filter fp={fp} reject=confirm_timeout token={start_token} query_profit={on_chain_profit} reason={reason}"
+                        );
+                    } else {
+                        record_balancer_batch_reject(BalancerBatchReject::RpcError);
+                        crate::info!(
+                            "balancer: batch_filter fp={fp} reject=confirm_rpc token={start_token} query_profit={on_chain_profit} reason={reason}"
+                        );
+                    }
                     return None;
                 }
             };
@@ -1677,6 +1712,22 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             None
         }
     }
+}
+
+/// True when a Direct confirm error is a real FoT / zero-balance signal, not RPC noise.
+///
+/// Live: "header not found" was classified as zero_realized and cooled the start token
+/// for 30m after multiple confirmed Direct arbs on that same token. Only explicit
+/// semantic markers cool the token; route fingerprint still cools via batch_query.
+#[must_use]
+fn confirm_reason_is_semantic_fot(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("confirm_zero_return")
+        || r.contains("transferfailed")
+        || r.contains("transfer failed")
+        || r.contains("transfer amount exceeds")
+        || r.contains("insufficient balance")
+        || r.contains("fee-on-transfer")
 }
 
 /// On-chain `queryBatchSwap` probe for balancer near-misses (sim vs vault delta).
@@ -1785,10 +1836,17 @@ mod tests {
 
     #[test]
     fn resim_depth_replaces_pre_refresh_slippage() {
-        let initial = effective_slippage_after_resim_depth(25, 2, 100);
-        let refreshed = effective_slippage_after_resim_depth(25, 2, 900);
+        let initial =
+            effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3);
+        let refreshed =
+            effective_slippage_after_resim_depth(25, 2, 900, FlashLoanSource::AaveV3);
 
         assert!(refreshed > initial);
+        // Direct does not hop-compound the encode floor.
+        assert_eq!(
+            effective_slippage_after_resim_depth(0, 3, 0, FlashLoanSource::Direct),
+            50
+        );
     }
 
     #[test]

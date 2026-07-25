@@ -122,25 +122,13 @@ fn pin_cycles_touching_pools(
         return finalize_enumerated_cycles(rest, max_cycles);
     }
     let enum_touch = pinned.len();
-    let is_uni_only = |c: &crate::core::types::FoundCycle| {
-        c.edges.iter().all(|e| {
-            matches!(
-                e.protocol,
-                crate::core::types::ProtocolType::UniswapV2
-                    | crate::core::types::ProtocolType::UniswapV3
-                    | crate::core::types::ProtocolType::UniswapV4
-            )
-        })
-    };
-    let uni_only = pinned.iter().filter(|c| is_uni_only(c)).count();
     let ratio_gt_one = pinned.iter().filter(|c| c.cycle_ratio > ONE).count();
-    // Prefer Uni-only + ratio>ONE pins — Balancer mixes and ONE-inject junk
-    // burn HF probe (live: touch=32 → drop_obs=32; near_net with cover≪gas).
+    // Prefer ratio>ONE then execution score. Live: all confirmed arbs were
+    // Balancer-only Direct — Uni-only sort demoted the profitable path.
     pinned.sort_by(|a, b| {
-        is_uni_only(b)
-            .cmp(&is_uni_only(a))
-            .then_with(|| (b.cycle_ratio > ONE).cmp(&(a.cycle_ratio > ONE)))
-            .then_with(|| crate::pipeline::types::compare_cycle_score(a, b))
+        (b.cycle_ratio > ONE)
+            .cmp(&(a.cycle_ratio > ONE))
+            .then_with(|| crate::pipeline::types::compare_cycle_execution(a, b))
     });
     pinned.truncate(max_cycles);
     let pin_kept = pinned.len();
@@ -161,7 +149,7 @@ fn pin_cycles_touching_pools(
         }
     }
     crate::debug!(
-        "stream observed-live: enum_touch={enum_touch} uni_only={uni_only} ratio_gt_one={ratio_gt_one} pinned_cycles={pin_kept} total={} (cap={max_cycles})",
+        "stream observed-live: enum_touch={enum_touch} ratio_gt_one={ratio_gt_one} pinned_cycles={pin_kept} total={} (cap={max_cycles})",
         pinned.len()
     );
     pinned
@@ -885,10 +873,10 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             outcome.diag.log_summary();
         }
         let mut result = outcome.cycles;
-        // Merge cache on observed admit. Exclusive: only Uni-only cached
-        // cycles that already touch a pin pool (full Uni cache re-poisoned
-        // pins; skipping cache zeroed enum_touch when DFS closed none).
-        // Bridge-only pins: keep full prior cache (no pin filter — there is no close).
+        // Merge cache on observed admit. Exclusive: keep any prior cycle that
+        // already touches a pin pool (all protocols — live Balancer Direct is
+        // the confirmed profit path; Uni-only filter dropped it). Bridge-only:
+        // keep full prior (no pin close exists).
         if (incremental_refind || work.force_cycle_refind || pin_bridge_only)
             && let Some(cached) = cached_cycles.as_ref()
         {
@@ -898,17 +886,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 result.extend(
                     cached
                         .iter()
-                        .filter(|c| {
-                            c.edges.iter().any(|e| pin.contains(&e.pool_index))
-                                && c.edges.iter().all(|e| {
-                                    matches!(
-                                        e.protocol,
-                                        crate::core::types::ProtocolType::UniswapV2
-                                            | crate::core::types::ProtocolType::UniswapV3
-                                            | crate::core::types::ProtocolType::UniswapV4
-                                    )
-                                })
-                        })
+                        .filter(|c| c.edges.iter().any(|e| pin.contains(&e.pool_index)))
                         .cloned(),
                 );
             } else {
@@ -931,8 +909,10 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         }
         enumeration_ms = crate::util::now_ms().saturating_sub(enum_started);
         let enumerated_cycles = result.len();
-        // pins_only only when exclusive pin search ran; bridge-skip keeps full prior.
-        let pins_only = exclusive_obs;
+        // Never pins_only-replace the universe. Live: exclusive pins_only stored
+        // 1–8 cycles into the graph cache and starved HF for many LF ticks
+        // (cycles=325 → 1/8, enumerated still 325 until next full refind).
+        // Pin-priority + prior fill keeps WSS coverage without wiping Balancer.
         let diversified = if work.observed_pool_indices.is_empty() || pin_bridge_only {
             finalize_enumerated_cycles(result, work.max_paths)
         } else {
@@ -940,11 +920,14 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 result,
                 &work.observed_pool_indices,
                 work.max_paths,
-                pins_only,
+                false, // never exclusive wipe
             )
         };
         // Exclusive / bridge pin miss used to store [] and wipe a good prior snap
         // (live: cycles_touching=6 → next admit 0/0).
+        // Also: sparse exclusive hits that still beat empty — if diversified is
+        // tiny vs a healthy prior, merge prior so the cache does not shrink.
+        const MIN_EXCLUSIVE_SNAP: usize = 64;
         let cycles = if (exclusive_obs || pin_bridge_only) && diversified.is_empty() {
             if let Some(prior) = cached_cycles.as_ref().filter(|c| !c.is_empty()) {
                 crate::info!(
@@ -975,6 +958,32 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     finalize_enumerated_cycles(refill.cycles, work.max_paths),
                 ))
             }
+        } else if exclusive_obs
+            && diversified.len() < MIN_EXCLUSIVE_SNAP
+            && let Some(prior) = cached_cycles.as_ref().filter(|c| c.len() > diversified.len())
+        {
+            let pin_first = diversified.len();
+            let mut seen: rustc_hash::FxHashSet<u64> = diversified
+                .iter()
+                .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+                .collect();
+            let mut merged = diversified;
+            for cycle in prior.iter() {
+                let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+                if seen.insert(key) {
+                    merged.push(cycle.clone());
+                    if merged.len() >= work.max_paths {
+                        break;
+                    }
+                }
+            }
+            crate::info!(
+                "stream observed-live: exclusive sparse merge pin_first={pin_first} prior={} merged={} lf_pass={}",
+                prior.len(),
+                merged.len(),
+                work.lf_pass
+            );
+            Arc::new(prune_dust_v2_cycles(&work.arena, merged))
         } else {
             Arc::new(prune_dust_v2_cycles(&work.arena, diversified))
         };
@@ -1399,6 +1408,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         .loaded_snapshot()
         .map(crate::services::execution::gas::compute_assessment_gas_price)
         .or(gas_price_wei);
+    // Snapshot pre-rescore topology — live rescore marks hundreds DEAD when
+    // spots/rates hole out (hard_floor=1 soft_fill=10 pre=272 → snap=11),
+    // then the graph cache stores the sparse set for many ticks.
+    let pre_rescore = capped.clone();
     rescore_cycles_with_table_and_gas(
         &arena,
         &table,
@@ -1408,16 +1421,75 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         Some(decimals.as_ref()),
         None,
     );
-    // Prune dead / underwater / fee-drag losers (hop-scaled floor for 3+ hops).
-    capped.retain(|c| {
+    // Drop true-dead edges only. Soft-keep (1) below min_profitable,
+    // (2) zero-ratio but non-dead, (3) pre-rescore structural fill when
+    // post-rescore hard floor is sparse.
+    const MIN_POST_RATIO_SNAP: usize = 128;
+    let pre_ratio_n = capped.len();
+    let mut hard = Vec::with_capacity(capped.len());
+    let mut soft = Vec::new();
+    let mut zeroed = Vec::new();
+    for c in capped {
         if c.score >= crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT {
-            return false;
+            continue;
         }
         if c.cycle_ratio.is_zero() {
-            return false;
+            zeroed.push(c);
+            continue;
         }
-        c.cycle_ratio >= min_profitable_cycle_ratio(c.edge_hops())
-    });
+        if c.cycle_ratio >= min_profitable_cycle_ratio(c.edge_hops()) {
+            hard.push(c);
+        } else {
+            soft.push(c);
+        }
+    }
+    let hard_floor = hard.len();
+    let mut soft_fill = 0usize;
+    let mut zero_fill = 0usize;
+    let mut structural_fill = 0usize;
+    if hard.len() < MIN_POST_RATIO_SNAP && !soft.is_empty() {
+        soft.sort_by(crate::pipeline::types::compare_cycle_execution);
+        let fill = MIN_POST_RATIO_SNAP.saturating_sub(hard.len());
+        let took = fill.min(soft.len());
+        soft_fill = took;
+        hard.extend(soft.into_iter().take(took));
+    }
+    if hard.len() < MIN_POST_RATIO_SNAP && !zeroed.is_empty() {
+        zeroed.sort_by(crate::pipeline::types::compare_cycle_execution);
+        let fill = MIN_POST_RATIO_SNAP.saturating_sub(hard.len());
+        let took = fill.min(zeroed.len());
+        zero_fill = took;
+        hard.extend(zeroed.into_iter().take(took));
+    }
+    if hard.len() < MIN_POST_RATIO_SNAP && pre_rescore.len() > hard.len() {
+        // Rescore DEAD-marked most of the universe (live: 272→11). Restore
+        // pre-rescore cycles so the cache does not shrink to pin dust.
+        let mut seen: rustc_hash::FxHashSet<u64> = hard
+            .iter()
+            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+            .collect();
+        let mut structural: Vec<_> = pre_rescore
+            .into_iter()
+            .filter(|c| {
+                let key = crate::pipeline::cycle_filter::cycle_key(&c.edges);
+                seen.insert(key)
+                    && c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT
+                    && !c.cycle_ratio.is_zero()
+            })
+            .collect();
+        structural.sort_by(crate::pipeline::types::compare_cycle_execution);
+        let fill = MIN_POST_RATIO_SNAP.saturating_sub(hard.len());
+        let took = fill.min(structural.len());
+        structural_fill = took;
+        hard.extend(structural.into_iter().take(took));
+    }
+    if soft_fill > 0 || zero_fill > 0 || structural_fill > 0 {
+        crate::debug!(
+            "lf post-cpu soft-keep: hard_floor={hard_floor} soft_fill={soft_fill} zero_fill={zero_fill} structural_fill={structural_fill} out={} pre={pre_ratio_n} lf_pass={lf_pass}",
+            hard.len()
+        );
+    }
+    capped = hard;
     // Protocol diversity (buckets ranked by gas-aware execution score).
     capped = finalize_enumerated_cycles(capped, max_paths.saturating_sub(live_held.len()));
     if !live_held.is_empty() {
@@ -1438,34 +1510,57 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             live_held.len()
         );
         live_held.sort_by(crate::pipeline::types::compare_cycle_execution);
-        live_held.truncate(32);
-        let mut seen: rustc_hash::FxHashSet<u64> = live_held
-            .iter()
-            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-            .collect();
-        let mut merged = live_held;
-        for cycle in capped {
-            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-            if seen.insert(key) {
-                merged.push(cycle);
-                if merged.len() >= max_paths {
-                    break;
+        // When every cycle touches the observed pin, live_held IS the universe —
+        // truncate(32) was wiping 110→32 (live: pre_hold=110/110 snap_total=32).
+        if capped.is_empty() {
+            capped = finalize_enumerated_cycles(std::mem::take(&mut live_held), max_paths);
+            crate::debug!(
+                "stream observed-live: pin_universe snap_total={} lf_pass={lf_pass}",
+                capped.len()
+            );
+        } else {
+            live_held.truncate(32);
+            let mut seen: rustc_hash::FxHashSet<u64> = live_held
+                .iter()
+                .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
+                .collect();
+            let mut merged = live_held;
+            for cycle in capped {
+                let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
+                if seen.insert(key) {
+                    merged.push(cycle);
+                    if merged.len() >= max_paths {
+                        break;
+                    }
                 }
             }
+            crate::debug!(
+                "stream observed-live: live_held={} snap_total={}",
+                merged
+                    .iter()
+                    .filter(|c| {
+                        c.edges
+                            .iter()
+                            .any(|e| observed_pin_set.contains(&e.pool_index))
+                    })
+                    .count(),
+                merged.len()
+            );
+            capped = merged;
         }
-        crate::debug!(
-            "stream observed-live: live_held={} snap_total={}",
-            merged
-                .iter()
-                .filter(|c| {
-                    c.edges
-                        .iter()
-                        .any(|e| observed_pin_set.contains(&e.pool_index))
-                })
-                .count(),
-            merged.len()
-        );
-        capped = merged;
+    }
+    // Safety net: rescore/ratio path emptied a non-empty CPU snap (live: cycles=0
+    // with enumerated=110). Restore the just-stored graph-cache cycles so HF is
+    // not published an empty universe until the next full refind.
+    if capped.is_empty() {
+        let cached = ctx.graph_cache.lock().cycles();
+        if let Some(prior) = cached.filter(|c| !c.is_empty()) {
+            crate::warn!(
+                "lf post-cpu emptied snap — restoring cache prior={} lf_pass={lf_pass}",
+                prior.len()
+            );
+            capped = finalize_enumerated_cycles(prior.iter().cloned().collect(), max_paths);
+        }
     }
     let finalize_ms = crate::util::now_ms().saturating_sub(finalize_started);
 

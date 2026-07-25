@@ -36,7 +36,7 @@ use crate::services::execution::flash_liquidity::{
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
 use crate::services::execution::impact_slippage::{
-    depth_impact_slippage_bps_with_base, effective_slippage_bps,
+    depth_impact_slippage_bps_with_base, effective_slippage_bps_for_flash,
 };
 use crate::services::execution::profit::{
     ProfitEvalContext, RouteAssessRequest, assessment_gas_for_edges, assessment_gas_units,
@@ -688,7 +688,12 @@ fn rank_one_cycle_probe(
         out.skip.net = 1;
         return out;
     }
-    let effective_slip = effective_slippage_bps(slippage_bps, cycle.edge_hops(), depth_bps);
+    let effective_slip = effective_slippage_bps_for_flash(
+        slippage_bps,
+        cycle.edge_hops(),
+        depth_bps,
+        flash_source,
+    );
 
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
@@ -1308,7 +1313,12 @@ fn probe_fallback_opt(
         input.token_to_matic_rates,
         input.token_decimals,
         input.gas_price,
-        effective_slippage_bps(input.slippage_bps, cycle.edge_hops(), fallback_depth),
+        effective_slippage_bps_for_flash(
+            input.slippage_bps,
+            cycle.edge_hops(),
+            fallback_depth,
+            flash_source,
+        ),
         flash_source,
         input.safety_multiplier_bps,
     );
@@ -1510,9 +1520,16 @@ fn evaluate_one(
         .map(|(amount, sim)| {
             let depth =
                 depth_impact_slippage_bps_with_base(input.arena, &cycle.edges, amount, Some(&sim));
-            effective_slippage_bps(input.slippage_bps, hop_count, depth)
+            effective_slippage_bps_for_flash(
+                input.slippage_bps,
+                hop_count,
+                depth,
+                flash_source_brent,
+            )
         })
-        .unwrap_or_else(|| effective_slippage_bps(base_slippage, hop_count, 0));
+        .unwrap_or_else(|| {
+            effective_slippage_bps_for_flash(base_slippage, hop_count, 0, flash_source_brent)
+        });
     let mut profit_ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
         input.arena,
@@ -1684,12 +1701,23 @@ fn evaluate_one(
         }
         depth_bps = 3_000;
     }
-    let slippage_bps = effective_slippage_bps(input.slippage_bps, hop_count, depth_bps);
+    let slippage_bps = effective_slippage_bps_for_flash(
+        input.slippage_bps,
+        hop_count,
+        depth_bps,
+        flash_source,
+    );
     let mut assessment =
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
-    // Probe-only dust phantoms: live ain=100000 (0.1 USDC) "profit" 0.25–0.40 MATIC
-    // then dry-run TransferFailed/IIA. MATIC economic floor alone is ~0.008 USDC at
-    // $0.08/MATIC — too low. Require ≥1 whole start token plus hop fidelity.
+    // Dispatch size floor + hop fidelity.
+    //
+    // Stable/dust tokens (≤8 decimals): require ≥1 whole unit. Live 0.1 USDC
+    // phantoms (ain=1e5) cleared the MATIC economic floor (~0.008 USDC) then
+    // dry-ran TransferFailed/IIA.
+    //
+    // 18-decimal hubs (WMATIC/WETH): economic floor alone. Forcing a full unit
+    // killed real edges sized at 0.3–0.9 token with 0.5–0.8 MATIC net (live:
+    // positive-net reject "below economic floor" while gas was covered 8×).
     if assessment.should_execute {
         let start_decimals =
             resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
@@ -1698,7 +1726,11 @@ fn evaluate_one(
             resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
         );
         let one_token = crate::util::ten_pow_u256(start_decimals);
-        let floor = economic.max(one_token);
+        let floor = if start_decimals <= 8 {
+            economic.max(one_token)
+        } else {
+            economic
+        };
         let has_hop_amounts = sim.hop_amounts.iter().any(|a| !a.is_zero());
         let fidelity_ok = has_hop_amounts
             && local_sim::route_hop_fidelity_ok_after_walk(
