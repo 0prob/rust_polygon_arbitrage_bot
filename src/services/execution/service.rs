@@ -1244,15 +1244,16 @@ impl ExecutionService {
             let reason = dry.failure_reason();
             // Adaptive USD flash cap was the binding constraint — size-fail demotes
             // so the next assess starts smaller instead of replaying BAL#528 at cap.
-            if candidate.adaptive_flash_cap_bound && flash_size_failure_reason(&reason) {
-                if let Some((previous, next)) = self.demote_adaptive_flash_loan_cap(
+            if candidate.adaptive_flash_cap_bound
+                && flash_size_failure_reason(&reason)
+                && let Some((previous, next)) = self.demote_adaptive_flash_loan_cap(
                     fp,
                     candidate.adaptive_flash_loan_usd_limit,
-                ) {
-                    crate::info!(
-                        "flash cap demoted: fp={fp} usd={previous}->{next} after size dry-run fail"
-                    );
-                }
+                )
+            {
+                crate::info!(
+                    "flash cap demoted: fp={fp} usd={previous}->{next} after size dry-run fail"
+                );
             }
             crate::info!(
                 "dry-run failed: fp={}, route_hash={}, flash={:?}, ain={}, profit_matic={}, hops={}, route={}, reason={}{}",
@@ -1368,9 +1369,11 @@ impl ExecutionService {
             }
         };
 
-        // Tip uplift from dry-run realized profit (MATIC wei). Executor returns token
-        // units — sim expected can be 5× optimistic when used raw (live: sim 0.69 MATIC
-        // → tip~173 gwei; realized token profit misread as MATIC over/under-tips).
+        // Tip intensity basis (MATIC wei), matching assess_profit's gross MATIC tip:
+        // 1) dry-run realized token profit → MATIC (authoritative when present)
+        // 2) sim gross → MATIC (same basis as assess priority uplift)
+        // 3) post-tip expected_profit fallback
+        // Using only post-tip expected under-bids vs assess (live: tip from net < tip from gross).
         let tip_profit = realized_profit
             .and_then(|p| {
                 token_profit_to_matic_wei(
@@ -1380,6 +1383,14 @@ impl ExecutionService {
                 )
             })
             .filter(|p| !p.is_zero())
+            .or_else(|| {
+                token_profit_to_matic_wei(
+                    candidate.gross_profit,
+                    candidate.token_to_matic_rate,
+                    candidate.token_decimals,
+                )
+                .filter(|p| !p.is_zero())
+            })
             .unwrap_or(candidate.expected_profit_matic_wei);
         // Tip intensity uses execution gas (sim/dry-run), not buffered tx limit.
         let tip_gas_units = dry

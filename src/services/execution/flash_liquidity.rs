@@ -25,9 +25,7 @@ use crate::infra::rpc::{RpcPool, rpc_host_label};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::simulate_route_detailed;
 use crate::pipeline::multicall::{MulticallItem, encode_call, execute_multicall};
-use crate::pipeline::sim_sanity::{
-    FlashBorrowCapParams, SimSanityInput, min_final_profit_matic_wei,
-};
+use crate::pipeline::sim_sanity::{FlashBorrowCapParams, SimSanityInput};
 use crate::pipeline::ternary::RouteGasCosting;
 use crate::pipeline::ternary::optimize_cycle;
 use crate::services::execution::aave::{
@@ -1506,14 +1504,12 @@ fn reoptimize_capped(
         source,
         input.safety_multiplier_bps,
     );
+    // Match HF Brent: `RouteGasCosting` pre-resolves observed/sim_scale gas —
+    // leave gas_scale_bps at 1.0× so probe_assess does not scale twice.
     profit_ctx.gas_scale_bps = 10_000;
     profit_ctx.hop_count = input.evaluated.cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
-    profit_ctx.charged_priority_fee_per_gas = input
-        .gas_oracle
-        .loaded_snapshot()
-        .map(|s| s.priority_fee.max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS))
-        .unwrap_or(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS);
+    profit_ctx.charged_priority_fee_per_gas = charged_priority_from_oracle(input.gas_oracle);
     let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
         input.gas_oracle,
         [input.route_fingerprint],
@@ -1580,20 +1576,34 @@ fn reoptimize_capped(
         },
         flash_source: source,
         liquidity_cap_applied: true,
-        adaptive_flash_cap_bound: false,
+        // Keep HF adaptive-USD flag so dry-run BAL#528 / size fails still demote
+        // the learned cap (was always cleared here → stuck oversized flash).
+        adaptive_flash_cap_bound: input.adaptive_flash_cap_bound,
     })
 }
 
 fn prepare_profit_thresholds(
     input: &PrepareDispatchInput<'_>,
 ) -> crate::services::execution::profit::ProfitThresholds {
+    // `min_profit_matic` is already `required_profit_matic_wei` (config ∪ $0.01 floor)
+    // from dispatch. Recomputing only the USD-cent floor dropped MIN_PROFIT_MATIC_WEI.
+    // charged_priority must match gas_price tip (not hardcoded min).
     route_profit_thresholds(
-        min_final_profit_matic_wei(input.matic_usd, input.matic_usd_chainlink).unwrap_or(U256::MAX),
+        input.min_profit_matic,
         input.min_profit_roi_bps,
         input.safety_multiplier_bps,
         input.profit_priority_alpha_bps,
         input.risk_multiplier_bps,
+        charged_priority_from_oracle(input.gas_oracle),
     )
+}
+
+#[inline]
+fn charged_priority_from_oracle(gas_oracle: &GasOracle) -> U256 {
+    gas_oracle
+        .loaded_snapshot()
+        .map(|s| s.priority_fee.max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS))
+        .unwrap_or(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS)
 }
 
 #[inline]
@@ -2089,11 +2099,47 @@ mod tests {
 
     #[test]
     fn prepare_thresholds_apply_route_risk_multiplier() {
-        let thresholds =
-            route_profit_thresholds(U256::from(10_000_000_000_000_000u64), 0, 10_000, 0, 30_000);
+        let thresholds = route_profit_thresholds(
+            U256::from(10_000_000_000_000_000u64),
+            0,
+            10_000,
+            0,
+            30_000,
+            crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+        );
         assert_eq!(
             thresholds.min_profit_matic_wei,
             U256::from(30_000_000_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn charged_priority_from_oracle_uses_snapshot_tip_not_hardcoded_min() {
+        use crate::services::execution::FeeSnapshot;
+        use crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS;
+
+        let oracle = GasOracle::default();
+        // Cold oracle → network min tip floor.
+        assert_eq!(
+            charged_priority_from_oracle(&oracle),
+            MIN_PRIORITY_FEE_PER_GAS
+        );
+
+        let elevated = U256::from(40_000_000_000u64); // 40 gwei > 25 gwei min
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(50_000_000_000u64),
+            priority_fee: elevated,
+        });
+        assert_eq!(charged_priority_from_oracle(&oracle), elevated);
+
+        // Sub-min tip still floors at MIN so assess does not re-charge the gap.
+        oracle.set_fee_snapshot_for_test(FeeSnapshot {
+            base_fee: U256::from(50_000_000_000u64),
+            priority_fee: U256::from(1u64),
+        });
+        assert_eq!(
+            charged_priority_from_oracle(&oracle),
+            MIN_PRIORITY_FEE_PER_GAS
         );
     }
 

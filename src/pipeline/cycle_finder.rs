@@ -775,12 +775,13 @@ fn pool_mark(used: &mut Vec<bool>, pool_id: u32) -> bool {
 }
 
 #[inline]
-fn pool_unmark(used: &mut Vec<bool>, pool_id: u32) {
+fn pool_unmark(used: &mut [bool], pool_id: u32) {
     if let Some(slot) = used.get_mut(pool_id as usize) {
         *slot = false;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_cycles_dfs_single_start(
     graph: &RoutingGraph,
     arena: &StateArena,

@@ -871,8 +871,8 @@ mod tests {
             score: 0.0,
             cycle_ratio: U256::ZERO,
         };
-        let mut table = SpotTable::new(1);
-        rescore_one_cycle(&arena, &mut table, &mut cycle, None, None, None, None);
+        let table = SpotTable::new(1);
+        rescore_one_cycle(&arena, &table, &mut cycle, None, None, None, None);
         let expected = cycle_product_ratio(&arena, &cycle.edges);
         assert_eq!(cycle.cycle_ratio, expected);
         assert!(!cycle.cycle_ratio.is_zero());

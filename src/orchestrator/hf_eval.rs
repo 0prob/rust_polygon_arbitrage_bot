@@ -1732,7 +1732,7 @@ fn assess_route_for_cycle(
     flash_source: FlashLoanSource,
 ) -> Option<ProfitAssessment> {
     let risk_bps = input.execution.route_risk_multiplier_bps(fp);
-    let mut thresholds = route_profit_thresholds(
+    let thresholds = route_profit_thresholds(
         required_profit_matic_wei(
             input.min_profit_matic,
             input.matic_usd,
@@ -1743,8 +1743,8 @@ fn assess_route_for_cycle(
         input.safety_multiplier_bps,
         input.profit_priority_alpha_bps,
         risk_bps,
+        input.charged_priority_fee_per_gas,
     );
-    thresholds.charged_priority_fee_per_gas = input.charged_priority_fee_per_gas;
     // Global MAX_SANE_PROFIT_MATIC_WEI already applied in assess_route_from_sim.
     Some(assess_route_from_sim(&RouteAssessRequest {
         cycle_start: cycle.start_token,

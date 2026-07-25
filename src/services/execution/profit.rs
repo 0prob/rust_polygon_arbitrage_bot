@@ -406,6 +406,9 @@ pub struct ProfitThresholds {
     pub charged_priority_fee_per_gas: U256,
 }
 
+/// Build assess thresholds. `charged_priority_fee_per_gas` must be the tip already
+/// priced into `gas_price_wei` (oracle tip floored at min) — never leave this at a
+/// hardcoded min when gas_price embeds a higher tip (double-counts uplift).
 #[must_use]
 pub fn route_profit_thresholds(
     min_profit_matic: U256,
@@ -413,6 +416,7 @@ pub fn route_profit_thresholds(
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
     risk_bps: u64,
+    charged_priority_fee_per_gas: U256,
 ) -> ProfitThresholds {
     ProfitThresholds {
         min_profit_matic_wei: min_profit_matic.saturating_mul(U256::from(risk_bps))
@@ -420,7 +424,7 @@ pub fn route_profit_thresholds(
         min_profit_roi_bps,
         safety_multiplier_bps,
         profit_priority_alpha_bps,
-        charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+        charged_priority_fee_per_gas,
     }
 }
 

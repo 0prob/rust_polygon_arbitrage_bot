@@ -62,10 +62,7 @@ fn matic_rate_from_probe_sim_with_decimals(
     // for USDC/USDT/etc. inflates hub MATIC rates by 1e12 and poisons gas/profit.
     let decimals = match token_decimals {
         Some(hints) => {
-            match crate::services::oracle::explicit_decimals_for_index(token, arena, hints) {
-                Some(d) => d,
-                None => return None,
-            }
+            crate::services::oracle::explicit_decimals_for_index(token, arena, hints)?
         }
         None => arena.token_decimals(token),
     };

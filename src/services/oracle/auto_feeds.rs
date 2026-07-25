@@ -145,10 +145,10 @@ pub fn load_and_apply_auto_feeds(oracle: &PriceOracle) {
         }
         no_n = guard.no_feed.len() as u32;
     }
-    if purged > 0 || unblocked > 0 || cleared_no_feed > 0 {
-        if let Err(e) = persist_store(&path) {
-            crate::warn!("oracle auto-feeds: purge persist failed: {e}");
-        }
+    if (purged > 0 || unblocked > 0 || cleared_no_feed > 0)
+        && let Err(e) = persist_store(&path)
+    {
+        crate::warn!("oracle auto-feeds: purge persist failed: {e}");
     }
     if feeds_n > 0 || no_n > 0 || purged > 0 || unblocked > 0 || cleared_no_feed > 0 {
         crate::info!(
