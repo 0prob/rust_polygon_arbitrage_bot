@@ -20,9 +20,6 @@ pub const EMPTY_TICK_COOLDOWN_MS: u64 = 90_000;
 /// After hydrate timeout (fetch never completed). Live: 30s under rate-limit left
 /// high-priority pools stuck tickless while residual prep re-burned elsewhere.
 pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 12_000;
-/// After a successful tick load, suppress re-hydrate. Preserve-on-price-move
-/// already keeps arrays; 8s cuts redundant TickLens when stream patches land.
-pub const RECENT_HYDRATE_COOLDOWN_MS: u64 = 8_000;
 /// HF probe narrow-only empty miss — not a full-empty proof (no widen).
 /// Lives in a separate map so LF can still widen; shared EMPTY cool was either
 /// pinning LF (45s) or letting HF re-burn the probe cap every 5s (live iter2:
@@ -463,8 +460,15 @@ pub async fn hydrate_cl_ticks_with_rpc_fallback(
                     } else {
                         let started = crate::util::now_ms();
                         v4_res = Some(
-                            enrich_v4_ticks(&provider, arena, &needed, v4_word_range, block_number)
-                                .await,
+                            enrich_v4_ticks(
+                                &provider,
+                                arena,
+                                &needed,
+                                v4_word_range,
+                                block_number,
+                                allow_widen,
+                            )
+                            .await,
                         );
                         v4_ms_add = crate::util::now_ms().saturating_sub(started);
                     }
@@ -785,11 +789,11 @@ pub async fn enrich_v3_ticks<
         }
     }
     if !loaded_ok.is_empty() {
-        mark_tick_cooldown_addresses(loaded_ok.iter().copied(), RECENT_HYDRATE_COOLDOWN_MS);
-        // Loaded via widen/algebra — drop probe-narrow miss so HF can re-touch if ticks drop.
-        let mut miss = PROBE_NARROW_MISS_UNTIL_MS.lock();
-        for pool in &loaded_ok {
-            miss.remove(pool);
+        // Success must clear miss/empty cool so a later hot-cache tick drop can
+        // re-hydrate. Writing RECENT into EMPTY_TICK (prior behavior) falsely
+        // armed tickless_stuck_skip while ticks were gone — pure poison.
+        for &pool in &loaded_ok {
+            clear_tick_hydrate_cooldown(pool);
         }
     }
     // URL fallback when empties remain after hard RPC fail or incomplete words.
@@ -993,6 +997,9 @@ pub async fn enrich_v4_ticks<
     targets: &[(PoolIndex, FixedBytes<32>)],
     word_range: i16,
     block_number: Option<u64>,
+    // HF probe: skip widen (2nd multicall wave) — free-tier rate limits make
+    // probe+widen of empty V4 batches a self-inflicted 429 storm.
+    allow_widen: bool,
 ) -> TickEnrichment {
     use crate::pipeline::abi_cache::{decode_abi_word, encode_extsload};
     use crate::pipeline::multicall::{MulticallItem, execute_multicall_at};
@@ -1169,7 +1176,7 @@ pub async fn enrich_v4_ticks<
     // Only pools that saw a full hydrate (wide pass, or word_range already maxed)
     // may enter the empty cooldown — capped-out narrow misses must stay eligible.
     let mut wide_attempted: FxHashSet<FixedBytes<32>> = FxHashSet::default();
-    let widen_available = word_range < 48;
+    let widen_available = allow_widen && word_range < 48;
     if updated < targets.len() && widen_available {
         let wide_range = word_range.saturating_mul(3).clamp(24, 48);
         let mut still: Vec<(PoolIndex, FixedBytes<32>, u128)> = targets
@@ -1212,18 +1219,26 @@ pub async fn enrich_v4_ticks<
         }
     }
     if !loaded_ok.is_empty() {
-        mark_v4_tick_cooldown(loaded_ok, RECENT_HYDRATE_COOLDOWN_MS);
+        // Clear empty/timeout cool so a later tick drop can re-hydrate (see V3).
+        for pool_id in loaded_ok {
+            clear_v4_tick_hydrate_cooldown(pool_id);
+        }
     }
     let incomplete_count = incomplete_pools.len();
     let needs_url_fallback =
         !still_tickless.is_empty() && (incomplete_count > 0 || capped || wide.rpc_failed);
     if !still_tickless.is_empty() && !needs_url_fallback {
-        // ponytail: cooldown only after wide attempt (or max word_range); else next tick retries
-        let cool = still_tickless
-            .iter()
-            .copied()
-            .filter(|id| !widen_available || wide_attempted.contains(id));
-        mark_empty_v4_tick_cooldown(cool);
+        if allow_widen {
+            // LF/dispatch: EMPTY cool only after wide attempt, or word_range already maxed.
+            let cool = still_tickless
+                .iter()
+                .copied()
+                .filter(|id| word_range >= 48 || wide_attempted.contains(id));
+            mark_empty_v4_tick_cooldown(cool);
+        } else {
+            // HF probe narrow-only: not a full-empty proof — short suppress only.
+            mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
+        }
     } else if !still_tickless.is_empty() && incomplete_count > 0 {
         mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
     }

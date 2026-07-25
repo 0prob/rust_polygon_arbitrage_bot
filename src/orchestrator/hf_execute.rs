@@ -1230,6 +1230,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     // any partial ticks from incomplete prior loads if we ever expand selection).
     // Probe: fewer bitmap words finish inside residual (default word_range=10 → 21
     // multicall items/pool; 4 → 9). Partial depth still unlocks probe rank.
+    // V4 previously used full word_range + unconditional widen — free-tier 429s
+    // on 27-pool LF batches poisoned the shared RPC budget for HF probe too.
     let probe_word_range = word_range.min(4);
     let pass = hydrate_cl_ticks_with_rpc_fallback(
         rpc,
@@ -1239,8 +1241,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
         &algebra_pools,
         &algebra_integral_pools,
         probe_word_range,
-        word_range,
-        false, // probe residual budget — narrow only
+        probe_word_range,
+        false, // probe residual budget — narrow only (V3 + V4)
         block_number,
         "hf probe-tick hydrate",
     )
