@@ -40,9 +40,8 @@ use crate::services::execution::impact_slippage::{
 };
 use crate::services::execution::profit::{
     ProfitEvalContext, RouteAssessRequest, assessment_gas_for_edges, assessment_gas_units,
-    assess_route_from_sim,
-    brent_score_matic_from_sim, cover_matic_from_sim, net_profit_matic_from_sim,
-    route_profit_thresholds,
+    assess_route_from_sim, brent_score_matic_from_sim, cover_matic_from_sim,
+    flash_loan_fee_bps, net_profit_matic_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
@@ -1543,16 +1542,17 @@ fn evaluate_one(
     // Shared CL shallow caps for post-Brent detailed walks.
     let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
 
-    let (opt, sim, probe_only) = match optimize_cycle(
+    let max_flash_usd = input
+        .execution
+        .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd);
+    let route_cache = route_state_revision
+        .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp));
+    let (mut opt, mut sim, probe_only) = match optimize_cycle(
         input.arena,
         cycle,
         input.token_to_matic_rates,
         input.token_decimals,
-        Some(
-            input
-                .execution
-                .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd),
-        ),
+        Some(max_flash_usd),
         input.matic_usd,
         input.matic_usd_chainlink,
         Some(input.brent_iters),
@@ -1560,8 +1560,7 @@ fn evaluate_one(
         &profit_ctx,
         brent_seed_slice,
         Some(route_gas_costing),
-        route_state_revision
-            .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp)),
+        route_cache,
     ) {
         Some(opt) => {
             let Some(sim) = simulate_route_detailed_with_caps(
@@ -1602,13 +1601,70 @@ fn evaluate_one(
         }
     };
 
-    let Some(flash_source) =
+    let Some(mut flash_source) =
         resolve_flash_source_with_context(&flash_ctx, input.flash_policy, opt.optimal_input)
     else {
         inc(&stats.flash_source);
         return None;
     };
-    // ponytail: single assess with depth-aware slip — no second Brent reopt.
+
+    // Probe-size flash plan is often free Balancer; economic/optimal size often
+    // needs Aave (5 bps). Brent under the wrong fee oversizes → prepare/dry-run miss.
+    // One re-size under the true fee (+ provider liquidity hard-cap when known).
+    if !probe_only && flash_loan_fee_bps(flash_source) != flash_loan_fee_bps(flash_source_brent)
+    {
+        profit_ctx.flash_source = flash_source;
+        let liq_cap = match flash_source {
+            FlashLoanSource::AaveV3 if flash_ctx.liquidity.aave_listed => {
+                Some(flash_ctx.liquidity.aave).filter(|c| !c.is_zero())
+            }
+            FlashLoanSource::Balancer => {
+                Some(flash_ctx.liquidity.balancer).filter(|c| !c.is_zero())
+            }
+            FlashLoanSource::Dodo => Some(flash_ctx.liquidity.dodo).filter(|c| !c.is_zero()),
+            FlashLoanSource::Direct | FlashLoanSource::AaveV3 => None,
+        };
+        if let Some(new_opt) = optimize_cycle(
+            input.arena,
+            cycle,
+            input.token_to_matic_rates,
+            input.token_decimals,
+            Some(max_flash_usd),
+            input.matic_usd,
+            input.matic_usd_chainlink,
+            Some(input.brent_iters),
+            liq_cap,
+            &profit_ctx,
+            brent_seed_slice,
+            Some(route_gas_costing),
+            route_cache,
+        ) && let Some(new_sim) = simulate_route_detailed_with_caps(
+            input.arena,
+            &cycle.edges,
+            new_opt.optimal_input,
+            route_shallow_caps.as_ref(),
+        ) && validate_optimized_sim(
+            input,
+            cycle,
+            &new_sim,
+            new_opt.optimal_input,
+            new_opt.search_low,
+        ) && let Some(src) = resolve_flash_source_with_context(
+            &flash_ctx,
+            input.flash_policy,
+            new_opt.optimal_input,
+        ) {
+            crate::debug!(
+                "evaluate_one flash-fee reopt: fp={fp:#x} {flash_source_brent:?}->{src:?} input {}->{}",
+                opt.optimal_input,
+                new_opt.optimal_input,
+            );
+            opt = new_opt;
+            sim = new_sim;
+            flash_source = src;
+        }
+    }
+
     let mut depth_bps = depth_impact_slippage_bps_with_base(
         input.arena,
         &cycle.edges,

@@ -45,6 +45,7 @@ pub fn encode_transfer_all_calldata(token: Address, to: Address) -> Bytes {
 /// Submit `transferAll(profit_token, recipient)` and wait for a receipt.
 ///
 /// Failures are returned to the caller; they must not change the arb `Confirmed` outcome.
+#[allow(clippy::too_many_arguments)]
 pub async fn sweep_profit_to_recipient<P: Provider<Ethereum>, S: Provider<Ethereum>>(
     submit_provider: &P,
     receipt_provider: &S,
