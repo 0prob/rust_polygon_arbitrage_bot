@@ -198,6 +198,24 @@ fn reserve_hydrate_budget(stage: Duration) -> (Duration /* work */, Duration /* 
     }
 }
 
+/// Resolve TickLens budget at hydrate time.
+///
+/// Prefer the floor carved before pool/flash. Expand toward MAX from residual
+/// when the gap is open. If carve left `floor=0` (sub-MIN stage) but residual
+/// later allows, reclaim a fresh carve (legacy path).
+#[inline]
+fn resolve_hydrate_budget(hydrate_floor: Duration, gap_ok: bool, residual: Duration) -> Duration {
+    if !gap_ok {
+        return Duration::ZERO;
+    }
+    let reclaimed = reserve_hydrate_budget(residual).1;
+    if hydrate_floor.is_zero() {
+        reclaimed
+    } else {
+        hydrate_floor.max(reclaimed).min(HF_PROBE_HYDRATE_MAX_BUDGET)
+    }
+}
+
 /// Hub tokens that block probe ranking when cold (WMATIC ColdCache → empty ranks).
 /// Hubs that are cold (missing / past full TTL) — soft-stale hubs (75–100% TTL)
 /// must not block HF; spawn/background refreshes them.
@@ -1761,18 +1779,19 @@ pub async fn run_hf_tick(
     let state_cache = Arc::clone(&ctx.cache);
     // Residual prep budget for pool/flash (shared deadline — no stage stacking).
     let stage_budget = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
-    // Only carve hydrate when the 1.5s gap will allow it. Live: every HF tick
-    // reserved up to 1.5s hydrate floor then skipped on gap → pool/flash starved
-    // and residual 0 for the rare tick that *could* hydrate.
+    // Carve hydrate from pool/flash. When the 1.5s gap will allow this tick, take up
+    // to MAX. When it won't, still keep a one-pool MIN floor — otherwise work burns
+    // the full stage and hydrate arrives with residual=0 just as the gap opens
+    // (live post-reclaim: floor=0 budget=0 residual=0 every ~7.5s).
     let hydrate_gap_will_allow = {
         let last = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
         now_ms().saturating_sub(last) >= PROBE_HYDRATE_MIN_GAP_MS
     };
-    // Reserve hydrate floor from *both* pool and flash. Live: pool_budget used the
-    // full stage (flash alone reserved 1.4s) → residual 0 after a 1.3s multicall →
-    // hydrate skipped → cl_tickless/shallow_cl emptied probe_kept.
     let (work_budget, hydrate_reserved) = if hydrate_gap_will_allow {
         reserve_hydrate_budget(stage_budget)
+    } else if stage_budget >= HF_PROBE_HYDRATE_MIN_BUDGET {
+        let hydrate = HF_PROBE_HYDRATE_MIN_BUDGET;
+        (stage_budget.saturating_sub(hydrate), hydrate)
     } else {
         (stage_budget, Duration::ZERO)
     };
@@ -2036,19 +2055,23 @@ pub async fn run_hf_tick(
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
-    // Use the carved hydrate_floor — prep_deadline residual is often 0 here after
-    // flash/oracle even when reserve_hydrate_budget held MAX at stage start.
-    let probe_tick_budget = hydrate_floor
+    // Prefer the pre-carve floor; if gap opened after we declined to reserve,
+    // reclaim from residual so TickLens is not idle with prep budget left.
+    let probe_tick_started = now_ms();
+    let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
+    let hydrate_gap_ok =
+        probe_tick_started.saturating_sub(last_hydrate) >= PROBE_HYDRATE_MIN_GAP_MS;
+    let residual_for_hydrate =
+        prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
+    let hydrate_budget =
+        resolve_hydrate_budget(hydrate_floor, hydrate_gap_ok, residual_for_hydrate);
+    let probe_tick_budget = hydrate_budget
         .min(HF_PROBE_HYDRATE_MAX_BUDGET)
         .min(prep_remaining(tick_deadline));
-    let probe_tick_started = now_ms();
     let probe_pool_cap =
         crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(probe_tick_budget);
     static HYDRATE_INFO_LOG_AT: AtomicU64 = AtomicU64::new(0);
     static HYDRATE_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
-    let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
-    let hydrate_gap_ok =
-        probe_tick_started.saturating_sub(last_hydrate) >= PROBE_HYDRATE_MIN_GAP_MS;
     // Use latest block for tick lens: hot-cache overlay may be newer than
     // `last_state_block`, and pinning there yields empty bitmaps (loaded=0).
     let hydrate_stats = if !hydrate_gap_ok {
@@ -2067,9 +2090,10 @@ pub async fn run_hf_tick(
                 .is_ok()
         {
             crate::info!(
-                "hf probe-tick hydrate skipped: floor={}ms residual_prep={}ms cap={probe_pool_cap} (need ≥{}ms)",
+                "hf probe-tick hydrate skipped: floor={}ms budget={}ms residual_prep={}ms cap={probe_pool_cap} (need ≥{}ms)",
                 hydrate_floor.as_millis(),
-                prep_remaining(prep_deadline).as_millis(),
+                hydrate_budget.as_millis(),
+                residual_for_hydrate.as_millis(),
                 HF_PROBE_HYDRATE_MIN_BUDGET.as_millis()
             );
         }
@@ -2954,6 +2978,45 @@ mod tests {
         assert_eq!(
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate_e),
             1
+        );
+    }
+
+    #[test]
+    fn resolve_hydrate_reclaims_when_gap_opens_after_carve() {
+        // Gap closed at carve → floor=0; gap open at hydrate with large residual.
+        let reclaimed = resolve_hydrate_budget(
+            Duration::ZERO,
+            true,
+            Duration::from_millis(2_400),
+        );
+        assert_eq!(reclaimed, HF_PROBE_HYDRATE_MAX_BUDGET);
+        assert_eq!(
+            crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(reclaimed),
+            6
+        );
+
+        // Gap still closed → do not run TickLens (floor held for next eligible tick).
+        assert!(resolve_hydrate_budget(
+            HF_PROBE_HYDRATE_MIN_BUDGET,
+            false,
+            Duration::from_millis(2_400)
+        )
+        .is_zero());
+
+        // MIN floor expands to MAX when residual allows.
+        assert_eq!(
+            resolve_hydrate_budget(
+                HF_PROBE_HYDRATE_MIN_BUDGET,
+                true,
+                Duration::from_millis(2_400)
+            ),
+            HF_PROBE_HYDRATE_MAX_BUDGET
+        );
+
+        // MIN floor kept when residual is gone (the residual=0 race).
+        assert_eq!(
+            resolve_hydrate_budget(HF_PROBE_HYDRATE_MIN_BUDGET, true, Duration::ZERO),
+            HF_PROBE_HYDRATE_MIN_BUDGET
         );
     }
 
