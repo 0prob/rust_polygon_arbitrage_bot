@@ -513,11 +513,11 @@ fn parse_rows(
         if b > max_block {
             max_block = b;
         }
-        let protocol: String = row.try_get("protocol").unwrap_or_default();
         if let Some(pool) = parse_pg_row(row) {
-            record_pg_row(&mut stats, &protocol, true);
+            record_pg_row(&mut stats, &pool.protocol_label, true);
             pools.push(pool);
         } else {
+            let protocol: String = row.try_get("protocol").unwrap_or_default();
             record_pg_row(&mut stats, &protocol, false);
         }
     }
@@ -532,14 +532,7 @@ fn parse_incremental_rows(
     let mut cursor = initial.clone();
     let mut stats = ParseStats::default();
     for row in rows {
-        let created = block_from_row(row, "createdBlock");
         let id: String = row.try_get("id").unwrap_or_default();
-        advance_cursor_pair(
-            &mut cursor.last_block,
-            &mut cursor.last_block_id,
-            created,
-            &id,
-        );
         if let Ok(updated) = row.try_get::<_, i32>("updatedAtBlock") {
             let updated = updated.max(0) as u64;
             advance_cursor_pair(
@@ -548,12 +541,20 @@ fn parse_incremental_rows(
                 updated,
                 &id,
             );
+        } else {
+            let created = block_from_row(row, "createdBlock");
+            advance_cursor_pair(
+                &mut cursor.last_block,
+                &mut cursor.last_block_id,
+                created,
+                &id,
+            );
         }
-        let protocol: String = row.try_get("protocol").unwrap_or_default();
         if let Some(pool) = parse_pg_row(row) {
-            record_pg_row(&mut stats, &protocol, true);
+            record_pg_row(&mut stats, &pool.protocol_label, true);
             pools.push(pool);
         } else {
+            let protocol: String = row.try_get("protocol").unwrap_or_default();
             record_pg_row(&mut stats, &protocol, false);
         }
     }

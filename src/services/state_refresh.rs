@@ -24,6 +24,7 @@ use crate::services::balancer_backend::enrich_polygon_balancer_pool_ids;
 use crate::services::discovery::{
     DiscoveredPool, TokenMeta, is_routable_pool, retain_routable_pool, unknown_tokens_from_pools,
 };
+use crate::services::hypersync::HyperSyncClient;
 use crate::services::index_diag::{
     log_index_summary, record_index_bootstrap_page, record_index_discovery_notify,
     record_index_discovery_skipped_tick, record_index_incremental_rows,
@@ -95,6 +96,8 @@ pub struct StateRefreshService {
     cache: Arc<StateCache>,
     rpc: Arc<RpcPool>,
     pool_meta_cache: Arc<PoolMetaCache>,
+    /// Envio HyperSync client for gap-fill pool discovery.
+    hypersync: HyperSyncClient,
     discovery_state: RwLock<DiscoveryState>,
     discovery_count: AtomicU64,
     token_metadata_loaded: AtomicBool,
@@ -123,12 +126,17 @@ impl StateRefreshService {
         let pool_meta_cache = Arc::new(PoolMetaCache::new(PathBuf::from(
             &config.pipeline.pool_meta_cache_path,
         )));
+        let hypersync = HyperSyncClient::new(
+            config.pipeline.hypersync_url.clone(),
+            config.pipeline.hypersync_enabled,
+        );
         Ok(Self {
             config,
             pg,
             cache,
             rpc,
             pool_meta_cache,
+            hypersync,
             discovery_state: RwLock::new(DiscoveryState::default()),
             discovery_count: AtomicU64::new(0),
             token_metadata_loaded: AtomicBool::new(false),
@@ -414,6 +422,29 @@ impl StateRefreshService {
         self.discovery_state.write().last_discovery_ms = now_ms();
         self.discovery_count.fetch_add(1, Ordering::Relaxed);
 
+        // HyperSync gap-fill: when PG indexer is stale, query HyperSync for any pool
+        // creation events in the lagging window so we stay current without waiting
+        // for PG to catch up.  Only runs when explicitly enabled and not bootstrapping.
+        if self.hypersync.is_enabled() && !force_bootstrap {
+            let indexer_block = self.last_indexer_block.load(Ordering::Relaxed);
+            let lag = self.indexer_lag_blocks.load(Ordering::Relaxed);
+            let hs_threshold = self.config.pipeline.indexer_max_lag_blocks;
+            if lag > hs_threshold && indexer_block > 0 {
+                let from = indexer_block.saturating_sub(1);
+                match self.hypersync.discover_recent_pools(from, None).await {
+                    Ok((_height, hs_pools)) if !hs_pools.is_empty() => {
+                        crate::info!(
+                            "hypersync gap-fill: lag={lag} blocks, {} new pools from block {from}",
+                            hs_pools.len()
+                        );
+                        result.pools.extend(hs_pools);
+                    }
+                    Ok(_) => {}
+                    Err(e) => crate::warn!("hypersync gap-fill error (non-fatal): {e:#}"),
+                }
+            }
+        }
+
         // Incremental path (or bootstrap that skipped the join) still needs metas once.
         if !self.token_metadata_loaded.load(Ordering::Acquire) {
             self.refresh_token_metas().await;
@@ -506,6 +537,8 @@ impl StateRefreshService {
                 // Pools already passed retain_routable_pool in bootstrap/incremental.
                 let discovered = Arc::make_mut(&mut state.discovered);
                 let address_index = Arc::make_mut(&mut address_index);
+                index.reserve(result.pools.len());
+                address_index.reserve(result.pools.len());
                 for pool in result.pools {
                     if let Some(&idx) = index.get(&pool.pool_key) {
                         if let Some(old_address) =

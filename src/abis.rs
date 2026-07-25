@@ -386,4 +386,26 @@ sol! {
         );
     }
 
+    // ── Factory creation events ── used by HyperSync pool discovery ──────────
+
+    /// Uniswap V2 / QuickSwap V2 / SushiSwap V2 factory.
+    interface IUniswapV2Factory {
+        event PairCreated(address indexed token0, address indexed token1, address pair, uint256 pairCount);
+    }
+
+    /// Uniswap V3 / QuickSwap V3 factory.
+    interface IUniswapV3Factory {
+        event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool);
+    }
+
+    /// Algebra V1.9 / QuickSwap V3 (Integral) factory.
+    interface IAlgebraFactory {
+        event Pool(address indexed token0, address indexed token1, address pool);
+    }
+
+    /// Uniswap V4 PoolManager initialization event.
+    interface IUniswapV4Factory {
+        event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick);
+    }
+
 }

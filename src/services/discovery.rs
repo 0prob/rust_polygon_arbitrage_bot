@@ -210,11 +210,12 @@ fn resolve_pool_identity(
     pool_id_raw: Option<&str>,
     address_raw: Option<&str>,
 ) -> Option<(String, Address, Option<FixedBytes<32>>)> {
-    let pool_key = id.to_ascii_lowercase();
-    let hex = pool_key.strip_prefix("0x")?;
+    let lower = id.to_ascii_lowercase();
+    let hex = lower.strip_prefix("0x").unwrap_or(&lower);
     if !((hex.len() == 40 || hex.len() == 64) && hex.chars().all(|c| c.is_ascii_hexdigit())) {
         return None;
     }
+    let pool_key = format!("0x{hex}");
 
     if hex.len() == 64 {
         let pool_id: FixedBytes<32> = pool_key.parse().ok()?;
@@ -231,9 +232,10 @@ fn resolve_pool_identity(
 
     // Prefer explicit `address` column for 20-byte pool contracts.
     if let Some(raw) = address_raw {
-        let hex = raw.strip_prefix("0x").or(Some(raw));
-        if hex.is_some_and(|h| h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
-            && let Ok(addr) = raw.parse::<Address>()
+        let raw_lower = raw.to_ascii_lowercase();
+        let raw_hex = raw_lower.strip_prefix("0x").unwrap_or(&raw_lower);
+        if raw_hex.len() == 40 && raw_hex.chars().all(|c| c.is_ascii_hexdigit())
+            && let Ok(addr) = format!("0x{raw_hex}").parse::<Address>()
             && is_plausible_contract_address(addr)
         {
             address = addr;
@@ -485,9 +487,14 @@ pub fn unknown_tokens_from_pools(
         }
     }
     hubs.sort_unstable();
+    if hubs.len() >= limit {
+        hubs.truncate(limit);
+        return hubs;
+    }
+    let needed = limit - hubs.len();
     rest.sort_unstable();
+    rest.truncate(needed);
     hubs.extend(rest);
-    hubs.truncate(limit);
     hubs
 }
 
@@ -954,6 +961,37 @@ mod tests {
                 None,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn accepts_unprefixed_hex_id_and_address() {
+        let tokens = vec![
+            "0d500b1d8e8ef31e21c99d1db9a6444d3adf1270".to_string(),
+            "2791bca1f2de4661ed88a30c99a7a9449aa84174".to_string(),
+        ];
+        let pool = parse_pool_meta_row(
+            "0000000000000000000000000000010000000003",
+            "UNISWAP_V2",
+            &tokens,
+            Some(30),
+            None,
+            None,
+            None,
+            None,
+            Some(100),
+            Some("0000000000000000000000000000010000000003"),
+        )
+        .expect("parsed pool with unprefixed hex");
+        assert_eq!(
+            pool.pool_key,
+            "0x0000000000000000000000000000010000000003"
+        );
+        assert_eq!(
+            pool.address,
+            "0x0000000000000000000000000000010000000003"
+                .parse::<Address>()
+                .unwrap()
         );
     }
 }

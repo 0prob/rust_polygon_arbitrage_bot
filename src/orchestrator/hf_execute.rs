@@ -20,7 +20,8 @@ use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
-    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, is_probe_narrow_miss_on_cooldown,
+    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
+    is_probe_narrow_miss_on_cooldown, is_probe_narrow_miss_v4_on_cooldown,
     mark_tick_hydrate_timeout_cooldown, mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3,
     still_tickless_v4,
 };
@@ -1130,22 +1131,51 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
     pool_metas: &[crate::pipeline::types::PoolMeta],
     cap: usize,
 ) -> (usize, Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>) {
-    let mut all = collect_v4_tick_targets(cycles, pool_metas);
-    all.retain(|(idx, _)| match arena.pool_state(*idx) {
-        Some(PoolState::V4(st)) => st.ticks.is_empty(),
-        _ => false,
-    });
-    let total = all.len();
-    all.retain(|(idx, pool_id)| {
-        let Some(addr) = arena.pool_address(*idx) else {
-            return true;
-        };
-        !is_cl_tick_on_hydrate_cooldown(addr, Some(*pool_id))
-    });
-    if all.len() > cap {
-        all.truncate(cap);
+    use rustc_hash::FxHashMap;
+    // pool_index -> (pool_id, hits, liquidity)
+    let mut freq: FxHashMap<PoolIndex, (alloy::primitives::FixedBytes<32>, u32, u128)> =
+        FxHashMap::default();
+    for cycle in cycles {
+        let mut in_cycle: rustc_hash::FxHashSet<PoolIndex> = rustc_hash::FxHashSet::default();
+        for edge in &cycle.as_ref().edges {
+            if edge.protocol != crate::core::types::ProtocolType::UniswapV4 {
+                continue;
+            }
+            let idx = edge.pool_index;
+            let (tickless, pool_id, liq) = match arena.pool_state(idx) {
+                Some(PoolState::V4(st)) => {
+                    let pid = crate::pipeline::types::pool_meta_at(pool_metas, idx)
+                        .and_then(|meta| meta.pool_id);
+                    (st.ticks.is_empty(), pid, st.liquidity)
+                }
+                _ => (false, None, 0),
+            };
+            let Some(pool_id) = pool_id else {
+                continue;
+            };
+            let addr = arena.pool_address(idx);
+            let is_on_cooldown = is_empty_v4_tick_on_cooldown(pool_id)
+                || is_probe_narrow_miss_v4_on_cooldown(pool_id)
+                || addr.is_some_and(is_empty_tick_on_cooldown);
+            if !tickless || is_on_cooldown {
+                continue;
+            }
+            if in_cycle.insert(idx) {
+                let e = freq.entry(idx).or_insert((pool_id, 0, liq));
+                e.1 = e.1.saturating_add(1);
+                e.2 = e.2.max(liq);
+            }
+        }
     }
-    (total, all)
+    let all = freq.len();
+    let mut ranked: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u32, u128)> = freq
+        .into_iter()
+        .map(|(idx, (pool_id, hits, liq))| (idx, pool_id, hits, liq))
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.cmp(&a.3)));
+    let out: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> =
+        ranked.into_iter().take(cap).map(|(idx, pid, _, _)| (idx, pid)).collect();
+    (all, out)
 }
 
 /// On probe-tick hydrate timeout the enrich future is dropped before it can
@@ -2223,5 +2253,111 @@ mod tests {
             (850_000..=950_000).contains(&gas),
             "mixed BAL+BAL+V3 assess gas {gas} outside 850k–950k (hop_sum={hop})"
         );
+    }
+
+    #[test]
+    fn tickless_v4_targets_prioritized_ranks_by_hits_and_liquidity() {
+        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex, V4PoolState};
+        use crate::pipeline::types::PoolMeta;
+        use alloy::primitives::{FixedBytes, U256};
+
+        let mut arena = StateArena::default();
+        let pool_id1 = FixedBytes::from([1u8; 32]);
+        let pool_id2 = FixedBytes::from([2u8; 32]);
+
+        let p1 = arena.register_pool(
+            Address::from([1u8; 20]),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 100,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                ticks: Arc::from([]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            })),
+        );
+        let p2 = arena.register_pool(
+            Address::from([2u8; 20]),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1000,
+                tick: 0,
+                fee: U256::from(3000u32),
+                tick_spacing: 60,
+                ticks: Arc::from([]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            })),
+        );
+
+        let metas = vec![
+            PoolMeta {
+                pool_index: p1,
+                protocol: ProtocolType::UniswapV4,
+                tokens: vec![],
+                fee_bps: 30,
+                bpt_index: None,
+                pool_id: Some(pool_id1),
+                protocol_label: None,
+                pool_type: None,
+                hooks: None,
+                tick_spacing: Some(60),
+            },
+            PoolMeta {
+                pool_index: p2,
+                protocol: ProtocolType::UniswapV4,
+                tokens: vec![],
+                fee_bps: 30,
+                bpt_index: None,
+                pool_id: Some(pool_id2),
+                protocol_label: None,
+                pool_type: None,
+                hooks: None,
+                tick_spacing: Some(60),
+            },
+        ];
+
+        let edge = |pool| Edge {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV4,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            zero_for_one: true,
+            fee_bps: 30,
+            token_in_idx: 0,
+            token_out_idx: 1,
+        };
+
+        let cycle1 = Arc::new(FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_iter([edge(p1)]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+
+        let cycle2 = Arc::new(FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_iter([edge(p2)]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+
+        // p2 is in two cycles, p1 is in one cycle.
+        let cycles = vec![cycle1, cycle2.clone(), cycle2];
+        let (total, targets) = tickless_v4_targets_prioritized(&arena, &cycles, &metas, 1);
+        assert_eq!(total, 2);
+        assert_eq!(targets.len(), 1);
+        // p2 should be picked first because it has 2 hits vs p1's 1 hit.
+        assert_eq!(targets[0], (p2, pool_id2));
     }
 }

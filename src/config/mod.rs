@@ -141,6 +141,12 @@ pub struct PipelineConfig {
     pub indexer_max_lag_blocks: u64,
     #[serde(default = "default_indexer_pause_on_lag")]
     pub indexer_pause_on_lag: bool,
+    /// Envio HyperSync endpoint for fast gap-fill discovery (default: Polygon public endpoint).
+    #[serde(default)]
+    pub hypersync_url: Option<String>,
+    /// Enable Envio HyperSync gap-fill discovery (default: false).
+    #[serde(default)]
+    pub hypersync_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -414,6 +420,8 @@ impl Default for PipelineConfig {
             stream_max_pools: default_stream_max_pools(),
             indexer_max_lag_blocks: default_indexer_max_lag_blocks(),
             indexer_pause_on_lag: default_indexer_pause_on_lag(),
+            hypersync_url: None,
+            hypersync_enabled: false,
         }
     }
 }
@@ -551,6 +559,8 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("indexer_pause_on_lag") => "pipeline.indexer_pause_on_lag",
         k if k.eq_ignore_ascii_case("pool_meta_cache_path") => "pipeline.pool_meta_cache_path",
         k if k.eq_ignore_ascii_case("balancer_backend_url") => "pipeline.balancer_backend_url",
+        k if k.eq_ignore_ascii_case("hypersync_url") => "pipeline.hypersync_url",
+        k if k.eq_ignore_ascii_case("hypersync_enabled") => "pipeline.hypersync_enabled",
         k if k.eq_ignore_ascii_case("routing_max_hops") => "routing.max_hops",
         k if k.eq_ignore_ascii_case("brent_search_iterations")
             || k.eq_ignore_ascii_case("ternary_search_iterations") =>

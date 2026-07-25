@@ -101,6 +101,9 @@ fn clear_empty_tick_cooldown(pool: Address) {
 /// V4 pools are keyed by pool id (not address), so they get their own map.
 static EMPTY_V4_TICK_UNTIL_MS: LazyLock<Mutex<FxHashMap<FixedBytes<32>, u64>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
+/// V4 probe-narrow misses only — checked by HF probe target selection, not LF.
+static PROBE_NARROW_MISS_V4_UNTIL_MS: LazyLock<Mutex<FxHashMap<FixedBytes<32>, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// True when this V4 pool recently stayed tickless after a full hydrate attempt.
 #[must_use]
@@ -110,6 +113,28 @@ pub fn is_empty_v4_tick_on_cooldown(pool_id: FixedBytes<32>) -> bool {
         .lock()
         .get(&pool_id)
         .is_some_and(|&until| now < until)
+}
+
+/// True when HF probe recently saw a narrow-only empty for V4 (skip re-fetch in probe).
+#[must_use]
+pub fn is_probe_narrow_miss_v4_on_cooldown(pool_id: FixedBytes<32>) -> bool {
+    let now = crate::util::now_ms();
+    PROBE_NARROW_MISS_V4_UNTIL_MS
+        .lock()
+        .get(&pool_id)
+        .is_some_and(|&until| now < until)
+}
+
+pub fn mark_probe_narrow_miss_v4(pool_ids: impl IntoIterator<Item = FixedBytes<32>>) {
+    let now = crate::util::now_ms();
+    let until = now.saturating_add(PROBE_NARROW_MISS_COOLDOWN_MS);
+    let mut map = PROBE_NARROW_MISS_V4_UNTIL_MS.lock();
+    map.retain(|_, u| *u > now);
+    for pool_id in pool_ids {
+        map.entry(pool_id)
+            .and_modify(|deadline| *deadline = (*deadline).max(until))
+            .or_insert(until);
+    }
 }
 
 fn mark_v4_tick_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>, cooldown_ms: u64) {
@@ -136,6 +161,7 @@ pub fn mark_v4_tick_hydrate_timeout_cooldown(pool_ids: impl IntoIterator<Item = 
 /// Clear V4 pool-id hydrate cooldown (e.g. after ticks load).
 pub fn clear_v4_tick_hydrate_cooldown(pool_id: FixedBytes<32>) {
     clear_empty_v4_tick_cooldown(pool_id);
+    PROBE_NARROW_MISS_V4_UNTIL_MS.lock().remove(&pool_id);
 }
 
 /// True when either address- or pool-id-keyed hydrate cooldown is active.
@@ -1067,6 +1093,11 @@ pub async fn enrich_v4_ticks<
     for (idx, pool_id, spacing, word_min, start, end, _) in spans {
         let mut complete = true;
         let mut pool_capped = false;
+        if tick_calls.len() >= MAX_CL_TICK_INFO_READS {
+            incomplete_pools.insert(idx);
+            capped = true;
+            continue;
+        }
         // Center-out word order: when capped, keep ticks nearest the current price.
         'words: for offset in cl_bitmap_center_out_offsets(end - start) {
             let Some(bytes) = bitmaps[start + offset].as_ref() else {
@@ -1236,8 +1267,9 @@ pub async fn enrich_v4_ticks<
                 .filter(|id| word_range >= 48 || wide_attempted.contains(id));
             mark_empty_v4_tick_cooldown(cool);
         } else {
-            // HF probe narrow-only: not a full-empty proof — short suppress only.
-            mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
+            // HF probe narrow-only: not a full-empty proof — don't touch shared
+            // EMPTY (blocks LF widen). Deprioritize for probe selection only.
+            mark_probe_narrow_miss_v4(still_tickless.iter().copied());
         }
     } else if !still_tickless.is_empty() && incomplete_count > 0 {
         mark_v4_tick_hydrate_timeout_cooldown(still_tickless.iter().copied());
@@ -1503,6 +1535,11 @@ async fn enrich_algebra_ticks<
     let mut no_tick_calls = 0usize;
     let mut capped = false;
     for (pool, idx, spacing, word_min, start, end) in spans {
+        if tick_calls.len() >= MAX_CL_TICK_INFO_READS {
+            incomplete_pools += 1;
+            capped = true;
+            continue;
+        }
         let tick_start = tick_calls.len();
         // Center-out: when tick budget hits, keep depth nearest the current price.
         'words: for offset in cl_bitmap_center_out_offsets(end - start) {
@@ -1735,5 +1772,20 @@ mod tests {
         );
         let still = still_tickless_v3(&arena, &[empty_addr, hydrated_addr]);
         assert_eq!(still, vec![empty_addr]);
+    }
+
+    #[test]
+    fn v4_probe_narrow_miss_cooldown_lifecycle() {
+        let pool_id = FixedBytes::from([0xab; 32]);
+        assert!(!is_probe_narrow_miss_v4_on_cooldown(pool_id));
+        assert!(!is_empty_v4_tick_on_cooldown(pool_id));
+
+        mark_probe_narrow_miss_v4([pool_id]);
+        assert!(is_probe_narrow_miss_v4_on_cooldown(pool_id));
+        // Does not touch shared EMPTY_V4_TICK (which would block LF widen).
+        assert!(!is_empty_v4_tick_on_cooldown(pool_id));
+
+        clear_v4_tick_hydrate_cooldown(pool_id);
+        assert!(!is_probe_narrow_miss_v4_on_cooldown(pool_id));
     }
 }
