@@ -528,12 +528,9 @@ fn rank_one_cycle_probe(
         out.skip.executor_budget = 1;
         return out;
     }
-    // FoT / zero-realized start tokens — skip before probe ladder (live: LGNS
-    // TransferFailed dry-run still ranked until dispatch).
-    if arena
-        .token_address(cycle.start_token)
-        .is_some_and(|t| execution.is_direct_token_quarantined(t))
-    {
+    // FoT / TransferFailed cool-down — any hop, not only start (live: Wrapped SOL
+    // mid-hop TransferFailed still ranked while start was WMATIC).
+    if execution.cycle_has_quarantined_token(arena, &cycle.edges) {
         return out;
     }
     if !has_reliable_matic_rate(cycle.start_token, token_to_matic_rates) {
@@ -1475,9 +1472,8 @@ fn evaluate_one(
         return None;
     }
     if input
-        .arena
-        .token_address(cycle.start_token)
-        .is_some_and(|t| input.execution.is_direct_token_quarantined(t))
+        .execution
+        .cycle_has_quarantined_token(input.arena, &cycle.edges)
     {
         inc(&stats.quarantine);
         return None;
@@ -1663,8 +1659,17 @@ fn evaluate_one(
             } else {
                 "hop fidelity failed for dispatch".into()
             });
-            if probe_only {
-                crate::info!(
+            // Live: probe-only stuck at 0.1 token re-eval'd 200+/fp without ever
+            // becoming dispatchable — cool so HF picks real candidates.
+            if probe_only && opt.optimal_input < floor {
+                if input.execution.quarantine_probe_below_dispatch_floor(fp) {
+                    crate::info!(
+                        "hf probe-dispatch blocked (quarantined 300s): fp={fp} input={} floor={floor}",
+                        opt.optimal_input,
+                    );
+                }
+            } else if probe_only {
+                crate::debug!(
                     "hf probe-dispatch blocked: fp={fp} input={} floor={floor} amounts={has_hop_amounts} fidelity={fidelity_ok}",
                     opt.optimal_input,
                 );

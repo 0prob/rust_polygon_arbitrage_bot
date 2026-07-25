@@ -1477,11 +1477,11 @@ pub(crate) async fn filter_balancer_onchain_verified<
             crate::debug!("balancer: batch_filter fp={fp} reject=missing_start_token");
             continue;
         };
-        if execution.is_direct_token_quarantined(start_token) {
+        if execution.cycle_has_quarantined_token(arena, &result.cycle.edges) {
             execution.quarantine_batch_query_failure(fp);
             record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
             crate::debug!(
-                "balancer: batch_filter fp={fp} reject=direct_token_quarantined token={start_token}"
+                "balancer: batch_filter fp={fp} reject=token_quarantined start={start_token}"
             );
             continue;
         }

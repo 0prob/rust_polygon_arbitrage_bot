@@ -74,13 +74,19 @@ const BATCH_QUERY_FAIL_QUARANTINE: Duration = Duration::from_secs(600);
 /// Start-token cooldown when vault query profit does not appear in executor balance
 /// (fee-on-transfer / reflective / nonstandard ERC20 such as STARV4).
 const DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE: Duration = Duration::from_secs(1800);
-/// Live TransferFailed on flash input (LGNS) — seed so restarts don't re-burn dry-run.
+/// Live TransferFailed on flash input / mid-hop (FoT / nonstandard ERC-20) — seed so
+/// restarts don't re-burn dry-run. Mid-hop hits must also be filtered via
+/// [`ExecutionService::cycle_has_quarantined_token`] (start-token-only was insufficient).
 const KNOWN_FOT_TOKENS: &[Address] = &[
     address!("0xeB51D9A39AD5EEF215dC0Bf39a8821ff804A0F01"), // LGNS
+    address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912"), // Wrapped SOL (hop-2 TransferFailed)
 ];
 // ponytail: process-lifetime stand-in; Instant has no forever.
 const KNOWN_FOT_SEED_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
+/// Probe-only sizing stuck below the 1-token dispatch floor (live: 641 INFO lines
+/// for 3 fps in 17m). Shorter than structural so liquidity recovery can retry.
+const PROBE_BELOW_FLOOR_QUARANTINE: Duration = Duration::from_secs(300);
 /// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
 /// Thin-liq underwater (available≪0.01 MATIC) — longer cool; live sticky V2
@@ -697,6 +703,18 @@ impl ExecutionService {
         }
     }
 
+    /// Cool probe-only routes that never clear the ≥1 start-token dispatch floor.
+    /// Returns true when a new cool-down was applied (no refresh of an active cool).
+    pub fn quarantine_probe_below_dispatch_floor(&self, fingerprint: u64) -> bool {
+        let now = Instant::now();
+        let mut q = self.quarantine.write();
+        if q.get(&fingerprint).is_some_and(|exp| *exp > now) {
+            return false;
+        }
+        q.insert(fingerprint, now + PROBE_BELOW_FLOOR_QUARANTINE);
+        true
+    }
+
     /// Cool down a Direct start token after `executeArbDirect` realizes zero vs vault query.
     pub fn quarantine_direct_token_zero_realized(&self, token: Address) {
         self.direct_token_quarantine.write().insert(
@@ -710,6 +728,30 @@ impl ExecutionService {
         let q = self.direct_token_quarantine.read();
         let now = Instant::now();
         q.get(&token).is_some_and(|expiry| now < *expiry)
+    }
+
+    /// True if any hop token (in or out) is in the FoT / TransferFailed cool-down.
+    ///
+    /// Live: hop-2 TransferFailed on Wrapped SOL quarantined the token, but probe
+    /// rank only checked `start_token` (WMATIC hub) so the same routes kept dry-running.
+    #[must_use]
+    pub fn cycle_has_quarantined_token(
+        &self,
+        arena: &crate::pipeline::arena::StateArena,
+        edges: &[crate::core::types::Edge],
+    ) -> bool {
+        let q = self.direct_token_quarantine.read();
+        if q.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        edges.iter().any(|edge| {
+            [edge.token_in, edge.token_out].into_iter().any(|ti| {
+                arena
+                    .token_address(ti)
+                    .is_some_and(|addr| q.get(&addr).is_some_and(|expiry| now < *expiry))
+            })
+        })
     }
 
     /// Count prepare skips for diagnostics (does not quarantine — soft quarantine
@@ -2652,5 +2694,100 @@ mod safety_tests {
             transfer_failed_token_to_quarantine(&top_tail, wmatic),
             Some(failing)
         );
+    }
+
+    #[test]
+    fn quarantine_probe_below_dispatch_floor_extends_and_is_idempotent() {
+        let path = PathBuf::from(format!(
+            "/tmp/rpbot-probe-floor-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let service = ExecutionService::with_route_stats_path(path.clone());
+        let fp = 42u64;
+        assert!(!service.is_route_quarantined(fp));
+        assert!(service.quarantine_probe_below_dispatch_floor(fp));
+        assert!(service.is_route_quarantined(fp));
+        // Second call within TTL is a no-op (already cool until ≥300s).
+        assert!(!service.quarantine_probe_below_dispatch_floor(fp));
+        assert!(service.is_route_quarantined(fp));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cycle_has_quarantined_token_matches_mid_hop_not_only_start() {
+        use crate::core::types::{Edge, PoolIndex, ProtocolType};
+        use crate::pipeline::arena::StateArena;
+
+        let path = PathBuf::from(format!(
+            "/tmp/rpbot-fot-cycle-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let service = ExecutionService::with_route_stats_path(path.clone());
+        // Seeded KNOWN_FOT includes Wrapped SOL.
+        let sol = address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912");
+        let wmatic = crate::core::constants::WMATIC;
+        assert!(service.is_direct_token_quarantined(sol));
+        assert!(!service.is_direct_token_quarantined(wmatic));
+
+        let mut arena = StateArena::default();
+        let t_wmatic = arena.register_token(wmatic);
+        let t_sol = arena.register_token(sol);
+        let t_usdc = arena.register_token(crate::core::constants::USDC_E);
+        let edges = [
+            Edge {
+                pool_index: PoolIndex(0),
+                token_in: t_wmatic,
+                token_out: t_sol,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: PoolIndex(1),
+                token_in: t_sol,
+                token_out: t_usdc,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: PoolIndex(2),
+                token_in: t_usdc,
+                token_out: t_wmatic,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+        ];
+        assert!(
+            service.cycle_has_quarantined_token(&arena, &edges),
+            "mid-hop Wrapped SOL must cool the whole cycle"
+        );
+        let hub_only = [Edge {
+            pool_index: PoolIndex(0),
+            token_in: t_wmatic,
+            token_out: t_usdc,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        assert!(!service.cycle_has_quarantined_token(&arena, &hub_only));
+        let _ = std::fs::remove_file(&path);
     }
 }
