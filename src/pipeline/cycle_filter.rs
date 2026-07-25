@@ -357,13 +357,19 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         }
     }
 
-    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(max_keep);
+    // Keeps fill the primary budget; rescues supplement *beyond* max_keep up to
+    // rescue_cap so Brent has candidates even when the keep window is saturated.
+    // A previous early `break` on `survivors.len() >= max_keep` silently dropped
+    // all rescue cycles whenever keeps filled the budget — Brent starved on those ticks.
+    let total_cap = max_keep.saturating_add(rescue_cap);
+    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(total_cap);
     survivors.extend(keeps.into_iter().take(max_keep));
 
     let mut rescue_used = 0usize;
     for cycle in gas_rescues {
-        if survivors.len() >= max_keep {
-            break;
+        if survivors.len() >= total_cap {
+            diag.rescue_cap_drop += 1;
+            continue;
         }
         if rescue_used >= rescue_cap {
             diag.rescue_cap_drop += 1;
@@ -374,8 +380,9 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         survivors.push(cycle);
     }
     for cycle in spot_rescues {
-        if survivors.len() >= max_keep {
-            break;
+        if survivors.len() >= total_cap {
+            diag.rescue_cap_drop += 1;
+            continue;
         }
         if rescue_used >= rescue_cap {
             diag.rescue_cap_drop += 1;

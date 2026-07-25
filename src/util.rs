@@ -328,9 +328,18 @@ where
 ///
 /// # Errors
 /// Returns a serde_json error if both parsers fail.
-pub fn simd_json_parse_borrowed<'de, T>(buf: &'de mut Vec<u8>) -> Result<T, serde_json::Error>
+pub fn simd_json_parse_borrowed<'de, T>(buf: &'de mut [u8]) -> Result<T, serde_json::Error>
 where
     T: serde::de::Deserialize<'de>,
 {
-    simd_json::serde::from_slice::<T>(buf).or_else(|_| serde_json::from_slice(buf))
+    // SAFETY: We create a temporary mutable slice for the simd-json attempt.
+    // If simd-json succeeds, `v` borrows from `buf`'s underlying memory for `'de`.
+    // If it fails, `simd_buf` is dropped, permitting fallback read via `serde_json`.
+    let buf_ptr = buf.as_mut_ptr();
+    let buf_len = buf.len();
+    let simd_buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
+    match simd_json::serde::from_slice::<T>(simd_buf) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_slice(buf),
+    }
 }

@@ -70,14 +70,15 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
             Ok(bytes) => {
                 let mut buf = bytes.to_vec();
                 crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf)
-                .ok()
-                .and_then(|parsed| parsed.result)
-                .and_then(|v| match v {
-                    JsonRpcResult::Hex(s) => Some(s),
-                    _ => None,
-                })
-                .is_some_and(|s| s.eq_ignore_ascii_case("0x89"))
+                    .ok()
+                    .and_then(|parsed| parsed.result)
+                    .and_then(|v| match v {
+                        JsonRpcResult::Hex(s) => Some(s),
+                        _ => None,
+                    })
+                    .is_some_and(|s| s.eq_ignore_ascii_case("0x89"))
             }
+            Err(_) => false,
         },
         Err(_) => false,
     };
@@ -99,20 +100,21 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
             Ok(bytes) => {
                 let mut buf = bytes.to_vec();
                 match crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf) {
-                Ok(parsed) => match parsed.error {
-                    Some(err) => {
-                        let msg = err.message.to_string();
-                        let exists = msg.contains("invalid")
-                            || msg.contains("rlp")
-                            || msg.contains("transaction")
-                            || msg.contains("not accepted");
-                        (exists, Some(msg))
-                    }
-                    None => (true, None),
-                },
-                Err(e) => (false, Some(e.to_string())),
+                    Ok(parsed) => match parsed.error {
+                        Some(err) => {
+                            let msg = err.message.to_string();
+                            let exists = msg.contains("invalid")
+                                || msg.contains("rlp")
+                                || msg.contains("transaction")
+                                || msg.contains("not accepted");
+                            (exists, Some(msg))
+                        }
+                        None => (true, None),
+                    },
+                    Err(e) => (false, Some(e.to_string())),
                 }
             }
+            Err(e) => (false, Some(e.to_string())),
         },
         Err(e) => (false, Some(e.to_string())),
     };
