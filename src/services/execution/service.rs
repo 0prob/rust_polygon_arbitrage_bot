@@ -38,6 +38,7 @@ use crate::services::execution::private_submit::{
 };
 use crate::services::execution::profit::assess_profit;
 use crate::services::execution::profit_logs::parse_transfer_profit;
+use crate::services::execution::profit_sweep::sweep_profit_to_recipient;
 use crate::services::execution::receipt::{ReceiptPollOutcome, ReceiptPoller};
 use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_receipt_timeout};
 use crate::services::execution::revert_decoder::DecodedRevert;
@@ -1796,18 +1797,27 @@ impl ExecutionService {
             .await
             {
                 NonceRecoveryOutcome::Mined(receipt) => {
-                    return self.finalize_receipt(
-                        fp,
-                        now,
-                        &nonce_mgr,
-                        nonce,
-                        &tx_hash_str,
-                        &receipt,
-                        candidate,
-                        final_gas,
-                        gas_oracle,
-                        ui_hook,
-                    );
+                    return self
+                        .finalize_receipt_and_maybe_sweep(
+                            fp,
+                            now,
+                            &nonce_mgr,
+                            nonce,
+                            &tx_hash_str,
+                            &receipt,
+                            candidate,
+                            final_gas,
+                            gas_oracle,
+                            ui_hook,
+                            &submit_provider,
+                            sim_provider,
+                            config,
+                            operator,
+                            private_cfg.as_ref(),
+                            hypersync,
+                            shutdown,
+                        )
+                        .await;
                 }
                 NonceRecoveryOutcome::Cancelled(cancel_hash) => {
                     crate::info!(
@@ -1842,7 +1852,7 @@ impl ExecutionService {
             return outcome;
         };
 
-        self.finalize_receipt(
+        self.finalize_receipt_and_maybe_sweep(
             fp,
             now,
             &nonce_mgr,
@@ -1853,7 +1863,78 @@ impl ExecutionService {
             final_gas,
             gas_oracle,
             ui_hook,
+            &submit_provider,
+            sim_provider,
+            config,
+            operator,
+            private_cfg.as_ref(),
+            hypersync,
+            shutdown,
         )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_receipt_and_maybe_sweep<P: Provider<Ethereum>, S: Provider<Ethereum>>(
+        &self,
+        fp: u64,
+        now: Instant,
+        nonce_mgr: &NonceManager,
+        nonce: u64,
+        tx_hash_str: &str,
+        receipt: &crate::services::execution::receipt::ReceiptData,
+        candidate: &CandidateExecution,
+        submitted_gas_limit: u64,
+        gas_oracle: &GasOracle,
+        ui_hook: Option<&SharedUiHook>,
+        submit_provider: &P,
+        receipt_provider: &S,
+        config: &AppConfig,
+        operator: Address,
+        private: Option<&PrivateSubmitConfig>,
+        hypersync: Option<&HyperSyncService>,
+        shutdown: Option<&watch::Receiver<bool>>,
+    ) -> ExecutionOutcome {
+        let outcome = self.finalize_receipt(
+            fp,
+            now,
+            nonce_mgr,
+            nonce,
+            tx_hash_str,
+            receipt,
+            candidate,
+            submitted_gas_limit,
+            gas_oracle,
+            ui_hook,
+        );
+        if let ExecutionOutcome::Confirmed { profit_wei, .. } = &outcome
+            && !profit_wei.is_zero()
+        {
+            match sweep_profit_to_recipient(
+                submit_provider,
+                receipt_provider,
+                nonce_mgr,
+                gas_oracle,
+                config,
+                candidate,
+                operator,
+                private,
+                hypersync,
+                shutdown,
+            )
+            .await
+            {
+                Ok(()) => self.invalidate_mempool_nonce_cache(),
+                Err(e) => {
+                    self.invalidate_mempool_nonce_cache();
+                    // Arb profit is already on-chain; sweep failure must not rewrite Confirmed.
+                    crate::warn!(
+                        "profit sweep failed after confirmed arb: fp={fp} hash={tx_hash_str} err={e:#}"
+                    );
+                }
+            }
+        }
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]

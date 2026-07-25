@@ -71,6 +71,9 @@ pub struct ExecutionConfig {
     pub mode: String,
     #[serde(default)]
     pub executor_address: Option<Address>,
+    /// Post-confirm `transferAll` destination. Defaults to the operator wallet when unset.
+    #[serde(default)]
+    pub profit_recipient: Option<Address>,
     #[serde(default)]
     pub private_key: Option<String>,
     #[serde(default = "default_min_profit_matic_wei")]
@@ -374,6 +377,7 @@ impl Default for ExecutionConfig {
         Self {
             mode: default_execution_mode(),
             executor_address: None,
+            profit_recipient: None,
             private_key: None,
             min_profit_matic_wei: default_min_profit_matic_wei(),
             slippage_bps: default_slippage_bps(),
@@ -573,6 +577,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("execution_rpc") => "rpc.execution_rpc_url",
         k if k.eq_ignore_ascii_case("execution_rpc_url") => "rpc.execution_rpc_url",
         k if k.eq_ignore_ascii_case("executor_address") => "execution.executor_address",
+        k if k.eq_ignore_ascii_case("profit_recipient") => "execution.profit_recipient",
         k if k.eq_ignore_ascii_case("private_key") => "execution.private_key",
         k if k.eq_ignore_ascii_case("hyper_sync_url") => "rpc.hyper_sync_url",
         k if k.eq_ignore_ascii_case("wss_url") => "rpc.wss_url",

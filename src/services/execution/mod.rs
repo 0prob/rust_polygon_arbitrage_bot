@@ -11,6 +11,7 @@ pub mod gas_oracle;
 pub mod mempool;
 pub mod private_submit;
 pub mod profit;
+pub mod profit_sweep;
 pub mod quote;
 pub mod receipt;
 pub mod recovery;
