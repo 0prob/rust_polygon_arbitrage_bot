@@ -816,7 +816,8 @@ pub async fn enrich_v3_ticks<
     }
 
     if empty_pools > 0 || incomplete_pools > 0 || algebra.loaded > 0 || wide_loaded > 0 {
-        crate::info!(
+        // Funnel is debug; surface a warn only when the batch is almost empty after work.
+        let msg = format!(
             "v3 tick hydration: targets={} direct_loaded={} direct_empty={} incomplete={} algebra_targets={} algebra_loaded={} algebra_no_tick_calls={} algebra_decode_rejects={} wide_loaded={} loaded={} still_empty={}",
             pool_addresses.len(),
             direct_loaded,
@@ -830,6 +831,11 @@ pub async fn enrich_v3_ticks<
             updated,
             still_tickless.len(),
         );
+        if updated == 0 && !pool_addresses.is_empty() {
+            crate::warn!("{msg} — TickLens empty; check RPC rate limits / word_range");
+        } else {
+            crate::debug!("{msg}");
+        }
         // Sample the first still-tickless target for offline diagnosis.
         for &pool in pool_addresses {
             let Some(idx) = arena.address_to_pool().get(&pool).copied() else {
@@ -838,7 +844,7 @@ pub async fn enrich_v3_ticks<
             if let Some(crate::core::types::PoolState::V3(s)) = arena.pool_state(idx)
                 && s.ticks.is_empty()
             {
-                crate::info!(
+                crate::debug!(
                     "v3 tick hydration miss: pool={pool} tick={} spacing={} liquidity={} labeled_algebra={}",
                     s.tick,
                     s.tick_spacing,
@@ -1228,7 +1234,7 @@ pub async fn enrich_v4_ticks<
                 && s.ticks.is_empty()
             {
                 let addr = arena.pool_address(idx).unwrap_or_default();
-                crate::info!(
+                crate::debug!(
                     "v4 tick hydration miss: pool={addr} pool_id={pool_id} tick={} spacing={} liquidity={} wide_attempted={} wide_loaded={} wide_rpc_failed={}",
                     s.tick,
                     s.tick_spacing,

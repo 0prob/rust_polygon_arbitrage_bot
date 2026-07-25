@@ -118,7 +118,7 @@ impl PoolLogFeed {
                             .await
                         {
                             Err(e) => {
-                                warn!("WSS subscription error ({}): {e}", rpc_host_label(&url));
+                                warn!("wss subscribe error: host={} err={e}", rpc_host_label(&url));
                                 self.cool_down_subscription_from_error(&url, &e);
                                 *self.sticky_url.lock() = None;
                             }
@@ -134,7 +134,7 @@ impl PoolLogFeed {
                     None => {
                         let now = now_ms();
                         if now.saturating_sub(last_no_endpoint_warn_at) >= 30_000 {
-                            warn!("no WSS endpoint available — retrying");
+                            warn!("wss: no endpoint available — check WSS_URL / POLYGON_WSS_URLS");
                             last_no_endpoint_warn_at = now;
                         }
                     }
@@ -206,7 +206,7 @@ impl PoolLogFeed {
             }
         });
         info!(
-            "WSS subscriptions armed ({}, mode=topic_sync_swap, interest_pools={})",
+            "wss armed: host={} mode=topic_sync_swap interest_pools={}",
             rpc_host_label(wss_url),
             addresses.len()
         );
@@ -229,7 +229,7 @@ impl PoolLogFeed {
                 }
                 maybe_log = log_rx.recv() => {
                     let Some(log) = maybe_log else {
-                        warn!("WSS feed disconnected ({}), reconnecting...", rpc_host_label(wss_url));
+                        warn!("wss disconnected: host={} — reconnecting", rpc_host_label(wss_url));
                         return Ok(SubscriptionExit::Unhealthy);
                     };
                     last_log_at = Instant::now();
@@ -243,7 +243,7 @@ impl PoolLogFeed {
                         .and_then(|r| r.ok())
                         .is_none()
                     {
-                        warn!("WSS ping failed ({}), reconnecting...", rpc_host_label(wss_url));
+                        warn!("wss ping failed: host={} — reconnecting", rpc_host_label(wss_url));
                         return Ok(SubscriptionExit::Unhealthy);
                     }
                     if !silence_forced
@@ -253,14 +253,14 @@ impl PoolLogFeed {
                         silence_forced = true;
                         self.addresses.request_force_replace();
                         warn!(
-                            "WSS log silence ({}): no Sync/Swap for {}s — forcing stream target reselect",
+                            "wss silence: host={} idle_s={} — forcing stream target reselect",
                             rpc_host_label(wss_url),
                             WSS_LOG_SILENCE_FORCE.as_secs()
                         );
                     }
                     if last_log_at.elapsed() >= STREAM_IDLE_TIMEOUT {
                         warn!(
-                            "WSS feed idle timeout ({}), reconnecting...",
+                            "wss idle timeout: host={} — reconnecting",
                             rpc_host_label(wss_url)
                         );
                         return Ok(SubscriptionExit::Unhealthy);
@@ -277,10 +277,10 @@ impl PoolLogFeed {
         let ts = now_ms();
         static RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let raw = RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if raw == 1 || raw.is_multiple_of(100) {
-            info!(
-                "WSS raw log: n={raw} pool={pool} topic0={topic0} data_len={}",
+        if crate::log::every_n(&RAW, 500) {
+            let raw = RAW.load(std::sync::atomic::Ordering::Relaxed);
+            crate::debug!(
+                "wss raw: n={raw} pool={pool} topic0={topic0} data_len={}",
                 data.len()
             );
         }
@@ -312,9 +312,9 @@ impl PoolLogFeed {
             }
             let total = WAKE_TRUE.load(std::sync::atomic::Ordering::Relaxed)
                 + WAKE_FALSE.load(std::sync::atomic::Ordering::Relaxed);
-            if total == 1 || total.is_multiple_of(200) {
-                info!(
-                    "WSS wake gate: n={total} wake_true={} wake_false={} in_interest={} universe_only={} sample_pool={pool} in_interest={in_interest} in_universe={in_universe}",
+            if total == 1 || total.is_multiple_of(500) {
+                crate::debug!(
+                    "wss wake gate: n={total} wake_true={} wake_false={} in_interest={} universe_only={} sample_pool={pool} in_interest={in_interest} in_universe={in_universe}",
                     WAKE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
                     WAKE_FALSE.load(std::sync::atomic::Ordering::Relaxed),
                     INTEREST.load(std::sync::atomic::Ordering::Relaxed),
@@ -326,10 +326,10 @@ impl PoolLogFeed {
             .partial
             .apply_log_notify(pool, topic0, data, ts, wake_hf)
         {
-            let miss = MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if miss == 1 || miss.is_multiple_of(50) {
-                warn!(
-                    "WSS log decode miss: n={miss} pool={pool} topic0={topic0} data_len={}",
+            if crate::log::every_n(&MISS, 100) {
+                let miss = MISS.load(std::sync::atomic::Ordering::Relaxed);
+                crate::warn!(
+                    "wss decode miss: n={miss} pool={pool} topic0={topic0} data_len={} — check topic/abi coverage",
                     data.len()
                 );
             }
@@ -352,7 +352,7 @@ impl PoolLogFeed {
             .lock()
             .insert(url.to_string(), until_ms);
         warn!(
-            "WSS endpoint subscription cooldown ({}, cooldown_ms={cooldown_ms})",
+            "wss cooldown: host={} cooldown_ms={cooldown_ms}",
             rpc_host_label(url)
         );
     }
@@ -489,7 +489,7 @@ impl WssUrlPick {
         match self {
             Self::Sticky(url) => {
                 crate::debug!(
-                    "WSS sticky reconnect ({}, probe skipped)",
+                    "wss sticky: host={} probe=skipped",
                     rpc_host_label(&url)
                 );
                 Some(url)
@@ -500,7 +500,7 @@ impl WssUrlPick {
                 }
                 let (url, latency) = probe_wss_urls(&candidates).await?;
                 info!(
-                    "WSS endpoint selected ({}, probe_ms={})",
+                    "wss selected: host={} probe_ms={}",
                     rpc_host_label(&url),
                     latency.as_millis()
                 );

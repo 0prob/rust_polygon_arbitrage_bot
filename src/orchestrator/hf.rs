@@ -290,7 +290,7 @@ async fn hf_flash_prefetch_stale(
                 .iter()
                 .all(|addr| flash_cache.has_fresh_entry(*addr))
             {
-                crate::info!(
+                crate::debug!(
                     "flash loan: hf_prefetch waited inflight ok hubs={blocking_n} stale={stale_n} fresh={fresh_n}"
                 );
                 return;
@@ -301,7 +301,7 @@ async fn hf_flash_prefetch_stale(
             .iter()
             .filter(|addr| !flash_cache.has_fresh_entry(**addr))
             .count();
-        crate::info!(
+        crate::debug!(
             "flash loan: hf_prefetch waited inflight timeout_ms={} hub_still={still_hubs}/{blocking_n} stale={stale_n}",
             wait_cap.as_millis(),
         );
@@ -328,7 +328,7 @@ async fn hf_flash_prefetch_stale(
             let wmatic = crate::core::constants::WMATIC;
             let wmatic_fresh = flash_cache.has_fresh_entry(wmatic);
             let wmatic_liq = flash_cache.snapshot(wmatic);
-            crate::info!(
+            crate::debug!(
                 "flash loan: hf_prefetch ok stale={stale_n} refresh={} fresh={fresh_n} generation={generation} wmatic_fresh={wmatic_fresh} wmatic_bal={} wmatic_aave={} wmatic_listed={}",
                 refresh_set.len(),
                 wmatic_liq.balancer,
@@ -337,9 +337,9 @@ async fn hf_flash_prefetch_stale(
             );
         }
         Ok(Err(e)) => {
-            crate::info!("flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}");
+            crate::warn!("flash loan: hf_prefetch fail stale={stale_n} fresh={fresh_n} err={e:#}");
         }
-        Err(_) => crate::info!(
+        Err(_) => crate::warn!(
             "flash loan: hf_prefetch timeout_ms={} stale={stale_n} fresh={fresh_n}",
             flash_budget.as_millis(),
         ),
@@ -560,23 +560,13 @@ fn cycle_edges_quarantined(
 }
 
 fn warn_hf_oracle_skip(message: &str) {
-    let now = now_ms();
-    let last = HF_ORACLE_SKIP_LOG_AT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < HF_ORACLE_SKIP_INTERVAL_MS {
-        return;
+    if crate::log::every_ms(&HF_ORACLE_SKIP_LOG_AT, HF_ORACLE_SKIP_INTERVAL_MS) {
+        crate::warn!("{message}");
     }
-    HF_ORACLE_SKIP_LOG_AT.store(now, Ordering::Relaxed);
-    crate::warn!("{message}");
 }
 
 fn should_log_hf_summary() -> bool {
-    let now = now_ms();
-    let last = HF_SUMMARY_LOG_AT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < HF_SUMMARY_INTERVAL_MS {
-        return false;
-    }
-    HF_SUMMARY_LOG_AT.store(now, Ordering::Relaxed);
-    true
+    crate::log::every_ms(&HF_SUMMARY_LOG_AT, HF_SUMMARY_INTERVAL_MS)
 }
 
 fn near_miss_verify_provider(
@@ -591,13 +581,7 @@ fn near_miss_verify_provider(
 }
 
 fn should_log_best_eval() -> bool {
-    let now = now_ms();
-    let last = HF_BEST_EVAL_LOG_AT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < HF_BEST_EVAL_INTERVAL_MS {
-        return false;
-    }
-    HF_BEST_EVAL_LOG_AT.store(now, Ordering::Relaxed);
-    true
+    crate::log::every_ms(&HF_BEST_EVAL_LOG_AT, HF_BEST_EVAL_INTERVAL_MS)
 }
 
 struct BestEvalDiag {
@@ -695,7 +679,7 @@ fn sample_proto_mismatch(
     if let Some((hop, expected, actual)) =
         crate::pipeline::local_sim::first_protocol_state_mismatch(arena, &cycle.edges)
     {
-        crate::info!(
+        crate::debug!(
             "proto mismatch sample: stage={stage} hop={hop} edge={expected:?} arena={actual:?} hops={}",
             cycle.edges.len()
         );
@@ -712,7 +696,7 @@ fn sample_proto_mismatch(
             let tin = arena.token_address(edge.token_in);
             let tout = arena.token_address(edge.token_out);
             let Some(m) = pool_meta_at(pool_metas, edge.pool_index) else {
-                crate::info!(
+                crate::debug!(
                     "proto mismatch sample: stage={stage} hop={hop} tin={tin:?} tout={tout:?} idxs={}/{} meta=None pool={:?}",
                     edge.token_in_idx,
                     edge.token_out_idx,
@@ -752,7 +736,7 @@ fn sample_proto_mismatch(
                     crate::core::types::PoolState::Invalid => "invalid",
                 })
                 .unwrap_or("none");
-            crate::info!(
+            crate::debug!(
                 "proto mismatch sample: stage={stage} hop={hop} proto={:?} arena={arena_kind} tin={tin:?} tout={tout:?} idxs={}/{} tin_ok={tin_ok} tout_ok={tout_ok} hop_break={hop_break} meta={meta:?} pool={:?}",
                 edge.protocol,
                 edge.token_in_idx,
@@ -768,7 +752,7 @@ fn sample_proto_mismatch(
         .map(|e| format!("{:?}", e.protocol))
         .collect::<Vec<_>>()
         .join(">");
-    crate::info!("proto mismatch sample: stage={stage} (no state mismatch) route=[{hops}]");
+    crate::debug!("proto mismatch sample: stage={stage} (no state mismatch) route=[{hops}]");
 }
 
 fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: &FoundCycle) {
@@ -795,7 +779,7 @@ fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: 
         let tin = arena.token_address(edge.token_in);
         let tout = arena.token_address(edge.token_out);
         let Some(state) = arena.pool_state(edge.pool_index) else {
-            crate::info!(
+            crate::debug!(
                 "multi realign sample: hop={hop} proto={:?} tin={tin:?} tout={tout:?} state=None pool={:?}",
                 edge.protocol,
                 arena.pool_address(edge.pool_index),
@@ -812,7 +796,7 @@ fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: 
             crate::core::types::PoolState::Dodo(s) => vec![s.base_token, s.quote_token],
             _ => Vec::new(),
         };
-        crate::info!(
+        crate::debug!(
             "multi realign sample: hop={hop} proto={:?} tin={tin:?} tout={tout:?} idxs={}/{} vault={vault:?} pool={:?}",
             edge.protocol,
             edge.token_in_idx,
@@ -821,7 +805,7 @@ fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: 
         );
         return;
     }
-    crate::info!(
+    crate::debug!(
         "multi realign sample: (no failing multi hop) hops={}",
         cycle.edges.len()
     );
@@ -857,7 +841,7 @@ fn sample_hop_break(
         .map(|e| format!("{:?}", e.protocol))
         .collect::<Vec<_>>()
         .join(">");
-    crate::info!(
+    crate::debug!(
         "hop break sample: at={break_at} prev={:?} out={:?}/{:?} next={:?} in={:?}/{:?} route=[{hops}]",
         prev_e.protocol,
         prev_e.token_out,

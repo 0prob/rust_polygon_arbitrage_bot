@@ -249,8 +249,8 @@ impl PartialPoolCache {
                 observed.remove(addr);
             }
         }
-        crate::info!(
-            "stream universe: pools={size} (cycle+observed+sticky; topic Sync/Swap wake HF)"
+        crate::debug!(
+            "stream universe: pools={size} sources=cycle+observed+sticky"
         );
     }
 
@@ -443,9 +443,9 @@ impl PartialPoolCache {
                     });
             }
         }
-        let n = self.patches.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n.is_multiple_of(50) {
-            crate::info!("WSS patch applied: n={n} pool={pool} wake_hf={wake_hf}");
+        if crate::log::every_n(&self.patches, 200) {
+            let n = self.patches.load(Ordering::Relaxed);
+            crate::debug!("wss patch: n={n} pool={pool} wake_hf={wake_hf}");
         }
         if wake_hf {
             self.dirty.lock().insert(pool);

@@ -436,11 +436,18 @@ pub fn hub_path_matic_rates_batch(
         }
     }
     let ms = crate::util::now_ms().saturating_sub(started);
+    // INFO: compact funnel. Sample dumps only at DEBUG (live dual_samples blew past 2KB).
     if path_miss > 0 || sim_fail > 0 || alt_rescue > 0 || dual_reject > 0 || need_n > 32 {
         crate::info!(
-            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} dual_samples={dual_samples:?} ms={ms} max_hops={}",
+            "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} ms={ms} max_hops={}",
             params.max_hops
         );
+        if !dual_samples.is_empty() {
+            crate::debug!(
+                "hub_path dual_samples: count={} samples={dual_samples:?}",
+                dual_samples.len()
+            );
+        }
     } else if need_n > 0 {
         crate::debug!(
             "hub_path batch: need={need_n} priced={priced} path_miss={path_miss} sim_fail={sim_fail} alt_rescue={alt_rescue} dual_reject={dual_reject} ms={ms} max_hops={}",

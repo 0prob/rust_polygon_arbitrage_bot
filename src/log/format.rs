@@ -105,6 +105,8 @@ struct FileEvent<'a> {
     ts: u64,
     level: &'a str,
     component: &'a str,
+    /// Message tag before the first `:` (empty when absent). Greppable funnel key.
+    event: &'a str,
     module: &'a str,
     message: &'a str,
 }
@@ -115,10 +117,33 @@ impl<'a> FileEvent<'a> {
             ts: event.timestamp_ms,
             level: event.level,
             component,
+            event: event_tag(&event.message),
             module: event.module,
             message: &event.message,
         }
     }
+}
+
+/// Extract the greppable event tag from a log message (`"hf tick: …"` → `"hf tick"`).
+pub(super) fn event_tag(message: &str) -> &str {
+    let Some((tag, rest)) = message.split_once(':') else {
+        return "";
+    };
+    let tag = tag.trim();
+    if tag.is_empty() || tag.len() > 48 {
+        return "";
+    }
+    // Reject URL-like prefixes (`https:`) and bare drive letters.
+    if rest.starts_with("//") || rest.starts_with('\\') {
+        return "";
+    }
+    if !tag
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '/' | '.'))
+    {
+        return "";
+    }
+    tag
 }
 
 pub(super) fn write_sink_error(
@@ -171,17 +196,24 @@ pub(super) fn render_terminal(
 }
 
 pub(super) fn component_for_module(module: &str) -> &'static str {
+    // Order matters: more specific paths first.
     if module.contains("::services::execution") || module.contains("::orchestrator::hf_execute") {
         "execution"
     } else if module.contains("::services::oracle") {
         "oracle"
+    } else if module.contains("::services::partial_cache") || module.contains("::infra::wss_feed") {
+        // WSS path + stream patch cache — shared stream surface for ops.
+        "stream"
     } else if module.contains("::pipeline") || module.contains("::services::pipeline_survival") {
         "routing"
     } else if module.contains("::orchestrator") {
         "orchestrator"
     } else if module.contains("::infra") {
         "infra"
-    } else if module.contains("::services::state") || module.contains("::services::discovery") {
+    } else if module.contains("::services::state")
+        || module.contains("::services::discovery")
+        || module.contains("::services::index_diag")
+    {
         "state"
     } else if module.contains("::tui") {
         "tui"

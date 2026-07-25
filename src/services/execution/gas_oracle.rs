@@ -355,23 +355,19 @@ impl GasOracle {
             self.snapshot_updated_at_ms
                 .store(crate::util::now_ms(), Ordering::Relaxed);
         }
+        let cons = compute_conservative_gas_price(snapshot);
+        let base_gwei = crate::util::u256_to_f64(snapshot.base_fee) / 1e9;
+        let prio_gwei = crate::util::u256_to_f64(snapshot.priority_fee) / 1e9;
+        let cons_gwei = crate::util::u256_to_f64(cons) / 1e9;
         if is_initial_snapshot {
             crate::info!(
-                "gas oracle initialized: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
-                snapshot.base_fee,
-                snapshot.priority_fee,
-                priority_fee_source,
-                compute_conservative_gas_price(snapshot),
+                "gas oracle: init base_gwei={base_gwei:.3} priority_gwei={prio_gwei:.3} source={priority_fee_source} conservative_gwei={cons_gwei:.3}"
             );
         } else if priority_fee_source != "rpc"
             || previous.is_some_and(|prior| snapshot_changed_materially(prior, snapshot))
         {
             crate::info!(
-                "gas oracle update: base_fee_wei={} priority_fee_wei={} priority_fee_source={} conservative_gas_price_wei={}",
-                snapshot.base_fee,
-                snapshot.priority_fee,
-                priority_fee_source,
-                compute_conservative_gas_price(snapshot),
+                "gas oracle: update base_gwei={base_gwei:.3} priority_gwei={prio_gwei:.3} source={priority_fee_source} conservative_gwei={cons_gwei:.3}"
             );
         }
         Ok(())

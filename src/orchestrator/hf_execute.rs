@@ -251,7 +251,7 @@ pub(crate) async fn dispatch_profitable_candidates(
     }
 
     let Some(executor) = ctx.config.execution.executor_address else {
-        crate::warn!("dispatch skipped: EXECUTOR_ADDRESS not configured");
+        crate::warn!("dispatch skip: EXECUTOR_ADDRESS not configured");
         return;
     };
 
@@ -260,7 +260,7 @@ pub(crate) async fn dispatch_profitable_candidates(
         match ctx.rpc.connect_simulation() {
             Ok(p) => p,
             Err(e) => {
-                crate::warn!("dispatch skipped: simulation RPC unavailable: {e:#}");
+                crate::warn!("dispatch skip: simulation RPC unavailable: {e:#}");
                 return;
             }
         }
@@ -270,9 +270,9 @@ pub(crate) async fn dispatch_profitable_candidates(
             Err(e) => {
                 let msg = format!("{e:#}");
                 if msg.contains("no executor bytecode") {
-                    crate::debug!("dispatch skipped: {msg}");
+                    crate::debug!("dispatch skip: {msg}");
                 } else {
-                    crate::warn!("dispatch skipped: simulation RPC/executor check failed: {msg}");
+                    crate::warn!("dispatch skip: simulation RPC/executor check failed: {msg}");
                 }
                 return;
             }
@@ -335,13 +335,13 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     matic_usd_hint: Option<f64>,
 ) {
     if ctx.execution.global_is_quarantined() {
-        crate::warn!("dispatch skipped: execution circuit breaker active");
+        crate::warn!("dispatch skip: execution circuit breaker active");
         return;
     }
     let flash_policy = ctx.config.flash_policy;
     let Some(gas_price) = ctx.gas_oracle.conservative_gas_price_for_live_submit() else {
         let age = ctx.gas_oracle.snapshot_age_ms();
-        crate::warn!("dispatch skipped: gas fee snapshot missing or stale (age_ms={age:?})");
+        crate::warn!("dispatch skip: gas fee snapshot missing or stale (age_ms={age:?})");
         return;
     };
     let brent_iters = ctx.config.routing.brent_search_iterations;
@@ -351,7 +351,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let Some(matic_usd) =
         resolve_matic_usd_for_flash_dispatch(&ctx.price_oracle, matic_usd_hint, sim_provider).await
     else {
-        crate::warn!("dispatch skipped: MATIC/USD oracle unavailable for flash loan cap");
+        crate::warn!("dispatch skip: MATIC/USD oracle unavailable for flash loan cap");
         return;
     };
     let min_profit_matic = required_profit_matic_wei(

@@ -111,7 +111,7 @@ fn pin_cycles_touching_pools(
         }
     }
     if pinned.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: enum_touch=0/{} pin_pools={} (DFS found none)",
             rest.len(),
             pin_pools.len()
@@ -160,7 +160,7 @@ fn pin_cycles_touching_pools(
             }
         }
     }
-    crate::info!(
+    crate::debug!(
         "stream observed-live: enum_touch={enum_touch} uni_only={uni_only} ratio_gt_one={ratio_gt_one} pinned_cycles={pin_kept} total={} (cap={max_cycles})",
         pinned.len()
     );
@@ -636,7 +636,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 .collect();
             force_attached = forced.len();
             if force_attached > 0 {
-                crate::info!(
+                crate::debug!(
                     "stream observed-live: force_attach={force_attached}/{} stubs={} rescored_stubs={rescored_stubs} lf_pass={}",
                     need_force.len(),
                     attached.len(),
@@ -789,7 +789,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                     .filter(|p| cov.pool_indices.contains(&p.0))
                     .count()
             });
-            crate::info!(
+            crate::debug!(
                 "stream observed-live: dfs_seed tokens={} pools={} in_graph={obs_in_graph}/{} (pre_attach={obs_in_graph_before}) attached={missing_graph_pools} force_attach={force_attached} first_hop_pin={first_hop_pin} pin_covered={pin_covered} incremental={incremental_refind} exclusive={} lf_pass={}",
                 obs_starts.len(),
                 work.observed_pool_indices.len(),
@@ -871,7 +871,7 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
         // ponytail: dropped relax-uni-or-pin retry — live still dfs=0 (sparse pin
         // close); keeping-prior already covers empty exclusive.
         if exclusive_obs || work.force_cycle_refind || pin_bridge_only {
-            crate::info!(
+            crate::debug!(
                 "stream observed-live: cycle_search raw={} dedupe={} out={} dfs={} starts={} enum_ms={} lf_pass={}",
                 outcome.diag.raw_collected,
                 outcome.diag.post_dedupe,
@@ -1375,7 +1375,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             .count()
     };
     if !observed_pin.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: pre_hold_touching={pre_hold_touching}/{} lf_pass={lf_pass}",
             capped.len()
         );
@@ -1433,7 +1433,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             None,
         );
         let held_gt_one = live_held.iter().filter(|c| c.cycle_ratio > ONE).count();
-        crate::info!(
+        crate::debug!(
             "stream observed-live: live_held_ratio_gt_one={held_gt_one}/{} lf_pass={lf_pass}",
             live_held.len()
         );
@@ -1705,7 +1705,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         Some(&arena),
     );
     if live_for_rates.is_empty() && !live_unpriced_backup.is_empty() {
-        crate::info!(
+        crate::debug!(
             "stream observed-live: priced_start dropped all {} live pins — restoring unpriced lf_pass={lf_pass}",
             live_unpriced_backup.len()
         );
@@ -1738,7 +1738,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     .any(|edge| observed_pin_set.contains(&edge.pool_index))
             })
             .count();
-        crate::info!(
+        crate::debug!(
             "stream observed-live: cycles_touching={touching}/{} observed_pools={} lf_pass={lf_pass}",
             capped.len(),
             observed_pin.len()

@@ -336,14 +336,11 @@ pub fn log_brent_summary() {
     if attempts == 0 {
         return;
     }
-    let now = crate::util::now_ms();
-    let last = BRENT_SUMMARY_LOG_AT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < BRENT_SUMMARY_INTERVAL_MS {
+    if !crate::log::every_ms(&BRENT_SUMMARY_LOG_AT, BRENT_SUMMARY_INTERVAL_MS) {
         return;
     }
-    BRENT_SUMMARY_LOG_AT.store(now, Ordering::Relaxed);
-    // Debug-session: INFO so cyclical runs capture sizing funnel without RPBOT_LOG=debug.
-    crate::info!(
+    // Funnel counters — debug by default; set RPBOT_LOG=debug when sizing regressions.
+    crate::debug!(
         "brent: attempts={attempts} ok={ok} bounds_fail={} bal_bounds_fail={} cl_cap_fail={} floor_fail={} zero_profit={} sanity_fail={} \
          eval_sim={} eval_reject={} (sim_none={} zero={} sanity={}) \
          sim_none_sample(v2={} shallow={} tickless={} zero_out={} unsupported={} token_mismatch={} other={}) \

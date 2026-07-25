@@ -117,8 +117,9 @@ pub fn log_curve_sim_summary() {
     if stable_ok == 0 && crypto_ok == 0 && stable_fail == 0 && crypto_fail == 0 {
         return;
     }
-    crate::info!(
-        "curve: sim stable_ok={stable_ok} stable_fail={stable_fail} (zero_out={} d={} y={} other={}) \
+    // Cumulative counters — debug only (INFO flooded JSONL every HF tick).
+    crate::debug!(
+        "curve sim: stable_ok={stable_ok} stable_fail={stable_fail} (zero_out={} d={} y={} other={}) \
          crypto_ok={crypto_ok} crypto_fail={crypto_fail} (zero_out={} newton_d={} newton_y={} other={})",
         STABLE_ZERO_OUT.load(Ordering::Relaxed),
         STABLE_D.load(Ordering::Relaxed),

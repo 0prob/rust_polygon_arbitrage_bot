@@ -1,6 +1,40 @@
+//! Async structured logging for the bot.
+//!
+//! # Levels (`RPBOT_LOG`)
+//!
+//! | Level | When to use |
+//! |-------|-------------|
+//! | **error** | Process cannot continue a critical path: panic, misconfig that blocks live submit, unrecoverable task death. |
+//! | **warn**  | Operator action or degraded mode: retries exhausted, rate limits, lag, skip of a whole tick, config suboptimal. |
+//! | **info**  | Operator-visible milestones at default verbosity: startup, LF/HF tick summaries, profitable outcomes, reconnects, first-time init. Rate-limit hot loops. |
+//! | **debug** | Per-pass / per-batch diagnostics: funnel counters, sample routes, RPC batch detail, routine refreshes. |
+//! | **trace** | Hot-path math and hop-level detail (ternary/Brent bounds, sim steps). Never on the default path. |
+//!
+//! # Message shape
+//!
+//! Prefer a greppable event tag, then `key=value` fields:
+//!
+//! ```text
+//! hf tick: profitable=0 considered=14 elapsed_ms=1 stream=1
+//! dispatch skip: fp=42 reason=circuit_breaker
+//! ```
+//!
+//! - **Precise**: include identifiers (fp, pool, url host) and units (`_ms`, `_wei`, `_bps`).
+//! - **Human-readable**: short prose after the tag is fine; avoid giant dumps at info.
+//! - **Actionable**: warns/errors should say what failed and what to check next.
+//!
+//! JSONL records under `$RPBOT_LOG_DIR/run-*/{component}.jsonl` include an `event` field
+//! parsed from the message tag (text before the first `:`).
+//!
+//! # Throttling
+//!
+//! Hot paths must not flood the queue (see [`every_ms`], [`every_n`]). DEBUG/TRACE are
+//! dropped under backpressure; INFO+ are counted and warned.
+
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -22,9 +56,9 @@ const QUEUE_CAPACITY: usize = 32_768;
 const DEFAULT_LOG_DIR: &str = "/tmp/bot";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
-pub static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(LEVEL_INFO);
+pub static LOG_LEVEL: AtomicU8 = AtomicU8::new(LEVEL_INFO);
 static STDOUT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static DROPPED_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -46,17 +80,50 @@ struct Logger {
 }
 
 pub fn set_stdout_enabled(enabled: bool) {
-    STDOUT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    STDOUT_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn set_level(level: &str) {
-    LOG_LEVEL.store(parse_level(level), std::sync::atomic::Ordering::Relaxed);
+    LOG_LEVEL.store(parse_level(level), Ordering::Relaxed);
+}
+
+/// True when the process log filter accepts `threshold` (and more verbose levels below it).
+#[inline]
+#[must_use]
+pub fn enabled(threshold: u8) -> bool {
+    LOG_LEVEL.load(Ordering::Relaxed) >= threshold
 }
 
 /// Active run directory (`RPBOT_LOG_DIR/run-<ts>-<pid>/`), set after successful `init`.
 #[must_use]
 pub fn run_dir() -> Option<&'static Path> {
     RUN_DIR.get().map(PathBuf::as_path)
+}
+
+/// Wall-clock throttle: returns true at most once per `interval_ms` for `slot`.
+///
+/// Race-safe under concurrent callers (compare-exchange). On success, `slot` stores `now_ms`.
+#[must_use]
+pub fn every_ms(slot: &AtomicU64, interval_ms: u64) -> bool {
+    let now = crate::util::now_ms();
+    let prev = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < interval_ms {
+        return false;
+    }
+    slot.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Count throttle: returns true on the 1st hit and every `n` thereafter.
+///
+/// `counter` is incremented on every call. Pass `n >= 1`.
+#[must_use]
+pub fn every_n(counter: &AtomicU64, n: u64) -> bool {
+    let c = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if n <= 1 {
+        return true;
+    }
+    c == 1 || c.is_multiple_of(n)
 }
 
 pub fn init() -> io::Result<()> {
@@ -127,7 +194,7 @@ pub fn log(level: &'static str, module: &'static str, mut message: String) {
             if log_level_rank(event.level) >= LEVEL_DEBUG {
                 return;
             }
-            DROPPED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
         | Err(TrySendError::Full(Command::Shutdown))
@@ -171,13 +238,16 @@ fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
                 if let Err(error) = files.write(&event, component) {
                     with_stdout(|stdout| format::write_sink_error(stdout, &error, &palette));
                 }
-                let dropped = DROPPED_EVENTS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let dropped = DROPPED_EVENTS.swap(0, Ordering::Relaxed);
                 if dropped > 0 {
                     let warning = Event {
                         timestamp_ms: crate::util::now_ms(),
                         level: "WARN",
                         module: "rpbot::log",
-                        message: format!("log queue saturated; dropped_events={dropped}"),
+                        message: format!(
+                            "log queue saturated: dropped_events={dropped} \
+                             (raise RPBOT_LOG filter or reduce hot-path info volume)"
+                        ),
                     };
                     with_stdout(|stdout| {
                         format::write_stdout(stdout, &warning, "system", &palette)
@@ -202,7 +272,7 @@ fn run_writer(run_dir: &Path, receiver: std::sync::mpsc::Receiver<Command>) {
 }
 
 fn with_stdout(write: impl FnOnce(&mut io::BufWriter<io::StdoutLock<'_>>) -> io::Result<()>) {
-    if !STDOUT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !STDOUT_ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let stdout = io::stdout();
@@ -259,7 +329,9 @@ macro_rules! trace { ($($arg:tt)*) => { $crate::log_if!("TRACE", $crate::log::LE
 
 #[cfg(test)]
 mod tests {
-    use super::format::{component_for_module, render_terminal};
+    use super::format::{component_for_module, event_tag, render_terminal};
+    use super::{every_ms, every_n, enabled, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn routes_modules_to_stable_component_logs() {
@@ -284,6 +356,14 @@ mod tests {
             component_for_module("rpbot::services::oracle::price_oracle"),
             "oracle"
         );
+        assert_eq!(
+            component_for_module("rpbot::services::partial_cache"),
+            "stream"
+        );
+        assert_eq!(
+            component_for_module("rpbot::services::state_refresh"),
+            "state"
+        );
         assert_eq!(component_for_module("rpbot::bootstrap"), "system");
     }
 
@@ -295,9 +375,6 @@ mod tests {
 
     #[test]
     fn queue_full_counts_info_plus_not_debug_trace() {
-        use super::{
-            LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank,
-        };
         // INFO+ must be countable under saturation; DEBUG/TRACE are silent drops.
         assert!(log_level_rank("ERROR") < LEVEL_DEBUG);
         assert!(log_level_rank("WARN") < LEVEL_DEBUG);
@@ -308,5 +385,45 @@ mod tests {
         assert_eq!(log_level_rank("WARN"), LEVEL_WARN);
         assert_eq!(log_level_rank("INFO"), LEVEL_INFO);
         assert_eq!(log_level_rank("TRACE"), LEVEL_TRACE);
+    }
+
+    #[test]
+    fn event_tag_extracts_message_prefix() {
+        assert_eq!(event_tag("hf tick: profitable=0"), "hf tick");
+        assert_eq!(event_tag("dispatch skip: fp=1 reason=cb"), "dispatch skip");
+        assert_eq!(event_tag("no colon here"), "");
+        assert_eq!(event_tag(""), "");
+    }
+
+    #[test]
+    fn every_n_fires_on_first_and_multiples() {
+        let c = AtomicU64::new(0);
+        assert!(every_n(&c, 50)); // n=1
+        for _ in 0..48 {
+            assert!(!every_n(&c, 50)); // n=2..=49
+        }
+        assert!(every_n(&c, 50)); // n=50
+    }
+
+    #[test]
+    fn every_ms_respects_interval() {
+        let slot = AtomicU64::new(0);
+        assert!(every_ms(&slot, 60_000));
+        assert!(!every_ms(&slot, 60_000));
+        // Force expiry
+        slot.store(
+            crate::util::now_ms().saturating_sub(60_001),
+            Ordering::Relaxed,
+        );
+        assert!(every_ms(&slot, 60_000));
+    }
+
+    #[test]
+    fn enabled_respects_log_level() {
+        let prior = super::LOG_LEVEL.swap(LEVEL_INFO, Ordering::Relaxed);
+        assert!(enabled(LEVEL_ERROR));
+        assert!(enabled(LEVEL_INFO));
+        assert!(!enabled(LEVEL_DEBUG));
+        super::LOG_LEVEL.store(prior, Ordering::Relaxed);
     }
 }

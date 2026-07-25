@@ -140,6 +140,16 @@ Executor ABI/details: [`0prob/solidity_and_huff_evm_contract`](https://github.co
 
 Compact colored stdout (`RPBOT_LOG`, default `info`). Component JSONL under `$RPBOT_LOG_DIR/run-<timestamp>-<pid>/` (default `/tmp/bot`). The TUI suppresses stdout logs while retaining JSONL files.
 
+| Level | Surface |
+|---|---|
+| `error` | Critical path death / hard misconfig (live submit blocked, task panic) |
+| `warn` | Degraded mode or operator action (rate limits, lag, whole-tick skips, reconnects) |
+| `info` | Milestones at default verbosity (startup, LF/HF tick summaries, profitable outcomes) |
+| `debug` | Per-pass funnels, sample routes, routine refreshes, WSS patch counters |
+| `trace` | Hot-path math (Brent/ternary hop detail) |
+
+Message shape: `event: key=value …` (JSONL also stores `event` and `component`). Grep by component file (`orchestrator.jsonl`, `stream.jsonl`, `execution.jsonl`, …) or `event` field.
+
 ## Project layout (docs)
 
 | Path | Content |

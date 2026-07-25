@@ -691,7 +691,7 @@ impl FlashLiquidityCache {
         }
         let n = to_fetch.len();
         let generation = self.publish_updates(updates);
-        crate::info!("flash liquidity refresh: tokens={n} generation={generation}");
+        crate::debug!("flash liquidity: tokens={n} generation={generation}");
         aave_stats.log_refresh_summary(n, generation);
         Ok(())
     }

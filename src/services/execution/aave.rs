@@ -88,19 +88,36 @@ impl AaveRefreshStats {
         if self.listed_viable == 0 && ineligible == 0 {
             return;
         }
-        crate::info!(
-            "aave: refresh tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
-             (rpc_err={} no_atoken={} inactive={} paused={} flash_off={} pinned={}) fee_bps={}",
-            self.listed_viable,
-            ineligible,
-            self.rpc_error,
-            self.no_atoken,
-            self.inactive,
-            self.paused,
-            self.flash_disabled,
-            self.pinned_inactive,
-            aave_flash_loan_fee_bps_cached(),
-        );
+        // Routine refresh: debug. Elevate to warn when RPC/config collapses viability.
+        let fee_bps = aave_flash_loan_fee_bps_cached();
+        if self.rpc_error > 0 || (self.listed_viable == 0 && tokens_fetched > 0) {
+            crate::warn!(
+                "aave refresh: tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
+                 (rpc_err={} no_atoken={} inactive={} paused={} flash_off={} pinned={}) fee_bps={fee_bps} \
+                 — check Aave aToken mapping / RPC",
+                self.listed_viable,
+                ineligible,
+                self.rpc_error,
+                self.no_atoken,
+                self.inactive,
+                self.paused,
+                self.flash_disabled,
+                self.pinned_inactive,
+            );
+        } else {
+            crate::debug!(
+                "aave refresh: tokens={tokens_fetched} gen={generation} viable={} ineligible={} \
+                 (rpc_err={} no_atoken={} inactive={} paused={} flash_off={} pinned={}) fee_bps={fee_bps}",
+                self.listed_viable,
+                ineligible,
+                self.rpc_error,
+                self.no_atoken,
+                self.inactive,
+                self.paused,
+                self.flash_disabled,
+                self.pinned_inactive,
+            );
+        }
     }
 }
 
@@ -124,8 +141,8 @@ pub fn log_aave_gate_summary(candidates: u32) {
     if prepare == 0 && marked == 0 {
         return;
     }
-    crate::info!(
-        "aave: dispatch_gate candidates={candidates} prepare_skip_inactive={prepare} mark_inactive={marked} fee_bps={}",
+    crate::debug!(
+        "aave dispatch_gate: candidates={candidates} prepare_skip_inactive={prepare} mark_inactive={marked} fee_bps={}",
         aave_flash_loan_fee_bps_cached(),
     );
 }
