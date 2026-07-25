@@ -531,7 +531,7 @@ mod tests {
         // word 2: hooks = zero address (hooks = None)
         let log = make_log(
             V4_INITIALIZE_TOPIC,
-            vec![*pool_id, c0.into_word(), c1.into_word()],
+            vec![pool_id, c0.into_word(), c1.into_word()],
             data,
         );
         let pool = parse_creation_log(&log).expect("v4 Initialize");
