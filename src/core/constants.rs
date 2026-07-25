@@ -190,9 +190,11 @@ pub const GAS_V3_BASE: u32 = 155_000;
 pub const GAS_V4_BASE: u32 = 170_000;
 pub const GAS_CURVE_HOP: u32 = 250_000;
 /// Per-hop seed for mixed/Aave-flash Balancer vault swaps (each hop is a separate call).
-/// parity5 dry-run Aave+BAL×2+Woofi: gas_used 942k → ~315k/BAL after overhead/Woofi.
-/// 420k was still ~1.33× hot and stacked badly with sim_scale on mixed near-misses.
-pub const GAS_BALANCER_HOP: u32 = 340_000;
+/// Reverse from live Aave+BAL×2+Woofi dry-run 942k:
+///   (942k − Woofi150 − route_overhead154 − Aave~50) / 2 ≈ 294k per BAL hop.
+/// Prior 340k stacked to ~996k on BAL+BAL+V3 (half-cover sticky monopolist) and
+/// understated cover by ~16% vs reverse-calc — keep ~300k with a small margin.
+pub const GAS_BALANCER_HOP: u32 = 300_000;
 /// All-in gas for Direct vault `batchSwap` (`executeArbDirect`, ≤4 hops → one call).
 /// Not passed through per-edge ROUTE_EXECUTION_* overhead (that double-counted hops).
 /// Prefer [`balancer_direct_batch_gas`] (hop-scaled). This constant is the 2-hop seed

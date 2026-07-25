@@ -1329,8 +1329,17 @@ fn probe_fallback_opt(
     let (mut psn, mut pzp, mut pf, mut ps) = (0u32, 0u32, 0u32, 0u32);
     let mut best: Option<(OptimizationResult, RouteSimulationResult, U256)> = None;
     let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
+    // Sanity rejects amount < economic floor unless in the tickless probe band
+    // [spot_probe, floor). Micro (10^(dec-6)) is always below that for 18-dec tokens
+    // — sim-then-reject burned ~35k DEBUG lines / HF eval CPU per run.
+    let economic_floor = min_economic_amount_in(decimals, rate);
+    let tickless_probe = crate::pipeline::spot_price::spot_probe_for_decimals(decimals);
     for amount in probe_fallback_amounts(cycle, input, probe_seed) {
         if amount.is_zero() {
+            continue;
+        }
+        if amount < economic_floor && amount < tickless_probe {
+            ps += 1;
             continue;
         }
         let seed_backed = probe_seed

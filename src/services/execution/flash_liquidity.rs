@@ -1229,7 +1229,13 @@ pub fn resolve_flash_source_with_context(
             } else if !ctx.start_fresh {
                 None
             } else {
-                if ctx.start_fresh {
+                // Skip pure zero-liq spam (live: 6.6k DEBUG lines for 5 dead tokens).
+                // Partial-liquidity rejects (listed but capped / mixed rules) still log.
+                let any_liq = !ctx.liquidity.balancer.is_zero()
+                    || !ctx.liquidity.aave.is_zero()
+                    || !ctx.liquidity.dodo.is_zero()
+                    || ctx.liquidity.aave_listed;
+                if any_liq {
                     crate::debug!(
                         "flash source reject: token={} policy={policy:?} forbid_balancer={} balancer_only={} balancer={} aave={} aave_listed={} dodo={}",
                         ctx.start_addr,

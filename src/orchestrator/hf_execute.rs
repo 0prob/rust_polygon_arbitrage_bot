@@ -1730,6 +1730,31 @@ fn confirm_reason_is_semantic_fot(reason: &str) -> bool {
         || r.contains("fee-on-transfer")
 }
 
+/// Local sim retained less than this fraction of vault `queryBatchSwap` profit → cool.
+/// Live: modeled 26.8e15 / on_chain 5.9e15 ≈ 22% retain (4.5× overstate) kept winning
+/// best-eval while only logging; 50% is well above that phantom band and below
+/// normal re-sim noise (RESIM allows 10% drift).
+const BALANCER_SIM_MIN_RETAIN_BPS: u64 = 5_000;
+
+/// On-chain retain bps of local-sim profit (`on_chain * 10_000 / modeled`).
+#[must_use]
+pub(crate) fn balancer_sim_retain_bps(modeled: U256, on_chain: U256) -> u64 {
+    if modeled.is_zero() {
+        return 10_000;
+    }
+    let bps = on_chain.saturating_mul(U256::from(10_000u64)) / modeled;
+    u64::try_from(bps).unwrap_or(u64::MAX).min(10_000)
+}
+
+/// True when vault profit is so far below local sim that the edge is a phantom.
+#[must_use]
+pub(crate) fn balancer_sim_overstated(modeled: U256, on_chain: U256) -> bool {
+    if modeled.is_zero() {
+        return false;
+    }
+    balancer_sim_retain_bps(modeled, on_chain) < BALANCER_SIM_MIN_RETAIN_BPS
+}
+
 /// On-chain `queryBatchSwap` probe for balancer near-misses (sim vs vault delta).
 pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
     execution: &crate::services::execution::ExecutionService,
@@ -1782,10 +1807,35 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
     match query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await
     {
         BatchQueryOutcome::Profit(on_chain) => {
-            crate::info!(
-                "hf near-miss-verify: fp={fp} route={route} modeled={modeled} on_chain={on_chain} net_matic={}",
-                result.assessment.net_profit_after_gas_matic_wei,
-            );
+            let retain_bps = balancer_sim_retain_bps(modeled, on_chain);
+            if balancer_sim_overstated(modeled, on_chain) {
+                // Structural cool: stale balances / wrong pool kind / math drift.
+                // Cool every start-rotation so the same pools do not re-enter as a
+                // different fingerprint (same pattern as underwater cool).
+                execution.quarantine_batch_query_failure(fp);
+                let n = result.cycle.edges.len();
+                if n > 1 {
+                    let mut rotated =
+                        crate::core::types::CycleEdges::from_slice(&result.cycle.edges);
+                    for _ in 0..n {
+                        let rfp =
+                            crate::services::execution::candidate::hash_cycle_edges(&rotated);
+                        if rfp != fp {
+                            execution.quarantine_batch_query_failure(rfp);
+                        }
+                        rotated.rotate_left(1);
+                    }
+                }
+                crate::info!(
+                    "hf near-miss-verify: fp={fp} route={route} modeled={modeled} on_chain={on_chain} retain_bps={retain_bps} net_matic={} sim_overstate quarantined (+rotations)",
+                    result.assessment.net_profit_after_gas_matic_wei,
+                );
+            } else {
+                crate::info!(
+                    "hf near-miss-verify: fp={fp} route={route} modeled={modeled} on_chain={on_chain} retain_bps={retain_bps} net_matic={}",
+                    result.assessment.net_profit_after_gas_matic_wei,
+                );
+            }
         }
         BatchQueryOutcome::NonPositiveDelta(delta) => {
             execution.quarantine_batch_query_failure(fp);
@@ -2106,5 +2156,70 @@ mod tests {
             &mk(dead, 7),
             pool_metas
         ));
+    }
+
+    #[test]
+    fn balancer_sim_retain_detects_live_4x_overstate() {
+        // Live near-miss: modeled 26_779… / on_chain 5_896… ≈ 22% retain.
+        let modeled = U256::from(26_779_070_152_868_894u128);
+        let on_chain = U256::from(5_896_560_291_339_009u128);
+        let retain = balancer_sim_retain_bps(modeled, on_chain);
+        assert!(retain < 2_500, "live overstate retain_bps={retain}");
+        assert!(balancer_sim_overstated(modeled, on_chain));
+        // Near-exact vault match must not cool.
+        let tight = U256::from(26_779_070_152_868_614u128);
+        assert!(!balancer_sim_overstated(modeled, tight));
+        assert_eq!(balancer_sim_retain_bps(modeled, modeled), 10_000);
+        assert!(!balancer_sim_overstated(U256::ZERO, on_chain));
+    }
+
+    #[test]
+    fn mixed_flash_balancer_gas_seed_near_live_band() {
+        // Aave + BAL×2 + V3 (sticky half-cover route shape). Prior 340k hop → ~996k;
+        // reverse-calc ~294k/BAL → total ~916k with 300k hop.
+        use crate::core::constants::{GAS_BALANCER_HOP, GAS_V3_BASE};
+        use crate::core::types::{Edge, ProtocolType, TokenIndex};
+        use crate::pipeline::local_sim::estimate_route_gas;
+
+        let edges = [
+            Edge {
+                pool_index: crate::core::types::PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: crate::core::types::PoolIndex(1),
+                token_in: TokenIndex(1),
+                token_out: TokenIndex(2),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::BalancerV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+            Edge {
+                pool_index: crate::core::types::PoolIndex(2),
+                token_in: TokenIndex(2),
+                token_out: TokenIndex(0),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV3,
+                fee_bps: 30,
+                zero_for_one: true,
+            },
+        ];
+        // Not pure-Balancer Direct (V3 hop) → per-hop flash path.
+        let gas = estimate_route_gas(&edges);
+        let hop = GAS_BALANCER_HOP * 2 + GAS_V3_BASE;
+        assert_eq!(GAS_BALANCER_HOP, 300_000);
+        assert!(
+            (850_000..=950_000).contains(&gas),
+            "mixed BAL+BAL+V3 assess gas {gas} outside 850k–950k (hop_sum={hop})"
+        );
     }
 }

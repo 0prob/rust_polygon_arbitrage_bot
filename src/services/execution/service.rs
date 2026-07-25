@@ -52,12 +52,14 @@ const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
 /// eth_blockNumber hang protection (matches state_refresh head budget).
 const CHAIN_HEAD_RPC_TIMEOUT: Duration = Duration::from_millis(1_500);
 // ponytail: prepare-skip only counts for logs — quarantine was starving selected=0.
-/// Best-eval cover below this (bps of gas cost) is chronic dust — soft-quarantine
-/// so sticky underwater routes stop crowding the HF window (live: same V3↔V3 fp
-/// at ~358 bps across captures while ge_1000 stayed 0).
-// Cool only sub-5% cover dust. Live: ~880 cover near-misses were quarantined
-// in the old <10% band while still the best absolute-MATIC candidates.
-const CHRONIC_UNDERWATER_COVER_BPS: u64 = 500;
+/// Best-eval cover below this (bps of gas cost) is chronic underwater — soft-quarantine
+/// so sticky routes stop crowding the HF window.
+///
+/// Live: fp 278927702089123978 (BAL+BAL+V3) won best-eval **940×** at cover≈50% /
+/// net=0 / avail≈0.14 MATIC without cooling — sub-5% ceiling only caught deep dust.
+/// 3-strike + 120s window still protects one-shot diversions; true near-misses that
+/// cover gas fully (cover≥10_000, often positive-net path) stay out of this band.
+const CHRONIC_UNDERWATER_COVER_BPS: u64 = 10_000;
 /// Absolute MATIC available toward gas; below this, cover_bps≥1000 is wei-dust
 /// (live: USDT input=8040 cover=1024 escaped uq while sticky V2 at 0.006 MATIC cooled).
 const CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(15); // 0.001 MATIC
@@ -92,9 +94,9 @@ const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
 /// Thin-liq underwater (available≪0.01 MATIC) — longer cool; live sticky V2
 /// 0xe43e/0x2f44 kept returning at cover~380 / gross=0.0067 with ~1-unit scarce side.
 const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
-/// Below this absolute MATIC, cover%≥500 is still chronic (live: USDT dust
-/// avail≈0.035 / cover≈1770 escaped the old 0.01 floor and crowded a
-/// cover≈20000 / avail≈0.15 near-miss).
+/// Below this absolute MATIC, cover≥[`CHRONIC_UNDERWATER_COVER_BPS`] is still chronic
+/// (live: USDT dust avail≈0.035 / cover≈1770 escaped the old 0.01 floor and crowded a
+/// cover≈20000 / avail≈0.15 near-miss). Thin absolute MATIC cools on first strike.
 const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 5u128 * 10u128.pow(16); // 0.05 MATIC
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -2270,13 +2272,22 @@ mod safety_tests {
         let thin_fp = 0x7e17_u64;
         let thin_avail = U256::from(35u128 * 10u128.pow(15)); // 0.035 MATIC
         assert!(exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
-        // ≥0.05 MATIC with cover≥500 escapes chronic (real near-miss territory).
+        // Cover≥break-even (10_000) with real MATIC escapes chronic (positive-net /
+        // absolute-floor territory — different cool path).
         let near_fp = 0x9ea5_u64;
         let near_avail = U256::from(15u128 * 10u128.pow(16)); // 0.15 MATIC
         assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
         assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
         assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
         assert!(!exec.is_route_quarantined(near_fp));
+        // Half-cover monopolist (live: 940× best-eval at ~50% / 0.14 MATIC) cools
+        // after 3 strikes once the ceiling covers the full sub-breakeven band.
+        let half_fp = 0xba1b_a1b0_u64;
+        let half_avail = U256::from(14u128 * 10u128.pow(16)); // 0.14 MATIC
+        assert!(!exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
+        assert!(!exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
+        assert!(exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
+        assert!(exec.is_route_quarantined(half_fp));
     }
 
     #[test]
