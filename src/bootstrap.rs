@@ -159,7 +159,12 @@ async fn bootstrap_inner(
 
     match (block.hypersync_built, block.envio_token_present) {
         (false, true) => {
-            crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled")
+            #[cfg(feature = "hypersync")]
+            crate::warn!("ENVIO_API_TOKEN set but hypersync client failed to build — disabled");
+            #[cfg(not(feature = "hypersync"))]
+            crate::warn!(
+                "ENVIO_API_TOKEN set but binary built without `hypersync` feature — rebuild with default features"
+            );
         }
         (false, false) => crate::info!("ENVIO_API_TOKEN not set — hypersync disabled"),
         _ => {}

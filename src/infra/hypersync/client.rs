@@ -1,9 +1,5 @@
 //! Native Rust HyperSync client wrapper.
 //!
-//! Complements (does not replace) the Envio HyperIndex data:
-//! - **PostgreSQL** — pool/token discovery metadata (LF path, direct SQL)
-//! - **HyperSync** — fast head feed, receipts, traces, historical log scans
-//!
 //! See: <https://docs.rs/hypersync-client/latest/hypersync_client/>
 //! Docs: <https://docs.envio.dev/docs/HyperSync/overview>
 
@@ -12,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use hypersync_client::Client;
-use hypersync_client::HeightStreamEvent;
 use hypersync_client::format::{Hash, Quantity, TransactionStatus};
 use hypersync_client::net_types::{
     JoinMode, Query, TransactionFilter, transaction::TransactionField,
@@ -23,6 +18,9 @@ use tokio::time::{Duration, timeout};
 use crate::config::RpcConfig;
 use crate::core::constants::POLYGON_CHAIN_ID;
 use crate::util::now_ms;
+
+/// Re-export so callers do not need a direct `hypersync_client` dependency.
+pub use hypersync_client::HeightStreamEvent;
 
 const DEFAULT_RECEIPT_LOOKBACK: u64 = 50;
 const HEIGHT_CACHE_TTL_MS: u64 = 15_000;

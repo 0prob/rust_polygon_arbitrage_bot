@@ -261,7 +261,7 @@ pub async fn run_pass_loop(
                     None => std::future::pending().await,
                 }
             }, if height_rx.is_some() => {
-                use hypersync_client::HeightStreamEvent;
+                use crate::infra::hypersync::HeightStreamEvent;
                 match event {
                     Some(HeightStreamEvent::Height(height)) => {
                         hs_restart_backoff = Duration::from_secs(2);
