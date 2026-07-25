@@ -69,17 +69,10 @@ fn is_acceptable_realized_profit(profit: Option<U256>) -> bool {
 }
 
 fn decode_realized_profit(output: &[u8]) -> Option<U256> {
-    if output.is_empty() {
+    if output.len() < 32 {
         return None;
     }
-    // Standard ABI uint256 return; some RPCs pad to 32 bytes only.
-    if output.len() == 32 {
-        return Some(U256::from_be_slice(output));
-    }
-    if output.len() > 32 {
-        return Some(U256::from_be_slice(&output[output.len() - 32..]));
-    }
-    None
+    Some(U256::from_be_slice(&output[output.len() - 32..]))
 }
 
 fn build_tx(

@@ -139,7 +139,7 @@ pub struct CycleCapableCoverage {
 
 impl CycleCapableCoverage {
     #[inline]
-    fn mask_set(words: &mut Vec<u64>, idx: usize) {
+    fn mask_set(words: &mut [u64], idx: usize) {
         let word = idx / 64;
         let bit = idx % 64;
         if word < words.len() {

@@ -484,11 +484,13 @@ pub fn load_dotenv() {
             continue;
         }
         let value = value.trim();
-        // Strip unquoted inline comments (`KEY=val # note`); quoted values keep `#`.
-        let value = if value.starts_with('"') || value.starts_with('\'') {
-            value.trim_matches('"').trim_matches('\'')
+        // Strip matching outer quotes (`"..."` or `'...'`); unquoted values drop `#` comments.
+        let value = if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+        {
+            &value[1..value.len() - 1]
         } else {
-            value.split('#').next().unwrap_or(value).trim()
+            value.split('#').next().unwrap_or("").trim()
         };
         // ponytail: ignore set_var errors (e.g. key contains '=')
         // ponytail: Rust 2024 marks set_var unsafe — dotenv loader only

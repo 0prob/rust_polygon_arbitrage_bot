@@ -991,7 +991,7 @@ mod tests {
             pool.address,
             "0x0000000000000000000000000000010000000003"
                 .parse::<Address>()
-                .unwrap()
+                .expect("valid address")
         );
     }
 }
