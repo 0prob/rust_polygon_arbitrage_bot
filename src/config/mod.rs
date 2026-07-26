@@ -240,8 +240,10 @@ fn default_brent_search_iterations() -> u32 {
     12
 }
 fn default_enumeration_max_paths() -> u32 {
-    // 13: target <1.5s at 1.3k+ (1.52s@1.1k w/15). Lower budget; fresh near-misses on CRV/BAL in history, monitor for dispatch on non-bad.
-    13
+    // 24: live iter8–9 at 13 left ~half the snap on tickless_stuck / ZeroProfit after
+    // sticky DODO/V2 uq — too little diversify for Brent. 24 keeps LF under ~2s at
+    // current graph sizes while giving HF more non-phantom candidates.
+    24
 }
 fn default_cycle_finder() -> CycleFinderMode {
     CycleFinderMode::Hybrid
@@ -299,7 +301,8 @@ fn default_hf_prefetch_count() -> usize {
     60
 }
 /// Floor for `HF_PREFETCH_BUDGET_MS` — must cover one TickLens pool
-/// (`HF_PROBE_HYDRATE_MIN_BUDGET` in orchestrator/hf.rs = 300ms).
+/// Floor must leave residual for one TickLens pool
+/// (`HF_PROBE_TICK_MS_PER_POOL` in orchestrator/hf_execute.rs).
 const HF_PREFETCH_BUDGET_MIN_MS: u64 = 300;
 /// Cap so a mis-set env cannot open a 60s prep wall and stall the HF semaphore.
 const HF_PREFETCH_BUDGET_MAX_MS: u64 = 8_000;

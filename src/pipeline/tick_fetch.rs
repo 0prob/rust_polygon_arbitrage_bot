@@ -55,7 +55,9 @@ pub fn is_probe_narrow_miss_on_cooldown(pool: Address) -> bool {
         .is_some_and(|&until| now < until)
 }
 
-fn mark_probe_narrow_miss(pools: impl IntoIterator<Item = Address>) {
+/// HF probe: deprioritize pools that stayed tickless after a narrow (or observed)
+/// miss — does not arm shared EMPTY (LF widen still allowed).
+pub fn mark_probe_narrow_miss(pools: impl IntoIterator<Item = Address>) {
     let now = crate::util::now_ms();
     let until = now.saturating_add(PROBE_NARROW_MISS_COOLDOWN_MS);
     let mut map = PROBE_NARROW_MISS_UNTIL_MS.lock();

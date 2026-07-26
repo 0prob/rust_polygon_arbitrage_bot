@@ -49,6 +49,10 @@ use crate::services::state_cache::StateCache;
 
 const ROUTE_COOLDOWN: Duration = Duration::from_secs(30);
 const DRY_RUN_PASS_COOLDOWN: Duration = Duration::from_secs(120);
+/// Exclusive Brent/assess window per edge-rotation set — concurrent HF ticks were
+/// all ranking the same near_net DODO then hitting quarantine in evaluate_one
+/// (live iter15: assess_q 73→693, 503 events <300ms apart).
+const ROUTE_ASSESS_CLAIM_TTL: Duration = Duration::from_secs(3);
 /// eth_blockNumber hang protection (matches state_refresh head budget).
 const CHAIN_HEAD_RPC_TIMEOUT: Duration = Duration::from_millis(1_500);
 // ponytail: prepare-skip only counts for logs — quarantine was starving selected=0.
@@ -177,6 +181,8 @@ pub struct ExecutionService {
     /// Cached `(fetched_at, latest_nonce, pending_nonce)` for mempool gate RPC coalescing.
     mempool_nonce_cache: Mutex<Option<(Instant, u64, u64)>>,
     quarantine: RwLock<FxHashMap<u64, Instant>>,
+    /// Short exclusive claim while a tick runs Brent/assess on a route (all rotations).
+    assess_inflight: RwLock<FxHashMap<u64, Instant>>,
     route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
     /// Direct (`executeArbDirect`) start tokens that failed zero-realized confirm.
     direct_token_quarantine: RwLock<FxHashMap<Address, Instant>>,
@@ -312,6 +318,7 @@ impl ExecutionService {
             last_global_submit: Mutex::new(None),
             mempool_nonce_cache: Mutex::new(None),
             quarantine: RwLock::new(FxHashMap::default()),
+            assess_inflight: RwLock::new(FxHashMap::default()),
             route_hash_quarantine: RwLock::new(FxHashMap::default()),
             direct_token_quarantine: RwLock::new(direct_token_quarantine),
             underwater_strikes: RwLock::new(FxHashMap::default()),
@@ -616,6 +623,60 @@ impl ExecutionService {
 
     pub fn is_route_quarantined(&self, fingerprint: u64) -> bool {
         self.any_quarantined(&[fingerprint])
+    }
+
+    /// True when any start-rotation of `edges` is quarantined.
+    /// Underwater / stale cools call `quarantine_all_edge_rotations`; checking only the
+    /// current fp lets Aave-rotated starts leak back into probe_kept (live iter13:
+    /// assess in=1 quarantine=1 ×224 after single-fp re-check).
+    #[must_use]
+    pub fn cycle_edges_quarantined(&self, edges: &[crate::core::types::Edge]) -> bool {
+        let fps = Self::edge_rotation_fps(edges);
+        !fps.is_empty() && self.any_quarantined(&fps)
+    }
+
+    fn edge_rotation_fps(
+        edges: &[crate::core::types::Edge],
+    ) -> smallvec::SmallVec<[u64; crate::core::constants::HOP_CAP_USIZE]> {
+        let n = edges.len();
+        let mut fps =
+            smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
+        if n == 0 {
+            return fps;
+        }
+        let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
+        for _ in 0..n {
+            fps.push(super::candidate::hash_cycle_edges(&rotated));
+            rotated.rotate_left(1);
+        }
+        fps
+    }
+
+    /// Claim exclusive assess/Brent for this edge set (all rotations). Fails when
+    /// quarantined or another tick already claimed — stops concurrent assess_q spam.
+    #[must_use]
+    pub fn try_claim_route_assess(&self, edges: &[crate::core::types::Edge]) -> bool {
+        let fps = Self::edge_rotation_fps(edges);
+        if fps.is_empty() || self.any_quarantined(&fps) {
+            return false;
+        }
+        let mut map = self.assess_inflight.write();
+        let now = Instant::now();
+        if fps
+            .iter()
+            .any(|fp| map.get(fp).is_some_and(|exp| *exp > now))
+        {
+            return false;
+        }
+        static CLAIMS: AtomicU32 = AtomicU32::new(0);
+        if CLAIMS.fetch_add(1, Ordering::Relaxed).is_multiple_of(32) {
+            map.retain(|_, exp| *exp > now);
+        }
+        let until = now + ROUTE_ASSESS_CLAIM_TTL;
+        for fp in fps {
+            map.insert(fp, until);
+        }
+        true
     }
 
     pub fn is_route_hash_quarantined(&self, route_hash: &FixedBytes<32>) -> bool {

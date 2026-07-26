@@ -263,6 +263,8 @@ pub struct HfEvalInputOwned {
     pub profit_priority_alpha_bps: u64,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
     pub execution: Arc<ExecutionService>,
+    /// Arena-synced metas for V4 pool_id / hydrate-exhausted phantom cool.
+    pub pool_metas: Arc<Vec<crate::pipeline::types::PoolMeta>>,
 }
 
 impl HfEvalInputOwned {
@@ -511,6 +513,7 @@ fn rank_one_cycle_probe(
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
     execution: &ExecutionService,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
     let rotated = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
@@ -525,6 +528,11 @@ fn rank_one_cycle_probe(
     let fp = hash_cycle_edges(&cycle.edges);
     if !route_fits_executor(&cycle.edges) {
         out.skip.executor_budget = 1;
+        return out;
+    }
+    // Rotation-aware: underwater cools all start-rotations; single-fp miss let
+    // Aave-rotated starts refill probe_kept (live iter13: assess quarantine ×224).
+    if execution.cycle_edges_quarantined(&cycle.edges) {
         return out;
     }
     // FoT / TransferFailed cool-down — any hop, not only start (live: Wrapped SOL
@@ -621,25 +629,60 @@ fn rank_one_cycle_probe(
             }
             // Spot-positive / walk-zero phantoms refill every tick (live: zero_profit
             // emptied probe_kept). Cool all start-rotations so select skips them.
-            // Same for NoSimulation that is not ClTickless-only (tickless waits on
-            // hydrate; live sticky nosim fps like 0x20e0 repeated empty ranks).
+            // ClTickless-only NoSimulation: arm hop-level probe-miss then always
+            // stale-cool the route. Waiting on hydrate-exhausted was a chicken-egg
+            // (live iter19: same fp re-probed every ~2s; hops never entered cooldown
+            // after hydrate gap / pool_cap truncation → exhausted stayed false).
             let cool_phantoms = match reject {
                 MinimalProbeReject::ZeroProfit => true,
                 MinimalProbeReject::NoSimulation => {
                     let fails: Vec<_> = attempt_failures.iter().flatten().copied().collect();
-                    !fails.is_empty()
-                        && !fails
+                    if fails.is_empty() {
+                        false
+                    } else if fails.iter().all(|f| {
+                        matches!(
+                            f,
+                            local_sim::MinimalSimFailure::ClTickless { .. }
+                                | local_sim::MinimalSimFailure::ShallowCl { .. }
+                        )
+                    }) {
+                        // ClTickless: arm hop miss for drain. ShallowCl: longer cool
+                        // (live iter20/21: 30s stale let fp 0x21f58… recycle ×7).
+                        if fails
                             .iter()
-                            .all(|f| matches!(f, local_sim::MinimalSimFailure::ClTickless { .. }))
+                            .any(|f| matches!(f, local_sim::MinimalSimFailure::ClTickless { .. }))
+                        {
+                            crate::orchestrator::hf_execute::mark_cycle_tickless_cl_probe_miss(
+                                arena, &cycle, pool_metas,
+                            );
+                        }
+                        true
+                    } else {
+                        true
+                    }
                 }
                 MinimalProbeReject::SanityReject(_) => false,
             };
             if cool_phantoms {
                 let n = cycle.edges.len();
                 if n > 0 {
+                    // ShallowCl-only: ticks exist but never walk — 30s stale recycled
+                    // the same fp every cooldown window (iter21: 0x21f58… ×7 / ~5min).
+                    let nosim_fails: Vec<_> =
+                        attempt_failures.iter().flatten().copied().collect();
+                    let shallow_only = matches!(reject, MinimalProbeReject::NoSimulation)
+                        && !nosim_fails.is_empty()
+                        && nosim_fails.iter().all(|f| {
+                            matches!(f, local_sim::MinimalSimFailure::ShallowCl { .. })
+                        });
                     let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
                     for _ in 0..n {
-                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
+                        let fp_rot = hash_cycle_edges(&rotated);
+                        if shallow_only {
+                            execution.quarantine_probe_below_dispatch_floor(fp_rot);
+                        } else {
+                            execution.quarantine_stale_route(fp_rot);
+                        }
                         rotated.rotate_left(1);
                     }
                 }
@@ -730,7 +773,11 @@ fn rank_one_cycle_probe(
             // then pins at floor with zero sim profit (live: same fps ×10k/hour).
             // Economic-sized underwater edges still go to near_net so Brent can
             // size up (deep pool, thin probe ROI is not a dust reject).
-            if probe_amount < economic_floor {
+            // Zero MATIC cover at economic size: Brent cannot grow an edge (live
+            // iter7: after chronic uq of cover~500–2271, cover_matic=0 monopolized
+            // near_net → skip_net=1 / peak_avail=0). Stale-cool rotations (30s) —
+            // not chronic uq (MIN_COVER_BPS=25 guards that cascade).
+            if probe_amount < economic_floor || cover_matic.is_zero() {
                 let n = cycle.edges.len();
                 if n > 0 {
                     let mut rotated =
@@ -787,6 +834,7 @@ pub fn rank_cycles_by_probe_net(
     safety_multiplier_bps: u64,
     profit_priority_alpha_bps: u64,
     execution: &ExecutionService,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> (Vec<FoundCycle>, FxHashMap<u64, (U256, MinimalSimResult)>) {
     if cycles.is_empty() || max_keep == 0 {
         return (Vec::new(), FxHashMap::default());
@@ -818,6 +866,7 @@ pub fn rank_cycles_by_probe_net(
                     safety_multiplier_bps,
                     profit_priority_alpha_bps,
                     execution,
+                    pool_metas,
                 )
             })
             .reduce(ProbeRankPartial::default, ProbeRankPartial::merge)
@@ -841,6 +890,7 @@ pub fn rank_cycles_by_probe_net(
                     safety_multiplier_bps,
                     profit_priority_alpha_bps,
                     execution,
+                    pool_metas,
                 )
             })
             .fold(ProbeRankPartial::default(), ProbeRankPartial::merge)
@@ -870,6 +920,11 @@ pub fn rank_cycles_by_probe_net(
         )
     });
     let rescue_len = rescue.len();
+    // Drop cycles cooled by a sibling during parallel rank (rotation-aware).
+    let profitable_ranked: Vec<_> = profitable_ranked
+        .into_iter()
+        .filter(|(_, _, cycle)| !execution.cycle_edges_quarantined(&cycle.edges))
+        .collect();
     let had_net_ranked = !profitable_ranked.is_empty();
     // Fill order: profitable → near_net (simulatable underwater) → rescue → score fallback.
     // Rescue must not run before near_net: when profitable is empty, admitting rescue_cap
@@ -896,6 +951,12 @@ pub fn rank_cycles_by_probe_net(
                 if kept.len() >= max_keep || near_net_kept >= near_net_slots {
                     break;
                 }
+                // Re-check after parallel rank (rotation + FoT token cool).
+                if execution.cycle_edges_quarantined(&cycle.edges)
+                    || execution.cycle_has_quarantined_token(arena, &cycle.edges)
+                {
+                    continue;
+                }
                 if seen.insert(fp)
                     && cycle_flash_evaluable(
                         &cycle,
@@ -915,7 +976,20 @@ pub fn rank_cycles_by_probe_net(
         if kept.len() < max_keep && !rescue.is_empty() {
             rescue.sort_by(|a, b| compare_cycle_execution(&a.1, &b.1));
             let remaining = max_keep - kept.len();
-            for (fp, cycle) in rescue.into_iter().take(rescue_cap.min(remaining)) {
+            // Spot-negative rescue must not flood Brent when near_net already holds
+            // real underwater edges (live iter10: near_net_slots=4 then rescue≈30 →
+            // probe_kept≈32, sticky DODO monopolized best-eval after chronic-uq).
+            let rescue_take = if had_net_ranked {
+                rescue_cap.min(remaining)
+            } else if near_net_count > 0 {
+                0
+            } else {
+                rescue_cap.min(remaining).min(4)
+            };
+            for (fp, cycle) in rescue.into_iter().take(rescue_take) {
+                if execution.cycle_edges_quarantined(&cycle.edges) {
+                    continue;
+                }
                 if seen.insert(fp) {
                     kept.push((fp, cycle));
                 }
@@ -925,10 +999,14 @@ pub fn rank_cycles_by_probe_net(
             // Without any gas-clearing probe, cap total admissions so score-fallback
             // cannot re-flood Brent with the same underwater dust (live: kept=34 of
             // 35 with near_net_slots=4 then fallback filled the rest).
+            // When near_net is also empty, score-fallback used to force total_cap≥1
+            // (live iter16: kept=1 near_net=0 → assess quarantine / evaluated=0).
             let total_cap = if had_net_ranked {
                 max_keep
-            } else {
+            } else if near_net_count > 0 {
                 max_keep.min(6).max(kept.len().max(1))
+            } else {
+                kept.len()
             };
             let fallback = simulatable_score_fallback(
                 &scanned,
@@ -944,7 +1022,10 @@ pub fn rank_cycles_by_probe_net(
                     break;
                 }
                 let fp = hash_cycle_edges(&cycle.edges);
-                if !seen.insert(fp) {
+                if execution.cycle_edges_quarantined(&cycle.edges)
+                    || execution.cycle_has_quarantined_token(arena, &cycle.edges)
+                    || !seen.insert(fp)
+                {
                     continue;
                 }
                 // Score-fallback used to admit seedless cycles → assess all opt_none
@@ -1279,7 +1360,20 @@ pub async fn rescore_rank_and_evaluate_async(
             input.safety_multiplier_bps,
             input.profit_priority_alpha_bps,
             input.execution.as_ref(),
+            input.pool_metas.as_ref(),
         );
+        // Drop cooled routes/tokens and claim exclusive assess (live iter15: concurrent
+        // HF ticks → assess_q 693; iter16: try_claim passed but evaluate_one still hit
+        // quarantine=1 via FoT token cool — same counter, not checked at claim).
+        let cycles: Vec<_> = cycles
+            .into_iter()
+            .filter(|c| {
+                !input
+                    .execution
+                    .cycle_has_quarantined_token(&input.arena, &c.edges)
+                    && input.execution.try_claim_route_assess(&c.edges)
+            })
+            .collect();
         if !cycles.is_empty() {
             crate::debug!("probe rank kept {} cycles for Brent", cycles.len());
         }
@@ -1527,7 +1621,7 @@ fn evaluate_one(
         inc(&stats.executor_budget);
         return None;
     }
-    if input.execution.is_route_quarantined(fp) {
+    if input.execution.cycle_edges_quarantined(&cycle.edges) {
         inc(&stats.quarantine);
         return None;
     }

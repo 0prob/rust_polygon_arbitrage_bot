@@ -20,11 +20,13 @@ use crate::pipeline::types::MinimalSimResult;
 
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
-    is_cl_tick_on_hydrate_cooldown, is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
+    is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
     is_probe_narrow_miss_on_cooldown, is_probe_narrow_miss_v4_on_cooldown,
-    mark_tick_hydrate_timeout_cooldown, mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3,
-    still_tickless_v4,
+    mark_probe_narrow_miss_v4, mark_tick_hydrate_timeout_cooldown,
+    mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
 };
+#[cfg(test)]
+use crate::pipeline::tick_fetch::is_cl_tick_on_hydrate_cooldown;
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
 };
@@ -389,9 +391,12 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let profitable: Vec<_> = profitable
         .into_iter()
         .filter(|r| {
-            let fp = r.route_fingerprint;
-            !ctx.execution.is_route_quarantined(fp)
-                && !ctx.execution.is_route_on_cooldown(fp, &ctx.config)
+            // Rotation-aware: underwater/stale cool all starts; single-fp let a
+            // rotated profitable candidate leak into submit (parity with evaluate_one).
+            !ctx.execution.cycle_edges_quarantined(&r.cycle.edges)
+                && !ctx
+                    .execution
+                    .is_route_on_cooldown(r.route_fingerprint, &ctx.config)
         })
         .collect();
     if profitable.is_empty() {
@@ -939,8 +944,12 @@ fn restore_dispatch_cl_ticks(arena: &mut StateArena, snapshots: Vec<(PoolIndex, 
 /// Live TickLens finishes in ~100–250ms; cap=3 left v3_total=7–8 with
 /// cycles_tickless stuck (iter1: 221 cl_tickless → NoSimulation).
 const HF_PROBE_TICK_POOL_CAP: usize = 6;
-/// ms per tickless pool — observed hydrate often 100–250ms; keep headroom.
-const HF_PROBE_TICK_MS_PER_POOL: u64 = 250;
+/// ms per tickless pool for budget→cap scaling.
+///
+/// Live probe-tick (word_range≤4): often 44–120ms/pool. The prior 250ms floor
+/// forced `cap=1` under residual prep so multi-hop CL cycles stayed
+/// `cycles_tickless=N→N` after a successful `v3_loaded=1`.
+pub(crate) const HF_PROBE_TICK_MS_PER_POOL: u64 = 120;
 
 /// Scale the probe hydrate pool set to residual prep budget so we finish more
 /// often instead of cooling a large pending set on timeout.
@@ -954,6 +963,7 @@ pub(crate) fn probe_tick_pool_cap_for_budget(budget: std::time::Duration) -> usi
     ((ms / HF_PROBE_TICK_MS_PER_POOL) as usize).min(HF_PROBE_TICK_POOL_CAP)
 }
 
+#[cfg(test)]
 fn cl_pool_on_hydrate_cooldown(
     arena: &StateArena,
     pool_metas: &[crate::pipeline::types::PoolMeta],
@@ -963,13 +973,17 @@ fn cl_pool_on_hydrate_cooldown(
     let Some(addr) = arena.pool_address(pool_index) else {
         return false;
     };
-    let v4_pool_id = (protocol == crate::core::types::ProtocolType::UniswapV4)
-        .then(|| {
-            crate::pipeline::types::pool_meta_at(pool_metas, pool_index)
-                .and_then(|meta| meta.pool_id)
-        })
-        .flatten();
-    is_cl_tick_on_hydrate_cooldown(addr, v4_pool_id)
+    if protocol == crate::core::types::ProtocolType::UniswapV4 {
+        let v4_pool_id = crate::pipeline::types::pool_meta_at(pool_metas, pool_index)
+            .and_then(|meta| meta.pool_id);
+        // Missing pool_id: TickLens cannot target the hop — treat as stuck so
+        // selection/drain does not keep burning probe on permanently tickless V4.
+        if v4_pool_id.is_none() {
+            return true;
+        }
+        return is_cl_tick_on_hydrate_cooldown(addr, v4_pool_id);
+    }
+    is_cl_tick_on_hydrate_cooldown(addr, None)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1009,36 +1023,164 @@ fn count_tickless_cl_cycles<C: AsRef<FoundCycle>>(arena: &StateArena, cycles: &[
         .count()
 }
 
-/// True when the cycle has tickless CL hops and every such pool is on tick-miss cooldown
-/// (wide fetch already failed recently — further HF eval is dust-only noise).
-pub(crate) fn cycle_tickless_cl_all_on_miss_cooldown(
+/// True when every tickless V3 hop is on HF-exhausted cooldown (empty-tick **or**
+/// probe_narrow_miss). Used to stale-cool ClTickless-only `NoSimulation` phantoms
+/// that otherwise refill probe every tick after narrow hydrate skipped them
+/// (live iter8: cl_tickless monopolized ranks while `near_net≈0`).
+///
+/// Prefer [`cycle_tickless_cl_hf_hydrate_exhausted`] when `pool_metas` is available
+/// (covers V4/mixed residue; live iter18: V3-only left V4 phantoms re-probing).
+///
+/// Does **not** consult `pool_metas` / V4 pool_id — LF wide hydrate is unaffected
+/// (probe_narrow_miss is HF-only and does not arm shared EMPTY).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn cycle_v3_tickless_hf_hydrate_exhausted(
     arena: &StateArena,
     cycle: &FoundCycle,
-    pool_metas: &[crate::pipeline::types::PoolMeta],
 ) -> bool {
     let mut saw_tickless = false;
     for edge in &cycle.edges {
+        if edge.protocol != crate::core::types::ProtocolType::UniswapV3 {
+            continue;
+        }
         let tickless = matches!(
-            (arena.pool_state(edge.pool_index), edge.protocol),
-            (Some(PoolState::V3(s)), crate::core::types::ProtocolType::UniswapV3)
-            | (Some(PoolState::V4(s)), crate::core::types::ProtocolType::UniswapV4)
-                if s.ticks.is_empty()
+            arena.pool_state(edge.pool_index),
+            Some(PoolState::V3(s)) if s.ticks.is_empty()
         );
         if !tickless {
             continue;
         }
         saw_tickless = true;
-        if !cl_pool_on_hydrate_cooldown(arena, pool_metas, edge.pool_index, edge.protocol) {
+        let Some(addr) = arena.pool_address(edge.pool_index) else {
+            return false;
+        };
+        if !is_empty_tick_on_cooldown(addr) && !is_probe_narrow_miss_on_cooldown(addr) {
             return false;
         }
     }
     saw_tickless
 }
 
+/// V3+V4 HF hydrate exhausted: every tickless CL hop is on empty-tick **or**
+/// probe_narrow_miss (V4: empty_v4 / narrow_v4 / missing pool_id).
+///
+/// Used to stale-cool ClTickless-only `NoSimulation` phantoms after hydrate can
+/// no longer unlock the route this cooldown window.
+#[must_use]
+pub(crate) fn cycle_tickless_cl_hf_hydrate_exhausted(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> bool {
+    let mut saw_tickless = false;
+    for edge in &cycle.edges {
+        match edge.protocol {
+            crate::core::types::ProtocolType::UniswapV3 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V3(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                saw_tickless = true;
+                let Some(addr) = arena.pool_address(edge.pool_index) else {
+                    return false;
+                };
+                if !is_empty_tick_on_cooldown(addr) && !is_probe_narrow_miss_on_cooldown(addr) {
+                    return false;
+                }
+            }
+            crate::core::types::ProtocolType::UniswapV4 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V4(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                saw_tickless = true;
+                let Some(addr) = arena.pool_address(edge.pool_index) else {
+                    return false;
+                };
+                let Some(pool_id) = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+                    .and_then(|meta| meta.pool_id)
+                else {
+                    // No pool_id → TickLens cannot target; treat hop as permanently stuck.
+                    continue;
+                };
+                if !is_empty_v4_tick_on_cooldown(pool_id)
+                    && !is_probe_narrow_miss_v4_on_cooldown(pool_id)
+                    && !is_empty_tick_on_cooldown(addr)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_tickless
+}
+
+/// Arm probe-narrow-miss on every currently tickless V3/V4 hop.
+///
+/// Closes the chicken-egg where ClTickless `NoSimulation` waited on
+/// [`cycle_tickless_cl_hf_hydrate_exhausted`] but hops never entered cooldown
+/// (hydrate gap / pool_cap truncation — live iter19: same fp every ~2s).
+pub(crate) fn mark_cycle_tickless_cl_probe_miss(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> usize {
+    let mut v3: Vec<Address> = Vec::new();
+    let mut v4: Vec<alloy::primitives::FixedBytes<32>> = Vec::new();
+    for edge in &cycle.edges {
+        match edge.protocol {
+            crate::core::types::ProtocolType::UniswapV3 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V3(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                if let Some(addr) = arena.pool_address(edge.pool_index) {
+                    v3.push(addr);
+                }
+            }
+            crate::core::types::ProtocolType::UniswapV4 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V4(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                if let Some(pool_id) =
+                    crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+                        .and_then(|meta| meta.pool_id)
+                {
+                    v4.push(pool_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let n = v3.len() + v4.len();
+    if !v3.is_empty() {
+        crate::pipeline::tick_fetch::mark_probe_narrow_miss(v3);
+    }
+    if !v4.is_empty() {
+        mark_probe_narrow_miss_v4(v4);
+    }
+    n
+}
+
 /// True when any V3/V4 hop's pool is on tick-miss cooldown.
 ///
 /// Previously used at HF selection (over-pruned to `selected=0`); select now uses
-/// [`cycle_tickless_cl_all_on_miss_cooldown`].
+/// [`cycle_tickless_cl_hf_hydrate_exhausted`].
 #[cfg(test)]
 pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
     arena: &StateArena,
@@ -1061,7 +1203,7 @@ pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
 }
 
 /// Drop cycles stuck on cooldown-empty CL ticks so probe/Brent budget goes to tradeable routes.
-/// Returns how many cycles were removed. No-op when that would empty the set.
+/// Returns how many cycles were removed. Empty remaining is fine (tick handles 0 cycles).
 pub(crate) fn drain_cooldown_stuck_tickless_cycles(
     arena: &StateArena,
     cycles: &mut Vec<std::sync::Arc<FoundCycle>>,
@@ -1071,28 +1213,45 @@ pub(crate) fn drain_cooldown_stuck_tickless_cycles(
         return 0;
     }
     let before = cycles.len();
-    cycles.retain(|c| !cycle_tickless_cl_all_on_miss_cooldown(arena, c.as_ref(), pool_metas));
+    // Empty-tick **or** probe-narrow-miss (iter20: ClTickless phantom cool arms
+    // narrow-miss; empty-only drain left those cycles re-selected every tick).
+    cycles.retain(|c| !cycle_tickless_cl_hf_hydrate_exhausted(arena, c.as_ref(), pool_metas));
     // Previously refused to drain when *every* cycle was stuck (kept.is_empty →
     // return 0), which left HF evaluating only dust-only phantoms for the tick.
     // Empty remaining is fine — the tick already handles cycles_considered=0.
     before.saturating_sub(cycles.len())
 }
 
-/// Collect tickless V3 addresses ranked by how many selected cycles they unlock
-/// (then liquidity). Cap=1 under residual prep — cycle order alone left the same
-/// low-value pool hydrating while multi-cycle hubs stayed tickless (live).
+/// Collect tickless V3 addresses ranked by how many selected cycles they **fully
+/// unlock** (sole remaining fetchable hop, no blocked siblings), then by cycle
+/// membership, then liquidity.
+///
+/// Prior membership-only ranking hydrated hubs that left sibling hops empty →
+/// live `v3_loaded=1` with `cycles_tickless=1→1` and probe `cl_tickless`.
 fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
     arena: &StateArena,
     cycles: &[C],
     cap: usize,
 ) -> (usize, Vec<Address>) {
     use rustc_hash::FxHashMap;
-    // addr → (cycle_hits, liquidity, pool_index)
-    let mut freq: FxHashMap<Address, (u32, u128)> = FxHashMap::default();
+    // addr → (sole_unlocks, membership_hits, liquidity)
+    let mut freq: FxHashMap<Address, (u32, u32, u128)> = FxHashMap::default();
     for cycle in cycles {
-        let mut in_cycle: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
+        let mut fetchable: Vec<(Address, u128)> = Vec::new();
+        let mut blocked_sibling = false;
+        let mut seen: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
         for edge in &cycle.as_ref().edges {
             if edge.protocol != crate::core::types::ProtocolType::UniswapV3 {
+                // V4 tickless hops also block a "full unlock" this tick.
+                if edge.protocol == crate::core::types::ProtocolType::UniswapV4 {
+                    let tickless = matches!(
+                        arena.pool_state(edge.pool_index),
+                        Some(PoolState::V4(st)) if st.ticks.is_empty()
+                    );
+                    if tickless {
+                        blocked_sibling = true;
+                    }
+                }
                 continue;
             }
             let Some(addr) = arena.pool_address(edge.pool_index) else {
@@ -1102,26 +1261,36 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
                 Some(PoolState::V3(st)) => (st.ticks.is_empty(), st.liquidity),
                 _ => (false, 0),
             };
-            if !tickless
-                || is_empty_tick_on_cooldown(addr)
-                || is_probe_narrow_miss_on_cooldown(addr)
-            {
+            if !tickless || !seen.insert(addr) {
                 continue;
             }
-            if in_cycle.insert(addr) {
-                let e = freq.entry(addr).or_insert((0, liq));
-                e.0 = e.0.saturating_add(1);
-                e.1 = e.1.max(liq);
+            if is_empty_tick_on_cooldown(addr) || is_probe_narrow_miss_on_cooldown(addr) {
+                blocked_sibling = true;
+                continue;
             }
+            fetchable.push((addr, liq));
+        }
+        let sole = !blocked_sibling && fetchable.len() == 1;
+        for (addr, liq) in fetchable {
+            let e = freq.entry(addr).or_insert((0, 0, liq));
+            if sole {
+                e.0 = e.0.saturating_add(1);
+            }
+            e.1 = e.1.saturating_add(1);
+            e.2 = e.2.max(liq);
         }
     }
     let all = freq.len();
-    let mut ranked: Vec<(Address, u32, u128)> = freq
+    let mut ranked: Vec<(Address, u32, u32, u128)> = freq
         .into_iter()
-        .map(|(addr, (hits, liq))| (addr, hits, liq))
+        .map(|(addr, (sole, hits, liq))| (addr, sole, hits, liq))
         .collect();
-    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-    let out: Vec<Address> = ranked.into_iter().take(cap).map(|(a, _, _)| a).collect();
+    ranked.sort_unstable_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    let out: Vec<Address> = ranked.into_iter().take(cap).map(|(a, _, _, _)| a).collect();
     (all, out)
 }
 
@@ -1132,59 +1301,93 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
     cap: usize,
 ) -> (usize, Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>) {
     use rustc_hash::FxHashMap;
-    // pool_index -> (pool_id, hits, liquidity)
-    let mut freq: FxHashMap<PoolIndex, (alloy::primitives::FixedBytes<32>, u32, u128)> =
+    // pool_index -> (pool_id, sole_unlocks, membership_hits, liquidity)
+    let mut freq: FxHashMap<PoolIndex, (alloy::primitives::FixedBytes<32>, u32, u32, u128)> =
         FxHashMap::default();
     for cycle in cycles {
-        let mut in_cycle: rustc_hash::FxHashSet<PoolIndex> = rustc_hash::FxHashSet::default();
+        let mut fetchable: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u128)> = Vec::new();
+        let mut blocked_sibling = false;
+        let mut seen: rustc_hash::FxHashSet<PoolIndex> = rustc_hash::FxHashSet::default();
         for edge in &cycle.as_ref().edges {
-            if edge.protocol != crate::core::types::ProtocolType::UniswapV4 {
-                continue;
-            }
-            let idx = edge.pool_index;
-            let (tickless, pool_id, liq) = match arena.pool_state(idx) {
-                Some(PoolState::V4(st)) => {
-                    let pid = crate::pipeline::types::pool_meta_at(pool_metas, idx)
-                        .and_then(|meta| meta.pool_id);
-                    (st.ticks.is_empty(), pid, st.liquidity)
+            match edge.protocol {
+                crate::core::types::ProtocolType::UniswapV3 => {
+                    // Any tickless V3 sibling means this V4 hop alone cannot unlock.
+                    if matches!(
+                        arena.pool_state(edge.pool_index),
+                        Some(PoolState::V3(st)) if st.ticks.is_empty()
+                    ) {
+                        blocked_sibling = true;
+                    }
                 }
-                _ => (false, None, 0),
-            };
-            let Some(pool_id) = pool_id else {
-                continue;
-            };
-            let addr = arena.pool_address(idx);
-            let is_on_cooldown = is_empty_v4_tick_on_cooldown(pool_id)
-                || is_probe_narrow_miss_v4_on_cooldown(pool_id)
-                || addr.is_some_and(is_empty_tick_on_cooldown);
-            if !tickless || is_on_cooldown {
-                continue;
+                crate::core::types::ProtocolType::UniswapV4 => {
+                    let idx = edge.pool_index;
+                    let (tickless, pool_id, liq) = match arena.pool_state(idx) {
+                        Some(PoolState::V4(st)) => {
+                            let pid = crate::pipeline::types::pool_meta_at(pool_metas, idx)
+                                .and_then(|meta| meta.pool_id);
+                            (st.ticks.is_empty(), pid, st.liquidity)
+                        }
+                        _ => (false, None, 0),
+                    };
+                    if !tickless || !seen.insert(idx) {
+                        continue;
+                    }
+                    let Some(pool_id) = pool_id else {
+                        blocked_sibling = true;
+                        continue;
+                    };
+                    let addr = arena.pool_address(idx);
+                    let is_on_cooldown = is_empty_v4_tick_on_cooldown(pool_id)
+                        || is_probe_narrow_miss_v4_on_cooldown(pool_id)
+                        || addr.is_some_and(is_empty_tick_on_cooldown);
+                    if is_on_cooldown {
+                        blocked_sibling = true;
+                        continue;
+                    }
+                    fetchable.push((idx, pool_id, liq));
+                }
+                _ => {}
             }
-            if in_cycle.insert(idx) {
-                let e = freq.entry(idx).or_insert((pool_id, 0, liq));
+        }
+        let sole = !blocked_sibling && fetchable.len() == 1;
+        for (idx, pool_id, liq) in fetchable {
+            let e = freq.entry(idx).or_insert((pool_id, 0, 0, liq));
+            if sole {
                 e.1 = e.1.saturating_add(1);
-                e.2 = e.2.max(liq);
             }
+            e.2 = e.2.saturating_add(1);
+            e.3 = e.3.max(liq);
         }
     }
     let all = freq.len();
-    let mut ranked: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u32, u128)> = freq
+    let mut ranked: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u32, u32, u128)> = freq
         .into_iter()
-        .map(|(idx, (pool_id, hits, liq))| (idx, pool_id, hits, liq))
+        .map(|(idx, (pool_id, sole, hits, liq))| (idx, pool_id, sole, hits, liq))
         .collect();
-    ranked.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.cmp(&a.3)));
-    let out: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> =
-        ranked.into_iter().take(cap).map(|(idx, pid, _, _)| (idx, pid)).collect();
+    ranked.sort_unstable_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| b.4.cmp(&a.4))
+    });
+    let out: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> = ranked
+        .into_iter()
+        .take(cap)
+        .map(|(idx, pid, _, _, _)| (idx, pid))
+        .collect();
     (all, out)
 }
 
 /// On probe-tick hydrate timeout the enrich future is dropped before it can
 /// mark misses, so the next tick would re-burn the whole budget on the same
-/// pools. Briefly cooldown the targets it was about to fetch; live pools
-/// recover on the next completed attempt. Returns how many were cooled.
+/// pools. Briefly cooldown still-tickless hops; live pools recover on the next
+/// completed attempt. Returns how many were cooled.
 ///
 /// `cap` must match the set `hydrate_tickless_cl_for_cycles` attempted (budget-
 /// scaled). Using the hard 64-cap here used to cool pools never in-flight.
+///
+/// Does **not** re-rank via [`tickless_cl_targets_shared_cap`]: that skips
+/// `probe_narrow_miss` pools armed mid-pass before the outer timeout fires
+/// (live iter21: 21/25 timeouts → cooled 0 → same tickless re-selected).
 pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     arena: &StateArena,
     cycles: &[C],
@@ -1194,9 +1397,70 @@ pub(crate) fn mark_probe_hydrate_timeout_cooldown<C: AsRef<FoundCycle>>(
     if cap == 0 {
         return 0;
     }
-    let (_, v3, _, v4) = tickless_cl_targets_shared_cap(arena, cycles, pool_metas, cap);
+    use rustc_hash::FxHashSet;
+    let mut v3: Vec<Address> = Vec::new();
+    let mut v4: Vec<alloy::primitives::FixedBytes<32>> = Vec::new();
+    let mut seen_v3 = FxHashSet::default();
+    let mut seen_v4 = FxHashSet::default();
+    for cycle in cycles {
+        for edge in &cycle.as_ref().edges {
+            match edge.protocol {
+                crate::core::types::ProtocolType::UniswapV3 => {
+                    let tickless = matches!(
+                        arena.pool_state(edge.pool_index),
+                        Some(PoolState::V3(s)) if s.ticks.is_empty()
+                    );
+                    if !tickless {
+                        continue;
+                    }
+                    let Some(addr) = arena.pool_address(edge.pool_index) else {
+                        continue;
+                    };
+                    // EMPTY already has a longer cool — timeout cool is redundant.
+                    if is_empty_tick_on_cooldown(addr) || !seen_v3.insert(addr) {
+                        continue;
+                    }
+                    v3.push(addr);
+                }
+                crate::core::types::ProtocolType::UniswapV4 => {
+                    let tickless = matches!(
+                        arena.pool_state(edge.pool_index),
+                        Some(PoolState::V4(s)) if s.ticks.is_empty()
+                    );
+                    if !tickless {
+                        continue;
+                    }
+                    let Some(pool_id) =
+                        crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+                            .and_then(|meta| meta.pool_id)
+                    else {
+                        continue;
+                    };
+                    if is_empty_v4_tick_on_cooldown(pool_id)
+                        || arena
+                            .pool_address(edge.pool_index)
+                            .is_some_and(is_empty_tick_on_cooldown)
+                        || !seen_v4.insert(pool_id)
+                    {
+                        continue;
+                    }
+                    v4.push(pool_id);
+                }
+                _ => {}
+            }
+            if v3.len() + v4.len() >= cap {
+                break;
+            }
+        }
+        if v3.len() + v4.len() >= cap {
+            break;
+        }
+    }
+    v3.truncate(cap);
+    let v4_cap = cap.saturating_sub(v3.len());
+    v4.truncate(v4_cap);
     mark_tick_hydrate_timeout_cooldown(v3.iter().copied());
-    mark_v4_tick_hydrate_timeout_cooldown(v4.iter().map(|&(_, pool_id)| pool_id));
+    mark_v4_tick_hydrate_timeout_cooldown(v4.iter().copied());
     v3.len() + v4.len()
 }
 
@@ -1222,11 +1486,152 @@ fn tickless_cl_targets_shared_cap<C: AsRef<FoundCycle>>(
     (v3_total, v3, v4_total, v4)
 }
 
+/// Still-tickless hops on cycles that already have ≥1 hydrated CL hop.
+///
+/// Primary ranking skips `probe_narrow_miss` pools, so a hub can load while the
+/// sibling stays cooled → live `v3_loaded=N` with `cycles_tickless=1→1`. Bypass
+/// narrow-miss here; still respect empty-tick cooldowns (wide already failed).
+fn sibling_completion_cl_targets<C: AsRef<FoundCycle>>(
+    arena: &StateArena,
+    cycles: &[C],
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    cap: usize,
+) -> (
+    Vec<Address>,
+    Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)>,
+) {
+    use rustc_hash::FxHashMap;
+    // addr → (sole_remaining, hits, liq)
+    let mut v3_freq: FxHashMap<Address, (u32, u32, u128)> = FxHashMap::default();
+    // pool_index → (pool_id, sole_remaining, hits, liq)
+    let mut v4_freq: FxHashMap<
+        PoolIndex,
+        (alloy::primitives::FixedBytes<32>, u32, u32, u128),
+    > = FxHashMap::default();
+
+    for cycle in cycles {
+        let edges = &cycle.as_ref().edges;
+        let mut has_hydrated_cl = false;
+        let mut v3_rem: Vec<(Address, u128)> = Vec::new();
+        let mut v4_rem: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u128)> = Vec::new();
+        let mut seen_v3: rustc_hash::FxHashSet<Address> = rustc_hash::FxHashSet::default();
+        let mut seen_v4: rustc_hash::FxHashSet<PoolIndex> = rustc_hash::FxHashSet::default();
+
+        for edge in edges {
+            match edge.protocol {
+                crate::core::types::ProtocolType::UniswapV3 => {
+                    let Some(addr) = arena.pool_address(edge.pool_index) else {
+                        continue;
+                    };
+                    match arena.pool_state(edge.pool_index) {
+                        Some(PoolState::V3(st)) if !st.ticks.is_empty() => {
+                            has_hydrated_cl = true;
+                        }
+                        Some(PoolState::V3(st)) if st.ticks.is_empty() => {
+                            // Wide-empty already failed recently — don't re-hammer.
+                            if is_empty_tick_on_cooldown(addr) {
+                                continue;
+                            }
+                            if seen_v3.insert(addr) {
+                                v3_rem.push((addr, st.liquidity));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                crate::core::types::ProtocolType::UniswapV4 => {
+                    let idx = edge.pool_index;
+                    match arena.pool_state(idx) {
+                        Some(PoolState::V4(st)) if !st.ticks.is_empty() => {
+                            has_hydrated_cl = true;
+                        }
+                        Some(PoolState::V4(st)) if st.ticks.is_empty() => {
+                            let Some(pool_id) =
+                                crate::pipeline::types::pool_meta_at(pool_metas, idx)
+                                    .and_then(|meta| meta.pool_id)
+                            else {
+                                continue;
+                            };
+                            if is_empty_v4_tick_on_cooldown(pool_id)
+                                || arena
+                                    .pool_address(idx)
+                                    .is_some_and(is_empty_tick_on_cooldown)
+                            {
+                                continue;
+                            }
+                            if seen_v4.insert(idx) {
+                                v4_rem.push((idx, pool_id, st.liquidity));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !has_hydrated_cl || (v3_rem.is_empty() && v4_rem.is_empty()) {
+            continue;
+        }
+        let sole = v3_rem.len() + v4_rem.len() == 1;
+        for (addr, liq) in v3_rem {
+            let e = v3_freq.entry(addr).or_insert((0, 0, liq));
+            if sole {
+                e.0 = e.0.saturating_add(1);
+            }
+            e.1 = e.1.saturating_add(1);
+            e.2 = e.2.max(liq);
+        }
+        for (idx, pool_id, liq) in v4_rem {
+            let e = v4_freq.entry(idx).or_insert((pool_id, 0, 0, liq));
+            if sole {
+                e.1 = e.1.saturating_add(1);
+            }
+            e.2 = e.2.saturating_add(1);
+            e.3 = e.3.max(liq);
+        }
+    }
+
+    let mut v3_ranked: Vec<(Address, u32, u32, u128)> = v3_freq
+        .into_iter()
+        .map(|(addr, (sole, hits, liq))| (addr, sole, hits, liq))
+        .collect();
+    v3_ranked.sort_unstable_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    let mut v4_ranked: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>, u32, u32, u128)> =
+        v4_freq
+            .into_iter()
+            .map(|(idx, (pid, sole, hits, liq))| (idx, pid, sole, hits, liq))
+            .collect();
+    v4_ranked.sort_unstable_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| b.4.cmp(&a.4))
+    });
+
+    // Prefer sole-remaining V3, reserve ≥1 V4 slot when both need work.
+    let v4_reserve = usize::from(!v4_ranked.is_empty() && !v3_ranked.is_empty() && cap >= 2);
+    let v3_cap = cap.saturating_sub(v4_reserve);
+    let v3: Vec<Address> = v3_ranked.into_iter().take(v3_cap).map(|(a, _, _, _)| a).collect();
+    let v4_cap = cap.saturating_sub(v3.len());
+    let v4: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> = v4_ranked
+        .into_iter()
+        .take(v4_cap)
+        .map(|(idx, pid, _, _, _)| (idx, pid))
+        .collect();
+    (v3, v4)
+}
+
 /// Hydrate empty V3/V4 tick arrays on selected HF cycles before probe ranking.
 /// Hot-cache refresh drops ticks when price/liquidity moves; without this, those
 /// routes classify as `cl_tickless` and never reach Brent/economics.
 ///
 /// `pool_cap` limits how many tickless pools to fetch this tick (budget-scaled).
+/// `budget` bounds sequential wide/sibling passes so they finish under the outer
+/// `timeout` instead of burning 1500ms then cooling 0 (live iter21).
 pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     rpc: &RpcPool,
     arena: &mut StateArena,
@@ -1235,6 +1640,7 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     word_range: i16,
     block_number: Option<u64>,
     pool_cap: usize,
+    budget: std::time::Duration,
 ) -> ProbeTickHydrateStats {
     let mut stats = ProbeTickHydrateStats {
         cycles_tickless_before: count_tickless_cl_cycles(arena, cycles),
@@ -1244,6 +1650,9 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
         stats.cycles_tickless_after = stats.cycles_tickless_before;
         return stats;
     }
+    let hydrate_started = std::time::Instant::now();
+    let one_pool = std::time::Duration::from_millis(HF_PROBE_TICK_MS_PER_POOL);
+    let budget_allows_pass = || hydrate_started.elapsed() + one_pool <= budget;
     let (v3_total, v3, v4_total, v4) =
         tickless_cl_targets_shared_cap(arena, cycles, pool_metas, pool_cap);
     stats.v3_total = v3_total;
@@ -1283,7 +1692,169 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     stats.v3_algebra_loaded = pass.v3_algebra_loaded;
     stats.v4_loaded = pass.v4_loaded;
     stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+
+    // Narrow word_range≤4 often misses sparse liquidity (live: v3_loaded=0 empty=N
+    // with cycles_tickless=N→N). Wide TickLens — same widen formula as LF
+    // (`word*3` clamped 24..48) — without re-widening the whole probe batch.
+    // Use the already-ranked `v3` list: probe_narrow_miss just armed and would
+    // exclude these from a fresh `tickless_v3_addresses_prioritized` pass.
+    // Also when the batch partially loaded (live: v3_loaded=1 empty=1) — widen the
+    // remaining empty sole-unlocks, not only the all-empty case.
+    // Cap 8: iter15 still had 31/61 hydrates 1→1 with cap=4; ranked batch is already
+    // pool_cap-bounded so wider retry stays inside the probe RPC budget.
+    const PROBE_WIDE_EMPTY_RETRY_CAP: usize = 8;
+    if budget_allows_pass() && stats.v3_empty > 0 && stats.cycles_tickless_after > 0 {
+        let wide_range = probe_wide_tick_word_range(probe_word_range);
+        let retry: Vec<Address> = v3
+            .iter()
+            .copied()
+            .filter(|&addr| {
+                arena
+                    .address_to_pool()
+                    .get(&addr)
+                    .and_then(|&idx| arena.pool_state(idx))
+                    .is_some_and(|st| matches!(st, PoolState::V3(s) if s.ticks.is_empty()))
+            })
+            .take(PROBE_WIDE_EMPTY_RETRY_CAP)
+            .collect();
+        if !retry.is_empty() {
+            let (alg, alg_int) =
+                crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas, &retry);
+            let wide = hydrate_cl_ticks_with_rpc_fallback(
+                rpc,
+                arena,
+                &retry,
+                &[],
+                &alg,
+                &alg_int,
+                wide_range,
+                wide_range,
+                true, // allow Algebra/TickLens widen after the wide seed
+                block_number,
+                "hf probe-tick hydrate wide",
+            )
+            .await;
+            stats.v3_loaded = stats.v3_loaded.saturating_add(wide.v3_loaded);
+            stats.v3_algebra_loaded = stats
+                .v3_algebra_loaded
+                .saturating_add(wide.v3_algebra_loaded);
+            let unlocked = wide.v3_loaded.saturating_add(wide.v3_algebra_loaded);
+            if unlocked > 0 {
+                stats.v3_empty = stats.v3_empty.saturating_sub(unlocked);
+            }
+            stats.v3_incomplete = stats.v3_incomplete.saturating_add(wide.v3_incomplete);
+            stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+        }
+    }
+
+    // Mirror V3: mixed V3+V4 cycles stay tickless when V3 loads but V4 narrow
+    // (word≤4) misses sparse liquidity (live: v3_loaded=2 v4_fetch=1 v4_loaded=0,
+    // cycles_tickless=1→1 → cl_tickless). Also when partial V4 load leaves a sibling
+    // empty (live iter12: gate was v4_loaded==0 only — skipped still-empty widen).
+    // Reuse pre-ranked `v4` — probe_narrow_miss_v4 just armed and would exclude
+    // them from a fresh prioritize pass.
+    if budget_allows_pass() && stats.v4_needed > 0 && stats.cycles_tickless_after > 0 {
+        let wide_range = probe_wide_tick_word_range(probe_word_range);
+        let retry: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> = v4
+            .iter()
+            .copied()
+            .filter(|&(idx, _)| {
+                matches!(arena.pool_state(idx), Some(PoolState::V4(s)) if s.ticks.is_empty())
+            })
+            .take(PROBE_WIDE_EMPTY_RETRY_CAP)
+            .collect();
+        if !retry.is_empty() {
+            let empty_alg = rustc_hash::FxHashSet::default();
+            let wide = hydrate_cl_ticks_with_rpc_fallback(
+                rpc,
+                arena,
+                &[],
+                &retry,
+                &empty_alg,
+                &empty_alg,
+                wide_range,
+                wide_range,
+                true,
+                block_number,
+                "hf probe-tick hydrate v4 wide",
+            )
+            .await;
+            stats.v4_loaded = stats.v4_loaded.saturating_add(wide.v4_loaded);
+            stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+        }
+    }
+
+    // Partial unlock residue (live iter17: 36× cycles_tickless=1→1 with v3_loaded≥1
+    // while a sibling stayed on probe_narrow_miss). Finish those hops with wide depth;
+    // narrow-miss bypass lives in `sibling_completion_cl_targets`.
+    const PROBE_SIBLING_COMPLETION_CAP: usize = 4;
+    if budget_allows_pass() && stats.cycles_tickless_after > 0 {
+        let (sib_v3, sib_v4) = sibling_completion_cl_targets(
+            arena,
+            cycles,
+            pool_metas,
+            PROBE_SIBLING_COMPLETION_CAP,
+        );
+        if !sib_v3.is_empty() || !sib_v4.is_empty() {
+            let wide_range = probe_wide_tick_word_range(probe_word_range);
+            let (alg, alg_int) =
+                crate::pipeline::tick_fetch::collect_algebra_pools(arena, pool_metas, &sib_v3);
+            let wide = hydrate_cl_ticks_with_rpc_fallback(
+                rpc,
+                arena,
+                &sib_v3,
+                &sib_v4,
+                &alg,
+                &alg_int,
+                wide_range,
+                wide_range,
+                true,
+                block_number,
+                "hf probe-tick hydrate sibling",
+            )
+            .await;
+            stats.v3_loaded = stats.v3_loaded.saturating_add(wide.v3_loaded);
+            stats.v3_algebra_loaded = stats
+                .v3_algebra_loaded
+                .saturating_add(wide.v3_algebra_loaded);
+            stats.v3_empty = stats.v3_empty.saturating_add(wide.v3_empty);
+            stats.v3_incomplete = stats.v3_incomplete.saturating_add(wide.v3_incomplete);
+            stats.v4_loaded = stats.v4_loaded.saturating_add(wide.v4_loaded);
+            stats.v3_needed = stats.v3_needed.saturating_add(sib_v3.len());
+            stats.v4_needed = stats.v4_needed.saturating_add(sib_v4.len());
+            stats.cycles_tickless_after = count_tickless_cl_cycles(arena, cycles);
+        }
+    }
+
+    // Still-tickless after a real fetch attempt used to wait for probe NoSimulation
+    // before probe-miss armed (live iter20: stuck11=21 while nosim already cooled).
+    // Arm now so `drain_cooldown_stuck_tickless_cycles` clears phantoms this tick.
+    if stats.cycles_tickless_after > 0 && (stats.v3_needed > 0 || stats.v4_needed > 0) {
+        let mut marked = 0usize;
+        for cycle in cycles {
+            if cycle_has_tickless_cl(arena, cycle.as_ref()) {
+                marked = marked.saturating_add(mark_cycle_tickless_cl_probe_miss(
+                    arena,
+                    cycle.as_ref(),
+                    pool_metas,
+                ));
+            }
+        }
+        if marked > 0 {
+            crate::debug!(
+                "hf probe-tick hydrate: armed probe-miss on {marked} still-tickless hops (cycles_tickless={})",
+                stats.cycles_tickless_after
+            );
+        }
+    }
     stats
+}
+
+/// LF-matched widen depth for a post-narrow sole-unlock TickLens retry.
+#[inline]
+#[must_use]
+pub(crate) fn probe_wide_tick_word_range(narrow: i16) -> i16 {
+    narrow.saturating_mul(3).clamp(24, 48)
 }
 
 async fn enrich_dispatch_cl_ticks(
@@ -1917,6 +2488,151 @@ mod tests {
     use crate::services::state_refresh::PoolRefreshResult;
 
     #[test]
+    fn probe_wide_tick_word_range_matches_lf_widen() {
+        assert_eq!(probe_wide_tick_word_range(4), 24);
+        assert_eq!(probe_wide_tick_word_range(10), 30);
+        assert_eq!(probe_wide_tick_word_range(20), 48);
+    }
+
+    #[test]
+    fn sibling_completion_targets_partial_unlock_only() {
+        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+        use crate::pipeline::tick_fetch::{
+            clear_tick_hydrate_cooldown, mark_tick_hydrate_timeout_cooldown,
+        };
+
+        let hub = Address::from([1u8; 20]);
+        let sibling = Address::from([2u8; 20]);
+        let tick = V3Tick {
+            tick: 0,
+            liquidity_gross: 1,
+            liquidity_net: 0,
+        };
+        let mut arena = StateArena::default();
+        let hub_idx = arena.register_pool(
+            hub,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![tick]),
+            })),
+        );
+        let sib_idx = arena.register_pool(
+            sibling,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 500_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![]),
+            })),
+        );
+        let cycle = FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_iter([
+                Edge {
+                    pool_index: hub_idx,
+                    protocol: ProtocolType::UniswapV3,
+                    token_in: TokenIndex(0),
+                    token_out: TokenIndex(1),
+                    zero_for_one: true,
+                    fee_bps: 30,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                },
+                Edge {
+                    pool_index: sib_idx,
+                    protocol: ProtocolType::UniswapV3,
+                    token_in: TokenIndex(1),
+                    token_out: TokenIndex(0),
+                    zero_for_one: false,
+                    fee_bps: 30,
+                    token_in_idx: 1,
+                    token_out_idx: 0,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 1.0,
+            cycle_ratio: U256::from(1u64),
+        };
+        // Hub already has ticks → sibling is the completion target (narrow-miss
+        // is intentionally not consulted by this helper).
+        let (v3, v4) = sibling_completion_cl_targets(&arena, &[cycle.clone()], &[], 4);
+        assert!(v4.is_empty());
+        assert_eq!(v3, vec![sibling]);
+
+        // Empty-tick (wide already failed) must not re-fetch.
+        mark_tick_hydrate_timeout_cooldown([sibling]);
+        let (v3_cool, _) = sibling_completion_cl_targets(&arena, &[cycle], &[], 4);
+        assert!(v3_cool.is_empty());
+        clear_tick_hydrate_cooldown(sibling);
+        clear_tick_hydrate_cooldown(hub);
+    }
+
+    #[test]
+    fn v3_tickless_hf_hydrate_exhausted_when_empty_cooldown() {
+        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+        use crate::pipeline::tick_fetch::{
+            clear_tick_hydrate_cooldown, mark_tick_hydrate_timeout_cooldown,
+        };
+
+        let addr = Address::from([42u8; 20]);
+        let mut arena = StateArena::default();
+        let idx = arena.register_pool(
+            addr,
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity: 1_000_000,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![]),
+            })),
+        );
+        let cycle = FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_iter([Edge {
+                pool_index: idx,
+                protocol: ProtocolType::UniswapV3,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                zero_for_one: true,
+                fee_bps: 30,
+                token_in_idx: 0,
+                token_out_idx: 1,
+            }]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 1.0,
+            cycle_ratio: U256::from(1u64),
+        };
+        assert!(
+            !cycle_v3_tickless_hf_hydrate_exhausted(&arena, &cycle),
+            "fresh tickless pool should still be fetchable"
+        );
+        mark_tick_hydrate_timeout_cooldown([addr]);
+        assert!(cycle_v3_tickless_hf_hydrate_exhausted(&arena, &cycle));
+        clear_tick_hydrate_cooldown(addr);
+        assert!(!cycle_v3_tickless_hf_hydrate_exhausted(&arena, &cycle));
+    }
+
+    #[test]
     fn resim_depth_replaces_pre_refresh_slippage() {
         let initial =
             effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3);
@@ -2096,6 +2812,74 @@ mod tests {
         };
         assert_eq!(state.ticks.len(), 1);
         assert_eq!(state.ticks[0].tick, 60);
+    }
+
+    #[test]
+    fn tickless_v3_prioritizes_sole_unlock_over_membership_hub() {
+        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+        let hub = Address::from([10u8; 20]);
+        let sole = Address::from([11u8; 20]);
+        let sibling = Address::from([12u8; 20]);
+        let mut arena = StateArena::default();
+        let mk_v3 = |arena: &mut StateArena, addr, liq| {
+            arena.register_pool(
+                addr,
+                Arc::new(PoolState::V3(V3PoolState {
+                    sqrt_price_x96: U256::from(1u128 << 96),
+                    liquidity: liq,
+                    tick: 0,
+                    fee: U256::from(3_000u32),
+                    tick_spacing: 60,
+                    unlocked: true,
+                    fee_protocol: 0,
+                    observation_cardinality: 1,
+                    ticks: Arc::from(vec![]),
+                })),
+            )
+        };
+        let hub_idx = mk_v3(&mut arena, hub, 9_000_000);
+        let sole_idx = mk_v3(&mut arena, sole, 1_000);
+        let sib_idx = mk_v3(&mut arena, sibling, 9_000_000);
+        let edge = |pool| Edge {
+            pool_index: pool,
+            protocol: ProtocolType::UniswapV3,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            zero_for_one: true,
+            fee_bps: 30,
+            token_in_idx: 0,
+            token_out_idx: 1,
+        };
+        // Hub appears in two multi-hop tickless cycles (high membership + liq).
+        let multi = |a, b, id| {
+            Arc::new(FoundCycle {
+                start_token: TokenIndex(id),
+                edges: CycleEdges::from_iter([edge(a), edge(b)]),
+                hop_count: 2,
+                log_weight: 0.0,
+                cumulative_fee_bps: 0,
+                score: 0.0,
+                cycle_ratio: U256::ZERO,
+            })
+        };
+        let one = Arc::new(FoundCycle {
+            start_token: TokenIndex(9),
+            edges: CycleEdges::from_iter([edge(sole_idx)]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 0,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        });
+        let cycles = vec![
+            multi(hub_idx, sib_idx, 1),
+            multi(hub_idx, sib_idx, 2),
+            one,
+        ];
+        let (total, ranked) = tickless_v3_addresses_prioritized(&arena, &cycles, 1);
+        assert_eq!(total, 3);
+        // Cap=1 must fetch the sole-unlock pool, not the high-liq membership hub.
+        assert_eq!(ranked, vec![sole]);
     }
 
     #[test]

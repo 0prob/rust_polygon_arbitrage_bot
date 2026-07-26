@@ -16,7 +16,7 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    cycle_tickless_cl_all_on_miss_cooldown, dispatch_profitable_candidates,
+    cycle_tickless_cl_hf_hydrate_exhausted, dispatch_profitable_candidates,
     drain_cooldown_stuck_tickless_cycles, filter_balancer_onchain_verified,
     hydrate_tickless_cl_for_cycles, probe_near_miss_balancer, refresh_and_resim_profitable,
 };
@@ -170,8 +170,9 @@ const HF_FLASH_INFLIGHT_WAIT_CAP: Duration = Duration::from_millis(350);
 /// 700ms covers a full hub batch without eating the tick wall.
 const HF_STREAM_FLASH_BUDGET_CAP: Duration = Duration::from_millis(700);
 /// Skip probe-tick hydrate when residual prep cannot finish one pool.
-/// Must match `HF_PROBE_TICK_MS_PER_POOL` (250ms).
-const HF_PROBE_HYDRATE_MIN_BUDGET: Duration = Duration::from_millis(250);
+/// Must match [`crate::orchestrator::hf_execute::HF_PROBE_TICK_MS_PER_POOL`].
+const HF_PROBE_HYDRATE_MIN_BUDGET: Duration =
+    Duration::from_millis(crate::orchestrator::hf_execute::HF_PROBE_TICK_MS_PER_POOL);
 /// Cap so TickLens cannot burn the whole prep wall; 1500ms → up to 6 pools.
 const HF_PROBE_HYDRATE_MAX_BUDGET: Duration = Duration::from_millis(1_500);
 /// Stream HF can fire every ~100–200ms; TickLens hydrate must not.
@@ -561,23 +562,12 @@ fn quarantine_all_edge_rotations(execution: &ExecutionService, edges: &[crate::c
     }
 }
 
+#[inline]
 fn cycle_edges_quarantined(
     execution: &ExecutionService,
     edges: &[crate::core::types::Edge],
 ) -> bool {
-    let n = edges.len();
-    if n == 0 {
-        return false;
-    }
-    // from_slice: Copy-optimal without smallvec `specialization` (servo docs).
-    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
-    let mut fps =
-        smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
-    for _ in 0..n {
-        fps.push(hash_cycle_edges(&rotated));
-        rotated.rotate_left(1);
-    }
-    execution.any_quarantined(&fps)
+    execution.cycle_edges_quarantined(edges)
 }
 
 fn warn_hf_oracle_skip(message: &str) {
@@ -991,12 +981,11 @@ fn select_cycles_for_rescore(
     for cycle in snap_cycles {
         // Pool set unchanged by heal/realign — cheap live flag for drop staging.
         let live = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now) > 0;
-        // Skip only when every tickless CL hop is on miss cooldown. Skipping any
-        // CL pool on cooldown (even with LF ticks) wiped the HF window
-        // (`selected=0`, tickless_stuck≫candidates) whenever a hub pool missed.
-        // Live WSS: do not tickless-cull. Miss cooldowns wiped stream ticks
-        // (`selected=0`, hot_pools=0) while wake_hf=true; hydrate+probe still useful.
-        if cycle_tickless_cl_all_on_miss_cooldown(arena, cycle.as_ref(), pool_metas) {
+        // Skip when every tickless CL hop is hydrate-exhausted (EMPTY **or**
+        // probe_narrow_miss). EMPTY-only left narrow-miss phantoms through select
+        // until pre-hydrate drain (live iter21: wasted prefetch on stuck CL).
+        // Live WSS: still admit (counted) — hydrate+probe can unlock after wake.
+        if cycle_tickless_cl_hf_hydrate_exhausted(arena, cycle.as_ref(), pool_metas) {
             if live {
                 live_drop_tickless += 1; // counted, still admitted
             } else {
@@ -1550,6 +1539,11 @@ pub async fn run_hf_tick(
                         .is_some_and(|a| dirty_uni.contains(&a))
                 });
                 if !touches {
+                    continue;
+                }
+                // Stream dirty-swap used to bypass select quarantine and re-admit
+                // chronic-uq sticky dust (live: same DODO/V2 fps after underwater cool).
+                if cycle_edges_quarantined(&ctx.execution, &c.edges) {
                     continue;
                 }
                 prefer.push(Arc::clone(c));
@@ -2110,6 +2104,7 @@ pub async fn run_hf_tick(
                 ctx.config.oracle.tick_word_range,
                 None,
                 probe_pool_cap,
+                probe_tick_budget,
             ),
         )
         .await
@@ -2232,6 +2227,7 @@ pub async fn run_hf_tick(
         profit_priority_alpha_bps: ctx.config.execution.profit_priority_fee_alpha_bps,
         flash_liquidity: Arc::clone(&ctx.execution.flash_liquidity),
         execution: Arc::clone(&ctx.execution),
+        pool_metas: Arc::clone(&pool_metas_for_dispatch),
     });
     let cycles_considered = cycles.len();
     let eval_started = now_ms();
@@ -2956,13 +2952,13 @@ mod tests {
         let (work, hydrate) = reserve_hydrate_budget(stage);
         assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
         assert_eq!(work + hydrate, stage);
-        // Full MAX residual admits hard pool cap (6 × 250ms).
+        // Full MAX residual admits hard pool cap (6 × HF_PROBE_TICK_MS_PER_POOL).
         assert_eq!(
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate),
             6
         );
 
-        let tight = Duration::from_millis(200);
+        let tight = HF_PROBE_HYDRATE_MIN_BUDGET.saturating_sub(Duration::from_millis(1));
         let (work_t, hydrate_t) = reserve_hydrate_budget(tight);
         assert!(hydrate_t.is_zero());
         assert_eq!(work_t, tight);
