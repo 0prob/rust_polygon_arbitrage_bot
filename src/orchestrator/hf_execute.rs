@@ -524,7 +524,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         };
         if matches!(
             outcome,
-            ExecutionOutcome::SkippedCircuitBreaker | ExecutionOutcome::SkippedShutdown
+            ExecutionOutcome::SkippedCircuitBreaker
+                | ExecutionOutcome::SkippedShutdown
+                | ExecutionOutcome::SkippedInsufficientBalance
         ) {
             break;
         }

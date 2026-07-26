@@ -43,7 +43,8 @@ use crate::services::execution::recovery::{NonceRecoveryOutcome, recover_after_r
 use crate::services::execution::revert_decoder::DecodedRevert;
 use crate::services::execution::rpc_errors::{SubmitAction, classify_submit_error};
 use crate::services::execution::submit::{
-    expected_submit_gas_price, resolve_submit_fees_with_profit, submit_with_recovery,
+    FEE_BUMP_BPS, bump_fees, expected_submit_gas_price, resolve_submit_fees_with_profit,
+    submit_with_recovery,
 };
 use crate::services::state_cache::StateCache;
 
@@ -196,6 +197,8 @@ pub struct ExecutionService {
     pub total_trades: AtomicU64,
     pub total_losses: AtomicU64,
     pub consecutive_fails: AtomicU32,
+    /// When set, [`Self::record_realized`] trips a 1h global quarantine on breach.
+    max_daily_loss_matic_wei: Option<U256>,
     route_stats: RwLock<FxHashMap<u64, RouteStats>>,
     _route_stats_path: PathBuf,
     last_near_miss_log: Mutex<Option<Instant>>,
@@ -301,7 +304,11 @@ impl ExecutionService {
             std::env::var("ROUTE_STATS_PATH")
                 .unwrap_or_else(|_| ".rpbot-route-stats.json".to_string())
         };
-        Self::with_route_stats_path(PathBuf::from(path))
+        let mut service = Self::with_route_stats_path(PathBuf::from(path));
+        service.max_daily_loss_matic_wei = parse_max_daily_loss_wei(
+            &config.execution.max_daily_loss_matic_wei,
+        );
+        service
     }
 
     pub(crate) fn with_route_stats_path(route_stats_path: PathBuf) -> Self {
@@ -330,6 +337,7 @@ impl ExecutionService {
             total_trades: AtomicU64::new(0),
             total_losses: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
+            max_daily_loss_matic_wei: None,
             route_stats: RwLock::new(route_stats),
             _route_stats_path: route_stats_path.clone(),
             last_near_miss_log: Mutex::new(None),
@@ -339,6 +347,21 @@ impl ExecutionService {
             route_sim_cache: Arc::new(crate::pipeline::route_sim_cache::RouteSimCache::new()),
             route_stats_writer: RouteStatsWriter::spawn(route_stats_path),
             cached_chain_id: Mutex::new(None),
+        }
+    }
+}
+
+fn parse_max_daily_loss_wei(raw: &str) -> Option<U256> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<U256>() {
+        Ok(v) if !v.is_zero() => Some(v),
+        Ok(_) => None,
+        Err(_) => {
+            // validate() rejects bad values in live startup; keep disabled if reached.
+            None
         }
     }
 }
@@ -541,14 +564,17 @@ impl ExecutionService {
     }
 
     fn record_realized(&self, profit_wei: U256, gas_cost_wei: U256) {
-        if profit_wei > gas_cost_wei {
+        if profit_wei >= gas_cost_wei {
+            // Break-even is neutral economically but still a successful confirmation.
             self.consecutive_fails.store(0, Ordering::Relaxed);
             let p = profit_wei
                 .saturating_sub(gas_cost_wei)
                 .min(U256::from(i128::MAX as u128))
                 .to::<u128>() as i128;
-            self.pnl.lock().record_profit(p);
-            self.total_trades.fetch_add(1, Ordering::Relaxed);
+            if p > 0 {
+                self.pnl.lock().record_profit(p);
+                self.total_trades.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             let loss = gas_cost_wei
                 .saturating_sub(profit_wei)
@@ -558,6 +584,33 @@ impl ExecutionService {
             self.total_losses.fetch_add(1, Ordering::Relaxed);
             self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
         }
+        self.enforce_daily_loss_limit();
+    }
+
+    /// Book gas-only loss without treating attribution failure as a trade outcome.
+    fn record_gas_cost_loss(&self, gas_cost_wei: U256) {
+        if gas_cost_wei.is_zero() {
+            return;
+        }
+        self.record_realized(U256::ZERO, gas_cost_wei);
+    }
+
+    fn enforce_daily_loss_limit(&self) {
+        let Some(max_loss) = self.max_daily_loss_matic_wei else {
+            return;
+        };
+        let daily = self.pnl_snapshot().1;
+        if daily >= 0 {
+            return;
+        }
+        let abs_loss = U256::from(daily.unsigned_abs());
+        if abs_loss < max_loss {
+            return;
+        }
+        self.quarantine_global(Duration::from_secs(3600), Instant::now());
+        crate::error!(
+            "DAILY LOSS LIMIT BREACHED: {abs_loss} >= {max_loss} wei — execution quarantined 1h"
+        );
     }
 }
 
@@ -583,6 +636,8 @@ pub enum ExecutionOutcome {
         reason: String,
     },
     SkippedCircuitBreaker,
+    /// Operator MATIC below gas+value requirement (not a consecutive-fail trip).
+    SkippedInsufficientBalance,
     SkippedQuarantined,
     SkippedCooldown,
     SkippedNoWallet,
@@ -1677,7 +1732,7 @@ impl ExecutionService {
                 final_gas,
                 fees.max_fee_per_gas,
             );
-            let outcome = ExecutionOutcome::SkippedCircuitBreaker;
+            let outcome = ExecutionOutcome::SkippedInsufficientBalance;
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
             }
@@ -1823,7 +1878,8 @@ impl ExecutionService {
         let Some(receipt) = (match poll_outcome {
             ReceiptPollOutcome::Received(receipt) => Some(receipt),
             ReceiptPollOutcome::Shutdown => {
-                nonce_mgr.release(nonce);
+                // Tx already submitted — never release; reuse races the in-flight nonce.
+                nonce_mgr.mark_stale(nonce);
                 let outcome = ExecutionOutcome::SkippedShutdown;
                 if let Some(ui_hook) = ui_hook {
                     ui_hook.on_execution_outcome(&outcome, fp);
@@ -1850,7 +1906,7 @@ impl ExecutionService {
                 nonce,
             );
             if shutdown.is_some_and(|rx| *rx.borrow()) {
-                nonce_mgr.release(nonce);
+                nonce_mgr.mark_stale(nonce);
                 let outcome = ExecutionOutcome::SkippedShutdown;
                 if let Some(ui_hook) = ui_hook {
                     ui_hook.on_execution_outcome(&outcome, fp);
@@ -1893,8 +1949,13 @@ impl ExecutionService {
                         .await;
                 }
                 NonceRecoveryOutcome::Cancelled(cancel_hash) => {
+                    // Cancel uses bumped fees (same as recovery); upper-bound book to daily PnL.
+                    let cancel_fees = bump_fees(fees, FEE_BUMP_BPS);
+                    let cancel_cost =
+                        U256::from(21_000u64).saturating_mul(cancel_fees.max_fee_per_gas);
+                    self.record_gas_cost_loss(cancel_cost);
                     crate::info!(
-                        "receipt timeout: cancel tx submitted fp={}, original={}, cancel={cancel_hash}",
+                        "receipt timeout: cancel tx submitted fp={}, original={}, cancel={cancel_hash} attributed_gas_wei={cancel_cost}",
                         fp,
                         tx_hash,
                     );
@@ -2041,7 +2102,7 @@ impl ExecutionService {
                     );
                     U256::ZERO
                 });
-            self.record_realized(U256::ZERO, gas_cost);
+            self.record_gas_cost_loss(gas_cost);
             // OOG at the gas ceiling reads as a revert but still teaches route gas.
             if receipt.gas_used > u64::from(candidate.simulated_gas) * 105 / 100 {
                 let oog_at_limit = submitted_gas_limit > 0
@@ -2118,9 +2179,10 @@ impl ExecutionService {
         });
         if let Some(profit_matic_wei) = profit_matic_wei {
             self.record_realized(profit_matic_wei, gas_cost);
-            if profit_matic_wei > gas_cost {
+            if profit_matic_wei >= gas_cost {
                 self.clear_fail_count(fp);
-                if candidate.adaptive_flash_cap_bound
+                if profit_matic_wei > gas_cost
+                    && candidate.adaptive_flash_cap_bound
                     && let Some((previous, next)) = self.promote_adaptive_flash_loan_cap(
                         fp,
                         candidate.adaptive_flash_loan_usd_limit,
@@ -2134,8 +2196,9 @@ impl ExecutionService {
                 self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
             }
         } else {
-            self.record_realized(U256::ZERO, gas_cost);
-            self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+            // Attribution unknown — do not book a phantom gas-only loss (trips breaker /
+            // daily-loss on confirmed wins). Soft-cool the route for a retry window.
+            self.quarantine_route_soft(fp, now);
         }
         if parsed_profit.is_none() {
             crate::error!(
@@ -2436,6 +2499,24 @@ mod safety_tests {
         assert_eq!(service.pnl_snapshot().1, 14);
         assert_eq!(service.total_trades.load(Ordering::Relaxed), 1);
         assert_eq!(service.consecutive_fails.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn break_even_realized_is_neutral_not_loss() {
+        let service = ExecutionService::new();
+        service.record_realized(U256::from(10u8), U256::from(10u8));
+        assert_eq!(service.pnl_snapshot().1, 0);
+        assert_eq!(service.total_trades.load(Ordering::Relaxed), 0);
+        assert_eq!(service.total_losses.load(Ordering::Relaxed), 0);
+        assert_eq!(service.consecutive_fails.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn daily_loss_limit_trips_on_record_realized() {
+        let mut service = ExecutionService::new();
+        service.max_daily_loss_matic_wei = Some(U256::from(5u8));
+        service.record_realized(U256::ZERO, U256::from(5u8));
+        assert!(service.global_is_quarantined());
     }
 
     #[test]

@@ -65,6 +65,10 @@ pub fn hf_eval_flash_source(policy: FlashLoanPolicy) -> FlashLoanSource {
 
 // --- profit_logs ---
 
+/// Net profit-token flow for `executor` from Transfer logs.
+///
+/// Returns `None` when no matching transfers, or when outflows exceed inflows
+/// (checked — saturating to zero used to book false gas-only losses).
 pub fn parse_transfer_profit(
     logs: &[Log],
     executor: Address,
@@ -92,7 +96,7 @@ pub fn parse_transfer_profit(
         if is_to {
             net = net.saturating_add(decoded.value);
         } else if is_from {
-            net = net.saturating_sub(decoded.value);
+            net = net.checked_sub(decoded.value)?;
         }
     }
     matched.then_some(net)
@@ -505,6 +509,61 @@ pub fn effective_slippage_bps_for_flash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Log as PrimitiveLog;
+    use alloy::sol_types::SolEvent;
+
+    fn transfer_log(token: Address, from: Address, to: Address, value: U256) -> Log {
+        let data = IERC20::Transfer { from, to, value }.encode_log_data();
+        Log {
+            inner: PrimitiveLog {
+                address: token,
+                data,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_transfer_profit_nets_inflow_minus_outflow() {
+        let executor = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let token = Address::repeat_byte(0xaa);
+        let logs = [
+            transfer_log(token, other, executor, U256::from(100u64)),
+            transfer_log(token, executor, other, U256::from(40u64)),
+        ];
+        assert_eq!(
+            parse_transfer_profit(&logs, executor, Some(token)),
+            Some(U256::from(60u64))
+        );
+    }
+
+    #[test]
+    fn parse_transfer_profit_returns_none_on_underflow() {
+        let executor = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let token = Address::repeat_byte(0xaa);
+        let logs = [
+            transfer_log(token, other, executor, U256::from(10u64)),
+            transfer_log(token, executor, other, U256::from(11u64)),
+        ];
+        assert_eq!(parse_transfer_profit(&logs, executor, Some(token)), None);
+    }
+
+    #[test]
+    fn parse_transfer_profit_ignores_unrelated_token() {
+        let executor = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let profit = Address::repeat_byte(0xaa);
+        let other_token = Address::repeat_byte(0xbb);
+        let logs = [transfer_log(
+            other_token,
+            other,
+            executor,
+            U256::from(99u64),
+        )];
+        assert_eq!(parse_transfer_profit(&logs, executor, Some(profit)), None);
+    }
 
     #[test]
     fn classify_submit_error_sees_through_anyhow_context() {

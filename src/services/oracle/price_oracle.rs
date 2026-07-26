@@ -11,7 +11,8 @@ use reqwest::{Client, Url};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 
-const ORACLE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Shared Hermes/HTTP timeout for Pyth price + catalog fetches.
+pub(crate) const ORACLE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Hermes URL length stays bounded when many distinct feed ids are requested.
 const PYTH_FETCH_CHUNK: usize = 24;
 /// Reject Pyth quotes older than this (plan: ≤60s skew vs wall clock).

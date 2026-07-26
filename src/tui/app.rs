@@ -620,6 +620,13 @@ impl App {
                 None,
                 None,
             ),
+            ExecutionOutcome::SkippedInsufficientBalance => (
+                Severity::Warn,
+                "skipped insufficient balance".to_string(),
+                None,
+                None,
+                None,
+            ),
             ExecutionOutcome::SkippedQuarantined => (
                 Severity::Warn,
                 "quarantined (no simulation)".to_string(),

@@ -226,7 +226,7 @@ pub fn profit_priority_uplift_wei(
 }
 
 /// Safety floor in native MATIC wei (`revert_penalty × safety_bps / 10_000`).
-/// `safety_bps == 0` disables the ratio gate and gas gate (dry-run eth_call); default 25_000.
+/// `safety_bps == 0` disables the ratio gate and gas gate (dry-run eth_call); default 10_000.
 #[must_use]
 pub fn safety_floor_matic_wei(revert_penalty_wei: U256, safety_bps: u64) -> U256 {
     if safety_bps == 0 {
@@ -283,8 +283,8 @@ fn ceil_div(numer: U256, denom: U256) -> Option<U256> {
     })
 }
 
-/// Default 2.5× worst-case gas loss buffer before submitting (25_000 bps = 2.5×).
-pub const DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS: u64 = 25_000;
+/// Default 1.0× gas cover before submitting (10_000 bps). Live values ≥25_000 warn.
+pub const DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS: u64 = 10_000;
 
 #[derive(Clone)]
 pub struct AssessProfitInput {

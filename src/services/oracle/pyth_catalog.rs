@@ -2,7 +2,7 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::Deserialize;
 
-const ORACLE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+use crate::services::oracle::price_oracle::ORACLE_HTTP_TIMEOUT;
 
 #[derive(Debug, Clone)]
 pub struct PythFeedCandidate {

@@ -276,7 +276,7 @@ fn default_profit_priority_fee_alpha_bps() -> u64 {
     1_000
 }
 fn default_profit_safety_multiplier_bps() -> u64 {
-    10_000
+    crate::services::execution::profit::DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS
 }
 fn default_min_operator_matic_wei() -> String {
     "500000000000000000".to_string()

@@ -551,7 +551,7 @@ fn spawn_pass_loop_sidecars(
     }
 }
 
-/// ponytail: global lock on daily loss check. Per-circuit refinement if needed.
+/// Backup daily-loss check (60s). Primary enforcement is on `record_realized`.
 fn spawn_daily_loss_guard(
     ctx: &Arc<RuntimeContext>,
     shutdown_rx: &watch::Receiver<bool>,

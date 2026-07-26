@@ -14,16 +14,15 @@ fn sort_v4_tick_spans_by_liquidity(spans: &mut [V4TickSpan]) {
 }
 
 /// After full hydrate (lens + algebra + wide) still tickless → skip re-RPC until
-/// this deadline. Iter2: 65% of probe TickLens fetches were empty and recycled
-/// into the cap within 45s while cycles_tickless stayed stuck.
+/// this deadline (90s). Shorter windows recycled empty TickLens misses into the
+/// probe cap while cycles_tickless stayed stuck.
 pub const EMPTY_TICK_COOLDOWN_MS: u64 = 90_000;
-/// After hydrate timeout (fetch never completed). Live: 30s under rate-limit left
-/// high-priority pools stuck tickless while residual prep re-burned elsewhere.
+/// After hydrate timeout (fetch never completed). 12s cool avoids huge sticky
+/// gaps under rate-limit while still giving the RPC a breath.
 pub const TICK_HYDRATE_TIMEOUT_COOLDOWN_MS: u64 = 12_000;
 /// HF probe narrow-only empty miss — not a full-empty proof (no widen).
 /// Lives in a separate map so LF can still widen; shared EMPTY cool was either
-/// pinning LF (45s) or letting HF re-burn the probe cap every 5s (live iter2:
-/// same miss pools ×10–16 while load_rate≈31%).
+/// pinning LF (90s) or letting HF re-burn the probe cap every few seconds.
 pub const PROBE_NARROW_MISS_COOLDOWN_MS: u64 = 30_000;
 /// Cap the expensive wide TickLens pass (word_range×3) so sparse empties do not
 /// dominate LF under rate limits.
