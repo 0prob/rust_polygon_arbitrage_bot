@@ -1,16 +1,16 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rpbot::config::CycleFinderMode;
 use rpbot::core::constants::MIN_HOP_TOKEN_BALANCE;
 use rpbot::core::math::uniswap_v2::simulate_v2_swap;
 use rpbot::core::math::uniswap_v3::simulate_v3_swap;
-use rpbot::core::types::{Edge, PoolState, ProtocolType, V2PoolState, V3PoolState, V3Tick};
-use rpbot::pipeline::arena::StateArena;
+use rpbot::core::types::{Edge, ProtocolType, V2PoolState, V3PoolState, V3Tick};
 use rpbot::pipeline::cycle_search::find_cycles_for_mode;
-use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair, rescore_graph_in_place};
+use rpbot::pipeline::graph::rescore_graph_in_place;
 use rpbot::pipeline::local_sim::simulate_route_minimal;
 use rpbot::pipeline::ternary::optimize_cycle;
 use rpbot::pipeline::types::CycleSearchPass;
+use rpbot::test_support::FixtureBuilder;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -60,48 +60,38 @@ fn bench_swaps(c: &mut Criterion) {
 }
 
 fn bench_route_sim(c: &mut Criterion) {
-    let mut arena = StateArena::default();
-    let a = arena.register_token(Address::from([1u8; 20]));
-    let b = arena.register_token(Address::from([2u8; 20]));
-    let c_tok = arena.register_token(Address::from([3u8; 20]));
-    let pools = [
-        arena.register_pool(
-            Address::from([4u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(2000u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-        arena.register_pool(
-            Address::from([5u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(2000u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(1500u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-        arena.register_pool(
-            Address::from([6u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1500u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-    ];
-    let metas = [
-        pool_meta_from_pair(pools[0], ProtocolType::UniswapV2, a, b, 30),
-        pool_meta_from_pair(pools[1], ProtocolType::UniswapV2, b, c_tok, 30),
-        pool_meta_from_pair(pools[2], ProtocolType::UniswapV2, c_tok, a, 30),
-    ];
-    let graph = build_graph(&arena, &metas);
+    let mut fx = FixtureBuilder::new();
+    let a = fx.token(1);
+    let b = fx.token(2);
+    let c_tok = fx.token(3);
+    fx.v2_pool(
+        4,
+        ProtocolType::UniswapV2,
+        a,
+        b,
+        MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(2000u64),
+        30,
+    );
+    fx.v2_pool(
+        5,
+        ProtocolType::UniswapV2,
+        b,
+        c_tok,
+        MIN_HOP_TOKEN_BALANCE * U256::from(2000u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(1500u64),
+        30,
+    );
+    fx.v2_pool(
+        6,
+        ProtocolType::UniswapV2,
+        c_tok,
+        a,
+        MIN_HOP_TOKEN_BALANCE * U256::from(1500u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
+        30,
+    );
+    let graph = fx.build_graph();
     let edges: Vec<Edge> = graph.adjacency[a.0 as usize]
         .iter()
         .chain(graph.adjacency[b.0 as usize].iter())
@@ -113,40 +103,29 @@ fn bench_route_sim(c: &mut Criterion) {
     let mut group = c.benchmark_group("route");
     group.throughput(Throughput::Elements(3));
     group.bench_function("simulate_3hop", |b| {
-        b.iter(|| simulate_route_minimal(black_box(&arena), black_box(&edges), black_box(amount)));
+        b.iter(|| {
+            simulate_route_minimal(black_box(&fx.arena), black_box(&edges), black_box(amount))
+        });
     });
     group.finish();
 }
 
 fn bench_graph_rescore(c: &mut Criterion) {
-    let mut arena = StateArena::default();
-    let mut metas = Vec::new();
+    let mut fx = FixtureBuilder::new();
     for i in 0..64u8 {
-        let t0 = arena.register_token(Address::from([
-            i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
-        ]));
-        let t1 = arena.register_token(Address::from([
-            i, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
-        ]));
-        let pool = arena.register_pool(
-            Address::from([i, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(u64::from(i) + 1),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(u64::from(i) + 2),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        );
-        metas.push(pool_meta_from_pair(
-            pool,
+        let t0 = fx.token(i);
+        let t1 = fx.token(i + 64);
+        fx.v2_pool(
+            i + 128,
             ProtocolType::UniswapV2,
             t0,
             t1,
+            MIN_HOP_TOKEN_BALANCE * U256::from(u64::from(i) + 1),
+            MIN_HOP_TOKEN_BALANCE * U256::from(u64::from(i) + 2),
             30,
-        ));
+        );
     }
-    let graph = build_graph(&arena, &metas);
+    let graph = fx.build_graph();
 
     let mut group = c.benchmark_group("graph");
     group.throughput(Throughput::Elements(64));
@@ -154,7 +133,7 @@ fn bench_graph_rescore(c: &mut Criterion) {
     group.bench_function("rescore_64_pools", |b| {
         b.iter_batched(
             || graph.clone(),
-            |mut g| rescore_graph_in_place(black_box(&arena), black_box(&mut g)),
+            |mut g| rescore_graph_in_place(black_box(&fx.arena), black_box(&mut g)),
             BatchSize::SmallInput,
         );
     });
@@ -162,48 +141,38 @@ fn bench_graph_rescore(c: &mut Criterion) {
 }
 
 fn bench_cycle_search(c: &mut Criterion) {
-    let mut arena = StateArena::default();
-    let a = arena.register_token(Address::from([1u8; 20]));
-    let b = arena.register_token(Address::from([2u8; 20]));
-    let c_tok = arena.register_token(Address::from([3u8; 20]));
-    let pools = [
-        arena.register_pool(
-            Address::from([4u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-        arena.register_pool(
-            Address::from([5u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-        arena.register_pool(
-            Address::from([6u8; 20]),
-            Arc::new(PoolState::V2(V2PoolState {
-                reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
-                reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
-                fee: U256::from(997u64),
-                fee_denominator: U256::from(1_000u64),
-                block_timestamp_last: 0,
-            })),
-        ),
-    ];
-    let metas = [
-        pool_meta_from_pair(pools[0], ProtocolType::UniswapV2, a, b, 30),
-        pool_meta_from_pair(pools[1], ProtocolType::UniswapV2, b, c_tok, 30),
-        pool_meta_from_pair(pools[2], ProtocolType::UniswapV2, c_tok, a, 30),
-    ];
-    let graph = build_graph(&arena, &metas);
+    let mut fx = FixtureBuilder::new();
+    let a = fx.token(1);
+    let b = fx.token(2);
+    let c_tok = fx.token(3);
+    fx.v2_pool(
+        4,
+        ProtocolType::UniswapV2,
+        a,
+        b,
+        MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
+        30,
+    );
+    fx.v2_pool(
+        5,
+        ProtocolType::UniswapV2,
+        b,
+        c_tok,
+        MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
+        30,
+    );
+    fx.v2_pool(
+        6,
+        ProtocolType::UniswapV2,
+        c_tok,
+        a,
+        MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(1000u64),
+        30,
+    );
+    let graph = fx.build_graph();
     let passes = [CycleSearchPass {
         max_hops: 4,
         max_cycles: 500,
@@ -215,9 +184,9 @@ fn bench_cycle_search(c: &mut Criterion) {
         b.iter_with_large_drop(|| {
             find_cycles_for_mode(
                 CycleFinderMode::Hybrid,
-                black_box(&arena),
+                black_box(&fx.arena),
                 black_box(&graph),
-                black_box(&metas),
+                black_box(fx.metas()),
                 black_box(&passes),
                 false,
                 None,
@@ -229,29 +198,28 @@ fn bench_cycle_search(c: &mut Criterion) {
 }
 
 fn bench_optimize_cycle(c: &mut Criterion) {
-    let mut arena = StateArena::default();
-    let a = arena.register_token(Address::from([1u8; 20]));
-    let b = arena.register_token(Address::from([2u8; 20]));
-    let pool = arena.register_pool(
-        Address::from([3u8; 20]),
-        Arc::new(PoolState::V2(V2PoolState {
-            reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-            reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-            fee: U256::from(997u64),
-            fee_denominator: U256::from(1_000u64),
-            block_timestamp_last: 0,
-        })),
+    let mut fx = FixtureBuilder::new();
+    let a = fx.token(1);
+    let b = fx.token(2);
+    let pool = fx.v2_pool(
+        3,
+        ProtocolType::UniswapV2,
+        a,
+        b,
+        MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
+        30,
     );
-    let pool2 = arena.register_pool(
-        Address::from([4u8; 20]),
-        Arc::new(PoolState::V2(V2PoolState {
-            reserve0: MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
-            reserve1: MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
-            fee: U256::from(997u64),
-            fee_denominator: U256::from(1_000u64),
-            block_timestamp_last: 0,
-        })),
+    let pool2 = fx.v2_pool(
+        4,
+        ProtocolType::UniswapV2,
+        b,
+        a,
+        MIN_HOP_TOKEN_BALANCE * U256::from(900u64),
+        MIN_HOP_TOKEN_BALANCE * U256::from(1100u64),
+        30,
     );
+    let arena = &fx.arena;
     let cycle = rpbot::core::types::FoundCycle {
         start_token: a,
         edges: vec![
@@ -287,7 +255,7 @@ fn bench_optimize_cycle(c: &mut Criterion) {
     let decimals = FxHashMap::default();
     let profit_ctx = rpbot::services::execution::profit::ProfitEvalContext::for_cycle(
         a,
-        &arena,
+        arena,
         &rates,
         &decimals,
         U256::from(30_000_000_000u64),
@@ -299,7 +267,7 @@ fn bench_optimize_cycle(c: &mut Criterion) {
     group.bench_function("cycle_2hop", |b| {
         b.iter(|| {
             optimize_cycle(
-                black_box(&arena),
+                black_box(arena),
                 black_box(&cycle),
                 &rates,
                 &decimals,

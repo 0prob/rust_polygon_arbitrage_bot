@@ -3146,4 +3146,117 @@ mod tests {
         // p2 should be picked first because it has 2 hits vs p1's 1 hit.
         assert_eq!(targets[0], (p2, pool_id2));
     }
+
+    #[test]
+    fn shared_cap_reserves_one_v4_slot_when_both_families_need_work() {
+        use crate::core::types::{
+            CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex, V4PoolState,
+        };
+        use crate::pipeline::types::PoolMeta;
+        use alloy::primitives::{FixedBytes, U256};
+
+        let mut arena = StateArena::default();
+        let v3_tickless_pool = |liquidity: u128| {
+            Arc::new(PoolState::V3(V3PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+                ticks: Arc::from(vec![]),
+            }))
+        };
+        let v3_a = arena.register_pool(Address::from([100u8; 20]), v3_tickless_pool(1_000_000));
+        let v3_b = arena.register_pool(Address::from([101u8; 20]), v3_tickless_pool(2_000_000));
+
+        let v4_tickless_pool = |liquidity: u128| {
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                liquidity,
+                tick: 0,
+                fee: U256::from(3_000u32),
+                tick_spacing: 60,
+                ticks: Arc::from([]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            }))
+        };
+        let pool_id_a = FixedBytes::from([102u8; 32]);
+        let pool_id_b = FixedBytes::from([103u8; 32]);
+        let v4_a = arena.register_pool(Address::from([102u8; 20]), v4_tickless_pool(100));
+        let v4_b = arena.register_pool(Address::from([103u8; 20]), v4_tickless_pool(200));
+
+        let metas = vec![
+            PoolMeta {
+                pool_index: v4_a,
+                protocol: ProtocolType::UniswapV4,
+                tokens: vec![],
+                fee_bps: 30,
+                bpt_index: None,
+                pool_id: Some(pool_id_a),
+                protocol_label: None,
+                pool_type: None,
+                hooks: None,
+                tick_spacing: Some(60),
+            },
+            PoolMeta {
+                pool_index: v4_b,
+                protocol: ProtocolType::UniswapV4,
+                tokens: vec![],
+                fee_bps: 30,
+                bpt_index: None,
+                pool_id: Some(pool_id_b),
+                protocol_label: None,
+                pool_type: None,
+                hooks: None,
+                tick_spacing: Some(60),
+            },
+        ];
+
+        let cycle = |pool, protocol| {
+            Arc::new(FoundCycle {
+                start_token: TokenIndex(0),
+                edges: CycleEdges::from_iter([Edge {
+                    pool_index: pool,
+                    protocol,
+                    token_in: TokenIndex(0),
+                    token_out: TokenIndex(1),
+                    zero_for_one: true,
+                    fee_bps: 30,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                }]),
+                hop_count: 1,
+                log_weight: 0.0,
+                cumulative_fee_bps: 0,
+                score: 0.0,
+                cycle_ratio: U256::ZERO,
+            })
+        };
+        let cycles = vec![
+            cycle(v3_a, ProtocolType::UniswapV3),
+            cycle(v3_b, ProtocolType::UniswapV3),
+            cycle(v4_a, ProtocolType::UniswapV4),
+            cycle(v4_b, ProtocolType::UniswapV4),
+        ];
+
+        let (v3_total, v3, v4_total, v4) =
+            tickless_cl_targets_shared_cap(&arena, &cycles, &metas, 2);
+        assert_eq!(v3_total, 2);
+        assert_eq!(v4_total, 2);
+        // Both families need work and cap=2: V3 is preferred but must still yield
+        // at least 1 V4 slot (doc: "Prefer V3 but reserve ≥1 V4 slot when both
+        // families need work") — this is the interaction the sub-parts don't cover.
+        assert_eq!(v3.len(), 1, "V3 must yield a slot when V4 also needs work");
+        assert_eq!(v4.len(), 1, "V4 must get its reserved slot");
+
+        // With only 1 slot total, there's no room to reserve — V3 takes it all.
+        let (_, v3_one, _, v4_one) = tickless_cl_targets_shared_cap(&arena, &cycles, &metas, 1);
+        assert_eq!(v3_one.len(), 1);
+        assert!(v4_one.is_empty(), "no slot left for V4 when cap=1");
+    }
 }
