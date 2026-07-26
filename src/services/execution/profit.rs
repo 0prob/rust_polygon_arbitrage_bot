@@ -467,9 +467,7 @@ pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 
             oracle,
             route_fp,
         } => match lookup {
-            Some(lookup) => {
-                lookup.route_gas_observed_or_seed(oracle, *route_fp, simulated_gas)
-            }
+            Some(lookup) => lookup.route_gas_observed_or_seed(oracle, *route_fp, simulated_gas),
             None => oracle.route_gas_observed_or_seed(*route_fp, simulated_gas),
         },
     }

@@ -34,8 +34,7 @@ use crate::services::execution::aave::{
 use crate::services::execution::flash_policy::FlashLoanPolicy;
 use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::profit::{
-    ProfitEvalContext, RouteAssessRequest, assess_route_from_sim,
-    route_profit_thresholds,
+    ProfitEvalContext, RouteAssessRequest, assess_route_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::rpc_errors::is_rpc_rate_limited;
 use crate::services::oracle::{
@@ -1608,7 +1607,10 @@ fn prepare_profit_thresholds(
 fn charged_priority_from_oracle(gas_oracle: &GasOracle) -> U256 {
     gas_oracle
         .loaded_snapshot()
-        .map(|s| s.priority_fee.max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS))
+        .map(|s| {
+            s.priority_fee
+                .max(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS)
+        })
         .unwrap_or(crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS)
 }
 

@@ -84,8 +84,7 @@ pub use profit::{
     AssessProfitInput, AssessmentGas, DEFAULT_PROFIT_SAFETY_MULTIPLIER_BPS, ProfitEvalContext,
     ProfitThresholds, RouteAssessRequest, RouteProfitParams, assess_profit, assess_route_from_sim,
     assess_route_profit, assessment_gas_for_edges, assessment_gas_units, compound_slippage_bps,
-    modeled_net_profit_tokens,
-    on_chain_min_profit_for_route, on_chain_min_profit_from_assessment,
+    modeled_net_profit_tokens, on_chain_min_profit_for_route, on_chain_min_profit_from_assessment,
     profit_priority_tip_per_gas, profit_priority_uplift_wei, safety_floor_matic_wei,
 };
 pub use service::{ExecutionOutcome, ExecutionService};

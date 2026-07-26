@@ -14,9 +14,7 @@ use crate::services::execution::gas_oracle::GasOracle;
 use crate::services::execution::nonce::NonceManager;
 use crate::services::execution::private_submit::PrivateSubmitConfig;
 use crate::services::execution::receipt::{ReceiptPollOutcome, ReceiptPoller};
-use crate::services::execution::submit::{
-    resolve_submit_fees, submit_with_recovery,
-};
+use crate::services::execution::submit::{resolve_submit_fees, submit_with_recovery};
 
 /// Gas ceiling for owner `transferAll` + ERC-20 transfer.
 const TRANSFER_ALL_GAS_LIMIT: u64 = 150_000;
@@ -168,7 +166,10 @@ mod tests {
     fn recipient_skips_executor_and_zero() {
         let operator = address!("0x1111111111111111111111111111111111111111");
         let executor = address!("0x2222222222222222222222222222222222222222");
-        assert_eq!(resolve_profit_recipient(Some(executor), operator, executor), None);
+        assert_eq!(
+            resolve_profit_recipient(Some(executor), operator, executor),
+            None
+        );
         assert_eq!(
             resolve_profit_recipient(Some(Address::ZERO), operator, executor),
             None
@@ -183,6 +184,9 @@ mod tests {
         let data = encode_transfer_all_calldata(token, to);
         let expected = IArbExecutor::transferAllCall { token, to }.abi_encode();
         assert_eq!(data.as_ref(), expected.as_slice());
-        assert_eq!(&data.as_ref()[..4], &IArbExecutor::transferAllCall::SELECTOR);
+        assert_eq!(
+            &data.as_ref()[..4],
+            &IArbExecutor::transferAllCall::SELECTOR
+        );
     }
 }

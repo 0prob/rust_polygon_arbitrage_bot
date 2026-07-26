@@ -415,11 +415,7 @@ pub fn evaluate_batch_query(
 /// `slippage_bps` is **route-level** (same as assess / `effective_slippage_bps`). Callers
 /// already pass compounded+depth slip — apply once (no hop re-compound).
 #[must_use]
-pub fn batch_profit_covers_min(
-    on_chain_profit: U256,
-    amount_in: U256,
-    slippage_bps: u64,
-) -> bool {
+pub fn batch_profit_covers_min(on_chain_profit: U256, amount_in: U256, slippage_bps: u64) -> bool {
     if on_chain_profit.is_zero() {
         return false;
     }
@@ -470,13 +466,9 @@ mod tests {
         let on_chain = U256::from(100_000u64);
         let amount_in = U256::from(1_000_000u64);
         let route_slip = 500u64;
-        let floor = on_chain_min_profit_for_route(
-            on_chain,
-            amount_in,
-            route_slip,
-            FlashLoanSource::Direct,
-        )
-        .expect("floor");
+        let floor =
+            on_chain_min_profit_for_route(on_chain, amount_in, route_slip, FlashLoanSource::Direct)
+                .expect("floor");
         assert_eq!(
             batch_profit_covers_min(on_chain, amount_in, route_slip),
             on_chain >= floor

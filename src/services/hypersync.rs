@@ -32,9 +32,7 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::abis::{
-    IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IUniswapV4Factory,
-};
+use crate::abis::{IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IUniswapV4Factory};
 use crate::core::types::ProtocolType;
 use crate::infra::http::{HttpClientOpts, build_static};
 use crate::services::discovery::{DiscoveredPool, is_routable_pool, synthetic_cache_address};
@@ -281,7 +279,12 @@ fn decode_raw_log(r: RawLog) -> Option<HyperSyncLog> {
         .as_deref()
         .map(|d| hex::decode(d.trim_start_matches("0x")).unwrap_or_default())
         .unwrap_or_default();
-    Some(HyperSyncLog { block_number, address, topics, data })
+    Some(HyperSyncLog {
+        block_number,
+        address,
+        topics,
+        data,
+    })
 }
 
 // ── Pool creation log parser ──────────────────────────────────────────────────
@@ -342,8 +345,7 @@ fn parse_v3_pool_created(log: &HyperSyncLog) -> Option<DiscoveredPool> {
     if log.data.len() < 64 {
         return None;
     }
-    let tick_spacing =
-        i32::from_be_bytes([log.data[28], log.data[29], log.data[30], log.data[31]]);
+    let tick_spacing = i32::from_be_bytes([log.data[28], log.data[29], log.data[30], log.data[31]]);
     let pool = Address::from_slice(&log.data[44..64]);
     if !crate::services::discovery::is_plausible_contract_address(pool) {
         return None;
@@ -407,8 +409,7 @@ fn parse_v4_initialize(log: &HyperSyncLog) -> Option<DiscoveredPool> {
     }
     let fee_raw = u32::from_be_bytes([log.data[28], log.data[29], log.data[30], log.data[31]]);
     let fee_bps = fee_raw / 100;
-    let tick_spacing =
-        i32::from_be_bytes([log.data[60], log.data[61], log.data[62], log.data[63]]);
+    let tick_spacing = i32::from_be_bytes([log.data[60], log.data[61], log.data[62], log.data[63]]);
     let hooks = Address::from_slice(&log.data[76..96]);
     let hooks = if hooks.is_zero() { None } else { Some(hooks) };
     let address = synthetic_cache_address(&pool_id);
@@ -475,7 +476,7 @@ mod tests {
     fn parses_v2_pair_created_log() {
         let token0 = Address::repeat_byte(0xaa);
         let token1 = Address::repeat_byte(0xbb);
-        let pair   = Address::repeat_byte(0xcc);
+        let pair = Address::repeat_byte(0xcc);
         let mut data = vec![0u8; 64];
         data[12..32].copy_from_slice(pair.as_slice());
         let log = make_log(
@@ -506,7 +507,11 @@ mod tests {
         data[44..64].copy_from_slice(pool_addr.as_slice());
         let log = make_log(
             V3_POOL_CREATED_TOPIC,
-            vec![token0.into_word(), token1.into_word(), B256::from_slice(&fee_word)],
+            vec![
+                token0.into_word(),
+                token1.into_word(),
+                B256::from_slice(&fee_word),
+            ],
             data,
         );
         let pool = parse_creation_log(&log).expect("v3 PoolCreated");

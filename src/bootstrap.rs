@@ -77,10 +77,7 @@ pub fn spawn_pg_probe(refresh: Arc<StateRefreshService>) {
     StateRefreshService::spawn_connectivity_probe(refresh);
 }
 
-pub fn build_runtime(
-    config: AppConfig,
-    wallet: WalletSecrets,
-) -> anyhow::Result<RuntimeContext> {
+pub fn build_runtime(config: AppConfig, wallet: WalletSecrets) -> anyhow::Result<RuntimeContext> {
     RuntimeContext::new(config, wallet).context("failed to initialize runtime context")
 }
 

@@ -249,9 +249,7 @@ impl PartialPoolCache {
                 observed.remove(addr);
             }
         }
-        crate::debug!(
-            "stream universe: pools={size} sources=cycle+observed+sticky"
-        );
+        crate::debug!("stream universe: pools={size} sources=cycle+observed+sticky");
     }
 
     /// After topic-observed pools are refreshed into the arena/universe, wake HF

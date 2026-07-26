@@ -34,7 +34,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -330,7 +330,10 @@ macro_rules! trace { ($($arg:tt)*) => { $crate::log_if!("TRACE", $crate::log::LE
 #[cfg(test)]
 mod tests {
     use super::format::{component_for_module, event_tag, render_terminal};
-    use super::{every_ms, every_n, enabled, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, log_level_rank};
+    use super::{
+        LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN, enabled, every_ms, every_n,
+        log_level_rank,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]

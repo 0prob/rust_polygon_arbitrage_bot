@@ -305,9 +305,8 @@ impl ExecutionService {
                 .unwrap_or_else(|_| ".rpbot-route-stats.json".to_string())
         };
         let mut service = Self::with_route_stats_path(PathBuf::from(path));
-        service.max_daily_loss_matic_wei = parse_max_daily_loss_wei(
-            &config.execution.max_daily_loss_matic_wei,
-        );
+        service.max_daily_loss_matic_wei =
+            parse_max_daily_loss_wei(&config.execution.max_daily_loss_matic_wei);
         service
     }
 
@@ -482,9 +481,7 @@ impl ExecutionService {
         if attempts < 3 {
             return 10_000;
         }
-        let hard_extra = stats
-            .reverts
-            .saturating_add(stats.realized_losses);
+        let hard_extra = stats.reverts.saturating_add(stats.realized_losses);
         let weighted_failures = stats
             .failures
             .saturating_add(hard_extra)
@@ -496,8 +493,7 @@ impl ExecutionService {
 
     #[inline]
     fn adaptive_flash_cap_initial(configured_max_usd: u64) -> u64 {
-        configured_max_usd
-            .saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
+        configured_max_usd.saturating_add(ADAPTIVE_FLASH_CAP_START_DIVISOR - 1)
             / ADAPTIVE_FLASH_CAP_START_DIVISOR
     }
 
@@ -1376,10 +1372,8 @@ impl ExecutionService {
             // so the next assess starts smaller instead of replaying BAL#528 at cap.
             if candidate.adaptive_flash_cap_bound
                 && flash_size_failure_reason(&reason)
-                && let Some((previous, next)) = self.demote_adaptive_flash_loan_cap(
-                    fp,
-                    candidate.adaptive_flash_loan_usd_limit,
-                )
+                && let Some((previous, next)) =
+                    self.demote_adaptive_flash_loan_cap(fp, candidate.adaptive_flash_loan_usd_limit)
             {
                 crate::info!(
                     "flash cap demoted: fp={fp} usd={previous}->{next} after size dry-run fail"
@@ -1872,9 +1866,7 @@ impl ExecutionService {
 
         let tx_hash_str = tx_hash.to_string();
 
-        let poll_outcome = poller
-            .wait(sim_provider, tx_hash, shutdown)
-            .await;
+        let poll_outcome = poller.wait(sim_provider, tx_hash, shutdown).await;
         let Some(receipt) = (match poll_outcome {
             ReceiptPollOutcome::Received(receipt) => Some(receipt),
             ReceiptPollOutcome::Shutdown => {
@@ -2806,7 +2798,9 @@ mod safety_tests {
         assert!(flash_size_failure_reason(
             "execution reverted: BAL#528 (insufficient Balancer flash-loan balance)"
         ));
-        assert!(!flash_size_failure_reason("execution reverted: InsufficientProfit"));
+        assert!(!flash_size_failure_reason(
+            "execution reverted: InsufficientProfit"
+        ));
         drop(service);
         let _ = std::fs::remove_file(path);
     }

@@ -960,7 +960,9 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             }
         } else if exclusive_obs
             && diversified.len() < MIN_EXCLUSIVE_SNAP
-            && let Some(prior) = cached_cycles.as_ref().filter(|c| c.len() > diversified.len())
+            && let Some(prior) = cached_cycles
+                .as_ref()
+                .filter(|c| c.len() > diversified.len())
         {
             let pin_first = diversified.len();
             let mut seen: rustc_hash::FxHashSet<u64> = diversified
@@ -1152,7 +1154,10 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             let n = gap.len();
             ctx.refresh.enrich_token_decimals(gap).await;
             decimals = ctx.refresh.token_decimals_map();
-            crate::debug!("token decimals lf backfill: requested={n} map={}", decimals.len());
+            crate::debug!(
+                "token decimals lf backfill: requested={n} map={}",
+                decimals.len()
+            );
         }
     }
     let arena_sync_started = crate::util::now_ms();

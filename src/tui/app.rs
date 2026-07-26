@@ -8,9 +8,7 @@ use rustc_hash::FxBuildHasher;
 
 use crate::orchestrator::hf::HfCandidateUiRow;
 use crate::services::execution::service::ExecutionOutcome;
-use crate::tui::route_viz::{
-    format_token_path, polygonscan_address_url, polygonscan_tx_url,
-};
+use crate::tui::route_viz::{format_token_path, polygonscan_address_url, polygonscan_tx_url};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -713,12 +711,8 @@ impl App {
         let (tokens, route) = self.resolve_trade_route(route_fingerprint);
         // Explorer links only for confirmed (successful) swaps.
         let (explorer_tx, explorer_contract) = if severity == Severity::Good {
-            let tx = tx_hash
-                .as_deref()
-                .map(polygonscan_tx_url);
-            let contract = self
-                .executor_address
-                .map(polygonscan_address_url);
+            let tx = tx_hash.as_deref().map(polygonscan_tx_url);
+            let contract = self.executor_address.map(polygonscan_address_url);
             (tx, contract)
         } else {
             (None, None)
@@ -1224,7 +1218,10 @@ mod tests {
             "https://polygonscan.com/address/{}",
             Address::repeat_byte(0x11)
         );
-        assert_eq!(ok.explorer_contract.as_deref(), Some(expected_contract.as_str()));
+        assert_eq!(
+            ok.explorer_contract.as_deref(),
+            Some(expected_contract.as_str())
+        );
         assert!(
             app.activity
                 .back()

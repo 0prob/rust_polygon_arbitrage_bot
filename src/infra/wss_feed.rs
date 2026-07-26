@@ -488,10 +488,7 @@ impl WssUrlPick {
     async fn resolve(self) -> Option<String> {
         match self {
             Self::Sticky(url) => {
-                crate::debug!(
-                    "wss sticky: host={} probe=skipped",
-                    rpc_host_label(&url)
-                );
+                crate::debug!("wss sticky: host={} probe=skipped", rpc_host_label(&url));
                 Some(url)
             }
             Self::Probe(candidates) => {

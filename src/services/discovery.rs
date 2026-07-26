@@ -234,7 +234,8 @@ fn resolve_pool_identity(
     if let Some(raw) = address_raw {
         let raw_lower = raw.to_ascii_lowercase();
         let raw_hex = raw_lower.strip_prefix("0x").unwrap_or(&raw_lower);
-        if raw_hex.len() == 40 && raw_hex.chars().all(|c| c.is_ascii_hexdigit())
+        if raw_hex.len() == 40
+            && raw_hex.chars().all(|c| c.is_ascii_hexdigit())
             && let Ok(addr) = format!("0x{raw_hex}").parse::<Address>()
             && is_plausible_contract_address(addr)
         {
@@ -983,10 +984,7 @@ mod tests {
             Some("0000000000000000000000000000010000000003"),
         )
         .expect("parsed pool with unprefixed hex");
-        assert_eq!(
-            pool.pool_key,
-            "0x0000000000000000000000000000010000000003"
-        );
+        assert_eq!(pool.pool_key, "0x0000000000000000000000000000010000000003");
         assert_eq!(
             pool.address,
             "0x0000000000000000000000000000010000000003"

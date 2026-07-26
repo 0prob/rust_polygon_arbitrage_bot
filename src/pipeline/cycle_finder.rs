@@ -833,7 +833,8 @@ impl DfsScratch {
         }
         self.path.clear();
         if self.path.capacity() < hop_cap {
-            self.path.reserve(hop_cap.saturating_sub(self.path.capacity()));
+            self.path
+                .reserve(hop_cap.saturating_sub(self.path.capacity()));
         }
     }
 }
@@ -876,208 +877,334 @@ fn collect_cycles_dfs_single_start(
         let mut cycles = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
 
-    #[allow(clippy::too_many_arguments)]
-    fn dfs(
-        graph: &RoutingGraph,
-        arena: &StateArena,
-        pool_metas: &PoolMetaIndex<'_>,
-        prep: &ActiveGraph,
-        start: TokenIndex,
-        curr_node: u32,
-        pending: Option<PendingHubSwap>,
-        path: &mut Vec<Edge>,
-        path_hop_calls: u16,
-        used_pools: &mut Vec<bool>,
-        used_tokens: &mut [bool],
-        hops: u32,
-        log_w: f64,
-        product_ratio: U256,
-        cum_fee: u32,
-        hop_cap: u32,
-        max_cycles: usize,
-        budget: &SharedDeadlineGuard,
-        global_cap: &SharedCycleCap,
-        cycles: &mut Vec<FoundCycle>,
-        seen: &mut rustc_hash::FxHashSet<u64>,
-        pin_touched: bool,
-    ) {
-        if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
-            return;
-        }
-
-        if graph.is_virtual_node(curr_node) {
-            let Some(pending) = pending else {
-                return;
-            };
-            let pool_id = pending.pool_index.0;
-            if !pool_mark(used_pools, pool_id) {
+        #[allow(clippy::too_many_arguments)]
+        fn dfs(
+            graph: &RoutingGraph,
+            arena: &StateArena,
+            pool_metas: &PoolMetaIndex<'_>,
+            prep: &ActiveGraph,
+            start: TokenIndex,
+            curr_node: u32,
+            pending: Option<PendingHubSwap>,
+            path: &mut Vec<Edge>,
+            path_hop_calls: u16,
+            used_pools: &mut Vec<bool>,
+            used_tokens: &mut [bool],
+            hops: u32,
+            log_w: f64,
+            product_ratio: U256,
+            cum_fee: u32,
+            hop_cap: u32,
+            max_cycles: usize,
+            budget: &SharedDeadlineGuard,
+            global_cap: &SharedCycleCap,
+            cycles: &mut Vec<FoundCycle>,
+            seen: &mut rustc_hash::FxHashSet<u64>,
+            pin_touched: bool,
+        ) {
+            if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                 return;
             }
-            // Hub enter already marks pin_touched when the pending pool is a pin.
-            let hub_pin = pin_touched || edge_is_pin(prep, pending.pool_index);
-            // Hoist meta/state once — exit-leg loop used to re-fetch every iteration.
-            let Some(meta) = pool_metas
-                .get(pending.pool_index.0 as usize)
-                .and_then(Option::as_ref)
-            else {
-                pool_unmark(used_pools, pool_id);
-                return;
-            };
-            let Some(state) = arena.pool_state(pending.pool_index) else {
-                pool_unmark(used_pools, pool_id);
-                return;
-            };
-            let exit_legs = hub_exit_legs(graph, curr_node, meta, state);
-            for out_leg in exit_legs {
-                if out_leg == pending.token_in_idx {
-                    continue;
+
+            if graph.is_virtual_node(curr_node) {
+                let Some(pending) = pending else {
+                    return;
+                };
+                let pool_id = pending.pool_index.0;
+                if !pool_mark(used_pools, pool_id) {
+                    return;
                 }
+                // Hub enter already marks pin_touched when the pending pool is a pin.
+                let hub_pin = pin_touched || edge_is_pin(prep, pending.pool_index);
+                // Hoist meta/state once — exit-leg loop used to re-fetch every iteration.
+                let Some(meta) = pool_metas
+                    .get(pending.pool_index.0 as usize)
+                    .and_then(Option::as_ref)
+                else {
+                    pool_unmark(used_pools, pool_id);
+                    return;
+                };
+                let Some(state) = arena.pool_state(pending.pool_index) else {
+                    pool_unmark(used_pools, pool_id);
+                    return;
+                };
+                let exit_legs = hub_exit_legs(graph, curr_node, meta, state);
+                for out_leg in exit_legs {
+                    if out_leg == pending.token_in_idx {
+                        continue;
+                    }
+                    if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
+                        break;
+                    }
+                    let out_idx = out_leg as usize;
+                    let Some(token_out) =
+                        crate::pipeline::graph::routing_token_at_leg(arena, state, meta, out_idx)
+                    else {
+                        continue;
+                    };
+                    let Some((edge, edge_log_w, ratio)) =
+                        resolve_lazy_swap_edge(arena, pending, token_out, out_leg)
+                    else {
+                        continue;
+                    };
+                    let next_log_w = log_w + edge_log_w;
+                    let next_ratio = mul_ratio_saturating(product_ratio, ratio);
+                    if !can_still_find_profitable_cycle(
+                        next_log_w,
+                        next_ratio,
+                        hops + 1,
+                        hop_cap,
+                        token_out,
+                        prep,
+                        hub_pin,
+                    ) {
+                        continue;
+                    }
+                    let hop_calls = estimate_hop_calls(edge.protocol) as u16;
+                    if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
+                        continue;
+                    }
+                    path.push(edge);
+                    dfs(
+                        graph,
+                        arena,
+                        pool_metas,
+                        prep,
+                        start,
+                        token_out.0,
+                        None,
+                        path,
+                        path_hop_calls.saturating_add(hop_calls),
+                        used_pools,
+                        used_tokens,
+                        hops + 1,
+                        next_log_w,
+                        next_ratio,
+                        cum_fee + clamp_fee_bps(edge.fee_bps),
+                        hop_cap,
+                        max_cycles,
+                        budget,
+                        global_cap,
+                        cycles,
+                        seen,
+                        hub_pin,
+                    );
+                    path.pop();
+                }
+                pool_unmark(used_pools, pool_id);
+                return;
+            }
+
+            let curr_idx = curr_node as usize;
+            // Stale graphs can carry target_node / token ids past token_count.
+            if curr_idx >= used_tokens.len() {
+                return;
+            }
+            let curr = TokenIndex(curr_node);
+            if hops >= 2 && curr == start {
+                if route_hop_budget_exceeded(path_hop_calls) {
+                    return;
+                }
+                // Observed pin search: relax close profit/score for pin-touching
+                // paths (live: first_hop_pin>0 enum_touch=0 under min_ratio).
+                // Hard pin-only recording zeroed exclusive DFS (raw=0); pin paths
+                // rarely close before budget while non-pin Uni fills the cap —
+                // prefer pin via prioritize_first_hop + pin_cycles_touching_pools.
+                let pin_touch = pin_touched
+                    || prep
+                        .first_hop_pools
+                        .as_ref()
+                        .is_some_and(|pins| path.iter().any(|e| pins.contains(&e.pool_index)));
+                if !pin_touch
+                    && (product_ratio <= ONE || product_ratio < min_profitable_cycle_ratio(hops))
+                {
+                    return;
+                }
+                let penalty = hop_penalty(hops);
+                let score = log_w + penalty;
+                if !pin_touch && score > LOG_WEIGHT_PRUNE_THRESHOLD {
+                    return;
+                }
+                let fp = cycle_key(path);
+                if seen.contains(&fp) {
+                    return;
+                }
+                // Reserve half the shared cap for pin-touch closes during obs search
+                // (live: non-pin Uni filled cap before pin paths returned).
+                if prep.first_hop_pools.is_some() && !pin_touch && global_cap.is_past_fraction(1, 2)
+                {
+                    return;
+                }
+                if !global_cap.try_claim() {
+                    return;
+                }
+                seen.insert(fp);
+                let edges: CycleEdges = CycleEdges::from(path.as_slice());
+                cycles.push(FoundCycle {
+                    start_token: start,
+                    edges,
+                    hop_count: hops,
+                    log_weight: score,
+                    cumulative_fee_bps: cum_fee,
+                    score,
+                    cycle_ratio: product_ratio,
+                });
+                return;
+            }
+
+            if used_tokens[curr_idx] || hops >= hop_cap {
+                return;
+            }
+            if !can_still_find_profitable_cycle(
+                log_w,
+                product_ratio,
+                hops,
+                hop_cap,
+                curr,
+                prep,
+                pin_touched,
+            ) {
+                return;
+            }
+            let next_edges = match prep.adjacency.get(curr_idx) {
+                Some(e) if !e.is_empty() => e,
+                _ => return,
+            };
+
+            used_tokens[curr_idx] = true;
+
+            for ge in next_edges {
                 if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                     break;
                 }
-                let out_idx = out_leg as usize;
-                let Some(token_out) =
-                    crate::pipeline::graph::routing_token_at_leg(arena, state, meta, out_idx)
-                else {
-                    continue;
-                };
-                let Some((edge, edge_log_w, ratio)) =
-                    resolve_lazy_swap_edge(arena, pending, token_out, out_leg)
-                else {
-                    continue;
-                };
-                let next_log_w = log_w + edge_log_w;
-                let next_ratio = mul_ratio_saturating(product_ratio, ratio);
-                if !can_still_find_profitable_cycle(
-                    next_log_w,
-                    next_ratio,
-                    hops + 1,
-                    hop_cap,
-                    token_out,
-                    prep,
-                    hub_pin,
-                ) {
-                    continue;
+                match ge.phase {
+                    GraphHopPhase::EnterPool => {
+                        let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
+                        let pending = PendingHubSwap {
+                            pool_index: ge.edge.pool_index,
+                            token_in: ge.edge.token_in,
+                            token_in_idx: ge.edge.token_in_idx,
+                            protocol: ge.edge.protocol,
+                            fee_bps: ge.edge.fee_bps,
+                        };
+                        dfs(
+                            graph,
+                            arena,
+                            pool_metas,
+                            prep,
+                            start,
+                            ge.target_node,
+                            Some(pending),
+                            path,
+                            path_hop_calls,
+                            used_pools,
+                            used_tokens,
+                            hops,
+                            log_w,
+                            product_ratio,
+                            cum_fee,
+                            hop_cap,
+                            max_cycles,
+                            budget,
+                            global_cap,
+                            cycles,
+                            seen,
+                            next_pin,
+                        );
+                    }
+                    GraphHopPhase::Direct => {
+                        if ge.ratio.is_zero() {
+                            continue;
+                        }
+                        let pool_id = ge.edge.pool_index.0;
+                        if !pool_mark(used_pools, pool_id) {
+                            continue;
+                        }
+                        let next_log_w = log_w + ge.log_weight;
+                        let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
+                        let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
+                        if !can_still_find_profitable_cycle(
+                            next_log_w,
+                            next_ratio,
+                            hops + 1,
+                            hop_cap,
+                            ge.edge.token_out,
+                            prep,
+                            next_pin,
+                        ) {
+                            pool_unmark(used_pools, pool_id);
+                            continue;
+                        }
+                        let hop_calls = estimate_hop_calls(ge.edge.protocol) as u16;
+                        if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
+                            pool_unmark(used_pools, pool_id);
+                            continue;
+                        }
+                        path.push(ge.edge);
+                        dfs(
+                            graph,
+                            arena,
+                            pool_metas,
+                            prep,
+                            start,
+                            ge.target_node,
+                            None,
+                            path,
+                            path_hop_calls.saturating_add(hop_calls),
+                            used_pools,
+                            used_tokens,
+                            hops + 1,
+                            next_log_w,
+                            next_ratio,
+                            cum_fee + clamp_fee_bps(ge.edge.fee_bps),
+                            hop_cap,
+                            max_cycles,
+                            budget,
+                            global_cap,
+                            cycles,
+                            seen,
+                            next_pin,
+                        );
+                        path.pop();
+                        pool_unmark(used_pools, pool_id);
+                    }
+                    GraphHopPhase::ExitPool => {}
                 }
-                let hop_calls = estimate_hop_calls(edge.protocol) as u16;
-                if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
-                    continue;
-                }
-                path.push(edge);
-                dfs(
-                    graph,
-                    arena,
-                    pool_metas,
-                    prep,
-                    start,
-                    token_out.0,
-                    None,
-                    path,
-                    path_hop_calls.saturating_add(hop_calls),
-                    used_pools,
-                    used_tokens,
-                    hops + 1,
-                    next_log_w,
-                    next_ratio,
-                    cum_fee + clamp_fee_bps(edge.fee_bps),
-                    hop_cap,
-                    max_cycles,
-                    budget,
-                    global_cap,
-                    cycles,
-                    seen,
-                    hub_pin,
-                );
-                path.pop();
             }
-            pool_unmark(used_pools, pool_id);
-            return;
+
+            used_tokens[curr_idx] = false;
         }
 
-        let curr_idx = curr_node as usize;
-        // Stale graphs can carry target_node / token ids past token_count.
-        if curr_idx >= used_tokens.len() {
-            return;
+        if start.0 as usize >= used_tokens.len() {
+            return cycles;
         }
-        let curr = TokenIndex(curr_node);
-        if hops >= 2 && curr == start {
-            if route_hop_budget_exceeded(path_hop_calls) {
-                return;
-            }
-            // Observed pin search: relax close profit/score for pin-touching
-            // paths (live: first_hop_pin>0 enum_touch=0 under min_ratio).
-            // Hard pin-only recording zeroed exclusive DFS (raw=0); pin paths
-            // rarely close before budget while non-pin Uni fills the cap —
-            // prefer pin via prioritize_first_hop + pin_cycles_touching_pools.
-            let pin_touch = pin_touched
-                || prep
-                    .first_hop_pools
-                    .as_ref()
-                    .is_some_and(|pins| path.iter().any(|e| pins.contains(&e.pool_index)));
-            if !pin_touch
-                && (product_ratio <= ONE || product_ratio < min_profitable_cycle_ratio(hops))
-            {
-                return;
-            }
-            let penalty = hop_penalty(hops);
-            let score = log_w + penalty;
-            if !pin_touch && score > LOG_WEIGHT_PRUNE_THRESHOLD {
-                return;
-            }
-            let fp = cycle_key(path);
-            if seen.contains(&fp) {
-                return;
-            }
-            // Reserve half the shared cap for pin-touch closes during obs search
-            // (live: non-pin Uni filled cap before pin paths returned).
-            if prep.first_hop_pools.is_some() && !pin_touch && global_cap.is_past_fraction(1, 2) {
-                return;
-            }
-            if !global_cap.try_claim() {
-                return;
-            }
-            seen.insert(fp);
-            let edges: CycleEdges = CycleEdges::from(path.as_slice());
-            cycles.push(FoundCycle {
-                start_token: start,
-                edges,
-                hop_count: hops,
-                log_weight: score,
-                cumulative_fee_bps: cum_fee,
-                score,
-                cycle_ratio: product_ratio,
-            });
-            return;
-        }
-
-        if used_tokens[curr_idx] || hops >= hop_cap {
-            return;
-        }
-        if !can_still_find_profitable_cycle(
-            log_w,
-            product_ratio,
-            hops,
-            hop_cap,
-            curr,
-            prep,
-            pin_touched,
-        ) {
-            return;
-        }
-        let next_edges = match prep.adjacency.get(curr_idx) {
+        let first_edges = match prep.adjacency.get(start.0 as usize) {
             Some(e) if !e.is_empty() => e,
-            _ => return,
+            _ => return cycles,
         };
+        // Exclusive obs: if this start has a pin opening edge, only take those.
+        let pin_open = prep.first_hop_pools.as_ref().is_some_and(|pins| {
+            first_edges
+                .iter()
+                .any(|ge| pins.contains(&ge.edge.pool_index))
+        });
 
-        used_tokens[curr_idx] = true;
-
-        for ge in next_edges {
+        used_tokens[start.0 as usize] = true;
+        for ge in first_edges {
             if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
                 break;
             }
+            if pin_open
+                && prep
+                    .first_hop_pools
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&ge.edge.pool_index))
+            {
+                continue;
+            }
             match ge.phase {
                 GraphHopPhase::EnterPool => {
-                    let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
+                    let next_pin = edge_is_pin(prep, ge.edge.pool_index);
                     let pending = PendingHubSwap {
                         pool_index: ge.edge.pool_index,
                         token_in: ge.edge.token_in,
@@ -1094,19 +1221,19 @@ fn collect_cycles_dfs_single_start(
                         ge.target_node,
                         Some(pending),
                         path,
-                        path_hop_calls,
+                        0,
                         used_pools,
                         used_tokens,
-                        hops,
-                        log_w,
-                        product_ratio,
-                        cum_fee,
+                        0,
+                        0.0,
+                        ONE,
+                        0,
                         hop_cap,
                         max_cycles,
                         budget,
                         global_cap,
-                        cycles,
-                        seen,
+                        &mut cycles,
+                        &mut seen,
                         next_pin,
                     );
                 }
@@ -1115,27 +1242,24 @@ fn collect_cycles_dfs_single_start(
                         continue;
                     }
                     let pool_id = ge.edge.pool_index.0;
-                    if !pool_mark(used_pools, pool_id) {
-                        continue;
-                    }
-                    let next_log_w = log_w + ge.log_weight;
-                    let next_ratio = mul_ratio_saturating(product_ratio, ge.ratio);
-                    let next_pin = pin_touched || edge_is_pin(prep, ge.edge.pool_index);
+                    let next_pin = edge_is_pin(prep, ge.edge.pool_index);
                     if !can_still_find_profitable_cycle(
-                        next_log_w,
-                        next_ratio,
-                        hops + 1,
+                        ge.log_weight,
+                        ge.ratio,
+                        1,
                         hop_cap,
                         ge.edge.token_out,
                         prep,
                         next_pin,
                     ) {
-                        pool_unmark(used_pools, pool_id);
                         continue;
                     }
                     let hop_calls = estimate_hop_calls(ge.edge.protocol) as u16;
-                    if route_hop_budget_exceeded(path_hop_calls.saturating_add(hop_calls)) {
-                        pool_unmark(used_pools, pool_id);
+                    if route_hop_budget_exceeded(hop_calls) {
+                        continue;
+                    }
+                    // Same mark semantics as mid-path Direct — never walk unmarked OOB.
+                    if !pool_mark(used_pools, pool_id) {
                         continue;
                     }
                     path.push(ge.edge);
@@ -1148,19 +1272,19 @@ fn collect_cycles_dfs_single_start(
                         ge.target_node,
                         None,
                         path,
-                        path_hop_calls.saturating_add(hop_calls),
+                        hop_calls,
                         used_pools,
                         used_tokens,
-                        hops + 1,
-                        next_log_w,
-                        next_ratio,
-                        cum_fee + clamp_fee_bps(ge.edge.fee_bps),
+                        1,
+                        ge.log_weight,
+                        ge.ratio,
+                        clamp_fee_bps(ge.edge.fee_bps),
                         hop_cap,
                         max_cycles,
                         budget,
                         global_cap,
-                        cycles,
-                        seen,
+                        &mut cycles,
+                        &mut seen,
                         next_pin,
                     );
                     path.pop();
@@ -1169,130 +1293,8 @@ fn collect_cycles_dfs_single_start(
                 GraphHopPhase::ExitPool => {}
             }
         }
-
-        used_tokens[curr_idx] = false;
-    }
-
-    if start.0 as usize >= used_tokens.len() {
-        return cycles;
-    }
-    let first_edges = match prep.adjacency.get(start.0 as usize) {
-        Some(e) if !e.is_empty() => e,
-        _ => return cycles,
-    };
-    // Exclusive obs: if this start has a pin opening edge, only take those.
-    let pin_open = prep.first_hop_pools.as_ref().is_some_and(|pins| {
-        first_edges
-            .iter()
-            .any(|ge| pins.contains(&ge.edge.pool_index))
-    });
-
-    used_tokens[start.0 as usize] = true;
-    for ge in first_edges {
-        if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
-            break;
-        }
-        if pin_open
-            && prep
-                .first_hop_pools
-                .as_ref()
-                .is_some_and(|pins| !pins.contains(&ge.edge.pool_index))
-        {
-            continue;
-        }
-        match ge.phase {
-            GraphHopPhase::EnterPool => {
-                let next_pin = edge_is_pin(prep, ge.edge.pool_index);
-                let pending = PendingHubSwap {
-                    pool_index: ge.edge.pool_index,
-                    token_in: ge.edge.token_in,
-                    token_in_idx: ge.edge.token_in_idx,
-                    protocol: ge.edge.protocol,
-                    fee_bps: ge.edge.fee_bps,
-                };
-                dfs(
-                    graph,
-                    arena,
-                    pool_metas,
-                    prep,
-                    start,
-                    ge.target_node,
-                    Some(pending),
-                    path,
-                    0,
-                    used_pools,
-                    used_tokens,
-                    0,
-                    0.0,
-                    ONE,
-                    0,
-                    hop_cap,
-                    max_cycles,
-                    budget,
-                    global_cap,
-                    &mut cycles,
-                    &mut seen,
-                    next_pin,
-                );
-            }
-            GraphHopPhase::Direct => {
-                if ge.ratio.is_zero() {
-                    continue;
-                }
-                let pool_id = ge.edge.pool_index.0;
-                let next_pin = edge_is_pin(prep, ge.edge.pool_index);
-                if !can_still_find_profitable_cycle(
-                    ge.log_weight,
-                    ge.ratio,
-                    1,
-                    hop_cap,
-                    ge.edge.token_out,
-                    prep,
-                    next_pin,
-                ) {
-                    continue;
-                }
-                let hop_calls = estimate_hop_calls(ge.edge.protocol) as u16;
-                if route_hop_budget_exceeded(hop_calls) {
-                    continue;
-                }
-                // Same mark semantics as mid-path Direct — never walk unmarked OOB.
-                if !pool_mark(used_pools, pool_id) {
-                    continue;
-                }
-                path.push(ge.edge);
-                dfs(
-                    graph,
-                    arena,
-                    pool_metas,
-                    prep,
-                    start,
-                    ge.target_node,
-                    None,
-                    path,
-                    hop_calls,
-                    used_pools,
-                    used_tokens,
-                    1,
-                    ge.log_weight,
-                    ge.ratio,
-                    clamp_fee_bps(ge.edge.fee_bps),
-                    hop_cap,
-                    max_cycles,
-                    budget,
-                    global_cap,
-                    &mut cycles,
-                    &mut seen,
-                    next_pin,
-                );
-                path.pop();
-                pool_unmark(used_pools, pool_id);
-            }
-            GraphHopPhase::ExitPool => {}
-        }
-    }
-    used_tokens[start.0 as usize] = false;
-    cycles
+        used_tokens[start.0 as usize] = false;
+        cycles
     })
 }
 

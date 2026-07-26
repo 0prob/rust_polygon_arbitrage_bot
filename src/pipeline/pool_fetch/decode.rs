@@ -397,12 +397,10 @@ fn decode_balancer_linear(
     targets_bytes: Option<&Bytes>,
     rate_bytes: Option<&Bytes>,
 ) -> Option<BalancerLinearState> {
-    let main =
-        IBalancerLinearPool::getMainTokenCall::abi_decode_returns(main_bytes?).ok()?;
+    let main = IBalancerLinearPool::getMainTokenCall::abi_decode_returns(main_bytes?).ok()?;
     let wrapped =
         IBalancerLinearPool::getWrappedTokenCall::abi_decode_returns(wrapped_bytes?).ok()?;
-    let targets =
-        IBalancerLinearPool::getTargetsCall::abi_decode_returns(targets_bytes?).ok()?;
+    let targets = IBalancerLinearPool::getTargetsCall::abi_decode_returns(targets_bytes?).ok()?;
     let rate =
         IBalancerLinearPool::getWrappedTokenRateCall::abi_decode_returns(rate_bytes?).ok()?;
     let main_index = vault_tokens.iter().position(|t| *t == main)?;
@@ -495,8 +493,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         }
     }
 
-    let tokens =
-        IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes?).ok()?;
+    let tokens = IBalancerVaultRead::getPoolTokensCall::abi_decode_returns(tokens_bytes?).ok()?;
     let last_change_block = tokens.lastChangeBlock.as_limbs()[0];
     // ponytail: move decoded vecs — uint256[] already is Vec<U256>.
     let balances = tokens.balances;
@@ -1192,13 +1189,12 @@ mod tests {
                 lastChangeBlock: U256::from(99u64),
             },
         );
-        let fee_ret = IBalancerPool::getSwapFeePercentageCall::abi_encode_returns(
-            &U256::from(3_000_000_000_000_000u64),
-        );
+        let fee_ret = IBalancerPool::getSwapFeePercentageCall::abi_encode_returns(&U256::from(
+            3_000_000_000_000_000u64,
+        ));
         let weights_ret =
             IBalancerPool::getNormalizedWeightsCall::abi_encode_returns(&vec![half, half]);
-        let scaling_ret =
-            IBalancerPool::getScalingFactorsCall::abi_encode_returns(&vec![ONE, ONE]);
+        let scaling_ret = IBalancerPool::getScalingFactorsCall::abi_encode_returns(&vec![ONE, ONE]);
         let results = vec![
             Some(Bytes::from(scaling_ret)),
             Some(Bytes::from(fee_ret)),
@@ -1209,7 +1205,10 @@ mod tests {
             panic!("weighted Balancer pool should decode regardless of kind order");
         };
         assert_eq!(state.pool_type, BalancerPoolKind::Weighted);
-        assert_eq!(state.balances, vec![U256::from(1_000u64), U256::from(2_000u64)]);
+        assert_eq!(
+            state.balances,
+            vec![U256::from(1_000u64), U256::from(2_000u64)]
+        );
         assert_eq!(state.fee, U256::from(3_000_000_000_000_000u64));
         assert_eq!(state.last_change_block, 99);
         assert!(state.linear.is_none());

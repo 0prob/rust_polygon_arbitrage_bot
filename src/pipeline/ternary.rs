@@ -1405,7 +1405,10 @@ mod tests {
             None,
             None,
         );
-        assert!(bounds.is_some(), "start-hop capacity alone still yields bounds");
+        assert!(
+            bounds.is_some(),
+            "start-hop capacity alone still yields bounds"
+        );
         // With known 18-dec mid, FX normalize contributes (not only start hop).
         let mut known = FxHashMap::default();
         known.insert(WMATIC, 18u8);

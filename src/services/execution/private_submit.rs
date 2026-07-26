@@ -192,15 +192,15 @@ fn parse_bloxroute_submit_response(
     }
 
     let mut buf = trimmed.to_vec();
-    let parsed: JsonRpcResponse<'_> =
-        crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf).with_context(
-            || {
-                format!(
-                    "bloxroute response decode failed (HTTP {status}): {}",
-                    preview_response_body(trimmed)
-                )
-            },
-        )?;
+    let parsed: JsonRpcResponse<'_> = crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(
+        &mut buf,
+    )
+    .with_context(|| {
+        format!(
+            "bloxroute response decode failed (HTTP {status}): {}",
+            preview_response_body(trimmed)
+        )
+    })?;
 
     if let Some(err) = parsed.error {
         anyhow::bail!("bloxroute polygon_private_tx: {}", err.message);

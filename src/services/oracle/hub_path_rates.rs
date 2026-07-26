@@ -61,9 +61,7 @@ fn matic_rate_from_probe_sim_with_decimals(
     // When discovery hints are wired, refuse the 18-decimal guess — wrong scale
     // for USDC/USDT/etc. inflates hub MATIC rates by 1e12 and poisons gas/profit.
     let decimals = match token_decimals {
-        Some(hints) => {
-            crate::services::oracle::explicit_decimals_for_index(token, arena, hints)?
-        }
+        Some(hints) => crate::services::oracle::explicit_decimals_for_index(token, arena, hints)?,
         None => arena.token_decimals(token),
     };
     if decimals > MAX_SUPPORTED_TOKEN_DECIMALS {

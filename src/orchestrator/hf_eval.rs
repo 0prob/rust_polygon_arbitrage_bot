@@ -39,9 +39,9 @@ use crate::services::execution::impact_slippage::{
     depth_impact_slippage_bps_with_base, effective_slippage_bps_for_flash,
 };
 use crate::services::execution::profit::{
-    ProfitEvalContext, RouteAssessRequest, assessment_gas_for_edges, assessment_gas_units,
-    assess_route_from_sim, brent_score_matic_from_sim, cover_matic_from_sim,
-    flash_loan_fee_bps, net_profit_matic_from_sim, route_profit_thresholds,
+    ProfitEvalContext, RouteAssessRequest, assess_route_from_sim, assessment_gas_for_edges,
+    assessment_gas_units, brent_score_matic_from_sim, cover_matic_from_sim, flash_loan_fee_bps,
+    net_profit_matic_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
 use crate::services::oracle::{
@@ -668,13 +668,12 @@ fn rank_one_cycle_probe(
                 if n > 0 {
                     // ShallowCl-only: ticks exist but never walk — 30s stale recycled
                     // the same fp every cooldown window (iter21: 0x21f58… ×7 / ~5min).
-                    let nosim_fails: Vec<_> =
-                        attempt_failures.iter().flatten().copied().collect();
+                    let nosim_fails: Vec<_> = attempt_failures.iter().flatten().copied().collect();
                     let shallow_only = matches!(reject, MinimalProbeReject::NoSimulation)
                         && !nosim_fails.is_empty()
-                        && nosim_fails.iter().all(|f| {
-                            matches!(f, local_sim::MinimalSimFailure::ShallowCl { .. })
-                        });
+                        && nosim_fails
+                            .iter()
+                            .all(|f| matches!(f, local_sim::MinimalSimFailure::ShallowCl { .. }));
                     let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
                     for _ in 0..n {
                         let fp_rot = hash_cycle_edges(&rotated);
@@ -731,12 +730,8 @@ fn rank_one_cycle_probe(
         out.skip.net = 1;
         return out;
     }
-    let effective_slip = effective_slippage_bps_for_flash(
-        slippage_bps,
-        cycle.edge_hops(),
-        depth_bps,
-        flash_source,
-    );
+    let effective_slip =
+        effective_slippage_bps_for_flash(slippage_bps, cycle.edge_hops(), depth_bps, flash_source);
 
     let mut ctx = ProfitEvalContext::with_safety_multiplier(
         cycle.start_token,
@@ -780,8 +775,7 @@ fn rank_one_cycle_probe(
             if probe_amount < economic_floor || cover_matic.is_zero() {
                 let n = cycle.edges.len();
                 if n > 0 {
-                    let mut rotated =
-                        crate::core::types::CycleEdges::from_slice(&cycle.edges);
+                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
                     for _ in 0..n {
                         execution.quarantine_stale_route(hash_cycle_edges(&rotated));
                         rotated.rotate_left(1);
@@ -1334,8 +1328,7 @@ pub async fn rescore_rank_and_evaluate_async(
                 None,
             );
             // Gas-aware score primary among profitable (not raw ratio).
-            cycles[..probe_window]
-                .sort_by(|a, b| compare_cycle_execution(a.as_ref(), b.as_ref()));
+            cycles[..probe_window].sort_by(|a, b| compare_cycle_execution(a.as_ref(), b.as_ref()));
         }
         let route_gas = RouteGasLookup::for_fingerprints(
             &input.gas_oracle,
@@ -1694,9 +1687,7 @@ fn evaluate_one(
         lookup: input.route_gas,
         oracle: input.gas_oracle,
         fingerprint: fp,
-        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(
-            &cycle.edges,
-        ),
+        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(&cycle.edges),
     };
     let brent_seeds =
         build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
@@ -1773,8 +1764,7 @@ fn evaluate_one(
     // Probe-size flash plan is often free Balancer; economic/optimal size often
     // needs Aave (5 bps). Brent under the wrong fee oversizes → prepare/dry-run miss.
     // One re-size under the true fee (+ provider liquidity hard-cap when known).
-    if !probe_only && flash_loan_fee_bps(flash_source) != flash_loan_fee_bps(flash_source_brent)
-    {
+    if !probe_only && flash_loan_fee_bps(flash_source) != flash_loan_fee_bps(flash_source_brent) {
         profit_ctx.flash_source = flash_source;
         let liq_cap = match flash_source {
             FlashLoanSource::AaveV3 if flash_ctx.liquidity.aave_listed => {
@@ -1811,11 +1801,9 @@ fn evaluate_one(
             &new_sim,
             new_opt.optimal_input,
             new_opt.search_low,
-        ) && let Some(src) = resolve_flash_source_with_context(
-            &flash_ctx,
-            input.flash_policy,
-            new_opt.optimal_input,
-        ) {
+        ) && let Some(src) =
+            resolve_flash_source_with_context(&flash_ctx, input.flash_policy, new_opt.optimal_input)
+        {
             crate::debug!(
                 "evaluate_one flash-fee reopt: fp={fp:#x} {flash_source_brent:?}->{src:?} input {}->{}",
                 opt.optimal_input,
@@ -1846,12 +1834,8 @@ fn evaluate_one(
         }
         depth_bps = 3_000;
     }
-    let slippage_bps = effective_slippage_bps_for_flash(
-        input.slippage_bps,
-        hop_count,
-        depth_bps,
-        flash_source,
-    );
+    let slippage_bps =
+        effective_slippage_bps_for_flash(input.slippage_bps, hop_count, depth_bps, flash_source);
     let mut assessment =
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
     // Dispatch size floor + hop fidelity.
@@ -1988,12 +1972,7 @@ fn assess_route_for_cycle(
         hop_count: cycle.edge_hops(),
         slippage_bps,
         flash_source,
-        gas: assessment_gas_for_edges(
-            &cycle.edges,
-            Some(input.route_gas),
-            input.gas_oracle,
-            fp,
-        ),
+        gas: assessment_gas_for_edges(&cycle.edges, Some(input.route_gas), input.gas_oracle, fp),
         thresholds,
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,

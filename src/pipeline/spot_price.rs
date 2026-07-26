@@ -436,11 +436,7 @@ pub fn gas_log_penalty_for_cycle(
     (drag_f64 / rate_f64).ln_1p()
 }
 
-pub fn rescore_cycles_with_table(
-    arena: &StateArena,
-    table: &SpotTable,
-    cycles: &mut [FoundCycle],
-) {
+pub fn rescore_cycles_with_table(arena: &StateArena, table: &SpotTable, cycles: &mut [FoundCycle]) {
     rescore_cycles_with_table_and_gas(arena, table, cycles, None, None, None, None);
 }
 

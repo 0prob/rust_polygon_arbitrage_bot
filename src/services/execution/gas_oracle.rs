@@ -111,21 +111,14 @@ impl RouteGasLookup {
     /// Use for all-in calibrated seeds ([`crate::core::constants::balancer_direct_batch_gas`])
     /// so mixed-route underestimates cannot re-inflate Direct near-miss gas.
     #[must_use]
-    pub fn route_gas_observed_or_seed(
-        &self,
-        oracle: &GasOracle,
-        route_fp: u64,
-        seed: u32,
-    ) -> u32 {
+    pub fn route_gas_observed_or_seed(&self, oracle: &GasOracle, route_fp: u64, seed: u32) -> u32 {
         if let Some(&gas) = self.observed.get(&route_fp) {
             return gas;
         }
         if !self.preloaded {
             return oracle.route_gas_observed_or_seed(route_fp, seed);
         }
-        oracle
-            .observed_route_gas(route_fp)
-            .unwrap_or(seed)
+        oracle.observed_route_gas(route_fp).unwrap_or(seed)
     }
 }
 
@@ -241,9 +234,8 @@ impl GasOracle {
         if simulated == 0 || observed == 0 {
             return;
         }
-        let raw_ratio_bps =
-            ((observed.saturating_mul(10_000)) / u64::from(simulated)).min(u64::from(u32::MAX))
-                as u32;
+        let raw_ratio_bps = ((observed.saturating_mul(10_000)) / u64::from(simulated))
+            .min(u64::from(u32::MAX)) as u32;
         if raw_ratio_bps > GLOBAL_SCALE_OUTLIER_BPS {
             return;
         }
@@ -601,7 +593,10 @@ mod tests {
             oracle.record_sim_observed(100_000, 140_000);
         }
         let elevated = oracle.sim_scale_bps();
-        assert!(elevated > 12_000, "precondition elevated scale, got {elevated}");
+        assert!(
+            elevated > 12_000,
+            "precondition elevated scale, got {elevated}"
+        );
         // Accurate dry-runs (obs ≈ sim) must pull scale down (not sticky at 1.4×).
         for _ in 0..32 {
             oracle.record_sim_observed(100_000, 100_000);

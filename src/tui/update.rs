@@ -214,7 +214,11 @@ pub fn graph_snapshot_for_poll(
         cache.graph = Some(Arc::clone(&cached));
         return cached;
     }
-    let graph = Arc::new(build_graph_snapshot(snap, indexer_lag_blocks, stale_indexer));
+    let graph = Arc::new(build_graph_snapshot(
+        snap,
+        indexer_lag_blocks,
+        stale_indexer,
+    ));
     cache.graph_generation = snap.generation;
     cache.graph = Some(Arc::clone(&graph));
     graph
@@ -472,7 +476,8 @@ fn build_routes(
                 amount_in,
                 gas_units: sim.total_gas,
                 gas_price_wei: gas_price,
-                charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+                charged_priority_fee_per_gas:
+                    crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
                 token_to_matic_rate: rate,
                 token_decimals: decimals,
                 hop_count: cycle.edge_hops(),

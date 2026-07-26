@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use crate::config::AppConfig;
 use crate::info;
 use crate::infra::http::{HttpClientOpts, build_static};
@@ -12,6 +11,7 @@ use alloy::primitives::Address;
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
