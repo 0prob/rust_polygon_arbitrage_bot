@@ -234,7 +234,6 @@ impl ExecutionService {
         *self.cached_chain_id.lock() = Some(id);
         Some(id)
     }
-
 }
 
 #[derive(Debug, Clone)]
