@@ -2012,6 +2012,26 @@ mod safety_tests {
     }
 
     #[test]
+    fn odd_timeout_count_applies_half_weight() {
+        let service = ExecutionService::new();
+        service.route_stats.write().insert(
+            9,
+            RouteStats {
+                successes: 2,
+                failures: 1,
+                receipt_timeouts: 1,
+                ..RouteStats::default()
+            },
+        );
+        // attempts=3, weighted_half=2*1 + 1 = 3 → 10_000 + 30_000/3 = 20_000
+        // (old integer /2 truncated the +½ and yielded 16_666)
+        assert_eq!(service.route_risk_multiplier_bps(9), 20_000);
+        let (risk, flash) = service.route_learning_snapshot(9, 50_000);
+        assert_eq!(risk, 20_000);
+        assert_eq!(flash, 12_500);
+    }
+
+    #[test]
     fn dry_run_pass_lowers_risk_floor_without_mined_receipt() {
         let service = ExecutionService::new();
         service.route_stats.write().insert(

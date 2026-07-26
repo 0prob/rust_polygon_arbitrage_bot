@@ -340,7 +340,22 @@ impl ExecutionService {
     /// realized loss) get **+1 weight** (2× total); timeouts get **+½**.
     pub fn route_risk_multiplier_bps(&self, fp: u64) -> u64 {
         let stats = self.route_stats.read();
-        let Some(stats) = stats.get(&fp) else {
+        Self::risk_multiplier_bps_from_stats(stats.get(&fp))
+    }
+
+    /// Single read-lock snapshot of learned risk + adaptive flash USD for the HF prepare path.
+    #[must_use]
+    pub fn route_learning_snapshot(&self, fp: u64, configured_max_usd: u64) -> (u64, u64) {
+        let stats = self.route_stats.read();
+        let entry = stats.get(&fp);
+        let risk_bps = Self::risk_multiplier_bps_from_stats(entry);
+        let flash_usd = Self::adaptive_flash_loan_usd_from_stats(entry, configured_max_usd);
+        (risk_bps, flash_usd)
+    }
+
+    #[inline]
+    fn risk_multiplier_bps_from_stats(stats: Option<&super::RouteStats>) -> u64 {
+        let Some(stats) = stats else {
             return 10_000;
         };
         let attempts = stats.successes.saturating_add(stats.failures);
@@ -348,12 +363,14 @@ impl ExecutionService {
             return 10_000;
         }
         let hard_extra = stats.reverts.saturating_add(stats.realized_losses);
-        let weighted_failures = stats
+        // Half-units: base failure = 2, hard extra = +2, timeout = +1 (+½ weight).
+        let weighted_half = stats
             .failures
-            .saturating_add(hard_extra)
-            .saturating_add(stats.receipt_timeouts / 2);
+            .saturating_mul(2)
+            .saturating_add(hard_extra.saturating_mul(2))
+            .saturating_add(stats.receipt_timeouts);
         10_000u64
-            .saturating_add(weighted_failures.saturating_mul(20_000) / attempts)
+            .saturating_add(weighted_half.saturating_mul(10_000) / attempts)
             .min(30_000)
     }
 
@@ -363,15 +380,22 @@ impl ExecutionService {
             / ADAPTIVE_FLASH_CAP_START_DIVISOR
     }
 
-    #[must_use]
-    pub fn adaptive_flash_loan_usd(&self, fp: u64, configured_max_usd: u64) -> u64 {
+    #[inline]
+    fn adaptive_flash_loan_usd_from_stats(
+        stats: Option<&super::RouteStats>,
+        configured_max_usd: u64,
+    ) -> u64 {
         let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
-        self.route_stats
-            .read()
-            .get(&fp)
-            .and_then(|stats| stats.adaptive_flash_loan_usd)
+        stats
+            .and_then(|s| s.adaptive_flash_loan_usd)
             .unwrap_or(initial)
             .min(configured_max_usd)
+    }
+
+    #[must_use]
+    pub fn adaptive_flash_loan_usd(&self, fp: u64, configured_max_usd: u64) -> u64 {
+        let stats = self.route_stats.read();
+        Self::adaptive_flash_loan_usd_from_stats(stats.get(&fp), configured_max_usd)
     }
 
     pub(super) fn promote_adaptive_flash_loan_cap(

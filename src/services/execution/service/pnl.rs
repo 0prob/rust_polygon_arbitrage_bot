@@ -89,27 +89,34 @@ impl ExecutionService {
     }
 
     pub(super) fn record_realized(&self, profit_wei: U256, gas_cost_wei: U256) {
-        if profit_wei >= gas_cost_wei {
+        let daily = if profit_wei >= gas_cost_wei {
             // Break-even is neutral economically but still a successful confirmation.
             self.consecutive_fails.store(0, Ordering::Relaxed);
             let p = profit_wei
                 .saturating_sub(gas_cost_wei)
                 .min(U256::from(i128::MAX as u128))
                 .to::<u128>() as i128;
+            let mut pnl = self.pnl.lock();
             if p > 0 {
-                self.pnl.lock().record_profit(p);
+                pnl.record_profit(p);
                 self.total_trades.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Still roll the day under the same lock so the limit check matches booking.
+                pnl.maybe_roll_daily();
             }
+            pnl.daily
         } else {
             let loss = gas_cost_wei
                 .saturating_sub(profit_wei)
                 .min(U256::from(i128::MAX as u128))
                 .to::<u128>() as i128;
-            self.pnl.lock().record_loss(loss);
+            let mut pnl = self.pnl.lock();
+            pnl.record_loss(loss);
             self.total_losses.fetch_add(1, Ordering::Relaxed);
             self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
-        }
-        self.enforce_daily_loss_limit();
+            pnl.daily
+        };
+        self.enforce_daily_loss_limit_with_daily(daily);
     }
 
     /// Book gas-only loss without treating attribution failure as a trade outcome.
@@ -120,11 +127,10 @@ impl ExecutionService {
         self.record_realized(U256::ZERO, gas_cost_wei);
     }
 
-    pub(super) fn enforce_daily_loss_limit(&self) {
+    fn enforce_daily_loss_limit_with_daily(&self, daily: i128) {
         let Some(max_loss) = self.max_daily_loss_matic_wei else {
             return;
         };
-        let daily = self.pnl_snapshot().1;
         if daily >= 0 {
             return;
         }

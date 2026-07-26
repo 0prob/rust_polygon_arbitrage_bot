@@ -28,6 +28,19 @@ pub(super) enum RouteFailureKind {
     RealizedLoss,
 }
 
+impl RouteFailureKind {
+    /// Stable on-disk tag (must match `replay_route_stats`).
+    pub(super) const fn as_tag(self) -> &'static str {
+        match self {
+            Self::DryRun => "DryRun",
+            Self::Submit => "Submit",
+            Self::Timeout => "Timeout",
+            Self::Revert => "Revert",
+            Self::RealizedLoss => "RealizedLoss",
+        }
+    }
+}
+
 enum RouteStatsMsg {
     Line(String),
     Flush(Sender<()>),
@@ -119,7 +132,14 @@ impl ExecutionService {
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) => {
+                    crate::warn!(
+                        "route stats replay stopped on IO error at {}: {e}",
+                        path.display()
+                    );
+                    break;
+                }
                 Ok(_) => {
                     let mut parts = line.split_whitespace();
                     let Some(fp_str) = parts.next() else {
@@ -169,7 +189,7 @@ impl ExecutionService {
             RouteFailureKind::RealizedLoss => stats.realized_losses += 1,
         }
         drop(all);
-        self.write_route_event(format!("{} f {:?}", fp, kind));
+        self.write_route_event(format!("{} f {}", fp, kind.as_tag()));
     }
 
     pub(super) fn record_route_success(&self, fp: u64) {

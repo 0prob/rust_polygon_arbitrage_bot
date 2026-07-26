@@ -695,6 +695,9 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     );
     // prepare re-validates flash fee vs planned source before reuse.
     let log_prepare_skip = ctx.execution.should_log_prepare_skip(fp);
+    let (risk_multiplier_bps, adaptive_flash_usd) = ctx
+        .execution
+        .route_learning_snapshot(fp, max_flash_loan_usd);
     let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
         evaluated: &evaluated,
         arena,
@@ -707,9 +710,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         min_profit_roi_bps,
         gas_price,
         slippage_bps: route_slippage_bps,
-        max_flash_loan_usd: ctx
-            .execution
-            .adaptive_flash_loan_usd(fp, max_flash_loan_usd),
+        max_flash_loan_usd: adaptive_flash_usd,
         matic_usd,
         matic_usd_chainlink: ctx.price_oracle.fresh_matic_usd_chainlink_raw(),
         safety_multiplier_bps: ctx.config.execution.profit_safety_multiplier_bps,
@@ -717,7 +718,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         route_fingerprint: fp,
         gas_oracle: &ctx.gas_oracle,
         search_low,
-        risk_multiplier_bps: ctx.execution.route_risk_multiplier_bps(fp),
+        risk_multiplier_bps,
         existing_assessment: prior_assessment,
         log_skips: log_prepare_skip,
         adaptive_flash_cap_bound,
