@@ -18,15 +18,15 @@ use crate::pipeline::local_sim::{self, simulate_route_detailed_with_caps};
 use crate::pipeline::sim_sanity::required_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
-use crate::pipeline::tick_fetch::{
-    collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
-    is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
-    is_probe_narrow_miss_on_cooldown, is_probe_narrow_miss_v4_on_cooldown,
-    mark_probe_narrow_miss_v4, mark_tick_hydrate_timeout_cooldown,
-    mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
-};
 #[cfg(test)]
 use crate::pipeline::tick_fetch::is_cl_tick_on_hydrate_cooldown;
+use crate::pipeline::tick_fetch::{
+    collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
+    is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown, is_probe_narrow_miss_on_cooldown,
+    is_probe_narrow_miss_v4_on_cooldown, mark_probe_narrow_miss_v4,
+    mark_tick_hydrate_timeout_cooldown, mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3,
+    still_tickless_v4,
+};
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
 };
@@ -1106,8 +1106,9 @@ pub(crate) fn cycle_tickless_cl_hf_hydrate_exhausted(
                 let Some(addr) = arena.pool_address(edge.pool_index) else {
                     return false;
                 };
-                let Some(pool_id) = crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
-                    .and_then(|meta| meta.pool_id)
+                let Some(pool_id) =
+                    crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+                        .and_then(|meta| meta.pool_id)
                 else {
                     // No pool_id → TickLens cannot target; treat hop as permanently stuck.
                     continue;
@@ -1506,10 +1507,8 @@ fn sibling_completion_cl_targets<C: AsRef<FoundCycle>>(
     // addr → (sole_remaining, hits, liq)
     let mut v3_freq: FxHashMap<Address, (u32, u32, u128)> = FxHashMap::default();
     // pool_index → (pool_id, sole_remaining, hits, liq)
-    let mut v4_freq: FxHashMap<
-        PoolIndex,
-        (alloy::primitives::FixedBytes<32>, u32, u32, u128),
-    > = FxHashMap::default();
+    let mut v4_freq: FxHashMap<PoolIndex, (alloy::primitives::FixedBytes<32>, u32, u32, u128)> =
+        FxHashMap::default();
 
     for cycle in cycles {
         let edges = &cycle.as_ref().edges;
@@ -1617,7 +1616,11 @@ fn sibling_completion_cl_targets<C: AsRef<FoundCycle>>(
     // Prefer sole-remaining V3, reserve ≥1 V4 slot when both need work.
     let v4_reserve = usize::from(!v4_ranked.is_empty() && !v3_ranked.is_empty() && cap >= 2);
     let v3_cap = cap.saturating_sub(v4_reserve);
-    let v3: Vec<Address> = v3_ranked.into_iter().take(v3_cap).map(|(a, _, _, _)| a).collect();
+    let v3: Vec<Address> = v3_ranked
+        .into_iter()
+        .take(v3_cap)
+        .map(|(a, _, _, _)| a)
+        .collect();
     let v4_cap = cap.saturating_sub(v3.len());
     let v4: Vec<(PoolIndex, alloy::primitives::FixedBytes<32>)> = v4_ranked
         .into_iter()
@@ -1634,16 +1637,26 @@ fn sibling_completion_cl_targets<C: AsRef<FoundCycle>>(
 /// `pool_cap` limits how many tickless pools to fetch this tick (budget-scaled).
 /// `budget` bounds sequential wide/sibling passes so they finish under the outer
 /// `timeout` instead of burning 1500ms then cooling 0 (live iter21).
+pub(crate) struct TicklessHydrateBudget {
+    pub word_range: i16,
+    pub block_number: Option<u64>,
+    pub pool_cap: usize,
+    pub budget: std::time::Duration,
+}
+
 pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     rpc: &RpcPool,
     arena: &mut StateArena,
     cycles: &[C],
     pool_metas: &[crate::pipeline::types::PoolMeta],
-    word_range: i16,
-    block_number: Option<u64>,
-    pool_cap: usize,
-    budget: std::time::Duration,
+    params: TicklessHydrateBudget,
 ) -> ProbeTickHydrateStats {
+    let TicklessHydrateBudget {
+        word_range,
+        block_number,
+        pool_cap,
+        budget,
+    } = params;
     let mut stats = ProbeTickHydrateStats {
         cycles_tickless_before: count_tickless_cl_cycles(arena, cycles),
         ..ProbeTickHydrateStats::default()
@@ -1791,12 +1804,8 @@ pub(crate) async fn hydrate_tickless_cl_for_cycles<C: AsRef<FoundCycle>>(
     // narrow-miss bypass lives in `sibling_completion_cl_targets`.
     const PROBE_SIBLING_COMPLETION_CAP: usize = 4;
     if budget_allows_pass() && stats.cycles_tickless_after > 0 {
-        let (sib_v3, sib_v4) = sibling_completion_cl_targets(
-            arena,
-            cycles,
-            pool_metas,
-            PROBE_SIBLING_COMPLETION_CAP,
-        );
+        let (sib_v3, sib_v4) =
+            sibling_completion_cl_targets(arena, cycles, pool_metas, PROBE_SIBLING_COMPLETION_CAP);
         if !sib_v3.is_empty() || !sib_v4.is_empty() {
             let wide_range = probe_wide_tick_word_range(probe_word_range);
             let (alg, alg_int) =
@@ -2219,11 +2228,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
     let query_block = (state_block > 0).then_some(state_block);
     let outcome =
         query_balancer_batch_profit(sim_provider, executor, &hops, start_token, query_block).await;
-    match evaluate_batch_query(
-        outcome,
-        result.sim.amount_in,
-        slippage,
-    ) {
+    match evaluate_batch_query(outcome, result.sim.amount_in, slippage) {
         BatchQueryVerdict::Accepted(on_chain_profit) => {
             let mut accepted = result;
             accepted.sim.profit = on_chain_profit;
@@ -2423,8 +2428,7 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
                     let mut rotated =
                         crate::core::types::CycleEdges::from_slice(&result.cycle.edges);
                     for _ in 0..n {
-                        let rfp =
-                            crate::services::execution::candidate::hash_cycle_edges(&rotated);
+                        let rfp = crate::services::execution::candidate::hash_cycle_edges(&rotated);
                         if rfp != fp {
                             execution.quarantine_batch_query_failure(rfp);
                         }
@@ -2571,7 +2575,7 @@ mod tests {
         };
         // Hub already has ticks → sibling is the completion target (narrow-miss
         // is intentionally not consulted by this helper).
-        let (v3, v4) = sibling_completion_cl_targets(&arena, &[cycle.clone()], &[], 4);
+        let (v3, v4) = sibling_completion_cl_targets(&arena, std::slice::from_ref(&cycle), &[], 4);
         assert!(v4.is_empty());
         assert_eq!(v3, vec![sibling]);
 
@@ -2636,10 +2640,8 @@ mod tests {
 
     #[test]
     fn resim_depth_replaces_pre_refresh_slippage() {
-        let initial =
-            effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3);
-        let refreshed =
-            effective_slippage_after_resim_depth(25, 2, 900, FlashLoanSource::AaveV3);
+        let initial = effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3);
+        let refreshed = effective_slippage_after_resim_depth(25, 2, 900, FlashLoanSource::AaveV3);
 
         assert!(refreshed > initial);
         // Direct does not hop-compound the encode floor.
@@ -2873,11 +2875,7 @@ mod tests {
             score: 0.0,
             cycle_ratio: U256::ZERO,
         });
-        let cycles = vec![
-            multi(hub_idx, sib_idx, 1),
-            multi(hub_idx, sib_idx, 2),
-            one,
-        ];
+        let cycles = vec![multi(hub_idx, sib_idx, 1), multi(hub_idx, sib_idx, 2), one];
         let (total, ranked) = tickless_v3_addresses_prioritized(&arena, &cycles, 1);
         assert_eq!(total, 3);
         // Cap=1 must fetch the sole-unlock pool, not the high-liq membership hub.
@@ -3043,7 +3041,9 @@ mod tests {
 
     #[test]
     fn tickless_v4_targets_prioritized_ranks_by_hits_and_liquidity() {
-        use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex, V4PoolState};
+        use crate::core::types::{
+            CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex, V4PoolState,
+        };
         use crate::pipeline::types::PoolMeta;
         use alloy::primitives::{FixedBytes, U256};
 

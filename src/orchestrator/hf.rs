@@ -213,7 +213,9 @@ fn resolve_hydrate_budget(hydrate_floor: Duration, gap_ok: bool, residual: Durat
     if hydrate_floor.is_zero() {
         reclaimed
     } else {
-        hydrate_floor.max(reclaimed).min(HF_PROBE_HYDRATE_MAX_BUDGET)
+        hydrate_floor
+            .max(reclaimed)
+            .min(HF_PROBE_HYDRATE_MAX_BUDGET)
     }
 }
 
@@ -2055,8 +2057,7 @@ pub async fn run_hf_tick(
     let last_hydrate = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
     let hydrate_gap_ok =
         probe_tick_started.saturating_sub(last_hydrate) >= PROBE_HYDRATE_MIN_GAP_MS;
-    let residual_for_hydrate =
-        prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
+    let residual_for_hydrate = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
     let hydrate_budget =
         resolve_hydrate_budget(hydrate_floor, hydrate_gap_ok, residual_for_hydrate);
     let probe_tick_budget = hydrate_budget
@@ -2101,10 +2102,12 @@ pub async fn run_hf_tick(
                 &mut arena,
                 &cycles,
                 pool_metas_for_dispatch.as_ref(),
-                ctx.config.oracle.tick_word_range,
-                None,
-                probe_pool_cap,
-                probe_tick_budget,
+                crate::orchestrator::hf_execute::TicklessHydrateBudget {
+                    word_range: ctx.config.oracle.tick_word_range,
+                    block_number: None,
+                    pool_cap: probe_pool_cap,
+                    budget: probe_tick_budget,
+                },
             ),
         )
         .await
@@ -2597,8 +2600,8 @@ pub async fn run_hf_tick(
                 // Sticky positive-net rejects re-fill every HF tick (live: min-profit
                 // net 0.123 vs floor 0.130; safety-floor net 0.008 vs gas 0.070 — same
                 // fp many times). Cool so the window rotates; 300s = probe-below-floor.
-                let sticky = reason.contains("below min profit")
-                    || reason.contains("below safety floor");
+                let sticky =
+                    reason.contains("below min profit") || reason.contains("below safety floor");
                 if sticky
                     && ctx
                         .execution
@@ -2980,11 +2983,7 @@ mod tests {
     #[test]
     fn resolve_hydrate_reclaims_when_gap_opens_after_carve() {
         // Gap closed at carve → floor=0; gap open at hydrate with large residual.
-        let reclaimed = resolve_hydrate_budget(
-            Duration::ZERO,
-            true,
-            Duration::from_millis(2_400),
-        );
+        let reclaimed = resolve_hydrate_budget(Duration::ZERO, true, Duration::from_millis(2_400));
         assert_eq!(reclaimed, HF_PROBE_HYDRATE_MAX_BUDGET);
         assert_eq!(
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(reclaimed),
@@ -2992,12 +2991,14 @@ mod tests {
         );
 
         // Gap still closed → do not run TickLens (floor held for next eligible tick).
-        assert!(resolve_hydrate_budget(
-            HF_PROBE_HYDRATE_MIN_BUDGET,
-            false,
-            Duration::from_millis(2_400)
-        )
-        .is_zero());
+        assert!(
+            resolve_hydrate_budget(
+                HF_PROBE_HYDRATE_MIN_BUDGET,
+                false,
+                Duration::from_millis(2_400)
+            )
+            .is_zero()
+        );
 
         // MIN floor expands to MAX when residual allows.
         assert_eq!(
