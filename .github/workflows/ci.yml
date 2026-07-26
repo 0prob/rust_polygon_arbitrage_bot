@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml pins host-local flags (native-cpu codegen, a hardcoded
+  # mold linker path) that don't exist on CI runners. Setting RUSTFLAGS (even
+  # empty) takes precedence over that file's build.rustflags and neutralizes
+  # them; the config's `linker = "clang"` is a separate key and still applies,
+  # which is fine since ubuntu-latest ships clang.
+  RUSTFLAGS: ""
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features
+
+  test-lib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib
+
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      # oracle_live_test.rs's 5 tests are all #[ignore]d (live network) and
+      # stay skipped since --ignored isn't passed; no secrets needed here.
+      - run: cargo test --tests
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  check-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      # Type-checks the release profile (panic=abort, LTO cfg) cheaply.
+      # Not a full `cargo build --release`: fat LTO is too slow for a
+      # per-push gate and codegen isn't what this gate needs to catch.
+      - run: cargo check --release

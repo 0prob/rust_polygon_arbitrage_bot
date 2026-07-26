@@ -1,29 +1,40 @@
 # cargo-deny configuration for rpbot MEV arbitrage bot
 # Run: cargo deny check
+#
+# advisories/licenses lost their per-field lint-level knobs (vulnerability=,
+# unmaintained=, yanked=, notice=, unlicensed=, copyleft=, default=) in
+# current cargo-deny — vulnerabilities are unconditionally denied, and any
+# license not in the allow list below unconditionally fails. That's a
+# stricter/simpler version of the same original intent, not a policy change.
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
-ignore = []
+ignore = [
+    # paste: author-archived/feature-complete, compile-time-only proc-macro
+    # (no runtime or network surface); pulled in transitively via
+    # alloy-primitives, not removable without forking alloy.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time-only proc-macro, transitive via alloy-primitives, no runtime surface" },
+]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "BSD-3-Clause",
     "ISC",
     "CC0-1.0",
     "MPL-2.0",
     "OpenSSL",
     "Zlib",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "deny"
-default = "deny"
+
+# rpbot is a private trading bot, never published (see Cargo.toml `publish = false`).
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
