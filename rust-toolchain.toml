@@ -3,3 +3,4 @@
 # Bump to latest nightly once that PR lands on nightly.
 [toolchain]
 channel = "nightly-2026-07-20"
+components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]

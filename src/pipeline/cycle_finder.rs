@@ -489,6 +489,31 @@ struct NodePrep {
     direct_legs: u16,
 }
 
+fn compare_cycle_start_source(
+    a: &(TokenIndex, usize, usize),
+    b: &(TokenIndex, usize, usize),
+) -> std::cmp::Ordering {
+    b.1.cmp(&a.1)
+        .then_with(|| b.2.cmp(&a.2))
+        .then_with(|| a.0.0.cmp(&b.0.0))
+}
+
+fn select_cycle_start_tokens(mut scored: Vec<(TokenIndex, usize, usize)>) -> Vec<TokenIndex> {
+    let take = scored.len().min(DFS_MAX_START_SOURCES);
+    if take == 0 {
+        return Vec::new();
+    }
+    if take < scored.len() {
+        scored.select_nth_unstable_by(take, compare_cycle_start_source);
+    }
+    scored[..take].sort_unstable_by(compare_cycle_start_source);
+    scored
+        .into_iter()
+        .take(take)
+        .map(|(token, _, _)| token)
+        .collect()
+}
+
 fn prep_node(
     index: usize,
     token_count: usize,
@@ -588,7 +613,7 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
     let mut max_outgoing_ratio: Vec<U256> = vec![ONE; token_count];
     let mut global_min = f64::INFINITY;
     let mut global_max_ratio = ONE;
-    let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::new();
+    let mut scored_div: Vec<(TokenIndex, usize, usize)> = Vec::with_capacity(token_count);
 
     for (index, node) in per_node.into_iter().enumerate() {
         let len = node.live.len();
@@ -614,16 +639,7 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
         compact.push(node.live);
     }
 
-    scored_div.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.0.cmp(&b.0.0))
-    });
-    let start_tokens = scored_div
-        .into_iter()
-        .take(DFS_MAX_START_SOURCES)
-        .map(|(t, _, _)| t)
-        .collect();
+    let start_tokens = select_cycle_start_tokens(scored_div);
     // Convert sparse Option<f64> to dense f64 with INFINITY sentinel
     // Only needed for tokens that reached min_outgoing — others get INFINITY
     // which makes can_still_be_negative return false immediately.
@@ -1735,6 +1751,19 @@ mod tests {
         let degrees: [usize; 0] = [];
         let r = prioritize_cycle_start_tokens_from_out_degrees(degrees.into_iter());
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn select_cycle_start_tokens_keeps_the_best_ranked_sources() {
+        let starts = select_cycle_start_tokens(
+            (0..(DFS_MAX_START_SOURCES as u32 + 8))
+                .map(|index| (TokenIndex(index), 1, index as usize))
+                .collect(),
+        );
+
+        assert_eq!(starts.len(), DFS_MAX_START_SOURCES);
+        assert_eq!(starts.first(), Some(&TokenIndex(39)));
+        assert_eq!(starts.last(), Some(&TokenIndex(8)));
     }
 
     #[test]

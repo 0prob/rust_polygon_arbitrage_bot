@@ -22,6 +22,7 @@ required-features = ["tui"]
 # Optional TUI: `--features tui`.
 default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:libc"]
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dependencies]
 # Defaults already include essentials + `reqwest`/`reqwest-rustls-tls` (alloy feature
@@ -48,6 +49,7 @@ smallvec = { version = "1.15.2", features = ["union", "const_generics"] }
 # tokio 1.53 defaults are empty; enable only what we use. `parking_lot` reuses our dep
 # for sync primitives inside the runtime. CPU work stays on rayon (not spawn_blocking).
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "parking_lot"] }
+console-subscriber = { version = "0.5.0", optional = true }
 tokio-postgres = "0.7.18"
 # Statement-cached pool for tokio-postgres; Runtime::Tokio1 + Verified recycle in infra::pg.
 deadpool-postgres = "0.14.1"

@@ -25,11 +25,7 @@ fn main() -> anyhow::Result<()> {
     // Kill any other rpbot/tui (debug/release/bolt) before we open RPC/PG/WSS.
     rpbot::single_instance::ensure_single_instance();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("rpbot-tokio")
-        .build()
-        .context("failed to build tokio runtime")?;
+    let runtime = rpbot::runtime::build()?;
 
     // `block_on` holds the runtime until pass-loop has joined (or aborted).
     // Dropping `runtime` afterward shuts workers down without orphaning tasks.

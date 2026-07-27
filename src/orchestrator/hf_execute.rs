@@ -2,6 +2,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use rustc_hash::FxHashMap;
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::task::JoinSet;
@@ -192,6 +193,40 @@ pub(crate) struct DispatchInputs<'a> {
     pub(crate) skip_dispatch_refresh: bool,
     /// HF tick flash-cap USD price; skips redundant oracle RPC on dispatch when set.
     pub(crate) matic_usd: Option<f64>,
+}
+
+struct PriorityDispatchQueue {
+    capacity: usize,
+    items: Vec<HfEvalResult>,
+}
+
+impl PriorityDispatchQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            items: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, item: HfEvalResult) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.items.push(item);
+        self.items.sort_unstable_by(dispatch_priority_cmp);
+        self.items.truncate(self.capacity);
+    }
+
+    fn pop(&mut self) -> Option<HfEvalResult> {
+        self.items.pop()
+    }
+}
+
+fn dispatch_priority_cmp(a: &HfEvalResult, b: &HfEvalResult) -> CmpOrdering {
+    a.assessment
+        .net_profit_after_gas_matic_wei
+        .cmp(&b.assessment.net_profit_after_gas_matic_wei)
+        .then_with(|| b.route_fingerprint.cmp(&a.route_fingerprint))
 }
 
 #[derive(Default)]
@@ -488,8 +523,16 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     .ok()
     .and_then(Result::ok);
 
+    let mut queue = PriorityDispatchQueue::new(ctx.config.pipeline.hf_max_dispatch);
     for evaluated in profitable {
+        queue.push(evaluated);
+    }
+    while let Some(evaluated) = queue.pop() {
         if *shutdown.borrow() {
+            break;
+        }
+        if ctx.cache.generation() != dispatch_state_generation {
+            crate::debug!("dispatch skip: state generation changed before submit");
             break;
         }
         let Some(outcome) = dispatch_one_candidate(

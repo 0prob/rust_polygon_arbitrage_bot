@@ -1,15 +1,16 @@
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rpbot::config::CycleFinderMode;
 use rpbot::core::constants::MIN_HOP_TOKEN_BALANCE;
 use rpbot::core::math::uniswap_v2::simulate_v2_swap;
 use rpbot::core::math::uniswap_v3::simulate_v3_swap;
-use rpbot::core::types::{Edge, ProtocolType, V2PoolState, V3PoolState, V3Tick};
+use rpbot::core::types::{Edge, PoolState, ProtocolType, V2PoolState, V3PoolState, V3Tick};
+use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_search::find_cycles_for_mode;
-use rpbot::pipeline::graph::rescore_graph_in_place;
+use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair, rescore_graph_in_place};
 use rpbot::pipeline::local_sim::simulate_route_minimal;
 use rpbot::pipeline::ternary::optimize_cycle;
-use rpbot::pipeline::types::CycleSearchPass;
+use rpbot::pipeline::types::{CycleSearchPass, PoolMeta, RoutingGraph};
 use rpbot::test_support::FixtureBuilder;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
@@ -197,6 +198,112 @@ fn bench_cycle_search(c: &mut Criterion) {
     group.finish();
 }
 
+struct ActiveMarketFixture {
+    arena: StateArena,
+    metas: Vec<PoolMeta>,
+    graph: RoutingGraph,
+    route: Vec<Edge>,
+}
+
+fn indexed_address(namespace: u8, index: u32) -> Address {
+    let mut bytes = [0u8; 20];
+    bytes[0] = namespace;
+    bytes[16..].copy_from_slice(&index.to_be_bytes());
+    Address::from(bytes)
+}
+
+fn active_market_fixture(pool_count: usize) -> ActiveMarketFixture {
+    assert!(pool_count >= 4 && pool_count.is_multiple_of(4));
+
+    let mut arena = StateArena::default();
+    let tokens: Vec<_> = (0..pool_count)
+        .map(|index| arena.register_token(indexed_address(1, index as u32)))
+        .collect();
+    let mut metas = Vec::with_capacity(pool_count);
+    let mut route = Vec::with_capacity(4);
+    let reserve = MIN_HOP_TOKEN_BALANCE * U256::from(10_000u64);
+    for index in 0..pool_count {
+        let group_start = index / 4 * 4;
+        let next = group_start + (index + 1 - group_start) % 4;
+        let pool = arena.register_pool(
+            indexed_address(2, index as u32),
+            Arc::new(PoolState::V2(V2PoolState {
+                reserve0: reserve,
+                reserve1: reserve,
+                fee: U256::from(9_970u32),
+                fee_denominator: U256::from(10_000u32),
+                block_timestamp_last: 0,
+            })),
+        );
+        metas.push(pool_meta_from_pair(
+            pool,
+            ProtocolType::UniswapV2,
+            tokens[index],
+            tokens[next],
+            30,
+        ));
+        if index < 4 {
+            route.push(Edge {
+                pool_index: pool,
+                token_in: tokens[index],
+                token_out: tokens[next],
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            });
+        }
+    }
+    let graph = build_graph(&arena, &metas);
+
+    ActiveMarketFixture {
+        arena,
+        metas,
+        graph,
+        route,
+    }
+}
+
+fn bench_active_market_search_and_gas(c: &mut Criterion) {
+    let mut search_group = c.benchmark_group("search_active_market");
+    for pool_count in [64usize, 256, 1_024] {
+        let fixture = active_market_fixture(pool_count);
+        let passes = [CycleSearchPass {
+            max_hops: 4,
+            max_cycles: 500,
+        }];
+        search_group.throughput(Throughput::Elements(pool_count as u64));
+        search_group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(format!("{pool_count}_pools")),
+            &fixture,
+            |b, fixture| {
+                b.iter_with_large_drop(|| {
+                    find_cycles_for_mode(
+                        CycleFinderMode::Hybrid,
+                        black_box(&fixture.arena),
+                        black_box(&fixture.graph),
+                        black_box(&fixture.metas),
+                        black_box(&passes),
+                        false,
+                        None,
+                    )
+                    .cycles
+                });
+            },
+        );
+    }
+    search_group.finish();
+
+    let fixture = active_market_fixture(1_024);
+    let mut gas_group = c.benchmark_group("gas");
+    gas_group.throughput(Throughput::Elements(fixture.route.len() as u64));
+    gas_group.bench_function("estimate_route_gas_4hop", |b| {
+        b.iter(|| rpbot::pipeline::local_sim::estimate_route_gas(black_box(&fixture.route)));
+    });
+    gas_group.finish();
+}
+
 fn bench_optimize_cycle(c: &mut Criterion) {
     let mut fx = FixtureBuilder::new();
     let a = fx.token(1);
@@ -292,6 +399,7 @@ criterion_group!(
     bench_route_sim,
     bench_graph_rescore,
     bench_cycle_search,
+    bench_active_market_search_and_gas,
     bench_optimize_cycle
 );
 criterion_main!(benches);
