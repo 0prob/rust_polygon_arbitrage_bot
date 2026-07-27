@@ -81,7 +81,7 @@ fn effective_slippage_after_resim(
     sim: &crate::core::types::RouteSimulationResult,
     configured_per_hop_bps: u64,
     flash_source: FlashLoanSource,
-) -> u64 {
+) -> Option<u64> {
     let depth_bps = depth_impact_slippage_bps_with_base(
         arena,
         edges,
@@ -105,17 +105,10 @@ fn effective_slippage_after_resim_depth(
     hop_count: u32,
     depth_bps: u64,
     flash_source: FlashLoanSource,
-) -> u64 {
-    effective_slippage_bps_for_flash(
-        configured_per_hop_bps,
-        hop_count,
-        if depth_bps >= 10_000 {
-            3_000
-        } else {
-            depth_bps
-        },
-        flash_source,
-    )
+) -> Option<u64> {
+    (depth_bps < 10_000).then(|| {
+        effective_slippage_bps_for_flash(configured_per_hop_bps, hop_count, depth_bps, flash_source)
+    })
 }
 
 /// Pure Balancer routes use Direct `batchSwap` (no per-hop minOut); mixed use multi-call.
@@ -716,7 +709,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             &refreshed,
             base_slippage_bps,
             resim_flash_source_for_slip(&evaluated.cycle),
-        );
+        )?;
         refreshed
     } else {
         evaluated.sim
@@ -2696,14 +2689,20 @@ mod tests {
 
     #[test]
     fn resim_depth_replaces_pre_refresh_slippage() {
-        let initial = effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3);
-        let refreshed = effective_slippage_after_resim_depth(25, 2, 900, FlashLoanSource::AaveV3);
+        let initial = effective_slippage_after_resim_depth(25, 2, 100, FlashLoanSource::AaveV3)
+            .expect("known depth");
+        let refreshed = effective_slippage_after_resim_depth(25, 2, 900, FlashLoanSource::AaveV3)
+            .expect("known depth");
 
         assert!(refreshed > initial);
         // Direct does not hop-compound the encode floor.
         assert_eq!(
             effective_slippage_after_resim_depth(0, 3, 0, FlashLoanSource::Direct),
-            50
+            Some(50)
+        );
+        assert_eq!(
+            effective_slippage_after_resim_depth(0, 3, 10_000, FlashLoanSource::Direct),
+            None,
         );
     }
 

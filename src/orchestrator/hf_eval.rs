@@ -40,7 +40,7 @@ use crate::services::execution::impact_slippage::{
 };
 use crate::services::execution::profit::{
     ProfitEvalContext, RouteAssessRequest, assess_route_from_sim, assessment_gas_for_edges,
-    assessment_gas_units, brent_score_matic_from_sim, cover_matic_from_sim, flash_loan_fee_bps,
+    assessment_gas_units, brent_score_matic_from_sim, cover_matic_from_sim, flash_loan_fee_amount,
     net_profit_matic_from_sim, route_profit_thresholds,
 };
 use crate::services::execution::service::ExecutionService;
@@ -1830,7 +1830,14 @@ fn evaluate_one(
     // Probe-size flash plan is often free Balancer; economic/optimal size often
     // needs Aave (5 bps). Brent under the wrong fee oversizes → prepare/dry-run miss.
     // One re-size under the true fee (+ provider liquidity hard-cap when known).
-    if !probe_only && flash_loan_fee_bps(flash_source) != flash_loan_fee_bps(flash_source_brent) {
+    let flash_fee_changed = match (
+        flash_loan_fee_amount(flash_source, opt.optimal_input),
+        flash_loan_fee_amount(flash_source_brent, opt.optimal_input),
+    ) {
+        (Some(selected), Some(brent)) => selected != brent,
+        _ => return None,
+    };
+    if !probe_only && flash_fee_changed {
         profit_ctx.flash_source = flash_source;
         let liq_cap = match flash_source {
             FlashLoanSource::AaveV3 if flash_ctx.liquidity.aave_listed => {
@@ -1881,7 +1888,7 @@ fn evaluate_one(
         }
     }
 
-    let mut depth_bps = depth_impact_slippage_bps_with_base(
+    let depth_bps = depth_impact_slippage_bps_with_base(
         input.arena,
         &cycle.edges,
         opt.optimal_input,
@@ -1891,14 +1898,9 @@ fn evaluate_one(
             total_gas: sim.total_gas,
         }),
     );
-    // depth=10000 only for zero-profit base. +5% miss is now 2500 (depth_impact).
-    // Live kill-switch: depth_unknown==in, ok=0 on every route assess.
     if depth_bps >= 10_000 {
         inc(&stats.depth_unknown);
-        if sim.profit.is_zero() {
-            return None;
-        }
-        depth_bps = 3_000;
+        return None;
     }
     let slippage_bps =
         effective_slippage_bps_for_flash(input.slippage_bps, hop_count, depth_bps, flash_source);

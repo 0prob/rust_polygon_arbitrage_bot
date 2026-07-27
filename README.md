@@ -119,6 +119,14 @@ pass_loop
 
 Pool metadata flows PostgreSQL → `StateRefreshService` → `StateCache` → routing graph. LF publishes cycle snapshots; HF reads them lock-free via `SnapshotStore` (ArcSwap). Stream patches merge into `StateCache` on the hot path without a full node refresh.
 
+### Profitability gate
+
+`assess_profit` is the execution gate. It applies the full-route slippage haircut to output once, subtracts the selected flash premium, then subtracts `gas_units × (base fee + charged priority fee)`; a profit-derived priority bid subtracts only its incremental uplift above that charged tip. It requires positive post-gas net profit, `max(MIN_PROFIT_MATIC_WEI, $0.01 in POL)` after gas, the optional ROI floor, and the configured gas safety cover. Missing or invalid POL/USD fails closed.
+
+Brent/probe ranking uses the same fee, slippage, gas-scale, and priority basis as that gate. A source change that changes the flash fee is re-optimized before assessment. `MAX_FLASH_LOAN_USD` is a hard configured ceiling; adaptive per-route caps start at one quarter and rise only after profitable, receipt-confirmed cap-bound executions.
+
+Preflight is local simulation, then `queryBatchSwap` plus executor `eth_call` for Direct Balancer routes, then the final calldata `eth_call`/gas reassessment before submit. The three checks cover distinct boundaries and are deliberately not interchangeable. A collapsed depth estimate (`depth_bps >= 10000`) is rejected, while an unavailable +5% depth probe receives the explicit 2500-bps haircut from the shared depth helper. Inputs for tokens with eight or fewer decimals must also be at least one whole token; 18-decimal hubs use only the economic notional floor.
+
 Stream is **off by default** (`STREAM_ENABLED` code default `false`). Set `STREAM_ENABLED=true` and configure `POLYGON_WSS_URLS` or `WSS_URL` (HTTP→WSS conversion from state RPCs is unreliable on many providers). Live submits should not use the public execution RPC for mempool injection — use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER`.
 
 ### Flash loans
