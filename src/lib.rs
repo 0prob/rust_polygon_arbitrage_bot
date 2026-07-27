@@ -1,8 +1,8 @@
 pub mod abis;
 pub mod bootstrap;
 pub mod cli;
-pub mod console;
 pub mod config;
+pub mod console;
 pub mod core;
 pub mod infra;
 pub mod log;

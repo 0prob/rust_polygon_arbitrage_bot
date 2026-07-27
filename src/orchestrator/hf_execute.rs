@@ -47,7 +47,9 @@ use crate::services::execution::flash_liquidity::route_is_balancer_only;
 use crate::services::execution::impact_slippage::{
     depth_impact_slippage_bps_with_base, effective_slippage_bps_for_flash,
 };
-use crate::services::execution::profit::on_chain_min_profit_from_assessment;
+use crate::services::execution::profit::{
+    flash_loan_fee_is_fresh, on_chain_min_profit_from_assessment,
+};
 use crate::services::execution::{
     CandidateBuildConfig, ExecutionOutcome, PrepareDispatchInput, build_execution_candidate,
     prepare_evaluated_route,
@@ -771,6 +773,18 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
         }
         return None;
     };
+
+    if !flash_loan_fee_is_fresh(prepared.flash_source) {
+        skipped.record("prepare_flash_fee");
+        if log_prepare_skip {
+            crate::info!(
+                "dispatch skip: fp={fp} flash fee unavailable or stale source={}",
+                prepared.flash_source.label()
+            );
+            ctx.execution.record_prepare_skip(fp);
+        }
+        return None;
+    }
 
     if prepared.flash_source == FlashLoanSource::AaveV3 {
         let cache_viable = ctx

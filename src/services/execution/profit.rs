@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::constants::BPS_SCALE;
 use crate::core::types::{FlashLoanSource, ProfitAssessment, TokenIndex};
@@ -18,9 +18,11 @@ pub use crate::core::constants::{
 // ponytail: 5 bps is the Aave V3 default FLASHLOAN_PREMIUM_TOTAL.
 // Refetch on-chain periodically via fetch_and_cache_aave_flash_loan_fee_bps.
 static AAVE_FLASH_LOAN_FEE_BPS: AtomicU64 = AtomicU64::new(5);
+static AAVE_FLASH_LOAN_FEE_FETCHED_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_aave_flash_loan_fee_bps(fee_bps: u64) {
-    AAVE_FLASH_LOAN_FEE_BPS.store(fee_bps, std::sync::atomic::Ordering::Relaxed);
+    AAVE_FLASH_LOAN_FEE_BPS.store(fee_bps, Ordering::Relaxed);
+    AAVE_FLASH_LOAN_FEE_FETCHED_AT_MS.store(crate::util::now_ms(), Ordering::Release);
 }
 
 #[must_use]
@@ -31,14 +33,31 @@ pub fn aave_flash_loan_fee_bps_cached() -> u64 {
 /// Balancer V2 ProtocolFeesCollector flash fee as 1e18 FixedPoint (0 on Polygon today).
 /// Refetch via `fetch_and_cache_balancer_flash_loan_fee_pct`.
 static BALANCER_FLASH_LOAN_FEE_PCT_1E18: AtomicU64 = AtomicU64::new(0);
+static BALANCER_FLASH_LOAN_FEE_FETCHED_AT_MS: AtomicU64 = AtomicU64::new(0);
+const FLASH_FEE_MAX_AGE_MS: u64 = 90_000;
 
 pub fn set_balancer_flash_loan_fee_pct(pct_1e18: u64) {
-    BALANCER_FLASH_LOAN_FEE_PCT_1E18.store(pct_1e18, std::sync::atomic::Ordering::Relaxed);
+    BALANCER_FLASH_LOAN_FEE_PCT_1E18.store(pct_1e18, Ordering::Relaxed);
+    BALANCER_FLASH_LOAN_FEE_FETCHED_AT_MS.store(crate::util::now_ms(), Ordering::Release);
 }
 
 #[must_use]
 pub fn balancer_flash_loan_fee_pct_cached() -> u64 {
-    BALANCER_FLASH_LOAN_FEE_PCT_1E18.load(std::sync::atomic::Ordering::Relaxed)
+    BALANCER_FLASH_LOAN_FEE_PCT_1E18.load(Ordering::Relaxed)
+}
+
+const fn flash_fee_snapshot_is_fresh(fetched_at_ms: u64, now_ms: u64) -> bool {
+    fetched_at_ms != 0 && now_ms.saturating_sub(fetched_at_ms) <= FLASH_FEE_MAX_AGE_MS
+}
+
+#[must_use]
+pub fn flash_loan_fee_is_fresh(source: FlashLoanSource) -> bool {
+    let fetched_at_ms = match source {
+        FlashLoanSource::AaveV3 => AAVE_FLASH_LOAN_FEE_FETCHED_AT_MS.load(Ordering::Acquire),
+        FlashLoanSource::Balancer => BALANCER_FLASH_LOAN_FEE_FETCHED_AT_MS.load(Ordering::Acquire),
+        FlashLoanSource::Dodo | FlashLoanSource::Direct => return true,
+    };
+    flash_fee_snapshot_is_fresh(fetched_at_ms, crate::util::now_ms())
 }
 
 /// FixedPoint.ONE — Balancer fee percentage denominator.
@@ -1336,6 +1355,19 @@ mod safety_tests {
             flash_loan_fee_amount(FlashLoanSource::Dodo, U256::from(1_000_000u64)),
             Some(U256::ZERO)
         );
+    }
+
+    #[test]
+    fn external_flash_fee_snapshot_rejects_unknown_and_stale_values() {
+        assert!(!flash_fee_snapshot_is_fresh(0, 1));
+        assert!(flash_fee_snapshot_is_fresh(1, 1));
+        assert!(!flash_fee_snapshot_is_fresh(
+            1,
+            FLASH_FEE_MAX_AGE_MS.saturating_add(2),
+        ));
+        assert!(flash_loan_fee_is_fresh(FlashLoanSource::Direct));
+        set_aave_flash_loan_fee_bps(5);
+        assert!(flash_loan_fee_is_fresh(FlashLoanSource::AaveV3));
     }
 
     #[test]
