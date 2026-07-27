@@ -37,7 +37,19 @@ const POOL_META_VALIDITY_SQL: &str = r#"
         )
         AND (
             protocol <> 'BALANCER_V2'
-            OR cardinality(tokens) >= 2
+            OR (
+                fee IS NOT NULL
+                AND "poolId" IS NOT NULL
+                AND "poolType" IN ('weighted', 'stable', 'linear')
+            )
+        )
+        AND (
+            protocol <> 'CURVE'
+            OR (
+                fee IS NOT NULL
+                AND fee > 0
+                AND "poolType" IN ('stable', 'crypto', 'stable_ng', 'crypto_ng')
+            )
         )
     "#;
 
@@ -711,6 +723,8 @@ mod tests {
         assert!(page.contains(r#"("createdBlock", id) >"#));
         assert!(page.contains("cardinality(tokens) >= 2"));
         assert!(page.contains("protocol <> 'UNISWAP_V4'"));
+        assert!(page.contains("protocol <> 'BALANCER_V2'"));
+        assert!(page.contains("protocol <> 'CURVE'"));
         assert!(page.contains("right(lower(hooks), 4)"));
         assert!(!page.contains("OFFSET"));
 
