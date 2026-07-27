@@ -1086,7 +1086,14 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     let discovery_started = crate::util::now_ms();
-    let _ = ctx.refresh.maybe_discover().await?;
+    if let Err(e) = ctx.refresh.maybe_discover().await.context("lf discovery") {
+        let pools = ctx.refresh.discovered_pool_count();
+        crate::warn!(
+            "lf refresh: event=discovery_failed pass={lf_pass} pools={pools} error={e:#}; skipping tick"
+        );
+        ctx.ui_hook.on_lf_complete(0, 0, pools);
+        return Ok(());
+    }
     let discovery_ms = crate::util::now_ms().saturating_sub(discovery_started);
 
     // Promote topic-observed venues into this tick's refresh before arena sync.
@@ -1111,7 +1118,22 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     }
 
     let refresh_started = crate::util::now_ms();
-    let refresh_result = ctx.refresh.refresh_pool_states(refresh_batch).await?;
+    let refresh_result = match ctx
+        .refresh
+        .refresh_pool_states(refresh_batch)
+        .await
+        .context("lf pool-state refresh")
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let pools = ctx.refresh.discovered_pool_count();
+            crate::warn!(
+                "lf refresh: event=state_refresh_failed pass={lf_pass} batch={refresh_batch} pools={pools} error={e:#}; skipping tick"
+            );
+            ctx.ui_hook.on_lf_complete(0, 0, pools);
+            return Ok(());
+        }
+    };
     let refreshed_pools = refresh_result.updated;
     let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
     if lf_pass <= 2 || lf_pass.is_multiple_of(10) {

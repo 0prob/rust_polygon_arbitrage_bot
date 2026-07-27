@@ -6,6 +6,7 @@ use alloy::primitives::U256;
 use alloy::primitives::{Address, I256, address};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
+use anyhow::Context;
 use parking_lot::RwLock;
 use reqwest::{Client, Url};
 use rustc_hash::{FxBuildHasher, FxHashMap};
@@ -884,8 +885,16 @@ impl PriceOracle {
         match Self::fetch_pyth_once_with(http, base_url, ids).await {
             Ok(prices) => Ok(prices),
             Err(e) => {
-                crate::debug!("Pyth Hermes request failed — retrying once: {e}");
-                Self::fetch_pyth_once_with(http, base_url, ids).await
+                const PYTH_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+                crate::debug!(
+                    "oracle pyth: event=request_failed ids={} retry=1 backoff_ms={} error={e:#}",
+                    ids.len(),
+                    PYTH_RETRY_BACKOFF.as_millis(),
+                );
+                tokio::time::sleep(PYTH_RETRY_BACKOFF).await;
+                Self::fetch_pyth_once_with(http, base_url, ids)
+                    .await
+                    .context("pyth hermes retry")
             }
         }
     }
@@ -898,14 +907,16 @@ impl PriceOracle {
         if ids.is_empty() {
             return Ok((FxHashMap::default(), PythParseStats::default()));
         }
-        let url = pyth_updates_url(base_url, ids)?;
+        let url = pyth_updates_url(base_url, ids).context("pyth updates URL")?;
         let resp = http
             .get(url)
             .timeout(ORACLE_HTTP_TIMEOUT)
             .send()
-            .await?
-            .error_for_status()?;
-        let body: PythHermesResponse = resp.json().await?;
+            .await
+            .with_context(|| format!("pyth hermes request ids={}", ids.len()))?
+            .error_for_status()
+            .context("pyth hermes response status")?;
+        let body: PythHermesResponse = resp.json().await.context("pyth hermes response JSON")?;
         let mut out = FxHashMap::with_capacity_and_hasher(body.parsed.len(), FxBuildHasher);
         let mut stats = PythParseStats::default();
         for item in body.parsed {
