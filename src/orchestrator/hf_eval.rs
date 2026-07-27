@@ -1906,60 +1906,15 @@ fn evaluate_one(
         effective_slippage_bps_for_flash(input.slippage_bps, hop_count, depth_bps, flash_source);
     let mut assessment =
         assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
-    // Dispatch size floor + hop fidelity.
-    //
-    // Stable/dust tokens (≤8 decimals): require ≥1 whole unit. Live 0.1 USDC
-    // phantoms (ain=1e5) cleared the MATIC economic floor (~0.008 USDC) then
-    // dry-ran TransferFailed/IIA.
-    //
-    // 18-decimal hubs (WMATIC/WETH): economic floor alone. Forcing a full unit
-    // killed real edges sized at 0.3–0.9 token with 0.5–0.8 MATIC net (live:
-    // positive-net reject "below economic floor" while gas was covered 8×).
-    if assessment.should_execute {
-        let start_decimals =
-            resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
-        let economic = min_economic_amount_in(
-            start_decimals,
-            resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
+    if probe_only
+        && assessment.reject_reason.as_deref() == Some(DISPATCH_BELOW_ECONOMIC_FLOOR)
+        && input.execution.quarantine_probe_below_dispatch_floor(fp)
+    {
+        crate::info!(
+            "hf probe-dispatch blocked (quarantined 300s): fp={fp} input={} floor={}",
+            opt.optimal_input,
+            dispatch_floor_for_cycle(input, cycle),
         );
-        let one_token = crate::util::ten_pow_u256(start_decimals);
-        let floor = if start_decimals <= 8 {
-            economic.max(one_token)
-        } else {
-            economic
-        };
-        let has_hop_amounts = sim.hop_amounts.iter().any(|a| !a.is_zero());
-        let fidelity_ok = has_hop_amounts
-            && local_sim::route_hop_fidelity_ok_after_walk(
-                input.arena,
-                &cycle.edges,
-                &sim.hop_amounts,
-            );
-        if opt.optimal_input < floor || !has_hop_amounts || !fidelity_ok {
-            assessment.should_execute = false;
-            assessment.reject_reason = Some(if opt.optimal_input < floor {
-                "below economic floor for dispatch".into()
-            } else if !has_hop_amounts {
-                "missing hop amounts for dispatch".into()
-            } else {
-                "hop fidelity failed for dispatch".into()
-            });
-            // Live: probe-only stuck at 0.1 token re-eval'd 200+/fp without ever
-            // becoming dispatchable — cool so HF picks real candidates.
-            if probe_only && opt.optimal_input < floor {
-                if input.execution.quarantine_probe_below_dispatch_floor(fp) {
-                    crate::info!(
-                        "hf probe-dispatch blocked (quarantined 300s): fp={fp} input={} floor={floor}",
-                        opt.optimal_input,
-                    );
-                }
-            } else if probe_only {
-                crate::debug!(
-                    "hf probe-dispatch blocked: fp={fp} input={} floor={floor} amounts={has_hop_amounts} fidelity={fidelity_ok}",
-                    opt.optimal_input,
-                );
-            }
-        }
     }
     if probe_only && !assessment.should_execute {
         assessment.reject_reason = assessment
@@ -2031,7 +1986,7 @@ fn assess_route_for_cycle(
         input.charged_priority_fee_per_gas,
     );
     // Global MAX_SANE_PROFIT_MATIC_WEI already applied in assess_route_from_sim.
-    Some(assess_route_from_sim(&RouteAssessRequest {
+    let assessment = assess_route_from_sim(&RouteAssessRequest {
         cycle_start: cycle.start_token,
         arena: input.arena,
         gross_profit: sim.profit,
@@ -2045,7 +2000,62 @@ fn assess_route_for_cycle(
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
         gas_price: input.gas_price,
-    }))
+    });
+    Some(apply_dispatch_gate(input, cycle, sim, assessment))
+}
+
+const DISPATCH_BELOW_ECONOMIC_FLOOR: &str = "below economic floor for dispatch";
+const DISPATCH_MISSING_HOP_AMOUNTS: &str = "missing hop amounts for dispatch";
+const DISPATCH_HOP_FIDELITY_FAILED: &str = "hop fidelity failed for dispatch";
+
+fn dispatch_input_floor(token_decimals: u8, economic_floor: U256) -> U256 {
+    if token_decimals <= 8 {
+        economic_floor.max(crate::util::ten_pow_u256(token_decimals))
+    } else {
+        economic_floor
+    }
+}
+
+fn dispatch_floor_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> U256 {
+    let start_decimals =
+        resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
+    dispatch_input_floor(
+        start_decimals,
+        min_economic_amount_in(
+            start_decimals,
+            resolve_token_to_matic_rate(cycle.start_token, input.token_to_matic_rates),
+        ),
+    )
+}
+
+fn dispatch_reject_reason(
+    input: &HfEvalInput<'_>,
+    cycle: &FoundCycle,
+    sim: &RouteSimulationResult,
+) -> Option<&'static str> {
+    if sim.amount_in < dispatch_floor_for_cycle(input, cycle) {
+        return Some(DISPATCH_BELOW_ECONOMIC_FLOOR);
+    }
+    if !sim.hop_amounts.iter().any(|amount| !amount.is_zero()) {
+        return Some(DISPATCH_MISSING_HOP_AMOUNTS);
+    }
+    (!local_sim::route_hop_fidelity_ok_after_walk(input.arena, &cycle.edges, &sim.hop_amounts))
+        .then_some(DISPATCH_HOP_FIDELITY_FAILED)
+}
+
+fn apply_dispatch_gate(
+    input: &HfEvalInput<'_>,
+    cycle: &FoundCycle,
+    sim: &RouteSimulationResult,
+    mut assessment: ProfitAssessment,
+) -> ProfitAssessment {
+    if assessment.should_execute {
+        if let Some(reason) = dispatch_reject_reason(input, cycle, sim) {
+            assessment.should_execute = false;
+            assessment.reject_reason = Some(reason.into());
+        }
+    }
+    assessment
 }
 
 fn flash_cap_for_cycle(
@@ -2118,6 +2128,18 @@ mod tests {
 
     fn arc_cycle(id: u32) -> Arc<FoundCycle> {
         Arc::new(cycle(id))
+    }
+
+    #[test]
+    fn dispatch_floor_requires_one_whole_low_decimal_token() {
+        assert_eq!(
+            dispatch_input_floor(6, U256::from(8_000u64)),
+            U256::from(1_000_000u64)
+        );
+        assert_eq!(
+            dispatch_input_floor(18, U256::from(8_000u64)),
+            U256::from(8_000u64)
+        );
     }
 
     #[test]
