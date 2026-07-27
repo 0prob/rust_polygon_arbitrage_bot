@@ -390,6 +390,7 @@ pub enum UsdFeedScanStatus {
 pub async fn scan_addresses_for_usd_feeds(
     http: &reqwest::Client,
     hermes_url: &str,
+    api_key: Option<&str>,
     rows: &[(Address, Option<&'static str>)],
 ) -> anyhow::Result<Vec<UsdFeedScanRow>> {
     const HERMES_SCAN_CONCURRENCY: usize = 8;
@@ -423,8 +424,10 @@ pub async fn scan_addresses_for_usd_feeds(
         }
         let http = http.clone();
         let hermes = hermes_url.to_string();
+        let api_key = api_key.map(str::to_string);
         tasks.spawn(async move {
-            match pyth_catalog::search_pyth_feeds(&http, &hermes, &query).await {
+            match pyth_catalog::search_pyth_feeds(&http, &hermes, api_key.as_deref(), &query).await
+            {
                 Ok(candidates) => {
                     if let Some(best) =
                         pyth_catalog::pick_best_usd_candidate_for_hint(&candidates, &query)

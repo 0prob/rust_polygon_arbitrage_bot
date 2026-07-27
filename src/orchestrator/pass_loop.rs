@@ -91,11 +91,14 @@ impl RuntimeContext {
         let execution = Arc::new(execution);
         let gas_oracle = Arc::new(GasOracle::default());
         let oracle_started = crate::util::now_ms();
-        let price_oracle = Arc::new(PriceOracle::new(
-            rpc.http().clone(),
-            config.oracle.pyth_hermes_url.clone(),
-            config.oracle.cache_ttl_ms,
-        ));
+        let price_oracle = Arc::new(
+            PriceOracle::new(
+                rpc.http().clone(),
+                config.oracle.pyth_hermes_url.clone(),
+                config.oracle.cache_ttl_ms,
+            )
+            .with_pyth_api_key(config.oracle.pyth_api_key.clone()),
+        );
         register_configured_oracle_feeds(&price_oracle, &config.oracle);
         load_and_apply_auto_feeds(&price_oracle);
         let oracle_ms = crate::util::now_ms().saturating_sub(oracle_started);
@@ -439,6 +442,7 @@ fn spawn_pass_loop_sidecars(
         Arc::clone(&ctx.price_oracle),
         ctx.rpc.http().clone(),
         ctx.config.oracle.pyth_hermes_url.clone(),
+        ctx.config.oracle.pyth_api_key.clone(),
         shutdown.clone(),
     );
 

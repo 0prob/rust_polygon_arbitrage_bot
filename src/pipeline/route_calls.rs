@@ -18,6 +18,15 @@ pub fn balancer_direct_batch_eligible(edges: &[Edge]) -> bool {
         && edges.len() <= MAX_BALANCER_BATCH_HOPS
 }
 
+/// Pure DODO routes that use Balancer flash + DODO PMM hops (external DODO flash
+/// disabled). Eligible for all-in gas seed — same hop cap as Direct batch.
+#[must_use]
+pub fn dodo_flash_batch_eligible(edges: &[Edge]) -> bool {
+    !edges.is_empty()
+        && edges.iter().all(|e| e.protocol == ProtocolType::Dodo)
+        && edges.len() <= MAX_BALANCER_BATCH_HOPS
+}
+
 /// Exact packed-call count for execution gating when a route can collapse into a
 /// Balancer batch call.
 #[must_use]
@@ -95,6 +104,15 @@ mod tests {
     fn balancer_only_batch_route_counts_as_single_packed_call() {
         let edges: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::BalancerV2), 4).collect();
         assert_eq!(estimate_packed_route_calls(&edges), 1);
+    }
+
+    #[test]
+    fn dodo_flash_batch_eligible_pure_dodo_only() {
+        let dodo: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::Dodo), 2).collect();
+        assert!(dodo_flash_batch_eligible(&dodo));
+        let mixed = vec![edge(ProtocolType::Dodo), edge(ProtocolType::UniswapV2)];
+        assert!(!dodo_flash_batch_eligible(&mixed));
+        assert!(!balancer_direct_batch_eligible(&dodo));
     }
 
     #[test]

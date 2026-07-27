@@ -2497,6 +2497,8 @@ pub async fn run_hf_tick(
                     "observed_route"
                 } else if crate::pipeline::route_calls::balancer_direct_batch_eligible(
                     &result.cycle.edges,
+                ) || crate::pipeline::route_calls::dodo_flash_batch_eligible(
+                    &result.cycle.edges,
                 ) {
                     "calibrated_direct_seed"
                 } else {

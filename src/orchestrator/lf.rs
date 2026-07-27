@@ -9,7 +9,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::config::AppConfig;
-use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS};
+use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS, is_polygon_hub_token};
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
@@ -211,6 +211,44 @@ fn observed_pool_start_tokens(
         }
     }
     out
+}
+
+/// Exclusive obs DFS only seeds tokens on observed pools. Hub majors that sit on
+/// those pools but were skipped by funded-leg seeding (live: BAL on sticky DODO
+/// `0x4f5e/0x7534` arrived only via post-rate refind) never start → miss
+/// hub→DODO×2 near-misses. Union priced hubs that appear on the pin pools.
+fn extend_obs_starts_with_priced_hubs(
+    starts: &mut Vec<TokenIndex>,
+    arena: &StateArena,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+    pools: &[PoolIndex],
+    rates: &FxHashMap<TokenIndex, U256>,
+) {
+    if pools.is_empty() || rates.is_empty() {
+        return;
+    }
+    let want: FxHashSet<PoolIndex> = pools.iter().copied().collect();
+    let mut seen: FxHashSet<TokenIndex> = starts.iter().copied().collect();
+    for meta in pool_metas {
+        if !want.contains(&meta.pool_index) {
+            continue;
+        }
+        for &t in &meta.tokens {
+            if !seen.insert(t) {
+                continue;
+            }
+            let Some(addr) = arena.token_address(t) else {
+                continue;
+            };
+            if !is_polygon_hub_token(addr) {
+                continue;
+            }
+            if !rates.contains_key(&t) {
+                continue;
+            }
+            starts.push(t);
+        }
+    }
 }
 
 /// Drop cycles that touch dust V2 hops before they poison the HF window.
@@ -743,11 +781,21 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
             let _ = rescore_pools_in_place(&work.arena, g, &work.observed_pool_indices);
         }
         let enum_started = crate::util::now_ms();
-        let obs_starts = observed_pool_start_tokens(
+        let mut obs_starts = observed_pool_start_tokens(
             &work.arena,
             work.pool_metas.as_ref(),
             &work.observed_pool_indices,
             Some(graph.as_ref()),
+        );
+        // Hub majors on pin pools (e.g. BAL on DODO) must be DFS starts under exclusive
+        // obs — funded-leg seeding alone missed them (live iter34: cover~3815 BAL-start
+        // only appeared after post-rate refind).
+        extend_obs_starts_with_priced_hubs(
+            &mut obs_starts,
+            &work.arena,
+            work.pool_metas.as_ref(),
+            &work.observed_pool_indices,
+            work.prior_rates.as_ref(),
         );
         let mut first_hop_pin = 0usize;
         let mut pin_covered = 0usize;
@@ -1745,11 +1793,18 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                 };
                 // ponytail: same seed as pre-rate DFS — `&[]` hub-only missed
                 // observed peripherals (live: cycles_touching then prune drop_obs).
-                let obs_starts = observed_pool_start_tokens(
+                let mut obs_starts = observed_pool_start_tokens(
                     &arena,
                     pool_metas.as_ref(),
                     &observed_pin,
                     Some(routing_graph.as_ref()),
+                );
+                extend_obs_starts_with_priced_hubs(
+                    &mut obs_starts,
+                    &arena,
+                    pool_metas.as_ref(),
+                    &observed_pin,
+                    rates.as_ref(),
                 );
                 let exclusive_obs = defer_priced && !obs_starts.is_empty();
                 let first_hop = if exclusive_obs {

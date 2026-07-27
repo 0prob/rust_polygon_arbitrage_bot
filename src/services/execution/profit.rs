@@ -460,8 +460,9 @@ pub enum AssessmentGas<'a> {
         oracle: &'a GasOracle,
         route_fp: u64,
     },
-    /// Live-calibrated all-in seed (Direct `batchSwap`) — observed or seed, no sim_scale.
-    /// Global scale is trained on mixed-route underestimates and must not re-inflate Direct.
+    /// Live-calibrated all-in seed (Direct `batchSwap` / pure-DODO flash) — observed
+    /// or seed, no sim_scale. Global scale is trained on mixed-route underestimates
+    /// and must not re-inflate these routes.
     CalibratedSeed {
         lookup: Option<&'a RouteGasLookup>,
         oracle: &'a GasOracle,
@@ -492,7 +493,7 @@ pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 
     }
 }
 
-/// HF/dispatch gas resolution: Direct `batchSwap` seeds skip global sim_scale.
+/// HF/dispatch gas resolution: Direct `batchSwap` / pure-DODO flash seeds skip global sim_scale.
 #[must_use]
 pub fn assessment_gas_for_edges<'a>(
     edges: &[crate::core::types::Edge],
@@ -500,7 +501,9 @@ pub fn assessment_gas_for_edges<'a>(
     oracle: &'a GasOracle,
     route_fp: u64,
 ) -> AssessmentGas<'a> {
-    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
+    if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges)
+        || crate::pipeline::route_calls::dodo_flash_batch_eligible(edges)
+    {
         AssessmentGas::CalibratedSeed {
             lookup,
             oracle,
@@ -1408,6 +1411,14 @@ mod safety_tests {
         let edges = [bal_edge, bal_edge];
         let gas = assessment_gas_for_edges(&edges, None, &oracle, 1);
         assert_eq!(assessment_gas_units(220_000, &gas), 220_000);
+        // Pure DODO flash also takes calibrated seed (no sim_scale).
+        let dodo_edge = Edge {
+            protocol: ProtocolType::Dodo,
+            ..bal_edge
+        };
+        let dodo_edges = [dodo_edge, dodo_edge];
+        let dodo_gas = assessment_gas_for_edges(&dodo_edges, None, &oracle, 3);
+        assert_eq!(assessment_gas_units(340_000, &dodo_gas), 340_000);
         // Mixed (V2) still takes global scale.
         let v2 = Edge {
             protocol: ProtocolType::UniswapV2,

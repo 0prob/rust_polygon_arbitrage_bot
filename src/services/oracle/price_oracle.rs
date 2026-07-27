@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
@@ -48,7 +49,7 @@ const PYTH_MATIC_USD_ID: &str = "ffd11c5a1cfd42f80afb2df4d9f264c15f956d681533353
 /// executes without a real price. The real MATIC/USD is fetched every tick.
 const DEFAULT_MATIC_USD: f64 = 0.0;
 /// Default oracle quote cache TTL (also `OracleConfig::cache_ttl_ms` serde default).
-pub const DEFAULT_CACHE_TTL_MS: u64 = 10_000;
+pub const DEFAULT_CACHE_TTL_MS: u64 = 30_000;
 
 #[derive(Clone, Copy)]
 struct TokenFeed {
@@ -285,7 +286,9 @@ struct PriceEntry {
 
 pub struct PriceOracle {
     http: Client,
-    pyth_hermes_url: String,
+    pyth_hermes_urls: Vec<String>,
+    pyth_api_key: Option<String>,
+    pyth_url_index: AtomicUsize,
     matic_usd: RwLock<Option<PriceEntry>>,
     token_usd: RwLock<FxHashMap<Address, PriceEntry>>,
     /// Raw Chainlink USD answers (8 decimals) for integer profit conversion.
@@ -305,9 +308,12 @@ pub struct PriceOracle {
 impl PriceOracle {
     #[must_use]
     pub fn new(http: Client, pyth_hermes_url: String, cache_ttl_ms: u64) -> Self {
+        let pyth_hermes_urls = parse_pyth_hermes_urls(&pyth_hermes_url);
         Self {
             http,
-            pyth_hermes_url,
+            pyth_hermes_urls,
+            pyth_api_key: None,
+            pyth_url_index: AtomicUsize::new(0),
             matic_usd: RwLock::new(None),
             token_usd: RwLock::new(FxHashMap::default()),
             chainlink_usd_raw: RwLock::new(FxHashMap::default()),
@@ -317,6 +323,12 @@ impl PriceOracle {
             cache_ttl: Duration::from_millis(cache_ttl_ms),
             matic_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    #[must_use]
+    pub fn with_pyth_api_key(mut self, api_key: String) -> Self {
+        self.pyth_api_key = (!api_key.trim().is_empty()).then_some(api_key);
+        self
     }
 
     pub fn register_pyth_feed(&self, token: Address, feed_id: String) {
@@ -485,9 +497,6 @@ impl PriceOracle {
             crate::debug!("matic/usd refresh: source=pyth usd={usd}");
             return usd;
         }
-        if let Some(stale) = self.touch_stale_matic_usd("Chainlink and Pyth unavailable") {
-            return stale;
-        }
         crate::warn!(
             "oracle has no MATIC/USD price — Chainlink and Pyth unavailable, no cached value"
         );
@@ -507,9 +516,6 @@ impl PriceOracle {
             self.store_matic_usd(usd);
             crate::debug!("matic/usd refresh offline: source=pyth usd={usd}");
             return usd;
-        }
-        if let Some(stale) = self.touch_stale_matic_usd("Pyth unavailable") {
-            return stale;
         }
         crate::warn!("oracle has no MATIC/USD price — Pyth unavailable, no cached value");
         DEFAULT_MATIC_USD
@@ -533,19 +539,6 @@ impl PriceOracle {
             None => self.get_matic_usd_offline().await,
         };
         matic_usd_for_flash_cap(usd)
-    }
-
-    fn touch_stale_matic_usd(&self, reason: &str) -> Option<f64> {
-        let stale = self.matic_usd.read().as_ref().map(|e| e.value)?;
-        if !(stale.is_finite() && stale > 0.0) {
-            return None;
-        }
-        crate::warn!("oracle using stale MATIC/USD — {reason}");
-        self.matic_usd.write().replace(PriceEntry {
-            value: stale,
-            updated_at: Instant::now(),
-        });
-        Some(stale)
     }
 
     pub async fn prefetch_token_usd_offline(&self, tokens: &[Address]) {
@@ -872,10 +865,12 @@ impl PriceOracle {
         for chunk in chunks {
             let owned: Vec<String> = chunk.iter().map(|id| (*id).to_owned()).collect();
             let http = self.http.clone();
-            let base = self.pyth_hermes_url.clone();
+            let urls = self.pyth_hermes_urls.clone();
+            let api_key = self.pyth_api_key.clone();
+            let url_idx = self.pyth_url_index.fetch_add(1, Ordering::Relaxed);
             tasks.spawn(async move {
                 let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-                Self::fetch_pyth_chunk_with(&http, &base, &refs).await
+                Self::fetch_pyth_chunk_with(&http, &urls, api_key.as_deref(), url_idx, &refs).await
             });
         }
         let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), FxBuildHasher);
@@ -909,27 +904,41 @@ impl PriceOracle {
         &self,
         ids: &[&str],
     ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
-        Self::fetch_pyth_chunk_with(&self.http, &self.pyth_hermes_url, ids).await
+        let url_idx = self.pyth_url_index.fetch_add(1, Ordering::Relaxed);
+        Self::fetch_pyth_chunk_with(
+            &self.http,
+            &self.pyth_hermes_urls,
+            self.pyth_api_key.as_deref(),
+            url_idx,
+            ids,
+        )
+        .await
     }
 
     async fn fetch_pyth_chunk_with(
         http: &Client,
-        base_url: &str,
+        urls: &[String],
+        api_key: Option<&str>,
+        url_idx: usize,
         ids: &[&str],
     ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
-        match Self::fetch_pyth_once_with(http, base_url, ids).await {
+        if urls.is_empty() {
+            anyhow::bail!("no pyth hermes URLs configured");
+        }
+        let primary_url = &urls[url_idx % urls.len()];
+        match Self::fetch_pyth_once_with(http, primary_url, api_key, ids).await {
             Ok(prices) => Ok(prices),
             Err(e) => {
                 const PYTH_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+                let fallback_url = &urls[(url_idx + 1) % urls.len()];
                 crate::debug!(
-                    "oracle pyth: event=request_failed ids={} retry=1 backoff_ms={} error={e:#}",
+                    "oracle pyth: primary={primary_url} failed ({e:#}), retrying fallback={fallback_url} (ids={})",
                     ids.len(),
-                    PYTH_RETRY_BACKOFF.as_millis(),
                 );
                 tokio::time::sleep(PYTH_RETRY_BACKOFF).await;
-                Self::fetch_pyth_once_with(http, base_url, ids)
+                Self::fetch_pyth_once_with(http, fallback_url, api_key, ids)
                     .await
-                    .context("pyth hermes retry")
+                    .with_context(|| format!("pyth hermes retry on fallback {fallback_url}"))
             }
         }
     }
@@ -937,15 +946,18 @@ impl PriceOracle {
     async fn fetch_pyth_once_with(
         http: &Client,
         base_url: &str,
+        api_key: Option<&str>,
         ids: &[&str],
     ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         if ids.is_empty() {
             return Ok((FxHashMap::default(), PythParseStats::default()));
         }
         let url = pyth_updates_url(base_url, ids).context("pyth updates URL")?;
-        let resp = http
-            .get(url)
-            .timeout(ORACLE_HTTP_TIMEOUT)
+        let mut request = http.get(url).timeout(ORACLE_HTTP_TIMEOUT);
+        if let Some(auth) = pyth_authorization(api_key) {
+            request = request.header(reqwest::header::AUTHORIZATION, auth);
+        }
+        let resp = request
             .send()
             .await
             .with_context(|| format!("pyth hermes request ids={}", ids.len()))?
@@ -1060,6 +1072,19 @@ fn integer_matic_rate_from_raw(token_raw: I256, matic_raw: I256) -> Option<U256>
     }
 }
 
+fn parse_pyth_hermes_urls(raw: &str) -> Vec<String> {
+    let urls: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if urls.is_empty() {
+        vec!["https://hermes.pyth.network".to_string()]
+    } else {
+        urls
+    }
+}
+
 fn pyth_updates_url(base_url: &str, ids: &[&str]) -> anyhow::Result<Url> {
     let mut url = Url::parse(&format!(
         "{}/v2/updates/price/latest",
@@ -1085,6 +1110,13 @@ fn normalize_pyth_feed_id(id: &str) -> String {
         .or_else(|| id.strip_prefix("0X"))
         .unwrap_or(id);
     id.to_ascii_lowercase()
+}
+
+pub(crate) fn pyth_authorization(api_key: Option<&str>) -> Option<String> {
+    api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(|key| format!("Bearer {key}"))
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1454,6 +1486,68 @@ mod tests {
     }
 
     #[test]
+    fn pyth_authorization_uses_trimmed_bearer_key() {
+        assert_eq!(
+            pyth_authorization(Some(" key ")).as_deref(),
+            Some("Bearer key")
+        );
+        assert!(pyth_authorization(Some(" ")).is_none());
+    }
+
+    #[tokio::test]
+    async fn pyth_fetch_sends_configured_bearer_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let publish_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0u8; 4096];
+            let n = socket.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer core-key"));
+            let body = format!(
+                r#"{{"parsed":[{{"id":"feed","price":{{"price":"100000000","conf":"100","expo":-8,"publish_time":{publish_time}}}}}]}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            DEFAULT_CACHE_TTL_MS,
+        )
+        .with_pyth_api_key(" core-key ".to_string());
+        let (quotes, _) = oracle.fetch_pyth(&["feed"]).await.expect("Pyth quote");
+        assert_eq!(quotes.get("feed").map(|quote| quote.usd), Some(1.0));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn stale_matic_usd_is_not_revalidated_when_refresh_fails() {
+        let oracle = PriceOracle::new(reqwest::Client::new(), "http://127.0.0.1:1".to_string(), 0);
+        oracle.matic_usd.write().replace(PriceEntry {
+            value: 1.0,
+            updated_at: Instant::now(),
+        });
+        assert_eq!(oracle.get_matic_usd_offline().await, DEFAULT_MATIC_USD);
+        assert!(oracle.cached_matic_usd().is_none());
+    }
+
+    #[test]
     fn configured_pyth_feed_overrides_builtin_mapping() {
         let oracle = PriceOracle::new(
             reqwest::Client::new(),
@@ -1721,6 +1815,25 @@ mod tests {
             oracle
                 .last_known_matic_usd()
                 .is_some_and(|(usd, age)| usd == 1.0 && age >= Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn test_parse_pyth_hermes_urls_multiple_and_default() {
+        let default_urls = parse_pyth_hermes_urls("");
+        assert_eq!(
+            default_urls,
+            vec!["https://hermes.pyth.network".to_string()]
+        );
+
+        let custom =
+            parse_pyth_hermes_urls("https://hermes.pyth.network, https://custom-hermes.com/ ");
+        assert_eq!(
+            custom,
+            vec![
+                "https://hermes.pyth.network".to_string(),
+                "https://custom-hermes.com".to_string()
+            ]
         );
     }
 }

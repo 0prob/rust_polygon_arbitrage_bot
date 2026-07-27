@@ -1755,7 +1755,8 @@ fn evaluate_one(
         lookup: input.route_gas,
         oracle: input.gas_oracle,
         fingerprint: fp,
-        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(&cycle.edges),
+        calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(&cycle.edges)
+            || crate::pipeline::route_calls::dodo_flash_batch_eligible(&cycle.edges),
     };
     let brent_seeds = build_brent_probe_seeds(
         input.arena,

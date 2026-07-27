@@ -211,6 +211,7 @@ pub fn spawn_auto_feed_sidecar(
     oracle: Arc<PriceOracle>,
     http: Client,
     hermes_url: String,
+    pyth_api_key: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -234,7 +235,9 @@ pub fn spawn_auto_feed_sidecar(
             if pending_auto_feed_count() == 0 {
                 continue;
             }
-            if let Err(e) = run_auto_feed_batch(&oracle, &http, &hermes_url).await {
+            if let Err(e) =
+                run_auto_feed_batch(&oracle, &http, &hermes_url, Some(&pyth_api_key)).await
+            {
                 crate::warn!("oracle auto-feeds scan failed: {e:#}");
             }
         }
@@ -245,6 +248,7 @@ async fn run_auto_feed_batch(
     oracle: &PriceOracle,
     http: &Client,
     hermes_url: &str,
+    api_key: Option<&str>,
 ) -> anyhow::Result<()> {
     let batch: Vec<Address> = {
         let mut pending = PENDING.lock();
@@ -281,7 +285,7 @@ async fn run_auto_feed_batch(
         rows.len(),
         rows.iter().filter(|(_, l)| l.is_some()).count()
     );
-    let results = scan_addresses_for_usd_feeds(http, hermes_url, &rows).await?;
+    let results = scan_addresses_for_usd_feeds(http, hermes_url, api_key, &rows).await?;
     let mut added = 0u32;
     let mut marked = 0u32;
     let mut retry = 0u32;

@@ -8,7 +8,7 @@ use super::route_stats::RouteFailureKind;
 use super::{
     ADAPTIVE_FLASH_CAP_START_DIVISOR, BATCH_QUERY_FAIL_QUARANTINE,
     CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI, CHRONIC_THIN_LIQ_QUARANTINE,
-    CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_NEAR_MISS_COVER_BPS,
+    CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_MID_BAND_QUARANTINE, CHRONIC_NEAR_MISS_COVER_BPS,
     CHRONIC_NEAR_MISS_QUARANTINE,
     CHRONIC_UNDERWATER_COVER_BPS, CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI,
     CHRONIC_UNDERWATER_MIN_COVER_BPS, CHRONIC_UNDERWATER_QUARANTINE,
@@ -299,16 +299,20 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        // First-strike: true dust / weak-cover thin, OR gas near-miss (cover≥1000).
-        // Near-misses used to need 3 strikes then 90s — live iter27 burned 3 evals
-        // on the same ~280 gwei snapshot then sat out 90s between rechecks.
+        // First-strike: true dust / weak-cover thin, OR gas near-miss / mid-band.
+        // Near-miss (≥500 + ≥0.01): 30s sticky. Mid-band (≥500 + [0.001,0.01)): 90s
+        // — live iter35 weak sticky cover~960/avail~0.009 monopolized best-eval 17×
+        // vs BAL-DODO cover~3850 only 3×.
         let near_miss = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
             && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
+        let mid_band = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
+            && available_matic_wei >= U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
+            && available_matic_wei < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
         let thin_first_strike = available_matic_wei
             < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
             || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
                 && cover_bps < CHRONIC_NEAR_MISS_COVER_BPS);
-        let strikes_needed = if thin_first_strike || near_miss {
+        let strikes_needed = if thin_first_strike || near_miss || mid_band {
             1
         } else {
             CHRONIC_UNDERWATER_STRIKES
@@ -318,18 +322,20 @@ impl ExecutionService {
         }
         self.underwater_strikes.write().remove(&fingerprint);
         // TTL tiers:
-        //   wei-dust (<0.001 MATIC)     → 1h
-        //   thin weak-cover (<1000 bps) → 600s
-        //   near-miss (≥1000 + ≥dust)   → 30s (1-strike sticky)
-        //   else                         → 600s
+        //   wei-dust (<0.001 MATIC)                    → 1h
+        //   near-miss (≥500 bps + ≥0.01)               → 30s
+        //   mid-band (≥500 bps + [0.001, 0.01))        → 90s
+        //   thin weak-cover (<500 bps / other)         → 600s
         let ttl = if available_matic_wei
             < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
         {
             CHRONIC_THIN_LIQ_QUARANTINE
-        } else if thin_first_strike {
-            CHRONIC_UNDERWATER_QUARANTINE
         } else if near_miss {
             CHRONIC_NEAR_MISS_QUARANTINE
+        } else if mid_band {
+            CHRONIC_MID_BAND_QUARANTINE
+        } else if thin_first_strike {
+            CHRONIC_UNDERWATER_QUARANTINE
         } else {
             CHRONIC_UNDERWATER_QUARANTINE
         };

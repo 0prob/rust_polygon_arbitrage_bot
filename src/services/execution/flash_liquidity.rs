@@ -1553,6 +1553,8 @@ fn reoptimize_capped(
         fingerprint: input.route_fingerprint,
         calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(
             &input.evaluated.cycle.edges,
+        ) || crate::pipeline::route_calls::dodo_flash_batch_eligible(
+            &input.evaluated.cycle.edges,
         ),
     };
     let opt = optimize_cycle(

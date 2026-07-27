@@ -2,7 +2,7 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::services::oracle::price_oracle::ORACLE_HTTP_TIMEOUT;
+use crate::services::oracle::price_oracle::{ORACLE_HTTP_TIMEOUT, pyth_authorization};
 
 #[derive(Debug, Clone)]
 pub struct PythFeedCandidate {
@@ -35,6 +35,7 @@ struct PythFeedAttributes {
 pub async fn search_pyth_feeds(
     http: &Client,
     hermes_base: &str,
+    api_key: Option<&str>,
     query: &str,
 ) -> anyhow::Result<Vec<PythFeedCandidate>> {
     let base = hermes_base.trim_end_matches('/');
@@ -47,9 +48,11 @@ pub async fn search_pyth_feeds(
         })
         .collect();
     let url = format!("{base}/v2/price_feeds?query={encoded}");
-    let resp = http
-        .get(url)
-        .timeout(ORACLE_HTTP_TIMEOUT)
+    let mut request = http.get(url).timeout(ORACLE_HTTP_TIMEOUT);
+    if let Some(auth) = pyth_authorization(api_key) {
+        request = request.header(reqwest::header::AUTHORIZATION, auth);
+    }
+    let resp = request
         .send()
         .await
         .context("pyth catalog request failed")?

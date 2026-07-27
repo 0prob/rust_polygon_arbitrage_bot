@@ -183,6 +183,8 @@ pub struct AppConfig {
 pub struct OracleConfig {
     #[serde(default = "default_pyth_hermes_url")]
     pub pyth_hermes_url: String,
+    #[serde(default, skip_serializing)]
+    pub pyth_api_key: String,
     #[serde(default = "default_tick_word_range")]
     pub tick_word_range: i16,
     #[serde(default)]
@@ -433,6 +435,7 @@ impl Default for OracleConfig {
     fn default() -> Self {
         Self {
             pyth_hermes_url: default_pyth_hermes_url(),
+            pyth_api_key: String::new(),
             tick_word_range: default_tick_word_range(),
             pyth_feeds: String::new(),
             chainlink_feeds: String::new(),
@@ -577,6 +580,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         }
         k if k.eq_ignore_ascii_case("routing_cycle_finder") => "routing.cycle_finder",
         k if k.eq_ignore_ascii_case("oracle_pyth_hermes_url") => "oracle.pyth_hermes_url",
+        k if k.eq_ignore_ascii_case("oracle_pyth_api_key") => "oracle.pyth_api_key",
         k if k.eq_ignore_ascii_case("tick_word_range") => "oracle.tick_word_range",
         k if k.eq_ignore_ascii_case("oracle_cache_ttl_ms") => "oracle.cache_ttl_ms",
         k if k.eq_ignore_ascii_case("oracle_pyth_feeds") => "oracle.pyth_feeds",
@@ -1221,6 +1225,18 @@ mod tests {
                     "https://env-b.example".to_string(),
                 ]
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn env_pyth_api_key_overrides_default() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("ORACLE_PYTH_API_KEY", "test-pyth-key");
+            let config: AppConfig = AppConfig::figment().extract_lossy()?;
+            assert_eq!(config.oracle.pyth_api_key, "test-pyth-key");
             Ok(())
         });
     }

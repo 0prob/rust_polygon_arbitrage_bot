@@ -1,6 +1,6 @@
 use crate::core::constants::{
     GAS_BALANCER_HOP, GAS_CURVE_HOP, GAS_DODO_HOP, GAS_V2_HOP, GAS_V3_BASE, GAS_V4_BASE,
-    GAS_WOOFI_HOP, HOP_CAP_USIZE, balancer_direct_batch_gas,
+    GAS_WOOFI_HOP, HOP_CAP_USIZE, balancer_direct_batch_gas, dodo_flash_batch_gas,
 };
 use crate::core::math::balancer::simulate_balancer_swap;
 use crate::core::math::dodo::get_dodo_amount_out;
@@ -30,11 +30,15 @@ pub fn estimate_hop_gas(protocol: ProtocolType) -> u32 {
     }
 }
 
-/// Hop gas budget for ranking: one `batchSwap` for pure Balancer direct routes, else per-hop sum.
+/// Hop gas budget for ranking: one all-in seed for pure Balancer Direct / pure DODO
+/// flash routes, else per-hop sum.
 #[must_use]
 pub fn route_hop_gas_budget(edges: &[Edge]) -> u32 {
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
         return balancer_direct_batch_gas(edges.len());
+    }
+    if crate::pipeline::route_calls::dodo_flash_batch_eligible(edges) {
+        return dodo_flash_batch_gas(edges.len());
     }
     edges.iter().map(|e| estimate_hop_gas(e.protocol)).sum()
 }
@@ -46,9 +50,12 @@ fn finalize_route_total_gas(edges: &[Edge], walked_hop_gas: u32) -> u32 {
     if hop_count == 0 {
         return crate::services::execution::gas::ROUTE_EXECUTION_GAS_OVERHEAD;
     }
-    // Direct batchSwap is one vault call; seed is all-in (do not pile ROUTE_EXECUTION_* × edges).
+    // Direct batchSwap / pure-DODO flash: all-in seed (do not pile ROUTE_EXECUTION_* × edges).
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
         return balancer_direct_batch_gas(hop_count);
+    }
+    if crate::pipeline::route_calls::dodo_flash_batch_eligible(edges) {
+        return dodo_flash_batch_gas(hop_count);
     }
     let hop_budget = route_hop_gas_budget(edges);
     let static_gas = crate::services::execution::gas::estimate_route_gas_from_hops_evm(
@@ -76,6 +83,9 @@ pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     }
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges) {
         return balancer_direct_batch_gas(edges.len());
+    }
+    if crate::pipeline::route_calls::dodo_flash_batch_eligible(edges) {
+        return dodo_flash_batch_gas(edges.len());
     }
     let hop_gas = route_hop_gas_budget(edges);
     let cold_slots = edges.len() as u32;
@@ -1133,7 +1143,9 @@ pub fn minimal_sim_failure(
 /// (hop-0 dust V2 is also caught earlier by `first_v2_hop_below_reserve`; this
 /// covers mid-route V2 that dies even at micro), and Balancer/Woofi/DODO
 /// `TokenMismatch` (amount-independent vault/base-quote index skew). Leave
-/// `ClTickless` alone — spot probe sizes can still rank those.
+/// `ClTickless` / `ShallowCl` / `ClCapExceeded` alone — partial ticks still need
+/// wide hydrate (live iter29: micro_dead_skip 8–14/tick starved CL-mix before
+/// TickLens; same passthrough policy as tickless spot rank).
 #[must_use]
 pub fn micro_probe_liquidity_dead(
     arena: &StateArena,
@@ -1143,8 +1155,6 @@ pub fn micro_probe_liquidity_dead(
     match minimal_sim_failure(arena, edges, micro_probe) {
         Some(fail @ MinimalSimFailure::ZeroOutput { .. })
         | Some(fail @ MinimalSimFailure::BalancerMaxInRatio { .. })
-        | Some(fail @ MinimalSimFailure::ShallowCl { .. })
-        | Some(fail @ MinimalSimFailure::ClCapExceeded { .. })
         | Some(fail @ MinimalSimFailure::V2ReserveExhausted { .. })
         | Some(fail @ MinimalSimFailure::TokenMismatch { .. }) => Some(fail),
         _ => None,
@@ -1210,8 +1220,9 @@ pub fn micro_probe_insane_gross_phantom(
 /// that already fail amount-dependent liquidity there never `kept` — prune at HF
 /// select so micro-only survivors stop crowding empties as `v2_reserve` /
 /// `shallow_cl` / `bal_max_in` (live probefloor: v2_reserve=27, shallow_cl=9,
-/// bal_max_in=9 across probe_fail lines). Leave `ClTickless` / `TokenMismatch`
-/// alone (tickless can still rank at spot; mismatch is micro-pruned).
+/// bal_max_in=9 across probe_fail lines). Leave `ClTickless` / `ShallowCl` /
+/// `ClCapExceeded` / `TokenMismatch` alone (partial ticks need wide hydrate;
+/// tickless ranks at spot; mismatch is micro-pruned).
 #[must_use]
 pub fn economic_floor_liquidity_dead(
     arena: &StateArena,
@@ -1224,8 +1235,6 @@ pub fn economic_floor_liquidity_dead(
     match minimal_sim_failure(arena, edges, economic_floor) {
         Some(fail @ MinimalSimFailure::ZeroOutput { .. })
         | Some(fail @ MinimalSimFailure::BalancerMaxInRatio { .. })
-        | Some(fail @ MinimalSimFailure::ShallowCl { .. })
-        | Some(fail @ MinimalSimFailure::ClCapExceeded { .. })
         | Some(fail @ MinimalSimFailure::V2ReserveExhausted { .. }) => Some(fail),
         _ => None,
     }
