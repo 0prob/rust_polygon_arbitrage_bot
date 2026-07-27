@@ -102,13 +102,24 @@ const STRUCTURAL_DRY_RUN_QUARANTINE: Duration = Duration::from_secs(600);
 const PROBE_BELOW_FLOOR_QUARANTINE: Duration = Duration::from_secs(300);
 /// Sticky V3 dust (~355 bps) — same TTL as structural dry-run (was 30m).
 const CHRONIC_UNDERWATER_QUARANTINE: Duration = STRUCTURAL_DRY_RUN_QUARANTINE;
-/// Thin-liq underwater (available≪0.01 MATIC) — longer cool; live sticky V2
-/// 0xe43e/0x2f44 kept returning at cover~380 / gross=0.0067 with ~1-unit scarce side.
+/// Wei-dust underwater (available < 0.001 MATIC) — long cool. Weak-cover thin
+/// (0.001–0.05) uses [`CHRONIC_UNDERWATER_QUARANTINE`] instead — live iter26
+/// 1h-cooled cover~500–575 (+rotations) emptied HF select for the whole run.
 const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
-/// Below this absolute MATIC, cover≥[`CHRONIC_UNDERWATER_COVER_BPS`] is still chronic
-/// (live: USDT dust avail≈0.035 / cover≈1770 escaped the old 0.01 floor and crowded a
-/// cover≈20000 / avail≈0.15 near-miss). Thin absolute MATIC cools on first strike.
+/// Gas near-miss (cover≥[`CHRONIC_NEAR_MISS_COVER_BPS`], avail≥dust): short cool so
+/// the edge retries when base fee moves. Live iter24: DODO cover=2638 / avail≈0.037
+/// took 3 strikes then 600s exile while gas sat ~280 gwei — missed any dip.
+const CHRONIC_NEAR_MISS_QUARANTINE: Duration = Duration::from_secs(90);
+/// Below this, high cover% is still clamped into the chronic band (USDT dust
+/// avail≈0.035 / cover≈1770 crowded a cover≈20000 near-miss). First-strike cool
+/// uses [`CHRONIC_DUST_AVAILABLE_MATIC_WEI`] + cover gate — not this alone
+/// (live iter23: cover=2661 / avail≈0.037 got 1h cool and killed the best edge).
 const CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI: u128 = 5u128 * 10u128.pow(16); // 0.05 MATIC
+/// Absolute dust: always first-strike cool. Between this and thin-liq ceiling,
+/// first-strike only when cover is weak (<[`CHRONIC_NEAR_MISS_COVER_BPS`]).
+const CHRONIC_DUST_AVAILABLE_MATIC_WEI: u128 = 10u128.pow(16); // 0.01 MATIC
+/// Cover at/above this with ≥ dust avail is a gas near-miss — use 3-strike + short TTL.
+const CHRONIC_NEAR_MISS_COVER_BPS: u64 = 1_000;
 const PERMANENT_QUARANTINE: Duration = Duration::from_secs(3600);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const ADAPTIVE_FLASH_CAP_START_DIVISOR: u64 = 4;
@@ -1653,45 +1664,64 @@ mod safety_tests {
         let fp = 0xdead_beef_u64;
         let thick = U256::from(10u128.pow(17)); // 0.1 MATIC — needs 3 strikes
         // Near-zero cover never strikes (cascade guard).
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 10, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 10, thick).is_none());
         assert!(!exec.is_route_quarantined(fp));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
         assert!(!exec.is_route_quarantined(fp));
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_some());
         assert!(exec.is_route_quarantined(fp));
         // Already quarantined — no re-apply signal.
-        assert!(!exec.quarantine_chronic_gas_underwater(fp, 350, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
         // One-shot diversion (different fp) stays selectable.
-        assert!(!exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick));
+        assert!(exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick).is_none());
         assert!(!exec.is_route_quarantined(0xcafe_u64));
         // Sub-100 cover with real MATIC still chronic-cools (live: 42/65 best-evals).
         let low_fp = 0x1042_u64;
-        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
-        assert!(!exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
-        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick));
-        // Wei-dust / thin absolute MATIC cool on first strike.
+        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_some());
+        // Wei-dust (<0.001 MATIC) cools on first strike with 1h.
         let dust_fp = 0xd057_u64;
         let dust_avail = U256::from(100u64);
-        assert!(exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail));
+        assert_eq!(
+            exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        // Thin absolute + weak cover: first-strike but 600s (not 1h) — iter26 1h
+        // rotation cools emptied the HF window (peak cover 575, no ge_1000).
         let thin_fp = 0x7e17_u64;
         let thin_avail = U256::from(35u128 * 10u128.pow(15)); // 0.035 MATIC
-        assert!(exec.quarantine_chronic_gas_underwater(thin_fp, 1768, thin_avail));
-        // Cover≥break-even (10_000) with real MATIC escapes chronic (positive-net /
-        // absolute-floor territory — different cool path).
+        assert_eq!(
+            exec.quarantine_chronic_gas_underwater(thin_fp, 380, thin_avail),
+            Some(std::time::Duration::from_secs(600))
+        );
+        // Near-miss cover (≥1000) at same avail needs 3 strikes + 90s cool.
+        let miss_fp = 0x2661_u64;
+        assert!(exec.quarantine_chronic_gas_underwater(miss_fp, 2_661, thin_avail).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(miss_fp, 2_661, thin_avail).is_none());
+        assert!(!exec.is_route_quarantined(miss_fp));
+        assert_eq!(
+            exec.quarantine_chronic_gas_underwater(miss_fp, 2_661, thin_avail),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert!(exec.is_route_quarantined(miss_fp));
+        // Cover≥break-even (10_000) with real MATIC escapes chronic.
         let near_fp = 0x9ea5_u64;
         let near_avail = U256::from(15u128 * 10u128.pow(16)); // 0.15 MATIC
-        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail));
+        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
         assert!(!exec.is_route_quarantined(near_fp));
-        // Half-cover monopolist (live: 940× best-eval at ~50% / 0.14 MATIC) cools
-        // after 3 strikes once the ceiling covers the full sub-breakeven band.
+        // Half-cover with real MATIC (≥dust) uses near-miss 90s TTL after 3 strikes.
         let half_fp = 0xba1b_a1b0_u64;
         let half_avail = U256::from(14u128 * 10u128.pow(16)); // 0.14 MATIC
-        assert!(!exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
-        assert!(!exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
-        assert!(exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail));
+        assert!(exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail).is_none());
+        assert!(exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail).is_none());
+        assert_eq!(
+            exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail),
+            Some(std::time::Duration::from_secs(90))
+        );
         assert!(exec.is_route_quarantined(half_fp));
     }
 

@@ -29,7 +29,7 @@ use crate::pipeline::types::OptimizationResult;
 use crate::pipeline::types::{MinimalSimResult, compare_cycle_execution};
 use crate::services::execution::candidate::hash_cycle_edges;
 use crate::services::execution::flash_liquidity::{
-    FlashLiquidityCache, FlashLoanDiagnostics, balancer_route_flash_feasible,
+    FlashLiquidityCache, FlashLoanDiagnostics, FlashRejectReason, balancer_route_flash_feasible,
     build_cycle_flash_context, flash_reject_reason, prefer_aave_flash_start,
     resolve_flash_source_for_cycle, resolve_flash_source_with_context,
 };
@@ -738,6 +738,19 @@ fn rank_one_cycle_probe(
             // ponytail: do not quarantine ColdCache — flash prefetch/background
             // warms hubs within a tick; ROUTE_COOLDOWN emptied ranks for 30s on
             // cold-start (live: skip_flash_source=12 then sticky cools).
+            // Proven ZeroLiquidity (fresh cache, no borrowable cash, rotation
+            // already tried) — cool all start-rotations so select stops
+            // re-feeding the same dead start (live iter22: fresh=true bal=0).
+            if matches!(reason, FlashRejectReason::ZeroLiquidity) && flash_ctx.start_fresh {
+                let n = cycle.edges.len();
+                if n > 0 {
+                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
+                    for _ in 0..n {
+                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
+                        rotated.rotate_left(1);
+                    }
+                }
+            }
         }
         if out.flash_diag.is_none() {
             out.flash_diag = Some(format!(

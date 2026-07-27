@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, FixedBytes};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 
 use crate::core::constants::UNISWAP_V4_POOL_MANAGER;
@@ -34,6 +35,22 @@ static EMPTY_TICK_UNTIL_MS: LazyLock<Mutex<FxHashMap<Address, u64>>> =
 static PROBE_NARROW_MISS_UNTIL_MS: LazyLock<Mutex<FxHashMap<Address, u64>>> =
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
+fn mark_tick_cooldown<K: Eq + Hash>(
+    map: &Mutex<FxHashMap<K, u64>>,
+    keys: impl IntoIterator<Item = K>,
+    cooldown_ms: u64,
+) {
+    let now = crate::util::now_ms();
+    let until = now.saturating_add(cooldown_ms);
+    let mut map = map.lock();
+    map.retain(|_, deadline| *deadline > now);
+    for key in keys {
+        map.entry(key)
+            .and_modify(|deadline| *deadline = (*deadline).max(until))
+            .or_insert(until);
+    }
+}
+
 /// True when this pool recently stayed tickless after a full hydrate attempt.
 #[must_use]
 pub fn is_empty_tick_on_cooldown(pool: Address) -> bool {
@@ -57,27 +74,15 @@ pub fn is_probe_narrow_miss_on_cooldown(pool: Address) -> bool {
 /// HF probe: deprioritize pools that stayed tickless after a narrow (or observed)
 /// miss — does not arm shared EMPTY (LF widen still allowed).
 pub fn mark_probe_narrow_miss(pools: impl IntoIterator<Item = Address>) {
-    let now = crate::util::now_ms();
-    let until = now.saturating_add(PROBE_NARROW_MISS_COOLDOWN_MS);
-    let mut map = PROBE_NARROW_MISS_UNTIL_MS.lock();
-    map.retain(|_, u| *u > now);
-    for pool in pools {
-        map.entry(pool)
-            .and_modify(|deadline| *deadline = (*deadline).max(until))
-            .or_insert(until);
-    }
+    mark_tick_cooldown(
+        &PROBE_NARROW_MISS_UNTIL_MS,
+        pools,
+        PROBE_NARROW_MISS_COOLDOWN_MS,
+    );
 }
 
 fn mark_tick_cooldown_addresses(pools: impl IntoIterator<Item = Address>, cooldown_ms: u64) {
-    let now = crate::util::now_ms();
-    let until = now.saturating_add(cooldown_ms);
-    let mut map = EMPTY_TICK_UNTIL_MS.lock();
-    map.retain(|_, u| *u > now);
-    for pool in pools {
-        map.entry(pool)
-            .and_modify(|deadline| *deadline = (*deadline).max(until))
-            .or_insert(until);
-    }
+    mark_tick_cooldown(&EMPTY_TICK_UNTIL_MS, pools, cooldown_ms);
 }
 
 fn mark_empty_tick_cooldown(pools: impl IntoIterator<Item = Address>) {
@@ -127,27 +132,15 @@ pub fn is_probe_narrow_miss_v4_on_cooldown(pool_id: FixedBytes<32>) -> bool {
 }
 
 pub fn mark_probe_narrow_miss_v4(pool_ids: impl IntoIterator<Item = FixedBytes<32>>) {
-    let now = crate::util::now_ms();
-    let until = now.saturating_add(PROBE_NARROW_MISS_COOLDOWN_MS);
-    let mut map = PROBE_NARROW_MISS_V4_UNTIL_MS.lock();
-    map.retain(|_, u| *u > now);
-    for pool_id in pool_ids {
-        map.entry(pool_id)
-            .and_modify(|deadline| *deadline = (*deadline).max(until))
-            .or_insert(until);
-    }
+    mark_tick_cooldown(
+        &PROBE_NARROW_MISS_V4_UNTIL_MS,
+        pool_ids,
+        PROBE_NARROW_MISS_COOLDOWN_MS,
+    );
 }
 
 fn mark_v4_tick_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>, cooldown_ms: u64) {
-    let now = crate::util::now_ms();
-    let until = now.saturating_add(cooldown_ms);
-    let mut map = EMPTY_V4_TICK_UNTIL_MS.lock();
-    map.retain(|_, u| *u > now);
-    for pool_id in pool_ids {
-        map.entry(pool_id)
-            .and_modify(|deadline| *deadline = (*deadline).max(until))
-            .or_insert(until);
-    }
+    mark_tick_cooldown(&EMPTY_V4_TICK_UNTIL_MS, pool_ids, cooldown_ms);
 }
 
 fn mark_empty_v4_tick_cooldown(pool_ids: impl IntoIterator<Item = FixedBytes<32>>) {

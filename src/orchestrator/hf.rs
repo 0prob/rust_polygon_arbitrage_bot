@@ -219,9 +219,9 @@ fn resolve_hydrate_budget(hydrate_floor: Duration, gap_ok: bool, residual: Durat
     }
 }
 
-/// Hub tokens that block probe ranking when cold (WMATIC ColdCache → empty ranks).
-/// Hubs that are cold (missing / past full TTL) — soft-stale hubs (75–100% TTL)
-/// must not block HF; spawn/background refreshes them.
+/// Hub tokens that block the HF tick while cold (WMATIC ColdCache → empty ranks).
+/// Soft-stale hubs (75–100% TTL, still `has_fresh_entry`) must not block; background
+/// refreshes them. Inflight wait uses this set only — never wait on dust.
 fn flash_blocking_stale(stale: &[Address], flash: &FlashLiquidityCache) -> Vec<Address> {
     stale
         .iter()
@@ -229,6 +229,17 @@ fn flash_blocking_stale(stale: &[Address], flash: &FlashLiquidityCache) -> Vec<A
         .filter(|addr| {
             crate::core::constants::is_polygon_hub_token(*addr) && !flash.has_fresh_entry(*addr)
         })
+        .collect()
+}
+
+/// Tokens past soft-stale that lack a full-TTL cache entry (missing or expired).
+/// Unlike [`flash_blocking_stale`], includes non-hub cycle starts — deferring those
+/// caused live `skip_flash_source` ColdCache empties (`stale_n<4` dust defer).
+fn flash_cold_tokens(stale: &[Address], flash: &FlashLiquidityCache) -> Vec<Address> {
+    stale
+        .iter()
+        .copied()
+        .filter(|addr| !flash.has_fresh_entry(*addr))
         .collect()
 }
 
@@ -290,11 +301,13 @@ async fn hf_flash_prefetch_stale(
     let stale_n = stale.len();
     let fresh_n = flash_token_list.len().saturating_sub(stale_n);
     let blocking = flash_blocking_stale(&stale, flash_cache);
+    let cold = flash_cold_tokens(&stale, flash_cache);
     let blocking_n = blocking.len();
-    // Dust-only or soft-stale hubs: defer to spawn/background (live: 638ms
-    // timeout on tokens=1 WMATIC that was still within full TTL).
-    if blocking.is_empty() && stale_n < 4 {
-        crate::debug!("flash loan: hf_prefetch defer non-cold stale={stale_n} fresh={fresh_n}");
+    // Soft-stale only (still within full TTL): defer to spawn/background.
+    // Truly cold cycle starts must refresh — live deferred 1–3 cold non-hubs
+    // (`blocking` hubs-only + stale_n<4) → probe ColdCache emptied ranks.
+    if cold.is_empty() && stale_n < 4 {
+        crate::debug!("flash loan: hf_prefetch defer soft-stale={stale_n} fresh={fresh_n}");
         return;
     }
     let deadline = Instant::now() + flash_budget;
@@ -331,13 +344,14 @@ async fn hf_flash_prefetch_stale(
         );
         return;
     };
-    // Tight budget: refresh hubs only so WMATIC lands; dust rides background.
-    let refresh_set: &[Address] =
-        if flash_budget <= HF_FLASH_INFLIGHT_WAIT_CAP && !blocking.is_empty() {
-            &blocking
-        } else {
-            &stale
-        };
+    // Tight budget: refresh truly cold tokens (hubs first via sort above).
+    // Soft-stale dust rides background; cold cycle starts must not be skipped.
+    let refresh_set: &[Address] = if flash_budget <= HF_FLASH_INFLIGHT_WAIT_CAP && !cold.is_empty()
+    {
+        &cold
+    } else {
+        &stale
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return;
@@ -549,9 +563,27 @@ fn cycle_with_reliable_start(
 
 /// True when any start-rotation of `edges` is quarantined. Assess may Aave-rotate
 /// after select; `cycle_key` includes hop order + vault idxs so a single fp miss
-/// lets underwater cooldowns leak back into `probe_kept` (`evaluated=0`).
-///
-/// Batches all rotation fingerprints into one quarantine map read.
+/// Cool every start-rotation of `edges` for `ttl` (never shortens a longer cool).
+/// Underwater path must use this — `quarantine_stale_route` (30s) let sticky V2
+/// sibling rotations leak back while the winning fp sat in 1h cool (iter25).
+fn quarantine_edge_rotations_for(
+    execution: &ExecutionService,
+    edges: &[crate::core::types::Edge],
+    ttl: Duration,
+) {
+    let n = edges.len();
+    if n == 0 {
+        return;
+    }
+    let until = Instant::now() + ttl;
+    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
+    for _ in 0..n {
+        execution.quarantine_extend_until(hash_cycle_edges(&rotated), until);
+        rotated.rotate_left(1);
+    }
+}
+
+/// Soft `ROUTE_COOLDOWN` on all start-rotations (structural / probe-below-floor).
 fn quarantine_all_edge_rotations(execution: &ExecutionService, edges: &[crate::core::types::Edge]) {
     let n = edges.len();
     if n == 0 {
@@ -1775,21 +1807,39 @@ pub async fn run_hf_tick(
     let state_cache = Arc::clone(&ctx.cache);
     // Residual prep budget for pool/flash (shared deadline — no stage stacking).
     let stage_budget = prep_remaining(prep_deadline).min(prep_remaining(tick_deadline));
-    // Carve hydrate from pool/flash. When the 1.5s gap will allow this tick, take up
-    // to MAX. When it won't, still keep a one-pool MIN floor — otherwise work burns
-    // the full stage and hydrate arrives with residual=0 just as the gap opens
-    // (live post-reclaim: floor=0 budget=0 residual=0 every ~7.5s).
+    // Peel cold-flash reserve BEFORE hydrate carve. When the gap is open,
+    // `reserve_hydrate_budget` can assign the entire stage to TickLens
+    // (work_budget=0) and the non-stream path skips flash entirely — live:
+    // skip_flash_source ColdCache with fresh=false on cycle starts.
+    let cold_flash_reserve = {
+        let stale = flash_cache.stale_tokens(&flash_token_list);
+        let cold = flash_cold_tokens(&stale, flash_cache.as_ref());
+        if cold.is_empty() {
+            Duration::ZERO
+        } else {
+            stage_budget.min(HF_FLASH_INFLIGHT_WAIT_CAP)
+        }
+    };
+    let stage_after_cold_flash = if cold_flash_reserve.is_zero() {
+        stage_budget
+    } else {
+        Duration::ZERO
+    };
+    // Carve hydrate from remaining pool/flash budget. When the 1.5s gap will
+    // allow this tick, take up to MAX. When it won't, still keep a one-pool MIN
+    // floor — otherwise work burns the full stage and hydrate arrives with
+    // residual=0 just as the gap opens (live post-reclaim: floor=0 budget=0).
     let hydrate_gap_will_allow = {
         let last = LAST_PROBE_HYDRATE_MS.load(Ordering::Relaxed);
         now_ms().saturating_sub(last) >= PROBE_HYDRATE_MIN_GAP_MS
     };
     let (work_budget, hydrate_reserved) = if hydrate_gap_will_allow {
-        reserve_hydrate_budget(stage_budget)
-    } else if stage_budget >= HF_PROBE_HYDRATE_MIN_BUDGET {
+        reserve_hydrate_budget(stage_after_cold_flash)
+    } else if stage_after_cold_flash >= HF_PROBE_HYDRATE_MIN_BUDGET {
         let hydrate = HF_PROBE_HYDRATE_MIN_BUDGET;
-        (stage_budget.saturating_sub(hydrate), hydrate)
+        (stage_after_cold_flash.saturating_sub(hydrate), hydrate)
     } else {
-        (stage_budget, Duration::ZERO)
+        (stage_after_cold_flash, Duration::ZERO)
     };
     // Preserve the carved floor as an absolute budget — do not re-derive from
     // prep_deadline residual later (oracle/reselect ate it → hydrate never ran).
@@ -1800,16 +1850,32 @@ pub async fn run_hf_tick(
         work_budget
     };
 
-    if skip_prefetch || hot_pools.is_empty() {
+    // Always warm truly cold flash tokens first (non-stealable reserve).
+    if !cold_flash_reserve.is_zero() {
         let flash_prefetch_started = now_ms();
         hf_flash_prefetch_stale(
             flash_cache.as_ref(),
             rpc.as_ref(),
             &flash_token_list,
-            flash_budget,
+            stage_budget,
         )
         .await;
         flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
+    }
+
+    if skip_prefetch || hot_pools.is_empty() {
+        if !flash_budget.is_zero() {
+            let flash_prefetch_started = now_ms();
+            hf_flash_prefetch_stale(
+                flash_cache.as_ref(),
+                rpc.as_ref(),
+                &flash_token_list,
+                flash_budget,
+            )
+            .await;
+            flash_prefetch_ms =
+                flash_prefetch_ms.saturating_add(now_ms().saturating_sub(flash_prefetch_started));
+        }
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
@@ -1831,6 +1897,9 @@ pub async fn run_hf_tick(
             (result, now_ms().saturating_sub(pool_prefetch_started))
         };
         let flash_fut = async {
+            if flash_budget.is_zero() {
+                return 0;
+            }
             let flash_prefetch_started = now_ms();
             hf_flash_prefetch_stale(
                 flash_cache.as_ref(),
@@ -1843,7 +1912,7 @@ pub async fn run_hf_tick(
         };
         let ((pool_out, pool_ms), flash_ms) = tokio::join!(pool_fut, flash_fut);
         pool_prefetch_ms = pool_ms;
-        flash_prefetch_ms = flash_ms;
+        flash_prefetch_ms = flash_prefetch_ms.saturating_add(flash_ms);
         match pool_out {
             Ok(Ok(result)) => prefetch_ok = result.prefetch_tick_succeeded(),
             Ok(Err(e)) => crate::debug!("hf prefetch failed: {e:#}"),
@@ -1852,6 +1921,9 @@ pub async fn run_hf_tick(
         if !flash_token_list.is_empty() {
             flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
         }
+    } else if !flash_token_list.is_empty() {
+        // work_budget=0 after cold reserve + hydrate carve — still spawn bg.
+        flash_cache.spawn_refresh_if_stale(Arc::clone(&rpc), &flash_token_list);
     }
 
     let prefetch_wall_ms = now_ms().saturating_sub(pool_prefetch_started);
@@ -2621,18 +2693,19 @@ pub async fn run_hf_tick(
                 let available_matic = diag
                     .gas_cost_wei
                     .saturating_sub(diag.gas_shortfall_matic_wei);
-                if ctx.execution.quarantine_chronic_gas_underwater(
+                if let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
                     diag.fp,
                     diag.gas_cover_bps,
                     available_matic,
                 ) {
-                    // Cool rotations too — sticky 2-hop V2 dust returned as a
-                    // different fp with the same edges after single-fp cool.
-                    quarantine_all_edge_rotations(&ctx.execution, &diag.edges);
+                    // Same TTL on rotations — stale 30s let sticky V2 siblings leak
+                    // back while the winning fp sat in 1h/90s cool (iter25).
+                    quarantine_edge_rotations_for(&ctx.execution, &diag.edges, ttl);
                     crate::info!(
-                        "hf underwater quarantine: fp={} cover_bps={} (+rotations)",
+                        "hf underwater quarantine: fp={} cover_bps={} ttl_s={} (+rotations)",
                         diag.fp,
-                        diag.gas_cover_bps
+                        diag.gas_cover_bps,
+                        ttl.as_secs(),
                     );
                 }
                 // Always log near-misses ≥4% cover with real MATIC — rate-limit hid
@@ -2678,15 +2751,16 @@ pub async fn run_hf_tick(
                 // Sub-diag-gate dust still ranked (live: peak_avail≈6.8e14 / cover≈77
                 // after sticky cool) — cool it so near_net stops filling the window.
                 if let Some(ref edges) = cover_peak_edges
-                    && ctx.execution.quarantine_chronic_gas_underwater(
+                    && let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
                         cover_peak_fp,
                         cover_max_bps,
                         cover_peak_avail,
                     )
                 {
-                    quarantine_all_edge_rotations(&ctx.execution, edges);
+                    quarantine_edge_rotations_for(&ctx.execution, edges, ttl);
                     crate::info!(
-                        "hf underwater quarantine: fp={cover_peak_fp} cover_bps={cover_max_bps} avail={cover_peak_avail} (+rotations, peak-no-diag)"
+                        "hf underwater quarantine: fp={cover_peak_fp} cover_bps={cover_max_bps} avail={cover_peak_avail} ttl_s={} (+rotations, peak-no-diag)",
+                        ttl.as_secs(),
                     );
                 }
                 if should_log_best_eval() {
@@ -2927,6 +3001,17 @@ mod tests {
         let stale = vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
         let flash = FlashLiquidityCache::new();
         assert!(flash_blocking_stale(&stale, &flash).is_empty());
+    }
+
+    #[test]
+    fn flash_cold_tokens_includes_cold_dust_and_hubs() {
+        let dust = Address::repeat_byte(0xab);
+        let stale = vec![dust, WMATIC];
+        let flash = FlashLiquidityCache::new();
+        let cold = flash_cold_tokens(&stale, &flash);
+        assert_eq!(cold.len(), 2);
+        assert!(cold.contains(&dust));
+        assert!(cold.contains(&WMATIC));
     }
 
     #[test]

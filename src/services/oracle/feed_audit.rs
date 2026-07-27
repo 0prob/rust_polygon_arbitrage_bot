@@ -23,8 +23,18 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
         "STMATIC",
     ),
     (
+        "stMATIC",
+        address!("0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4"),
+        "STMATIC",
+    ),
+    (
         "MaticX",
         address!("0xFa68FB4628dFF1028C0C610198bB4D9B5AfE0902"),
+        "MATICX",
+    ),
+    (
+        "MaticX",
+        address!("0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6"),
         "MATICX",
     ),
     (
@@ -54,8 +64,18 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
         "EURS",
     ),
     (
+        "EURA",
+        address!("0xF32E6dC7709c596c5a5f328fa01eDd8eC3F62517"),
+        "EURS",
+    ),
+    (
         "miMATIC",
         address!("0xa3Fa99A148fA48D14Ed51d610c367C61876997F1"),
+        "MAI",
+    ),
+    (
+        "miMATIC",
+        address!("0x63d38FCf3cC014735B28339F47EC3FA9BA97b4B9"),
         "MAI",
     ),
     (

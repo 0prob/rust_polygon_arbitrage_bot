@@ -8,6 +8,8 @@ use super::route_stats::RouteFailureKind;
 use super::{
     ADAPTIVE_FLASH_CAP_START_DIVISOR, BATCH_QUERY_FAIL_QUARANTINE,
     CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI, CHRONIC_THIN_LIQ_QUARANTINE,
+    CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_NEAR_MISS_COVER_BPS,
+    CHRONIC_NEAR_MISS_QUARANTINE,
     CHRONIC_UNDERWATER_COVER_BPS, CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI,
     CHRONIC_UNDERWATER_MIN_COVER_BPS, CHRONIC_UNDERWATER_QUARANTINE,
     CHRONIC_UNDERWATER_STRIKE_WINDOW, CHRONIC_UNDERWATER_STRIKES,
@@ -256,13 +258,13 @@ impl ExecutionService {
     }
 
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
-    /// Returns true only when a *new* cooldown was applied (not on refresh / first strike).
+    /// Returns the applied TTL when a *new* cooldown was set (not on refresh / strike).
     pub fn quarantine_chronic_gas_underwater(
         &self,
         fingerprint: u64,
         gas_cover_bps: u64,
         available_matic_wei: U256,
-    ) -> bool {
+    ) -> Option<Duration> {
         // Clamp inflated cover% into the chronic band when absolute MATIC is thin.
         // Live: USDT-start dust posted cover≈1768 with gross≈0 while real WMATIC
         // edges at ~0.017 MATIC / ~490 cover never won best-eval long enough.
@@ -276,7 +278,7 @@ impl ExecutionService {
             gas_cover_bps
         };
         if !(CHRONIC_UNDERWATER_MIN_COVER_BPS..CHRONIC_UNDERWATER_COVER_BPS).contains(&cover_bps) {
-            return false;
+            return None;
         }
         let now = Instant::now();
         if self
@@ -285,7 +287,7 @@ impl ExecutionService {
             .get(&fingerprint)
             .is_some_and(|expiry| now < *expiry)
         {
-            return false;
+            return None;
         }
         let strikes = {
             let mut map = self.underwater_strikes.write();
@@ -297,25 +299,51 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        // ponytail: thin-liq (<0.05 MATIC) cools on first strike — sticky V2 dust
-        // burned 3 best-eval ticks every cold start before the 1h cool applied.
-        let strikes_needed =
-            if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI) {
-                1
-            } else {
-                CHRONIC_UNDERWATER_STRIKES
-            };
+        // First-strike long cool only for true dust / weak-cover thin edges.
+        // Near-misses (cover≥1000, avail≥0.01) use 3-strike — live iter23 DODO
+        // cover=2661 / avail≈0.037 was 1h-cooled on first best-eval.
+        let thin_first_strike = available_matic_wei
+            < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
+            || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
+                && cover_bps < CHRONIC_NEAR_MISS_COVER_BPS);
+        let strikes_needed = if thin_first_strike {
+            1
+        } else {
+            CHRONIC_UNDERWATER_STRIKES
+        };
         if strikes < strikes_needed {
-            return false;
+            return None;
         }
         self.underwater_strikes.write().remove(&fingerprint);
-        let ttl = if available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI) {
+        // TTL tiers (live iter26: 4× first-strike 3600s on cover~70–575 emptied the
+        // HF window via rotation cool — no ge_1000 for the rest of the run):
+        //   wei-dust (<0.001 MATIC)     → 1h  (true junk)
+        //   thin weak-cover (<1000 bps) → 600s (was 1h — over-quarantined graph)
+        //   near-miss (≥1000 + ≥dust)   → 90s
+        //   else                         → 600s
+        let ttl = if available_matic_wei
+            < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
+        {
             CHRONIC_THIN_LIQ_QUARANTINE
+        } else if thin_first_strike {
+            CHRONIC_UNDERWATER_QUARANTINE
+        } else if gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
+            && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
+        {
+            CHRONIC_NEAR_MISS_QUARANTINE
         } else {
             CHRONIC_UNDERWATER_QUARANTINE
         };
         self.quarantine_insert(fingerprint, now + ttl);
-        true
+        Some(ttl)
+    }
+
+    /// Extend quarantine to `until` without shortening an existing longer cool.
+    pub fn quarantine_extend_until(&self, fingerprint: u64, until: Instant) {
+        let mut q = self.quarantine.write();
+        if q.get(&fingerprint).is_none_or(|exp| *exp < until) {
+            q.insert(fingerprint, until);
+        }
     }
 
     pub fn quarantine_global(&self, duration: Duration, now: Instant) {

@@ -623,4 +623,32 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         &address!("0x3Dbd2A88627566306AE9f5F5FB466B498535aF21"),
         "ETHV",
     ),
+    (
+        &address!("0xAba308c24952f70a533474653349a68Bb639FA2A"),
+        "MATIC-SS",
+    ),
+    (
+        &address!("0xD289c01528921B5f6D5B111a50a99456D495bF78"),
+        "STARV2",
+    ),
+    (
+        &address!("0xb7Acf75C942D4fB7BD9DEFb5D67ee92e774f1841"),
+        "BTC-SS",
+    ),
+    (
+        &address!("0xC8fc7E7E7B4D94FA02751B8719F5BbBb4C1413Cf"),
+        "ETH-SS",
+    ),
+    (
+        &address!("0x91B2745d7acA9D64560cD1693b6fF96678FfC433"),
+        "FOMO",
+    ),
+    (
+        &address!("0x3B260979D18D4BE11A39B8C9CdD22f61E47BDEbc"),
+        "ETH-S",
+    ),
+    (
+        &address!("0x17840DF7CAa07e298b16E8612157B90ED231C973"),
+        "DAO",
+    ),
 ];

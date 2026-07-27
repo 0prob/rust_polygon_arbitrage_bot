@@ -941,8 +941,13 @@ pub fn balancer_route_flash_feasible(
     cycle_has_aave_listed_token(cycle, arena, flash, ttl)
         || dodo_base_flash_pool_for_cycle(arena, cycle).is_some()
 }
-/// Mixed Balancer routes forbid Balancer flash loans (`BalancerVaultReentrancy`). Prefer an Aave-listed token
-/// already present in the cycle as the flash borrow asset.
+/// Prefer a flash-borrowable start token already on the cycle.
+///
+/// - Mixed Balancer vault routes: Aave-listed hop (Balancer flash reentrancy).
+/// - Pure Balancer: unchanged (`executeArbDirect`).
+/// - Other routes: if the current start is fresh with zero borrow liquidity,
+///   rotate to the deepest borrowable hop (live: ZeroLiquidity empties ranks
+///   after ColdCache warm — e.g. unlisted junk starts with WMATIC mid-hop).
 pub fn prefer_aave_flash_start<'a>(
     cycle: &'a FoundCycle,
     arena: &StateArena,
@@ -950,7 +955,7 @@ pub fn prefer_aave_flash_start<'a>(
     ttl: Duration,
     token_to_matic_rates: &FxHashMap<TokenIndex, U256>,
 ) -> Cow<'a, FoundCycle> {
-    if !route_uses_balancer_vault_swap(cycle) || route_is_balancer_only(cycle) {
+    if route_is_balancer_only(cycle) {
         return Cow::Borrowed(cycle);
     }
 
@@ -969,17 +974,40 @@ pub fn prefer_aave_flash_start<'a>(
         token_indices.push(token);
     }
     let snapshots = flash.tokens_liquidity(&token_addrs, ttl);
+
     let mut candidates: Vec<(U256, TokenIndex)> = Vec::new();
-    for (liq, token) in snapshots.into_iter().zip(token_indices) {
-        if liq.aave_listed
-            && !liq.aave.is_zero()
-            && has_reliable_matic_rate(token, token_to_matic_rates)
-        {
-            candidates.push((liq.aave, token));
+    if route_uses_balancer_vault_swap(cycle) {
+        for (liq, token) in snapshots.into_iter().zip(token_indices) {
+            if liq.aave_listed
+                && !liq.aave.is_zero()
+                && has_reliable_matic_rate(token, token_to_matic_rates)
+            {
+                candidates.push((liq.aave, token));
+            }
+        }
+    } else {
+        let start_dead = arena
+            .token_address(cycle.start_token)
+            .is_some_and(|addr| token_flash_borrow_proven_unviable(addr, flash, ttl));
+        if !start_dead {
+            return Cow::Borrowed(cycle);
+        }
+        for (liq, token) in snapshots.into_iter().zip(token_indices) {
+            if token_flash_liquidity_borrowable(&liq)
+                && has_reliable_matic_rate(token, token_to_matic_rates)
+            {
+                // Prefer deeper Aave cash, then Balancer vault balance.
+                let depth = if !liq.aave.is_zero() {
+                    liq.aave
+                } else {
+                    liq.balancer
+                };
+                candidates.push((depth, token));
+            }
         }
     }
 
-    let Some((_, best)) = candidates.into_iter().max_by_key(|(aave, _)| *aave) else {
+    let Some((_, best)) = candidates.into_iter().max_by_key(|(depth, _)| *depth) else {
         return Cow::Borrowed(cycle);
     };
 
