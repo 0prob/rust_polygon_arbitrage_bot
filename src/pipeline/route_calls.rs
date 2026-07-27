@@ -1,7 +1,6 @@
 use crate::core::types::{Edge, ProtocolType};
 
-/// Huff ArbExecutor rejects routes with >= 12 packed calls.
-pub const MAX_ROUTE_CALLS: usize = 12;
+pub const MAX_EXECUTOR_CALLS: usize = 12;
 /// `executeArbDirect` batchSwap gas grows quickly; beyond this use per-hop flash routes.
 pub const MAX_BALANCER_BATCH_HOPS: usize = 4;
 
@@ -55,11 +54,16 @@ pub fn route_executor_budget(edges: &[Edge]) -> RouteExecutorBudget {
     }
 }
 
-/// Huff `ArbExecutor` rejects routes at or above 12 packed calls.
+#[inline]
+#[must_use]
+pub const fn packed_calls_fit_executor(packed_calls: usize) -> bool {
+    packed_calls <= MAX_EXECUTOR_CALLS
+}
+
 #[inline]
 #[must_use]
 pub fn route_fits_executor(edges: &[Edge]) -> bool {
-    estimate_packed_route_calls(edges) <= MAX_ROUTE_CALLS
+    packed_calls_fit_executor(estimate_packed_route_calls(edges))
 }
 
 #[cfg(test)]
@@ -84,7 +88,7 @@ mod tests {
     fn v4_heavy_route_exceeds_executor_budget() {
         let edges: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::UniswapV4), 7).collect();
         assert_eq!(estimate_route_calls(&edges), 14);
-        assert!(estimate_route_calls(&edges) > MAX_ROUTE_CALLS);
+        assert!(!packed_calls_fit_executor(estimate_route_calls(&edges)));
     }
 
     #[test]
@@ -109,6 +113,12 @@ mod tests {
         let batch: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::BalancerV2), 4).collect();
         assert!(route_fits_executor(&batch));
         assert!(route_executor_budget(&batch).balancer_batch);
+    }
+
+    #[test]
+    fn packed_executor_budget_includes_twelve_calls() {
+        assert!(packed_calls_fit_executor(12));
+        assert!(!packed_calls_fit_executor(13));
     }
 
     #[test]

@@ -171,6 +171,15 @@ pub fn is_cl_tick_on_hydrate_cooldown(addr: Address, v4_pool_id: Option<FixedByt
     is_empty_tick_on_cooldown(addr) || v4_pool_id.is_some_and(is_empty_v4_tick_on_cooldown)
 }
 
+#[must_use]
+pub fn is_cl_tick_on_probe_cooldown(addr: Address, v4_pool_id: Option<FixedBytes<32>>) -> bool {
+    is_empty_tick_on_cooldown(addr)
+        || is_probe_narrow_miss_on_cooldown(addr)
+        || v4_pool_id.is_some_and(|pool_id| {
+            is_empty_v4_tick_on_cooldown(pool_id) || is_probe_narrow_miss_v4_on_cooldown(pool_id)
+        })
+}
+
 fn clear_empty_v4_tick_cooldown(pool_id: FixedBytes<32>) {
     EMPTY_V4_TICK_UNTIL_MS.lock().remove(&pool_id);
 }
@@ -1788,5 +1797,20 @@ mod tests {
 
         clear_v4_tick_hydrate_cooldown(pool_id);
         assert!(!is_probe_narrow_miss_v4_on_cooldown(pool_id));
+    }
+
+    #[test]
+    fn cl_probe_cooldown_combines_address_and_v4_keys() {
+        let addr = Address::from([0xac; 20]);
+        let pool_id = FixedBytes::from([0xad; 32]);
+        assert!(!is_cl_tick_on_probe_cooldown(addr, Some(pool_id)));
+
+        mark_probe_narrow_miss([addr]);
+        assert!(is_cl_tick_on_probe_cooldown(addr, Some(pool_id)));
+        clear_tick_hydrate_cooldown(addr);
+
+        mark_probe_narrow_miss_v4([pool_id]);
+        assert!(is_cl_tick_on_probe_cooldown(addr, Some(pool_id)));
+        clear_v4_tick_hydrate_cooldown(pool_id);
     }
 }

@@ -867,6 +867,7 @@ pub fn assess_profit(input: &AssessProfitInput) -> ProfitAssessment {
         revert_penalty,
         net_profit: net_before_gas,
         net_profit_after_gas,
+        priority_bid_basis_matic_wei: net_profit_after_gas_matic_wei,
         net_profit_after_gas_matic_wei: net_after_priority,
         roi,
         reject_reason,
@@ -889,6 +890,7 @@ fn rejected_arithmetic(input: &AssessProfitInput, reason: &str) -> ProfitAssessm
         revert_penalty: gas_cost_wei,
         net_profit: U256::ZERO,
         net_profit_after_gas: U256::ZERO,
+        priority_bid_basis_matic_wei: U256::ZERO,
         net_profit_after_gas_matic_wei: U256::ZERO,
         roi: 0.0,
         reject_reason: Some(reason.to_string()),
@@ -1103,6 +1105,22 @@ mod safety_tests {
         assert!(uplift.is_zero());
         let tip = profit_priority_tip_per_gas(U256::from(10u128.pow(16)), 1_000, 1_000_000);
         assert!(tip < floor);
+    }
+
+    #[test]
+    fn assessment_retains_priority_bid_basis() {
+        let mut i = input();
+        i.gross_profit = U256::from(10u128.pow(18));
+        i.amount_in = U256::from(10u128.pow(18));
+        i.slippage_bps = 0;
+        i.flash_loan_source = FlashLoanSource::Direct;
+        i.gas_units = 100_000;
+        i.gas_price_wei = U256::from(100u64);
+        i.profit_priority_alpha_bps = 1_000;
+        let assessment = assess_profit(&i);
+        assert!(
+            assessment.priority_bid_basis_matic_wei > assessment.net_profit_after_gas_matic_wei
+        );
     }
 
     #[test]

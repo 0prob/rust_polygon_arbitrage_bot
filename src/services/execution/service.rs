@@ -791,11 +791,6 @@ impl ExecutionService {
             }
         };
 
-        // Tip intensity basis (MATIC wei), matching assess_profit's gross MATIC tip:
-        // 1) dry-run realized token profit → MATIC (authoritative when present)
-        // 2) sim gross → MATIC (same basis as assess priority uplift)
-        // 3) post-tip expected_profit fallback
-        // Using only post-tip expected under-bids vs assess (live: tip from net < tip from gross).
         let tip_profit = realized_profit
             .and_then(|p| {
                 token_profit_to_matic_wei(
@@ -806,12 +801,8 @@ impl ExecutionService {
             })
             .filter(|p| !p.is_zero())
             .or_else(|| {
-                token_profit_to_matic_wei(
-                    candidate.gross_profit,
-                    candidate.token_to_matic_rate,
-                    candidate.token_decimals,
-                )
-                .filter(|p| !p.is_zero())
+                (!candidate.priority_bid_basis_matic_wei.is_zero())
+                    .then_some(candidate.priority_bid_basis_matic_wei)
             })
             .unwrap_or(candidate.expected_profit_matic_wei);
         // Tip intensity uses execution gas (sim/dry-run), not buffered tx limit.
@@ -1853,6 +1844,7 @@ mod safety_tests {
             value: U256::ZERO,
             profit_token: Address::repeat_byte(9),
             expected_profit_matic_wei: U256::from(1u64),
+            priority_bid_basis_matic_wei: U256::from(1u64),
             gas_limit: None,
             simulated_gas: 100,
             route_hash: Default::default(),
@@ -1895,6 +1887,7 @@ mod safety_tests {
             value: U256::ZERO,
             profit_token: Address::repeat_byte(8),
             expected_profit_matic_wei: U256::ZERO,
+            priority_bid_basis_matic_wei: U256::ZERO,
             gas_limit: None,
             simulated_gas: 100,
             route_hash: Default::default(),
@@ -1940,6 +1933,7 @@ mod safety_tests {
             value: U256::ZERO,
             profit_token: Address::repeat_byte(10),
             expected_profit_matic_wei: U256::from(878_359_083_215_296_116u128),
+            priority_bid_basis_matic_wei: U256::from(878_359_083_215_296_116u128),
             gas_limit: None,
             simulated_gas: 795_000,
             route_hash: Default::default(),
@@ -2032,7 +2026,7 @@ mod safety_tests {
     }
 
     #[test]
-    fn dry_run_pass_lowers_risk_floor_without_mined_receipt() {
+    fn dry_run_pass_does_not_reduce_risk_floor_without_mined_receipt() {
         let service = ExecutionService::new();
         service.route_stats.write().insert(
             11,
@@ -2045,15 +2039,11 @@ mod safety_tests {
         );
         let elevated = service.route_risk_multiplier_bps(11);
         assert!(elevated > 10_000);
-        // Four semantic+profit dry-run passes should dilute failure rate.
         for _ in 0..4 {
             service.record_route_dry_run_pass(11);
         }
         let cooled = service.route_risk_multiplier_bps(11);
-        assert!(
-            cooled < elevated,
-            "dry-run pass must recover risk: elevated={elevated} cooled={cooled}"
-        );
+        assert_eq!(cooled, elevated);
     }
 
     #[test]
@@ -2133,6 +2123,7 @@ mod safety_tests {
             value: U256::ZERO,
             profit_token: Address::ZERO,
             expected_profit_matic_wei: U256::ZERO,
+            priority_bid_basis_matic_wei: U256::ZERO,
             gas_limit: None,
             simulated_gas: 1,
             route_hash: Default::default(),
@@ -2188,6 +2179,7 @@ mod safety_tests {
         for _ in 0..100 {
             service.record_route_success(7);
         }
+        service.record_route_dry_run_pass(7);
         service.record_route_failure(7, RouteFailureKind::DryRun);
         assert_eq!(
             service.promote_adaptive_flash_loan_cap(7, 50_000),
@@ -2198,6 +2190,7 @@ mod safety_tests {
         let saved = ExecutionService::replay_route_stats(&path);
         let stats = saved.get(&7).expect("saved route");
         assert_eq!(stats.successes, 100);
+        assert_eq!(stats.dry_run_successes, 1);
         assert_eq!(stats.failures, 1);
         assert_eq!(stats.dry_run_failures, 1);
         assert_eq!(stats.adaptive_flash_loan_usd, Some(25_000));

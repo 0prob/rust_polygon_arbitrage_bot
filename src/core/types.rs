@@ -466,6 +466,7 @@ pub struct ProfitAssessment {
     pub revert_penalty: U256,
     pub net_profit: U256,
     pub net_profit_after_gas: U256,
+    pub priority_bid_basis_matic_wei: U256,
     pub net_profit_after_gas_matic_wei: U256,
     pub roi: f64,
     pub reject_reason: Option<String>,

@@ -23,10 +23,9 @@ use crate::pipeline::types::MinimalSimResult;
 use crate::pipeline::tick_fetch::is_cl_tick_on_hydrate_cooldown;
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
-    is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown, is_probe_narrow_miss_on_cooldown,
-    is_probe_narrow_miss_v4_on_cooldown, mark_probe_narrow_miss_v4,
-    mark_tick_hydrate_timeout_cooldown, mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3,
-    still_tickless_v4,
+    is_cl_tick_on_probe_cooldown, is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
+    mark_probe_narrow_miss_v4, mark_tick_hydrate_timeout_cooldown,
+    mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
 };
 use crate::services::execution::aave::{
     AaveReserveStatus, aave_flash_reserve_status_live, record_aave_prepare_skip_inactive,
@@ -1101,7 +1100,7 @@ pub(crate) fn cycle_v3_tickless_hf_hydrate_exhausted(
         let Some(addr) = arena.pool_address(edge.pool_index) else {
             return false;
         };
-        if !is_empty_tick_on_cooldown(addr) && !is_probe_narrow_miss_on_cooldown(addr) {
+        if !is_cl_tick_on_probe_cooldown(addr, None) {
             return false;
         }
     }
@@ -1134,7 +1133,7 @@ pub(crate) fn cycle_tickless_cl_hf_hydrate_exhausted(
                 let Some(addr) = arena.pool_address(edge.pool_index) else {
                     return false;
                 };
-                if !is_empty_tick_on_cooldown(addr) && !is_probe_narrow_miss_on_cooldown(addr) {
+                if !is_cl_tick_on_probe_cooldown(addr, None) {
                     return false;
                 }
             }
@@ -1157,10 +1156,7 @@ pub(crate) fn cycle_tickless_cl_hf_hydrate_exhausted(
                     // No pool_id → TickLens cannot target; treat hop as permanently stuck.
                     continue;
                 };
-                if !is_empty_v4_tick_on_cooldown(pool_id)
-                    && !is_probe_narrow_miss_v4_on_cooldown(pool_id)
-                    && !is_empty_tick_on_cooldown(addr)
-                {
+                if !is_cl_tick_on_probe_cooldown(addr, Some(pool_id)) {
                     return false;
                 }
             }
@@ -1311,7 +1307,7 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
             if !tickless || !seen.insert(addr) {
                 continue;
             }
-            if is_empty_tick_on_cooldown(addr) || is_probe_narrow_miss_on_cooldown(addr) {
+            if is_cl_tick_on_probe_cooldown(addr, None) {
                 blocked_sibling = true;
                 continue;
             }
@@ -1384,9 +1380,11 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
                         continue;
                     };
                     let addr = arena.pool_address(idx);
-                    let is_on_cooldown = is_empty_v4_tick_on_cooldown(pool_id)
-                        || is_probe_narrow_miss_v4_on_cooldown(pool_id)
-                        || addr.is_some_and(is_empty_tick_on_cooldown);
+                    let is_on_cooldown = addr
+                        .map(|addr| is_cl_tick_on_probe_cooldown(addr, Some(pool_id)))
+                        .unwrap_or_else(|| {
+                            is_cl_tick_on_probe_cooldown(Address::ZERO, Some(pool_id))
+                        });
                     if is_on_cooldown {
                         blocked_sibling = true;
                         continue;

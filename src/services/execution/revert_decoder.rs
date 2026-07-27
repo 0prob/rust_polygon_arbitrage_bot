@@ -194,7 +194,7 @@ fn sanitize_external_call_failed(
     target: Address,
     reason: String,
 ) -> Option<DecodedRevert> {
-    if index >= crate::pipeline::route_calls::MAX_ROUTE_CALLS as u64 {
+    if index >= crate::pipeline::route_calls::MAX_EXECUTOR_CALLS as u64 {
         return None;
     }
     let target = if crate::services::discovery::is_plausible_contract_address(target) {

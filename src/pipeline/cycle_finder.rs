@@ -15,7 +15,7 @@ use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
-use crate::pipeline::route_calls::{MAX_ROUTE_CALLS, estimate_hop_calls};
+use crate::pipeline::route_calls::{estimate_hop_calls, packed_calls_fit_executor};
 use crate::pipeline::spot_price::{min_profitable_cycle_ratio, mul_ratio_saturating};
 use crate::pipeline::types::{
     CycleSearchPass, GraphEdge, GraphHopPhase, PoolMeta, RoutingGraph, compare_cycle_execution,
@@ -665,7 +665,7 @@ pub fn prepare_active_graph(graph: &RoutingGraph) -> ActiveGraph {
 
 #[inline]
 fn route_hop_budget_exceeded(hop_call_sum: u16) -> bool {
-    hop_call_sum as usize > MAX_ROUTE_CALLS
+    !packed_calls_fit_executor(hop_call_sum as usize)
 }
 
 #[inline]

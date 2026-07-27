@@ -453,6 +453,7 @@ mod tests {
             value: U256::ZERO,
             profit_token: Address::repeat_byte(2),
             expected_profit_matic_wei: U256::from(1u8),
+            priority_bid_basis_matic_wei: U256::from(1u8),
             gas_limit: Some(U256::from(21_000u64)),
             simulated_gas: 21_000,
             route_hash: FixedBytes::ZERO,

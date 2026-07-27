@@ -288,6 +288,33 @@ impl StateArena {
         Some(h.finish())
     }
 
+    #[must_use]
+    pub fn route_state_revision_with_base(&self, edges: &[Edge], base_revision: u64) -> u64 {
+        let mut h = FxHasher::default();
+        h.write_u64(base_revision);
+        h.write_usize(edges.len());
+        for edge in edges {
+            let index = edge.pool_index.0 as usize;
+            h.write_u32(edge.pool_index.0);
+            match self
+                .hot_overlay
+                .get(index)
+                .and_then(Option::as_ref)
+                .zip(self.hot_revisions.get(index))
+            {
+                Some((_, revision)) if *revision != 0 => {
+                    h.write_u8(1);
+                    h.write_u64(*revision);
+                }
+                _ => {
+                    h.write_u8(0);
+                    h.write_u64(base_revision);
+                }
+            }
+        }
+        h.finish()
+    }
+
     pub fn pool_state_mut(&mut self, index: PoolIndex) -> Option<&mut PoolState> {
         let idx = index.0 as usize;
         let inner = Arc::make_mut(&mut self.inner);
@@ -1300,6 +1327,29 @@ mod tests {
         cache.insert(route_addr, (*v2_state()).clone());
         arena.apply_hot_cache(&cache, &addresses);
         assert_ne!(arena.route_state_revision(&edges), Some(before));
+    }
+
+    #[test]
+    fn route_state_revision_with_base_caches_canonical_routes() {
+        let addr = Address::with_last_byte(1);
+        let mut arena = StateArena::default();
+        let pool = arena.register_pool(addr, v2_state());
+        let edges: CycleEdges = [Edge {
+            pool_index: pool,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]
+        .into_iter()
+        .collect();
+        assert_ne!(
+            arena.route_state_revision_with_base(&edges, 7),
+            arena.route_state_revision_with_base(&edges, 8)
+        );
     }
 
     #[test]

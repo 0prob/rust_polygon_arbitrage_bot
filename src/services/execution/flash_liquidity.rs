@@ -1888,6 +1888,7 @@ mod tests {
             revert_penalty: U256::ZERO,
             net_profit: U256::ZERO,
             net_profit_after_gas: U256::ZERO,
+            priority_bid_basis_matic_wei: U256::ZERO,
             net_profit_after_gas_matic_wei: U256::ZERO,
             roi: 0.0,
             reject_reason: None,

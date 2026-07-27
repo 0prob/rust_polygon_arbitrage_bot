@@ -2216,6 +2216,7 @@ pub async fn run_hf_tick(
         token_decimals,
         gas_oracle: Arc::clone(&ctx.gas_oracle),
         state_generation: evaluation_state_generation,
+        route_sim_base_revision: snap_generation,
         brent_iters: ctx.config.routing.brent_search_iterations,
         min_profit_matic: ctx.config.min_profit_matic,
         min_profit_roi_bps: ctx.config.execution.min_profit_roi_bps,

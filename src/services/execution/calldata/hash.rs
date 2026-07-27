@@ -12,11 +12,11 @@ pub fn pack_executor_calls(calls: &[ExecutorCall]) -> anyhow::Result<Vec<u8>> {
     if calls.is_empty() {
         anyhow::bail!("route must contain at least one executor call");
     }
-    if calls.len() > crate::pipeline::route_calls::MAX_ROUTE_CALLS {
+    if !crate::pipeline::route_calls::packed_calls_fit_executor(calls.len()) {
         anyhow::bail!(
             "route has {} calls, maximum is {}",
             calls.len(),
-            crate::pipeline::route_calls::MAX_ROUTE_CALLS
+            crate::pipeline::route_calls::MAX_EXECUTOR_CALLS
         );
     }
     if calls.iter().any(|call| {

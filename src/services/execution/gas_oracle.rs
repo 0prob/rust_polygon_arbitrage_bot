@@ -44,7 +44,6 @@ pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 1;
 pub struct RouteGasLookup {
     scale_bps: u64,
     observed: FxHashMap<u64, u32>,
-    preloaded: bool,
 }
 
 impl RouteGasLookup {
@@ -59,20 +58,19 @@ impl RouteGasLookup {
             return Self {
                 scale_bps,
                 observed: FxHashMap::default(),
-                preloaded: true,
             };
         }
         let mut observed =
             FxHashMap::with_capacity_and_hasher(fps.len().min(ROUTE_GAS_HISTORY), FxBuildHasher);
+        let history = oracle.route_gas.lock();
         for fp in fps {
-            if let Some(gas) = oracle.observed_route_gas(fp) {
+            if let Some(&gas) = history.map.get(&fp) {
                 observed.insert(fp, gas);
             }
         }
         Self {
             scale_bps,
             observed,
-            preloaded: true,
         }
     }
 
@@ -82,25 +80,18 @@ impl RouteGasLookup {
     }
 
     #[cfg(test)]
-    pub(crate) fn preloaded(&self) -> bool {
-        self.preloaded
-    }
-
-    #[cfg(test)]
     pub(crate) fn observed_gas(&self, route_fp: u64) -> Option<u32> {
         self.observed.get(&route_fp).copied()
     }
 
     /// Prefer prefetched observed gas; otherwise scaled heuristic (lock-free after build).
-    pub fn route_gas_or_heuristic(&self, oracle: &GasOracle, route_fp: u64, heuristic: u32) -> u32 {
+    pub fn route_gas_or_heuristic(
+        &self,
+        _oracle: &GasOracle,
+        route_fp: u64,
+        heuristic: u32,
+    ) -> u32 {
         if let Some(&gas) = self.observed.get(&route_fp) {
-            return gas;
-        }
-        // Snapshot miss: fall back to live oracle map (handles empty tick fps / races).
-        if !self.preloaded {
-            return oracle.route_gas_or_heuristic(route_fp, heuristic);
-        }
-        if let Some(gas) = oracle.observed_route_gas(route_fp) {
             return gas;
         }
         scaled_simulated_gas(heuristic, self.scale_bps)
@@ -111,14 +102,11 @@ impl RouteGasLookup {
     /// Use for all-in calibrated seeds ([`crate::core::constants::balancer_direct_batch_gas`])
     /// so mixed-route underestimates cannot re-inflate Direct near-miss gas.
     #[must_use]
-    pub fn route_gas_observed_or_seed(&self, oracle: &GasOracle, route_fp: u64, seed: u32) -> u32 {
+    pub fn route_gas_observed_or_seed(&self, _oracle: &GasOracle, route_fp: u64, seed: u32) -> u32 {
         if let Some(&gas) = self.observed.get(&route_fp) {
             return gas;
         }
-        if !self.preloaded {
-            return oracle.route_gas_observed_or_seed(route_fp, seed);
-        }
-        oracle.observed_route_gas(route_fp).unwrap_or(seed)
+        seed
     }
 }
 
@@ -471,10 +459,21 @@ mod tests {
         let oracle = GasOracle::new(Duration::from_secs(1));
         oracle.record_route_gas(7, 500_000);
         let lookup = RouteGasLookup::for_fingerprints(&oracle, [7u64, 8, 9]);
-        assert!(lookup.preloaded());
         assert_eq!(lookup.observed_gas(7), Some(500_000));
         assert_eq!(lookup.route_gas_or_heuristic(&oracle, 7, 100_000), 500_000);
         assert_eq!(lookup.route_gas_or_heuristic(&oracle, 99, 100_000), 100_000);
+    }
+
+    #[test]
+    fn route_gas_lookup_does_not_read_observations_added_after_snapshot() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        let lookup = RouteGasLookup::for_fingerprints(&oracle, [7u64]);
+        oracle.record_route_gas(99, 190_000);
+        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 99, 100_000), 100_000);
+        assert_eq!(
+            lookup.route_gas_observed_or_seed(&oracle, 99, 220_000),
+            220_000
+        );
     }
 
     #[test]
@@ -541,7 +540,6 @@ mod tests {
         let oracle = GasOracle::new(Duration::from_secs(1));
         oracle.record_route_gas(1, 250_000);
         let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64, 2]);
-        assert!(lookup.preloaded());
         assert_eq!(lookup.observed_gas(1), Some(250_000));
         assert_eq!(lookup.route_gas_or_heuristic(&oracle, 1, 100_000), 250_000);
     }

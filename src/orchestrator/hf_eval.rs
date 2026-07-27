@@ -224,6 +224,7 @@ pub struct HfEvalInput<'a> {
     pub gas_oracle: &'a GasOracle,
     pub route_gas: &'a RouteGasLookup,
     pub state_generation: u64,
+    pub route_sim_base_revision: u64,
     pub brent_iters: u32,
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
@@ -249,6 +250,7 @@ pub struct HfEvalInputOwned {
     pub token_decimals: Arc<FxHashMap<Address, u8>>,
     pub gas_oracle: Arc<GasOracle>,
     pub state_generation: u64,
+    pub route_sim_base_revision: u64,
     pub brent_iters: u32,
     pub min_profit_matic: U256,
     pub min_profit_roi_bps: u64,
@@ -276,6 +278,7 @@ impl HfEvalInputOwned {
             gas_oracle: self.gas_oracle.as_ref(),
             route_gas,
             state_generation: self.state_generation,
+            route_sim_base_revision: self.route_sim_base_revision,
             brent_iters: self.brent_iters,
             min_profit_matic: self.min_profit_matic,
             min_profit_roi_bps: self.min_profit_roi_bps,
@@ -1609,7 +1612,9 @@ fn evaluate_one(
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
     let fp = hash_cycle_edges(&cycle.edges);
-    let route_state_revision = input.arena.route_state_revision(&cycle.edges);
+    let route_state_revision = input
+        .arena
+        .route_state_revision_with_base(&cycle.edges, input.route_sim_base_revision);
     if !route_fits_executor(&cycle.edges) {
         inc(&stats.executor_budget);
         return None;
@@ -1698,8 +1703,11 @@ fn evaluate_one(
     let max_flash_usd = input
         .execution
         .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd);
-    let route_cache = route_state_revision
-        .map(|revision| (input.execution.route_sim_cache.as_ref(), revision, fp));
+    let route_cache = Some((
+        input.execution.route_sim_cache.as_ref(),
+        route_state_revision,
+        fp,
+    ));
     let (mut opt, mut sim, probe_only) = match optimize_cycle(
         input.arena,
         cycle,

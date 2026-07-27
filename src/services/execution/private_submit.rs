@@ -11,7 +11,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use reqwest::Client;
 
-use crate::infra::http::{HttpClientOpts, build_static};
+use crate::infra::http::{HttpClientOpts, build};
 use crate::infra::json_rpc::{
     BloxroutePrivateTxParams, BloxrouteRequest, JsonRpcRequest, JsonRpcResponse, JsonRpcResult,
 };
@@ -20,16 +20,19 @@ const BLOXROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BLOXROUTE_API_URL: &str = "https://api.blxrbdn.com";
 
-static HTTP: LazyLock<Client> = LazyLock::new(|| {
-    build_static(
-        HttpClientOpts {
-            timeout: SUBMIT_TIMEOUT,
-            pool_max_idle_per_host: 4,
-            max_redirects: 0,
-        },
-        "private submit",
-    )
+static HTTP: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    build(HttpClientOpts {
+        timeout: SUBMIT_TIMEOUT,
+        pool_max_idle_per_host: 4,
+        max_redirects: 0,
+    })
+    .map_err(|err| err.to_string())
 });
+
+fn http() -> anyhow::Result<&'static Client> {
+    HTTP.as_ref()
+        .map_err(|err| anyhow::anyhow!("private submit HTTP client unavailable: {err}"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateSubmitMode {
@@ -52,7 +55,18 @@ pub struct PrivateSubmitProbe {
 
 /// Probe an RPC URL for private-transaction capabilities (no wallet required).
 pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
-    let client = &*HTTP;
+    let client = match http() {
+        Ok(client) => client,
+        Err(err) => {
+            return PrivateSubmitProbe {
+                url: url.to_string(),
+                chain_id_ok: false,
+                supports_private_rpc_method: false,
+                private_method_error: Some(err.to_string()),
+                recommended_mode: PrivateSubmitMode::Standard,
+            };
+        }
+    };
     let chain_id_ok = match client
         .post(url)
         .timeout(BLOXROUTE_PROBE_TIMEOUT)
@@ -259,7 +273,8 @@ async fn post_bloxroute(
     auth_header: &str,
     timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
-    HTTP.post(BLOXROUTE_API_URL)
+    http()?
+        .post(BLOXROUTE_API_URL)
         .timeout(timeout)
         .header("Authorization", normalize_bloxroute_auth(auth_header))
         .json(body)
@@ -277,7 +292,7 @@ pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Res
         method: "eth_sendRawTransactionPrivate",
         params: vec![raw_hex],
     };
-    let resp = HTTP
+    let resp = http()?
         .post(url)
         .json(&body)
         .send()
