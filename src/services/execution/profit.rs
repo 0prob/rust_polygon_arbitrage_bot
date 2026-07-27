@@ -1312,6 +1312,25 @@ mod safety_tests {
     }
 
     #[test]
+    fn configured_min_profit_and_roi_both_gate_execution() {
+        let mut i = input();
+        i.flash_loan_source = FlashLoanSource::Direct;
+        i.gross_profit = U256::from(100u64);
+        i.amount_in = U256::from(1_000u64);
+        i.gas_units = 0;
+        i.gas_price_wei = U256::ZERO;
+        i.slippage_bps = 0;
+        i.safety_multiplier_bps = 0;
+        i.min_profit_matic_wei = U256::from(101u64);
+        assert!(!assess_profit(&i).should_execute);
+        i.min_profit_matic_wei = U256::from(100u64);
+        i.min_profit_roi_bps = 1_001;
+        assert!(!assess_profit(&i).should_execute);
+        i.min_profit_roi_bps = 1_000;
+        assert!(assess_profit(&i).should_execute);
+    }
+
+    #[test]
     fn zero_slippage_preserves_full_profit() {
         let mut i = input();
         i.slippage_bps = 0;
@@ -1448,6 +1467,46 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
+        #[test]
+        fn direct_modeled_net_and_gas_match_assessment_across_u256_ranges(
+            gross in 0u128..10u128.pow(30),
+            amount_in in 1u128..10u128.pow(30),
+            slippage in 0u64..10_000u64,
+            gas_units in 0u32..1_000_000u32,
+            gas_price in 0u64..1_000_000_000_000u64,
+        ) {
+            let gross = U256::from(gross);
+            let amount_in = U256::from(amount_in);
+            let gas_price = U256::from(gas_price);
+            let modeled = modeled_net_profit_tokens(
+                gross,
+                amount_in,
+                slippage,
+                FlashLoanSource::Direct,
+            ).expect("valid direct model");
+            let assessment = assess_profit(&AssessProfitInput {
+                gross_profit: gross,
+                amount_in,
+                gas_units,
+                gas_price_wei: gas_price,
+                charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+                token_to_matic_rate: RATE_PRECISION,
+                token_decimals: 18,
+                hop_count: 3,
+                min_profit_matic_wei: U256::ZERO,
+                min_profit_roi_bps: 0,
+                slippage_bps: slippage,
+                flash_loan_source: FlashLoanSource::Direct,
+                safety_multiplier_bps: 0,
+                profit_priority_alpha_bps: 0,
+            });
+            let gas = U256::from(gas_units) * gas_price;
+            prop_assert_eq!(assessment.net_profit, modeled);
+            prop_assert_eq!(assessment.gas_cost_wei, gas);
+            prop_assert_eq!(assessment.gas_cost_in_tokens, gas);
+            prop_assert_eq!(assessment.net_profit_after_gas, modeled.saturating_sub(gas));
+        }
+
         #[test]
         fn modeled_net_matches_assessment_zero_gas(
             gross in 1u64..1_000_000u64,

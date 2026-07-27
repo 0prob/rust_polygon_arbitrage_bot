@@ -109,14 +109,14 @@ impl Drop for RouteStatsWriter {
 }
 
 fn route_stats_writer_loop(path: PathBuf, rx: mpsc::Receiver<RouteStatsMsg>) {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            crate::error!(
-                "route stats directory create failed: {}: {err}",
-                parent.display()
-            );
-            return;
-        }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        crate::error!(
+            "route stats directory create failed: {}: {err}",
+            parent.display()
+        );
+        return;
     }
     let mut file = match std::fs::OpenOptions::new()
         .append(true)

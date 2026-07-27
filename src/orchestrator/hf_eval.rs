@@ -842,6 +842,11 @@ fn rank_one_cycle_probe(
     out
 }
 
+type RankedProbeSeeds = (
+    Vec<(u64, Arc<FoundCycle>)>,
+    FxHashMap<u64, (U256, MinimalSimResult)>,
+);
+
 #[allow(clippy::too_many_arguments)]
 pub fn rank_cycles_by_probe_net(
     arena: &StateArena,
@@ -861,10 +866,7 @@ pub fn rank_cycles_by_probe_net(
     execution: &ExecutionService,
     pool_metas: &[crate::pipeline::types::PoolMeta],
     route_sim_base_revision: u64,
-) -> (
-    Vec<(u64, Arc<FoundCycle>)>,
-    FxHashMap<u64, (U256, MinimalSimResult)>,
-) {
+) -> RankedProbeSeeds {
     if cycles.is_empty() || max_keep == 0 {
         return (Vec::new(), FxHashMap::default());
     }
@@ -1830,13 +1832,8 @@ fn evaluate_one(
     // Probe-size flash plan is often free Balancer; economic/optimal size often
     // needs Aave (5 bps). Brent under the wrong fee oversizes → prepare/dry-run miss.
     // One re-size under the true fee (+ provider liquidity hard-cap when known).
-    let flash_fee_changed = match (
-        flash_loan_fee_amount(flash_source, opt.optimal_input),
-        flash_loan_fee_amount(flash_source_brent, opt.optimal_input),
-    ) {
-        (Some(selected), Some(brent)) => selected != brent,
-        _ => return None,
-    };
+    let flash_fee_changed =
+        flash_fee_changed_for_amount(flash_source, flash_source_brent, opt.optimal_input)?;
     if !probe_only && flash_fee_changed {
         profit_ctx.flash_source = flash_source;
         let liq_cap = match flash_source {
@@ -1945,6 +1942,17 @@ fn evaluate_one(
     })
 }
 
+fn flash_fee_changed_for_amount(
+    selected_source: FlashLoanSource,
+    probe_source: FlashLoanSource,
+    amount: U256,
+) -> Option<bool> {
+    Some(
+        flash_loan_fee_amount(selected_source, amount)?
+            != flash_loan_fee_amount(probe_source, amount)?,
+    )
+}
+
 /// Recompute profitability after `sim` was updated (resim, on-chain verify, etc.).
 #[must_use]
 pub fn reassess_hf_eval_result(
@@ -2049,11 +2057,11 @@ fn apply_dispatch_gate(
     sim: &RouteSimulationResult,
     mut assessment: ProfitAssessment,
 ) -> ProfitAssessment {
-    if assessment.should_execute {
-        if let Some(reason) = dispatch_reject_reason(input, cycle, sim) {
-            assessment.should_execute = false;
-            assessment.reject_reason = Some(reason.into());
-        }
+    if assessment.should_execute
+        && let Some(reason) = dispatch_reject_reason(input, cycle, sim)
+    {
+        assessment.should_execute = false;
+        assessment.reject_reason = Some(reason.into());
     }
     assessment
 }
@@ -2139,6 +2147,53 @@ mod tests {
         assert_eq!(
             dispatch_input_floor(18, U256::from(8_000u64)),
             U256::from(8_000u64)
+        );
+    }
+
+    #[test]
+    fn aave_economic_size_reoptimizes_a_free_balancer_probe_on_assess_basis() {
+        use crate::services::execution::profit::{
+            AssessProfitInput, assess_profit, set_aave_flash_loan_fee_bps,
+            set_balancer_flash_loan_fee_pct,
+        };
+
+        set_balancer_flash_loan_fee_pct(0);
+        set_aave_flash_loan_fee_bps(5);
+        let amount = U256::from(1_000u64);
+        assert_eq!(
+            flash_fee_changed_for_amount(
+                FlashLoanSource::AaveV3,
+                FlashLoanSource::Balancer,
+                amount
+            ),
+            Some(true)
+        );
+        let assessment = |flash_loan_source| {
+            assess_profit(&AssessProfitInput {
+                gross_profit: U256::from(100u64),
+                amount_in: amount,
+                gas_units: 0,
+                gas_price_wei: U256::ZERO,
+                charged_priority_fee_per_gas:
+                    crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+                token_to_matic_rate: crate::core::math::fixed_point::ONE,
+                token_decimals: 18,
+                hop_count: 2,
+                min_profit_matic_wei: U256::ZERO,
+                min_profit_roi_bps: 0,
+                slippage_bps: 0,
+                flash_loan_source,
+                safety_multiplier_bps: 0,
+                profit_priority_alpha_bps: 0,
+            })
+        };
+        let balancer_probe = assessment(FlashLoanSource::Balancer);
+        let aave_economic = assessment(FlashLoanSource::AaveV3);
+        assert_eq!(
+            balancer_probe
+                .net_profit
+                .saturating_sub(aave_economic.net_profit),
+            U256::ONE
         );
     }
 

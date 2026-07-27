@@ -551,6 +551,16 @@ mod tests {
     }
 
     #[test]
+    fn invalid_pol_usd_fails_closed_for_final_profit_and_flash_cap() {
+        let rate = U256::from(10u128.pow(18));
+        for price in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(min_final_profit_matic_wei(price, None), None);
+            assert_eq!(max_flash_borrow_wei(50_000, 18, rate, price, None), None);
+        }
+        assert_eq!(min_final_profit_matic_wei(1.0, Some(I256::ZERO)), None);
+    }
+
+    #[test]
     fn required_profit_floor_honors_configured_minimum() {
         let configured = U256::from(30_000_000_000_000_000u64);
         assert_eq!(

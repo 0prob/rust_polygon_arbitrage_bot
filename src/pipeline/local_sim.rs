@@ -2856,6 +2856,39 @@ mod tests {
     }
 
     #[test]
+    fn v2_hop_matches_constant_product_fee_math() {
+        use crate::core::types::V2PoolState;
+
+        let reserve_in = U256::from(1_000_000u64);
+        let reserve_out = U256::from(2_000_000u64);
+        let amount_in = U256::from(10_000u64);
+        let state = PoolState::V2(V2PoolState {
+            reserve0: reserve_in,
+            reserve1: reserve_out,
+            fee: U256::from(997u64),
+            fee_denominator: U256::from(1_000u64),
+            block_timestamp_last: 0,
+        });
+        let edge = Edge {
+            pool_index: crate::core::types::PoolIndex(0),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let amount_in_after_fee = amount_in * U256::from(997u64);
+        let expected = amount_in_after_fee * reserve_out
+            / (reserve_in * U256::from(1_000u64) + amount_in_after_fee);
+        assert_eq!(
+            simulate_hop_amount_out(&state, &edge, amount_in),
+            Some(expected)
+        );
+    }
+
+    #[test]
     fn minimal_sim_diagnoses_v2_reserve_exhaustion() {
         use crate::core::constants::V2_MIN_RESERVE;
         use crate::core::types::V2PoolState;
