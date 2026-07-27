@@ -29,6 +29,10 @@ sol! {
     function convertSharesToTokens(uint256 shares) external view returns (uint256);
 }
 
+/// Alternate stMATIC / MaticX deployment addresses on Polygon mainnet.
+const ST_MATIC_ALT: Address = address!("0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4");
+const MATIC_X_ALT: Address = address!("0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6");
+
 /// Stader Labs Child Pool (`convertSharesToTokens`).
 const STADER_CHILD_POOL: Address = address!("0xfd225c9e6601c9d38d8f98d8731bf59efcf8c0e3");
 
@@ -39,7 +43,7 @@ static UNSUPPORTED_LST_VIEWS: AtomicU8 = AtomicU8::new(0);
 #[inline]
 #[must_use]
 pub fn is_lst_priced_token(addr: Address) -> bool {
-    addr == ST_MATIC || addr == MATIC_X
+    addr == ST_MATIC || addr == ST_MATIC_ALT || addr == MATIC_X || addr == MATIC_X_ALT
 }
 
 /// Fetch LST→MATIC rates for tokens present in `tokens` (keyed by TokenIndex).
@@ -57,9 +61,9 @@ where
         let Some(addr) = arena.token_address(idx) else {
             continue;
         };
-        if addr == ST_MATIC {
+        if addr == ST_MATIC || addr == ST_MATIC_ALT {
             want_stmatic.push(idx);
-        } else if addr == MATIC_X {
+        } else if addr == MATIC_X || addr == MATIC_X_ALT {
             want_maticx.push(idx);
         }
     }

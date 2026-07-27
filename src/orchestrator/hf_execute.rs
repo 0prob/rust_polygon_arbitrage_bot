@@ -19,12 +19,10 @@ use crate::pipeline::local_sim::{self, simulate_route_detailed_with_caps};
 use crate::pipeline::sim_sanity::required_profit_matic_wei;
 use crate::pipeline::types::MinimalSimResult;
 
-#[cfg(test)]
-use crate::pipeline::tick_fetch::is_cl_tick_on_hydrate_cooldown;
 use crate::pipeline::tick_fetch::{
     collect_v3_pool_addresses, collect_v4_tick_targets, hydrate_cl_ticks_with_rpc_fallback,
-    is_cl_tick_on_probe_cooldown, is_empty_tick_on_cooldown, is_empty_v4_tick_on_cooldown,
-    mark_probe_narrow_miss_v4, mark_tick_hydrate_timeout_cooldown,
+    is_cl_tick_on_hydrate_cooldown, is_cl_tick_on_probe_cooldown, is_empty_tick_on_cooldown,
+    is_empty_v4_tick_on_cooldown, mark_probe_narrow_miss_v4, mark_tick_hydrate_timeout_cooldown,
     mark_v4_tick_hydrate_timeout_cooldown, still_tickless_v3, still_tickless_v4,
 };
 use crate::services::execution::aave::{
@@ -1114,6 +1112,64 @@ pub(crate) fn cycle_v3_tickless_hf_hydrate_exhausted(
     saw_tickless
 }
 
+/// Select + pre-hydrate: only skip when every tickless CL hop is on **empty**
+/// (90s) cooldown. Narrow-miss (30s) is not a full-empty proof — live iter28
+/// `tickless_stuck_skip=11` treated it as stuck and emptied `selected=0` before
+/// wide TickLens could run. Post-hydrate drain still uses
+/// [`cycle_tickless_cl_hf_hydrate_exhausted`].
+#[must_use]
+pub(crate) fn cycle_tickless_cl_hf_empty_exhausted(
+    arena: &StateArena,
+    cycle: &FoundCycle,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> bool {
+    let mut saw_tickless = false;
+    for edge in &cycle.edges {
+        match edge.protocol {
+            crate::core::types::ProtocolType::UniswapV3 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V3(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                saw_tickless = true;
+                let Some(addr) = arena.pool_address(edge.pool_index) else {
+                    return false;
+                };
+                if !is_cl_tick_on_hydrate_cooldown(addr, None) {
+                    return false;
+                }
+            }
+            crate::core::types::ProtocolType::UniswapV4 => {
+                let tickless = matches!(
+                    arena.pool_state(edge.pool_index),
+                    Some(PoolState::V4(s)) if s.ticks.is_empty()
+                );
+                if !tickless {
+                    continue;
+                }
+                saw_tickless = true;
+                let Some(addr) = arena.pool_address(edge.pool_index) else {
+                    return false;
+                };
+                let Some(pool_id) =
+                    crate::pipeline::types::pool_meta_at(pool_metas, edge.pool_index)
+                        .and_then(|meta| meta.pool_id)
+                else {
+                    continue;
+                };
+                if !is_cl_tick_on_hydrate_cooldown(addr, Some(pool_id)) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_tickless
+}
+
 /// V3+V4 HF hydrate exhausted: every tickless CL hop is on empty-tick **or**
 /// probe_narrow_miss (V4: empty_v4 / narrow_v4 / missing pool_id).
 ///
@@ -1252,6 +1308,21 @@ pub(crate) fn cycle_has_cl_pool_on_miss_cooldown(
     false
 }
 
+/// Drop cycles stuck on proven-empty CL ticks (90s) before hydrate.
+/// Does **not** drain narrow-miss — those need wide TickLens this tick.
+pub(crate) fn drain_empty_tick_stuck_tickless_cycles(
+    arena: &StateArena,
+    cycles: &mut Vec<std::sync::Arc<FoundCycle>>,
+    pool_metas: &[crate::pipeline::types::PoolMeta],
+) -> usize {
+    if cycles.is_empty() {
+        return 0;
+    }
+    let before = cycles.len();
+    cycles.retain(|c| !cycle_tickless_cl_hf_empty_exhausted(arena, c.as_ref(), pool_metas));
+    before.saturating_sub(cycles.len())
+}
+
 /// Drop cycles stuck on cooldown-empty CL ticks so probe/Brent budget goes to tradeable routes.
 /// Returns how many cycles were removed. Empty remaining is fine (tick handles 0 cycles).
 pub(crate) fn drain_cooldown_stuck_tickless_cycles(
@@ -1314,7 +1385,7 @@ fn tickless_v3_addresses_prioritized<C: AsRef<FoundCycle>>(
             if !tickless || !seen.insert(addr) {
                 continue;
             }
-            if is_cl_tick_on_probe_cooldown(addr, None) {
+            if is_cl_tick_on_hydrate_cooldown(addr, None) {
                 blocked_sibling = true;
                 continue;
             }
@@ -1388,9 +1459,9 @@ fn tickless_v4_targets_prioritized<C: AsRef<FoundCycle>>(
                     };
                     let addr = arena.pool_address(idx);
                     let is_on_cooldown = addr
-                        .map(|addr| is_cl_tick_on_probe_cooldown(addr, Some(pool_id)))
+                        .map(|addr| is_cl_tick_on_hydrate_cooldown(addr, Some(pool_id)))
                         .unwrap_or_else(|| {
-                            is_cl_tick_on_probe_cooldown(Address::ZERO, Some(pool_id))
+                            is_cl_tick_on_hydrate_cooldown(Address::ZERO, Some(pool_id))
                         });
                     if is_on_cooldown {
                         blocked_sibling = true;

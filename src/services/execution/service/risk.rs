@@ -299,14 +299,16 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        // First-strike long cool only for true dust / weak-cover thin edges.
-        // Near-misses (cover≥1000, avail≥0.01) use 3-strike — live iter23 DODO
-        // cover=2661 / avail≈0.037 was 1h-cooled on first best-eval.
+        // First-strike: true dust / weak-cover thin, OR gas near-miss (cover≥1000).
+        // Near-misses used to need 3 strikes then 90s — live iter27 burned 3 evals
+        // on the same ~280 gwei snapshot then sat out 90s between rechecks.
+        let near_miss = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
+            && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
         let thin_first_strike = available_matic_wei
             < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
             || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
                 && cover_bps < CHRONIC_NEAR_MISS_COVER_BPS);
-        let strikes_needed = if thin_first_strike {
+        let strikes_needed = if thin_first_strike || near_miss {
             1
         } else {
             CHRONIC_UNDERWATER_STRIKES
@@ -315,11 +317,10 @@ impl ExecutionService {
             return None;
         }
         self.underwater_strikes.write().remove(&fingerprint);
-        // TTL tiers (live iter26: 4× first-strike 3600s on cover~70–575 emptied the
-        // HF window via rotation cool — no ge_1000 for the rest of the run):
-        //   wei-dust (<0.001 MATIC)     → 1h  (true junk)
-        //   thin weak-cover (<1000 bps) → 600s (was 1h — over-quarantined graph)
-        //   near-miss (≥1000 + ≥dust)   → 90s
+        // TTL tiers:
+        //   wei-dust (<0.001 MATIC)     → 1h
+        //   thin weak-cover (<1000 bps) → 600s
+        //   near-miss (≥1000 + ≥dust)   → 30s (1-strike sticky)
         //   else                         → 600s
         let ttl = if available_matic_wei
             < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
@@ -327,9 +328,7 @@ impl ExecutionService {
             CHRONIC_THIN_LIQ_QUARANTINE
         } else if thin_first_strike {
             CHRONIC_UNDERWATER_QUARANTINE
-        } else if gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
-            && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
-        {
+        } else if near_miss {
             CHRONIC_NEAR_MISS_QUARANTINE
         } else {
             CHRONIC_UNDERWATER_QUARANTINE

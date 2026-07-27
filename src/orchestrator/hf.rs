@@ -16,8 +16,9 @@ use crate::infra::rpc::RpcPool;
 use crate::orchestrator::hf_eval::HfEvalResult;
 use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_async};
 use crate::orchestrator::hf_execute::{
-    cycle_tickless_cl_hf_hydrate_exhausted, dispatch_profitable_candidates,
-    drain_cooldown_stuck_tickless_cycles, filter_balancer_onchain_verified,
+    cycle_tickless_cl_hf_empty_exhausted, dispatch_profitable_candidates,
+    drain_cooldown_stuck_tickless_cycles, drain_empty_tick_stuck_tickless_cycles,
+    filter_balancer_onchain_verified,
     hydrate_tickless_cl_for_cycles, probe_near_miss_balancer, refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
@@ -1015,11 +1016,11 @@ fn select_cycles_for_rescore(
     for cycle in snap_cycles {
         // Pool set unchanged by heal/realign — cheap live flag for drop staging.
         let live = cycle_activity_score(cycle.as_ref(), arena, partial_cache, activity_now) > 0;
-        // Skip when every tickless CL hop is hydrate-exhausted (EMPTY **or**
-        // probe_narrow_miss). EMPTY-only left narrow-miss phantoms through select
-        // until pre-hydrate drain (live iter21: wasted prefetch on stuck CL).
+        // Skip when every tickless CL hop is on EMPTY (90s) cooldown. Narrow-miss
+        // (30s) must still reach wide TickLens — live iter28: treating narrow as
+        // stuck yielded tickless_stuck_skip=11 / selected=0.
         // Live WSS: still admit (counted) — hydrate+probe can unlock after wake.
-        if cycle_tickless_cl_hf_hydrate_exhausted(arena, cycle.as_ref(), pool_metas) {
+        if cycle_tickless_cl_hf_empty_exhausted(arena, cycle.as_ref(), pool_metas) {
             if live {
                 live_drop_tickless += 1; // counted, still admitted
             } else {
@@ -2116,10 +2117,13 @@ pub async fn run_hf_tick(
     };
     let oracle_ms = now_ms().saturating_sub(oracle_started);
 
-    // Drop cooldown-stuck tickless cycles *before* hydrate so residual prep is not
-    // burned re-fetching pools already known empty this minute.
-    let stuck_before_hydrate =
-        drain_cooldown_stuck_tickless_cycles(&arena, &mut cycles, pool_metas_for_dispatch.as_ref());
+    // Drop proven-empty tickless cycles *before* hydrate. Narrow-miss stays so
+    // wide TickLens can run (iter28: full exhausted drain emptied the set).
+    let stuck_before_hydrate = drain_empty_tick_stuck_tickless_cycles(
+        &arena,
+        &mut cycles,
+        pool_metas_for_dispatch.as_ref(),
+    );
 
     // Hot-cache refresh drops CL ticks on price moves; hydrate tickless pools on
     // the selected HF set before probe ranking (otherwise cl_tickless dominates).
