@@ -191,9 +191,9 @@ impl MinimalProbeReject {
 
 #[derive(Default)]
 struct ProbeRankPartial {
-    profitable: Vec<(u64, U256, FoundCycle)>,
-    rescue: Vec<(u64, FoundCycle)>,
-    near_net: Vec<(u64, U256, FoundCycle)>,
+    profitable: Vec<(u64, U256, Arc<FoundCycle>)>,
+    rescue: Vec<(u64, Arc<FoundCycle>)>,
+    near_net: Vec<(u64, U256, Arc<FoundCycle>)>,
     seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
     skip: SkipCounters,
     minimal_sim_reasons: MinimalSimReasonCounts,
@@ -301,7 +301,7 @@ impl HfEvalInputOwned {
 #[derive(Clone)]
 pub struct HfEvalResult {
     pub route_fingerprint: u64,
-    pub cycle: FoundCycle,
+    pub cycle: Arc<FoundCycle>,
     pub opt: OptimizationResult,
     pub sim: RouteSimulationResult,
     pub assessment: ProfitAssessment,
@@ -320,8 +320,9 @@ fn try_rank_probe_minimal(
     cycle: &FoundCycle,
     start_decimals: u8,
     rate: U256,
+    route_sim_cache: Option<(&crate::pipeline::route_sim_cache::RouteSimCache, u64, u64)>,
 ) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
-    minimal_rank_probe(arena, cycle, start_decimals, rate)
+    minimal_rank_probe(arena, cycle, start_decimals, rate, route_sim_cache)
 }
 
 /// Shared minimal probe used by rank + simulatable checks.
@@ -330,6 +331,7 @@ fn minimal_rank_probe(
     cycle: &FoundCycle,
     start_decimals: u8,
     rate: U256,
+    route_sim_cache: Option<(&crate::pipeline::route_sim_cache::RouteSimCache, u64, u64)>,
 ) -> Result<(U256, MinimalSimResult), MinimalProbeReject> {
     let mut best: Option<(U256, MinimalSimResult)> = None;
     let mut saw_simulation = false;
@@ -348,9 +350,21 @@ fn minimal_rank_probe(
         if amount < economic_floor && !tickless_cap_trade {
             return;
         }
-        let Some(sim) =
-            simulate_route_minimal_with_caps(arena, &cycle.edges, amount, shallow_caps.as_ref())
-        else {
+        let sim = route_sim_cache
+            .and_then(|(cache, revision, fp)| cache.get(revision, fp, amount))
+            .or_else(|| {
+                let sim = simulate_route_minimal_with_caps(
+                    arena,
+                    &cycle.edges,
+                    amount,
+                    shallow_caps.as_ref(),
+                )?;
+                if let Some((cache, revision, fp)) = route_sim_cache {
+                    cache.insert(revision, fp, amount, sim);
+                }
+                Some(sim)
+            });
+        let Some(sim) = sim else {
             return;
         };
         saw_simulation = true;
@@ -403,7 +417,7 @@ fn cycle_simulatable(
     }
     let decimals = resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
     let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-    minimal_rank_probe(arena, cycle, decimals, rate).is_ok()
+    minimal_rank_probe(arena, cycle, decimals, rate, None).is_ok()
 }
 
 fn cycle_flash_evaluable(
@@ -468,17 +482,17 @@ fn simulatable_score_fallback(
 }
 
 fn select_probe_survivors(
-    mut profitable: Vec<(u64, U256, FoundCycle)>,
-    mut rescue: Vec<(u64, FoundCycle)>,
+    mut profitable: Vec<(u64, U256, Arc<FoundCycle>)>,
+    mut rescue: Vec<(u64, Arc<FoundCycle>)>,
     max_keep: usize,
     rescue_cap: usize,
-) -> Vec<(u64, FoundCycle)> {
+) -> Vec<(u64, Arc<FoundCycle>)> {
     // Primary: cover MATIC; secondary: gas-aware execution rank (not raw ratio).
     profitable.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| compare_cycle_execution(&a.2, &b.2))
     });
-    let mut kept: Vec<(u64, FoundCycle)> = profitable
+    let mut kept: Vec<(u64, Arc<FoundCycle>)> = profitable
         .into_iter()
         .take(max_keep)
         .map(|(fp, _, cycle)| (fp, cycle))
@@ -517,6 +531,7 @@ fn rank_one_cycle_probe(
     profit_priority_alpha_bps: u64,
     execution: &ExecutionService,
     pool_metas: &[crate::pipeline::types::PoolMeta],
+    route_sim_base_revision: u64,
 ) -> ProbeRankPartial {
     let mut out = ProbeRankPartial::default();
     let rotated = prefer_aave_flash_start(cycle_arc, arena, flash, flash_ttl, token_to_matic_rates);
@@ -528,7 +543,13 @@ fn rank_one_cycle_probe(
     } else {
         rotated
     };
+    let cycle = match cycle {
+        std::borrow::Cow::Borrowed(_) => Arc::clone(cycle_arc),
+        std::borrow::Cow::Owned(cycle) => Arc::new(cycle),
+    };
     let fp = hash_cycle_edges(&cycle.edges);
+    let route_state_revision =
+        arena.route_state_revision_with_base(&cycle.edges, route_sim_base_revision);
     if !route_fits_executor(&cycle.edges) {
         out.skip.executor_budget = 1;
         return out;
@@ -593,7 +614,14 @@ fn rank_one_cycle_probe(
         MinimalProbeReject::NoSimulation.record(&mut out.skip);
         return out;
     }
-    let (probe_amount, probe) = match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
+    let rank_cache = Some((execution.route_sim_cache.as_ref(), route_state_revision, fp));
+    let (probe_amount, probe) = match try_rank_probe_minimal(
+        arena,
+        &cycle,
+        start_decimals,
+        rate,
+        rank_cache,
+    ) {
         Ok(probe) => probe,
         Err(reject) => {
             let mut attempt_failures: Vec<Option<local_sim::MinimalSimFailure>> = Vec::new();
@@ -690,7 +718,7 @@ fn rank_one_cycle_probe(
                 }
             }
             if should_rescue_probe_reject(reject, &attempt_failures) {
-                out.rescue.push((fp, cycle.into_owned()));
+                out.rescue.push((fp, Arc::clone(&cycle)));
             } else {
                 if let MinimalProbeReject::SanityReject(reason) = &reject {
                     out.minimal_sim_reasons.record_sanity(*reason);
@@ -785,7 +813,7 @@ fn rank_one_cycle_probe(
                     }
                 }
             } else {
-                out.near_net.push((fp, cover_matic, cycle.into_owned()));
+                out.near_net.push((fp, cover_matic, Arc::clone(&cycle)));
             }
         }
         out.skip.net = 1;
@@ -810,7 +838,7 @@ fn rank_one_cycle_probe(
         probe.profit,
         ranked_probe.total_gas,
     );
-    out.profitable.push((fp, net_matic, cycle.into_owned()));
+    out.profitable.push((fp, net_matic, cycle));
     out
 }
 
@@ -832,7 +860,11 @@ pub fn rank_cycles_by_probe_net(
     profit_priority_alpha_bps: u64,
     execution: &ExecutionService,
     pool_metas: &[crate::pipeline::types::PoolMeta],
-) -> (Vec<FoundCycle>, FxHashMap<u64, (U256, MinimalSimResult)>) {
+    route_sim_base_revision: u64,
+) -> (
+    Vec<(u64, Arc<FoundCycle>)>,
+    FxHashMap<u64, (U256, MinimalSimResult)>,
+) {
     if cycles.is_empty() || max_keep == 0 {
         return (Vec::new(), FxHashMap::default());
     }
@@ -864,6 +896,7 @@ pub fn rank_cycles_by_probe_net(
                     profit_priority_alpha_bps,
                     execution,
                     pool_metas,
+                    route_sim_base_revision,
                 )
             })
             .reduce(ProbeRankPartial::default, ProbeRankPartial::merge)
@@ -888,6 +921,7 @@ pub fn rank_cycles_by_probe_net(
                     profit_priority_alpha_bps,
                     execution,
                     pool_metas,
+                    route_sim_base_revision,
                 )
             })
             .fold(ProbeRankPartial::default(), ProbeRankPartial::merge)
@@ -1018,6 +1052,7 @@ pub fn rank_cycles_by_probe_net(
                 if kept.len() >= total_cap {
                     break;
                 }
+                let cycle = Arc::new(cycle);
                 let fp = hash_cycle_edges(&cycle.edges);
                 if execution.cycle_edges_quarantined(&cycle.edges)
                     || execution.cycle_has_quarantined_token(arena, &cycle.edges)
@@ -1030,7 +1065,7 @@ pub fn rank_cycles_by_probe_net(
                 let start_decimals =
                     resolve_token_decimals_for_index(cycle.start_token, arena, token_decimals);
                 let rate = resolve_token_to_matic_rate(cycle.start_token, token_to_matic_rates);
-                match try_rank_probe_minimal(arena, &cycle, start_decimals, rate) {
+                match try_rank_probe_minimal(arena, &cycle, start_decimals, rate, None) {
                     Ok((amount, sim)) if !sim.profit.is_zero() => {
                         let economic_floor = min_economic_amount_in(start_decimals, rate);
                         // Same dust reject as near_net — below-floor seeds only feed
@@ -1214,8 +1249,7 @@ pub fn rank_cycles_by_probe_net(
     flash_loan.cache_generation = flash.generation();
     flash_loan.log_summary("probe_rank");
 
-    let kept_cycles = kept.into_iter().map(|(_, cycle)| cycle).collect();
-    (kept_cycles, probe_seeds)
+    (kept, probe_seeds)
 }
 
 #[derive(Default)]
@@ -1280,7 +1314,7 @@ fn load(c: &AtomicU32) -> u32 {
 
 #[must_use]
 pub fn evaluate_cycles_parallel(
-    cycles: &[FoundCycle],
+    cycles: &[(u64, Arc<FoundCycle>)],
     input: &HfEvalInput<'_>,
     probe_seeds: &FxHashMap<u64, (U256, MinimalSimResult)>,
 ) -> Vec<HfEvalResult> {
@@ -1289,12 +1323,12 @@ pub fn evaluate_cycles_parallel(
     let results: Vec<HfEvalResult> = if crate::util::should_use_rayon(cycles.len()) {
         cycles
             .par_iter()
-            .filter_map(|cycle| evaluate_one(cycle, input, probe_seeds, &stats))
+            .filter_map(|(fp, cycle)| evaluate_one(*fp, cycle, input, probe_seeds, &stats))
             .collect()
     } else {
         cycles
             .iter()
-            .filter_map(|cycle| evaluate_one(cycle, input, probe_seeds, &stats))
+            .filter_map(|(fp, cycle)| evaluate_one(*fp, cycle, input, probe_seeds, &stats))
             .collect()
     };
     if in_count > 0 && (results.len() < in_count || results.is_empty()) {
@@ -1357,17 +1391,18 @@ pub async fn rescore_rank_and_evaluate_async(
             input.profit_priority_alpha_bps,
             input.execution.as_ref(),
             input.pool_metas.as_ref(),
+            input.route_sim_base_revision,
         );
         // Drop cooled routes/tokens and claim exclusive assess (live iter15: concurrent
         // HF ticks → assess_q 693; iter16: try_claim passed but evaluate_one still hit
         // quarantine=1 via FoT token cool — same counter, not checked at claim).
         let cycles: Vec<_> = cycles
             .into_iter()
-            .filter(|c| {
+            .filter(|(_, cycle)| {
                 !input
                     .execution
-                    .cycle_has_quarantined_token(&input.arena, &c.edges)
-                    && input.execution.try_claim_route_assess(&c.edges)
+                    .cycle_has_quarantined_token(&input.arena, &cycle.edges)
+                    && input.execution.try_claim_route_assess(&cycle.edges)
             })
             .collect();
         if !cycles.is_empty() {
@@ -1567,6 +1602,7 @@ fn build_brent_probe_seeds(
     start_decimals: u8,
     start_rate: U256,
     probe_seed: Option<(U256, MinimalSimResult)>,
+    route_sim_cache: Option<(&crate::pipeline::route_sim_cache::RouteSimCache, u64, u64)>,
 ) -> Vec<(U256, MinimalSimResult)> {
     let mut seeds = Vec::with_capacity(2);
     if let Some(pair) = probe_seed {
@@ -1580,9 +1616,21 @@ fn build_brent_probe_seeds(
         if seeds.iter().any(|(a, _)| *a == amount) {
             return;
         }
-        let Some(sim) =
-            simulate_route_minimal_with_caps(arena, &cycle.edges, amount, shallow_caps.as_ref())
-        else {
+        let sim = route_sim_cache
+            .and_then(|(cache, revision, fp)| cache.get(revision, fp, amount))
+            .or_else(|| {
+                let sim = simulate_route_minimal_with_caps(
+                    arena,
+                    &cycle.edges,
+                    amount,
+                    shallow_caps.as_ref(),
+                )?;
+                if let Some((cache, revision, fp)) = route_sim_cache {
+                    cache.insert(revision, fp, amount, sim);
+                }
+                Some(sim)
+            });
+        let Some(sim) = sim else {
             return;
         };
         if sim.profit.is_zero() {
@@ -1605,13 +1653,13 @@ fn build_brent_probe_seeds(
 }
 
 fn evaluate_one(
-    cycle: &FoundCycle,
+    fp: u64,
+    cycle: &Arc<FoundCycle>,
     input: &HfEvalInput<'_>,
     probe_seeds: &FxHashMap<u64, (U256, MinimalSimResult)>,
     stats: &EvalFailStats,
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
-    let fp = hash_cycle_edges(&cycle.edges);
     let route_state_revision = input
         .arena
         .route_state_revision_with_base(&cycle.edges, input.route_sim_base_revision);
@@ -1694,8 +1742,18 @@ fn evaluate_one(
         fingerprint: fp,
         calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(&cycle.edges),
     };
-    let brent_seeds =
-        build_brent_probe_seeds(input.arena, cycle, start_decimals, start_rate, probe_seed);
+    let brent_seeds = build_brent_probe_seeds(
+        input.arena,
+        cycle,
+        start_decimals,
+        start_rate,
+        probe_seed,
+        Some((
+            input.execution.route_sim_cache.as_ref(),
+            route_state_revision,
+            fp,
+        )),
+    );
     let brent_seed_slice = (!brent_seeds.is_empty()).then_some(brent_seeds.as_slice());
     // Shared CL shallow caps for post-Brent detailed walks.
     let route_shallow_caps = precompute_route_shallow_caps(input.arena, &cycle.edges);
@@ -1919,7 +1977,7 @@ fn evaluate_one(
 
     Some(HfEvalResult {
         route_fingerprint: fp,
-        cycle: cycle.clone(),
+        cycle: Arc::clone(cycle),
         opt,
         sim,
         assessment,
@@ -2039,7 +2097,10 @@ fn validate_optimized_sim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{CycleEdges, TokenIndex};
+    use crate::core::types::{CycleEdges, Edge, FoundCycle, ProtocolType, TokenIndex};
+    use crate::pipeline::route_sim_cache::RouteSimCache;
+    use crate::test_support::FixtureBuilder;
+    use std::sync::atomic::Ordering;
 
     fn cycle(id: u32) -> FoundCycle {
         FoundCycle {
@@ -2053,17 +2114,34 @@ mod tests {
         }
     }
 
+    fn arc_cycle(id: u32) -> Arc<FoundCycle> {
+        Arc::new(cycle(id))
+    }
+
     #[test]
     fn profitable_probe_routes_fill_full_cap_before_rescues() {
         let profitable = (0..8)
-            .map(|id| (u64::from(id), U256::from(100u32 - id), cycle(id)))
+            .map(|id| (u64::from(id), U256::from(100u32 - id), arc_cycle(id)))
             .collect();
-        let kept = select_probe_survivors(profitable, vec![(99, cycle(99))], 8, 2);
+        let kept = select_probe_survivors(profitable, vec![(99, arc_cycle(99))], 8, 2);
         assert_eq!(kept.len(), 8);
         assert!(
             kept.iter()
                 .all(|(_, cycle)| cycle.start_token != TokenIndex(99))
         );
+    }
+
+    #[test]
+    fn probe_survivor_keeps_shared_cycle() {
+        let cycle = arc_cycle(1);
+        let kept = select_probe_survivors(
+            vec![(1, U256::from(100u8), Arc::clone(&cycle))],
+            Vec::new(),
+            1,
+            0,
+        );
+
+        assert!(Arc::ptr_eq(&kept[0].1, &cycle));
     }
 
     #[test]
@@ -2076,12 +2154,16 @@ mod tests {
     #[test]
     fn rescue_routes_only_backfill_unused_capacity() {
         let profitable = vec![
-            (1, U256::from(100u8), cycle(1)),
-            (2, U256::from(90u8), cycle(2)),
+            (1, U256::from(100u8), arc_cycle(1)),
+            (2, U256::from(90u8), arc_cycle(2)),
         ];
         let kept = select_probe_survivors(
             profitable,
-            vec![(10, cycle(10)), (11, cycle(11)), (12, cycle(12))],
+            vec![
+                (10, arc_cycle(10)),
+                (11, arc_cycle(11)),
+                (12, arc_cycle(12)),
+            ],
             4,
             2,
         );
@@ -2094,7 +2176,11 @@ mod tests {
     fn rescues_fill_when_no_profitable_probes() {
         let kept = select_probe_survivors(
             Vec::new(),
-            vec![(10, cycle(10)), (11, cycle(11)), (12, cycle(12))],
+            vec![
+                (10, arc_cycle(10)),
+                (11, arc_cycle(11)),
+                (12, arc_cycle(12)),
+            ],
             4,
             2,
         );
@@ -2165,5 +2251,83 @@ mod tests {
         aggregate.merge(reduced);
 
         assert_eq!(aggregate.probe(), 2);
+    }
+
+    #[test]
+    fn rank_probe_reuses_route_cache_for_unchanged_revision() {
+        let mut fixture = FixtureBuilder::new();
+        let a = fixture.token(1);
+        let b = fixture.token(2);
+        let first = fixture.v2_pool(
+            3,
+            ProtocolType::UniswapV2,
+            a,
+            b,
+            U256::from(1_100u64) * U256::from(10u128.pow(18)),
+            U256::from(900u64) * U256::from(10u128.pow(18)),
+            30,
+        );
+        let second = fixture.v2_pool(
+            4,
+            ProtocolType::UniswapV2,
+            b,
+            a,
+            U256::from(900u64) * U256::from(10u128.pow(18)),
+            U256::from(1_200u64) * U256::from(10u128.pow(18)),
+            30,
+        );
+        let cycle = FoundCycle {
+            start_token: a,
+            edges: CycleEdges::from_slice(&[
+                Edge {
+                    pool_index: first,
+                    token_in: a,
+                    token_out: b,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                Edge {
+                    pool_index: second,
+                    token_in: b,
+                    token_out: a,
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: 0.0,
+            cumulative_fee_bps: 60,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        };
+        let cache = RouteSimCache::new();
+        let fp = hash_cycle_edges(&cycle.edges);
+        let revision = fixture
+            .arena
+            .route_state_revision_with_base(&cycle.edges, 1);
+
+        let _ = minimal_rank_probe(
+            &fixture.arena,
+            &cycle,
+            18,
+            U256::from(10u128.pow(18)),
+            Some((&cache, revision, fp)),
+        );
+        let hits_before = cache.stats.hits.load(Ordering::Relaxed);
+        let _ = minimal_rank_probe(
+            &fixture.arena,
+            &cycle,
+            18,
+            U256::from(10u128.pow(18)),
+            Some((&cache, revision, fp)),
+        );
+
+        assert!(cache.stats.hits.load(Ordering::Relaxed) > hits_before);
     }
 }

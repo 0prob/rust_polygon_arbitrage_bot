@@ -451,7 +451,7 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
         collect_flash_tokens_for_cycle(arena, &route.cycle, &mut flash_seen, &mut flash_tokens);
     }
     let dispatch_pools = collect_route_pool_addresses(arena, &profitable);
-    let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| &r.cycle).collect();
+    let dispatch_cycles: Vec<&FoundCycle> = profitable.iter().map(|r| r.cycle.as_ref()).collect();
     let mut dispatch_state_generation = state_generation;
     let mut dispatch_state_block = state_block;
     let mut dispatch_state_hash = state_hash;
@@ -732,7 +732,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     let search_low = evaluated.opt.search_low;
     let adaptive_flash_cap_bound = evaluated.adaptive_flash_cap_bound;
     let evaluated = crate::services::execution::candidate::evaluated_from_sim(
-        evaluated.cycle,
+        evaluated.cycle.as_ref().clone(),
         evaluated.sim,
         evaluated.assessment,
         route_slippage_bps,
