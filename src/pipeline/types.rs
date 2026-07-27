@@ -16,6 +16,8 @@ pub enum GraphHopPhase {
     ExitPool,
 }
 
+pub use crate::pipeline::graph_base_view::{GraphAggregateIndex, GraphBaseView};
+
 #[derive(Debug, Clone, Copy)]
 pub struct GraphEdge {
     pub edge: Edge,
@@ -69,6 +71,7 @@ pub struct RoutingGraph {
     /// Cached cycle-capable coverage from Tarjan bridge search.
     /// Refreshed when thinning removes edges or on first build, not on weight-only rescoring.
     pub coverage: Option<std::sync::Arc<crate::pipeline::cycle_finder::CycleCapableCoverage>>,
+    base_view: Option<GraphBaseView>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +108,7 @@ impl RoutingGraph {
             v4_singleton_hub: None,
             pool_edge_positions: Vec::new(),
             coverage: None,
+            base_view: None,
         }
     }
 
@@ -180,6 +184,7 @@ impl RoutingGraph {
         self.token_count = token_count;
         // Token/hub renumbering invalidates bridge coverage indices.
         self.coverage = None;
+        self.base_view = None;
     }
 
     #[inline]
@@ -217,11 +222,35 @@ impl RoutingGraph {
             self.pool_edge_positions.resize(pool_idx + 1, Vec::new());
         }
         self.pool_edge_positions[pool_idx].push((idx, pos));
+        self.base_view = None;
+    }
+
+    #[must_use]
+    pub const fn base_view(&self) -> Option<&GraphBaseView> {
+        self.base_view.as_ref()
+    }
+
+    pub fn invalidate_base_view(&mut self) {
+        self.base_view = None;
+    }
+
+    pub fn rebuild_base_view(&mut self) {
+        self.base_view = Some(GraphBaseView::build(self));
+    }
+
+    pub fn patch_base_view_nodes(&mut self, nodes: &[usize], pools: &[PoolIndex]) {
+        if let Some(mut view) = self.base_view.take() {
+            view.patch(self, nodes, pools);
+            self.base_view = Some(view);
+        }
     }
 
     /// Pools with at least one live (tradable) directed edge in adjacency.
     #[must_use]
     pub fn active_pool_count(&self) -> usize {
+        if let Some(view) = self.base_view() {
+            return view.aggregate_index().active_pools;
+        }
         let mut live = rustc_hash::FxHashSet::default();
         for adj in &self.adjacency {
             for ge in adj {

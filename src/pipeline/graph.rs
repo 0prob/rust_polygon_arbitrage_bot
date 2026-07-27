@@ -838,6 +838,7 @@ pub(crate) fn remove_pool_edges_from_graph(graph: &mut RoutingGraph, pool: PoolI
     }
     rebuild_pool_edge_positions_for_pools(graph, reindex);
     graph.coverage = None;
+    graph.invalidate_base_view();
 }
 
 pub(crate) fn attach_pool_to_graph(
@@ -997,25 +998,33 @@ pub fn topology_stats(graph: &RoutingGraph) -> GraphTopologyStats {
         virtual_hubs: graph.virtual_hubs.len(),
         ..GraphTopologyStats::default()
     };
-    for (adj_idx, adj) in graph.adjacency.iter().enumerate() {
-        for ge in adj {
-            match ge.phase {
-                GraphHopPhase::Direct => {
-                    if is_live_graph_edge(ge) {
-                        stats.live_direct_edges += 1;
-                    } else {
-                        stats.dead_direct_edges += 1;
+    if let Some(view) = graph.base_view() {
+        let aggregate = view.aggregate_index();
+        stats.live_direct_edges = aggregate.live_direct_edges;
+        stats.dead_direct_edges = aggregate.dead_direct_edges;
+        stats.hub_leg_edges = aggregate.hub_leg_edges;
+        stats.active_pools = aggregate.active_pools;
+    } else {
+        for (adj_idx, adj) in graph.adjacency.iter().enumerate() {
+            for ge in adj {
+                match ge.phase {
+                    GraphHopPhase::Direct => {
+                        if is_live_graph_edge(ge) {
+                            stats.live_direct_edges += 1;
+                        } else {
+                            stats.dead_direct_edges += 1;
+                        }
                     }
-                }
-                GraphHopPhase::EnterPool | GraphHopPhase::ExitPool => {
-                    if adj_idx < stats.token_slots && is_live_graph_edge(ge) {
-                        stats.hub_leg_edges += 1;
+                    GraphHopPhase::EnterPool | GraphHopPhase::ExitPool => {
+                        if adj_idx < stats.token_slots && is_live_graph_edge(ge) {
+                            stats.hub_leg_edges += 1;
+                        }
                     }
                 }
             }
         }
+        stats.active_pools = graph.active_pool_count();
     }
-    stats.active_pools = graph.active_pool_count();
     stats.cycle_capable_pools = graph
         .coverage
         .as_ref()
@@ -1259,6 +1268,7 @@ pub fn build_graph_with_gate(
 pub fn rescore_graph_in_place(arena: &StateArena, graph: &mut RoutingGraph) {
     rescore_adjacency(arena, &mut graph.adjacency);
     compact_token_adjacency(graph, None);
+    graph.rebuild_base_view();
 }
 
 /// Rescore only dirty pools when the touch set is small; otherwise rescore all edges.
@@ -1322,6 +1332,12 @@ pub fn rescore_pools_in_place(
     touched_pools.dedup();
     affected_adjacencies.sort_unstable();
     affected_adjacencies.dedup();
+    let mut aggregate_pools = pools.to_vec();
+    for &adj_idx in &affected_adjacencies {
+        if let Some(adj) = graph.adjacency.get(adj_idx) {
+            aggregate_pools.extend(adj.iter().map(|edge| edge.edge.pool_index));
+        }
+    }
     let token_count = graph.token_count as usize;
     let compact_slots: Vec<usize> = affected_adjacencies
         .iter()
@@ -1352,6 +1368,7 @@ pub fn rescore_pools_in_place(
             rebuild_pool_edge_positions_for_pools(graph, touched_pools.iter().copied());
         }
     }
+    graph.patch_base_view_nodes(&affected_adjacencies, &aggregate_pools);
     touched
 }
 
@@ -2026,14 +2043,26 @@ mod tests {
             pool_meta_from_pair(dust_pool, ProtocolType::UniswapV2, a, b, 30),
         ];
         let mut graph = build_graph(&arena, &metas);
+        assert!(graph.base_view().is_some());
         assert_eq!(graph.active_pool_count(), 2);
         let dust_idx = dust_pool.0 as usize;
+        let dirty_nodes: Vec<usize> = graph.pool_edge_positions[dust_idx]
+            .iter()
+            .map(|&(node, _)| node)
+            .collect();
         for &(adj_idx, edge_pos) in &graph.pool_edge_positions[dust_idx].clone() {
             let ge = &mut graph.adjacency[adj_idx][edge_pos];
             ge.log_weight = DEAD_EDGE_LOG_WEIGHT;
             ge.ratio = U256::ZERO;
         }
+        graph.patch_base_view_nodes(&dirty_nodes, &[dust_pool]);
         assert_eq!(graph.active_pool_count(), 1);
+        let aggregate = graph
+            .base_view()
+            .map(crate::pipeline::types::GraphBaseView::aggregate_index);
+        assert_eq!(aggregate.map(|index| index.active_pools), Some(1));
+        assert_eq!(aggregate.map(|index| index.live_direct_edges), Some(2));
+        assert_eq!(aggregate.map(|index| index.dead_direct_edges), Some(2));
         assert!(graph.pool_has_live_edges(live_pool));
         assert!(!graph.pool_has_live_edges(dust_pool));
     }

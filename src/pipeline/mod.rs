@@ -9,6 +9,7 @@ pub mod cycle_search;
 pub mod deadline;
 pub mod fetcher;
 pub mod graph;
+pub mod graph_base_view;
 pub mod graph_cache;
 pub mod local_sim;
 pub mod multicall;
