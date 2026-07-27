@@ -8,7 +8,7 @@ use alloy::primitives::{Address, I256, address};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use anyhow::Context;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reqwest::{Client, Url};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
@@ -17,6 +17,7 @@ use serde::Deserialize;
 pub(crate) const ORACLE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Hermes URL length stays bounded when many distinct feed ids are requested.
 const PYTH_FETCH_CHUNK: usize = 24;
+const PYTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 /// Reject Pyth quotes older than this (plan: ≤60s skew vs wall clock).
 const PYTH_MAX_PUBLISH_AGE_SECS: i64 = 60;
 /// Reject when `conf / price` exceeds 1% (plan: confidence ratio cap).
@@ -303,6 +304,7 @@ pub struct PriceOracle {
     cache_ttl: Duration,
     /// Coalesce concurrent MATIC/USD refreshes (HF ticks at 200ms can stampede).
     matic_refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pyth_retry_after: Mutex<Option<Instant>>,
 }
 
 impl PriceOracle {
@@ -322,6 +324,7 @@ impl PriceOracle {
             pyth_sourced: RwLock::new(rustc_hash::FxHashSet::default()),
             cache_ttl: Duration::from_millis(cache_ttl_ms),
             matic_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            pyth_retry_after: Mutex::new(None),
         }
     }
 
@@ -856,6 +859,32 @@ impl PriceOracle {
         if ids.is_empty() {
             return Ok((FxHashMap::default(), PythParseStats::default()));
         }
+        if self
+            .pyth_retry_after
+            .lock()
+            .is_some_and(|retry_after| Instant::now() < retry_after)
+        {
+            return Ok((FxHashMap::default(), PythParseStats::default()));
+        }
+        let result = self.fetch_pyth_uncooled(ids).await;
+        match result {
+            Ok(result) => {
+                self.pyth_retry_after.lock().take();
+                Ok(result)
+            }
+            Err(error) => {
+                self.pyth_retry_after
+                    .lock()
+                    .replace(Instant::now() + PYTH_FAILURE_COOLDOWN);
+                Err(error)
+            }
+        }
+    }
+
+    async fn fetch_pyth_uncooled(
+        &self,
+        ids: &[&str],
+    ) -> anyhow::Result<(FxHashMap<String, PythQuote>, PythParseStats)> {
         let chunks: Vec<&[&str]> = ids.chunks(PYTH_FETCH_CHUNK).collect();
         if chunks.len() == 1 {
             return self.fetch_pyth_chunk(chunks[0]).await;
@@ -1545,6 +1574,22 @@ mod tests {
         });
         assert_eq!(oracle.get_matic_usd_offline().await, DEFAULT_MATIC_USD);
         assert!(oracle.cached_matic_usd().is_none());
+    }
+
+    #[tokio::test]
+    async fn pyth_failure_cooldown_skips_repeat_request() {
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_string(),
+            DEFAULT_CACHE_TTL_MS,
+        );
+        assert!(oracle.fetch_pyth(&["feed"]).await.is_err());
+        let (quotes, stats) = oracle
+            .fetch_pyth(&["feed"])
+            .await
+            .expect("cooldown skips request");
+        assert!(quotes.is_empty());
+        assert_eq!(stats.parsed, 0);
     }
 
     #[test]
