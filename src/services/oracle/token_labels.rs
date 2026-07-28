@@ -651,4 +651,129 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         &address!("0x17840DF7CAa07e298b16E8612157B90ED231C973"),
         "DAO",
     ),
+    (
+        &address!("0x00D5149cDF7CEC8725bf50073c51c4fa58eCCa12"),
+        "POWER",
+    ),
+    (
+        &address!("0x0129258AeCD42b8A750FB13578A6E66B30b41a14"),
+        "CORN",
+    ),
+    (
+        &address!("0x012e89B2eBa5d449Ba6e5e3057F7112EC9C3FD86"),
+        "PBAKE",
+    ),
+    (
+        &address!("0x017CE65a6ac1726A69BeC4AfE0766e51C8d6465e"),
+        "ROLL",
+    ),
+    (
+        &address!("0x01bCEC6175FA9366D14b8275e95D0fA45702f696"),
+        "GORILLA",
+    ),
+    (
+        &address!("0x07150dCC5223CED5d3EF35D5D850FfA24Ad6be5B"),
+        "BALLZ",
+    ),
+    (
+        &address!("0x093b735dD3daEceDA74A4DC4352aF82EA54B806D"),
+        "SHIBABY",
+    ),
+    (
+        &address!("0x22734Bfa0bD1589BC283E78F672EdD5736503dfA"),
+        "CRAB",
+    ),
+    (
+        &address!("0x292F16a3D5Ad04fA2209aD0E65c58C4B9F7f16b8"),
+        "LMS",
+    ),
+    (
+        &address!("0x32934CB16DA43fd661116468c1B225Fc26CF9A8c"),
+        "SNE",
+    ),
+    (
+        &address!("0x6b140057F140e082B2501399915D9629751b011e"),
+        "POLYTOKEN",
+    ),
+    (
+        &address!("0x6cC2c94Bf853FcA7Ee473b2a7186D5251099697e"),
+        "APPLE",
+    ),
+    (
+        &address!("0x782eb3304F8b9adD877F13a5cA321f72c4AA9804"),
+        "PLATIN",
+    ),
+    (
+        &address!("0x7D41E0D59149F018D0D5B93F44B65f8ae0b90d6d"),
+        "GOLD",
+    ),
+    (
+        &address!("0x8b8E89fdB1Ec4696c604FCFEbeD2740E4c727900"),
+        "KTEST",
+    ),
+    (
+        &address!("0x91eE7D76599Fdc8da86FD291423139BF5D679CF0"),
+        "LMOOSE",
+    ),
+    (
+        &address!("0xBC6B630B014e941A921CDc0967AAea2a8aB932B5"),
+        "PCP",
+    ),
+    (
+        &address!("0xc2E93cC8E8EC96076D20f9d9d16f8d415D90CFb8"),
+        "MiniDoge",
+    ),
+    (
+        &address!("0xe4e8d9CfD123699a040219165E22Fa912D47147b"),
+        "PONA",
+    ),
+    (
+        &address!("0xE9f2e81894D34aefE7b6bBc89898fF92C39Db320"),
+        "UTOPIA",
+    ),
+    (
+        &address!("0xF501dd45a1198C2E1b5aEF5314A68B9006D842E0"),
+        "MTA",
+    ),
+    (
+        &address!("0xfd5962484BE2c3574D70131BF5D452CcC7C69F67"),
+        "UCT",
+    ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_unmapped_contract_labels_are_present() {
+        let labels = [
+            ("0x00D5149cDF7CEC8725bf50073c51c4fa58eCCa12", "POWER"),
+            ("0x0129258AeCD42b8A750FB13578A6E66B30b41a14", "CORN"),
+            ("0x012e89B2eBa5d449Ba6e5e3057F7112EC9C3FD86", "PBAKE"),
+            ("0x017CE65a6ac1726A69BeC4AfE0766e51C8d6465e", "ROLL"),
+            ("0x01bCEC6175FA9366D14b8275e95D0fA45702f696", "GORILLA"),
+            ("0x07150dCC5223CED5d3EF35D5D850FfA24Ad6be5B", "BALLZ"),
+            ("0x093b735dD3daEceDA74A4DC4352aF82EA54B806D", "SHIBABY"),
+            ("0x22734Bfa0bD1589BC283E78F672EdD5736503dfA", "CRAB"),
+            ("0x292F16a3D5Ad04fA2209aD0E65c58C4B9F7f16b8", "LMS"),
+            ("0x32934CB16DA43fd661116468c1B225Fc26CF9A8c", "SNE"),
+            ("0x6b140057F140e082B2501399915D9629751b011e", "POLYTOKEN"),
+            ("0x6cC2c94Bf853FcA7Ee473b2a7186D5251099697e", "APPLE"),
+            ("0x782eb3304F8b9adD877F13a5cA321f72c4AA9804", "PLATIN"),
+            ("0x7D41E0D59149F018D0D5B93F44B65f8ae0b90d6d", "GOLD"),
+            ("0x8b8E89fdB1Ec4696c604FCFEbeD2740E4c727900", "KTEST"),
+            ("0x91eE7D76599Fdc8da86FD291423139BF5D679CF0", "LMOOSE"),
+            ("0xBC6B630B014e941A921CDc0967AAea2a8aB932B5", "PCP"),
+            ("0xc2E93cC8E8EC96076D20f9d9d16f8d415D90CFb8", "MiniDoge"),
+            ("0xe4e8d9CfD123699a040219165E22Fa912D47147b", "PONA"),
+            ("0xE9f2e81894D34aefE7b6bBc89898fF92C39Db320", "UTOPIA"),
+            ("0xF501dd45a1198C2E1b5aEF5314A68B9006D842E0", "MTA"),
+            ("0xfd5962484BE2c3574D70131BF5D452CcC7C69F67", "UCT"),
+        ];
+        for (address, symbol) in labels {
+            let address = address.parse().expect("valid test address");
+            assert_eq!(lookup_symbol(&address), Some(symbol));
+        }
+    }
+}
