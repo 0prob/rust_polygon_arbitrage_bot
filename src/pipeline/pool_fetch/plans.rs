@@ -6,10 +6,11 @@ use crate::core::v4_storage::{V4_LIQUIDITY_OFFSET, compute_v4_pool_field_slot};
 use crate::pipeline::abi_cache::{
     ALGEBRA_GLOBAL_STATE, BALANCER_AMP, BALANCER_LINEAR_MAIN, BALANCER_LINEAR_RATE,
     BALANCER_LINEAR_TARGETS, BALANCER_LINEAR_WRAPPED, BALANCER_SCALING, BALANCER_SWAP_FEE,
-    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_CRYPTO_PRECISIONS, CURVE_CRYPTO_PRICE_SCALE,
-    CURVE_FEE, CURVE_GAMMA, CURVE_STORED_RATES, DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K,
-    DODO_LP_FEE, DODO_MT_FEE, DODO_PMM_STATE, DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN,
-    V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY, V3_SLOT0, encode_balancer_pool_tokens, encode_extsload,
+    BALANCER_WEIGHTS, CURVE_A, CURVE_BALANCES, CURVE_CRYPTO_PRECISIONS, CURVE_CRYPTO_PRICE_SCALE_0,
+    CURVE_CRYPTO_PRICE_SCALE_1, CURVE_FEE, CURVE_GAMMA, CURVE_PRICE_SCALE, CURVE_STORED_RATES,
+    DODO_BASE_RESERVE, DODO_BASE_TOKEN, DODO_I, DODO_K, DODO_LP_FEE, DODO_MT_FEE, DODO_PMM_STATE,
+    DODO_QUOTE_RESERVE, DODO_QUOTE_TOKEN, V2_GET_RESERVES, V3_FEE, V3_LIQUIDITY, V3_SLOT0,
+    encode_balancer_pool_tokens, encode_extsload,
 };
 use crate::pipeline::multicall::MulticallItem;
 use crate::services::discovery::{DiscoveredPool, resolve_v4_pool_id};
@@ -191,12 +192,28 @@ fn build_curve_plan(plan: &mut PoolFetchPlan) {
             CURVE_GAMMA.clone(),
             CallKind::CurveGamma,
         );
-        push_call(
-            plan,
-            plan.pool.address,
-            CURVE_CRYPTO_PRICE_SCALE.clone(),
-            CallKind::CurveCryptoPriceScale,
-        );
+        // Twocrypto: no-arg price_scale(); tricrypto: price_scale(0), price_scale(1).
+        if n <= 2 {
+            push_call(
+                plan,
+                plan.pool.address,
+                CURVE_PRICE_SCALE.clone(),
+                CallKind::CurveCryptoPriceScale,
+            );
+        } else {
+            push_call(
+                plan,
+                plan.pool.address,
+                CURVE_CRYPTO_PRICE_SCALE_0.clone(),
+                CallKind::CurveCryptoPriceScale,
+            );
+            push_call(
+                plan,
+                plan.pool.address,
+                CURVE_CRYPTO_PRICE_SCALE_1.clone(),
+                CallKind::CurveCryptoPriceScale,
+            );
+        }
         push_call(
             plan,
             plan.pool.address,
@@ -294,7 +311,11 @@ fn plan_call_capacity(
         ProtocolType::UniswapV4 => 2,
         ProtocolType::Dodo => 9,
         ProtocolType::CurveStable => curve_balance_slots(token_count).saturating_add(3),
-        ProtocolType::CurveCrypto => curve_balance_slots(token_count).saturating_add(5),
+        // balances + A + fee + gamma + (n-1) price_scale + precisions
+        ProtocolType::CurveCrypto => {
+            let n = curve_balance_slots(token_count);
+            n.saturating_add(4).saturating_add(n.saturating_sub(1).max(1))
+        }
         ProtocolType::BalancerV2 => {
             // tokens + fee + scaling, plus optional weights/amp/linear probes.
             let mut n = 3usize;
@@ -394,5 +415,61 @@ mod tests {
         let plan = build_plan_with_pool_id(&pool, pool.pool_id).expect("plan");
         assert!(plan.kinds.contains(&CallKind::BalancerWeights));
         assert!(plan.kinds.contains(&CallKind::BalancerAmp));
+    }
+
+    #[test]
+    fn curve_crypto_tricrypto_fetches_two_price_scales() {
+        let pool = DiscoveredPool {
+            pool_key: "0xcurve".into(),
+            address: Address::from([9u8; 20]),
+            protocol: ProtocolType::CurveCrypto,
+            protocol_label: "CURVE_CRYPTO".into(),
+            tokens: vec![
+                Address::from([1u8; 20]),
+                Address::from([2u8; 20]),
+                Address::from([3u8; 20]),
+            ],
+            fee_bps: 10,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: Some("crypto".into()),
+            created_block: 1,
+        };
+        let plan = build_plan_with_pool_id(&pool, None).expect("plan");
+        let scale_calls = plan
+            .kinds
+            .iter()
+            .filter(|k| matches!(k, CallKind::CurveCryptoPriceScale))
+            .count();
+        assert_eq!(scale_calls, 2);
+        assert!(plan.kinds.contains(&CallKind::CurveCryptoPrecisions));
+        assert!(!plan.kinds.contains(&CallKind::CurveRates));
+    }
+
+    #[test]
+    fn curve_crypto_twocrypto_uses_single_noarg_price_scale() {
+        let pool = DiscoveredPool {
+            pool_key: "0xcurve2".into(),
+            address: Address::from([8u8; 20]),
+            protocol: ProtocolType::CurveCrypto,
+            protocol_label: "CURVE_CRYPTO".into(),
+            tokens: vec![Address::from([1u8; 20]), Address::from([2u8; 20])],
+            fee_bps: 10,
+            tick_spacing: None,
+            pool_id: None,
+            pool_id_verified: false,
+            hooks: None,
+            pool_type: Some("crypto".into()),
+            created_block: 1,
+        };
+        let plan = build_plan_with_pool_id(&pool, None).expect("plan");
+        let scale_calls = plan
+            .kinds
+            .iter()
+            .filter(|k| matches!(k, CallKind::CurveCryptoPriceScale))
+            .count();
+        assert_eq!(scale_calls, 1);
     }
 }

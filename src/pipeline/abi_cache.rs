@@ -91,9 +91,16 @@ cached_view_call!(CURVE_A, ICurvePool::ACall {});
 cached_view_call!(CURVE_FEE, ICurvePool::feeCall {});
 cached_view_call!(CURVE_STORED_RATES, ICurvePool::stored_ratesCall {});
 cached_view_call!(CURVE_GAMMA, ICurvePool::gammaCall {});
+// Twocrypto / 2-coin crypto: no-arg `price_scale()`.
+cached_view_call!(CURVE_PRICE_SCALE, ICurvePool::price_scaleCall {});
+// Tricrypto: `price_scale(i)` for i in 0..n-2.
 cached_view_call!(
-    CURVE_CRYPTO_PRICE_SCALE,
+    CURVE_CRYPTO_PRICE_SCALE_0,
     ICurveCryptoPool::price_scaleCall { i: U256::ZERO }
+);
+cached_view_call!(
+    CURVE_CRYPTO_PRICE_SCALE_1,
+    ICurveCryptoPool::price_scaleCall { i: U256::from(1) }
 );
 cached_view_call!(CURVE_CRYPTO_PRECISIONS, ICurveCryptoPool::precisionsCall {});
 cached_view_call!(

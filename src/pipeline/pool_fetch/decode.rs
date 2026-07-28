@@ -290,39 +290,95 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
     Some(balances)
 }
 
-fn decode_curve_fee(results: &[Option<Bytes>], fee_idx: usize) -> Option<U256> {
-    decode_u256(results.get(fee_idx)?.as_ref()?)
+/// Classic StableSwap fee is ~4 bps in 1e10 units when `fee()` is absent.
+const DEFAULT_CURVE_FEE_1E10: u64 = 4_000_000;
+
+fn curve_fee_from_bps(fee_bps: u32) -> U256 {
+    if fee_bps == 0 {
+        return U256::from(DEFAULT_CURVE_FEE_1E10);
+    }
+    // Curve fee is 1e-10 fraction; 1 bps = 1e6 in that encoding.
+    U256::from(fee_bps).saturating_mul(U256::from(1_000_000u64))
+}
+
+fn decode_curve_fee(results: &[Option<Bytes>], fee_idx: usize, fee_bps: u32) -> U256 {
+    results
+        .get(fee_idx)
+        .and_then(|r| r.as_ref())
+        .and_then(decode_u256)
+        .unwrap_or_else(|| curve_fee_from_bps(fee_bps))
+}
+
+/// NG / metapools need live `stored_rates()`; classic plain pools do not expose it.
+fn curve_pool_requires_stored_rates(pool_type: Option<&str>) -> bool {
+    crate::core::protocol::is_curve_stableswap_ng_pool_type(pool_type)
+        || pool_type.is_some_and(|t| {
+            let b = t.as_bytes();
+            b.windows(4).any(|w| w.eq_ignore_ascii_case(b"meta"))
+        })
 }
 
 fn decode_curve_stored_rates(
+    plan: &PoolFetchPlan,
     results: &[Option<Bytes>],
     n_fetched: usize,
     rates_idx: usize,
 ) -> Option<Vec<U256>> {
-    let rates = results
+    let decoded = results
         .get(rates_idx)
         .and_then(|b| b.as_ref())
         .and_then(|b| ICurvePool::stored_ratesCall::abi_decode_returns(b).ok())
         .map(|r| r.iter().map(|&x| U256::from(x)).collect::<Vec<_>>());
-    let rates = rates?;
-    if rates.len() != n_fetched || rates.iter().any(U256::is_zero) {
+    if let Some(decoded) = decoded
+        && decoded.len() == n_fetched
+        && !decoded.iter().any(U256::is_zero)
+    {
+        return Some(decoded);
+    }
+    // Classic 2/3/4-coin stables lack `stored_rates()` — unit rates match on-chain xp=balances.
+    if curve_pool_requires_stored_rates(plan.pool.pool_type.as_deref()) {
         return None;
     }
-    Some(rates)
+    Some(vec![ONE; n_fetched])
 }
 
-fn decode_curve_crypto_rates(
-    n_fetched: usize,
-    price_scale: U256,
-    precisions: [U256; 2],
-) -> Option<Vec<U256>> {
-    if n_fetched != 2 || price_scale.is_zero() || precisions.iter().any(U256::is_zero) {
+/// `precisions()` is a fixed-size ABI array (2 for twocrypto, 3 for tricrypto) — decode raw words.
+fn decode_curve_precisions_words(bytes: &Bytes, n: usize) -> Option<Vec<U256>> {
+    if n < 2 || bytes.len() < n.saturating_mul(32) {
         return None;
     }
-    Some(vec![
-        precisions[0].checked_mul(ONE)?,
-        precisions[1].checked_mul(price_scale)?,
-    ])
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i * 32;
+        // Exact 32-byte words — do not use decode_abi_word (it takes the *last* word when len>32).
+        out.push(U256::from_be_slice(&bytes[start..start + 32]));
+    }
+    if out.iter().any(U256::is_zero) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Crypto rates: `rates[0]=p0*1e18`, `rates[i]=p_i*price_scale[i-1]` for i>0.
+fn decode_curve_crypto_rates(
+    n_fetched: usize,
+    price_scales: &[U256],
+    precisions: &[U256],
+) -> Option<Vec<U256>> {
+    if !(2..=3).contains(&n_fetched)
+        || precisions.len() != n_fetched
+        || price_scales.len() != n_fetched - 1
+        || precisions.iter().any(U256::is_zero)
+        || price_scales.iter().any(U256::is_zero)
+    {
+        return None;
+    }
+    let mut rates = Vec::with_capacity(n_fetched);
+    rates.push(precisions[0].checked_mul(ONE)?);
+    for i in 1..n_fetched {
+        rates.push(precisions[i].checked_mul(price_scales[i - 1])?);
+    }
+    Some(rates)
 }
 
 fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
@@ -332,8 +388,8 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
     let a_raw = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_curve_fee(results, fee_idx)?;
-    let rates = decode_curve_stored_rates(results, n_fetched, rates_idx)?;
+    let fee = decode_curve_fee(results, fee_idx, plan.pool.fee_bps);
+    let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
     if a_raw.is_zero() {
         return None;
     }
@@ -355,13 +411,17 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
 fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolState> {
     let balances = decode_curve_balances(plan, results)?;
     let n_fetched = balances.len();
+    if !(2..=3).contains(&n_fetched) {
+        return None;
+    }
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let gamma_idx = n_fetched + 2;
-    let price_scale_idx = n_fetched + 3;
-    let precisions_idx = n_fetched + 4;
+    let price_scale_start = n_fetched + 3;
+    let n_scales = n_fetched - 1;
+    let precisions_idx = price_scale_start + n_scales;
     let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_curve_fee(results, fee_idx)?;
+    let fee = decode_curve_fee(results, fee_idx, plan.pool.fee_bps);
     let gamma = results
         .get(gamma_idx)
         .and_then(|b| b.as_ref())
@@ -370,15 +430,22 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     if gamma.is_zero() || a.is_zero() {
         return None;
     }
-    let price_scale = results
-        .get(price_scale_idx)
-        .and_then(|b| b.as_ref())
-        .and_then(|b| ICurveCryptoPool::price_scaleCall::abi_decode_returns(b).ok())?;
-    let precisions = results
-        .get(precisions_idx)
-        .and_then(|b| b.as_ref())
-        .and_then(|b| ICurveCryptoPool::precisionsCall::abi_decode_returns(b).ok())?;
-    let rates = decode_curve_crypto_rates(n_fetched, price_scale, precisions)?;
+    let mut price_scales = Vec::with_capacity(n_scales);
+    for i in 0..n_scales {
+        let raw = results.get(price_scale_start + i)?.as_ref()?;
+        // Twocrypto: no-arg `price_scale()`; tricrypto: `price_scale(i)`.
+        let scale = if n_fetched == 2 {
+            ICurvePool::price_scaleCall::abi_decode_returns(raw).ok()
+        } else {
+            ICurveCryptoPool::price_scaleCall::abi_decode_returns(raw).ok()
+        }?;
+        if scale.is_zero() {
+            return None;
+        }
+        price_scales.push(scale);
+    }
+    let precisions = decode_curve_precisions_words(results.get(precisions_idx)?.as_ref()?, n_fetched)?;
+    let rates = decode_curve_crypto_rates(n_fetched, &price_scales, &precisions)?;
     Some(PoolState::Curve(CurvePoolState {
         balances,
         a,
@@ -731,6 +798,47 @@ mod tests {
     }
 
     #[test]
+    fn decode_curve_stable_legacy_without_stored_rates_is_tradable() {
+        let plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("stable".into()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::CurveBalance(0),
+                CallKind::CurveBalance(1),
+                CallKind::CurveA,
+                CallKind::CurveFee,
+                CallKind::CurveRates,
+            ],
+        };
+        let results = vec![
+            Some(Bytes::copy_from_slice(&abi_word(1_000_000_000_000_000_000))),
+            Some(Bytes::copy_from_slice(&abi_word(1_000_000_000_000_000_000))),
+            Some(Bytes::copy_from_slice(&abi_word(200))),
+            None, // fee() missing → discovery/default fallback
+            None, // stored_rates() missing → unit rates
+        ];
+
+        let Some(state) = decode_plan(&plan, &results) else {
+            panic!("legacy Curve stable should decode without stored_rates/fee");
+        };
+        let PoolState::Curve(curve) = &state else {
+            panic!("expected Curve state");
+        };
+        assert_eq!(curve.rates, vec![ONE, ONE]);
+        assert_eq!(curve.fee, U256::from(4_000_000u64));
+        assert!(state.is_tradable());
+    }
+
+    #[test]
     fn decode_v4_keeps_zero_lp_fee_from_slot0() {
         // sqrt=2^96, tick=0, protocol=0, lpFee=0 — indexer fee_bps must not win.
         let slot0 = U256::from(1u128 << 96);
@@ -1058,31 +1166,48 @@ mod tests {
     }
 
     #[test]
-    fn curve_crypto_rates_require_indexed_scale_and_precisions() {
-        let scale = U256::from(2_112_531_811_800_907_072u128);
-        let precisions = [
+    fn curve_crypto_rates_support_two_and_three_coins() {
+        let scale0 = U256::from(2_112_531_811_800_907_072u128);
+        let scale1 = U256::from(1_500_000_000_000_000_000u128);
+        let p2 = [
             U256::from(1_000_000_000_000u64),
             U256::from(1_000_000_000u64),
         ];
+        let p3 = [
+            U256::from(1_000_000_000_000u64),
+            U256::from(1_000_000_000u64),
+            U256::from(1u64),
+        ];
 
         assert_eq!(
-            decode_curve_crypto_rates(2, scale, precisions),
-            Some(vec![precisions[0] * ONE, precisions[1] * scale])
+            decode_curve_crypto_rates(2, &[scale0], &p2),
+            Some(vec![p2[0] * ONE, p2[1] * scale0])
         );
-        assert!(decode_curve_crypto_rates(2, U256::ZERO, precisions).is_none());
-        assert!(decode_curve_crypto_rates(3, scale, precisions).is_none());
+        assert_eq!(
+            decode_curve_crypto_rates(3, &[scale0, scale1], &p3),
+            Some(vec![p3[0] * ONE, p3[1] * scale0, p3[2] * scale1])
+        );
+        assert!(decode_curve_crypto_rates(2, &[U256::ZERO], &p2).is_none());
+        assert!(decode_curve_crypto_rates(3, &[scale0], &p3).is_none());
     }
 
     #[test]
-    fn curve_fee_requires_a_successful_multicall_result() {
-        assert_eq!(decode_curve_fee(&[None], 0), None);
+    fn curve_fee_falls_back_when_multicall_slot_missing() {
         assert_eq!(
-            decode_curve_fee(&[Some(Bytes::from_static(&[0u8; 31]))], 0),
-            None
+            decode_curve_fee(&[None], 0, 0),
+            U256::from(DEFAULT_CURVE_FEE_1E10)
         );
         assert_eq!(
-            decode_curve_fee(&[Some(Bytes::copy_from_slice(&abi_word(4_000_000)))], 0),
-            Some(U256::from(4_000_000u64))
+            decode_curve_fee(&[Some(Bytes::from_static(&[0u8; 31]))], 0, 0),
+            U256::from(DEFAULT_CURVE_FEE_1E10)
+        );
+        assert_eq!(
+            decode_curve_fee(&[None], 0, 4),
+            U256::from(4_000_000u64)
+        );
+        assert_eq!(
+            decode_curve_fee(&[Some(Bytes::copy_from_slice(&abi_word(5_000_000)))], 0, 4),
+            U256::from(5_000_000u64)
         );
     }
 
@@ -1116,13 +1241,34 @@ mod tests {
     }
 
     #[test]
-    fn curve_stored_rates_must_be_live_and_complete() {
+    fn legacy_curve_pool_without_stored_rates_uses_unit_rates() {
+        let mut plan = PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![Address::ZERO, Address::with_last_byte(1)],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some("stable".to_string()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: Vec::new(),
+        };
         let missing = vec![None];
-        assert_eq!(decode_curve_stored_rates(&missing, 2, 0), None);
+
+        assert_eq!(
+            decode_curve_stored_rates(&plan, &missing, 2, 0),
+            Some(vec![ONE, ONE])
+        );
+
+        plan.pool.pool_type = Some("stable_ng".to_string());
+        assert_eq!(decode_curve_stored_rates(&plan, &missing, 2, 0), None);
 
         let zero_rates = ICurvePool::stored_ratesCall::abi_encode_returns(&vec![ONE, U256::ZERO]);
         assert_eq!(
-            decode_curve_stored_rates(&[Some(Bytes::from(zero_rates))], 2, 0),
+            decode_curve_stored_rates(&plan, &[Some(Bytes::from(zero_rates))], 2, 0),
             None
         );
     }
