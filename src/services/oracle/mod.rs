@@ -276,10 +276,9 @@ const MERGED_RATES_SOFT_CAP: usize = 2_048;
 
 /// Merge LF enrich output into the prior rate map.
 ///
-/// Non-refreshed priors are always retained (enrich only covers cycle+hub tokens).
-/// Refreshed tokens present in `fresh` overwrite; refreshed tokens missing from
-/// `fresh` keep their prior rate when one exists (transient Hermes/hub misses
-/// must not wipe a still-usable quote). Soft-cap bounds retained map growth.
+/// Non-refreshed priors are retained because enrich only covers cycle+hub tokens.
+/// A refreshed token missing from `fresh` is dropped so a failed USD refresh
+/// cannot make an old rate look current in the next HF snapshot.
 ///
 /// `retain_stale_prior=false` forces a rebuild (new Arc) when the snapshot aged
 /// past quote TTL — it no longer wipes non-refreshed spokes.
@@ -299,7 +298,7 @@ pub fn merge_token_rates(
             .any(|(token, rate)| prior.get(token) != Some(rate))
         || refreshed_tokens
             .iter()
-            .any(|token| !prior.contains_key(token) && fresh.contains_key(token));
+            .any(|token| prior.contains_key(token) != fresh.contains_key(token));
     if !needs_merge {
         return Arc::clone(prior);
     }
@@ -307,16 +306,20 @@ pub fn merge_token_rates(
         .iter()
         .filter(|(token, _)| !refreshed_tokens.contains(token))
         .count();
-    let kept_stale_refreshed = refreshed_tokens
+    let dropped_refreshed = refreshed_tokens
         .iter()
         .filter(|t| prior.contains_key(t) && !fresh.contains_key(t))
         .count();
     let fresh_len = fresh.len();
     let mut merged =
         FxHashMap::with_capacity_and_hasher(prior.len().saturating_add(fresh.len()), FxBuildHasher);
-    // Keep all prior rates first; fresh overwrites successful refreshes.
-    // Unresolved refreshed tokens therefore retain their prior quote.
-    merged.extend(prior.iter().map(|(&token, &rate)| (token, rate)));
+    // Keep non-refreshed priors first; fresh overwrites successful refreshes.
+    merged.extend(
+        prior
+            .iter()
+            .filter(|(token, _)| !refreshed_tokens.contains(token))
+            .map(|(&token, &rate)| (token, rate)),
+    );
     merged.extend(fresh);
     // Soft-cap: drop excess priors not touched this tick.
     if merged.len() > MERGED_RATES_SOFT_CAP {
@@ -331,13 +334,13 @@ pub fn merge_token_rates(
             merged.remove(&k);
         }
     }
-    if kept_stale_refreshed > 0 || !retain_stale_prior {
+    if dropped_refreshed > 0 || !retain_stale_prior {
         crate::info!(
-            "token rates merge: prior={} fresh={} retained_prior={} kept_stale_refreshed={} merged={} retain_stale={}",
+            "token rates merge: prior={} fresh={} retained_prior={} dropped_refreshed={} merged={} retain_stale={}",
             prior.len(),
             fresh_len,
             retained_prior,
-            kept_stale_refreshed,
+            dropped_refreshed,
             merged.len(),
             retain_stale_prior
         );
@@ -844,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_token_rates_keeps_prior_when_refresh_unresolved() {
+    fn merge_token_rates_drops_prior_when_refresh_unresolved() {
         let prior = Arc::new(FxHashMap::from_iter([
             (TokenIndex(0), U256::from(1_000u64)),
             (TokenIndex(1), U256::from(2_000u64)),
@@ -853,10 +856,7 @@ mod tests {
 
         let merged = merge_token_rates(&prior, &refreshed, FxHashMap::default(), true);
 
-        assert_eq!(
-            merged.get(&TokenIndex(0)).copied(),
-            Some(U256::from(1_000u64))
-        );
+        assert!(merged.get(&TokenIndex(0)).is_none());
         assert_eq!(
             merged.get(&TokenIndex(1)).copied(),
             Some(U256::from(2_000u64))
