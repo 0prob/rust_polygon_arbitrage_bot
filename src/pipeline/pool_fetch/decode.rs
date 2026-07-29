@@ -448,6 +448,7 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
 
 fn decode_balancer_linear(
     vault_tokens: &[Address],
+    scaling_factors: &[U256],
     main_bytes: Option<&Bytes>,
     wrapped_bytes: Option<&Bytes>,
     targets_bytes: Option<&Bytes>,
@@ -461,8 +462,10 @@ fn decode_balancer_linear(
         IBalancerLinearPool::getWrappedTokenRateCall::abi_decode_returns(rate_bytes?).ok()?;
     let main_index = vault_tokens.iter().position(|t| *t == main)?;
     let wrapped_index = vault_tokens.iter().position(|t| *t == wrapped)?;
+    let main_scaling = *scaling_factors.get(main_index)?;
     if main_index == wrapped_index
         || U256::from(targets.upperTarget) < U256::from(targets.lowerTarget)
+        || main_scaling.is_zero()
         || U256::from(rate).is_zero()
     {
         return None;
@@ -470,8 +473,8 @@ fn decode_balancer_linear(
     Some(BalancerLinearState {
         main_index,
         wrapped_index,
-        lower_target: U256::from(targets.lowerTarget),
-        upper_target: U256::from(targets.upperTarget),
+        lower_target: U256::from(targets.lowerTarget).checked_mul(main_scaling)? / ONE,
+        upper_target: U256::from(targets.upperTarget).checked_mul(main_scaling)? / ONE,
         wrapped_rate: U256::from(rate),
     })
 }
@@ -581,6 +584,7 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
     // Kind-keyed linear fields — independent of call order / contiguity.
     let linear = decode_balancer_linear(
         &tokens.tokens,
+        &scaling_factors,
         linear_main,
         linear_wrapped,
         linear_targets,
@@ -624,6 +628,12 @@ mod tests {
     fn abi_word(value: u64) -> [u8; 32] {
         let mut out = [0u8; 32];
         out[24..].copy_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    fn abi_address(value: Address) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[12..].copy_from_slice(value.as_slice());
         out
     }
 
@@ -1287,6 +1297,31 @@ mod tests {
             ),
             Some(U256::from(3_000_000_000_000_000u64))
         );
+    }
+
+    #[test]
+    fn decode_balancer_linear_scales_six_decimal_main_targets() {
+        let main = Address::with_last_byte(1);
+        let wrapped = Address::with_last_byte(2);
+        let scale = ONE * U256::from(1_000_000_000_000u64);
+        let mut targets = Vec::with_capacity(64);
+        targets.extend_from_slice(&abi_word(50_000_000));
+        targets.extend_from_slice(&abi_word(150_000_000));
+
+        let linear = decode_balancer_linear(
+            &[main, wrapped],
+            &[scale, ONE],
+            Some(&Bytes::copy_from_slice(&abi_address(main))),
+            Some(&Bytes::copy_from_slice(&abi_address(wrapped))),
+            Some(&Bytes::from(targets)),
+            Some(&Bytes::copy_from_slice(&abi_word(
+                1_000_000_000_000_000_000,
+            ))),
+        )
+        .expect("linear state");
+
+        assert_eq!(linear.lower_target, U256::from(50u64) * ONE);
+        assert_eq!(linear.upper_target, U256::from(150u64) * ONE);
     }
 
     #[test]
