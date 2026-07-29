@@ -90,6 +90,12 @@ pub fn mul_ratio(a: U256, b: U256) -> Option<U256> {
     if a.is_zero() || b.is_zero() {
         return Some(U256::ZERO);
     }
+    if a == ONE {
+        return Some(b);
+    }
+    if b == ONE {
+        return Some(a);
+    }
     let product = U512::from(a).checked_mul(U512::from(b))? / ONE_U512;
     u512_to_u256_checked(product)
 }
@@ -879,6 +885,13 @@ mod tests {
         let huge = U256::MAX / U256::from(2u64);
         assert!(mul_ratio(huge, U256::MAX).is_none());
         assert_eq!(mul_ratio_saturating(huge, U256::MAX), U256::MAX);
+    }
+
+    #[test]
+    fn mul_ratio_preserves_identity() {
+        let ratio = ONE + U256::from(12_345u64);
+        assert_eq!(mul_ratio(ONE, ratio), Some(ratio));
+        assert_eq!(mul_ratio(ratio, ONE), Some(ratio));
     }
 
     #[test]

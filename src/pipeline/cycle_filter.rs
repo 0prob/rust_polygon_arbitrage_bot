@@ -428,21 +428,35 @@ pub fn cycle_key(edges: &[Edge]) -> u64 {
     h.finish()
 }
 
-/// Deduplicate by cycle key, keeping the best-scored variant.
-///
-/// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
-/// iterator chain directly without an intermediate `.collect()`.
-pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
+fn dedupe_cycles_by_key(
+    cycles: impl IntoIterator<Item = FoundCycle>,
+    key_for: impl Fn(&[Edge]) -> u64,
+) -> Vec<FoundCycle> {
     let cycles = cycles.into_iter();
     let (lower, upper) = cycles.size_hint();
     let mut best: FxHashMap<u64, FoundCycle> = FxHashMap::default();
+    let mut collisions: FxHashMap<u64, Vec<FoundCycle>> = FxHashMap::default();
     best.reserve(upper.unwrap_or(lower));
     for cycle in cycles {
-        let key = cycle_key(&cycle.edges);
+        let key = key_for(&cycle.edges);
         match best.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if cycle_prefers_candidate(&cycle, e.get()) {
-                    *e.get_mut() = cycle;
+                if e.get().edges == cycle.edges {
+                    if cycle_prefers_candidate(&cycle, e.get()) {
+                        *e.get_mut() = cycle;
+                    }
+                } else {
+                    let bucket = collisions.entry(key).or_default();
+                    if let Some(existing) = bucket
+                        .iter_mut()
+                        .find(|existing| existing.edges == cycle.edges)
+                    {
+                        if cycle_prefers_candidate(&cycle, existing) {
+                            *existing = cycle;
+                        }
+                    } else {
+                        bucket.push(cycle);
+                    }
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -451,8 +465,17 @@ pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> V
         }
     }
     let mut out: Vec<FoundCycle> = best.into_values().collect();
+    out.extend(collisions.into_values().flatten());
     out.sort_unstable_by(compare_cycle_score);
     out
+}
+
+/// Deduplicate by cycle key, keeping the best-scored variant.
+///
+/// Accepts any `IntoIterator<Item = FoundCycle>` so callers can pass an
+/// iterator chain directly without an intermediate `.collect()`.
+pub fn dedupe_cycles_by_edges(cycles: impl IntoIterator<Item = FoundCycle>) -> Vec<FoundCycle> {
+    dedupe_cycles_by_key(cycles, cycle_key)
 }
 
 /// True when every hop uses a protocol family we can simulate on-chain.
@@ -684,8 +707,7 @@ mod tests {
         let mut b = cycle(-0.2, false);
         a.edges[0].token_out = TokenIndex(2);
         b.edges[0].token_out = TokenIndex(3);
-        assert_ne!(cycle_key(&a.edges), cycle_key(&b.edges));
-        let kept = dedupe_cycles_by_edges(vec![a.clone(), b.clone(), a]);
+        let kept = dedupe_cycles_by_key(vec![a.clone(), b.clone(), a], |_| 0);
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].score, -0.2);
         assert_eq!(kept[1].score, -0.1);

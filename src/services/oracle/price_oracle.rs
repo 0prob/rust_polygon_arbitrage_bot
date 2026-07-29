@@ -957,6 +957,7 @@ impl PriceOracle {
         let primary_url = &urls[url_idx % urls.len()];
         match Self::fetch_pyth_once_with(http, primary_url, api_key, ids).await {
             Ok(prices) => Ok(prices),
+            Err(error) if urls.len() == 1 => Err(error),
             Err(e) => {
                 const PYTH_RETRY_BACKOFF: Duration = Duration::from_millis(100);
                 let fallback_url = &urls[(url_idx + 1) % urls.len()];
@@ -1590,6 +1591,39 @@ mod tests {
             .expect("cooldown skips request");
         assert!(quotes.is_empty());
         assert_eq!(stats.parsed, 0);
+    }
+
+    #[tokio::test]
+    async fn pyth_single_endpoint_does_not_retry_itself() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("write response");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "single Hermes endpoint was retried"
+            );
+        });
+        let oracle = PriceOracle::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            DEFAULT_CACHE_TTL_MS,
+        );
+        assert!(oracle.fetch_pyth(&["feed"]).await.is_err());
+        server.await.expect("server task");
     }
 
     #[test]

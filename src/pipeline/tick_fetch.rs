@@ -864,7 +864,7 @@ pub async fn enrich_v3_ticks<
             updated,
             still_tickless.len(),
         );
-        if updated == 0 && !pool_addresses.is_empty() {
+        if updated == 0 && !pool_addresses.is_empty() && needs_url_fallback {
             crate::warn!("{msg} — TickLens empty; check RPC rate limits / word_range");
         } else {
             crate::debug!("{msg}");

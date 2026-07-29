@@ -87,7 +87,7 @@ pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     if crate::pipeline::route_calls::dodo_flash_batch_eligible(edges) {
         return dodo_flash_batch_gas(edges.len());
     }
-    let hop_gas = route_hop_gas_budget(edges);
+    let hop_gas = edges.iter().map(|edge| estimate_hop_gas(edge.protocol)).sum();
     let cold_slots = edges.len() as u32;
     crate::services::execution::gas::estimate_route_gas_from_hops_evm(
         hop_gas,

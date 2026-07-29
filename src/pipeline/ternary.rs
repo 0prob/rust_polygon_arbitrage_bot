@@ -88,6 +88,7 @@ const DEFAULT_MAX_FLASH_LOAN_USD: u64 = 50_000;
 struct TernarySearchBounds {
     low: U256,
     high: U256,
+    flash_cap: Option<U256>,
 }
 
 /// Tickless CL pools cap trade size at the decimal-aware probe; Brent cannot search above that.
@@ -520,6 +521,7 @@ fn compute_ternary_search_bounds(
     Some(TernarySearchBounds {
         low: out_low,
         high: out_high,
+        flash_cap: flash_cap_wei,
     })
 }
 
@@ -533,6 +535,7 @@ fn clamp_brent_high_to_probe_seeds(
     high: U256,
     low: U256,
     economic_floor: U256,
+    flash_cap: Option<U256>,
     seeds: &[(U256, crate::pipeline::types::MinimalSimResult)],
     profit_ctx: Option<&ProfitEvalContext>,
 ) -> Option<U256> {
@@ -589,7 +592,7 @@ fn clamp_brent_high_to_probe_seeds(
     // needs ~1.8). Raise toward seed_high instead of only tightening.
     if seed_high > high {
         let raised = seed_high.min(high.saturating_mul(U256::from(16u8)));
-        return (raised > high).then_some(raised);
+        return (raised > high).then_some(flash_cap.map_or(raised, |cap| raised.min(cap)));
     }
     if seed_high >= high {
         return None;
@@ -805,7 +808,11 @@ pub fn optimize_cycle(
     let economic_floor = min_economic_amount_in(start_decimals, start_rate);
 
     let edges = &cycle.edges;
-    let TernarySearchBounds { mut low, mut high } = compute_ternary_search_bounds(
+    let TernarySearchBounds {
+        mut low,
+        mut high,
+        flash_cap,
+    } = compute_ternary_search_bounds(
         cycle,
         arena,
         token_to_matic_rates,
@@ -861,8 +868,14 @@ pub fn optimize_cycle(
     // largest profitable probe seed so Brent stays in the feasible band; the
     // first_infeasible wall still catches residual overshoots.
     if let Some(seeds) = seed_sims
-        && let Some(clamped) =
-            clamp_brent_high_to_probe_seeds(high, low, economic_floor, seeds, Some(profit_ctx))
+        && let Some(clamped) = clamp_brent_high_to_probe_seeds(
+            high,
+            low,
+            economic_floor,
+            flash_cap,
+            seeds,
+            Some(profit_ctx),
+        )
     {
         record_brent_seed_high_clamp();
         // ponytail: raise is hot-path; DEBUG avoids routing.jsonl spam.
@@ -996,6 +1009,10 @@ pub fn optimize_cycle(
             && let Some(cached) = cache.get(route_state_revision, route_fp, amount)
         {
             record_brent_cache_route();
+            let mut cached = cached;
+            if let Some(costing) = route_gas {
+                cached.total_gas = costing.resolve(cached.total_gas);
+            }
             if sim_cache.len() < BRENT_CACHE_SLOTS {
                 sim_cache.insert(amount, cached);
             }
@@ -1009,14 +1026,15 @@ pub fn optimize_cycle(
         }
         record_brent_eval_sim();
         match simulate_route_minimal_with_caps(arena, edges, amount, brent_shallow_caps.as_ref()) {
-            Some(mut sim) => {
-                if let Some(costing) = route_gas {
-                    sim.total_gas = costing.resolve(sim.total_gas);
-                }
+            Some(sim) => {
                 // Memoize before reject branches — zero-profit was ~95% of evals and
                 // was re-walked on every golden revisit / worker (route cache hit≈0).
                 if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
                     cache.insert(route_state_revision, route_fp, amount, sim);
+                }
+                let mut sim = sim;
+                if let Some(costing) = route_gas {
+                    sim.total_gas = costing.resolve(sim.total_gas);
                 }
                 if sim_cache.len() < BRENT_CACHE_SLOTS {
                     sim_cache.insert(amount, sim);
@@ -1040,12 +1058,10 @@ pub fn optimize_cycle(
                 brent_score_matic_from_sim(&sim, amount, profit_ctx)
             }
             None => {
-                // Depth failures are monotonic — wall the upper band. Sampled
-                // non-monotonic kinds (UnsupportedState / TokenMismatch / Math)
-                // undo the wall so Brent can still search.
+                let first_sim_none = first_infeasible > high;
                 first_infeasible = amount;
                 record_brent_eval_reject(BrentEvalReject::SimNone);
-                if should_sample_brent_sim_none() {
+                if first_sim_none || should_sample_brent_sim_none() {
                     let failure = minimal_sim_failure(arena, edges, amount);
                     if !sim_failure_is_size_monotonic(failure) {
                         first_infeasible = high.saturating_add(U256::from(1u8));
@@ -1258,8 +1274,8 @@ mod tests {
         let high = U256::from(1_000_000u64);
         let low = U256::from(1u8);
         let floor = U256::from(10u8);
-        let clamped =
-            clamp_brent_high_to_probe_seeds(high, low, floor, &seeds, None).expect("seed clamp");
+        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, None, &seeds, None)
+            .expect("seed clamp");
         assert_eq!(clamped, seed * U256::from(8u8));
         // Zero-profit seeds do not clamp.
         let dust = [(
@@ -1270,17 +1286,29 @@ mod tests {
                 total_gas: 100_000,
             },
         )];
-        assert!(clamp_brent_high_to_probe_seeds(high, low, floor, &dust, None).is_none());
+        assert!(clamp_brent_high_to_probe_seeds(high, low, floor, None, &dust, None).is_none());
         // Already at/under 8× seed: leave alone (no tighten, no raise).
         assert!(
-            clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, &seeds, None)
+            clamp_brent_high_to_probe_seeds(U256::from(8_000u64), low, floor, None, &seeds, None)
                 .is_none()
         );
         // Soft-cap below 8× seed: raise (was: return None and starve gas cover).
         let raised =
-            clamp_brent_high_to_probe_seeds(U256::from(2_000u64), low, floor, &seeds, None)
+            clamp_brent_high_to_probe_seeds(U256::from(2_000u64), low, floor, None, &seeds, None)
                 .expect("raise soft-cap");
         assert_eq!(raised, seed * U256::from(8u8));
+
+        let flash_cap = U256::from(2_500u64);
+        let capped = clamp_brent_high_to_probe_seeds(
+            U256::from(2_000u64),
+            low,
+            floor,
+            Some(flash_cap),
+            &seeds,
+            None,
+        )
+        .expect("flash-capped raise");
+        assert_eq!(capped, flash_cap);
     }
 
     #[test]
@@ -1301,7 +1329,7 @@ mod tests {
         let high = U256::from(10_000u64);
         let low = U256::from(500u64); // raised above seed (e.g. balancer floor)
         let floor = U256::from(50u64);
-        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, &seeds, None);
+        let clamped = clamp_brent_high_to_probe_seeds(high, low, floor, None, &seeds, None);
         // Seed is below low so clamp still uses it for 8× headroom from amount.
         assert_eq!(clamped, Some(seed * U256::from(8u8)));
         // Re-include logic in optimize_cycle: low → seed when no seed in [low, high].
@@ -1453,5 +1481,15 @@ mod tests {
             &[(peak, peaked_at(peak, 50))],
         );
         assert!(hot <= cold, "warm={hot} cold={cold}");
+    }
+
+    #[test]
+    fn non_size_failures_do_not_create_an_infeasible_wall() {
+        assert!(!sim_failure_is_size_monotonic(Some(
+            MinimalSimFailure::Math { hop: 0 }
+        )));
+        assert!(!sim_failure_is_size_monotonic(Some(
+            MinimalSimFailure::TokenMismatch { hop: 0 }
+        )));
     }
 }

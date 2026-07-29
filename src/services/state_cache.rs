@@ -303,6 +303,34 @@ impl StateCache {
         })
     }
 
+    #[must_use]
+    pub fn stale_addresses_within(
+        &self,
+        addresses: &[Address],
+        max_age: Duration,
+        limit: usize,
+    ) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let cache = self.inner.read();
+        addresses
+            .iter()
+            .copied()
+            .filter(|address| {
+                cache.get(address).is_none_or(|entry| {
+                    if !entry.state.is_tradable() {
+                        return true;
+                    }
+                    let age = now.saturating_duration_since(entry.updated_at);
+                    age > max_age || age > self.ttl
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
     /// Apply an in-place mutation when a full pool entry already exists.
     pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState)) -> bool {
         {

@@ -249,12 +249,7 @@ fn hf_pool_prefetch_targets(
     hot_pools: &[Address],
     prefetch_count: usize,
 ) -> Vec<Address> {
-    hot_pools
-        .iter()
-        .copied()
-        .filter(|pool| !cache.is_fresh_within(pool, HF_POOL_STATE_FRESH))
-        .take(prefetch_count)
-        .collect()
+    cache.stale_addresses_within(hot_pools, HF_POOL_STATE_FRESH, prefetch_count)
 }
 
 async fn hf_pool_prefetch(
@@ -3023,13 +3018,15 @@ mod tests {
     #[test]
     fn hf_pool_prefetch_skips_recent_entries_before_applying_cap() {
         let fresh = Address::repeat_byte(0x11);
+        let invalid = Address::repeat_byte(0x12);
         let missing = Address::repeat_byte(0x22);
         let cache = StateCache::new(8, Duration::from_secs(30));
         cache.insert(fresh, Arc::unwrap_or_clone(v2_state()));
+        cache.insert(invalid, PoolState::Invalid);
 
         assert_eq!(
-            hf_pool_prefetch_targets(&cache, &[fresh, missing], 1),
-            vec![missing]
+            hf_pool_prefetch_targets(&cache, &[fresh, invalid, missing], 2),
+            vec![invalid, missing]
         );
     }
 

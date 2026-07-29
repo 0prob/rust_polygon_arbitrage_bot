@@ -4,10 +4,21 @@ pub const MAX_EXECUTOR_CALLS: usize = 12;
 /// `executeArbDirect` batchSwap gas grows quickly; beyond this use per-hop flash routes.
 pub const MAX_BALANCER_BATCH_HOPS: usize = 4;
 
-/// Estimate executor packed calls for a route (V3=1, all other protocols=2).
+/// Estimate executor packed calls for a route.
 #[must_use]
 pub fn estimate_route_calls(edges: &[Edge]) -> usize {
-    edges.iter().map(|e| estimate_hop_calls(e.protocol)).sum()
+    let mut calls = 0;
+    let mut previous_v2 = false;
+    for edge in edges {
+        if edge.protocol == ProtocolType::UniswapV2 {
+            calls += 1 + usize::from(!previous_v2);
+            previous_v2 = true;
+        } else {
+            calls += estimate_hop_calls(edge.protocol);
+            previous_v2 = false;
+        }
+    }
+    calls
 }
 
 /// Pure Balancer routes eligible for `executeArbDirect` + one vault `batchSwap`.
@@ -98,6 +109,29 @@ mod tests {
         let edges: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::UniswapV4), 7).collect();
         assert_eq!(estimate_route_calls(&edges), 14);
         assert!(!packed_calls_fit_executor(estimate_route_calls(&edges)));
+    }
+
+    #[test]
+    fn v2_chain_uses_one_prefund_per_segment() {
+        let eleven: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::UniswapV2), 11).collect();
+        assert_eq!(estimate_route_calls(&eleven), 12);
+        assert!(route_fits_executor(&eleven));
+
+        let twelve: Vec<Edge> = std::iter::repeat_n(edge(ProtocolType::UniswapV2), 12).collect();
+        assert_eq!(estimate_route_calls(&twelve), 13);
+        assert!(!route_fits_executor(&twelve));
+    }
+
+    #[test]
+    fn separated_v2_chains_each_need_a_prefund() {
+        let edges = vec![
+            edge(ProtocolType::UniswapV2),
+            edge(ProtocolType::UniswapV2),
+            edge(ProtocolType::UniswapV3),
+            edge(ProtocolType::UniswapV2),
+            edge(ProtocolType::UniswapV2),
+        ];
+        assert_eq!(estimate_route_calls(&edges), 7);
     }
 
     #[test]
