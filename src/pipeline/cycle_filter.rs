@@ -567,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn probe_context_uses_decimal_aware_dust_floors() {
+        let mut arena = StateArena::default();
+        let token = arena.register_token(Address::from([7u8; 20]));
+        let mut decimals = FxHashMap::default();
+        decimals.insert(Address::from([7u8; 20]), 8);
+        let ctx = ProbeContext {
+            token_to_matic_rates: None,
+            token_decimals: Some(&decimals),
+            gas_price_wei: None,
+        };
+        let cycle = cycle(0.0, false);
+
+        let (low_decimal_floor, _, low_decimals) =
+            probe_context_for_cycle(&arena, &cycle, Some(&ctx));
+        let (hub_floor, _, hub_decimals) = probe_context_for_cycle(&arena, &cycle, None);
+
+        assert_eq!(token, cycle.start_token);
+        assert_eq!(low_decimals, 8);
+        assert_eq!(low_decimal_floor, U256::from(100_000u64));
+        assert_eq!(hub_decimals, 18);
+        assert_eq!(hub_floor, U256::from(10u128.pow(15)));
+    }
+
+    #[test]
     fn priced_filter_after_enrich_keeps_cycle_for_newly_mapped_start() {
         use crate::core::constants::MIN_TOKEN_TO_MATIC_RATE;
 

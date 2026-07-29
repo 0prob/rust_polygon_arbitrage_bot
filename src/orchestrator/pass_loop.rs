@@ -701,6 +701,7 @@ fn schedule_hf_tick(
         next_hf_stream_trigger(stream_triggered || patched_now, &hf_stream_pending);
     let hf_ctx_run = Arc::clone(&hf_ctx);
     let hf_task_store = Arc::clone(hf_task);
+    let hf_task_reschedule = Arc::clone(hf_task);
     let hf_pending_task = Arc::clone(&hf_pending);
     let hf_stream_pending_task = Arc::clone(&hf_stream_pending);
     let handle = tokio::spawn(async move {
@@ -717,6 +718,22 @@ fn schedule_hf_tick(
             if let Err(e) = run_hf_tick(Arc::clone(&hf_ctx_run), stream_triggered).await {
                 crate::warn!("hf tick failed: {e:#}");
             }
+        }
+        if take_pending_hf_tick(&hf_pending_task)
+            && !clear_hf_pending_on_shutdown(
+                &hf_ctx_run.shutdown,
+                &hf_pending_task,
+                &hf_stream_pending_task,
+            )
+        {
+            schedule_hf_tick(
+                hf_ctx_run,
+                hf_inflight,
+                &hf_task_reschedule,
+                hf_pending_task,
+                hf_stream_pending_task,
+                false,
+            );
         }
     });
     *hf_task_store.lock() = Some(handle);
@@ -742,6 +759,10 @@ fn next_hf_stream_trigger(stream_triggered: bool, hf_stream_pending: &AtomicBool
 
 fn take_pending_hf_stream(hf_stream_pending: &AtomicBool) -> bool {
     hf_stream_pending.swap(false, Ordering::AcqRel)
+}
+
+fn take_pending_hf_tick(hf_pending: &AtomicBool) -> bool {
+    hf_pending.swap(false, Ordering::AcqRel)
 }
 
 fn submit_probe_url<'a>(
@@ -804,7 +825,7 @@ fn register_configured_oracle_feeds(oracle: &PriceOracle, config: &OracleConfig)
 mod tests {
     use super::{
         clear_hf_pending_on_shutdown, next_hf_stream_trigger, submit_probe_url,
-        take_pending_hf_stream,
+        take_pending_hf_stream, take_pending_hf_tick,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::watch;
@@ -815,6 +836,14 @@ mod tests {
         assert!(take_pending_hf_stream(&pending));
         assert!(!pending.load(Ordering::Acquire));
         assert!(!take_pending_hf_stream(&pending));
+    }
+
+    #[test]
+    fn pending_hf_tick_is_consumed_once() {
+        let pending = AtomicBool::new(true);
+        assert!(take_pending_hf_tick(&pending));
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(!take_pending_hf_tick(&pending));
     }
 
     #[test]

@@ -1011,6 +1011,41 @@ mod safety_tests {
         );
     }
 
+    #[test]
+    fn modeled_net_matches_assessment_for_aave_with_route_slippage() {
+        set_aave_flash_loan_fee_bps(5);
+        let gross = U256::from(100_000u64);
+        let amount_in = U256::from(1_000_000u64);
+        let input = AssessProfitInput {
+            gross_profit: gross,
+            amount_in,
+            gas_units: 0,
+            gas_price_wei: U256::ZERO,
+            charged_priority_fee_per_gas: crate::services::execution::gas::MIN_PRIORITY_FEE_PER_GAS,
+            token_to_matic_rate: RATE_PRECISION,
+            token_decimals: 18,
+            hop_count: 4,
+            min_profit_matic_wei: U256::ZERO,
+            min_profit_roi_bps: 0,
+            slippage_bps: 100,
+            flash_loan_source: FlashLoanSource::AaveV3,
+            safety_multiplier_bps: 0,
+            profit_priority_alpha_bps: 0,
+        };
+        let assessment = assess_profit(&input);
+
+        assert_eq!(
+            modeled_net_profit_tokens(
+                gross,
+                amount_in,
+                input.slippage_bps,
+                input.flash_loan_source,
+            ),
+            Some(assessment.net_profit)
+        );
+        assert_eq!(assessment.slippage_deduction, U256::from(11_000u64));
+    }
+
     /// Depth-inflated route slip is already route-level on assessment; `on_chain_min_profit_for_route`
     /// must apply the same bps once (no hop re-compound), matching assess net.
     #[test]

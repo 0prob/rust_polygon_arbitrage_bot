@@ -125,6 +125,7 @@ fn host_tier(url: &str) -> HostTier {
         || host.contains("ankr.com")
         || host.contains("chainstack")
         || host.contains("quicknode")
+        || host.contains("quiknode")
         || host.contains("infura")
     {
         HostTier::Paid
@@ -228,11 +229,15 @@ mod tests {
     }
 
     #[test]
-    fn alchemy_is_paid_no_pace_floor() {
-        let url = "https://polygon-mainnet.g.alchemy.com/v2/key";
-        assert_eq!(host_rank_class(url), 0);
-        assert_eq!(min_batch_pace_ms(url), 0);
-        assert_eq!(effective_batch_pace_ms(url, 8), 8);
+    fn paid_hosts_have_no_pace_floor() {
+        for url in [
+            "https://polygon-mainnet.g.alchemy.com/v2/key",
+            "https://sleek-weathered-morning.matic.quiknode.pro/key",
+        ] {
+            assert_eq!(host_rank_class(url), 0);
+            assert_eq!(min_batch_pace_ms(url), 0);
+            assert_eq!(effective_batch_pace_ms(url, 8), 8);
+        }
     }
 
     #[test]

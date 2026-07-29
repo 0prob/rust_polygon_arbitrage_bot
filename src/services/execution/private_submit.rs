@@ -344,13 +344,31 @@ pub fn resolve_submit_mode(
 }
 
 /// Configuration for private transaction submission.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PrivateSubmitConfig {
     pub mode: PrivateSubmitMode,
     pub signer: PrivateKeySigner,
     pub chain_id: u64,
     pub private_url: Option<String>,
     pub bloxroute_auth: Option<String>,
+}
+
+impl std::fmt::Debug for PrivateSubmitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateSubmitConfig")
+            .field("mode", &self.mode)
+            .field("signer", &"<redacted>")
+            .field("chain_id", &self.chain_id)
+            .field(
+                "private_url",
+                &self.private_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "bloxroute_auth",
+                &self.bloxroute_auth.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Sign a [`TransactionRequest`] and return EIP-2718-encoded raw bytes
@@ -424,6 +442,26 @@ mod tests {
             .await
             .expect("sign eip1559");
         assert_eq!(raw.first().copied(), Some(0x02));
+    }
+
+    #[test]
+    fn private_submit_config_debug_redacts_credentials() {
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .expect("test key");
+        let config = PrivateSubmitConfig {
+            mode: PrivateSubmitMode::Bloxroute,
+            signer,
+            chain_id: 137,
+            private_url: Some("https://private.example/secret".into()),
+            bloxroute_auth: Some("relay-secret".into()),
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private.example"));
+        assert!(!debug.contains("relay-secret"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

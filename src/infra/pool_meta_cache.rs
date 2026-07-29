@@ -42,7 +42,7 @@ impl PoolMetaCache {
                 crate::warn!("pool meta cache read failed ({}): {e}", path.display());
                 PoolMetaData::default()
             }
-            Ok(raw) => match crate::util::simd_json_parse(&raw) {
+            Ok(mut raw) => match crate::util::simd_json_parse_borrowed(&mut raw) {
                 Ok(d) => d,
                 Err(e) => {
                     crate::warn!("pool meta cache parse failed ({}): {e}", path.display());

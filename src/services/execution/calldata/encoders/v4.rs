@@ -49,7 +49,7 @@ pub fn encode_v4_hop(
     )?;
 
     let (pool_key, zero_for_one) =
-        build_v4_pool_key(hop.token_in, hop.token_out, fee, tick_spacing, hooks);
+        build_v4_pool_key(hop.token_in, hop.token_out, fee, tick_spacing, hooks)?;
     let amount_pos = I256::try_from(hop.amount_in)
         .map_err(|_| anyhow::anyhow!("v4 amount_in does not fit i256"))?;
     let amount_spec = I256::ZERO - amount_pos;
@@ -94,23 +94,25 @@ fn build_v4_pool_key(
     fee: u32,
     tick_spacing: i32,
     hooks: Address,
-) -> (V4PoolKey, bool) {
+) -> anyhow::Result<(V4PoolKey, bool)> {
     let (currency0, currency1) = if token_in < token_out {
         (token_in, token_out)
     } else {
         (token_out, token_in)
     };
     let zero_for_one = token_in == currency0;
-    (
+    let tick_spacing = Signed::try_from(tick_spacing)
+        .map_err(|_| anyhow::anyhow!("v4 tick spacing does not fit int24"))?;
+    Ok((
         V4PoolKey {
             currency0,
             currency1,
             fee: Uint::from(fee),
-            tickSpacing: Signed::try_from(tick_spacing).unwrap_or(Signed::ZERO),
+            tickSpacing: tick_spacing,
             hooks,
         },
         zero_for_one,
-    )
+    ))
 }
 
 fn v4_static_fields(arena: &StateArena, hop: &CalldataHop) -> (u32, i32, Address) {
@@ -242,10 +244,25 @@ mod tests {
             3_000,
             60,
             passive_hook,
-        );
+        )
+        .expect("valid v4 pool key");
         assert_eq!(key.hooks, passive_hook);
         assert!(crate::services::discovery::is_supported_v4_hook(
             passive_hook
         ));
+    }
+
+    #[test]
+    fn v4_pool_key_rejects_out_of_range_tick_spacing() {
+        assert!(
+            build_v4_pool_key(
+                Address::with_last_byte(1),
+                Address::with_last_byte(2),
+                3_000,
+                i32::MAX,
+                Address::ZERO,
+            )
+            .is_err()
+        );
     }
 }

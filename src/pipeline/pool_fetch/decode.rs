@@ -142,7 +142,7 @@ fn decode_v3(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolStat
     let (sqrt, tick, unlocked, algebra_fee, fee_protocol, obs_card) = global_bytes
         .and_then(|b| decode_v3_head(b, true))
         .or_else(|| slot0_bytes.and_then(|b| decode_v3_head(b, false)))?;
-    let liquidity = decode_u256(liq_bytes?)?.as_limbs()[0] as u128;
+    let liquidity = u128::try_from(decode_u256(liq_bytes?)?).ok()?;
     if sqrt.is_zero() || liquidity == 0 {
         return None;
     }
@@ -698,7 +698,9 @@ mod tests {
             &plan,
             &[
                 Some(Bytes::from(slot0)),
-                Some(Bytes::copy_from_slice(&abi_word(1_000))),
+                Some(Bytes::copy_from_slice(
+                    &U256::from((1u128 << 64) + 1).to_be_bytes::<32>(),
+                )),
                 Some(Bytes::copy_from_slice(&abi_word(3_000))),
             ],
         )
@@ -706,6 +708,7 @@ mod tests {
         let PoolState::V3(state) = state else {
             panic!("expected V3 state");
         };
+        assert_eq!(state.liquidity, (1u128 << 64) + 1);
         assert_eq!(state.fee_protocol, 0x42);
     }
 
