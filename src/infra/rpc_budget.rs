@@ -209,9 +209,8 @@ impl TokenBucket {
 
     fn punish(&mut self) {
         self.refill();
-        // Cut to half of base (floor 4 rps) for 60s — stops stampeding after 429.
-        self.refill_per_sec = (self.base_refill_per_sec * 0.5).max(4.0);
-        self.tokens = self.tokens.min(2.0);
+        self.refill_per_sec = 4.0;
+        self.tokens = 0.0;
         self.punish_until = Some(Instant::now() + Duration::from_secs(60));
     }
 }
@@ -265,7 +264,7 @@ mod tests {
     fn punish_reduces_refill() {
         let mut b = TokenBucket::new(16.0);
         b.punish();
-        assert!(b.refill_per_sec < 16.0);
-        assert!(b.refill_per_sec >= 4.0);
+        assert_eq!(b.refill_per_sec, 4.0);
+        assert_eq!(b.tokens, 0.0);
     }
 }
