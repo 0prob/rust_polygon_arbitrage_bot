@@ -42,6 +42,7 @@ use crate::services::oracle::{
 };
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
+const AAVE_RESERVE_LIST_TTL: Duration = Duration::from_secs(300);
 /// Cap hot-token tracking so the 30s background loop does not refresh unbounded history.
 const MAX_HOT_FLASH_TOKENS: usize = 384;
 
@@ -177,6 +178,12 @@ struct CachedLiquidity {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CachedAaveReserves {
+    tokens: FxHashSet<Address>,
+    fetched_at: Instant,
+}
+
 /// Immutable, atomically published flash-liquidity map (LF/HF readers hold `Arc` snapshots).
 #[derive(Debug, Clone, Default)]
 pub struct FlashLiquiditySnapshot {
@@ -229,6 +236,7 @@ pub struct FlashLiquidityCache {
     hot_tokens: Mutex<FxHashSet<Address>>,
     /// Dry-run `ReserveInactive` pins — refresh must not resurrect Aave for these tokens.
     aave_inactive_pins: Mutex<FxHashSet<Address>>,
+    aave_reserves: Mutex<Option<CachedAaveReserves>>,
     /// Prevents HF tick + background + dispatch from hammering the same multicall batch.
     refresh_inflight: AtomicBool,
 }
@@ -243,6 +251,7 @@ impl FlashLiquidityCache {
             aave_pool: AAVE_V3_POOL,
             hot_tokens: Mutex::new(FxHashSet::default()),
             aave_inactive_pins: Mutex::new(FxHashSet::default()),
+            aave_reserves: Mutex::new(None),
             refresh_inflight: AtomicBool::new(false),
         }
     }
@@ -256,6 +265,7 @@ impl FlashLiquidityCache {
             aave_pool,
             hot_tokens: Mutex::new(FxHashSet::default()),
             aave_inactive_pins: Mutex::new(FxHashSet::default()),
+            aave_reserves: Mutex::new(None),
             refresh_inflight: AtomicBool::new(false),
         }
     }
@@ -597,7 +607,49 @@ impl FlashLiquidityCache {
             return Ok(());
         }
         let now = Instant::now();
-        let mut items = Vec::with_capacity(to_fetch.len() * 2);
+        let aave_reserves = self
+            .aave_reserves
+            .lock()
+            .as_ref()
+            .filter(|cached| {
+                now.saturating_duration_since(cached.fetched_at) < AAVE_RESERVE_LIST_TTL
+            })
+            .map(|cached| cached.tokens.clone());
+        let aave_reserves = match aave_reserves {
+            Some(reserves) => Some(reserves),
+            None => {
+                let list = execute_multicall(
+                    provider,
+                    &[MulticallItem {
+                        target: self.aave_pool,
+                        data: encode_call(&IAaveV3Pool::getReservesListCall {}),
+                    }],
+                )
+                .await
+                .ok()
+                .and_then(|results| {
+                    results
+                        .first()
+                        .and_then(|bytes| bytes.as_ref())
+                        .and_then(|bytes| {
+                            IAaveV3Pool::getReservesListCall::abi_decode_returns(bytes).ok()
+                        })
+                })
+                .map(|tokens| tokens.into_iter().collect::<FxHashSet<_>>());
+                if let Some(tokens) = list.as_ref() {
+                    *self.aave_reserves.lock() = Some(CachedAaveReserves {
+                        tokens: tokens.clone(),
+                        fetched_at: now,
+                    });
+                }
+                list
+            }
+        };
+        let reserve_count = to_fetch
+            .iter()
+            .filter(|token| aave_reserve_needs_fetch(aave_reserves.as_ref(), **token))
+            .count();
+        let mut items = Vec::with_capacity(to_fetch.len() + reserve_count);
         for token in to_fetch {
             items.push(MulticallItem {
                 target: *token,
@@ -605,6 +657,11 @@ impl FlashLiquidityCache {
                     account: self.balancer_vault,
                 }),
             });
+        }
+        for token in to_fetch {
+            if !aave_reserve_needs_fetch(aave_reserves.as_ref(), *token) {
+                continue;
+            }
             items.push(MulticallItem {
                 target: self.aave_pool,
                 data: encode_call(&IAaveV3Pool::getReserveDataCall { asset: *token }),
@@ -615,22 +672,34 @@ impl FlashLiquidityCache {
         let pinned_tokens: FxHashSet<Address> =
             self.aave_inactive_pins.lock().iter().copied().collect();
         let mut aave_stats = AaveRefreshStats::default();
+        let mut reserve_cursor = to_fetch.len();
         let reserves: Vec<Option<Address>> = (0..to_fetch.len())
             .map(|i| {
                 let token = to_fetch[i];
                 let pinned = pinned_tokens.contains(&token);
-                let decoded = results
-                    .get(i * 2 + 1)
-                    .and_then(|bytes| bytes.as_ref())
-                    .and_then(|bytes| {
-                        IAaveV3Pool::getReserveDataCall::abi_decode_returns(bytes).ok()
-                    });
-                let status = match decoded.as_ref() {
-                    Some(r) => {
-                        let has_a_token = !r.aTokenAddress.is_zero();
-                        reserve_status_from_config(r.configuration, has_a_token)
+                let queried_reserve = aave_reserve_needs_fetch(aave_reserves.as_ref(), token);
+                let decoded = if queried_reserve {
+                    let decoded = results
+                        .get(reserve_cursor)
+                        .and_then(|bytes| bytes.as_ref())
+                        .and_then(|bytes| {
+                            IAaveV3Pool::getReserveDataCall::abi_decode_returns(bytes).ok()
+                        });
+                    reserve_cursor += 1;
+                    decoded
+                } else {
+                    None
+                };
+                let status = if !queried_reserve {
+                    AaveReserveStatus::NoAToken
+                } else {
+                    match decoded.as_ref() {
+                        Some(r) => {
+                            let has_a_token = !r.aTokenAddress.is_zero();
+                            reserve_status_from_config(r.configuration, has_a_token)
+                        }
+                        None => AaveReserveStatus::RpcError,
                     }
-                    None => AaveReserveStatus::RpcError,
                 };
                 aave_stats.record(status, pinned);
                 if pinned || status != AaveReserveStatus::Viable {
@@ -692,6 +761,11 @@ impl FlashLiquidityCache {
         aave_stats.log_refresh_summary(n, generation);
         Ok(())
     }
+}
+
+#[inline]
+fn aave_reserve_needs_fetch(aave_reserves: Option<&FxHashSet<Address>>, token: Address) -> bool {
+    aave_reserves.is_none_or(|reserves| reserves.contains(&token))
 }
 
 impl Default for FlashLiquidityCache {
@@ -2265,6 +2339,18 @@ mod tests {
         assert!(cache.try_acquire_refresh_inflight().is_none());
         drop(g1);
         assert!(cache.try_acquire_refresh_inflight().is_some());
+    }
+
+    #[test]
+    fn aave_reserve_list_skips_known_unlisted_tokens() {
+        let listed = Address::repeat_byte(0xa1);
+        let unlisted = Address::repeat_byte(0xb2);
+        let mut reserves = FxHashSet::default();
+        reserves.insert(listed);
+
+        assert!(aave_reserve_needs_fetch(Some(&reserves), listed));
+        assert!(!aave_reserve_needs_fetch(Some(&reserves), unlisted));
+        assert!(aave_reserve_needs_fetch(None, unlisted));
     }
 
     #[test]

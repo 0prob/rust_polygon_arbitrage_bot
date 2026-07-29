@@ -337,6 +337,7 @@ sol! {
     #[sol(rpc)]
     interface IAaveV3Pool {
         function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
+        function getReservesList() external view returns (address[] memory);
         function getReserveData(address asset) external view returns (
             uint256 configuration,
             uint128 liquidityIndex,

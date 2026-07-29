@@ -277,6 +277,16 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b"),
     },
+    TokenFeed {
+        token: address!("0x9Cb74C8032b007466865f060ad2c46145d45553D"),
+        chainlink: None,
+        pyth_id: Some("6fdf9f1b31f6212aad9125dbc9d85ae6cfac3939fd914f6a8c397f01272eca8f"),
+    },
+    TokenFeed {
+        token: address!("0x2e1AD108fF1D8C782fcBbB89AAd783aC49586756"),
+        chainlink: None,
+        pyth_id: Some("433faaa801ecdb6618e3897177a118b273a8e18cc3ff545aadfc207d58d028f7"),
+    },
 ];
 
 #[derive(Clone)]
@@ -1711,6 +1721,20 @@ mod tests {
             LINK, AAVE, CRV, SUSHI, BAL, SAND, MANA, UNI, GRT, GHST, WST_ETH, COMP, SNX,
         ];
         assert!(tokens.iter().all(|token| pyth_feed(token).is_some()));
+    }
+
+    #[test]
+    fn runtime_identified_tokens_have_verified_pyth_feeds() {
+        let idex = address!("0x9Cb74C8032b007466865f060ad2c46145d45553D");
+        let tusd = address!("0x2e1AD108fF1D8C782fcBbB89AAd783aC49586756");
+        assert_eq!(
+            pyth_feed(&idex),
+            Some("6fdf9f1b31f6212aad9125dbc9d85ae6cfac3939fd914f6a8c397f01272eca8f")
+        );
+        assert_eq!(
+            pyth_feed(&tusd),
+            Some("433faaa801ecdb6618e3897177a118b273a8e18cc3ff545aadfc207d58d028f7")
+        );
     }
 
     #[test]

@@ -14,6 +14,90 @@ pub fn lookup_symbol(addr: &Address) -> Option<&'static str> {
 /// Top PG + runtime demand addresses (DexScreener polygon pairs, 2026-07).
 const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
     (
+        &address!("0xfB021f1Ce0d5327eE31EFE21F9b23c0b9A9ccC58"),
+        "fTIME",
+    ),
+    (
+        &address!("0x1deFA61862E27E5C9E8b9f8daE769290B9CF6D93"),
+        "ELONINDEX",
+    ),
+    (
+        &address!("0x35aC92580eb672d9c76FeE4228165F6eF224c334"),
+        "ELONINDEX",
+    ),
+    (
+        &address!("0xB29781B8B09ba707631eE6720E50129777d4ba31"),
+        "PFC",
+    ),
+    (
+        &address!("0x0E9b89007eEE9c958c0EDA24eF70723C2C93dD58"),
+        "ankrMATIC",
+    ),
+    (
+        &address!("0x5118aeC3AfCca3f1e21733eE9C88BB800AFE6F7b"),
+        "FLDG",
+    ),
+    (
+        &address!("0x86233fF3eD561A0E35910920acB2D91419Fd14d0"),
+        "DOGE",
+    ),
+    (
+        &address!("0x9Cb74C8032b007466865f060ad2c46145d45553D"),
+        "IDEX",
+    ),
+    (
+        &address!("0xa8c17604f6C9fFA20955b40CC3B607Bf9606b625"),
+        "DOGEINDEX",
+    ),
+    (
+        &address!("0xEe9A352F6aAc4aF1A5B9f467F6a93E0ffBe9Dd35"),
+        "MASQ",
+    ),
+    (
+        &address!("0x02753ee6a439BE76cFAF828CeBE02ce88eCFf8b5"),
+        "NOW",
+    ),
+    (
+        &address!("0xe1398B5d2f3CEF77a13a7CcBae33F2121c217301"),
+        "RODO",
+    ),
+    (
+        &address!("0x00e5646f60AC6Fb446f621d146B6E1886f002905"),
+        "RAI",
+    ),
+    (
+        &address!("0x454551c6027941BA34e149CC92A8dfC30c191570"),
+        "EFP",
+    ),
+    (
+        &address!("0x64c1B62Fe216B167BC7fd5B217630d494954b4c4"),
+        "ELONINDEX",
+    ),
+    (
+        &address!("0x8031c44b96Ec8c9B66aB16c2c164e8dEEb361a3f"),
+        "LIRA",
+    ),
+    (
+        &address!("0xB0ac8D198088cf310F45d9d05C747263be994849"),
+        "UCTL",
+    ),
+    (
+        &address!("0x5a5d62660F5B0556d33513869a4C9bA97d2d88e4"),
+        "CTK multi",
+    ),
+    (
+        &address!("0x62F594339830b90AE4C084aE7D223fFAFd9658A7"),
+        "SPHERE",
+    ),
+    (
+        &address!("0xfe48ee5070a045B2Caa2Ce9e344735D9E4886B46"),
+        "3TK",
+    ),
+    (
+        &address!("0x1c67201D5B748C9666205c2a1f7E2d4272F5Da3F"),
+        "ENTER",
+    ),
+    (
         &address!("0x61fFE097137d543f019F5257E1a1Ff7A6C5F0b68"),
         "UNI",
     ),
@@ -770,6 +854,27 @@ mod tests {
             ("0xE9f2e81894D34aefE7b6bBc89898fF92C39Db320", "UTOPIA"),
             ("0xF501dd45a1198C2E1b5aEF5314A68B9006D842E0", "MTA"),
             ("0xfd5962484BE2c3574D70131BF5D452CcC7C69F67", "UCT"),
+            ("0xfB021f1Ce0d5327eE31EFE21F9b23c0b9A9ccC58", "fTIME"),
+            ("0x1deFA61862E27E5C9E8b9f8daE769290B9CF6D93", "ELONINDEX"),
+            ("0x35aC92580eb672d9c76FeE4228165F6eF224c334", "ELONINDEX"),
+            ("0xB29781B8B09ba707631eE6720E50129777d4ba31", "PFC"),
+            ("0x0E9b89007eEE9c958c0EDA24eF70723C2C93dD58", "ankrMATIC"),
+            ("0x5118aeC3AfCca3f1e21733eE9C88BB800AFE6F7b", "FLDG"),
+            ("0x86233fF3eD561A0E35910920acB2D91419Fd14d0", "DOGE"),
+            ("0x9Cb74C8032b007466865f060ad2c46145d45553D", "IDEX"),
+            ("0xa8c17604f6C9fFA20955b40CC3B607Bf9606b625", "DOGEINDEX"),
+            ("0xEe9A352F6aAc4aF1A5B9f467F6a93E0ffBe9Dd35", "MASQ"),
+            ("0x02753ee6a439BE76cFAF828CeBE02ce88eCFf8b5", "NOW"),
+            ("0xe1398B5d2f3CEF77a13a7CcBae33F2121c217301", "RODO"),
+            ("0x00e5646f60AC6Fb446f621d146B6E1886f002905", "RAI"),
+            ("0x454551c6027941BA34e149CC92A8dfC30c191570", "EFP"),
+            ("0x64c1B62Fe216B167BC7fd5B217630d494954b4c4", "ELONINDEX"),
+            ("0x8031c44b96Ec8c9B66aB16c2c164e8dEEb361a3f", "LIRA"),
+            ("0xB0ac8D198088cf310F45d9d05C747263be994849", "UCTL"),
+            ("0x5a5d62660F5B0556d33513869a4C9bA97d2d88e4", "CTK multi"),
+            ("0x62F594339830b90AE4C084aE7D223fFAFd9658A7", "SPHERE"),
+            ("0xfe48ee5070a045B2Caa2Ce9e344735D9E4886B46", "3TK"),
+            ("0x1c67201D5B748C9666205c2a1f7E2d4272F5Da3F", "ENTER"),
         ];
         for (address, symbol) in labels {
             let address = address.parse().expect("valid test address");
