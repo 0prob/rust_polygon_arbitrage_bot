@@ -290,23 +290,11 @@ fn decode_curve_balances(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Opt
     Some(balances)
 }
 
-/// Classic StableSwap fee is ~4 bps in 1e10 units when `fee()` is absent.
-const DEFAULT_CURVE_FEE_1E10: u64 = 4_000_000;
-
-fn curve_fee_from_bps(fee_bps: u32) -> U256 {
-    if fee_bps == 0 {
-        return U256::from(DEFAULT_CURVE_FEE_1E10);
-    }
-    // Curve fee is 1e-10 fraction; 1 bps = 1e6 in that encoding.
-    U256::from(fee_bps).saturating_mul(U256::from(1_000_000u64))
-}
-
-fn decode_curve_fee(results: &[Option<Bytes>], fee_idx: usize, fee_bps: u32) -> U256 {
+fn decode_curve_fee(results: &[Option<Bytes>], fee_idx: usize) -> Option<U256> {
     results
         .get(fee_idx)
         .and_then(|r| r.as_ref())
         .and_then(decode_u256)
-        .unwrap_or_else(|| curve_fee_from_bps(fee_bps))
 }
 
 /// NG / metapools need live `stored_rates()`; classic plain pools do not expose it.
@@ -388,7 +376,7 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
     let a_raw = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_curve_fee(results, fee_idx, plan.pool.fee_bps);
+    let fee = decode_curve_fee(results, fee_idx)?;
     let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
     if a_raw.is_zero() {
         return None;
@@ -421,7 +409,7 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let n_scales = n_fetched - 1;
     let precisions_idx = price_scale_start + n_scales;
     let a = decode_u256(results.get(a_idx)?.as_ref()?)?;
-    let fee = decode_curve_fee(results, fee_idx, plan.pool.fee_bps);
+    let fee = decode_curve_fee(results, fee_idx)?;
     let gamma = results
         .get(gamma_idx)
         .and_then(|b| b.as_ref())
@@ -444,7 +432,8 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
         }
         price_scales.push(scale);
     }
-    let precisions = decode_curve_precisions_words(results.get(precisions_idx)?.as_ref()?, n_fetched)?;
+    let precisions =
+        decode_curve_precisions_words(results.get(precisions_idx)?.as_ref()?, n_fetched)?;
     let rates = decode_curve_crypto_rates(n_fetched, &price_scales, &precisions)?;
     Some(PoolState::Curve(CurvePoolState {
         balances,
@@ -819,16 +808,19 @@ mod tests {
                 CallKind::CurveRates,
             ],
         };
-        let results = vec![
+        let mut results = vec![
             Some(Bytes::copy_from_slice(&abi_word(1_000_000_000_000_000_000))),
             Some(Bytes::copy_from_slice(&abi_word(1_000_000_000_000_000_000))),
             Some(Bytes::copy_from_slice(&abi_word(200))),
-            None, // fee() missing → discovery/default fallback
+            None,
             None, // stored_rates() missing → unit rates
         ];
 
+        assert!(decode_plan(&plan, &results).is_none());
+        results[3] = Some(Bytes::copy_from_slice(&abi_word(4_000_000)));
+
         let Some(state) = decode_plan(&plan, &results) else {
-            panic!("legacy Curve stable should decode without stored_rates/fee");
+            panic!("legacy Curve stable should decode without stored_rates");
         };
         let PoolState::Curve(curve) = &state else {
             panic!("expected Curve state");
@@ -1192,22 +1184,15 @@ mod tests {
     }
 
     #[test]
-    fn curve_fee_falls_back_when_multicall_slot_missing() {
+    fn curve_fee_requires_authoritative_multicall() {
+        assert_eq!(decode_curve_fee(&[None], 0), None);
         assert_eq!(
-            decode_curve_fee(&[None], 0, 0),
-            U256::from(DEFAULT_CURVE_FEE_1E10)
+            decode_curve_fee(&[Some(Bytes::from_static(&[0u8; 31]))], 0),
+            None
         );
         assert_eq!(
-            decode_curve_fee(&[Some(Bytes::from_static(&[0u8; 31]))], 0, 0),
-            U256::from(DEFAULT_CURVE_FEE_1E10)
-        );
-        assert_eq!(
-            decode_curve_fee(&[None], 0, 4),
-            U256::from(4_000_000u64)
-        );
-        assert_eq!(
-            decode_curve_fee(&[Some(Bytes::copy_from_slice(&abi_word(5_000_000)))], 0, 4),
-            U256::from(5_000_000u64)
+            decode_curve_fee(&[Some(Bytes::copy_from_slice(&abi_word(5_000_000)))], 0),
+            Some(U256::from(5_000_000u64))
         );
     }
 
