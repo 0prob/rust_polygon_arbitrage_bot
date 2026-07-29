@@ -283,17 +283,27 @@ fn prune_dust_v2_cycles_arc(
     arena: &crate::pipeline::arena::StateArena,
     cycles: std::sync::Arc<Vec<crate::core::types::FoundCycle>>,
 ) -> std::sync::Arc<Vec<crate::core::types::FoundCycle>> {
-    if cycles.is_empty()
-        || cycles.iter().all(|c| {
-            crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &c.edges).is_none()
-        })
-    {
+    let Some(first_dust) = cycles.iter().position(|cycle| {
+        crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &cycle.edges).is_some()
+    }) else {
         return cycles;
-    }
-    std::sync::Arc::new(prune_dust_v2_cycles(
-        arena,
-        cycles.iter().cloned().collect(),
-    ))
+    };
+    let mut kept = Vec::with_capacity(cycles.len().saturating_sub(1));
+    kept.extend(cycles[..first_dust].iter().cloned());
+    kept.extend(
+        cycles[first_dust + 1..]
+            .iter()
+            .filter(|cycle| {
+                crate::pipeline::local_sim::v2_any_hop_dust_reserves(arena, &cycle.edges).is_none()
+            })
+            .cloned(),
+    );
+    let dropped = cycles.len().saturating_sub(kept.len());
+    crate::info!(
+        "lf cycle prune: v2_dust_drop={dropped} keep={} (graph/HF V2 floor)",
+        kept.len()
+    );
+    std::sync::Arc::new(kept)
 }
 
 fn cycle_search_passes(max_hops: u32, max_paths: usize) -> SmallVec<[CycleSearchPass; 2]> {
@@ -2427,8 +2437,47 @@ pub fn spawn_lf_background(
 
 #[cfg(test)]
 mod tests {
-    use super::cycle_search_passes;
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, U256};
+
+    use super::{cycle_search_passes, prune_dust_v2_cycles_arc};
     use crate::core::constants::HOP_CAP;
+    use crate::core::types::{
+        CycleEdges, Edge, FoundCycle, PoolIndex, PoolState, ProtocolType, TokenIndex, V2PoolState,
+    };
+    use crate::pipeline::arena::StateArena;
+
+    fn v2_cycle(pool_index: PoolIndex) -> FoundCycle {
+        FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_slice(&[Edge {
+                pool_index,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }]),
+            hop_count: 1,
+            log_weight: 0.0,
+            cumulative_fee_bps: 30,
+            score: 0.0,
+            cycle_ratio: U256::ONE,
+        }
+    }
+
+    fn v2_state(reserve: U256) -> Arc<PoolState> {
+        Arc::new(PoolState::V2(V2PoolState {
+            reserve0: reserve,
+            reserve1: reserve,
+            fee: U256::from(30u8),
+            fee_denominator: U256::from(10_000u64),
+            block_timestamp_last: 0,
+        }))
+    }
 
     #[test]
     fn short_hop_search_uses_single_pass_through_configured_cap() {
@@ -2454,5 +2503,23 @@ mod tests {
     fn hop_search_is_defensively_bounded_by_storage_capacity() {
         let passes = cycle_search_passes(u32::MAX, 5_000);
         assert_eq!(passes.last().map(|pass| pass.max_hops), Some(HOP_CAP));
+    }
+
+    #[test]
+    fn arc_dust_prune_filters_without_cloning_a_clean_snapshot() {
+        let mut arena = StateArena::default();
+        let clean = arena.register_pool(Address::with_last_byte(1), v2_state(U256::MAX));
+        let dust = arena.register_pool(Address::with_last_byte(2), v2_state(U256::ZERO));
+        let clean_cycles = Arc::new(vec![v2_cycle(clean)]);
+
+        assert!(Arc::ptr_eq(
+            &prune_dust_v2_cycles_arc(&arena, Arc::clone(&clean_cycles)),
+            &clean_cycles
+        ));
+
+        let pruned =
+            prune_dust_v2_cycles_arc(&arena, Arc::new(vec![v2_cycle(clean), v2_cycle(dust)]));
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].edges[0].pool_index, clean);
     }
 }

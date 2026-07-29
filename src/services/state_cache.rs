@@ -332,7 +332,7 @@ impl StateCache {
     }
 
     /// Apply an in-place mutation when a full pool entry already exists.
-    pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState)) -> bool {
+    pub fn patch_pool(&self, address: Address, mut f: impl FnMut(&mut PoolState) -> bool) -> bool {
         {
             let mut guard = self.inner.write();
             let Some(entry) = guard.get_mut(&address) else {
@@ -340,7 +340,9 @@ impl StateCache {
             };
             // ponytail: Arc::make_mut provides COW semantics — no deep clone when
             // the Arc is uniquely held (common for hot-patched pool states from WSS).
-            f(Arc::make_mut(&mut entry.state));
+            if !f(Arc::make_mut(&mut entry.state)) {
+                return true;
+            }
             entry.updated_at = Instant::now();
             entry.revision = self
                 .generation
@@ -805,6 +807,21 @@ mod tests {
         let dirty = cache.take_dirty_pool_indices(&map);
         assert_eq!(dirty, vec![PoolIndex(3)]);
         assert!(cache.take_dirty_pool_indices(&map).is_empty());
+    }
+
+    #[test]
+    fn no_op_patch_preserves_generation_and_dirty_set() {
+        let cache = StateCache::default();
+        let address = Address::with_last_byte(9);
+        let mut index = FxHashMap::default();
+        index.insert(address, PoolIndex(3));
+        cache.insert(address, PoolState::Invalid);
+        assert_eq!(cache.take_dirty_pool_indices(&index), vec![PoolIndex(3)]);
+        let generation = cache.generation();
+
+        assert!(cache.patch_pool(address, |_| false));
+        assert_eq!(cache.generation(), generation);
+        assert!(cache.take_dirty_pool_indices(&index).is_empty());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::orchestrator::hf_execute::{
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::sim_sanity::{matic_usd_for_flash_cap, min_economic_amount_in};
-use crate::pipeline::types::{PoolMeta, compare_cycle_score};
+use crate::pipeline::types::{PoolMeta, compare_cycle_execution, compare_cycle_score};
 use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -1299,10 +1299,8 @@ fn select_cycles_for_rescore(
         };
     }
 
-    // Prefer cycle quality among live routes so the 16-slot cap surfaces
-    // high cycle_ratio WSS edges instead of highest activity_count dust.
     active.sort_by(|a, b| {
-        compare_cycle_score(a.0.as_ref(), b.0.as_ref()).then_with(|| b.1.cmp(&a.1))
+        compare_cycle_execution(a.0.as_ref(), b.0.as_ref()).then_with(|| b.1.cmp(&a.1))
     });
     // Inactive: non-CL first (V2/BAL/CRV don't need TickLens), then quality.
     // Iter3: stream CL noise left best-eval V2 count at 3 vs 2371 in a prior
@@ -2983,6 +2981,7 @@ fn prefer_near_miss_by_absolute_matic(
 mod tests {
     use super::*;
     use crate::core::constants::{WMATIC, is_polygon_hub_token};
+    use crate::core::math::fixed_point::ONE;
     use crate::core::types::{CycleEdges, Edge, PoolIndex, PoolState, TokenIndex, V2PoolState};
     use crate::services::partial_cache::SlimPoolState;
 
@@ -3283,6 +3282,59 @@ mod tests {
 
         assert_eq!(selected.cycles.len(), 1);
         assert_eq!(selected.cycles[0].score, 4.0);
+    }
+
+    #[test]
+    fn active_selection_uses_execution_score_before_ratio() {
+        let mut arena = arena_with_edge_tokens();
+        let addresses: Vec<_> = (1u8..=5)
+            .map(|id| {
+                let address = Address::from([id; 20]);
+                arena.register_pool(address, v2_state());
+                address
+            })
+            .collect();
+        let partial_cache = PartialPoolCache::new();
+        for address in addresses {
+            partial_cache.seed(address, hot_slim_state(1));
+        }
+        let cycles: Vec<_> = [
+            (5_000u64, 10.0),
+            (1_000, -5.0),
+            (2_000, -4.0),
+            (3_000, -3.0),
+            (4_000, -2.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (ratio, score))| {
+            let mut cycle = cycle(PoolIndex(index as u32), score);
+            Arc::make_mut(&mut cycle).cycle_ratio = ONE + U256::from(ratio);
+            cycle
+        })
+        .collect();
+        let rates = one_to_one_rates();
+        let decimals = FxHashMap::default();
+
+        let selected = select_cycles_for_rescore(
+            &cycles,
+            &arena,
+            &[],
+            &partial_cache,
+            &ExecutionService::default(),
+            &rates,
+            &decimals,
+            12,
+            0,
+        );
+
+        assert_eq!(selected.activity_selected, 4);
+        let selected_pools: Vec<u32> = selected
+            .cycles
+            .iter()
+            .map(|cycle| cycle.edges[0].pool_index.0)
+            .collect();
+        assert_eq!(selected_pools, vec![1, 2, 3, 4]);
     }
 
     #[test]

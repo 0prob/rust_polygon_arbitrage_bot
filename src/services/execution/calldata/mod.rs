@@ -94,7 +94,6 @@ pub fn encode_route(
     {
         return encoders::balancer::encode_balancer_batch_route(hops, executor, config.deadline);
     }
-    let hops = conservative_execution_hops(arena, hops, config.slippage_bps)?;
     let mut calls = Vec::with_capacity(hops.len().saturating_mul(2));
     // Encoded V2 `amountOut` becomes the next hop's `amount_in` (V2 pair-chain or V3 exact-in).
     let mut chain_in: Option<U256> = None;
@@ -208,36 +207,6 @@ fn validate_flash_hop_compatibility(
         FlashLoanSource::AaveV3 | FlashLoanSource::Direct => {}
     }
     Ok(())
-}
-
-/// Re-quote the route for execution sizing.
-///
-/// - `amount_in` of hop 0 is preserved (flash/borrow size).
-/// - Each hop stores `amount_out` as the slippage floor (minOut for pull protocols).
-/// - The **next** hop's `amount_in` is the **full quote** (not the floor) so exact-in
-///   and V2 `amountOut` sizing match expected production, not a double haircut.
-fn conservative_execution_hops(
-    arena: &StateArena,
-    hops: &[CalldataHop],
-    slippage_bps: u64,
-) -> anyhow::Result<Vec<CalldataHop>> {
-    let mut amount_in = hops
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("route requires at least one hop"))?
-        .amount_in;
-    let mut out = Vec::with_capacity(hops.len());
-    for hop in hops {
-        let mut hop = hop.clone();
-        hop.amount_in = amount_in;
-        let quoted_out = quote_hop_for_execution(arena, &hop)
-            .ok_or_else(|| anyhow::anyhow!("execution quote unavailable"))?;
-        hop.amount_out = slippage_adjusted(quoted_out, slippage_bps)
-            .ok_or_else(|| anyhow::anyhow!("execution hop min out is zero"))?;
-        // Chain full quote so intermediate exact-in hops are not systematically undersized.
-        amount_in = quoted_out;
-        out.push(hop);
-    }
-    Ok(out)
 }
 
 #[must_use]
@@ -532,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn downstream_hop_chains_full_quote_and_stores_min_out() {
+    fn encode_route_requotes_chained_v2_hops() {
         let mut arena = StateArena::default();
         let t0 = arena.register_token(Address::from([1u8; 20]));
         let t1 = arena.register_token(Address::from([2u8; 20]));
@@ -541,15 +510,26 @@ mod tests {
         let second_pool = arena.register_pool(Address::from([5u8; 20]), v2_state());
         let mut first = v2_hop(first_pool, t0, t1);
         first.amount_in = U256::from(1_000u64);
-        let second = v2_hop(second_pool, t1, t2);
+        first.pool_address = Address::from([4u8; 20]);
+        first.token_in = Address::from([1u8; 20]);
+        first.token_out = Address::from([2u8; 20]);
+        let mut second = v2_hop(second_pool, t1, t2);
+        second.pool_address = Address::from([5u8; 20]);
+        second.token_in = Address::from([2u8; 20]);
+        second.token_out = Address::from([3u8; 20]);
 
-        let normalized = conservative_execution_hops(&arena, &[first.clone(), second], 100)
-            .expect("route should quote");
-        let quoted = quote_hop_for_execution(&arena, &first).expect("first quote");
-
-        // amount_out is the slippage floor; next amount_in is the full quote.
-        assert!(normalized[0].amount_out < quoted);
-        assert_eq!(normalized[1].amount_in, quoted);
+        let calls = encode_route(
+            &arena,
+            &[first, second],
+            Address::from([9u8; 20]),
+            RouteEncodeConfig {
+                slippage_bps: 100,
+                deadline: U256::from(1u8),
+            },
+            FlashLoanSource::AaveV3,
+        )
+        .expect("route should quote");
+        assert_eq!(calls.len(), 3);
     }
 
     #[test]

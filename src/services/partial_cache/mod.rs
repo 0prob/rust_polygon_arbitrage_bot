@@ -556,27 +556,37 @@ impl Default for PartialPoolCache {
     }
 }
 
-fn apply_slim_to_pool_state(state: &mut PoolState, slim: &SlimPoolState) {
+fn apply_slim_to_pool_state(state: &mut PoolState, slim: &SlimPoolState) -> bool {
     match (state, slim.protocol) {
         (PoolState::V2(v2), ProtocolType::UniswapV2) => {
+            let changed = v2.reserve0 != slim.reserve0 || v2.reserve1 != slim.reserve1;
             v2.reserve0 = slim.reserve0;
             v2.reserve1 = slim.reserve1;
+            changed
         }
         (PoolState::V3(v3), ProtocolType::UniswapV3)
             if slim.protocol == ProtocolType::UniswapV3 =>
         {
+            let changed = v3.sqrt_price_x96 != slim.sqrt_price_x96
+                || v3.liquidity != slim.liquidity
+                || v3.tick != slim.tick;
             v3.sqrt_price_x96 = slim.sqrt_price_x96;
             v3.liquidity = slim.liquidity;
             v3.tick = slim.tick;
+            changed
         }
         (PoolState::V4(v4), ProtocolType::UniswapV4)
             if slim.protocol == ProtocolType::UniswapV4 =>
         {
+            let changed = v4.sqrt_price_x96 != slim.sqrt_price_x96
+                || v4.liquidity != slim.liquidity
+                || v4.tick != slim.tick;
             v4.sqrt_price_x96 = slim.sqrt_price_x96;
             v4.liquidity = slim.liquidity;
             v4.tick = slim.tick;
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -961,6 +971,17 @@ mod tests {
         }
 
         assert_eq!(partial.flush_to_state_cache(&canonical, &[selected]), 1);
+        let generation = canonical.generation();
+        partial.apply_patch(
+            selected,
+            LogPatch::V2Reserves {
+                reserve0: U256::from(10u8),
+                reserve1: U256::from(10u8),
+            },
+            2,
+        );
+        assert_eq!(partial.flush_to_state_cache(&canonical, &[selected]), 1);
+        assert_eq!(canonical.generation(), generation);
         assert_eq!(partial.flush_to_state_cache(&canonical, &[deferred]), 0);
 
         canonical.insert(deferred, base());
