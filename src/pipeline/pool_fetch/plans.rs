@@ -314,7 +314,8 @@ fn plan_call_capacity(
         // balances + A + fee + gamma + (n-1) price_scale + precisions
         ProtocolType::CurveCrypto => {
             let n = curve_balance_slots(token_count);
-            n.saturating_add(4).saturating_add(n.saturating_sub(1).max(1))
+            n.saturating_add(4)
+                .saturating_add(n.saturating_sub(1).max(1))
         }
         ProtocolType::BalancerV2 => {
             // tokens + fee + scaling, plus optional weights/amp/linear probes.

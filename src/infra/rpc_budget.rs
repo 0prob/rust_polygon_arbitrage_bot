@@ -83,6 +83,14 @@ pub fn approx_tokens(url: &str) -> f64 {
     b.tokens
 }
 
+#[must_use]
+pub fn status(url: &str) -> (f64, f64) {
+    let bucket = bucket_for_url(url);
+    let mut b = bucket.lock();
+    b.refill();
+    (b.tokens, b.refill_per_sec)
+}
+
 /// Floor for `RPC_BATCH_PACE_MS` so free tiers cannot burst below their RPS cap.
 #[must_use]
 pub fn min_batch_pace_ms(url: &str) -> u64 {

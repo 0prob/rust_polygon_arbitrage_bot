@@ -139,6 +139,11 @@ impl RpcPool {
                 penalized.push(url.clone());
             }
         }
+        healthy.sort_by(|a, b| {
+            crate::infra::rpc_budget::status(b)
+                .0
+                .total_cmp(&crate::infra::rpc_budget::status(a).0)
+        });
         healthy.extend(budget_tight);
         healthy.extend(penalized);
         healthy
@@ -281,11 +286,10 @@ impl RpcPool {
             crate::warn!("state RPC probe found no healthy endpoints — keeping configured order");
             return;
         }
-        // Paid/keyed hosts before free public (Allnodes 1200/min) even if public is
-        // a few ms faster — live: publicnode ranked first then burned the free cap.
         ranked.sort_by(|(a, la), (b, lb)| {
-            crate::infra::rpc_budget::host_rank_class(a)
-                .cmp(&crate::infra::rpc_budget::host_rank_class(b))
+            crate::infra::rpc_budget::status(b)
+                .0
+                .total_cmp(&crate::infra::rpc_budget::status(a).0)
                 .then_with(|| la.cmp(lb))
         });
         // Drop cool-offs for URLs that just answered — otherwise deprioritize(60s)
@@ -306,7 +310,14 @@ impl RpcPool {
         }
         let summary: Vec<String> = ranked
             .iter()
-            .map(|(url, latency)| format!("{}={}ms", rpc_host_label(url), latency.as_millis()))
+            .map(|(url, latency)| {
+                let (tokens, rps) = crate::infra::rpc_budget::status(url);
+                format!(
+                    "{}={}ms tokens={tokens:.1} rps={rps:.1}",
+                    rpc_host_label(url),
+                    latency.as_millis()
+                )
+            })
             .collect();
         info!("state RPC order: {}", summary.join(", "));
         self.state_urls.store(Arc::new(ordered));

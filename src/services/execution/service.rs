@@ -1671,23 +1671,50 @@ mod safety_tests {
         let fp = 0xdead_beef_u64;
         let thick = U256::from(10u128.pow(17)); // 0.1 MATIC — needs 3 strikes
         // Near-zero cover never strikes (cascade guard).
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 10, thick).is_none());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(fp, 10, thick)
+                .is_none()
+        );
         assert!(!exec.is_route_quarantined(fp));
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+                .is_none()
+        );
         assert!(!exec.is_route_quarantined(fp));
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_some());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+                .is_some()
+        );
         assert!(exec.is_route_quarantined(fp));
         // Already quarantined — no re-apply signal.
-        assert!(exec.quarantine_chronic_gas_underwater(fp, 350, thick).is_none());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+                .is_none()
+        );
         // One-shot diversion (different fp) stays selectable.
-        assert!(exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick).is_none());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick)
+                .is_none()
+        );
         assert!(!exec.is_route_quarantined(0xcafe_u64));
         // Sub-100 cover with real MATIC still chronic-cools (live: 42/65 best-evals).
         let low_fp = 0x1042_u64;
-        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_none());
-        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_none());
-        assert!(exec.quarantine_chronic_gas_underwater(low_fp, 42, thick).is_some());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+                .is_some()
+        );
         // Wei-dust (<0.001 MATIC) cools on first strike with 1h.
         let dust_fp = 0xd057_u64;
         let dust_avail = U256::from(100u64);
@@ -1722,9 +1749,18 @@ mod safety_tests {
         // Cover≥break-even (10_000) with real MATIC escapes chronic.
         let near_fp = 0x9ea5_u64;
         let near_avail = U256::from(15u128 * 10u128.pow(16)); // 0.15 MATIC
-        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
-        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
-        assert!(exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail).is_none());
+        assert!(
+            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+                .is_none()
+        );
         assert!(!exec.is_route_quarantined(near_fp));
         // Half-cover with real MATIC (≥dust) also 1-strike + 30s.
         let half_fp = 0xba1b_a1b0_u64;

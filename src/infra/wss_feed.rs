@@ -35,6 +35,8 @@ const WSS_SUBSCRIPTION_FAILURE_COOLDOWN_MS: u64 = 60_000;
 const WSS_RATE_LIMIT_COOLDOWN_MS: u64 = 120_000;
 /// No Sync/Swap after arm → force LF to rotate interest set / re-seed ranking.
 const WSS_LOG_SILENCE_FORCE: Duration = Duration::from_secs(20);
+const WSS_DEDUP_TTL_MS: u64 = 120_000;
+const WSS_DEDUP_CAP: usize = 16_384;
 
 /// Why a live subscription session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,7 @@ pub struct PoolLogFeed {
     wss_urls: Vec<String>,
     sticky_url: Arc<Mutex<Option<String>>>,
     subscription_cooldowns: Arc<Mutex<rustc_hash::FxHashMap<String, u64>>>,
+    seen_logs: Arc<Mutex<rustc_hash::FxHashMap<(B256, u64), u64>>>,
     partial: Arc<PartialPoolCache>,
     addresses: StreamAddressSet,
     shutdown: watch::Receiver<bool>,
@@ -61,10 +64,29 @@ impl PoolLogFeed {
         addresses: StreamAddressSet,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
+        Self::with_preferred_url(
+            wss_urls,
+            None,
+            partial,
+            addresses,
+            shutdown,
+            Arc::new(Mutex::new(rustc_hash::FxHashMap::default())),
+        )
+    }
+
+    fn with_preferred_url(
+        wss_urls: Vec<String>,
+        preferred_url: Option<String>,
+        partial: Arc<PartialPoolCache>,
+        addresses: StreamAddressSet,
+        shutdown: watch::Receiver<bool>,
+        seen_logs: Arc<Mutex<rustc_hash::FxHashMap<(B256, u64), u64>>>,
+    ) -> Self {
         Self {
             wss_urls,
-            sticky_url: Arc::new(Mutex::new(None)),
+            sticky_url: Arc::new(Mutex::new(preferred_url)),
             subscription_cooldowns: Arc::new(Mutex::new(rustc_hash::FxHashMap::default())),
+            seen_logs,
             partial,
             addresses,
             shutdown,
@@ -275,6 +297,16 @@ impl PoolLogFeed {
         let topic0 = log.topics().first().copied().unwrap_or(B256::ZERO);
         let data = log.data().data.as_ref();
         let ts = now_ms();
+        if let (Some(tx_hash), Some(log_index)) = (log.transaction_hash, log.log_index) {
+            let mut seen = self.seen_logs.lock();
+            seen.retain(|_, seen_at| ts.saturating_sub(*seen_at) <= WSS_DEDUP_TTL_MS);
+            if seen.len() >= WSS_DEDUP_CAP {
+                seen.clear();
+            }
+            if seen.insert((tx_hash, log_index), ts).is_some() {
+                return;
+            }
+        }
         static RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if crate::log::every_n(&RAW, 500) {
@@ -381,9 +413,29 @@ pub fn spawn_pool_log_feed(
     if wss_urls.is_empty() {
         return None;
     }
-    let feed = PoolLogFeed::new(wss_urls, partial, addresses, shutdown);
+    let fanout = config.pipeline.stream_rpc_fanout;
     Some(tokio::spawn(async move {
-        feed.run().await;
+        let ranked = probe_wss_urls_ranked(&wss_urls).await;
+        let preferred = if ranked.is_empty() {
+            wss_urls.clone()
+        } else {
+            distinct_wss_providers(ranked.into_iter().map(|(url, _)| url).collect())
+        };
+        let fanout = fanout.min(preferred.len());
+        let seen_logs = Arc::new(Mutex::new(rustc_hash::FxHashMap::default()));
+        let mut feeds = JoinSet::new();
+        for url in preferred.into_iter().take(fanout) {
+            let feed = PoolLogFeed::with_preferred_url(
+                wss_urls.clone(),
+                Some(url),
+                Arc::clone(&partial),
+                addresses.clone(),
+                shutdown.clone(),
+                Arc::clone(&seen_logs),
+            );
+            feeds.spawn(async move { feed.run().await });
+        }
+        while feeds.join_next().await.is_some() {}
     }))
 }
 
@@ -436,6 +488,38 @@ fn ordered_wss_urls(
     ordered
 }
 
+fn distinct_wss_providers(urls: Vec<String>) -> Vec<String> {
+    let mut providers = rustc_hash::FxHashSet::default();
+    let mut distinct = Vec::with_capacity(urls.len());
+    let mut duplicates = Vec::new();
+    for url in urls {
+        if providers.insert(wss_provider_label(&url)) {
+            distinct.push(url);
+        } else {
+            duplicates.push(url);
+        }
+    }
+    distinct.extend(duplicates);
+    distinct
+}
+
+fn wss_provider_label(url: &str) -> String {
+    let host = rpc_host_label(url).to_ascii_lowercase();
+    if host.contains("drpc") {
+        "drpc".to_string()
+    } else if host.contains("publicnode") {
+        "publicnode".to_string()
+    } else if host.contains("tenderly") {
+        "tenderly".to_string()
+    } else if host.contains("chainstack") {
+        "chainstack".to_string()
+    } else if host.contains("quicknode") || host.contains("quiknode") {
+        "quicknode".to_string()
+    } else {
+        host
+    }
+}
+
 async fn probe_wss_latency(url: &str) -> Option<Duration> {
     let started = Instant::now();
     let ws = WsConnect::new(url.to_string());
@@ -456,6 +540,10 @@ async fn probe_wss_latency(url: &str) -> Option<Duration> {
 }
 
 async fn probe_wss_urls(urls: &[String]) -> Option<(String, Duration)> {
+    probe_wss_urls_ranked(urls).await.into_iter().next()
+}
+
+async fn probe_wss_urls_ranked(urls: &[String]) -> Vec<(String, Duration)> {
     let mut probes = tokio::task::JoinSet::new();
     for url in urls {
         let url = url.clone();
@@ -464,19 +552,15 @@ async fn probe_wss_urls(urls: &[String]) -> Option<(String, Duration)> {
             Some((url, latency))
         });
     }
-    let mut best: Option<(String, Duration)> = None;
+    let mut ranked = Vec::new();
     while let Some(result) = probes.join_next().await {
         let Ok(Some((url, latency))) = result else {
             continue;
         };
-        let replace = best
-            .as_ref()
-            .is_none_or(|(_, best_latency)| latency < *best_latency);
-        if replace {
-            best = Some((url, latency));
-        }
+        ranked.push((url, latency));
     }
-    best
+    ranked.sort_by_key(|(_, latency)| *latency);
+    ranked
 }
 
 enum WssUrlPick {
@@ -560,6 +644,22 @@ mod tests {
                 "wss://c".to_string(),
                 "wss://a".to_string(),
                 "wss://b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_wss_providers_keeps_fastest_per_provider_first() {
+        assert_eq!(
+            distinct_wss_providers(vec![
+                "wss://polygon.drpc.org".to_string(),
+                "wss://lb.drpc.live/polygon/key".to_string(),
+                "wss://polygon-bor-rpc.publicnode.com".to_string(),
+            ]),
+            vec![
+                "wss://polygon.drpc.org".to_string(),
+                "wss://polygon-bor-rpc.publicnode.com".to_string(),
+                "wss://lb.drpc.live/polygon/key".to_string(),
             ]
         );
     }

@@ -7,12 +7,11 @@ use super::ExecutionService;
 use super::route_stats::RouteFailureKind;
 use super::{
     ADAPTIVE_FLASH_CAP_START_DIVISOR, BATCH_QUERY_FAIL_QUARANTINE,
-    CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI, CHRONIC_THIN_LIQ_QUARANTINE,
     CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_MID_BAND_QUARANTINE, CHRONIC_NEAR_MISS_COVER_BPS,
-    CHRONIC_NEAR_MISS_QUARANTINE,
-    CHRONIC_UNDERWATER_COVER_BPS, CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI,
-    CHRONIC_UNDERWATER_MIN_COVER_BPS, CHRONIC_UNDERWATER_QUARANTINE,
-    CHRONIC_UNDERWATER_STRIKE_WINDOW, CHRONIC_UNDERWATER_STRIKES,
+    CHRONIC_NEAR_MISS_QUARANTINE, CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI,
+    CHRONIC_THIN_LIQ_QUARANTINE, CHRONIC_UNDERWATER_COVER_BPS,
+    CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI, CHRONIC_UNDERWATER_MIN_COVER_BPS,
+    CHRONIC_UNDERWATER_QUARANTINE, CHRONIC_UNDERWATER_STRIKE_WINDOW, CHRONIC_UNDERWATER_STRIKES,
     DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE, DRY_RUN_PASS_COOLDOWN, MAX_CONSECUTIVE_FAILURES,
     PERMANENT_QUARANTINE, PROBE_BELOW_FLOOR_QUARANTINE, ROUTE_ASSESS_CLAIM_TTL, ROUTE_COOLDOWN,
     STRUCTURAL_DRY_RUN_QUARANTINE,
@@ -308,8 +307,7 @@ impl ExecutionService {
         let mid_band = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
             && available_matic_wei >= U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
             && available_matic_wei < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
-        let thin_first_strike = available_matic_wei
-            < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
+        let thin_first_strike = available_matic_wei < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
             || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
                 && cover_bps < CHRONIC_NEAR_MISS_COVER_BPS);
         let strikes_needed = if thin_first_strike || near_miss || mid_band {
@@ -326,9 +324,7 @@ impl ExecutionService {
         //   near-miss (≥500 bps + ≥0.01)               → 30s
         //   mid-band (≥500 bps + [0.001, 0.01))        → 90s
         //   thin weak-cover (<500 bps / other)         → 600s
-        let ttl = if available_matic_wei
-            < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
-        {
+        let ttl = if available_matic_wei < U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI) {
             CHRONIC_THIN_LIQ_QUARANTINE
         } else if near_miss {
             CHRONIC_NEAR_MISS_QUARANTINE

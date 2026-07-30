@@ -12,7 +12,7 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Multi-protocol routing** — Uniswap V2/V3/V4 (hookless pools via `unlock`/`unlockCallback`), QuickSwap Algebra V3/Integral, Balancer V2, Curve (stable & crypto), DODO, WooFi.
 - **Cycle search** — Hybrid parallel DFS + Bellman-Ford (default), or `dfs` / `bellman-ford` alone (`johnson` is an env alias for Bellman-Ford); spot-weighted adjacency graph, atomic probe prefilter, graph/cycle caching.
 - **Pool discovery** — PostgreSQL direct SQL feed from HyperIndex; periodic refresh and dead-pool pruning. Optional V2 protocol toggles: `QUICKSWAP_V2_ENABLED`, `UNISWAP_V2_ENABLED`, `SUSHISWAP_V2_ENABLED` (unset = enabled).
-- **State refresh** — Archival RPC multicall for reserves, V3 ticks (TickLens), V4 storage slots, and protocol-specific fields.
+- **State refresh** — Multi-RPC archival multicall for reserves, V3 ticks (TickLens), V4 storage slots, and protocol-specific fields. Healthy endpoints are selected by rate-limit headroom, then probe latency; rate-limited endpoints cool off before reuse.
 - **Profit scoring** — Hop simulation uses in-memory pool state; base pricing uses an LF snapshot (`token_to_matic_rates`) from hub-path arena sim (token → WMATIC/WPOL; enabled by default in `OracleConfig`) plus Chainlink/Pyth for configured feeds and POL/USD caps. Gas oracle, live flash-loan fees, depth impact + optional static slippage, circuit breaker. Execution requires at least $0.01 final profit and final profit to cover gas; an unavailable POL/USD price fails closed.
 - **Learned route risk** — Per-route success/failure history at `ROUTE_STATS_PATH` (default `.rpbot-route-stats.json`); unreliable routes need proportionally more expected net profit before preflight.
 - **Flash-loan routing** — `FLASH_LOAN_SOURCE=auto` (default) picks a provider per cycle from live liquidity + Vault reentrancy rules (see [Flash loans](#flash-loans)). Aave V3 premium and Balancer protocol flash fee are RPC-refreshed.
@@ -106,14 +106,14 @@ Integration tests live under `tests/` (`oracle_feed_proposal_test`, `oracle_live
 ## Architecture
 
 ```
-Premium RPC (WSS) ──eth_subscribe logs──► PartialPoolCache (DashMap, target pools only)
-                                               │ flush on stream trigger
+WSS RPC fanout ──eth_subscribe logs──► dedup ──► PartialPoolCache (DashMap, target pools only)
+                                                    │ flush on stream trigger
 PostgreSQL ──► StateRefreshService ──► StateCache ◄┘
                │
 pass_loop
 ├── LF background (discovery → multicall refresh → graph → cycles → snapshot)
 │       └── updates WSS subscription target set (top V2/V3 pools)
-├── WSS feed (filtered Sync/Swap logs → partial cache patches)
+├── WSS feeds (up to STREAM_RPC_FANOUT concurrent filtered Sync/Swap feeds)
 └── HF (interval + block trigger + stream-triggered)
         └── prefetch skipped on stream ticks (stream patches already fresh)
         └── dry-run / submit via private RPC or bloXroute BDN
@@ -129,7 +129,7 @@ Brent/probe ranking uses the same fee, slippage, gas-scale, and priority basis a
 
 Preflight is local simulation, then `queryBatchSwap` plus executor `eth_call` for Direct Balancer routes, then the final calldata `eth_call`/gas reassessment before submit. The three checks cover distinct boundaries and are deliberately not interchangeable. A collapsed depth estimate (`depth_bps >= 10000`) is rejected, while an unavailable +5% depth probe receives the explicit 2500-bps haircut from the shared depth helper. Inputs for tokens with eight or fewer decimals must also be at least one whole token; 18-decimal hubs use only the economic notional floor.
 
-Stream is **off by default** (`STREAM_ENABLED` code default `false`). Set `STREAM_ENABLED=true` and configure `POLYGON_WSS_URLS` or `WSS_URL` (HTTP→WSS conversion from state RPCs is unreliable on many providers). Live submits should not use the public execution RPC for mempool injection — use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER`.
+Stream is **off by default** (`STREAM_ENABLED` code default `false`). Set `STREAM_ENABLED=true` and configure `POLYGON_WSS_URLS`; the bot probes the list and starts up to `STREAM_RPC_FANOUT` feeds (default `2`, maximum `3`), preferring distinct provider families. Duplicate `(transaction hash, log index)` events are discarded before they patch state. `WSS_URL` overrides the list and therefore uses one feed. HTTP→WSS fallback is used only when no explicit WSS URL is configured. Live submits should not use the public execution RPC for mempool injection — use `PRIVATE_RPC_URL` or `BLOXROUTE_AUTH_HEADER`.
 
 ### Flash loans
 

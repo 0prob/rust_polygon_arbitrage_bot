@@ -137,6 +137,8 @@ pub struct PipelineConfig {
     pub stream_enabled: bool,
     #[serde(default = "default_stream_max_pools")]
     pub stream_max_pools: usize,
+    #[serde(default = "default_stream_rpc_fanout")]
+    pub stream_rpc_fanout: usize,
     #[serde(default = "default_indexer_max_lag_blocks")]
     pub indexer_max_lag_blocks: u64,
     #[serde(default = "default_indexer_pause_on_lag")]
@@ -337,6 +339,9 @@ fn default_stream_max_pools() -> usize {
     // Fewer high-quality venues beat 500 dust shells that never emit Sync/Swap.
     200
 }
+fn default_stream_rpc_fanout() -> usize {
+    2
+}
 fn default_indexer_max_lag_blocks() -> u64 {
     200
 }
@@ -423,6 +428,7 @@ impl Default for PipelineConfig {
             pool_meta_cache_path: default_pool_meta_cache_path(),
             stream_enabled: false,
             stream_max_pools: default_stream_max_pools(),
+            stream_rpc_fanout: default_stream_rpc_fanout(),
             indexer_max_lag_blocks: default_indexer_max_lag_blocks(),
             indexer_pause_on_lag: default_indexer_pause_on_lag(),
             hypersync_url: None,
@@ -563,6 +569,7 @@ fn env_key_to_figment_path(key: &str) -> Option<&'static str> {
         k if k.eq_ignore_ascii_case("cycle_refind_interval") => "pipeline.cycle_refind_interval",
         k if k.eq_ignore_ascii_case("stream_enabled") => "pipeline.stream_enabled",
         k if k.eq_ignore_ascii_case("stream_max_pools") => "pipeline.stream_max_pools",
+        k if k.eq_ignore_ascii_case("stream_rpc_fanout") => "pipeline.stream_rpc_fanout",
         k if k.eq_ignore_ascii_case("indexer_max_lag_blocks") => "pipeline.indexer_max_lag_blocks",
         k if k.eq_ignore_ascii_case("indexer_pause_on_lag") => "pipeline.indexer_pause_on_lag",
         k if k.eq_ignore_ascii_case("pool_meta_cache_path") => "pipeline.pool_meta_cache_path",
@@ -726,6 +733,7 @@ impl AppConfig {
         }
         self.pipeline.hf_max_dispatch = self.pipeline.hf_max_dispatch.max(1);
         self.pipeline.stream_max_pools = self.pipeline.stream_max_pools.clamp(1, 2_000);
+        self.pipeline.stream_rpc_fanout = self.pipeline.stream_rpc_fanout.clamp(1, 3);
         self.pipeline.lf_bootstrap_batch = self.pipeline.lf_bootstrap_batch.max(1);
         self.pipeline.lf_hot_batch = self.pipeline.lf_hot_batch.max(1);
         self.routing.enumeration_max_paths = self.routing.enumeration_max_paths.max(1);

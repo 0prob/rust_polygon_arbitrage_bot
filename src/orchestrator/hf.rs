@@ -18,8 +18,8 @@ use crate::orchestrator::hf_eval::{HfEvalInputOwned, rescore_rank_and_evaluate_a
 use crate::orchestrator::hf_execute::{
     cycle_tickless_cl_hf_empty_exhausted, dispatch_profitable_candidates,
     drain_cooldown_stuck_tickless_cycles, drain_empty_tick_stuck_tickless_cycles,
-    filter_balancer_onchain_verified,
-    hydrate_tickless_cl_for_cycles, probe_near_miss_balancer, refresh_and_resim_profitable,
+    filter_balancer_onchain_verified, hydrate_tickless_cl_for_cycles, probe_near_miss_balancer,
+    refresh_and_resim_profitable,
 };
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
