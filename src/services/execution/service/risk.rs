@@ -7,11 +7,12 @@ use super::ExecutionService;
 use super::route_stats::RouteFailureKind;
 use super::{
     ADAPTIVE_FLASH_CAP_START_DIVISOR, BATCH_QUERY_FAIL_QUARANTINE,
-    CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_MID_BAND_QUARANTINE, CHRONIC_NEAR_MISS_COVER_BPS,
-    CHRONIC_NEAR_MISS_QUARANTINE, CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI,
-    CHRONIC_THIN_LIQ_QUARANTINE, CHRONIC_UNDERWATER_COVER_BPS,
-    CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI, CHRONIC_UNDERWATER_MIN_COVER_BPS,
-    CHRONIC_UNDERWATER_QUARANTINE, CHRONIC_UNDERWATER_STRIKE_WINDOW, CHRONIC_UNDERWATER_STRIKES,
+    CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_HIGH_COVER_BPS, CHRONIC_MID_BAND_QUARANTINE,
+    CHRONIC_NEAR_MISS_COVER_BPS, CHRONIC_NEAR_MISS_QUARANTINE,
+    CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI, CHRONIC_THIN_LIQ_QUARANTINE,
+    CHRONIC_UNDERWATER_COVER_BPS, CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI,
+    CHRONIC_UNDERWATER_MIN_COVER_BPS, CHRONIC_UNDERWATER_QUARANTINE,
+    CHRONIC_UNDERWATER_STRIKE_WINDOW, CHRONIC_UNDERWATER_STRIKES,
     DIRECT_TOKEN_ZERO_REALIZED_QUARANTINE, DRY_RUN_PASS_COOLDOWN, MAX_CONSECUTIVE_FAILURES,
     PERMANENT_QUARANTINE, PROBE_BELOW_FLOOR_QUARANTINE, ROUTE_ASSESS_CLAIM_TTL, ROUTE_COOLDOWN,
     STRUCTURAL_DRY_RUN_QUARANTINE,
@@ -298,11 +299,15 @@ impl ExecutionService {
             entry.1 = now;
             entry.0
         };
-        // First-strike: true dust / weak-cover thin, OR gas near-miss / mid-band.
+        // First-strike: true dust / weak-cover thin, mid-band, OR moderate near-miss.
         // Near-miss (≥500 + ≥0.01): 30s sticky. Mid-band (≥500 + [0.001,0.01)): 90s
         // — live iter35 weak sticky cover~960/avail~0.009 monopolized best-eval 17×
         // vs BAL-DODO cover~3850 only 3×.
+        // High-cover (≥7500 + ≥0.01): 3 strikes — almost-profitable edges (live
+        // DODO×2 cover=8672) must survive base-fee noise, not die on strike-1.
         let near_miss = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
+            && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
+        let high_cover_near_miss = gas_cover_bps >= CHRONIC_HIGH_COVER_BPS
             && available_matic_wei >= U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI);
         let mid_band = gas_cover_bps >= CHRONIC_NEAR_MISS_COVER_BPS
             && available_matic_wei >= U256::from(CHRONIC_UNDERWATER_MIN_AVAILABLE_MATIC_WEI)
@@ -310,11 +315,12 @@ impl ExecutionService {
         let thin_first_strike = available_matic_wei < U256::from(CHRONIC_DUST_AVAILABLE_MATIC_WEI)
             || (available_matic_wei < U256::from(CHRONIC_THIN_LIQ_AVAILABLE_MATIC_WEI)
                 && cover_bps < CHRONIC_NEAR_MISS_COVER_BPS);
-        let strikes_needed = if thin_first_strike || near_miss || mid_band {
-            1
-        } else {
-            CHRONIC_UNDERWATER_STRIKES
-        };
+        let strikes_needed =
+            if thin_first_strike || mid_band || (near_miss && !high_cover_near_miss) {
+                1
+            } else {
+                CHRONIC_UNDERWATER_STRIKES
+            };
         if strikes < strikes_needed {
             return None;
         }

@@ -539,7 +539,9 @@ pub fn realign_uni_cycle_from_pool_meta(
         if m.tokens.len() < 2 {
             continue;
         }
-        // Curve/DODO/Woofi: TokenIndex is source of truth — remap stale leg idxs from meta.
+        // Curve/DODO/Woofi: remap stale leg idxs from meta. Prefer address match —
+        // TokenIndex can drift after re-registration while ERC-20 addresses stay fixed
+        // (live: Curve GHST/stGHST wrong coin idx → exchange sold the wrong leg).
         // DODO meta is always [base, quote] after arena sync (sellBase ⇔ idx 0).
         // Woofi meta is [bases…, quote] matching hydrated `state.tokens`.
         if matches!(
@@ -551,10 +553,18 @@ pub fn realign_uni_cycle_from_pool_meta(
         ) {
             // ponytail: skip remap on stale meta — don't fail-closed the whole
             // cycle (live: uni_realign wiped Woofi/Balancer mixes with healthy Uni hops).
-            let Some(in_pos) = m.tokens.iter().position(|&t| t == edge.token_in) else {
+            let meta_pos = |tok: TokenIndex| {
+                m.tokens.iter().position(|&t| t == tok).or_else(|| {
+                    let want = arena.token_address(tok)?;
+                    m.tokens
+                        .iter()
+                        .position(|&t| arena.token_address(t) == Some(want))
+                })
+            };
+            let Some(in_pos) = meta_pos(edge.token_in) else {
                 continue;
             };
-            let Some(out_pos) = m.tokens.iter().position(|&t| t == edge.token_out) else {
+            let Some(out_pos) = meta_pos(edge.token_out) else {
                 continue;
             };
             if let Some(PoolState::Curve(s)) = arena.pool_state(edge.pool_index)

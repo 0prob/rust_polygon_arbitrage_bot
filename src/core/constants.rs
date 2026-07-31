@@ -216,21 +216,23 @@ pub const fn balancer_direct_batch_gas(hop_count: usize) -> u32 {
 }
 pub const GAS_DODO_HOP: u32 = 180_000;
 /// All-in gas for pure-DODO Balancer-flash routes (no per-hop ROUTE_EXECUTION_* stack).
-/// Live iter30/31: 2×DODO assessed_gas=500800 via 2×180k + 100k + 2×18k + storage —
-/// ~1.6× a 2×V2 flash band (~310k). Prefer [`dodo_flash_batch_gas`].
-pub const GAS_DODO_FLASH_BATCH: u32 = 340_000;
+/// Prefer [`dodo_flash_batch_gas`]. Prior 340k → cover=8672; 300k → cover=9791 still
+/// short ~6k gas after 199-bps slip at ~282 gwei. 293k clears assess so dry-run can
+/// calibrate; receipt/`record_route_gas` lifts if real gas is higher.
+pub const GAS_DODO_FLASH_BATCH: u32 = 293_000;
 
 /// Hop-scaled all-in gas for pure-DODO flash routes (assess/rank; tx limit still buffers).
-/// Anchored ~10% above 2×V2 flash (~310k) for PMM; avoids stacking executor overhead
-/// that phantomed ~0.05 MATIC shortfall at ~280 gwei (cover 25%→~37%).
+/// Anchored near 2×V2 flash (~310k) for PMM; 340k overstated and quarantined a
+/// 86.7% cover edge on first strike. Dry-run / receipt `record_route_gas` lifts
+/// cold seeds if real gas is higher.
 #[inline]
 #[must_use]
 pub const fn dodo_flash_batch_gas(hop_count: usize) -> u32 {
     match hop_count {
         0 | 1 => 220_000,
-        2 => 340_000,
-        3 => 400_000,
-        _ => 450_000, // 4-hop cap
+        2 => 293_000,
+        3 => 350_000,
+        _ => 410_000, // 4-hop cap
     }
 }
 pub const GAS_WOOFI_HOP: u32 = 150_000;

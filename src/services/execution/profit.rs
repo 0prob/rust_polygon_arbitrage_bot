@@ -1453,7 +1453,10 @@ mod safety_tests {
         };
         let dodo_edges = [dodo_edge, dodo_edge];
         let dodo_gas = assessment_gas_for_edges(&dodo_edges, None, &oracle, 3);
-        assert_eq!(assessment_gas_units(340_000, &dodo_gas), 340_000);
+        assert_eq!(
+            assessment_gas_units(crate::core::constants::GAS_DODO_FLASH_BATCH, &dodo_gas),
+            crate::core::constants::GAS_DODO_FLASH_BATCH
+        );
         // Mixed (V2) still takes global scale.
         let v2 = Edge {
             protocol: ProtocolType::UniswapV2,

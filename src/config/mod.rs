@@ -244,10 +244,10 @@ fn default_brent_search_iterations() -> u32 {
     12
 }
 fn default_enumeration_max_paths() -> u32 {
-    // 24: live iter8–9 at 13 left ~half the snap on tickless_stuck / ZeroProfit after
-    // sticky DODO/V2 uq — too little diversify for Brent. 24 keeps LF under ~2s at
-    // current graph sizes while giving HF more non-phantom candidates.
-    24
+    // 48: 24 left LF at ~25 cycles on 5k+ graph pools (dry-run) with half the snap
+    // lost to tickless_stuck / ZeroProfit / sticky uq — too little diversify for
+    // Brent. 48 still keeps hybrid search under tens of ms at current graph sizes.
+    48
 }
 fn default_cycle_finder() -> CycleFinderMode {
     CycleFinderMode::Hybrid

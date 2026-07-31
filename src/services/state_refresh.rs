@@ -35,11 +35,19 @@ use crate::util::now_ms;
 
 /// Remove a pool from the discovered list after this many consecutive
 /// fetch classifications as invalid / never-fetched.
-const MAX_INVALID_FETCHES: u32 = 30;
+/// Was 30 (~15 min at 30s invalid TTL); with 120s TTL, 6 strikes ≈ 12 min but
+/// each strike costs less RPC (invalids re-enter the fetch window less often).
+const MAX_INVALID_FETCHES: u32 = 6;
 pub const HF_POOL_STATE_FRESH: Duration = Duration::from_millis(1_500);
 /// Live: eth_blockNumber hung 5–11s (head_ms) and blew the 4s refresh interval
 /// with updated=0 — pin to cache on timeout instead of blocking the LF tick.
 const RPC_HEAD_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Adaptive LF batch scale in bps (10_000 = 100% of configured bootstrap/hot batch).
+const REFRESH_BATCH_SCALE_FULL_BPS: u64 = 10_000;
+/// Floor so adaptive shrink still covers a useful multicall wave (not empty ticks).
+const REFRESH_BATCH_SCALE_MIN_BPS: u64 = 4_000;
+/// Grow back toward full by this many bps when refresh finishes under 75% of interval.
+const REFRESH_BATCH_SCALE_STEP_BPS: u64 = 500;
 
 /// Outcome of a targeted or batch pool-state refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,6 +119,8 @@ pub struct StateRefreshService {
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
     fetch_never_scan_offset: AtomicUsize,
+    /// Adaptive scale for [`Self::lf_refresh_batch`] after overruns (bps, 10_000 = full).
+    refresh_batch_scale_bps: AtomicU64,
     /// Set to true by the LISTEN/NOTIFY task when a pool_meta_channel notification arrives.
     /// Cleared by `maybe_discover` after triggering an early incremental refresh.
     pg_notify_pending: Arc<AtomicBool>,
@@ -150,6 +160,7 @@ impl StateRefreshService {
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
             fetch_never_scan_offset: AtomicUsize::new(0),
+            refresh_batch_scale_bps: AtomicU64::new(REFRESH_BATCH_SCALE_FULL_BPS),
             pg_notify_pending: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1126,10 +1137,11 @@ impl StateRefreshService {
             }
         }
         let refresh_ms = now_ms().saturating_sub(refresh_started);
-        if refresh_ms >= self.config.lf_interval_ms {
+        let interval_ms = self.config.lf_interval_ms;
+        let scale_after = self.note_refresh_duration(refresh_ms, interval_ms);
+        if refresh_ms >= interval_ms {
             crate::warn!(
-                "state refresh overrun: total_ms={refresh_ms} interval_ms={} matched={matched} updated={total_updated} attempted={fetch_attempted} rpc_attempts={rpc_attempts}/{} head_ms={rpc_head_ms} fetch_ms={fetch_ms} hash_ms={hash_ms} pinned_block={last_pinned_block:?}",
-                self.config.lf_interval_ms,
+                "state refresh overrun: total_ms={refresh_ms} interval_ms={interval_ms} matched={matched} updated={total_updated} attempted={fetch_attempted} rpc_attempts={rpc_attempts}/{} head_ms={rpc_head_ms} fetch_ms={fetch_ms} hash_ms={hash_ms} pinned_block={last_pinned_block:?} batch_scale_bps={scale_after}",
                 candidates.len(),
             );
         }
@@ -1138,6 +1150,31 @@ impl StateRefreshService {
             attempted: fetch_attempted,
             matched,
         })
+    }
+
+    /// Shrink LF batch after overruns; grow slowly when under 75% of interval.
+    /// Returns the scale (bps) after the update.
+    fn note_refresh_duration(&self, refresh_ms: u64, interval_ms: u64) -> u64 {
+        let prev = self
+            .refresh_batch_scale_bps
+            .load(Ordering::Relaxed)
+            .max(REFRESH_BATCH_SCALE_MIN_BPS)
+            .min(REFRESH_BATCH_SCALE_FULL_BPS);
+        let next = next_refresh_batch_scale_bps(prev, refresh_ms, interval_ms);
+        if next != prev {
+            self.refresh_batch_scale_bps
+                .store(next, Ordering::Relaxed);
+            if next < prev {
+                crate::info!(
+                    "state refresh batch scale: {prev}→{next} bps (refresh_ms={refresh_ms} interval_ms={interval_ms})"
+                );
+            } else {
+                crate::debug!(
+                    "state refresh batch scale: {prev}→{next} bps (refresh_ms={refresh_ms} interval_ms={interval_ms})"
+                );
+            }
+        }
+        next
     }
 
     pub fn bootstrap_parse_stats(&self) -> Option<ParseStats> {
@@ -1150,8 +1187,53 @@ impl StateRefreshService {
     }
 
     pub fn lf_refresh_batch(&self, pass: u64) -> usize {
-        refresh_batch_for(pass, self.routable_pool_count(), &self.config.pipeline)
+        let base = refresh_batch_for(pass, self.routable_pool_count(), &self.config.pipeline);
+        let scale = self
+            .refresh_batch_scale_bps
+            .load(Ordering::Relaxed)
+            .max(REFRESH_BATCH_SCALE_MIN_BPS)
+            .min(REFRESH_BATCH_SCALE_FULL_BPS);
+        apply_refresh_batch_scale(base, scale, self.config.pipeline.lf_hot_batch)
     }
+}
+
+/// Pure adaptive scale update (bps). Shrink proportionally on overrun; grow by
+/// [`REFRESH_BATCH_SCALE_STEP_BPS`] when under 75% of the LF interval.
+#[must_use]
+fn next_refresh_batch_scale_bps(prev: u64, refresh_ms: u64, interval_ms: u64) -> u64 {
+    let prev = prev
+        .max(REFRESH_BATCH_SCALE_MIN_BPS)
+        .min(REFRESH_BATCH_SCALE_FULL_BPS);
+    if interval_ms == 0 {
+        return prev;
+    }
+    if refresh_ms >= interval_ms {
+        // Proportional shrink: 5s on 4.5s interval → ~90% of current scale.
+        let scaled = prev
+            .saturating_mul(interval_ms)
+            .saturating_div(refresh_ms.max(1));
+        scaled.max(REFRESH_BATCH_SCALE_MIN_BPS)
+    } else if refresh_ms.saturating_mul(4) < interval_ms.saturating_mul(3)
+        && prev < REFRESH_BATCH_SCALE_FULL_BPS
+    {
+        prev.saturating_add(REFRESH_BATCH_SCALE_STEP_BPS)
+            .min(REFRESH_BATCH_SCALE_FULL_BPS)
+    } else {
+        prev
+    }
+}
+
+/// Apply scale bps to a configured batch; floor at hot batch (or 1).
+#[must_use]
+fn apply_refresh_batch_scale(base: usize, scale_bps: u64, hot_batch: usize) -> usize {
+    let scale = scale_bps
+        .max(REFRESH_BATCH_SCALE_MIN_BPS)
+        .min(REFRESH_BATCH_SCALE_FULL_BPS);
+    let scaled = base
+        .saturating_mul(scale as usize)
+        .saturating_div(REFRESH_BATCH_SCALE_FULL_BPS as usize);
+    let floor = hot_batch.min(base).max(1);
+    scaled.max(floor).min(base).max(1)
 }
 
 fn refresh_batch_for(
@@ -1228,7 +1310,11 @@ fn bootstrap_cursor_block(keyset_created: i32, pool_created_max: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_sorted_addresses, refresh_batch_for, replace_discovered_pool};
+    use super::{
+        REFRESH_BATCH_SCALE_FULL_BPS, REFRESH_BATCH_SCALE_MIN_BPS, apply_refresh_batch_scale,
+        dedupe_sorted_addresses, next_refresh_batch_scale_bps, refresh_batch_for,
+        replace_discovered_pool,
+    };
     use crate::config::AppConfig;
     use crate::core::types::ProtocolType;
     use crate::services::discovery::DiscoveredPool;
@@ -1242,6 +1328,42 @@ mod tests {
         assert_eq!(refresh_batch_for(2, 3_000, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 17_999, &config.pipeline), 3_000);
         assert_eq!(refresh_batch_for(2, 18_000, &config.pipeline), 500);
+    }
+
+    #[test]
+    fn adaptive_scale_shrinks_on_overrun_and_grows_when_fast() {
+        let full = REFRESH_BATCH_SCALE_FULL_BPS;
+        // 5057ms on 4500ms interval → scale * 4500/5057 ≈ 8898
+        let shrunk = next_refresh_batch_scale_bps(full, 5_057, 4_500);
+        assert!(shrunk < full);
+        assert!(shrunk >= REFRESH_BATCH_SCALE_MIN_BPS);
+        assert_eq!(shrunk, full * 4_500 / 5_057);
+
+        // Under 75% of interval grows by step.
+        let grown = next_refresh_batch_scale_bps(8_000, 2_000, 4_500);
+        assert_eq!(grown, 8_500);
+
+        // Floor holds under extreme overrun.
+        assert_eq!(
+            next_refresh_batch_scale_bps(full, 20_000, 4_500),
+            REFRESH_BATCH_SCALE_MIN_BPS
+        );
+    }
+
+    #[test]
+    fn apply_scale_respects_hot_floor_and_base_cap() {
+        assert_eq!(
+            apply_refresh_batch_scale(2_500, REFRESH_BATCH_SCALE_FULL_BPS, 800),
+            2_500
+        );
+        assert_eq!(apply_refresh_batch_scale(2_500, 5_000, 800), 1_250);
+        // 40% of 2500 = 1000, still above hot floor 800.
+        assert_eq!(
+            apply_refresh_batch_scale(2_500, REFRESH_BATCH_SCALE_MIN_BPS, 800),
+            1_000
+        );
+        // Tiny base stays ≥1 and ≤ base.
+        assert_eq!(apply_refresh_batch_scale(100, 4_000, 800), 100);
     }
 
     #[test]

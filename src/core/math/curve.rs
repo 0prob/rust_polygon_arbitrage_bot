@@ -344,6 +344,35 @@ mod tests {
         let hi = onchain * U256::from(101u64) / U256::from(100u64);
         assert!(out >= lo && out <= hi, "out={out} onchain={onchain}");
     }
+
+    /// GHST/stGHST Stable-NG (0x4b3e…): dry-run hop2 transferAll empty-revert when Curve
+    /// leaves 0 intermediate. Local quote must not wildly diverge from get_dy.
+    #[test]
+    fn ghst_stghst_ng_quote_near_onchain_get_dy() {
+        // Live balances/A/fee; get_dy(1,0,397790001835358637)=269816550691123458
+        let state = CurvePoolState {
+            balances: vec![
+                U256::from(913_061_441_281_512_614u128),
+                U256::from(14_632_452_263_254_568_709u128),
+            ],
+            a: U256::from(10_000u64), // A()=100 → A_precise
+            fee: U256::from(4_000_000u64),
+            rates: vec![ONE, ONE],
+            n_coins: 2,
+            gamma: None,
+            d: None,
+        };
+        let ain = U256::from(397_790_001_835_358_637u128);
+        let out = try_curve_stable_amount_out(&state, ain, 1, 0).expect("quote");
+        let chain = U256::from(269_816_550_691_123_458u128);
+        let lo = chain * U256::from(95u64) / U256::from(100u64);
+        let hi = chain * U256::from(105u64) / U256::from(100u64);
+        assert!(
+            out >= lo && out <= hi,
+            "local={out} chain={chain} (bps={})",
+            out * U256::from(10_000u64) / chain
+        );
+    }
 }
 
 #[cfg(test)]

@@ -163,7 +163,7 @@ ROUTING_MAX_HOPS=5
 # Maximum cycle paths to enumerate per LF tick (code default: 24).
 # Higher values increase LF CPU; config warns above 1000 (try ≤650 for tuned LF).
 # Example: more enumeration budget for denser graphs
-ROUTING_ENUMERATION_MAX_PATHS=48
+ROUTING_ENUMERATION_MAX_PATHS=24
 
 # Cycle finder: hybrid (default) | dfs | johnson | bellman-ford
 # (johnson is an alias for bellman-ford)

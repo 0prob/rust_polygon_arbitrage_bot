@@ -143,10 +143,18 @@ pub fn simulate_v3_swap(
             tick
         };
         let mut next_tick = next_initialized_tick_with_net(ticks, tick_search, zero_for_one);
+        // Synthetic bound: no L_net cross (real initialized ticks have |net| often ≠ 0,
+        // but net=0 is also valid on-chain — track via `synthetic_bound` instead).
+        let mut synthetic_bound = false;
 
         if next_tick.is_none() && has_ticks {
-            tick_data_exhausted = true;
-            break;
+            // Swap.sol clamps missing bitmap hits to MIN/MAX and still runs
+            // computeSwapStep at constant L. Prior code `break`s here and marked
+            // shallow without consuming in-range liquidity — live shallow_cl flood
+            // when hydrate window ends before the next initialized tick while the
+            // trade still fits current L (probe rank: shallow_cl dominant).
+            next_tick = Some((if zero_for_one { MIN_TICK } else { MAX_TICK }, 0));
+            synthetic_bound = true;
         }
 
         if next_tick.is_none() && !has_ticks {
@@ -171,6 +179,7 @@ pub fn simulate_v3_swap(
                 raw_next
             };
             next_tick = Some((bounded.clamp(MIN_TICK, MAX_TICK), 0));
+            synthetic_bound = true;
         }
 
         let sqrt_price_next_tick_x96 = next_tick
@@ -195,11 +204,23 @@ pub fn simulate_v3_swap(
         };
 
         sqrt_price_x96 = step.sqrt_ratio_next_x96;
-        amount_remaining = amount_remaining.saturating_sub(step.amount_in + step.fee_amount);
-        amount_calculated += step.amount_out;
+        // saturating: amount_in+fee can theoretically exceed U256 on pathological steps;
+        // wrapping add would invent a tiny sum and leave a phantom remainder.
+        amount_remaining = amount_remaining
+            .saturating_sub(step.amount_in.saturating_add(step.fee_amount));
+        amount_calculated = amount_calculated.saturating_add(step.amount_out);
 
         if sqrt_price_x96 == sqrt_price_next_tick_x96 {
             if let Some((nt, liquidity_net)) = next_tick {
+                if synthetic_bound {
+                    // Hit hydrate/bitmap edge (or tickless step bound). Any unfilled
+                    // remainder needs ticks we do not have.
+                    if !amount_remaining.is_zero() {
+                        tick_data_exhausted = true;
+                    }
+                    tick = if zero_for_one { nt.saturating_sub(1) } else { nt };
+                    break;
+                }
                 if has_ticks {
                     liquidity = if zero_for_one {
                         liquidity - liquidity_net
@@ -213,6 +234,7 @@ pub fn simulate_v3_swap(
                 tick = if zero_for_one { nt - 1 } else { nt };
             }
         } else {
+            // Filled inside the step, or stopped at the swap price limit mid-range.
             let min_tick = if zero_for_one {
                 next_tick.map(|(nt, _)| nt).unwrap_or(MIN_TICK)
             } else {
@@ -225,6 +247,10 @@ pub fn simulate_v3_swap(
             };
             tick =
                 get_tick_at_sqrt_ratio_in_range(sqrt_price_x96, min_tick, max_tick).unwrap_or(tick);
+            // Synthetic bound / price-limit stop with leftover input = incomplete walk.
+            if (synthetic_bound || has_ticks) && !amount_remaining.is_zero() {
+                tick_data_exhausted = true;
+            }
             break;
         }
 
@@ -236,7 +262,9 @@ pub fn simulate_v3_swap(
         }
     }
 
-    let shallow = !has_ticks || tick_data_exhausted;
+    // Tickless is always shallow. With a tick array, any unfilled exact-input is
+    // either a hydrate hole or insufficient L — both fail closed as shallow.
+    let shallow = !has_ticks || tick_data_exhausted || !amount_remaining.is_zero();
     let gas_estimate = GAS_V3_BASE + ticks_crossed * GAS_PER_TICK_CROSSED;
 
     V3SwapResult {
@@ -340,6 +368,72 @@ mod tests {
             false,
         );
         assert_eq!(with_protocol_fee.amount_out, quote.amount_out);
+    }
+
+    /// Hydrate window only has ticks on the opposite side of the walk. Prior code
+    /// broke on `next_initialized == None` without a constant-L step → zero progress
+    /// + shallow, flooding probe rank with shallow_cl.
+    #[test]
+    fn incomplete_tick_window_fills_within_current_liquidity() {
+        use crate::core::types::V3Tick;
+        let ticks = vec![V3Tick {
+            tick: 600,
+            liquidity_gross: 1,
+            liquidity_net: 0,
+        }];
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(ticks),
+        };
+        // zero_for_one looks for ticks ≤ -1; only tick 600 is present → synthetic MIN.
+        let r = simulate_v3_swap(&state, U256::from(1_000_000u64), true, Some(30), false);
+        assert!(
+            r.amount_out > U256::ZERO,
+            "must quote with current L when next tick is outside hydrate window; out={}",
+            r.amount_out
+        );
+        assert!(
+            !r.shallow,
+            "full fill inside current L is not shallow (got shallow with out={})",
+            r.amount_out
+        );
+    }
+
+    #[test]
+    fn incomplete_tick_window_marks_shallow_when_amount_exceeds_current_l() {
+        use crate::core::types::V3Tick;
+        let ticks = vec![V3Tick {
+            tick: 600,
+            liquidity_gross: 1,
+            liquidity_net: 0,
+        }];
+        let state = V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(ticks),
+        };
+        // Huge input forces the synthetic MIN bound with residual input.
+        let r = simulate_v3_swap(
+            &state,
+            U256::from(10u128.pow(30)),
+            true,
+            Some(30),
+            false,
+        );
+        assert!(r.shallow, "unfilled remainder past hydrate edge must be shallow");
     }
 }
 

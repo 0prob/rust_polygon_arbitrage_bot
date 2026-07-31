@@ -76,6 +76,27 @@ pub fn build_packed_route_payload(
     Ok((payload.into(), route_hash))
 }
 
+/// Whether this hop can send `token_out` straight to an address other than the executor.
+///
+/// Used to fund the next V2 pair without Huff `transferAll` (live: Curve NG GHST/stGHST → V2
+/// failed hop-2 transferAll with empty nested revert when intermediate stayed off-executor).
+#[must_use]
+fn hop_can_direct_output_to(hop: &CalldataHop) -> bool {
+    match hop.edge.protocol {
+        ProtocolType::UniswapV2
+        | ProtocolType::UniswapV3
+        | ProtocolType::Dodo
+        | ProtocolType::BalancerV2
+        | ProtocolType::Woofi => true,
+        ProtocolType::CurveStable | ProtocolType::CurveCrypto => {
+            // Only StableSwap-NG `exchange(..., receiver)`; plain Stable/Crypto always
+            // pay `msg.sender` (executor) so the next hop must transferAll.
+            curve_uses_receiver(hop.pool_type.as_deref())
+        }
+        ProtocolType::UniswapV4 => false,
+    }
+}
+
 /// Encode route into executor calls via protocol-specific encoder functions.
 pub fn encode_route(
     arena: &StateArena,
@@ -97,6 +118,9 @@ pub fn encode_route(
     let mut calls = Vec::with_capacity(hops.len().saturating_mul(2));
     // Encoded V2 `amountOut` becomes the next hop's `amount_in` (V2 pair-chain or V3 exact-in).
     let mut chain_in: Option<U256> = None;
+    // Where the previous hop left `token_out` (pool address or executor). Flash credit
+    // lands on the executor, so `None` means "on executor" for hop0 Exact prefund.
+    let mut funds_at: Option<Address> = None;
     for (i, hop) in hops.iter().enumerate() {
         let mut hop = hop.clone();
         if let Some(ain) = chain_in.take() {
@@ -109,11 +133,8 @@ pub fn encode_route(
             hop.amount_in = ain;
         }
         if hop.edge.protocol == ProtocolType::UniswapV2 {
-            // ponytail: V2→V2 chains via swap(to=next_pair); skip mid transferAll
-            // (tokens already at next pair; transferAll would revert on zero balance).
-            let prev_v2 = i
-                .checked_sub(1)
-                .is_some_and(|j| hops[j].edge.protocol == ProtocolType::UniswapV2);
+            // V2→V2 (and Curve-NG/DODO/… → V2) leave tokens on this pair: skip prefund.
+            // transferAll only when residual is on the executor (else empty-balance revert).
             let next_v2 = hops
                 .get(i + 1)
                 .is_some_and(|h| h.edge.protocol == ProtocolType::UniswapV2);
@@ -122,7 +143,7 @@ pub fn encode_route(
             } else {
                 executor
             };
-            let prefund = if prev_v2 {
+            let prefund = if funds_at == Some(hop.pool_address) {
                 encoders::v2::V2Prefund::Skipped
             } else if i == 0 {
                 encoders::v2::V2Prefund::Exact
@@ -139,6 +160,7 @@ pub fn encode_route(
             )?;
             calls.extend(hop_calls);
             chain_in = Some(amount_out);
+            funds_at = Some(swap_to);
             continue;
         }
         // Refresh amount_out for the (possibly chained) ain before encode + chain_in.
@@ -162,14 +184,31 @@ pub fn encode_route(
             );
         }
         hop.amount_out = min_out;
+        // Prefer paying the next V2 pair directly when the ABI supports a recipient —
+        // skips transferAll and the live empty-balance class of failures.
+        let next_is_v2 = hops
+            .get(i + 1)
+            .is_some_and(|h| h.edge.protocol == ProtocolType::UniswapV2);
+        let recipient = if next_is_v2 && hop_can_direct_output_to(&hop) {
+            hops[i + 1].pool_address
+        } else {
+            executor
+        };
+        if recipient != executor {
+            crate::debug!(
+                "direct_out: hop={i} proto={:?} to_v2={recipient:#x}",
+                hop.edge.protocol
+            );
+        }
         calls.extend(encode_hop_for_protocol(
             &hop,
-            executor,
+            recipient,
             arena,
             &config,
             i == 0,
             flash_source,
         )?);
+        funds_at = Some(recipient);
         if i + 1 < hops.len() {
             chain_in = Some(quoted_out);
         }
@@ -314,13 +353,21 @@ pub fn build_calldata_hops(
         // V2/V3/V4 sim ignores pair membership; stale TokenIndex on a live pool
         // address → V2 INSUFFICIENT_INPUT / V3 InvalidPoolCaller (factory resolves
         // a different pool from callback token0/token1/fee).
+        // Curve: coins() order is meta.tokens — wrong idx → exchange pulls the wrong
+        // coin, intermediate stays 0, next V2 transferAll reverts empty on executor
+        // (live: GHST/stGHST Curve→V2 hop2 ExternalCallFailed target=executor).
         if matches!(
             edge.protocol,
-            ProtocolType::UniswapV2 | ProtocolType::UniswapV3 | ProtocolType::UniswapV4
+            ProtocolType::UniswapV2
+                | ProtocolType::UniswapV3
+                | ProtocolType::UniswapV4
+                | ProtocolType::CurveStable
+                | ProtocolType::CurveCrypto
         ) {
             let tag = match edge.protocol {
                 ProtocolType::UniswapV3 => "v3",
                 ProtocolType::UniswapV4 => "v4",
+                ProtocolType::CurveStable | ProtocolType::CurveCrypto => "curve",
                 _ => "v2",
             };
             match meta {
@@ -348,6 +395,42 @@ pub fn build_calldata_hops(
                 }
             }
         }
+
+        // Re-resolve Curve coin indices from meta.tokens order (matches coins()).
+        // Stale edge.token_in_idx from graph attach can disagree with coin order
+        // after token re-registration → exchange sells the wrong leg.
+        let mut edge = *edge;
+        if matches!(
+            edge.protocol,
+            ProtocolType::CurveStable | ProtocolType::CurveCrypto
+        )
+            && let Some(m) = meta {
+                let pos = |addr: Address| {
+                    m.tokens.iter().position(|&t| {
+                        arena.token_address(t).is_some_and(|a| a == addr)
+                    })
+                };
+                match (pos(token_in), pos(token_out)) {
+                    (Some(i_pos), Some(j_pos)) if i_pos != j_pos => {
+                        if edge.token_in_idx as usize != i_pos
+                            || edge.token_out_idx as usize != j_pos
+                        {
+                            crate::debug!(
+                                "curve idx remap: pool={pool_address:#x} edge={}->{} meta={i_pos}->{j_pos}",
+                                edge.token_in_idx,
+                                edge.token_out_idx,
+                            );
+                        }
+                        edge.token_in_idx = i_pos as u8;
+                        edge.token_out_idx = j_pos as u8;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "hop{i}: curve_coin_idx_unresolved in={token_in} out={token_out} pool={pool_address}"
+                        ));
+                    }
+                }
+            }
         if let Some(label) = meta.and_then(|pool| pool.protocol_label.as_deref())
             && !crate::core::protocol::is_known_protocol_label(label)
         {
@@ -361,7 +444,7 @@ pub fn build_calldata_hops(
             meta_pool_id
         };
         hops.push(CalldataHop {
-            edge: *edge,
+            edge,
             pool_address,
             token_in,
             token_out,
@@ -530,6 +613,44 @@ mod tests {
         )
         .expect("route should quote");
         assert_eq!(calls.len(), 3);
+    }
+
+    #[test]
+    fn hop_can_direct_output_curve_only_when_ng() {
+        let mut hop = CalldataHop {
+            edge: Edge {
+                pool_index: PoolIndex(0),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::CurveStable,
+                fee_bps: 4,
+                zero_for_one: true,
+            },
+            pool_address: Address::from([9u8; 20]),
+            token_in: Address::from([1u8; 20]),
+            token_out: Address::from([2u8; 20]),
+            amount_in: U256::from(1u64),
+            amount_out: U256::from(1u64),
+            pool_id: None,
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        };
+        assert!(
+            !hop_can_direct_output_to(&hop),
+            "plain Curve pays msg.sender only"
+        );
+        hop.pool_type = Some("stable_ng".into());
+        assert!(
+            hop_can_direct_output_to(&hop),
+            "StableSwap-NG exchange supports receiver"
+        );
+        hop.edge.protocol = ProtocolType::Dodo;
+        hop.pool_type = None;
+        assert!(hop_can_direct_output_to(&hop));
     }
 
     #[test]

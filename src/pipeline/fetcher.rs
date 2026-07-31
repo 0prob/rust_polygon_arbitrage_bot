@@ -85,8 +85,17 @@ impl Ord for RankedPool<'_> {
 }
 
 fn fetch_rank(pool: &DiscoveredPool, class: u8) -> FetchRank {
+    // class 3 (stale tradable) → 0 best. Never-fetched DODO (9-call plans) demoted
+    // below other never-fetched so CL/V4/Balancer fill warm-up slots first — live
+    // bootstrap spent ~4.5s on 2500 targets with ~18% tradable yield dominated by
+    // DODO Invalid churn.
+    let class_rank = match (class, pool.protocol) {
+        (3, _) => 0,
+        (1, ProtocolType::Dodo) => 4,
+        (c, _) => c,
+    };
     FetchRank(
-        if class == 3 { 0 } else { class },
+        class_rank,
         !pool.tokens.iter().any(|token| is_polygon_hub_token(*token)),
         Reverse(pool.created_block),
     )
@@ -493,6 +502,20 @@ mod tests {
         let candidate = pool(1, 1);
 
         assert!(fetch_rank(&candidate, 3) < fetch_rank(&candidate, 1));
+    }
+
+    #[test]
+    fn never_fetched_dodo_ranks_behind_never_fetched_v3() {
+        let mut v3 = pool(1, 100);
+        v3.protocol = ProtocolType::UniswapV3;
+        let mut dodo = pool(2, 200); // newer — would win without demotion
+        dodo.protocol = ProtocolType::Dodo;
+        assert!(
+            fetch_rank(&v3, 1) < fetch_rank(&dodo, 1),
+            "never-fetched V3 must outrank never-fetched DODO despite older created_block"
+        );
+        // Stale tradable DODO still beats never-fetched V3 (class 3 → rank 0).
+        assert!(fetch_rank(&dodo, 3) < fetch_rank(&v3, 1));
     }
 
     #[test]

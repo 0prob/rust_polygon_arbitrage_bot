@@ -592,6 +592,24 @@ fn quarantine_all_edge_rotations(execution: &ExecutionService, edges: &[crate::c
     }
 }
 
+/// Whether a positive-net assess reject should get the sticky 300s cool.
+///
+/// Close misses (min-profit, or safety-floor with net ≳ 25% of gas) monopolize HF
+/// and need a long cool. Dust positive-net after gas-seed calibration (live DODO×2
+/// cover≈10030, net≈0.00025 vs gas≈0.082) must **not** — that over-exiles edges the
+/// high-cover chronic path was meant to protect. Route those into chronic instead.
+#[must_use]
+fn positive_net_sticky_cool_eligible(reason: &str, net_matic: U256, gas_cost_wei: U256) -> bool {
+    if reason.contains("below min profit") {
+        return !net_matic.is_zero();
+    }
+    if !reason.contains("below safety floor") || gas_cost_wei.is_zero() || net_matic.is_zero() {
+        return false;
+    }
+    // net ≥ 25% of gas ≈ close to absorbing a full-revert safety floor.
+    net_matic.saturating_mul(U256::from(4u64)) >= gas_cost_wei
+}
+
 #[inline]
 fn cycle_edges_quarantined(
     execution: &ExecutionService,
@@ -1805,20 +1823,22 @@ pub async fn run_hf_tick(
     // `reserve_hydrate_budget` can assign the entire stage to TickLens
     // (work_budget=0) and the non-stream path skips flash entirely — live:
     // skip_flash_source ColdCache with fresh=false on cycle starts.
+    //
+    // Must subtract (not zero) remaining stage: prior path set work/hydrate to 0
+    // and passed full stage_budget into flash → 1.2–1.5s flash-only ticks with
+    // pool_prefetch_ok=false and no TickLens (live dry-run: flash:1228/1549).
     let cold_flash_reserve = {
         let stale = flash_cache.stale_tokens(&flash_token_list);
         let cold = flash_cold_tokens(&stale, flash_cache.as_ref());
         if cold.is_empty() {
             Duration::ZERO
         } else {
-            stage_budget.min(HF_FLASH_INFLIGHT_WAIT_CAP)
+            // Cap at stream flash budget (700ms) — enough for hub multicall, leaves
+            // residual for pool + TickLens on a 2.5s prep wall.
+            stage_budget.min(HF_STREAM_FLASH_BUDGET_CAP)
         }
     };
-    let stage_after_cold_flash = if cold_flash_reserve.is_zero() {
-        stage_budget
-    } else {
-        Duration::ZERO
-    };
+    let stage_after_cold_flash = stage_budget.saturating_sub(cold_flash_reserve);
     // Carve hydrate from remaining pool/flash budget. When the 1.5s gap will
     // allow this tick, take up to MAX. When it won't, still keep a one-pool MIN
     // floor — otherwise work burns the full stage and hydrate arrives with
@@ -1844,14 +1864,14 @@ pub async fn run_hf_tick(
         work_budget
     };
 
-    // Always warm truly cold flash tokens first (non-stealable reserve).
+    // Always warm truly cold flash tokens first (non-stealable reserve only).
     if !cold_flash_reserve.is_zero() {
         let flash_prefetch_started = now_ms();
         hf_flash_prefetch_stale(
             flash_cache.as_ref(),
             rpc.as_ref(),
             &flash_token_list,
-            stage_budget,
+            cold_flash_reserve,
         )
         .await;
         flash_prefetch_ms = now_ms().saturating_sub(flash_prefetch_started);
@@ -2669,12 +2689,13 @@ pub async fn run_hf_tick(
                     a.gas_cost_wei,
                     reason,
                 );
-                // Sticky positive-net rejects re-fill every HF tick (live: min-profit
-                // net 0.123 vs floor 0.130; safety-floor net 0.008 vs gas 0.070 — same
-                // fp many times). Cool so the window rotates; 300s = probe-below-floor.
-                let sticky =
-                    reason.contains("below min profit") || reason.contains("below safety floor");
-                if sticky
+                // Close sticky positive-net (min-profit near floor, safety with net≳25%
+                // of gas) re-fill every HF tick → 300s probe-below-floor cool.
+                // Dust positive-net after gas-seed tune (live DODO cover=10030, net≪gas)
+                // must use high-cover chronic (3-strike/30s), not 300s exile.
+                let net = a.net_profit_after_gas_matic_wei;
+                let gas_cost = a.gas_cost_wei;
+                if positive_net_sticky_cool_eligible(reason, net, gas_cost)
                     && ctx
                         .execution
                         .quarantine_probe_below_dispatch_floor(near.route_fingerprint)
@@ -2683,9 +2704,27 @@ pub async fn run_hf_tick(
                     crate::info!(
                         "hf positive-net near-miss cool: fp={} net_matic={} reject={} (+rotations, 300s)",
                         near.route_fingerprint,
-                        a.net_profit_after_gas_matic_wei,
+                        net,
                         reason,
                     );
+                } else if reason.contains("below safety floor") && !net.is_zero() {
+                    // available ≈ gas + post-gas net when cover ≥ 10_000 (shortfall 0).
+                    // Cap cover at 9999 so chronic high-cover band applies (3 strikes).
+                    let available = gas_cost.saturating_add(net);
+                    if let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
+                        near.route_fingerprint,
+                        9_999,
+                        available,
+                    ) {
+                        quarantine_edge_rotations_for(&ctx.execution, &near.cycle.edges, ttl);
+                        crate::info!(
+                            "hf positive-net high-cover cool: fp={} net_matic={} gas_cost_wei={} ttl_s={} (+rotations)",
+                            near.route_fingerprint,
+                            net,
+                            gas_cost,
+                            ttl.as_secs(),
+                        );
+                    }
                 }
             }
             if let Some(ref diag) = best_gross_diag {
@@ -3066,6 +3105,51 @@ mod tests {
             crate::orchestrator::hf_execute::probe_tick_pool_cap_for_budget(hydrate_e),
             1
         );
+    }
+
+    #[test]
+    fn cold_flash_reserve_leaves_stage_for_hydrate_and_pool() {
+        // Regression: cold flash used to set stage_after=0 and pass full stage into
+        // flash → 1.2–1.5s flash-only HF ticks with no TickLens residual.
+        let stage = Duration::from_millis(2_500);
+        let cold = stage.min(HF_STREAM_FLASH_BUDGET_CAP);
+        let after = stage.saturating_sub(cold);
+        assert_eq!(cold, HF_STREAM_FLASH_BUDGET_CAP);
+        assert!(after >= HF_PROBE_HYDRATE_MAX_BUDGET);
+        let (work, hydrate) = reserve_hydrate_budget(after);
+        assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
+        assert!(!work.is_zero(), "pool/work budget must remain after cold flash");
+        assert_eq!(cold + work + hydrate, stage);
+    }
+
+    #[test]
+    fn positive_net_sticky_cool_skips_dust_safety_floor() {
+        // Live DODO×2 after 293k seed: net≈0.00025, gas≈0.082 → must not 300s-cool.
+        let dust_net = U256::from(250_623_713_829_856u128);
+        let gas = U256::from(82_477_696_207_909_000u128);
+        assert!(!positive_net_sticky_cool_eligible(
+            "net profit … below safety floor …",
+            dust_net,
+            gas,
+        ));
+        // Close safety: net ≥ 25% of gas.
+        let close_net = gas / U256::from(3u64); // ~33%
+        assert!(positive_net_sticky_cool_eligible(
+            "net profit below safety floor 1",
+            close_net,
+            gas,
+        ));
+        // Min-profit always sticky when net > 0.
+        assert!(positive_net_sticky_cool_eligible(
+            "below min profit threshold",
+            U256::from(1u64),
+            gas,
+        ));
+        assert!(!positive_net_sticky_cool_eligible(
+            "below min profit threshold",
+            U256::ZERO,
+            gas,
+        ));
     }
 
     #[test]

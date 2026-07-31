@@ -12,7 +12,10 @@ use crate::core::types::{PoolIndex, PoolState};
 use crate::services::discovery::DiscoveredPool;
 
 const DEFAULT_MAX_ENTRIES: usize = 50_000;
-const DEFAULT_INVALID_RETRY_TTL: Duration = Duration::from_secs(30);
+/// How long Invalid stays off the fetch window. 30s re-burned bootstrap RPC on
+/// dead DODO/V3 (~9-call plans) every LF tick; 120s cuts churn while prune still
+/// removes chronic failures via `MAX_INVALID_FETCHES`.
+const DEFAULT_INVALID_RETRY_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_STALE_TRADABLE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]

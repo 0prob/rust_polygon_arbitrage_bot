@@ -111,6 +111,11 @@ const CHRONIC_THIN_LIQ_QUARANTINE: Duration = Duration::from_secs(3600);
 /// reappeared after 90s clusters but 3 rapid strikes burned the window on the
 /// same gas snapshot — 30s/1-strike matches `ROUTE_COOLDOWN` and catches dips.
 const CHRONIC_NEAR_MISS_QUARANTINE: Duration = Duration::from_secs(30);
+/// High-cover near-miss (cover≥this, avail≥0.01): almost clears gas — do **not**
+/// first-strike quarantine (live: DODO×2 cover=8672 killed 30s on strike-1 while
+/// gas seed was the only gap). Needs [`CHRONIC_UNDERWATER_STRIKES`] so base-fee
+/// dips / seed calibration can re-win best-eval.
+const CHRONIC_HIGH_COVER_BPS: u64 = 7_500;
 /// Mid-band near-miss: cover≥500 but avail in [0.001, 0.01). Live iter35: weak
 /// sticky DODO cover~960 / avail~0.009 retried every 30s (17× best-eval) and
 /// crowded BAL-start DODO cover~3850 (3×). 90s keeps mid-band alive without
@@ -629,13 +634,27 @@ impl ExecutionService {
 
         let realized_profit = dry.realized_profit.filter(|p| !p.is_zero());
         if !dry.success || !dry.semantic_success || realized_profit.is_none() {
-            let sim_fidelity_miss = matches!(
-                dry.decoded_revert,
-                Some(DecodedRevert::InsufficientProfit {
-                    final_balance,
+            // Huff `transferAll` reverts empty when executor balance is 0 (see
+            // ArbExecutor.huff transfer_all_zero). Target is the executor itself —
+            // common after Curve/DODO→V2 when the prior hop left no intermediate.
+            let transfer_all_funding_miss = matches!(
+                &dry.decoded_revert,
+                Some(DecodedRevert::ExternalCallFailed {
+                    target,
+                    reason,
                     ..
-                }) if final_balance.is_zero()
+                }) if *target == candidate.target_address
+                    && (reason.contains("empty nested revert")
+                        || reason.contains("transferAll zero balance"))
             );
+            let sim_fidelity_miss = transfer_all_funding_miss
+                || matches!(
+                    dry.decoded_revert,
+                    Some(DecodedRevert::InsufficientProfit {
+                        final_balance,
+                        ..
+                    }) if final_balance.is_zero()
+                );
             if matches!(dry.decoded_revert, Some(DecodedRevert::AaveReserveInactive)) {
                 self.flash_liquidity
                     .mark_aave_inactive(candidate.profit_token);
@@ -660,13 +679,15 @@ impl ExecutionService {
                 if matches!(
                     dry.decoded_revert,
                     Some(DecodedRevert::ExternalCallFailed { .. })
-                ) {
+                ) && !transfer_all_funding_miss
+                {
                     self.quarantine_route_hash(candidate.route_hash, now);
                     // Structural vault/router rejects (BAL#327, etc.) re-burn every
                     // ROUTE_COOLDOWN (30s) with new route_hash from re-sizing
                     // (live: same 2 fps failed BAL#327 three times in ~3m).
                     // Upgrade fp cool to structural TTL so mixed Aave phantoms
                     // stop crowding Direct profitable candidates.
+                    // transferAll-zero is sim-fidelity (soft cool above), not structural.
                     self.quarantine_insert(fp, now + STRUCTURAL_DRY_RUN_QUARANTINE);
                 }
                 // FoT / nonstandard ERC20 TransferFailed: cool the *failing* token.
@@ -683,7 +704,15 @@ impl ExecutionService {
                     );
                 }
             }
-            let reason = dry.failure_reason();
+            let mut reason = dry.failure_reason();
+            if transfer_all_funding_miss {
+                // Rephrase so ops logs don't look like a random nested vault/router fail.
+                if let Some(DecodedRevert::ExternalCallFailed { index, .. }) = &dry.decoded_revert {
+                    reason = format!(
+                        "transferAll zero balance at packed call {index} (prior hop left no intermediate on executor; often Curve/DODO→V2 after under-delivery or index mismatch)"
+                    );
+                }
+            }
             // Adaptive USD flash cap was the binding constraint — size-fail demotes
             // so the next assess starts smaller instead of replaying BAL#528 at cap.
             if candidate.adaptive_flash_cap_bound
@@ -1770,6 +1799,23 @@ mod safety_tests {
             Some(std::time::Duration::from_secs(30))
         );
         assert!(exec.is_route_quarantined(half_fp));
+        // High-cover near-miss (≥7500) needs 3 strikes — do not kill on first look.
+        let hi_fp = 0xd0d0_8672_u64;
+        let hi_avail = U256::from(8u128 * 10u128.pow(16)); // 0.08 MATIC
+        assert!(
+            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail)
+                .is_none()
+        );
+        assert!(
+            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail)
+                .is_none()
+        );
+        assert!(!exec.is_route_quarantined(hi_fp));
+        assert_eq!(
+            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert!(exec.is_route_quarantined(hi_fp));
     }
 
     #[test]

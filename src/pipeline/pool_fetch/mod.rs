@@ -433,7 +433,11 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
 }
 
 /// Concurrent plan-batch RPCs (bounded) — complements per-chunk multicall parallelism.
-const MAX_PARALLEL_PLAN_BATCHES: usize = 2;
+/// Outer plan-batch concurrency. Each batch still fans out up to
+/// [`crate::pipeline::multicall::MAX_CONCURRENT_CHUNKS`] RPC chunks. 2 left LF
+/// refresh at ~4.5–5s for 2500 pools; 3 cuts wall time without the free-tier
+/// 429 storm seen at higher fan-out.
+const MAX_PARALLEL_PLAN_BATCHES: usize = 3;
 
 async fn run_plan_batches<P: Provider<Ethereum> + Clone + Send + 'static>(
     provider: P,
