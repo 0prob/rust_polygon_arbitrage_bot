@@ -238,9 +238,11 @@ pub const GAS_WOOFI_HOP: u32 = 150_000;
 pub const GAS_PER_TICK_CROSSED: u32 = 20_000;
 
 /// LF graph attach / arena append batch size (growth catch-up per tick).
-pub const ATTACH_BATCH_CAP: usize = 512;
+/// 512 lagged arena growth under LF_BOOTSTRAP_BATCH≥2k; 768 keeps attach
+/// catching up without a full rebuild thrash (CPU-only, not RPC).
+pub const ATTACH_BATCH_CAP: usize = 768;
 /// Full arena rebuild ingest cap (remainder appends on later LF ticks).
-pub const ARENA_REBUILD_CAP: usize = 2048;
+pub const ARENA_REBUILD_CAP: usize = 3072;
 
 #[cfg(test)]
 mod tests {

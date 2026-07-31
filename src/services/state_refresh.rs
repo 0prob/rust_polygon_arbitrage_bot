@@ -1160,7 +1160,9 @@ fn refresh_batch_for(
     pipeline: &crate::config::PipelineConfig,
 ) -> usize {
     let bootstrap_batch = pipeline.lf_bootstrap_batch;
-    let warm_cache_target = bootstrap_batch.saturating_mul(4);
+    // *6 keeps full bootstrap batches until the tradable cache is large enough
+    // that hot-only ticks won't starve graph growth (was *4 → plateau ~6–8k).
+    let warm_cache_target = bootstrap_batch.saturating_mul(6);
     let full_sweep = pass == 1
         || routable_pool_count < warm_cache_target
         || pass.is_multiple_of(pipeline.lf_full_sweep_interval);
@@ -1236,9 +1238,10 @@ mod tests {
     #[test]
     fn keeps_bootstrap_batch_until_routable_set_is_warm() {
         let config = AppConfig::default();
+        // default lf_bootstrap_batch=3000 → warm = 3000*6 = 18_000
         assert_eq!(refresh_batch_for(2, 3_000, &config.pipeline), 3_000);
-        assert_eq!(refresh_batch_for(2, 11_999, &config.pipeline), 3_000);
-        assert_eq!(refresh_batch_for(2, 12_000, &config.pipeline), 500);
+        assert_eq!(refresh_batch_for(2, 17_999, &config.pipeline), 3_000);
+        assert_eq!(refresh_batch_for(2, 18_000, &config.pipeline), 500);
     }
 
     #[test]
