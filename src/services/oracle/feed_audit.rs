@@ -154,6 +154,12 @@ pub const CURATED_POLYGON_TOKEN_HINTS: &[(&str, Address, &str)] = &[
         address!("0xD14E0cd48CF32007D0F0b294Ee3d0b1530D8b04F"),
         "BAL",
     ),
+    (
+        // Polygon ApeCoin (PoS) — matches TOKEN_FEEDS Crypto.APE/USD.
+        "APE",
+        address!("0xB7b31a6BC18e48888545CE79e83E06003bE70930"),
+        "APE",
+    ),
 ];
 
 static RUNTIME_UNMAPPED_DEMAND: LazyLock<Mutex<FxHashMap<Address, u64>>> =

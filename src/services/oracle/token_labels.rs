@@ -118,12 +118,14 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         "FBX",
     ),
     (
+        // on-chain: SP / STAR-Power (was mislabeled JPYC from demand noise)
         &address!("0x72d31b6dD46DaaE07391036097A2CB4648991eCD"),
-        "JPYC",
+        "SP",
     ),
     (
+        // on-chain: USD-SS / USD Staked DeFi LP (StarSeeds) — not BANANA
         &address!("0x4b0dF7EDe79be6b046a4Ed71580A3733A109e641"),
-        "BANANA",
+        "USD-SS",
     ),
     (
         &address!("0xbbC11D55375F0B37f8A30b102C9ce143B097671e"),
@@ -187,8 +189,9 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         "DOLA",
     ),
     (
+        // on-chain: KOR / Kora (was mislabeled jGBP)
         &address!("0x0d929e52EFBf26F2322fd4033B157538c3b80474"),
-        "jGBP",
+        "KOR",
     ),
     (
         &address!("0x6f7C932e7684666C9fd1d44527765433e01fF61d"),
@@ -823,6 +826,117 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         &address!("0xfd5962484BE2c3574D70131BF5D452CcC7C69F67"),
         "UCT",
     ),
+    // --- runtime unmapped `?:` (2026-07-31 demand log) — on-chain symbol + name ---
+    (
+        // RAR / RecklessAndRelentless
+        &address!("0x0259ddfBD48e65C22Ca365bc32AFF5B0a5fB9567"),
+        "RAR",
+    ),
+    (
+        // APE / ApeCoin (PoS) — Crypto.APE/USD in TOKEN_FEEDS
+        &address!("0xB7b31a6BC18e48888545CE79e83E06003bE70930"),
+        "APE",
+    ),
+    (
+        // BTC-S / BTC Yield Index by StarSeeds
+        &address!("0xa147901A0bB2B6DA6b9e10c69020285db7eCd0DF"),
+        "BTC-S",
+    ),
+    (
+        // EMI / Emicoin (PoS)
+        &address!("0xFbeCfB7b87752aa28383a5Ac1e9d9e05E0526017"),
+        "EMI",
+    ),
+    (
+        // BRZ / BRZ Token (BRL-pegged)
+        &address!("0x4eD141110F6EeeAbA9A1df36d8c26f684d2475Dc"),
+        "BRZ",
+    ),
+    (
+        // MLC / MyLovelyCoin
+        &address!("0x0566C506477cD2d8dF4e0123512dBc344bD9D111"),
+        "MLC",
+    ),
+    (
+        // CES / WhaleBit
+        &address!("0x1Bdf71EDe1a4777dB1EebE7232BcdA20d6FC1610"),
+        "CES",
+    ),
+    (
+        // GGT / GO GAME TOKEN
+        &address!("0x8349314651eDe274f8c5FeF01Aa65fF8da75E57c"),
+        "GGT",
+    ),
+    (
+        // MEGA / MEGA STAKE TOKEN
+        &address!("0x797444569d03052A171aAc4524591044264AbD2B"),
+        "MEGA",
+    ),
+    (
+        // DOMME / Domme
+        &address!("0xf1CcF7f6aa6e5CF141dE54351E8E30A618945530"),
+        "DOMME",
+    ),
+    (
+        // KRW / KROWN (not Korean won)
+        &address!("0x6c3B2f402CD7d22AE2C319B9d2f16f57927a4A17"),
+        "KRW",
+    ),
+    (
+        // SSG / STAR-GOV by StarSeeds
+        &address!("0x8519d8DeaE7bA984C4C7850B11c4671b4f62b330"),
+        "SSG",
+    ),
+    (
+        // BAE / BaeBay
+        &address!("0xbAe1b833cbA827BAFe783697A7d3D285a326233C"),
+        "BAE",
+    ),
+    (
+        // BULL / BullRun Token
+        &address!("0xeDd4b24BE3c43De98989C233E67dB29Dc6554fC6"),
+        "BULL",
+    ),
+    (
+        // MCASH / Monsoon Finance
+        &address!("0xa25610a77077390A75aD9072A084c5FbC7d43A0d"),
+        "MCASH",
+    ),
+    (
+        // BRAIN / BrainSwap
+        &address!("0x5C6014246FC7911F4dB270aA3910F23EECD61720"),
+        "BRAIN",
+    ),
+    (
+        // polyBUNNY / Polygon BUNNY Token
+        &address!("0x4C16f69302CcB511c5Fac682c7626B9eF0Dc126a"),
+        "polyBUNNY",
+    ),
+    (
+        // WORK / The Employment Commons Work Token
+        &address!("0x6002410dDA2Fb88b4D0dc3c1D562F7761191eA80"),
+        "WORK",
+    ),
+    (
+        // PON / POLYGON Beplay
+        &address!("0xA99cf31b7f04EE76C27BbD30C9770703D0F5C3af"),
+        "PON",
+    ),
+    (
+        // TRZ / PolyTreasure Token
+        &address!("0x13436a3c5c2574C8145222260B0ed4C2Da31f760"),
+        "TRZ",
+    ),
+    (
+        // IMX / Impermax (PoS) — NOT Immutable X; do not map Crypto.IMX/USD
+        &address!("0x60bB3D364B765C497C8cE50AE0Ae3f0882c5bD05"),
+        "IMX",
+    ),
+    (
+        // POLYWHORE / WHORE.FINANCE
+        &address!("0x6C9f3c8EF26cd9e6479F579901a940856C8b3aa0"),
+        "POLYWHORE",
+    ),
 ];
 
 #[cfg(test)]
@@ -875,6 +989,33 @@ mod tests {
             ("0x62F594339830b90AE4C084aE7D223fFAFd9658A7", "SPHERE"),
             ("0xfe48ee5070a045B2Caa2Ce9e344735D9E4886B46", "3TK"),
             ("0x1c67201D5B748C9666205c2a1f7E2d4272F5Da3F", "ENTER"),
+            // Fixed mislabels (on-chain symbol)
+            ("0x72d31b6dD46DaaE07391036097A2CB4648991eCD", "SP"),
+            ("0x4b0dF7EDe79be6b046a4Ed71580A3733A109e641", "USD-SS"),
+            ("0x0d929e52EFBf26F2322fd4033B157538c3b80474", "KOR"),
+            // Runtime `?:` batch 2026-07-31
+            ("0x0259ddfBD48e65C22Ca365bc32AFF5B0a5fB9567", "RAR"),
+            ("0xB7b31a6BC18e48888545CE79e83E06003bE70930", "APE"),
+            ("0xa147901A0bB2B6DA6b9e10c69020285db7eCd0DF", "BTC-S"),
+            ("0xFbeCfB7b87752aa28383a5Ac1e9d9e05E0526017", "EMI"),
+            ("0x4eD141110F6EeeAbA9A1df36d8c26f684d2475Dc", "BRZ"),
+            ("0x0566C506477cD2d8dF4e0123512dBc344bD9D111", "MLC"),
+            ("0x1Bdf71EDe1a4777dB1EebE7232BcdA20d6FC1610", "CES"),
+            ("0x8349314651eDe274f8c5FeF01Aa65fF8da75E57c", "GGT"),
+            ("0x797444569d03052A171aAc4524591044264AbD2B", "MEGA"),
+            ("0xf1CcF7f6aa6e5CF141dE54351E8E30A618945530", "DOMME"),
+            ("0x6c3B2f402CD7d22AE2C319B9d2f16f57927a4A17", "KRW"),
+            ("0x8519d8DeaE7bA984C4C7850B11c4671b4f62b330", "SSG"),
+            ("0xbAe1b833cbA827BAFe783697A7d3D285a326233C", "BAE"),
+            ("0xeDd4b24BE3c43De98989C233E67dB29Dc6554fC6", "BULL"),
+            ("0xa25610a77077390A75aD9072A084c5FbC7d43A0d", "MCASH"),
+            ("0x5C6014246FC7911F4dB270aA3910F23EECD61720", "BRAIN"),
+            ("0x4C16f69302CcB511c5Fac682c7626B9eF0Dc126a", "polyBUNNY"),
+            ("0x6002410dDA2Fb88b4D0dc3c1D562F7761191eA80", "WORK"),
+            ("0xA99cf31b7f04EE76C27BbD30C9770703D0F5C3af", "PON"),
+            ("0x13436a3c5c2574C8145222260B0ed4C2Da31f760", "TRZ"),
+            ("0x60bB3D364B765C497C8cE50AE0Ae3f0882c5bD05", "IMX"),
+            ("0x6C9f3c8EF26cd9e6479F579901a940856C8b3aa0", "POLYWHORE"),
         ];
         for (address, symbol) in labels {
             let address = address.parse().expect("valid test address");

@@ -287,6 +287,12 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("433faaa801ecdb6618e3897177a118b273a8e18cc3ff545aadfc207d58d028f7"),
     },
+    // Polygon ApeCoin (PoS) — Hermes Crypto.APE/USD (verify ~$0.13, 2026-07-31).
+    TokenFeed {
+        token: address!("0xB7b31a6BC18e48888545CE79e83E06003bE70930"),
+        chainlink: None,
+        pyth_id: Some("15add95022ae13563a11992e727c91bdb6b55bc183d9d747436c80a483d8c864"),
+    },
 ];
 
 #[derive(Clone)]
@@ -1812,6 +1818,18 @@ mod tests {
         // Then: both independent price sources must cover WBTC.
         assert!(feeds.0.is_some());
         assert!(feeds.1.is_some());
+    }
+
+    #[test]
+    fn oracle_feeds_include_polygon_apecoin() {
+        let ape = address!("0xB7b31a6BC18e48888545CE79e83E06003bE70930");
+        assert_eq!(
+            pyth_feed(&ape),
+            Some("15add95022ae13563a11992e727c91bdb6b55bc183d9d747436c80a483d8c864")
+        );
+        // Impermax (symbol IMX) must NOT share Crypto.IMX/USD.
+        let impermax = address!("0x60bB3D364B765C497C8cE50AE0Ae3f0882c5bD05");
+        assert!(pyth_feed(&impermax).is_none());
     }
 
     #[test]
