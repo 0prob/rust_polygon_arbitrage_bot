@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, U256};
 
 use crate::core::math::uniswap_v3::{resolve_v3_fee_pips, simulate_v3_swap};
-use crate::core::types::{PoolState, V3PoolState};
+use crate::core::types::{PoolState, ProtocolType, V3PoolState};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::local_sim::{realign_multi_token_edge, simulate_hop_amount_out};
 use crate::services::execution::calldata::CalldataHop;
@@ -13,7 +13,27 @@ pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<
     if !realign_multi_token_edge(arena, state, &mut edge) {
         return None;
     }
-    simulate_hop_amount_out(state, &edge, hop.amount_in)
+    // V3/V4 execution quotes: refuse incomplete tick walks. Synthetic MIN/MAX fills
+    // can look complete at constant L while on-chain crosses unhydrated ticks and
+    // under-delivers → next hop TransferFailed (live: WPOL→BRZ/CES chain_in miss).
+    match (state, edge.protocol) {
+        (PoolState::V3(s), ProtocolType::UniswapV3)
+        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
+            let allow_zero = edge.protocol == ProtocolType::UniswapV4;
+            let r = simulate_v3_swap(
+                s,
+                hop.amount_in,
+                edge.zero_for_one,
+                Some(edge.fee_bps),
+                allow_zero,
+            );
+            if r.shallow || r.synthetic || r.amount_out.is_zero() {
+                return None;
+            }
+            Some(r.amount_out)
+        }
+        _ => simulate_hop_amount_out(state, &edge, hop.amount_in).filter(|q| !q.is_zero()),
+    }
 }
 
 #[must_use]
@@ -80,6 +100,11 @@ pub fn derive_tight_v3_price_limit(
             });
         }
         anyhow::bail!("v3 price limit: incomplete tick coverage");
+    }
+    if sim.synthetic {
+        // Full fill at constant L past hydrate edge is non-shallow for probe rank, but
+        // a tight limit derived from that walk is unsafe for last-hop encode.
+        anyhow::bail!("v3 price limit: synthetic tick bound");
     }
     if sim.sqrt_price_x96_after < MIN_SQRT_RATIO || sim.sqrt_price_x96_after >= MAX_SQRT_RATIO {
         anyhow::bail!("v3 price limit: invalid sqrt after swap");

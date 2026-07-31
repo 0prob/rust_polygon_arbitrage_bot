@@ -124,13 +124,20 @@ pub fn encode_route(
     for (i, hop) in hops.iter().enumerate() {
         let mut hop = hop.clone();
         if let Some(ain) = chain_in.take() {
+            // Cap by assess hop_amounts: encode re-quote can inflate intermediate
+            // above Brent sizing when local tick walk is optimistic.
+            let capped = if hop.amount_in.is_zero() {
+                ain
+            } else {
+                ain.min(hop.amount_in)
+            };
             crate::debug!(
-                "chain_in apply: hop={i} proto={:?} ain_was={} ain_now={ain} aout={}",
+                "chain_in apply: hop={i} proto={:?} ain_was={} chain={ain} ain_now={capped} aout={}",
                 hop.edge.protocol,
                 hop.amount_in,
                 hop.amount_out,
             );
-            hop.amount_in = ain;
+            hop.amount_in = capped;
         }
         if hop.edge.protocol == ProtocolType::UniswapV2 {
             // V2→V2 (and Curve-NG/DODO/… → V2) leave tokens on this pair: skip prefund.
@@ -197,6 +204,9 @@ pub fn encode_route(
                 hop.edge.protocol
             );
         }
+        // Intermediate V3 hops: full-range price limit so exact-in fully fills.
+        // Tight limits + stale state partial-fill → under-delivery vs chain_in.
+        let is_last = next.is_none();
         calls.extend(encode_hop_for_protocol(
             &hop,
             recipient,
@@ -204,23 +214,20 @@ pub fn encode_route(
             &config,
             i == 0,
             flash_source,
+            is_last,
         )?);
         funds_at = Some(recipient);
         if next.is_some() {
-            // Next hop pays exact `amount_in` from executor balance (V3/V4 callback,
-            // Curve dx, Balancer, DODO Exact, …). Chaining the full local quote
-            // over-sizes hop N+1 when hop N under-delivers on-chain → TransferFailed
-            // in the callback (live: WPOL→BRZ→USDT hop1 TransferFailed BRZ;
-            // WPOL→CES→USDT hop1 TransferFailed CES). Use slippage-haircut min_out.
-            // V2 transferAll residual is safer, but amountOut quote still needs
-            // ain ≤ delivered or UniswapV2:K — same haircut.
-            if min_out != quoted_out {
-                crate::debug!(
-                    "chain_in haircut: hop={i}->{} quoted={quoted_out} chained={min_out}",
-                    i + 1
-                );
-            }
-            chain_in = Some(min_out);
+            // Exact-pay next hops need chain_in ≤ delivered intermediate.
+            // minOut slip alone was insufficient (live BRZ/BRLA mid-hop TransferFailed).
+            let chain_bps = bps.saturating_add(crate::core::constants::EXECUTION_CHAIN_IN_BUFFER_BPS);
+            let chained = slippage_adjusted(quoted_out, chain_bps)
+                .ok_or_else(|| anyhow::anyhow!("chain_in hop buffer out is zero"))?;
+            crate::debug!(
+                "chain_in haircut: hop={i}->{} quoted={quoted_out} min={min_out} chained={chained} chain_bps={chain_bps}",
+                i + 1
+            );
+            chain_in = Some(chained);
         }
     }
     Ok(calls)

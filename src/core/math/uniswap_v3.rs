@@ -21,6 +21,10 @@ pub struct V3SwapResult {
     pub tick_after: i32,
     pub gas_estimate: u32,
     pub shallow: bool,
+    /// Walk used a synthetic MIN/MAX (or tickless step) bound — amount may still
+    /// fill inside current L, but on-chain tick crossings beyond the hydrate window
+    /// can deliver less. Execution quotes must fail closed on this; probe may accept.
+    pub synthetic: bool,
 }
 
 /// Next initialized tick at or below/above `current_tick` (ticks sorted by `tick` asc).
@@ -106,6 +110,7 @@ pub fn simulate_v3_swap(
             tick_after: fallback_tick,
             gas_estimate: 0,
             shallow: false,
+            synthetic: false,
         };
     }
 
@@ -131,6 +136,7 @@ pub fn simulate_v3_swap(
     let mut ticks_crossed = 0u32;
     let initial_tick = tick;
     let mut tick_data_exhausted = false;
+    let mut used_synthetic = false;
 
     for _ in 0..MAX_ITERATIONS {
         if amount_remaining.is_zero() {
@@ -155,6 +161,7 @@ pub fn simulate_v3_swap(
             // trade still fits current L (probe rank: shallow_cl dominant).
             next_tick = Some((if zero_for_one { MIN_TICK } else { MAX_TICK }, 0));
             synthetic_bound = true;
+            used_synthetic = true;
         }
 
         if next_tick.is_none() && !has_ticks {
@@ -180,6 +187,7 @@ pub fn simulate_v3_swap(
             };
             next_tick = Some((bounded.clamp(MIN_TICK, MAX_TICK), 0));
             synthetic_bound = true;
+            used_synthetic = true;
         }
 
         let sqrt_price_next_tick_x96 = next_tick
@@ -273,6 +281,7 @@ pub fn simulate_v3_swap(
         tick_after: tick,
         gas_estimate,
         shallow,
+        synthetic: used_synthetic,
     }
 }
 
@@ -403,6 +412,10 @@ mod tests {
             !r.shallow,
             "full fill inside current L is not shallow (got shallow with out={})",
             r.amount_out
+        );
+        assert!(
+            r.synthetic,
+            "incomplete hydrate window must flag synthetic for execution fail-closed"
         );
     }
 

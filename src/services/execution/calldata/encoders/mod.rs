@@ -25,6 +25,8 @@ use super::{CalldataHop, RouteEncodeConfig};
 /// - **Curve / WooFi**: approve + exact-in exchange (minOut carries slippage).
 /// - **DODO**: transfer + `sellBase`/`sellQuote` from on-chain base/quote; not under
 ///   DODO flash on the same pool (`preventReentrant`).
+/// `is_last_hop`: last hop may use a tight V3 price limit; intermediate hops use
+/// full-range limits so exact-in fully fills for chain_in fidelity.
 pub fn encode_hop_for_protocol(
     hop: &CalldataHop,
     recipient: Address,
@@ -32,6 +34,7 @@ pub fn encode_hop_for_protocol(
     config: &RouteEncodeConfig,
     is_first_hop: bool,
     _flash_source: FlashLoanSource,
+    is_last_hop: bool,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     match hop.edge.protocol {
         ProtocolType::UniswapV2 => {
@@ -51,7 +54,13 @@ pub fn encode_hop_for_protocol(
             )
             .map(|(calls, _)| calls)
         }
-        ProtocolType::UniswapV3 => v3::encode_v3_hop(hop, recipient, arena, config.slippage_bps),
+        ProtocolType::UniswapV3 => v3::encode_v3_hop(
+            hop,
+            recipient,
+            arena,
+            config.slippage_bps,
+            /* full_range_limit */ !is_last_hop,
+        ),
         ProtocolType::UniswapV4 => v4::encode_v4_hop(hop, arena, config.slippage_bps),
         ProtocolType::CurveStable | ProtocolType::CurveCrypto => {
             curve::encode_curve_hop(hop, recipient, arena, config.slippage_bps)

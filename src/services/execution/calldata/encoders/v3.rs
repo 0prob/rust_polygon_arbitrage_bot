@@ -16,12 +16,19 @@ use super::shared::{to_v3_state, v3_callback_protocol_id};
 ///
 /// Returns a single executor call to swap on the V3 pool with callback data
 /// containing (protocolId, token0, token1, fee_or_tickSpacing).
+///
+/// `full_range_limit`: intermediate hops must fully consume `amount_in` so the
+/// next hop's chain_in is funded. Tight limits + stale slot0 cause partial fills
+/// → mid-hop TransferFailed (live WPOL→BRZ/CES). Last hop keeps a tight limit.
 pub fn encode_v3_hop(
     hop: &CalldataHop,
     recipient: Address,
     arena: &StateArena,
     slippage_bps: u64,
+    full_range_limit: bool,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
+    use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
+
     let pool_state = arena
         .pool_state(hop.edge.pool_index)
         .ok_or_else(|| anyhow::anyhow!("missing pool state for v3 hop"))?;
@@ -30,16 +37,24 @@ pub fn encode_v3_hop(
     let quoted_out = quote_hop_for_execution(arena, hop)
         .ok_or_else(|| anyhow::anyhow!("v3 execution quote unavailable"))?;
     let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
-    let sqrt_limit = derive_tight_v3_price_limit(
-        &v3,
-        hop.amount_in,
-        quoted_out,
-        hop.edge.zero_for_one,
-        hop.edge.fee_bps,
-        slippage_bps,
-        Some(fee_pips),
-        false,
-    )?;
+    let sqrt_limit = if full_range_limit {
+        if hop.edge.zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO_EXCLUSIVE
+        }
+    } else {
+        derive_tight_v3_price_limit(
+            &v3,
+            hop.amount_in,
+            quoted_out,
+            hop.edge.zero_for_one,
+            hop.edge.fee_bps,
+            slippage_bps,
+            Some(fee_pips),
+            false,
+        )?
+    };
 
     let (token0, token1) = pool_tokens_from_hop(hop);
     let proto_id = v3_callback_protocol_id(hop.protocol_label.as_deref());

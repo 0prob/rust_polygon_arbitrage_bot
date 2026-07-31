@@ -177,6 +177,10 @@ pub const MAX_SANE_PROFIT_MATIC_WEI: u128 = 10u128.pow(18);
 /// 100 bps: 50 cleared Direct V2×2 but Balancer-flash V2→V2 hop1 still hit
 /// `UniswapV2: K` under reserve drift (parity3). Assess uses the same floor.
 pub const EXECUTION_MIN_SLIPPAGE_BPS: u64 = 100;
+/// Extra haircut on multi-hop `chain_in` beyond per-hop minOut slip. Exact-pay
+/// hops (V3 callback, Curve dx, …) fail hard when prior hop under-delivers;
+/// 100 bps alone still left live mid-hop TransferFailed on BRZ/BRLA routes.
+pub const EXECUTION_CHAIN_IN_BUFFER_BPS: u64 = 300;
 
 /// Per-hop gas seeds for route simulation (pool swap only — executor glue is
 /// [`crate::services::execution::gas::PER_HOP_EXECUTOR_GAS_OVERHEAD`] + route overhead).
@@ -310,6 +314,7 @@ mod tests {
         assert!(DEFAULT_FEE_NUMERATOR < FEE_DENOMINATOR);
         const { assert!(MAX_SANE_PROFIT_RATIO_BPS > 10_000) };
         assert_eq!(EXECUTION_MIN_SLIPPAGE_BPS, 100);
+        assert_eq!(EXECUTION_CHAIN_IN_BUFFER_BPS, 300);
     }
 
     #[test]
