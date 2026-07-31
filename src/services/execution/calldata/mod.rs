@@ -166,8 +166,6 @@ pub fn encode_route(
         // Refresh amount_out for the (possibly chained) ain before encode + chain_in.
         // Stale conservative_execution_hops floors were sized for the pre-chain ain and
         // can exceed what Balancer/Curve will deliver → next hop transfer/IIA fails.
-        // Chain the **full quote** into the next hop (same as conservative_execution_hops);
-        // minOut is the floor only — chaining it double-haircuts mixed non-V2 routes.
         let bps = config
             .slippage_bps
             .max(crate::core::constants::EXECUTION_MIN_SLIPPAGE_BPS);
@@ -186,9 +184,8 @@ pub fn encode_route(
         hop.amount_out = min_out;
         // Prefer paying the next V2 pair directly when the ABI supports a recipient —
         // skips transferAll and the live empty-balance class of failures.
-        let next_is_v2 = hops
-            .get(i + 1)
-            .is_some_and(|h| h.edge.protocol == ProtocolType::UniswapV2);
+        let next = hops.get(i + 1);
+        let next_is_v2 = next.is_some_and(|h| h.edge.protocol == ProtocolType::UniswapV2);
         let recipient = if next_is_v2 && hop_can_direct_output_to(&hop) {
             hops[i + 1].pool_address
         } else {
@@ -209,8 +206,21 @@ pub fn encode_route(
             flash_source,
         )?);
         funds_at = Some(recipient);
-        if i + 1 < hops.len() {
-            chain_in = Some(quoted_out);
+        if next.is_some() {
+            // Next hop pays exact `amount_in` from executor balance (V3/V4 callback,
+            // Curve dx, Balancer, DODO Exact, …). Chaining the full local quote
+            // over-sizes hop N+1 when hop N under-delivers on-chain → TransferFailed
+            // in the callback (live: WPOL→BRZ→USDT hop1 TransferFailed BRZ;
+            // WPOL→CES→USDT hop1 TransferFailed CES). Use slippage-haircut min_out.
+            // V2 transferAll residual is safer, but amountOut quote still needs
+            // ain ≤ delivered or UniswapV2:K — same haircut.
+            if min_out != quoted_out {
+                crate::debug!(
+                    "chain_in haircut: hop={i}->{} quoted={quoted_out} chained={min_out}",
+                    i + 1
+                );
+            }
+            chain_in = Some(min_out);
         }
     }
     Ok(calls)

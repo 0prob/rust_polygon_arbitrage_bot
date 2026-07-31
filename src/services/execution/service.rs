@@ -647,7 +647,13 @@ impl ExecutionService {
                     && (reason.contains("empty nested revert")
                         || reason.contains("transferAll zero balance"))
             );
+            // Mid-route TransferFailed (hop index ≥ 1): prior hop under-delivered vs
+            // optimistic chain_in / local quote — not FoT. Live: V3 hop1 callback
+            // TransferFailed on BRZ/CES after hop0 WPOL→intermediate. Soft-cool only;
+            // do not token-quarantine the intermediate (was blackholing long-tail legs).
+            let mid_hop_transfer_underfund = is_mid_hop_transfer_underfund(&dry.decoded_revert);
             let sim_fidelity_miss = transfer_all_funding_miss
+                || mid_hop_transfer_underfund
                 || matches!(
                     dry.decoded_revert,
                     Some(DecodedRevert::InsufficientProfit {
@@ -680,6 +686,7 @@ impl ExecutionService {
                     dry.decoded_revert,
                     Some(DecodedRevert::ExternalCallFailed { .. })
                 ) && !transfer_all_funding_miss
+                    && !mid_hop_transfer_underfund
                 {
                     self.quarantine_route_hash(candidate.route_hash, now);
                     // Structural vault/router rejects (BAL#327, etc.) re-burn every
@@ -687,7 +694,7 @@ impl ExecutionService {
                     // (live: same 2 fps failed BAL#327 three times in ~3m).
                     // Upgrade fp cool to structural TTL so mixed Aave phantoms
                     // stop crowding Direct profitable candidates.
-                    // transferAll-zero is sim-fidelity (soft cool above), not structural.
+                    // transferAll-zero / mid-hop underfund are sim-fidelity (soft cool).
                     self.quarantine_insert(fp, now + STRUCTURAL_DRY_RUN_QUARANTINE);
                 }
                 // FoT / nonstandard ERC20 TransferFailed: cool the *failing* token.
@@ -695,8 +702,12 @@ impl ExecutionService {
                 // profit_token=WMATIC for 30m (hub arbs blackholed). Prefer nested
                 // `token=0x…` from the executor error; only fall back to start token
                 // for hop-0 UniV2 TRANSFER_FAILED strings without an address.
-                if let Some(token) =
-                    transfer_failed_token_to_quarantine(&dry.decoded_revert, candidate.profit_token)
+                // Skip mid-hop underfund (chain_in optimism) — not a token ban.
+                if !mid_hop_transfer_underfund
+                    && let Some(token) = transfer_failed_token_to_quarantine(
+                        &dry.decoded_revert,
+                        candidate.profit_token,
+                    )
                 {
                     self.quarantine_direct_token_zero_realized(token);
                     crate::info!(
@@ -710,6 +721,14 @@ impl ExecutionService {
                 if let Some(DecodedRevert::ExternalCallFailed { index, .. }) = &dry.decoded_revert {
                     reason = format!(
                         "transferAll zero balance at packed call {index} (prior hop left no intermediate on executor; often Curve/DODO→V2 after under-delivery or index mismatch)"
+                    );
+                }
+            } else if mid_hop_transfer_underfund {
+                if let Some(DecodedRevert::ExternalCallFailed { index, reason: r, .. }) =
+                    &dry.decoded_revert
+                {
+                    reason = format!(
+                        "mid-hop transfer underfund at packed call {index} (prior hop delivered less than chain_in; {r})"
                     );
                 }
             }
@@ -1619,6 +1638,28 @@ fn min_operator_balance_wei(config: &AppConfig) -> Option<U256> {
         .filter(|v| !v.is_zero())
 }
 
+/// Packed-call index ≥ 1 TransferFailed / balance shortfall after a prior hop ran.
+/// Treat as chain_in / local-quote optimism, not FoT (see encode_route min_out chain).
+#[must_use]
+fn is_mid_hop_transfer_underfund(decoded: &Option<DecodedRevert>) -> bool {
+    match decoded {
+        Some(DecodedRevert::ExternalCallFailed { index, reason, .. }) if *index >= 1 => {
+            let r = reason.to_ascii_lowercase();
+            r.contains("transferfailed")
+                || r.contains("transfer_failed")
+                || r.contains("transfer amount exceeds balance")
+                || r.contains("insufficient balance")
+                || r.contains("exceeds balance")
+        }
+        Some(DecodedRevert::TransferFailed { .. }) => {
+            // Top-level TransferFailed has no hop index; only nest under ExternalCallFailed
+            // carries the packed-call index for mid-route classification.
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Resolve which token (if any) should enter the FoT/TransferFailed cool-down.
 ///
 /// Live bug (tui-bolt-optimized run): hop-2
@@ -1628,6 +1669,9 @@ fn transfer_failed_token_to_quarantine(
     decoded: &Option<DecodedRevert>,
     profit_token: Address,
 ) -> Option<Address> {
+    if is_mid_hop_transfer_underfund(decoded) {
+        return None;
+    }
     let token = match decoded {
         Some(DecodedRevert::TransferFailed { token, .. }) => Some(*token),
         Some(DecodedRevert::ExternalCallFailed { index, reason, .. }) => {
@@ -2323,18 +2367,34 @@ mod safety_tests {
 
     #[test]
     fn transfer_failed_quarantines_nested_token_not_hub_profit_token() {
-        // Live: hop-2 TransferFailed on 0xd93f… while profit_token was WMATIC.
         let failing = address!("0xd93f7E271cB87c23AaA73edC008A79646d1F9912");
         let wmatic = crate::core::constants::WMATIC;
-        let decoded = Some(DecodedRevert::ExternalCallFailed {
-            index: 2,
+        // Mid-hop (index≥1) TransferFailed = chain_in underfund, not FoT.
+        // Live: hop1 V3 callback TransferFailed on BRZ/CES after WPOL→intermediate.
+        let mid_hop = Some(DecodedRevert::ExternalCallFailed {
+            index: 1,
+            target: address!("0x296b95DD0E8B726c4e358b0683ff0B6d675C35E9"),
+            reason: format!(
+                "TransferFailed: token={failing}, to=0x296b95DD0E8B726c4e358b0683ff0B6d675C35E9, amount=847905430719831828"
+            ),
+        });
+        assert!(is_mid_hop_transfer_underfund(&mid_hop));
+        assert_eq!(
+            transfer_failed_token_to_quarantine(&mid_hop, wmatic),
+            None,
+            "must not FoT-cool intermediate on mid-hop underfund"
+        );
+        // Hop-0 nested TransferFailed still cools the failing (non-hub) token.
+        let hop0_nested = Some(DecodedRevert::ExternalCallFailed {
+            index: 0,
             target: address!("0x28056401Bb178061950b5Db21fEEED261b808E6C"),
             reason: format!(
                 "TransferFailed: token={failing}, to=0x28056401Bb178061950b5Db21fEEED261b808E6C, amount=1648989"
             ),
         });
+        assert!(!is_mid_hop_transfer_underfund(&hop0_nested));
         assert_eq!(
-            transfer_failed_token_to_quarantine(&decoded, wmatic),
+            transfer_failed_token_to_quarantine(&hop0_nested, wmatic),
             Some(failing)
         );
         // Never cool WMATIC even if nested token is missing and hop==0.
