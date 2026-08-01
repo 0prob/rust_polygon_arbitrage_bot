@@ -10,7 +10,6 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::core::constants::{MATIC_X, MIN_TOKEN_TO_MATIC_RATE, RATE_PRECISION, ST_MATIC};
 use crate::core::types::TokenIndex;
@@ -37,8 +36,6 @@ const MATIC_X_ALT: Address = address!("0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb
 const STADER_CHILD_POOL: Address = address!("0xfd225c9e6601c9d38d8f98d8731bf59efcf8c0e3");
 
 const ONE_18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
-
-static UNSUPPORTED_LST_VIEWS: AtomicU8 = AtomicU8::new(0);
 
 #[inline]
 #[must_use]
@@ -73,8 +70,7 @@ where
 
     let mut items = Vec::with_capacity(2);
     let mut tags = Vec::with_capacity(2);
-    let unsupported = UNSUPPORTED_LST_VIEWS.load(Ordering::Relaxed);
-    if !want_stmatic.is_empty() && unsupported & LstKind::StMatic.bit() == 0 {
+    if !want_stmatic.is_empty() {
         items.push(MulticallItem {
             target: ST_MATIC,
             data: encode_call(&convertStMaticToMaticCall {
@@ -83,7 +79,7 @@ where
         });
         tags.push(LstKind::StMatic);
     }
-    if !want_maticx.is_empty() && unsupported & LstKind::MaticX.bit() == 0 {
+    if !want_maticx.is_empty() {
         items.push(MulticallItem {
             target: STADER_CHILD_POOL,
             data: encode_call(&convertSharesToTokensCall { shares: ONE_18 }),
@@ -102,7 +98,7 @@ where
     let mut out = FxHashMap::default();
     for (tag, raw) in tags.into_iter().zip(results) {
         let Some(bytes) = raw else {
-            tag.disable_after_failed_view();
+            crate::debug!("lst rates: {} conversion view unavailable", tag.label());
             continue;
         };
         let rate = match tag {
@@ -110,7 +106,7 @@ where
             LstKind::MaticX => decode_shares_rate(&bytes),
         };
         let Some(rate) = rate.filter(|r| *r >= MIN_TOKEN_TO_MATIC_RATE) else {
-            tag.disable_after_failed_view();
+            crate::debug!("lst rates: {} conversion view unavailable", tag.label());
             continue;
         };
         let targets = match tag {
@@ -134,27 +130,10 @@ enum LstKind {
 }
 
 impl LstKind {
-    const fn bit(self) -> u8 {
-        match self {
-            Self::StMatic => 1,
-            Self::MaticX => 2,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::StMatic => "stMATIC",
             Self::MaticX => "MaticX",
-        }
-    }
-
-    fn disable_after_failed_view(self) {
-        let prior = UNSUPPORTED_LST_VIEWS.fetch_or(self.bit(), Ordering::Relaxed);
-        if prior & self.bit() == 0 {
-            crate::info!(
-                "lst rates: {} conversion view unavailable; suppressing further calls",
-                self.label()
-            );
         }
     }
 }
@@ -198,10 +177,5 @@ mod tests {
         assert!(is_lst_priced_token(ST_MATIC));
         assert!(is_lst_priced_token(MATIC_X));
         assert!(!is_lst_priced_token(crate::core::constants::WMATIC));
-    }
-
-    #[test]
-    fn lst_kind_bits_are_disjoint() {
-        assert_eq!(LstKind::StMatic.bit() & LstKind::MaticX.bit(), 0);
     }
 }

@@ -336,8 +336,6 @@ impl ExecutionService {
             CHRONIC_NEAR_MISS_QUARANTINE
         } else if mid_band {
             CHRONIC_MID_BAND_QUARANTINE
-        } else if thin_first_strike {
-            CHRONIC_UNDERWATER_QUARANTINE
         } else {
             CHRONIC_UNDERWATER_QUARANTINE
         };

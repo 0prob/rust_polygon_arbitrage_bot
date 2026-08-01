@@ -284,8 +284,8 @@ impl PgClient {
                         backoff.as_secs()
                     );
                     tokio::select! {
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
                                 break;
                             }
                         }
@@ -325,8 +325,8 @@ impl PgClient {
                     Some(Err(e)) => return Err(e.into()),
                     None => anyhow::bail!("pg LISTEN connection closed during subscribe"),
                 },
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         return Ok(());
                     }
                 }
@@ -336,8 +336,8 @@ impl PgClient {
 
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         return Ok(());
                     }
                 }

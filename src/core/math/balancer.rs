@@ -75,7 +75,11 @@ pub fn get_balancer_weighted_amount_out(
     in_idx: usize,
     out_idx: usize,
 ) -> U256 {
-    if in_idx >= state.weights.len() || out_idx >= state.weights.len() {
+    if in_idx >= state.balances.len()
+        || out_idx >= state.balances.len()
+        || in_idx >= state.weights.len()
+        || out_idx >= state.weights.len()
+    {
         return U256::ZERO;
     }
     let scaling = &state.scaling_factors;
@@ -387,7 +391,11 @@ pub fn get_balancer_linear_amount_out(
     let Some(linear) = state.linear.as_ref() else {
         return U256::ZERO;
     };
-    if state.scaling_factors.len() != state.balances.len()
+    if in_idx >= state.balances.len()
+        || out_idx >= state.balances.len()
+        || linear.main_index >= state.balances.len()
+        || linear.wrapped_index >= state.balances.len()
+        || state.scaling_factors.len() != state.balances.len()
         || state.scaling_factors[in_idx].is_zero()
         || state.scaling_factors[out_idx].is_zero()
         || linear.wrapped_rate.is_zero()
@@ -592,6 +600,32 @@ mod tests {
         let amount_out = simulate_balancer_swap(&state, U256::from(1_000_000_000_000_000u64), 0, 2);
         // Then: the quote must remain strictly below the pool's output balance.
         assert!(amount_out < state.balances[2]);
+    }
+
+    #[test]
+    fn malformed_weighted_state_returns_zero() {
+        let mut state = linear_state(U256::from(100) * ONE, U256::ZERO, ONE);
+        state.pool_type = BalancerPoolKind::Weighted;
+        state.weights = vec![ONE / U256::from(2u64); 2];
+        state.balances.truncate(1);
+        state.scaling_factors.truncate(1);
+
+        assert_eq!(
+            get_balancer_weighted_amount_out(&state, ONE, 0, 1),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn malformed_linear_state_returns_zero() {
+        let mut state = linear_state(U256::from(100) * ONE, U256::ZERO, ONE);
+        state.balances.truncate(1);
+        state.scaling_factors.truncate(1);
+
+        assert_eq!(
+            get_balancer_linear_amount_out(&state, ONE, 0, 1),
+            U256::ZERO
+        );
     }
 
     #[test]

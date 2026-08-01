@@ -1158,12 +1158,10 @@ impl StateRefreshService {
         let prev = self
             .refresh_batch_scale_bps
             .load(Ordering::Relaxed)
-            .max(REFRESH_BATCH_SCALE_MIN_BPS)
-            .min(REFRESH_BATCH_SCALE_FULL_BPS);
+            .clamp(REFRESH_BATCH_SCALE_MIN_BPS, REFRESH_BATCH_SCALE_FULL_BPS);
         let next = next_refresh_batch_scale_bps(prev, refresh_ms, interval_ms);
         if next != prev {
-            self.refresh_batch_scale_bps
-                .store(next, Ordering::Relaxed);
+            self.refresh_batch_scale_bps.store(next, Ordering::Relaxed);
             if next < prev {
                 crate::info!(
                     "state refresh batch scale: {prev}→{next} bps (refresh_ms={refresh_ms} interval_ms={interval_ms})"
@@ -1191,8 +1189,7 @@ impl StateRefreshService {
         let scale = self
             .refresh_batch_scale_bps
             .load(Ordering::Relaxed)
-            .max(REFRESH_BATCH_SCALE_MIN_BPS)
-            .min(REFRESH_BATCH_SCALE_FULL_BPS);
+            .clamp(REFRESH_BATCH_SCALE_MIN_BPS, REFRESH_BATCH_SCALE_FULL_BPS);
         apply_refresh_batch_scale(base, scale, self.config.pipeline.lf_hot_batch)
     }
 }
@@ -1201,9 +1198,7 @@ impl StateRefreshService {
 /// [`REFRESH_BATCH_SCALE_STEP_BPS`] when under 75% of the LF interval.
 #[must_use]
 fn next_refresh_batch_scale_bps(prev: u64, refresh_ms: u64, interval_ms: u64) -> u64 {
-    let prev = prev
-        .max(REFRESH_BATCH_SCALE_MIN_BPS)
-        .min(REFRESH_BATCH_SCALE_FULL_BPS);
+    let prev = prev.clamp(REFRESH_BATCH_SCALE_MIN_BPS, REFRESH_BATCH_SCALE_FULL_BPS);
     if interval_ms == 0 {
         return prev;
     }
@@ -1226,9 +1221,7 @@ fn next_refresh_batch_scale_bps(prev: u64, refresh_ms: u64, interval_ms: u64) ->
 /// Apply scale bps to a configured batch; floor at hot batch (or 1).
 #[must_use]
 fn apply_refresh_batch_scale(base: usize, scale_bps: u64, hot_batch: usize) -> usize {
-    let scale = scale_bps
-        .max(REFRESH_BATCH_SCALE_MIN_BPS)
-        .min(REFRESH_BATCH_SCALE_FULL_BPS);
+    let scale = scale_bps.clamp(REFRESH_BATCH_SCALE_MIN_BPS, REFRESH_BATCH_SCALE_FULL_BPS);
     let scaled = base
         .saturating_mul(scale as usize)
         .saturating_div(REFRESH_BATCH_SCALE_FULL_BPS as usize);

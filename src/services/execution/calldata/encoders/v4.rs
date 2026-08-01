@@ -345,8 +345,14 @@ mod tests {
         };
         // prequoted so encode does not re-walk (ticks may still be shallow for tiny L_net=0).
         let prequoted = U256::from(900u64);
-        let calls =
-            encode_v4_hop(&hop, &arena, 20, /* full_range */ true, Some(prequoted)).expect("encode");
+        let calls = encode_v4_hop(
+            &hop,
+            &arena,
+            20,
+            /* full_range */ true,
+            Some(prequoted),
+        )
+        .expect("encode");
         let unlock = &calls[1].data;
         let inner_len = U256::from_be_slice(&unlock[36..68]).to::<usize>();
         let inner = &unlock[68..68 + inner_len];

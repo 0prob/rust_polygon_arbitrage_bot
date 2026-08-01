@@ -165,10 +165,11 @@ impl PoolLogFeed {
             }
 
             tokio::select! {
-                _ = self.shutdown.changed() => {
-                    if *self.shutdown.borrow() { break; }
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() || *self.shutdown.borrow() { break; }
                 }
-                _ = addr_rx.changed() => {
+                changed = addr_rx.changed() => {
+                    if changed.is_err() { break; }
                     current_addrs.clone_from(&addr_rx.borrow());
                 }
                 () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {
@@ -241,12 +242,15 @@ impl PoolLogFeed {
         let armed_at = Instant::now();
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         return Ok(SubscriptionExit::AddressChange);
                     }
                 }
-                _ = addr_rx.changed() => {
+                changed = addr_rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(SubscriptionExit::AddressChange);
+                    }
                     let _ = addr_rx.borrow_and_update();
                 }
                 maybe_log = log_rx.recv() => {

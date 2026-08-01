@@ -186,7 +186,10 @@ mod tests {
         };
         // Direct-out to next V2: sell goes to next_v2, but transferAll must hit executor.
         let calls = encode_dodo_hop(&arena, &hop, next_v2, executor, true).expect("enc");
-        assert_eq!(calls[0].target, executor, "transferAll target must be executor");
+        assert_eq!(
+            calls[0].target, executor,
+            "transferAll target must be executor"
+        );
         assert_eq!(calls[1].target, pool);
         // sellBase `to` is next_v2 (last 32-byte word of ABI after selector).
         let sell = calls[1].data.as_ref();

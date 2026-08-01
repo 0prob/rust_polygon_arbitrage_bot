@@ -229,8 +229,8 @@ pub async fn run_pass_loop(
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
@@ -586,8 +586,8 @@ fn spawn_daily_loss_guard(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = rx.changed() => {
-                    if *rx.borrow() {
+                changed = rx.changed() => {
+                    if changed.is_err() || *rx.borrow() {
                         break;
                     }
                 }
@@ -639,8 +639,8 @@ fn spawn_matic_usd_oracle_background(
         ticker.tick().await;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         return;
                     }
                 }

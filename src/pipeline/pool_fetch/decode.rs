@@ -564,6 +564,9 @@ fn decode_balancer(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<Po
         return None;
     }
     let n = balances.len();
+    if tokens.tokens.len() != n {
+        return None;
+    }
     let swap_fee = IBalancerPool::getSwapFeePercentageCall::abi_decode_returns(swap_fee_bytes?)
         .ok()
         .map(U256::from)?;

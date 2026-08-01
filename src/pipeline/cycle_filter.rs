@@ -390,6 +390,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     survivors.extend(keeps.into_iter().take(keep_take));
 
     // Gas rescues before spot-dust; shared rescue_cap; break once full (no O(n) continue).
+    let rescue_candidates = gas_rescues.len().saturating_add(spot_rescues.len());
     let mut rescue_used = 0usize;
     let mut admit_rescue = |cycle: FoundCycle, is_gas: bool, diag: &mut PrefilterDiagnostics| -> bool {
         if rescue_used >= rescue_cap || survivors.len() >= total_cap {
@@ -406,39 +407,16 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     };
     for cycle in gas_rescues {
         if !admit_rescue(cycle, true, &mut diag) {
-            // Remaining gas + all spot are drops.
-            diag.rescue_cap_drop += 1;
-            // Count this breaker + rest of gas queue after loop via saturating math below.
             break;
         }
     }
-    // Any gas not admitted after break (or never walked) counts as drop once we know
-    // how many gas actually entered.
-    let gas_admitted = diag.gas_rescue;
-    // Recompute gas drops: we may have broken mid-loop. Easier: track below.
-
-    // Reset drop accounting from explicit residual sizes after admission.
-    // (gas_rescue already final for the admitted prefix; residual gas never pushed.)
-    let _ = gas_admitted;
-    // Simpler residual drop count after both loops:
-    // We'll recompute rescue_cap_drop at the end from inputs vs admitted.
 
     for cycle in spot_rescues {
         if !admit_rescue(cycle, false, &mut diag) {
             break;
         }
     }
-    // Drops = candidates that got a rescue verdict but were not admitted.
-    // profit_keep is admitted keeps only; rescue verdicts = window - raw keep verdicts
-    // is awkward after take — use admitted counters:
-    // We lost the pre-take keep count. Approximate drops from rescue budgets only:
-    diag.rescue_cap_drop = 0; // filled below after we track totals
-
-    // Re-derive drop count: everything in the sim window that is not in survivors
-    // and was not a discarded excess Keep.
-    // excess_keeps = (keeps before take) - keep_take — those are rank-overflow, not rescue drops.
-    // For diagnostics, rescue_cap_drop = gas_rescue_candidates + spot_rescue_candidates - admitted rescues.
-    // We no longer have candidate counts after move. Track before loops:
+    diag.rescue_cap_drop = rescue_candidates.saturating_sub(rescue_used);
     diag.out = survivors.len();
     (survivors, diag)
 }

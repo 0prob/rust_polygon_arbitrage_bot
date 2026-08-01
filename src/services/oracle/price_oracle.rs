@@ -351,13 +351,29 @@ impl PriceOracle {
     }
 
     pub fn register_pyth_feed(&self, token: Address, feed_id: String) {
-        self.custom_pyth
-            .write()
-            .insert(token, normalize_pyth_feed_id(&feed_id));
+        let _ = self.replace_pyth_feed(token, Some(feed_id));
     }
 
     pub fn unregister_pyth_feed(&self, token: &Address) {
-        self.custom_pyth.write().remove(token);
+        let _ = self.replace_pyth_feed(*token, None);
+    }
+
+    pub(crate) fn replace_pyth_feed(
+        &self,
+        token: Address,
+        feed_id: Option<String>,
+    ) -> Option<String> {
+        let mut feeds = self.custom_pyth.write();
+        let prior = feeds.get(&token).cloned();
+        match feed_id {
+            Some(feed_id) => {
+                feeds.insert(token, normalize_pyth_feed_id(&feed_id));
+            }
+            None => {
+                feeds.remove(&token);
+            }
+        }
+        prior
     }
 
     pub fn register_chainlink_feed(&self, token: Address, feed: Address) {

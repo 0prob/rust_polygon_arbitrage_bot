@@ -270,8 +270,8 @@ mod tests {
             router: None,
             hooks: None,
         };
-        let calls =
-            encode_balancer_hop(&hop, next_v2, executor, &arena, 50, U256::from(1u64)).expect("enc");
+        let calls = encode_balancer_hop(&hop, next_v2, executor, &arena, 50, U256::from(1u64))
+            .expect("enc");
         // vault.swap calldata: after selector, singleSwap then funds.sender (address word)
         // Funds starts after SingleSwap: poolId(32)+kind(32)+assetIn(32)+assetOut(32)+amount(32)+userData offset/len
         // Easier: search for executor and next_v2 in the payload.

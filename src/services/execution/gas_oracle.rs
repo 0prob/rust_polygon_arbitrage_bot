@@ -410,8 +410,8 @@ impl GasOracle {
             ticker.tick().await;
             loop {
                 tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
                             break;
                         }
                     }

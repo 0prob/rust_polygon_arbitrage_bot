@@ -63,31 +63,33 @@ pub async fn verify_proposed_pyth_feeds(
     let _ = oracle.get_matic_usd_offline().await;
     let mut verified = Vec::with_capacity(proposals.len());
     for proposal in proposals {
-        oracle.register_pyth_feed(proposal.token, proposal.feed_id.clone());
-        oracle
-            .prefetch_token_usd_offline(std::slice::from_ref(&proposal.token))
-            .await;
-        let usd = oracle
-            .token_usd(&proposal.token)
-            .ok_or_else(|| anyhow::anyhow!("no USD quote for {}", proposal.token))?;
-        if usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            anyhow::bail!("non-positive USD for {}", proposal.token);
+        let prior = oracle.replace_pyth_feed(proposal.token, Some(proposal.feed_id.clone()));
+        let result = async {
+            oracle
+                .prefetch_token_usd_offline(std::slice::from_ref(&proposal.token))
+                .await;
+            let usd = oracle
+                .token_usd_fresh(&proposal.token)
+                .ok_or_else(|| anyhow::anyhow!("no fresh USD quote for {}", proposal.token))?;
+            let matic_rate_ok = oracle
+                .token_matic_rate_per_unit_integer(&proposal.token)
+                .is_some_and(|r| r >= MIN_TOKEN_TO_MATIC_RATE);
+            if !matic_rate_ok {
+                anyhow::bail!(
+                    "missing or dust token/MATIC integer rate for {} (usd={usd})",
+                    proposal.token
+                );
+            }
+            Ok(VerifiedPythFeed {
+                token: proposal.token,
+                feed_id: proposal.feed_id.clone(),
+                token_usd: usd,
+                matic_rate_ok,
+            })
         }
-        let matic_rate_ok = oracle
-            .token_matic_rate_per_unit_integer(&proposal.token)
-            .is_some_and(|r| r >= MIN_TOKEN_TO_MATIC_RATE);
-        if !matic_rate_ok {
-            anyhow::bail!(
-                "missing or dust token/MATIC integer rate for {} (usd={usd})",
-                proposal.token
-            );
-        }
-        verified.push(VerifiedPythFeed {
-            token: proposal.token,
-            feed_id: proposal.feed_id.clone(),
-            token_usd: usd,
-            matic_rate_ok,
-        });
+        .await;
+        let _ = oracle.replace_pyth_feed(proposal.token, prior);
+        verified.push(result?);
     }
     Ok(verified)
 }

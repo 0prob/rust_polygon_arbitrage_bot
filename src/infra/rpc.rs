@@ -218,8 +218,8 @@ impl RpcPool {
             timer.tick().await;
             loop {
                 tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() { break; }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
                     }
                     _ = timer.tick() => {
                         pool.probe_and_rank_state_urls().await;

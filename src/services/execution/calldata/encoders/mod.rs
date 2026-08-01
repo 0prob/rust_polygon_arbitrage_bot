@@ -25,13 +25,7 @@ use super::{CalldataHop, RouteEncodeConfig};
 /// - **Curve / WooFi**: approve + exact-in exchange (minOut carries slippage).
 /// - **DODO**: transfer + `sellBase`/`sellQuote` from on-chain base/quote; not under
 ///   DODO flash on the same pool (`preventReentrant`).
-/// `is_last_hop`: last hop may use a tight V3/V4 price limit; intermediate hops use
-/// full-range limits so exact-in fully fills for chain_in fidelity.
-///
-/// `prequoted_out`: execution quote already computed by `encode_route` for chain_in
-/// (V3/V4 reuse it; other protocols re-quote via `compute_min_out`).
-///
-/// `executor` is the ArbExecutor address (required for DODO/V2 `transferAll` targets).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_hop_for_protocol(
     hop: &CalldataHop,
     recipient: Address,

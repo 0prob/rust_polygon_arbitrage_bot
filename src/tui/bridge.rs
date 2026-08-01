@@ -158,9 +158,8 @@ impl PipelineUiHook for TuiBridgeHook {
                         crate::warn!("tui event channel closed — execution outcome not shown");
                     }
                     Err(TrySendError::Full(event)) => {
-                        if self.tx.blocking_send(event).is_err() {
-                            crate::warn!("tui event channel closed — execution outcome not shown");
-                        }
+                        let _ = event;
+                        crate::warn!("tui event channel full — execution outcome not shown");
                     }
                 }
             }

@@ -723,14 +723,14 @@ impl ExecutionService {
                         "transferAll zero balance at packed call {index} (prior hop left no intermediate on executor; often Curve/DODO→V2 after under-delivery or index mismatch)"
                     );
                 }
-            } else if mid_hop_transfer_underfund {
-                if let Some(DecodedRevert::ExternalCallFailed { index, reason: r, .. }) =
-                    &dry.decoded_revert
-                {
-                    reason = format!(
-                        "mid-hop transfer underfund at packed call {index} (prior hop delivered less than chain_in; {r})"
-                    );
-                }
+            } else if mid_hop_transfer_underfund
+                && let Some(DecodedRevert::ExternalCallFailed {
+                    index, reason: r, ..
+                }) = &dry.decoded_revert
+            {
+                reason = format!(
+                    "mid-hop transfer underfund at packed call {index} (prior hop delivered less than chain_in; {r})"
+                );
             }
             // Adaptive USD flash cap was the binding constraint — size-fail demotes
             // so the next assess starts smaller instead of replaying BAL#528 at cap.
@@ -1650,11 +1650,6 @@ fn is_mid_hop_transfer_underfund(decoded: &Option<DecodedRevert>) -> bool {
                 || r.contains("transfer amount exceeds balance")
                 || r.contains("insufficient balance")
                 || r.contains("exceeds balance")
-        }
-        Some(DecodedRevert::TransferFailed { .. }) => {
-            // Top-level TransferFailed has no hop index; only nest under ExternalCallFailed
-            // carries the packed-call index for mid-route classification.
-            false
         }
         _ => false,
     }

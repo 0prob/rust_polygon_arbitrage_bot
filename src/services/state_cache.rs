@@ -452,6 +452,9 @@ impl StateCache {
     }
 
     pub fn insert(&self, address: Address, state: PoolState) {
+        if self.max_entries == 0 {
+            return;
+        }
         let mut dirty_addrs = Vec::with_capacity(2);
         {
             let mut guard = self.inner.write();
@@ -623,6 +626,14 @@ mod tests {
         cache.insert(addr, PoolState::Invalid);
         let got = cache.get(&addr);
         assert!(got.is_some());
+    }
+
+    #[test]
+    fn zero_capacity_cache_rejects_inserts() {
+        let cache = StateCache::new(0, Duration::from_secs(1));
+        cache.insert(Address::ZERO, PoolState::Invalid);
+
+        assert!(cache.is_empty());
     }
 
     #[test]

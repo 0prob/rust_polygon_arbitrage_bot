@@ -124,7 +124,7 @@ where
 
     rx.close();
     drop(tx);
-    drop(input_thread);
+    let _ = input_thread.join();
     terminal.restore().ok();
 
     join_pass_loop_after_shutdown(pass_handle).await

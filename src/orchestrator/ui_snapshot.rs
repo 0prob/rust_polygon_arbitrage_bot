@@ -48,8 +48,8 @@ pub fn spawn_snapshot_publisher(
 
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
