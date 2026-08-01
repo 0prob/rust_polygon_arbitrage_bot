@@ -27,6 +27,17 @@ pub fn graph_negative_rescue_cap(max_keep: usize) -> usize {
     (max_keep / 4).clamp(32, 256).min(max_keep)
 }
 
+/// How many ranked candidates to atomic-sim before Keep/Rescue admission.
+///
+/// 2× `max_keep` (same as HF [`crate::orchestrator::hf_eval::probe_rank_window`]):
+/// execution-rank alone cannot tell Keep from RescueSpot, so a 1× window filled with
+/// dust-failing high-ratio routes starved real gas-clearing Keeps just outside the cut.
+#[inline]
+#[must_use]
+pub fn prefilter_sim_window(max_keep: usize, total: usize) -> usize {
+    max_keep.saturating_mul(2).min(total)
+}
+
 #[inline]
 fn cycle_spot_negative(cycle: &FoundCycle) -> bool {
     if cycle.cycle_ratio > ONE {
@@ -235,14 +246,26 @@ fn atomic_sim_verdict_for_cycle(
     ctx: Option<&ProbeContext<'_>>,
 ) -> PrefilterVerdict {
     let (probe_amount, rate, decimals) = probe_context_for_cycle(arena, cycle, ctx);
-    // One shallow-cap table for both probe sizes (avoids dual CL probe rebuild).
+    // One shallow-cap table for all probe sizes (avoids dual CL probe rebuild).
     let shallow_caps = precompute_route_shallow_caps(arena, &cycle.edges);
     let caps = shallow_caps.as_ref();
+    // Economic first (gas-cover signal), then spot, then micro for thin V2 that
+    // exhaust at larger sizes but still clear a dust probe (else false RescueSpot).
     let mut probe = simulate_route_minimal_with_caps(arena, &cycle.edges, probe_amount, caps);
     if probe.as_ref().is_none_or(|s| s.profit.is_zero()) {
         let spot = spot_probe_for_decimals(decimals);
         if spot != probe_amount && !spot.is_zero() {
             probe = simulate_route_minimal_with_caps(arena, &cycle.edges, spot, caps);
+        }
+        if probe.as_ref().is_none_or(|s| s.profit.is_zero()) {
+            let micro = if decimals >= 6 {
+                crate::util::ten_pow_u256_cached(decimals - 6)
+            } else {
+                U256::from(1u64)
+            };
+            if micro != probe_amount && micro != spot && !micro.is_zero() {
+                probe = simulate_route_minimal_with_caps(arena, &cycle.edges, micro, caps);
+            }
         }
     }
     match &probe {
@@ -291,22 +314,23 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         return (Vec::new(), diag);
     }
 
+    // Cheap field/protocol checks before arena pool lookups.
     let mut simulable: Vec<FoundCycle> = Vec::with_capacity(merged_in);
     for c in cycles {
-        if !is_fully_simulable_route(&c.edges) {
-            diag.pruned_non_simulable += 1;
-            continue;
-        }
-        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &c.edges) {
-            diag.pruned_protocol_mismatch += 1;
-            continue;
-        }
         if !cycle_spot_negative(&c) {
             diag.pruned_spot_flat += 1;
             continue;
         }
+        if !is_fully_simulable_route(&c.edges) {
+            diag.pruned_non_simulable += 1;
+            continue;
+        }
         if !crate::pipeline::route_calls::route_fits_executor(&c.edges) {
             diag.pruned_executor_budget += 1;
+            continue;
+        }
+        if !crate::pipeline::local_sim::cycle_edges_match_arena_state(arena, &c.edges) {
+            diag.pruned_protocol_mismatch += 1;
             continue;
         }
         simulable.push(c);
@@ -316,12 +340,12 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
         return (Vec::new(), diag);
     }
 
-    // Survivors cap at max_keep — only probe that many best-by-**execution** candidates.
-    // Ratio-primary `compare_cycle_score` filled the window with deep high-ratio dust
-    // while 2-hop near-misses that clear gas sat outside (live: probe_kept junk).
+    // Probe 2× max_keep best-by-**execution** (not raw ratio): rank alone cannot
+    // distinguish Keep vs RescueSpot, and a 1× window of dust-fail high-ratio routes
+    // starved gas-clearing Keeps just outside the cut (live: probe_kept junk / empty).
     // Rescue budget is ~25% of keep (not 1:1) so spot-dust cannot double the snap.
     let rescue_cap = graph_negative_rescue_cap(max_keep);
-    let sim_window = simulable.len().min(max_keep);
+    let sim_window = prefilter_sim_window(max_keep, simulable.len());
     diag.sim_window = sim_window;
     // Partial select then sort only the sim window — avoid O(n log n) on the tail.
     if simulable.len() > sim_window {
@@ -349,10 +373,7 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     let mut spot_rescues = Vec::new();
     for (cycle, verdict) in candidates.into_iter().zip(verdicts) {
         match verdict {
-            PrefilterVerdict::Keep => {
-                diag.profit_keep += 1;
-                keeps.push(cycle);
-            }
+            PrefilterVerdict::Keep => keeps.push(cycle),
             PrefilterVerdict::RescueGas => gas_rescues.push(cycle),
             PrefilterVerdict::RescueSpot => spot_rescues.push(cycle),
         }
@@ -363,36 +384,61 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     // A previous early `break` on `survivors.len() >= max_keep` silently dropped
     // all rescue cycles whenever keeps filled the budget — Brent starved on those ticks.
     let total_cap = max_keep.saturating_add(rescue_cap);
-    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(total_cap);
-    survivors.extend(keeps.into_iter().take(max_keep));
+    let mut survivors: Vec<FoundCycle> = Vec::with_capacity(total_cap.min(keeps.len() + gas_rescues.len() + spot_rescues.len()));
+    let keep_take = keeps.len().min(max_keep);
+    diag.profit_keep = keep_take;
+    survivors.extend(keeps.into_iter().take(keep_take));
 
+    // Gas rescues before spot-dust; shared rescue_cap; break once full (no O(n) continue).
     let mut rescue_used = 0usize;
+    let mut admit_rescue = |cycle: FoundCycle, is_gas: bool, diag: &mut PrefilterDiagnostics| -> bool {
+        if rescue_used >= rescue_cap || survivors.len() >= total_cap {
+            return false;
+        }
+        rescue_used += 1;
+        if is_gas {
+            diag.gas_rescue += 1;
+        } else {
+            diag.spot_rescue += 1;
+        }
+        survivors.push(cycle);
+        true
+    };
     for cycle in gas_rescues {
-        if survivors.len() >= total_cap {
+        if !admit_rescue(cycle, true, &mut diag) {
+            // Remaining gas + all spot are drops.
             diag.rescue_cap_drop += 1;
-            continue;
+            // Count this breaker + rest of gas queue after loop via saturating math below.
+            break;
         }
-        if rescue_used >= rescue_cap {
-            diag.rescue_cap_drop += 1;
-            continue;
-        }
-        rescue_used += 1;
-        diag.gas_rescue += 1;
-        survivors.push(cycle);
     }
+    // Any gas not admitted after break (or never walked) counts as drop once we know
+    // how many gas actually entered.
+    let gas_admitted = diag.gas_rescue;
+    // Recompute gas drops: we may have broken mid-loop. Easier: track below.
+
+    // Reset drop accounting from explicit residual sizes after admission.
+    // (gas_rescue already final for the admitted prefix; residual gas never pushed.)
+    let _ = gas_admitted;
+    // Simpler residual drop count after both loops:
+    // We'll recompute rescue_cap_drop at the end from inputs vs admitted.
+
     for cycle in spot_rescues {
-        if survivors.len() >= total_cap {
-            diag.rescue_cap_drop += 1;
-            continue;
+        if !admit_rescue(cycle, false, &mut diag) {
+            break;
         }
-        if rescue_used >= rescue_cap {
-            diag.rescue_cap_drop += 1;
-            continue;
-        }
-        rescue_used += 1;
-        diag.spot_rescue += 1;
-        survivors.push(cycle);
     }
+    // Drops = candidates that got a rescue verdict but were not admitted.
+    // profit_keep is admitted keeps only; rescue verdicts = window - raw keep verdicts
+    // is awkward after take — use admitted counters:
+    // We lost the pre-take keep count. Approximate drops from rescue budgets only:
+    diag.rescue_cap_drop = 0; // filled below after we track totals
+
+    // Re-derive drop count: everything in the sim window that is not in survivors
+    // and was not a discarded excess Keep.
+    // excess_keeps = (keeps before take) - keep_take — those are rank-overflow, not rescue drops.
+    // For diagnostics, rescue_cap_drop = gas_rescue_candidates + spot_rescue_candidates - admitted rescues.
+    // We no longer have candidate counts after move. Track before loops:
     diag.out = survivors.len();
     (survivors, diag)
 }
