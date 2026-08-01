@@ -730,8 +730,9 @@ impl FlashLiquidityCache {
         let mut aave_index = 0usize;
         // Use snapshot from above — don't hold pins lock across publish.
         for (i, token) in to_fetch.iter().enumerate() {
-            let base = i * 2;
-            let balancer = decode_balance(results.get(base));
+            // Layout is sequential: [balanceOf×n] then [getReserveData×k], not interleaved.
+            // `i * 2` stole wrong balances / Aave blobs once n≥2 (live flash cap skew).
+            let balancer = decode_balance(results.get(i));
             let aave_pinned = pinned_tokens.contains(token);
             let aave_listed = !aave_pinned && reserves[i].is_some();
             let aave = if aave_listed {

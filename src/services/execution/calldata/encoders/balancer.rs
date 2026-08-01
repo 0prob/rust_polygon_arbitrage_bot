@@ -19,9 +19,15 @@ const BALANCER_GIVEN_IN: u8 = 0;
 /// Returns a vector containing:
 /// 1. An approval call if needed to the Balancer Vault
 /// 2. A swap call to the vault's single swap function
+///
+/// `executor` is always the vault `sender` (tokens are approved from the
+/// ArbExecutor). `recipient` may be the next V2 pair for direct-out funding —
+/// do **not** set sender=recipient when direct-out (vault would pull from the
+/// pair, which has no balance/approval).
 pub fn encode_balancer_hop(
     hop: &CalldataHop,
     recipient: Address,
+    executor: Address,
     arena: &StateArena,
     slippage_bps: u64,
     deadline: U256,
@@ -50,7 +56,7 @@ pub fn encode_balancer_hop(
             userData: Bytes::default(),
         },
         funds: BalancerFundManagement {
-            sender: recipient,
+            sender: executor,
             fromInternalBalance: false,
             recipient,
             toInternalBalance: false,
@@ -138,6 +144,9 @@ fn build_flash_swap_limits(assets: &[Address], hops: &[CalldataHop]) -> Vec<I256
 }
 
 /// Encode an all-Balancer route as one vault `batchSwap` flash-swap call for `executeArbDirect`.
+///
+/// `recipient` is the ArbExecutor (flash credit + final settlement). Batch funds use the same
+/// address as sender and recipient — there is no mid-route direct-out to a V2 pair.
 pub fn encode_balancer_batch_route(
     hops: &[CalldataHop],
     recipient: Address,
@@ -201,5 +210,78 @@ mod tests {
         let limits = build_flash_swap_limits(&assets, &hops);
         assert_eq!(limits[0], I256::MAX);
         assert_eq!(limits[1], I256::ZERO);
+    }
+
+    #[test]
+    fn single_swap_sender_is_executor_when_direct_out_to_next_pool() {
+        use crate::core::types::{BalancerPoolKind, BalancerPoolState, PoolState};
+        use alloy::primitives::FixedBytes;
+        use std::sync::Arc;
+
+        let executor = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let next_v2 = address!("0x2222222222222222222222222222222222222222");
+        let t_in = address!("0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270");
+        let t_out = address!("0x2791bca1f2de4661ed88a30c99a7a9489c09eb3f");
+        let pool = address!("0x1111111111111111111111111111111111111111");
+        let pool_id = FixedBytes::from([0xab; 32]);
+
+        let mut arena = StateArena::default();
+        let i0 = arena.register_token(t_in);
+        let i1 = arena.register_token(t_out);
+        let one = U256::from(10u64).pow(U256::from(18u64));
+        let bal = U256::from(1_000_000u64) * one;
+        let pool_index = arena.register_pool(
+            pool,
+            Arc::new(PoolState::Balancer(BalancerPoolState {
+                pool_id: Some(pool_id),
+                tokens: vec![t_in, t_out],
+                balances: vec![bal, bal + U256::from(1u64)],
+                weights: vec![one / U256::from(2u64), one / U256::from(2u64)],
+                scaling_factors: vec![one, one],
+                amp: U256::ZERO,
+                amp_precision: U256::from(1_000u64),
+                fee: U256::from(1_000_000_000_000_000u64),
+                pool_type: BalancerPoolKind::Weighted,
+                linear: None,
+                bpt_index: None,
+                is_updating: false,
+                last_change_block: 0,
+            })),
+        );
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index,
+                token_in: i0,
+                token_out: i1,
+                token_in_idx: 0,
+                token_out_idx: 1,
+                fee_bps: 30,
+                zero_for_one: true,
+                protocol: ProtocolType::BalancerV2,
+            },
+            pool_address: pool,
+            token_in: t_in,
+            token_out: t_out,
+            amount_in: U256::from(1_000u64),
+            amount_out: U256::from(900u64),
+            pool_id: Some(pool_id),
+            protocol_label: None,
+            pool_type: None,
+            router: None,
+            hooks: None,
+        };
+        let calls =
+            encode_balancer_hop(&hop, next_v2, executor, &arena, 50, U256::from(1u64)).expect("enc");
+        // vault.swap calldata: after selector, singleSwap then funds.sender (address word)
+        // Funds starts after SingleSwap: poolId(32)+kind(32)+assetIn(32)+assetOut(32)+amount(32)+userData offset/len
+        // Easier: search for executor and next_v2 in the payload.
+        let data = calls[1].data.as_ref();
+        assert_eq!(calls[1].target, BALANCER_VAULT);
+        let has_exec = data.windows(20).any(|w| w == executor.as_slice());
+        let has_next = data.windows(20).any(|w| w == next_v2.as_slice());
+        assert!(has_exec, "sender must encode executor");
+        assert!(has_next, "recipient may be next V2 for direct-out");
+        // sender word must not equal recipient-only: both present when direct-out.
+        assert_ne!(executor, next_v2);
     }
 }

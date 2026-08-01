@@ -76,6 +76,7 @@ fn sim_failure_is_size_monotonic(failure: Option<MinimalSimFailure>) -> bool {
             MinimalSimFailure::V2ReserveExhausted { .. }
                 | MinimalSimFailure::ClCapExceeded { .. }
                 | MinimalSimFailure::ShallowCl { .. }
+                | MinimalSimFailure::ClSynthetic { .. }
                 | MinimalSimFailure::ClTickless { .. }
                 | MinimalSimFailure::BalancerMaxInRatio { .. }
                 | MinimalSimFailure::ZeroOutput { .. }
@@ -1071,6 +1072,7 @@ pub fn optimize_cycle(
                             BrentSimNoneKind::V2Reserve
                         }
                         Some(MinimalSimFailure::ShallowCl { hop })
+                        | Some(MinimalSimFailure::ClSynthetic { hop })
                         | Some(MinimalSimFailure::ClCapExceeded { hop }) => {
                             record_brent_shallow_hop(hop);
                             BrentSimNoneKind::ShallowCl
@@ -1125,20 +1127,29 @@ pub fn optimize_cycle(
         );
         return None;
     }
-    let mut sim = sim_cache
-        .get(&optimal)
-        .copied()
-        .or_else(|| {
-            route_sim_cache.and_then(|(cache, route_state_revision, route_fp)| {
+    // Local cache entries are already gas-resolved. Only resolve when the sim is
+    // raw (route-cache hit or fresh walk) — double resolve × sim_scale understated
+    // nothing in scores but inflated `OptimizationResult.total_gas` (scale²).
+    let sim = if let Some(cached) = sim_cache.get(&optimal).copied() {
+        cached
+    } else {
+        let mut raw = route_sim_cache
+            .and_then(|(cache, route_state_revision, route_fp)| {
                 cache.get(route_state_revision, route_fp, optimal)
             })
-        })
-        .or_else(|| {
-            simulate_route_minimal_with_caps(arena, edges, optimal, brent_shallow_caps.as_ref())
-        })?;
-    if let Some(costing) = route_gas {
-        sim.total_gas = costing.resolve(sim.total_gas);
-    }
+            .or_else(|| {
+                simulate_route_minimal_with_caps(
+                    arena,
+                    edges,
+                    optimal,
+                    brent_shallow_caps.as_ref(),
+                )
+            })?;
+        if let Some(costing) = route_gas {
+            raw.total_gas = costing.resolve(raw.total_gas);
+        }
+        raw
+    };
     if sim.profit.is_zero() {
         record_brent_reject(BrentOptimizeReject::ZeroProfit);
         crate::trace!("optimize_cycle: optimal sim zero profit optimal={optimal} low={low}");

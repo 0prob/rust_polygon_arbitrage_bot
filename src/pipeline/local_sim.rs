@@ -99,10 +99,23 @@ pub fn estimate_route_gas(edges: &[Edge]) -> u32 {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HopResult {
     amount_out: U256,
     gas: u32,
+}
+
+/// Why [`simulate_hop`] refused a non-zero input (hot-path ranking + Brent diag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopReject {
+    /// Tickless CL input above spot-probe shallow cap (or early cap gate).
+    ClCap,
+    /// Ticked CL walk exhausted tick data / unfilled exact-in.
+    ClShallow,
+    /// Incomplete hydrate window full-filled at constant L (encode refuses).
+    ClSynthetic,
+    /// Protocol math zero-out, reserve, unsupported state, or realign failure.
+    Math,
 }
 
 /// Per-hop input caps for **tickless** CL hops only (spot-probe sized).
@@ -171,9 +184,9 @@ fn simulate_hop(
     edge: &Edge,
     amount_in: U256,
     shallow_cap: U256,
-) -> Option<HopResult> {
+) -> Result<HopResult, HopReject> {
     if amount_in.is_zero() {
-        return Some(HopResult {
+        return Ok(HopResult {
             amount_out: U256::ZERO,
             gas: 0,
         });
@@ -183,16 +196,16 @@ fn simulate_hop(
         ProtocolType::UniswapV3 | ProtocolType::UniswapV4
     ) && cl_hop_exceeds_shallow_cap(amount_in, shallow_cap)
     {
-        return None;
+        return Err(HopReject::ClCap);
     }
 
     match (state, edge.protocol) {
         (PoolState::V2(s), ProtocolType::UniswapV2) => {
             if amount_in >= v2_reserve_in(s, edge.zero_for_one) {
-                return None;
+                return Err(HopReject::Math);
             }
             let out = simulate_v2_swap(s, amount_in, edge.zero_for_one, Some(edge.fee_bps));
-            Some(HopResult {
+            Ok(HopResult {
                 amount_out: out,
                 gas: GAS_V2_HOP,
             })
@@ -210,12 +223,13 @@ fn simulate_hop(
             if r.shallow {
                 // Tickless pools always mark shallow, but the no-tick step path can
                 // still quote within the spot-probe cap. Accept that; refuse larger.
+                // Oversized tickless already returned ClCap at the entry gate.
                 let tickless = s.ticks.is_empty();
                 if !tickless
                     || cl_hop_exceeds_shallow_cap(amount_in, shallow_cap)
                     || r.amount_out.is_zero()
                 {
-                    return None;
+                    return Err(HopReject::ClShallow);
                 }
             } else if r.synthetic {
                 // Incomplete hydrate window full-fill at constant L is non-shallow in
@@ -223,9 +237,9 @@ fn simulate_hop(
                 // but execution quotes refuse synthetic (`quote_hop_for_execution`).
                 // Accepting here promoted phantoms → dispatch build
                 // "chain_in hop execution quote unavailable" (live 3×/run).
-                return None;
+                return Err(HopReject::ClSynthetic);
             }
-            Some(HopResult {
+            Ok(HopResult {
                 amount_out: r.amount_out,
                 gas: r.gas_estimate,
             })
@@ -237,8 +251,9 @@ fn simulate_hop(
                 amount_in,
                 edge.token_in_idx as usize,
                 edge.token_out_idx as usize,
-            )?;
-            Some(HopResult {
+            )
+            .ok_or(HopReject::Math)?;
+            Ok(HopResult {
                 amount_out: out,
                 gas: GAS_CURVE_HOP,
             })
@@ -252,9 +267,9 @@ fn simulate_hop(
             );
             // Fail closed like Curve — Some(0) looked like a quote to hop callers.
             if out.is_zero() {
-                return None;
+                return Err(HopReject::Math);
             }
-            Some(HopResult {
+            Ok(HopResult {
                 amount_out: out,
                 gas: GAS_BALANCER_HOP,
             })
@@ -266,9 +281,9 @@ fn simulate_hop(
             let base_to_quote = edge.token_in_idx == 0;
             let out = get_dodo_amount_out(s, amount_in, base_to_quote);
             if out.is_zero() {
-                return None;
+                return Err(HopReject::Math);
             }
-            Some(HopResult {
+            Ok(HopResult {
                 amount_out: out,
                 gas: GAS_DODO_HOP,
             })
@@ -290,18 +305,18 @@ fn simulate_hop(
             let out =
                 get_woofi_amount_out(s, amount_in, in_is_quote, out_is_quote, base_in, base_out);
             if out.is_zero() {
-                return None;
+                return Err(HopReject::Math);
             }
-            Some(HopResult {
+            Ok(HopResult {
                 amount_out: out,
                 gas: GAS_WOOFI_HOP,
             })
         }
-        _ => None,
+        _ => Err(HopReject::Math),
     }
 }
 
-/// Quote a single hop output for calldata encoding (reuses pipeline math).
+/// Quote a single hop output for ranking/sim (allows tickless CL within shallow cap).
 #[must_use]
 pub fn simulate_hop_amount_out(state: &PoolState, edge: &Edge, amount_in: U256) -> Option<U256> {
     simulate_hop_amount_out_with_cap(state, edge, amount_in, U256::MAX)
@@ -314,7 +329,42 @@ pub fn simulate_hop_amount_out_with_cap(
     amount_in: U256,
     shallow_cap: U256,
 ) -> Option<U256> {
-    simulate_hop(state, edge, amount_in, shallow_cap).map(|h| h.amount_out)
+    simulate_hop(state, edge, amount_in, shallow_cap)
+        .ok()
+        .map(|h| h.amount_out)
+}
+
+/// Execution-grade hop quote: refuse tickless/shallow CL and synthetic hydrate fills.
+/// Ranking still accepts tickless within the spot probe via [`simulate_hop_amount_out`].
+#[must_use]
+pub fn simulate_hop_amount_out_for_execution(
+    state: &PoolState,
+    edge: &Edge,
+    amount_in: U256,
+) -> Option<U256> {
+    if amount_in.is_zero() {
+        return None;
+    }
+    match (state, edge.protocol) {
+        (PoolState::V3(s), ProtocolType::UniswapV3)
+        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
+            let allow_zero = edge.protocol == ProtocolType::UniswapV4;
+            let r = simulate_v3_swap(
+                s,
+                amount_in,
+                edge.zero_for_one,
+                Some(edge.fee_bps),
+                allow_zero,
+            );
+            // Execution must not encode incomplete tick walks — on-chain under-delivers
+            // → next hop TransferFailed (live: WPOL→BRZ/CES chain_in miss).
+            if r.shallow || r.synthetic || r.amount_out.is_zero() {
+                return None;
+            }
+            Some(r.amount_out)
+        }
+        _ => simulate_hop_amount_out(state, edge, amount_in).filter(|q| !q.is_zero()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,7 +384,11 @@ pub enum MinimalSimFailure {
     ClCapExceeded {
         hop: usize,
     },
-    /// Legacy aggregate — prefer `ClTickless` / `ClCapExceeded` when classified.
+    /// Incomplete hydrate window full-filled at constant L (encode refuses synthetic).
+    ClSynthetic {
+        hop: usize,
+    },
+    /// Legacy aggregate — prefer `ClTickless` / `ClCapExceeded` / `ClSynthetic` when classified.
     ShallowCl {
         hop: usize,
     },
@@ -1111,39 +1165,49 @@ pub fn minimal_sim_failure(
                 });
             }
         }
-        let Some(result) = simulate_hop(state, &edge, current, shallow_caps[hop]) else {
-            // CL shallow is the common simulate_hop None; curve / bal / dodo / woofi
-            // also return None on math or zero-out.
-            if matches!(
-                edge.protocol,
-                ProtocolType::UniswapV3 | ProtocolType::UniswapV4
-            ) {
-                // Cap/tickless already classified above; residual = in-swap shallow walk.
+        let result = match simulate_hop(state, &edge, current, shallow_caps[hop]) {
+            Ok(r) => r,
+            Err(HopReject::ClCap) => {
+                return Some(if cl_hop_tickless(state) {
+                    MinimalSimFailure::ClTickless { hop }
+                } else {
+                    MinimalSimFailure::ClCapExceeded { hop }
+                });
+            }
+            Err(HopReject::ClSynthetic) => {
+                return Some(MinimalSimFailure::ClSynthetic { hop });
+            }
+            Err(HopReject::ClShallow) => {
+                // Cap/tickless already classified above when possible; residual =
+                // in-swap shallow walk (or tickless oversize re-hit).
                 return Some(MinimalSimFailure::ShallowCl { hop });
             }
-            if let (PoolState::Balancer(s), ProtocolType::BalancerV2) = (state, edge.protocol) {
-                // Vault address lookup — same as `balancer_batch_within_max_in_ratio`.
-                let bal = crate::core::math::balancer::balancer_balance_in(
-                    s,
-                    edge.token_in_idx as usize,
-                    arena.token_address(edge.token_in),
-                );
-                if crate::core::math::balancer::exceeds_balancer_max_in_ratio(current, bal) {
-                    return Some(MinimalSimFailure::BalancerMaxInRatio { hop });
+            Err(HopReject::Math) => {
+                if let (PoolState::Balancer(s), ProtocolType::BalancerV2) = (state, edge.protocol)
+                {
+                    // Vault address lookup — same as `balancer_batch_within_max_in_ratio`.
+                    let bal = crate::core::math::balancer::balancer_balance_in(
+                        s,
+                        edge.token_in_idx as usize,
+                        arena.token_address(edge.token_in),
+                    );
+                    if crate::core::math::balancer::exceeds_balancer_max_in_ratio(current, bal) {
+                        return Some(MinimalSimFailure::BalancerMaxInRatio { hop });
+                    }
+                    return Some(MinimalSimFailure::ZeroOutput {
+                        hop,
+                        protocol: ProtocolType::BalancerV2,
+                    });
                 }
-                return Some(MinimalSimFailure::ZeroOutput {
-                    hop,
-                    protocol: ProtocolType::BalancerV2,
-                });
+                if matches!(edge.protocol, ProtocolType::Dodo | ProtocolType::Woofi) {
+                    return Some(MinimalSimFailure::ZeroOutput {
+                        hop,
+                        protocol: edge.protocol,
+                    });
+                }
+                // Curve (and residual) math failures stay Math — not always size-monotonic.
+                return Some(MinimalSimFailure::Math { hop });
             }
-            if matches!(edge.protocol, ProtocolType::Dodo | ProtocolType::Woofi) {
-                return Some(MinimalSimFailure::ZeroOutput {
-                    hop,
-                    protocol: edge.protocol,
-                });
-            }
-            // Curve (and residual) math failures stay Math — not always size-monotonic.
-            return Some(MinimalSimFailure::Math { hop });
         };
         if result.amount_out.is_zero() {
             // V2 can still surface Some(0) for dust; Balancer/Dodo/Woofi fail closed above.
@@ -1726,7 +1790,7 @@ fn walk_route_hops(
         {
             return None;
         }
-        let hop = simulate_hop(state, &edge, current, shallow_caps[i])?;
+        let hop = simulate_hop(state, &edge, current, shallow_caps[i]).ok()?;
         if current > U256::ZERO && hop.amount_out.is_zero() {
             return None;
         }
@@ -3048,6 +3112,73 @@ mod tests {
             simulate_hop_amount_out_with_cap(&state, &edge, U256::from(1_000_000u64), U256::MAX)
                 .is_none(),
             "synthetic full-fill must not rank/size for execution"
+        );
+        assert!(
+            simulate_hop_amount_out_for_execution(&state, &edge, U256::from(1_000_000u64)).is_none(),
+            "execution quote must refuse synthetic"
+        );
+        assert_eq!(
+            simulate_hop(&state, &edge, U256::from(1_000_000u64), U256::MAX),
+            Err(HopReject::ClSynthetic)
+        );
+
+        // Arena path must classify synthetic (not dump into ShallowCl).
+        let mut arena = StateArena::default();
+        let t0 = arena.register_token(Address::repeat_byte(0x01));
+        let t1 = arena.register_token(Address::repeat_byte(0x02));
+        let pool = arena.register_pool(Address::repeat_byte(0xaa), std::sync::Arc::new(state));
+        let edges = [Edge {
+            pool_index: pool,
+            token_in: t0,
+            token_out: t1,
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        assert_eq!(
+            minimal_sim_failure(&arena, &edges, U256::from(1_000_000u64)),
+            Some(MinimalSimFailure::ClSynthetic { hop: 0 })
+        );
+    }
+
+    #[test]
+    fn execution_quote_refuses_tickless_cl_even_within_probe_cap() {
+        use crate::core::types::V3PoolState;
+        use std::sync::Arc;
+
+        let state = PoolState::V3(V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            ticks: Arc::from(Vec::new()),
+        });
+        let edge = Edge {
+            pool_index: crate::core::types::PoolIndex(0),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        let probe = U256::from(1_000_000u64);
+        // Ranking still accepts tickless within cap.
+        assert!(
+            simulate_hop_amount_out_with_cap(&state, &edge, probe, probe).is_some(),
+            "rank path keeps tickless within probe"
+        );
+        // Encode must fail closed (shallow always on tickless).
+        assert!(
+            simulate_hop_amount_out_for_execution(&state, &edge, probe).is_none(),
+            "execution path refuses tickless"
         );
     }
 

@@ -210,11 +210,13 @@ pub fn encode_route(
         calls.extend(encode_hop_for_protocol(
             &hop,
             recipient,
+            executor,
             arena,
             &config,
             i == 0,
             flash_source,
             is_last,
+            Some(quoted_out),
         )?);
         funds_at = Some(recipient);
         if next.is_some() {
@@ -309,10 +311,9 @@ pub fn build_calldata_hops(
             edges.len()
         ));
     }
-    if edges
-        .windows(2)
-        .any(|pair| pair[0].token_out != pair[1].token_in)
-    {
+    // Address-aware (same as sim): TokenIndex inequality false-fails aliases if any
+    // ever diverge; prefer ERC-20 address continuity.
+    if crate::pipeline::local_sim::first_hop_continuity_break_in_arena(arena, edges).is_some() {
         return Err("broken_token_chain".into());
     }
     let mut hops = Vec::with_capacity(edges.len());

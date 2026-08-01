@@ -24,15 +24,20 @@ pub(crate) fn encode_approve_if_needed(
     exec_call(token, IERC20::approveCall { spender, amount }.abi_encode())
 }
 
+/// Prefund a pool with `token`.
+///
+/// - Exact path: ERC-20 `transfer(pool, amount)` from the executor (msg.sender).
+/// - `transferAll` path: call **`executor.transferAll(token, pool)`** — `executor` must
+///   be the ArbExecutor address, never the swap output recipient / next pool.
 pub(crate) fn encode_token_transfer(
-    recipient: Address,
+    executor: Address,
     token: Address,
     pool: Address,
     amount: U256,
     use_transfer_all: bool,
 ) -> ExecutorCall {
     if use_transfer_all {
-        encode_transfer_all(recipient, token, pool)
+        encode_transfer_all(executor, token, pool)
     } else {
         exec_call(
             token,

@@ -20,12 +20,16 @@ use super::shared::{to_v3_state, v3_callback_protocol_id};
 /// `full_range_limit`: intermediate hops must fully consume `amount_in` so the
 /// next hop's chain_in is funded. Tight limits + stale slot0 cause partial fills
 /// → mid-hop TransferFailed (live WPOL→BRZ/CES). Last hop keeps a tight limit.
+///
+/// `prequoted_out`: reuse the execution quote from `encode_route` chain_in sizing
+/// when present (avoids a second CL walk per hop).
 pub fn encode_v3_hop(
     hop: &CalldataHop,
     recipient: Address,
     arena: &StateArena,
     slippage_bps: u64,
     full_range_limit: bool,
+    prequoted_out: Option<U256>,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
     use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
 
@@ -34,8 +38,11 @@ pub fn encode_v3_hop(
         .ok_or_else(|| anyhow::anyhow!("missing pool state for v3 hop"))?;
     let v3 = to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not v3/v4 state"))?;
 
-    let quoted_out = quote_hop_for_execution(arena, hop)
-        .ok_or_else(|| anyhow::anyhow!("v3 execution quote unavailable"))?;
+    let quoted_out = match prequoted_out.filter(|q| !q.is_zero()) {
+        Some(q) => q,
+        None => quote_hop_for_execution(arena, hop)
+            .ok_or_else(|| anyhow::anyhow!("v3 execution quote unavailable"))?,
+    };
     let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
     let sqrt_limit = if full_range_limit {
         if hop.edge.zero_for_one {

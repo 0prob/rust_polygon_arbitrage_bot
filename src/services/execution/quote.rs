@@ -1,9 +1,9 @@
 use alloy::primitives::{Address, U256};
 
 use crate::core::math::uniswap_v3::{resolve_v3_fee_pips, simulate_v3_swap};
-use crate::core::types::{PoolState, ProtocolType, V3PoolState};
+use crate::core::types::{PoolState, V3PoolState};
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::local_sim::{realign_multi_token_edge, simulate_hop_amount_out};
+use crate::pipeline::local_sim::{realign_multi_token_edge, simulate_hop_amount_out_for_execution};
 use crate::services::execution::calldata::CalldataHop;
 
 #[must_use]
@@ -13,27 +13,8 @@ pub fn quote_hop_for_execution(arena: &StateArena, hop: &CalldataHop) -> Option<
     if !realign_multi_token_edge(arena, state, &mut edge) {
         return None;
     }
-    // V3/V4 execution quotes: refuse incomplete tick walks. Synthetic MIN/MAX fills
-    // can look complete at constant L while on-chain crosses unhydrated ticks and
-    // under-delivers → next hop TransferFailed (live: WPOL→BRZ/CES chain_in miss).
-    match (state, edge.protocol) {
-        (PoolState::V3(s), ProtocolType::UniswapV3)
-        | (PoolState::V4(s), ProtocolType::UniswapV4) => {
-            let allow_zero = edge.protocol == ProtocolType::UniswapV4;
-            let r = simulate_v3_swap(
-                s,
-                hop.amount_in,
-                edge.zero_for_one,
-                Some(edge.fee_bps),
-                allow_zero,
-            );
-            if r.shallow || r.synthetic || r.amount_out.is_zero() {
-                return None;
-            }
-            Some(r.amount_out)
-        }
-        _ => simulate_hop_amount_out(state, &edge, hop.amount_in).filter(|q| !q.is_zero()),
-    }
+    // Shared execution policy with local_sim: refuse shallow/synthetic CL walks.
+    simulate_hop_amount_out_for_execution(state, &edge, hop.amount_in)
 }
 
 #[must_use]

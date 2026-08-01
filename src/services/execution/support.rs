@@ -500,8 +500,12 @@ pub fn effective_slippage_bps_for_flash(
 ) -> u64 {
     if flash_source == FlashLoanSource::Direct {
         let _ = hop_count;
-        let floor = configured_per_hop_bps.clamp(DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS, 9_999);
-        return floor.clamp(depth_route_bps, 9_999);
+        // depth can be 10_000 (zero-profit seed); `u64::clamp(min, max)` panics when
+        // min > max — same shape as multi-call path (max then min 9999).
+        let floor = configured_per_hop_bps
+            .max(DIRECT_ROUTE_DRIFT_SLIPPAGE_BPS)
+            .min(9_999);
+        return floor.max(depth_route_bps).min(9_999);
     }
     effective_slippage_bps(configured_per_hop_bps, hop_count, depth_route_bps)
 }
@@ -693,6 +697,19 @@ mod tests {
         // Config 0 floors to encode min (100) so 2-hop → 199 route bps.
         assert_eq!(effective_slippage_bps(0, 2, 0), 199);
         assert_eq!(effective_slippage_bps(0, 1, 0), 100);
+    }
+
+    #[test]
+    fn direct_slippage_survives_full_depth_reject_without_panic() {
+        // depth_impact returns 10_000 on zero-profit seed; must not panic on clamp.
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 10_000, FlashLoanSource::Direct),
+            9_999
+        );
+        assert_eq!(
+            effective_slippage_bps_for_flash(0, 3, 10_000, FlashLoanSource::AaveV3),
+            9_999
+        );
     }
 
     #[test]

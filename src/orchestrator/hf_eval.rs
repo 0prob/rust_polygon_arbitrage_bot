@@ -144,7 +144,10 @@ impl MinimalSimReasonCounts {
             MinimalSimFailure::NonTradable { .. } => self.non_tradable += 1,
             MinimalSimFailure::ClTickless { .. } => self.cl_tickless += 1,
             MinimalSimFailure::ClCapExceeded { .. } => self.cl_cap += 1,
-            MinimalSimFailure::ShallowCl { .. } => self.shallow_cl += 1,
+            // Synthetic incomplete-hydrate fills are encode-refused like shallow.
+            MinimalSimFailure::ClSynthetic { .. } | MinimalSimFailure::ShallowCl { .. } => {
+                self.shallow_cl += 1
+            }
             MinimalSimFailure::V2ReserveExhausted { .. } => self.v2_reserve_exhausted += 1,
             MinimalSimFailure::TokenMismatch { .. } => self.token_mismatch += 1,
             MinimalSimFailure::Math { .. } => self.math += 1,
@@ -675,6 +678,7 @@ fn rank_one_cycle_probe(
                             f,
                             local_sim::MinimalSimFailure::ClTickless { .. }
                                 | local_sim::MinimalSimFailure::ShallowCl { .. }
+                                | local_sim::MinimalSimFailure::ClSynthetic { .. }
                         )
                     }) {
                         // ClTickless: arm hop miss for drain. ShallowCl: longer cool
@@ -704,7 +708,13 @@ fn rank_one_cycle_probe(
                         && !nosim_fails.is_empty()
                         && nosim_fails
                             .iter()
-                            .all(|f| matches!(f, local_sim::MinimalSimFailure::ShallowCl { .. }));
+                            .all(|f| {
+                                matches!(
+                                    f,
+                                    local_sim::MinimalSimFailure::ShallowCl { .. }
+                                        | local_sim::MinimalSimFailure::ClSynthetic { .. }
+                                )
+                            });
                     let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
                     for _ in 0..n {
                         let fp_rot = hash_cycle_edges(&rotated);
@@ -1474,6 +1484,7 @@ fn probe_fallback_opt(
     let decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
     let flash = input.flash_liquidity.load();
+    // Fail closed: inventing Balancer (0 fee) under-costs Aave routes and mis-models Direct.
     let flash_source = resolve_flash_source_for_cycle(
         cycle,
         input.arena,
@@ -1481,8 +1492,7 @@ fn probe_fallback_opt(
         input.flash_ttl,
         input.flash_policy,
         min_economic_amount_in(decimals, rate),
-    )
-    .unwrap_or(FlashLoanSource::Balancer);
+    )?;
     let fallback_depth = probe_seed
         .as_ref()
         .map(|(amount, sim)| {

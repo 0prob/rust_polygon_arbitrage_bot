@@ -14,11 +14,22 @@ use crate::services::execution::quote::{
 };
 
 /// Encode a Uniswap V4 hop into executor calls.
+///
+/// `full_range_limit`: intermediate hops must fully consume `amount_in` so the
+/// next hop's chain_in is funded (same policy as V3 — tight limits + stale slot0
+/// partial-fill → mid-hop TransferFailed). Last hop keeps a tight limit.
+///
+/// `prequoted_out`: when `encode_route` already ran the execution quote for
+/// chain_in sizing, reuse it (avoids a second V3-math walk per hop).
 pub fn encode_v4_hop(
     hop: &CalldataHop,
     arena: &StateArena,
     slippage_bps: u64,
+    full_range_limit: bool,
+    prequoted_out: Option<U256>,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
+    use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
+
     let pool_manager: Address = UNISWAP_V4_POOL_MANAGER;
     let (fee, tick_spacing, hooks) = v4_static_fields(arena, hop);
 
@@ -34,19 +45,30 @@ pub fn encode_v4_hop(
         .ok_or_else(|| anyhow::anyhow!("missing pool state for v4 hop"))?;
     let v3 = to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not v4 state"))?;
 
-    let quoted_out = quote_hop_for_execution(arena, hop)
-        .ok_or_else(|| anyhow::anyhow!("v4 execution quote unavailable"))?;
+    let quoted_out = match prequoted_out.filter(|q| !q.is_zero()) {
+        Some(q) => q,
+        None => quote_hop_for_execution(arena, hop)
+            .ok_or_else(|| anyhow::anyhow!("v4 execution quote unavailable"))?,
+    };
     let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
-    let sqrt_limit = derive_tight_v3_price_limit(
-        &v3,
-        hop.amount_in,
-        quoted_out,
-        hop.edge.zero_for_one,
-        hop.edge.fee_bps,
-        slippage_bps,
-        Some(fee_pips),
-        true,
-    )?;
+    let sqrt_limit = if full_range_limit {
+        if hop.edge.zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO_EXCLUSIVE
+        }
+    } else {
+        derive_tight_v3_price_limit(
+            &v3,
+            hop.amount_in,
+            quoted_out,
+            hop.edge.zero_for_one,
+            hop.edge.fee_bps,
+            slippage_bps,
+            Some(fee_pips),
+            true,
+        )?
+    };
 
     let (pool_key, zero_for_one) =
         build_v4_pool_key(hop.token_in, hop.token_out, fee, tick_spacing, hooks)?;
@@ -222,7 +244,7 @@ mod tests {
             router: None,
             hooks: Some(Address::ZERO),
         };
-        let calls = encode_v4_hop(&hop, &arena, 20).expect("encode");
+        let calls = encode_v4_hop(&hop, &arena, 20, /* full_range */ false, None).expect("encode");
         let unlock = &calls[1].data;
         // unlock(bytes) ABI: selector + offset + length + inner
         let inner_len = U256::from_be_slice(&unlock[36..68]).to::<usize>();
@@ -263,6 +285,77 @@ mod tests {
                 Address::ZERO,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn intermediate_v4_hop_uses_full_range_sqrt_limit() {
+        use crate::core::math::tick_math::MIN_SQRT_RATIO;
+
+        let mut arena = StateArena::default();
+        let t0 = Address::from([1u8; 20]);
+        let t1 = Address::from([2u8; 20]);
+        let pool_index = arena.register_pool(
+            Address::with_last_byte(9),
+            Arc::new(PoolState::V4(V4PoolState {
+                sqrt_price_x96: U256::from(1u128 << 96),
+                tick: 0,
+                liquidity: 1_000_000_000_000u128,
+                fee: U256::from(3000u64),
+                tick_spacing: 60,
+                // Both sides of spot so the walk is non-synthetic for prequote reuse.
+                ticks: Arc::from([
+                    crate::core::types::V3Tick {
+                        tick: -60,
+                        liquidity_gross: 1,
+                        liquidity_net: 0,
+                    },
+                    crate::core::types::V3Tick {
+                        tick: 60,
+                        liquidity_gross: 1,
+                        liquidity_net: 0,
+                    },
+                ]),
+                unlocked: true,
+                fee_protocol: 0,
+                observation_cardinality: 1,
+            })),
+        );
+        let hop = CalldataHop {
+            edge: Edge {
+                pool_index,
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                fee_bps: 30,
+                zero_for_one: true,
+                protocol: ProtocolType::UniswapV4,
+            },
+            pool_address: Address::with_last_byte(9),
+            token_in: t0,
+            token_out: t1,
+            amount_in: U256::from(1_000u64),
+            amount_out: U256::from(900u64),
+            pool_id: None,
+            protocol_label: Some("UNISWAP_V4".into()),
+            pool_type: None,
+            router: None,
+            hooks: Some(Address::ZERO),
+        };
+        // prequoted so encode does not re-walk (ticks may still be shallow for tiny L_net=0).
+        let prequoted = U256::from(900u64);
+        let calls =
+            encode_v4_hop(&hop, &arena, 20, /* full_range */ true, Some(prequoted)).expect("encode");
+        let unlock = &calls[1].data;
+        let inner_len = U256::from_be_slice(&unlock[36..68]).to::<usize>();
+        let inner = &unlock[68..68 + inner_len];
+        // sqrtPriceLimitX96 is the last 32-byte word of the 8-word unlock body.
+        let limit = U256::from_be_slice(&inner[224..256]);
+        assert_eq!(
+            limit,
+            MIN_SQRT_RATIO + U256::ONE,
+            "intermediate V4 hop must use full-range limit for chain_in fidelity"
         );
     }
 }
