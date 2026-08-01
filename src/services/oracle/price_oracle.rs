@@ -248,31 +248,6 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         pyth_id: Some("5a5d5f7fb72cc84b579d74d1c06d258d751962e9a010c0b1cce7e6023aacb71b"),
     },
     TokenFeed {
-        token: address!("0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4"),
-        chainlink: None,
-        pyth_id: Some("d0ca22c7110e53a3eac4a7f0535cb58eb4b5539ab88ea68d067ed77fa9f34f4d"),
-    },
-    TokenFeed {
-        token: address!("0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6"),
-        chainlink: None,
-        pyth_id: Some("b630ff61b8f056f70a927a4d6bc70d306b9868c2cfb3734a66a1e64dd088a2a0"),
-    },
-    TokenFeed {
-        token: address!("0x63d38FCf3cC014735B28339F47EC3FA9BA97b4B9"),
-        chainlink: None,
-        pyth_id: Some("7a30366a2ca5ff4ebbc02ca21976241a7d65bd1ef6891eb7058df85d908fb263"),
-    },
-    TokenFeed {
-        token: address!("0x7bF44C2BE2b9bAB23cea3e071A14D93dF9CdEFaf"),
-        chainlink: None,
-        pyth_id: Some("51ed2872f9c9f0c29f4cc5e0b0e504c55aef33b28b7538a7c2957b4200787e91"),
-    },
-    TokenFeed {
-        token: address!("0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"),
-        chainlink: None,
-        pyth_id: Some("6a0a816b3d4f13a0c509c3e414c1d18721c56f7c3272e737c35e381014e2d312"),
-    },
-    TokenFeed {
         token: address!("0xF32E6dC7709c596c5a5f328fa01eDd8eC3F62517"),
         chainlink: None,
         pyth_id: Some("a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b"),
@@ -1022,9 +997,11 @@ impl PriceOracle {
         let resp = request
             .send()
             .await
-            .with_context(|| format!("pyth hermes request ids={}", ids.len()))?
-            .error_for_status()
-            .context("pyth hermes response status")?;
+            .with_context(|| format!("pyth hermes request ids={}", ids.len()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("pyth hermes response status {status}");
+        }
         let body: PythHermesResponse = resp.json().await.context("pyth hermes response JSON")?;
         let mut out = FxHashMap::with_capacity_and_hasher(body.parsed.len(), FxBuildHasher);
         let mut stats = PythParseStats::default();
