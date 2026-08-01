@@ -999,7 +999,9 @@ const HF_PROBE_TICK_POOL_CAP: usize = 6;
 /// Live probe-tick (word_range≤4): often 44–120ms/pool. The prior 250ms floor
 /// forced `cap=1` under residual prep so multi-hop CL cycles stayed
 /// `cycles_tickless=N→N` after a successful `v3_loaded=1`.
-pub(crate) const HF_PROBE_TICK_MS_PER_POOL: u64 = 120;
+/// Live: 72 hydrate timeouts / run with 120ms/pool (cap≈12 @ 1.5s); loaded only
+/// 62% of fetches. Prefer fewer pools per tick that finish under budget.
+pub(crate) const HF_PROBE_TICK_MS_PER_POOL: u64 = 160;
 
 /// Scale the probe hydrate pool set to residual prep budget so we finish more
 /// often instead of cooling a large pending set on timeout.

@@ -22,6 +22,14 @@ const POOL_META_COLUMNS: &str = r#"id, address, protocol::text, tokens, fee, "ti
 const POOL_META_VALIDITY_SQL: &str = r#"
         protocol IS NOT NULL
         AND cardinality(tokens) >= 2
+        -- Drop precompile-range / zero tokens (matches is_plausible_contract_address).
+        -- Live: 241 bad_shape parse rejects (132 UniV3 + 85 QuickV2 + …) were all
+        -- token addresses < 0x10000; filtering here saves bootstrap rows + parse work.
+        AND NOT EXISTS (
+            SELECT 1 FROM unnest(tokens) AS t
+            WHERE length(replace(lower(t), '0x', '')) <> 40
+               OR lower(t) < '0x0000000000000000000000000000000000010000'
+        )
         AND (
             protocol <> 'UNISWAP_V4'
             OR (
@@ -722,6 +730,10 @@ mod tests {
         );
         assert!(page.contains(r#"("createdBlock", id) >"#));
         assert!(page.contains("cardinality(tokens) >= 2"));
+        assert!(
+            page.contains("0000000000000000000000000000000000010000"),
+            "keyset sql must filter precompile-range tokens: {page}"
+        );
         assert!(page.contains("protocol <> 'UNISWAP_V4'"));
         assert!(page.contains("protocol <> 'BALANCER_V2'"));
         assert!(page.contains("protocol <> 'CURVE'"));
@@ -734,6 +746,10 @@ mod tests {
             "incremental sql missing quoted columns: {incremental}"
         );
         assert!(incremental.contains("cardinality(tokens) >= 2"));
+        assert!(
+            incremental.contains("0000000000000000000000000000000000010000"),
+            "incremental sql must filter precompile-range tokens"
+        );
         assert!(incremental.contains(r#"("createdBlock", id) > ($1, $2)"#));
         assert!(incremental.contains(r#"("updatedAtBlock", id) > ($3, $4)"#));
         assert!(incremental.contains(r#"ORDER BY "sortBlock" ASC, id ASC"#));

@@ -6,9 +6,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::pipeline::types::MinimalSimResult;
 
-/// Sized for zero-profit memos too (Brent now inserts those; was thrashing at 4k
-/// with only profitable inserts and hit_rate≈0).
-const ROUTE_SIM_CACHE_CAPACITY: usize = 8192;
+/// Sized for zero-profit memos + multi-amount Brent ladders. Live hit_rate≈24%
+/// with 8k and non-zero evictions under HF probe load; 16k cuts thrash.
+const ROUTE_SIM_CACHE_CAPACITY: usize = 16_384;
 const ROUTE_SIM_CACHE_SHARDS: usize = 16;
 const ROUTE_SIM_CACHE_SHARD_CAPACITY: usize = ROUTE_SIM_CACHE_CAPACITY / ROUTE_SIM_CACHE_SHARDS;
 const ROUTE_SIM_LOG_INTERVAL: u64 = 10_000;
@@ -101,11 +101,18 @@ impl RouteSimCache {
     ) {
         let mut entries = self.entries[Self::shard_index(route_fp)].lock();
         if entries.len() >= ROUTE_SIM_CACHE_SHARD_CAPACITY {
-            // Drop stale revisions first; hard-clear if still full.
+            // Drop stale revisions first. Same-revision pressure used to full-clear
+            // the shard (live: thrash under multi-amount Brent on hot routes);
+            // sample-drop to half capacity preserves recent same-revision hits.
             let before = entries.len();
             entries.retain(|k, _| k.route_state_revision == route_state_revision);
             if entries.len() >= ROUTE_SIM_CACHE_SHARD_CAPACITY {
-                entries.clear();
+                let target = ROUTE_SIM_CACHE_SHARD_CAPACITY / 2;
+                let drop_n = entries.len().saturating_sub(target);
+                let victims: Vec<RouteSimKey> = entries.keys().copied().take(drop_n).collect();
+                for key in victims {
+                    entries.remove(&key);
+                }
             }
             let removed = before.saturating_sub(entries.len());
             if removed > 0 {
@@ -230,5 +237,27 @@ mod tests {
         assert!(cache.get(2, 0, U256::from(0u8)).is_some());
         assert!(cache.get(1, 0, U256::from(0u64)).is_none());
         assert!(cache.entry_count() < ROUTE_SIM_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn same_revision_pressure_sample_drops_half_shard() {
+        let cache = RouteSimCache::new();
+        let sim = MinimalSimResult {
+            profit: U256::ONE,
+            amount_out: U256::ONE,
+            total_gas: 1,
+        };
+        // Fill one shard with distinct amounts under the same revision.
+        let fp = 0u64;
+        for i in 0..ROUTE_SIM_CACHE_SHARD_CAPACITY {
+            cache.insert(7, fp, U256::from(i as u64 + 1), sim);
+        }
+        assert_eq!(cache.entry_count(), ROUTE_SIM_CACHE_SHARD_CAPACITY);
+        // Next insert must not wipe the whole shard.
+        cache.insert(7, fp, U256::from(u64::MAX), sim);
+        assert!(cache.get(7, fp, U256::from(u64::MAX)).is_some());
+        let n = cache.entry_count();
+        assert!(n > ROUTE_SIM_CACHE_SHARD_CAPACITY / 2);
+        assert!(n <= ROUTE_SIM_CACHE_SHARD_CAPACITY / 2 + 1);
     }
 }

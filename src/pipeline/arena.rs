@@ -288,10 +288,16 @@ impl StateArena {
         Some(h.finish())
     }
 
+    /// Hash of route pool hot-state for sim-cache keys.
+    ///
+    /// **Do not** mix `base_revision` at the top level: that was `snap_generation`,
+    /// which advances every LF publish and invalidated every route key even when
+    /// pool hot-revisions were unchanged (live hit_rate≈24%, constant thrash).
+    /// Only cold hops (no hot overlay) fold in `base_revision` so rebuilds still
+    /// invalidate arena-only state.
     #[must_use]
     pub fn route_state_revision_with_base(&self, edges: &[Edge], base_revision: u64) -> u64 {
         let mut h = FxHasher::default();
-        h.write_u64(base_revision);
         h.write_usize(edges.len());
         for edge in edges {
             let index = edge.pool_index.0 as usize;
@@ -1320,11 +1326,17 @@ mod tests {
             .route_state_revision(&edges)
             .expect("hot route revision");
 
+        // No-op price-level reinsert must not thrash hot revisions either.
         cache.insert(unrelated_addr, (*v2_state()).clone());
         arena.apply_hot_cache(&cache, &addresses);
         assert_eq!(arena.route_state_revision(&edges), Some(before));
 
-        cache.insert(route_addr, (*v2_state()).clone());
+        // Real price move on the route pool advances cache revision → key changes.
+        let mut moved = (*v2_state()).clone();
+        if let PoolState::V2(ref mut s) = moved {
+            s.reserve0 = s.reserve0.saturating_add(U256::from(1u64));
+        }
+        cache.insert(route_addr, moved);
         arena.apply_hot_cache(&cache, &addresses);
         assert_ne!(arena.route_state_revision(&edges), Some(before));
     }
@@ -1346,9 +1358,37 @@ mod tests {
         }]
         .into_iter()
         .collect();
+        // Cold hops still fold base (snap) so arena-only rebuilds invalidate.
         assert_ne!(
             arena.route_state_revision_with_base(&edges, 7),
             arena.route_state_revision_with_base(&edges, 8)
+        );
+    }
+
+    #[test]
+    fn route_state_revision_with_base_stable_when_all_hops_hot() {
+        let addr = Address::with_last_byte(1);
+        let mut arena = StateArena::default();
+        let pool = arena.register_pool(addr, v2_state());
+        let cache = StateCache::default();
+        cache.insert(addr, (*v2_state()).clone());
+        arena.apply_hot_cache(&cache, &[addr]);
+        let edges: CycleEdges = [Edge {
+            pool_index: pool,
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]
+        .into_iter()
+        .collect();
+        // Hot revision dominates — snap_generation must not thrash sim cache keys.
+        assert_eq!(
+            arena.route_state_revision_with_base(&edges, 100),
+            arena.route_state_revision_with_base(&edges, 999_999)
         );
     }
 

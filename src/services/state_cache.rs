@@ -372,6 +372,10 @@ impl StateCache {
         }
     }
 
+    /// At capacity (~50k) a full-map scan on every insert burned LF CPU. Sample a
+    /// fixed window (hash iteration order is arbitrary — good enough for victim pick).
+    const EVICTION_SAMPLE: usize = 64;
+
     fn pick_eviction_victim(
         guard: &FxHashMap<Address, CachedEntry>,
         ttl: Duration,
@@ -380,7 +384,7 @@ impl StateCache {
         let mut invalid = None;
         let mut untradable = None;
         let mut tradable = None;
-        for (addr, entry) in guard {
+        for (addr, entry) in guard.iter().take(Self::EVICTION_SAMPLE) {
             let updated_at = entry.updated_at;
             if updated_at.elapsed() > ttl {
                 expired = Self::eviction_tier_candidate(expired, *addr, updated_at);
@@ -403,10 +407,69 @@ impl StateCache {
             .map(|(addr, _)| addr)
     }
 
+    /// Price-level equality for cache revision stability (not full tick arrays).
+    /// Identical reserves/sqrt/tick keep the revision so route_sim keys survive
+    /// no-op LF multicall refreshes of unchanged pools.
+    #[must_use]
+    fn pool_state_price_level_eq(a: &PoolState, b: &PoolState) -> bool {
+        match (a, b) {
+            (PoolState::V2(x), PoolState::V2(y)) => {
+                x.reserve0 == y.reserve0
+                    && x.reserve1 == y.reserve1
+                    && x.fee == y.fee
+                    && x.fee_denominator == y.fee_denominator
+            }
+            (PoolState::V3(x), PoolState::V3(y)) | (PoolState::V4(x), PoolState::V4(y)) => {
+                x.sqrt_price_x96 == y.sqrt_price_x96
+                    && x.liquidity == y.liquidity
+                    && x.tick == y.tick
+                    && x.fee == y.fee
+            }
+            (PoolState::Invalid, PoolState::Invalid) => true,
+            (PoolState::Dodo(x), PoolState::Dodo(y)) => {
+                x.base_reserve == y.base_reserve
+                    && x.quote_reserve == y.quote_reserve
+                    && x.i == y.i
+                    && x.k == y.k
+            }
+            (PoolState::Curve(x), PoolState::Curve(y)) => {
+                x.balances == y.balances && x.a == y.a && x.fee == y.fee && x.d == y.d
+            }
+            (PoolState::Balancer(x), PoolState::Balancer(y)) => {
+                x.balances == y.balances && x.weights == y.weights && x.fee == y.fee
+            }
+            (PoolState::Woofi(x), PoolState::Woofi(y)) => {
+                x.quote_reserve == y.quote_reserve
+                    && x.fee == y.fee
+                    && x.base_states.len() == y.base_states.len()
+                    && x.base_states
+                        .iter()
+                        .zip(y.base_states.iter())
+                        .all(|(a, b)| a.reserve == b.reserve && a.price == b.price)
+            }
+            _ => false,
+        }
+    }
+
     pub fn insert(&self, address: Address, state: PoolState) {
         let mut dirty_addrs = Vec::with_capacity(2);
         {
             let mut guard = self.inner.write();
+            if let Some(existing) = guard.get_mut(&address)
+                && Self::pool_state_price_level_eq(existing.state.as_ref(), &state)
+            {
+                // No-op refresh: touch TTL, keep revision (sim-cache stability).
+                existing.updated_at = Instant::now();
+                // Prefer newer Arc only when ticks may have been stripped (tickless
+                // multicall); preserve CL ticks when price level is unchanged.
+                if !matches!(
+                    (existing.state.as_ref(), &state),
+                    (PoolState::V3(_), PoolState::V3(_)) | (PoolState::V4(_), PoolState::V4(_))
+                ) {
+                    existing.state = Arc::new(state);
+                }
+                return;
+            }
             if guard.len() >= self.max_entries
                 && !guard.contains_key(&address)
                 && let Some(victim) = Self::pick_eviction_victim(&guard, self.ttl)
@@ -825,6 +888,45 @@ mod tests {
         assert!(cache.patch_pool(address, |_| false));
         assert_eq!(cache.generation(), generation);
         assert!(cache.take_dirty_pool_indices(&index).is_empty());
+    }
+
+    #[test]
+    fn insert_identical_price_level_preserves_generation() {
+        use alloy::primitives::U256;
+
+        let cache = StateCache::default();
+        let address = Address::with_last_byte(33);
+        let mut index = FxHashMap::default();
+        index.insert(address, PoolIndex(1));
+        let v2 = PoolState::V2(crate::core::types::V2PoolState {
+            reserve0: crate::core::constants::V2_MIN_RESERVE,
+            reserve1: crate::core::constants::V2_MIN_RESERVE + U256::from(1u64),
+            fee: U256::from(3u64),
+            fee_denominator: U256::from(1000u64),
+            block_timestamp_last: 1,
+        });
+        cache.insert(address, v2.clone());
+        let _ = cache.take_dirty_pool_indices(&index);
+        let generation = cache.generation();
+
+        // Identical reserves/fee — no revision bump, no dirty mark.
+        cache.insert(address, v2);
+        assert_eq!(cache.generation(), generation);
+        assert!(cache.take_dirty_pool_indices(&index).is_empty());
+
+        // Price change bumps generation and dirties the pool.
+        cache.insert(
+            address,
+            PoolState::V2(crate::core::types::V2PoolState {
+                reserve0: crate::core::constants::V2_MIN_RESERVE + U256::from(2u64),
+                reserve1: crate::core::constants::V2_MIN_RESERVE + U256::from(1u64),
+                fee: U256::from(3u64),
+                fee_denominator: U256::from(1000u64),
+                block_timestamp_last: 2,
+            }),
+        );
+        assert!(cache.generation() > generation);
+        assert_eq!(cache.take_dirty_pool_indices(&index), vec![PoolIndex(1)]);
     }
 
     #[test]

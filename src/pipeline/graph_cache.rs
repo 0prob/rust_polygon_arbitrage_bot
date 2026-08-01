@@ -5,10 +5,14 @@ use crate::core::types::FoundCycle;
 /// Minimum pool-count delta before forcing a connectivity rebuild (bootstrap arena).
 const POOL_COUNT_REBUILD_DELTA: usize = 64;
 /// Larger delta once the routable arena is warm — steady-state rebuilds stay rare.
-const WARM_POOL_COUNT_REBUILD_DELTA: usize = 256;
+/// Live warm graphs are 10k–20k pools; 512 lost pools (~2.5% at 20k) still rebuilds
+/// sooner than the /20 shrink floor while avoiding churn on small prune noise.
+const WARM_POOL_COUNT_REBUILD_DELTA: usize = 512;
 /// Routable pool count treated as a warm graph for rebuild throttling.
 const WARM_POOL_THRESHOLD: usize = 3_000;
-const ELIGIBLE_POOL_REBUILD_DELTA: usize = 64;
+/// Eligible growth before `connectivity_stale` (also floored by count/20).
+/// 128 reduces attach-driven rebuilds when LF eligibility jitters by dozens.
+const ELIGIBLE_POOL_REBUILD_DELTA: usize = 128;
 const DEFAULT_CYCLE_REFIND_INTERVAL: u64 = 8;
 
 #[must_use]
@@ -424,11 +428,11 @@ mod tests {
             3_500,
             0,
         );
-        // Small shrink under warm threshold — keep cache path.
-        assert!(!cache.needs_connectivity_rebuild(3_900, 1));
+        // Warm min delta is 512 (or count/20=200 → 512). Small prune noise keeps cache.
+        assert!(!cache.needs_connectivity_rebuild(3_700, 1)); // lost 300
         // Large shrink — rebuild.
-        assert!(cache.needs_connectivity_rebuild(3_500, 1));
-        assert!(!cache.cycle_cache_still_valid(3_500, 1, 0));
+        assert!(cache.needs_connectivity_rebuild(3_400, 1)); // lost 600
+        assert!(!cache.cycle_cache_still_valid(3_400, 1, 0));
     }
 
     #[test]
@@ -599,7 +603,9 @@ mod tests {
         assert!(!cache.connectivity_stale(800));
         assert!(!cache.connectivity_stale(799));
         assert!(!cache.connectivity_stale(801));
-        assert!(cache.connectivity_stale(864));
+        // ELIGIBLE_POOL_REBUILD_DELTA=128 (count/20=40 → 128).
+        assert!(!cache.connectivity_stale(864));
+        assert!(cache.connectivity_stale(928));
     }
 
     #[test]

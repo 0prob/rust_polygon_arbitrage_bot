@@ -217,6 +217,13 @@ fn simulate_hop(
                 {
                     return None;
                 }
+            } else if r.synthetic {
+                // Incomplete hydrate window full-fill at constant L is non-shallow in
+                // the math layer (probe used to accept it and cut shallow_cl flood),
+                // but execution quotes refuse synthetic (`quote_hop_for_execution`).
+                // Accepting here promoted phantoms → dispatch build
+                // "chain_in hop execution quote unavailable" (live 3×/run).
+                return None;
             }
             Some(HopResult {
                 amount_out: r.amount_out,
@@ -1464,14 +1471,15 @@ fn cl_hop_shallow_at_amount(
     match state {
         PoolState::V3(s) | PoolState::V4(s) => {
             let allow_zero = edge.protocol == ProtocolType::UniswapV4;
-            simulate_v3_swap(
+            let r = simulate_v3_swap(
                 s,
                 amount_in,
                 edge.zero_for_one,
                 Some(edge.fee_bps),
                 allow_zero,
-            )
-            .shallow
+            );
+            // synthetic full-fill is non-shallow in math but unusable for encode
+            r.shallow || r.synthetic
         }
         _ => false,
     }
@@ -2988,6 +2996,59 @@ mod tests {
         let cap = U256::from(1_000u64);
         assert!(simulate_hop_amount_out_with_cap(&state, &edge, cap, cap).is_some());
         assert!(simulate_hop_amount_out_with_cap(&state, &edge, cap + U256::ONE, cap).is_none());
+    }
+
+    /// Incomplete hydrate window (ticks only on the opposite side) can full-fill at
+    /// constant L without `shallow` — but local_sim must fail closed so probe/Brent
+    /// do not promote routes that encode refuses (`chain_in hop quote unavailable`).
+    #[test]
+    fn incomplete_hydrate_synthetic_fill_rejected_by_local_sim() {
+        use crate::core::types::{V3PoolState, V3Tick};
+        use std::sync::Arc;
+
+        let state = PoolState::V3(V3PoolState {
+            sqrt_price_x96: U256::from(1u128 << 96),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            fee: U256::from(3_000u32),
+            tick_spacing: 60,
+            unlocked: true,
+            fee_protocol: 0,
+            observation_cardinality: 1,
+            // zero_for_one looks ≤ -1; only tick 600 present → synthetic MIN bound.
+            ticks: Arc::from(vec![V3Tick {
+                tick: 600,
+                liquidity_gross: 1,
+                liquidity_net: 0,
+            }]),
+        });
+        let edge = Edge {
+            pool_index: crate::core::types::PoolIndex(0),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 30,
+            zero_for_one: true,
+        };
+        // Math layer would quote non-shallow; sim layer must refuse.
+        let math = crate::core::math::uniswap_v3::simulate_v3_swap(
+            match &state {
+                PoolState::V3(s) => s,
+                _ => unreachable!(),
+            },
+            U256::from(1_000_000u64),
+            true,
+            Some(30),
+            false,
+        );
+        assert!(!math.shallow && math.synthetic && math.amount_out > U256::ZERO);
+        assert!(
+            simulate_hop_amount_out_with_cap(&state, &edge, U256::from(1_000_000u64), U256::MAX)
+                .is_none(),
+            "synthetic full-fill must not rank/size for execution"
+        );
     }
 
     #[test]

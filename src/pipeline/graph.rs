@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::core::constants::MAX_POOL_TOKENS;
+use crate::core::constants::{MAX_POOL_TOKENS, is_polygon_hub_token};
 use crate::core::math::fixed_point::ONE;
 use crate::core::math::fixed_point::edge_log_weight_from_ratio;
 use crate::core::types::{Edge, PoolIndex, PoolState, ProtocolType, TokenIndex};
@@ -1106,6 +1106,89 @@ pub fn attach_missing_eligible_pools(
     attach_missing_eligible_pools_with_gate(arena, graph, pools, None)
 }
 
+/// Prefer hub-token pools when the attach cap binds so catch-up grows cycle-capable
+/// spokes first (live: hit_cap left 600+ missing of mostly non-hub tails).
+#[inline]
+fn pool_touches_hub(arena: &StateArena, meta: &PoolMeta) -> bool {
+    meta.tokens.iter().any(|&t| {
+        arena
+            .token_address(t)
+            .is_some_and(is_polygon_hub_token)
+    })
+}
+
+/// Try attaching one meta under the cap. Returns whether a new pool was attached.
+fn try_attach_missing_pool(
+    arena: &StateArena,
+    graph: &mut RoutingGraph,
+    meta: &PoolMeta,
+    gate: Option<&GraphBuildGate>,
+    attached_pools: &mut Vec<PoolIndex>,
+) -> bool {
+    if attached_pools.len() >= ATTACH_MISSING_CAP {
+        return false;
+    }
+    if !pool_worth_capped_attach(arena, meta, gate) {
+        return false;
+    }
+    // Stale Direct edges after meta refresh still look "live" — strip so
+    // attach_pool can rebuild (live: uni pin tout ∉ meta → uni_both).
+    if graph.pool_has_live_edges(meta.pool_index)
+        && !pool_direct_edges_match_meta(graph, arena, meta)
+    {
+        static STALE_META_EDGES: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        if STALE_META_EDGES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(16)
+        {
+            crate::info!(
+                "graph rebuild stale meta edges: pool_index={} tokens={}",
+                meta.pool_index.0,
+                meta.tokens.len()
+            );
+        }
+        remove_pool_edges_from_graph(graph, meta.pool_index);
+    } else if graph.pool_has_live_edges(meta.pool_index) {
+        return false;
+    } else if graph.pool_has_edges(meta.pool_index) {
+        // Already stubbed; leave for dirty/force rescore (not a missing attach).
+        return false;
+    }
+    if attach_pool_to_graph(graph, arena, meta, gate) {
+        attached_pools.push(meta.pool_index);
+        return true;
+    }
+    if !graph.pool_has_edges(meta.pool_index) && pool_has_admissible_edges(arena, meta, gate) {
+        let state = arena.pool_state(meta.pool_index);
+        let (state_protocol, state_tokens, leg0, leg1) =
+            state.map_or((meta.protocol, 0, None, None), |state| {
+                (
+                    crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
+                    match state {
+                        PoolState::Balancer(pool) => pool.tokens.len(),
+                        PoolState::Woofi(pool) => pool.tokens.len(),
+                        _ => meta.tokens.len(),
+                    },
+                    routing_token_at_leg(arena, state, meta, 0),
+                    routing_token_at_leg(arena, state, meta, 1),
+                )
+            });
+        crate::debug!(
+            "graph attach no adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} legs={:?}/{:?}",
+            meta.pool_index.0,
+            arena.pool_address(meta.pool_index),
+            meta.protocol,
+            state_protocol,
+            meta.tokens.len(),
+            state_tokens,
+            leg0,
+            leg1,
+        );
+    }
+    false
+}
+
 #[must_use]
 pub fn attach_missing_eligible_pools_with_gate(
     arena: &StateArena,
@@ -1119,67 +1202,19 @@ pub fn attach_missing_eligible_pools_with_gate(
     let mut attached_pools: Vec<PoolIndex> = Vec::new();
     // ponytail: uncapped growth attaches were 2k–3k/LF and stalled enum; remainder
     // lands on later ticks via LF catch-up (cached_eligible held back on hit_cap).
-    for meta in pools {
+    // Pass 1: hub-touching pools (cycle-capable). Pass 2: remainder.
+    for prefer_hub in [true, false] {
+        for meta in pools {
+            if attached_pools.len() >= ATTACH_MISSING_CAP {
+                break;
+            }
+            if prefer_hub != pool_touches_hub(arena, meta) {
+                continue;
+            }
+            let _ = try_attach_missing_pool(arena, graph, meta, gate, &mut attached_pools);
+        }
         if attached_pools.len() >= ATTACH_MISSING_CAP {
             break;
-        }
-        if !pool_worth_capped_attach(arena, meta, gate) {
-            continue;
-        }
-        // Stale Direct edges after meta refresh still look "live" — strip so
-        // attach_pool can rebuild (live: uni pin tout ∉ meta → uni_both).
-        if graph.pool_has_live_edges(meta.pool_index)
-            && !pool_direct_edges_match_meta(graph, arena, meta)
-        {
-            static STALE_META_EDGES: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            if STALE_META_EDGES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .is_multiple_of(16)
-            {
-                crate::info!(
-                    "graph rebuild stale meta edges: pool_index={} tokens={}",
-                    meta.pool_index.0,
-                    meta.tokens.len()
-                );
-            }
-            remove_pool_edges_from_graph(graph, meta.pool_index);
-        } else if graph.pool_has_live_edges(meta.pool_index) {
-            continue;
-        } else if graph.pool_has_edges(meta.pool_index) {
-            // Already stubbed; leave for dirty/force rescore (not a missing attach).
-            continue;
-        }
-        if attach_pool_to_graph(graph, arena, meta, gate) {
-            attached_pools.push(meta.pool_index);
-        } else if !graph.pool_has_edges(meta.pool_index)
-            && pool_has_admissible_edges(arena, meta, gate)
-        {
-            let state = arena.pool_state(meta.pool_index);
-            let (state_protocol, state_tokens, leg0, leg1) =
-                state.map_or((meta.protocol, 0, None, None), |state| {
-                    (
-                        crate::pipeline::local_sim::protocol_from_pool_state(state, meta.protocol),
-                        match state {
-                            PoolState::Balancer(pool) => pool.tokens.len(),
-                            PoolState::Woofi(pool) => pool.tokens.len(),
-                            _ => meta.tokens.len(),
-                        },
-                        routing_token_at_leg(arena, state, meta, 0),
-                        routing_token_at_leg(arena, state, meta, 1),
-                    )
-                });
-            crate::debug!(
-                "graph attach no adjacency: pool_index={} address={:?} meta_protocol={:?} state_protocol={:?} meta_tokens={} state_tokens={} legs={:?}/{:?}",
-                meta.pool_index.0,
-                arena.pool_address(meta.pool_index),
-                meta.protocol,
-                state_protocol,
-                meta.tokens.len(),
-                state_tokens,
-                leg0,
-                leg1,
-            );
         }
     }
     if !attached_pools.is_empty() {
@@ -1191,17 +1226,24 @@ pub fn attach_missing_eligible_pools_with_gate(
         .iter()
         .filter(|&&p| graph.pool_has_live_edges(p))
         .count();
-    let (missing_after, missing_sample) = pools.iter().fold((0usize, None), |acc, meta| {
-        let missing = pool_has_admissible_edges(arena, meta, gate)
-            && pool_worth_capped_attach(arena, meta, gate)
-            && !graph.pool_has_live_edges(meta.pool_index)
-            && !graph.pool_has_edges(meta.pool_index);
-        if missing {
-            (acc.0 + 1, acc.1.or(Some(meta.pool_index)))
-        } else {
-            acc
-        }
-    });
+    // Full missing scan only when the cap bound — under-cap remainder is attach
+    // failure noise and was O(eligible) every LF tick (live ~20k metas).
+    let at_cap = attached_pools.len() >= ATTACH_MISSING_CAP;
+    let (missing_after, missing_sample) = if at_cap {
+        pools.iter().fold((0usize, None), |acc, meta| {
+            let missing = pool_has_admissible_edges(arena, meta, gate)
+                && pool_worth_capped_attach(arena, meta, gate)
+                && !graph.pool_has_live_edges(meta.pool_index)
+                && !graph.pool_has_edges(meta.pool_index);
+            if missing {
+                (acc.0 + 1, acc.1.or(Some(meta.pool_index)))
+            } else {
+                acc
+            }
+        })
+    } else {
+        (0, None)
+    };
     if let Some(pool_index) = missing_sample
         && let Some(meta) = pools.iter().find(|meta| meta.pool_index == pool_index)
     {
@@ -1234,7 +1276,7 @@ pub fn attach_missing_eligible_pools_with_gate(
             leg1,
         );
     }
-    let hit_cap = attached_pools.len() >= ATTACH_MISSING_CAP && missing_after > 0;
+    let hit_cap = at_cap && missing_after > 0;
     GraphAttachReport {
         attached_pools: attached_pools.len(),
         live_after,

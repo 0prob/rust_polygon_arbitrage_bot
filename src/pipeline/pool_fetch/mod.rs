@@ -421,8 +421,12 @@ async fn apply_woofi_results<P: Provider<Ethereum> + Clone + Send + 'static>(
     for (addr, state) in fetched.states {
         match state {
             Some(s) => {
+                // Only tradable writes count as productive refresh (same as plans).
+                let tradable = s.is_tradable();
                 cache.insert(addr, s);
-                result.updated += 1;
+                if tradable {
+                    result.updated += 1;
+                }
             }
             None => {
                 cache.insert(addr, PoolState::Invalid);
@@ -750,8 +754,14 @@ fn apply_plan_results(
             continue;
         };
         if let Some(state) = decode_plan(plan, slice) {
+            // Dust / locked / unfunded decodes still land in cache (V2 dust keeps
+            // family for WSS Sync recovery) but must not count as productive refresh
+            // — live bootstrap reported ~18% "updated" yield that was mostly non-tradable.
+            let tradable = state.is_tradable();
             cache.insert(plan.pool.address, state);
-            result.updated += 1;
+            if tradable {
+                result.updated += 1;
+            }
         } else {
             cache.insert(plan.pool.address, PoolState::Invalid);
         }

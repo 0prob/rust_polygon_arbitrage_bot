@@ -11,6 +11,7 @@ use crate::pipeline::cycle_filter::{
     PrefilterDiagnostics, ProbeContext, dedupe_cycles_by_edges,
     prefilter_cycles_by_atomic_sim_with_context_and_diag, retain_cycles_with_priced_start_in,
 };
+use crate::pipeline::types::compare_cycle_execution;
 use crate::pipeline::cycle_finder::{
     CYCLE_ENUM_TIME_BUDGET, find_cycles_multi_pass_with_prep_budget, index_pool_metas,
     prepare_active_graph,
@@ -109,9 +110,15 @@ fn finalize_cycles(
         diag.prefilter = prefilter_diag;
         out
     } else {
+        // Exclusive-obs / pin path skips atomic sim — still rank gas-aware before
+        // truncating so deep high-ratio junk does not monopolize SharedCycleCap.
         let mut out = merged;
-        if out.len() > max_keep {
+        if max_keep == 0 {
+            out.clear();
+        } else if out.len() > max_keep {
+            out.select_nth_unstable_by(max_keep - 1, compare_cycle_execution);
             out.truncate(max_keep);
+            out.sort_unstable_by(compare_cycle_execution);
         }
         out
     };

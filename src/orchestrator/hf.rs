@@ -24,7 +24,7 @@ use crate::orchestrator::hf_execute::{
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::sim_sanity::{matic_usd_for_flash_cap, min_economic_amount_in};
-use crate::pipeline::types::{PoolMeta, compare_cycle_execution, compare_cycle_score};
+use crate::pipeline::types::{PoolMeta, compare_cycle_execution};
 use crate::services::execution::flash_liquidity::FlashLiquidityCache;
 use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
@@ -1320,13 +1320,14 @@ fn select_cycles_for_rescore(
     active.sort_by(|a, b| {
         compare_cycle_execution(a.0.as_ref(), b.0.as_ref()).then_with(|| b.1.cmp(&a.1))
     });
-    // Inactive: non-CL first (V2/BAL/CRV don't need TickLens), then quality.
-    // Iter3: stream CL noise left best-eval V2 count at 3 vs 2371 in a prior
-    // profitable window — hydrate/tickless burned inactive slots.
+    // Inactive: non-CL first (V2/BAL/CRV don't need TickLens), then gas-aware
+    // execution rank. Ratio-primary `compare_cycle_score` filled inactive slots
+    // with deep high-ratio dust while 2-hop near-misses that clear gas rotated
+    // out (same bug as prefilter window / live probe_kept junk).
     inactive.sort_by(|a, b| {
         cycle_needs_cl_ticks(a.as_ref())
             .cmp(&cycle_needs_cl_ticks(b.as_ref()))
-            .then_with(|| compare_cycle_score(a.as_ref(), b.as_ref()))
+            .then_with(|| compare_cycle_execution(a.as_ref(), b.as_ref()))
     });
 
     // Cap live/active slots — actscore filled rescore_cap with seed-stamped

@@ -85,13 +85,19 @@ impl Ord for RankedPool<'_> {
 }
 
 fn fetch_rank(pool: &DiscoveredPool, class: u8) -> FetchRank {
-    // class 3 (stale tradable) → 0 best. Never-fetched DODO (9-call plans) demoted
-    // below other never-fetched so CL/V4/Balancer fill warm-up slots first — live
-    // bootstrap spent ~4.5s on 2500 targets with ~18% tradable yield dominated by
-    // DODO Invalid churn.
+    // Priority (lower = better):
+    //   0  stale tradable (keep hot arena fresh)
+    //   1  never-fetched (grow coverage) — DODO demoted to 4 (9-call plans)
+    //   3  invalid/untradable retry (behind never-fetched so bootstrap doesn't
+    //      thrash the same dead set every invalid_retry_ttl)
+    //   4  never-fetched DODO
+    //   5  invalid DODO (worst — live Invalid churn burned bootstrap RPC)
+    // Hub-touching pools win the bool key; newer created_block wins Reverse.
     let class_rank = match (class, pool.protocol) {
         (3, _) => 0,
         (1, ProtocolType::Dodo) => 4,
+        (2, ProtocolType::Dodo) => 5,
+        (2, _) => 3,
         (c, _) => c,
     };
     FetchRank(
@@ -516,6 +522,20 @@ mod tests {
         );
         // Stale tradable DODO still beats never-fetched V3 (class 3 → rank 0).
         assert!(fetch_rank(&dodo, 3) < fetch_rank(&v3, 1));
+    }
+
+    #[test]
+    fn invalid_retry_ranks_behind_never_fetched() {
+        let v2 = pool(1, 1);
+        // class 2 (invalid/untradable) must not starve never-fetched coverage.
+        assert!(fetch_rank(&v2, 1) < fetch_rank(&v2, 2));
+        let mut dodo = pool(2, 1);
+        dodo.protocol = ProtocolType::Dodo;
+        assert!(
+            fetch_rank(&v2, 1) < fetch_rank(&dodo, 2),
+            "never-fetched V2 must outrank invalid DODO"
+        );
+        assert!(fetch_rank(&dodo, 1) < fetch_rank(&dodo, 2));
     }
 
     #[test]

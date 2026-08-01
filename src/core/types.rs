@@ -264,9 +264,12 @@ impl PoolState {
                     .get(token_idx)
                     .is_some_and(|balance| *balance >= MIN_HOP_TOKEN_BALANCE)
             }
+            // Align with V2 dust floor — 1-wei DODO legs were is_tradable and
+            // entered the arena with useless PMM edges, then re-burned LF slots
+            // as class-2 invalid after failing graph eligibility.
             PoolState::Dodo(s) => match token_idx {
-                0 => s.base_reserve >= MIN_HOP_TOKEN_BALANCE,
-                1 => s.quote_reserve >= MIN_HOP_TOKEN_BALANCE,
+                0 => s.base_reserve >= V2_MIN_RESERVE,
+                1 => s.quote_reserve >= V2_MIN_RESERVE,
                 _ => false,
             },
             PoolState::Woofi(s) => {
@@ -530,6 +533,41 @@ mod hop_routing_tests {
             fee: U256::from(30u8),
             fee_denominator: U256::from(10_000u64),
             block_timestamp_last: 0,
+        });
+        assert!(live.is_tradable());
+        assert!(live.hop_pair_routable(0, 1));
+    }
+
+    #[test]
+    fn dodo_rejects_dust_reserves_below_v2_floor() {
+        let dust = PoolState::Dodo(DodoPoolState {
+            base_reserve: U256::from(1_000u64),
+            quote_reserve: U256::from(2_000u64),
+            base_token: Address::with_last_byte(1),
+            quote_token: Address::with_last_byte(2),
+            base_target: U256::from(1_000u64),
+            quote_target: U256::from(2_000u64),
+            r_state: DodoRState::One,
+            i: U256::from(1u64) << 18,
+            k: U256::from(1u64) << 17,
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
+        });
+        assert!(!dust.is_tradable());
+        assert!(!dust.hop_pair_routable(0, 1));
+
+        let live = PoolState::Dodo(DodoPoolState {
+            base_reserve: crate::core::constants::V2_MIN_RESERVE,
+            quote_reserve: crate::core::constants::V2_MIN_RESERVE + U256::from(1u64),
+            base_token: Address::with_last_byte(1),
+            quote_token: Address::with_last_byte(2),
+            base_target: crate::core::constants::V2_MIN_RESERVE,
+            quote_target: crate::core::constants::V2_MIN_RESERVE,
+            r_state: DodoRState::One,
+            i: U256::from(1u64) << 18,
+            k: U256::from(1u64) << 17,
+            lp_fee_rate: U256::ZERO,
+            mt_fee_rate: U256::ZERO,
         });
         assert!(live.is_tradable());
         assert!(live.hop_pair_routable(0, 1));

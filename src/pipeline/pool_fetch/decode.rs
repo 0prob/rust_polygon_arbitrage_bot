@@ -240,8 +240,12 @@ fn decode_dodo(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Option<PoolSt
         r if r == U256::from(2u8) => DodoRState::BelowOne,
         _ => return None,
     };
-    if base.is_zero()
-        || quote.is_zero()
+    // Dust floor matches `PoolState::hop_token_funded` for DODO (V2_MIN_RESERVE):
+    // sub-floor reserves decode as Invalid so prune can drop them instead of
+    // parking non-tradable DodoPoolState that still burns 9-call re-fetches.
+    let min_reserve = crate::core::constants::V2_MIN_RESERVE;
+    if base < min_reserve
+        || quote < min_reserve
         || base_token.is_zero()
         || quote_token.is_zero()
         || pmm_i.is_zero()

@@ -319,7 +319,8 @@ pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     // Survivors cap at max_keep — only probe that many best-by-**execution** candidates.
     // Ratio-primary `compare_cycle_score` filled the window with deep high-ratio dust
     // while 2-hop near-misses that clear gas sat outside (live: probe_kept junk).
-    let rescue_cap = max_keep;
+    // Rescue budget is ~25% of keep (not 1:1) so spot-dust cannot double the snap.
+    let rescue_cap = graph_negative_rescue_cap(max_keep);
     let sim_window = simulable.len().min(max_keep);
     diag.sim_window = sim_window;
     // Partial select then sort only the sim window — avoid O(n log n) on the tail.
@@ -819,17 +820,26 @@ mod tests {
             "dust probe should not show profit for marginal 2-hop cycle"
         );
 
+        let max_keep = 33;
+        let rescue_budget = graph_negative_rescue_cap(max_keep);
         let (kept, diag) = prefilter_cycles_by_atomic_sim_with_context_and_diag(
             &arena,
-            std::iter::repeat_n(graph_negative.clone(), 33).collect(),
-            33,
+            std::iter::repeat_n(graph_negative.clone(), max_keep).collect(),
+            max_keep,
             None,
         );
-        assert_eq!(kept.len(), 33, "spot-negative cycles should be rescued");
+        // All are RescueSpot (dust probe) — rescue_cap (~25%) limits admissions so
+        // spot-dust cannot double the snap (was rescue_cap=max_keep → 2× keep).
+        assert_eq!(
+            kept.len(),
+            rescue_budget,
+            "spot-negative rescues should fill rescue budget only"
+        );
         assert_eq!(kept[0].cycle_ratio, graph_negative.cycle_ratio);
         assert_eq!(
-            diag.rescue_cap_drop, 0,
-            "route budget should not pre-drop rescues"
+            diag.rescue_cap_drop,
+            max_keep.saturating_sub(rescue_budget),
+            "excess spot-rescues beyond rescue_cap should drop"
         );
     }
 }
