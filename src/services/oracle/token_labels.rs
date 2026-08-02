@@ -933,6 +933,34 @@ const KNOWN_POLYGON_SYMBOLS: &[(&Address, &str)] = &[
         "IMX",
     ),
     (
+        &address!("0x6bb45cEAC714c52342Ef73ec663479da35934bf7"),
+        "BONE",
+    ),
+    (
+        &address!("0x8Ab2Fec94d17ae69FB90E7c773f2C85Ed1802c01"),
+        "LQTY",
+    ),
+    (
+        &address!("0xC467Dc2f2fA605ff590DbE56E7E71AbA90e15813"),
+        "PPGv2",
+    ),
+    (
+        &address!("0xEdEc94e7828135d8fDF426a72eF357Fe14cE9526"),
+        "LOL",
+    ),
+    (
+        &address!("0xaC3090B7042FCA2cDBF233022e4a9823a032600c"),
+        "BETA",
+    ),
+    (
+        &address!("0xF480f38C366dAaC4305dC484b2Ad7a496FF00CeA"),
+        "GTON",
+    ),
+    (
+        &address!("0x0B220b82F3eA3B7F6d9A1D8ab58930C064A2b5Bf"),
+        "GLM",
+    ),
+    (
         // POLYWHORE / WHORE.FINANCE
         &address!("0x6C9f3c8EF26cd9e6479F579901a940856C8b3aa0"),
         "POLYWHORE",
@@ -1015,6 +1043,13 @@ mod tests {
             ("0xA99cf31b7f04EE76C27BbD30C9770703D0F5C3af", "PON"),
             ("0x13436a3c5c2574C8145222260B0ed4C2Da31f760", "TRZ"),
             ("0x60bB3D364B765C497C8cE50AE0Ae3f0882c5bD05", "IMX"),
+            ("0x6bb45cEAC714c52342Ef73ec663479da35934bf7", "BONE"),
+            ("0x8Ab2Fec94d17ae69FB90E7c773f2C85Ed1802c01", "LQTY"),
+            ("0xC467Dc2f2fA605ff590DbE56E7E71AbA90e15813", "PPGv2"),
+            ("0xEdEc94e7828135d8fDF426a72eF357Fe14cE9526", "LOL"),
+            ("0xaC3090B7042FCA2cDBF233022e4a9823a032600c", "BETA"),
+            ("0xF480f38C366dAaC4305dC484b2Ad7a496FF00CeA", "GTON"),
+            ("0x0B220b82F3eA3B7F6d9A1D8ab58930C064A2b5Bf", "GLM"),
             ("0x6C9f3c8EF26cd9e6479F579901a940856C8b3aa0", "POLYWHORE"),
         ];
         for (address, symbol) in labels {

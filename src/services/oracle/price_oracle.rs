@@ -262,6 +262,16 @@ const TOKEN_FEEDS: &[TokenFeed] = &[
         chainlink: None,
         pyth_id: Some("433faaa801ecdb6618e3897177a118b273a8e18cc3ff545aadfc207d58d028f7"),
     },
+    TokenFeed {
+        token: address!("0x8Ab2Fec94d17ae69FB90E7c773f2C85Ed1802c01"),
+        chainlink: None,
+        pyth_id: Some("5e8b35b0da37ede980d8f4ddaa7988af73d8c3d110e3eddd2a56977beb839b63"),
+    },
+    TokenFeed {
+        token: address!("0x0B220b82F3eA3B7F6d9A1D8ab58930C064A2b5Bf"),
+        chainlink: None,
+        pyth_id: Some("01a09cbc99b1894271cfd90d6e5aab527cafa66b19d651b441b84e84f671de33"),
+    },
     // Polygon ApeCoin (PoS) — Hermes Crypto.APE/USD (verify ~$0.13, 2026-07-31).
     TokenFeed {
         token: address!("0xB7b31a6BC18e48888545CE79e83E06003bE70930"),
@@ -1739,6 +1749,8 @@ mod tests {
     fn runtime_identified_tokens_have_verified_pyth_feeds() {
         let idex = address!("0x9Cb74C8032b007466865f060ad2c46145d45553D");
         let tusd = address!("0x2e1AD108fF1D8C782fcBbB89AAd783aC49586756");
+        let lqty = address!("0x8Ab2Fec94d17ae69FB90E7c773f2C85Ed1802c01");
+        let glm = address!("0x0B220b82F3eA3B7F6d9A1D8ab58930C064A2b5Bf");
         assert_eq!(
             pyth_feed(&idex),
             Some("6fdf9f1b31f6212aad9125dbc9d85ae6cfac3939fd914f6a8c397f01272eca8f")
@@ -1746,6 +1758,14 @@ mod tests {
         assert_eq!(
             pyth_feed(&tusd),
             Some("433faaa801ecdb6618e3897177a118b273a8e18cc3ff545aadfc207d58d028f7")
+        );
+        assert_eq!(
+            pyth_feed(&lqty),
+            Some("5e8b35b0da37ede980d8f4ddaa7988af73d8c3d110e3eddd2a56977beb839b63")
+        );
+        assert_eq!(
+            pyth_feed(&glm),
+            Some("01a09cbc99b1894271cfd90d6e5aab527cafa66b19d651b441b84e84f671de33")
         );
     }
 
