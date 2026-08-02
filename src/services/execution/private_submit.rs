@@ -81,17 +81,14 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
         .and_then(|resp| resp.error_for_status())
     {
         Ok(resp) => match resp.bytes().await {
-            Ok(bytes) => {
-                let mut buf = bytes.to_vec();
-                crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf)
-                    .ok()
-                    .and_then(|parsed| parsed.result)
-                    .and_then(|v| match v {
-                        JsonRpcResult::Hex(s) => Some(s),
-                        _ => None,
-                    })
-                    .is_some_and(|s| s.eq_ignore_ascii_case("0x89"))
-            }
+            Ok(bytes) => serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes)
+                .ok()
+                .and_then(|parsed| parsed.result)
+                .and_then(|v| match v {
+                    JsonRpcResult::Hex(s) => Some(s),
+                    _ => None,
+                })
+                .is_some_and(|s| s.eq_ignore_ascii_case("0x89")),
             Err(_) => false,
         },
         Err(_) => false,
@@ -111,23 +108,20 @@ pub async fn probe_submit_endpoint(url: &str) -> PrivateSubmitProbe {
         .and_then(|resp| resp.error_for_status())
     {
         Ok(resp) => match resp.bytes().await {
-            Ok(bytes) => {
-                let mut buf = bytes.to_vec();
-                match crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf) {
-                    Ok(parsed) => match parsed.error {
-                        Some(err) => {
-                            let msg = err.message.to_string();
-                            let exists = msg.contains("invalid")
-                                || msg.contains("rlp")
-                                || msg.contains("transaction")
-                                || msg.contains("not accepted");
-                            (exists, Some(msg))
-                        }
-                        None => (true, None),
-                    },
-                    Err(e) => (false, Some(e.to_string())),
-                }
-            }
+            Ok(bytes) => match serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes) {
+                Ok(parsed) => match parsed.error {
+                    Some(err) => {
+                        let msg = err.message.to_string();
+                        let exists = msg.contains("invalid")
+                            || msg.contains("rlp")
+                            || msg.contains("transaction")
+                            || msg.contains("not accepted");
+                        (exists, Some(msg))
+                    }
+                    None => (true, None),
+                },
+                Err(e) => (false, Some(e.to_string())),
+            },
             Err(e) => (false, Some(e.to_string())),
         },
         Err(e) => (false, Some(e.to_string())),
@@ -164,8 +158,7 @@ pub async fn probe_bloxroute_auth(auth_header: &str) -> bool {
     let Ok(bytes) = resp.bytes().await else {
         return false;
     };
-    let mut buf = bytes.to_vec();
-    let Ok(parsed) = crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf) else {
+    let Ok(parsed) = serde_json::from_slice::<JsonRpcResponse<'_>>(&bytes) else {
         return false;
     };
     // Auth OK when the gateway accepts the method and rejects only the dummy tx bytes.
@@ -205,11 +198,7 @@ fn parse_bloxroute_submit_response(
         anyhow::bail!("bloxroute returned empty response body (HTTP {status})");
     }
 
-    let mut buf = trimmed.to_vec();
-    let parsed: JsonRpcResponse<'_> = crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(
-        &mut buf,
-    )
-    .with_context(|| {
+    let parsed: JsonRpcResponse<'_> = serde_json::from_slice(trimmed).with_context(|| {
         format!(
             "bloxroute response decode failed (HTTP {status}): {}",
             preview_response_body(trimmed)
@@ -299,9 +288,7 @@ pub async fn submit_polygon_private_rpc(url: &str, raw_tx: &[u8]) -> anyhow::Res
         .await?
         .error_for_status()?;
     let bytes = resp.bytes().await?;
-    let mut buf = bytes.to_vec();
-    let parsed: JsonRpcResponse<'_> =
-        crate::util::simd_json_parse_borrowed::<JsonRpcResponse<'_>>(&mut buf)?;
+    let parsed: JsonRpcResponse<'_> = serde_json::from_slice(&bytes)?;
     if let Some(err) = parsed.error {
         anyhow::bail!("eth_sendRawTransactionPrivate: {}", err.message);
     }

@@ -15,7 +15,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at, timeout};
 
 /// Base reconnect delay (doubles on each failure, capped at MAX_RECONNECT_DELAY_MS).
 /// Reduced for HFT sensitivity — Polygon WSS endpoints typically reconnect in <200ms.
@@ -240,6 +240,11 @@ impl PoolLogFeed {
         let mut last_log_at = Instant::now();
         let mut silence_forced = false;
         let armed_at = Instant::now();
+        let mut ping_timer = interval_at(
+            TokioInstant::now() + WSS_PING_INTERVAL,
+            WSS_PING_INTERVAL,
+        );
+        ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -262,7 +267,7 @@ impl PoolLogFeed {
                     silence_forced = false;
                     self.handle_log(&log);
                 }
-                () = tokio::time::sleep(WSS_PING_INTERVAL) => {
+                _ = ping_timer.tick() => {
                     if timeout(WSS_PROBE_TIMEOUT, provider.get_block_number())
                         .await
                         .ok()

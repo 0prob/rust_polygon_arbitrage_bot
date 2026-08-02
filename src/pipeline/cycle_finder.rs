@@ -12,7 +12,7 @@ use crate::core::types::{
     CycleEdges, Edge, FoundCycle, PoolIndex, PoolState, ProtocolType, TokenIndex,
 };
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::{cycle_key, dedupe_cycles_by_edges};
+use crate::pipeline::cycle_filter::dedupe_cycles_by_edges;
 use crate::pipeline::deadline::SharedDeadlineGuard;
 use crate::pipeline::graph::{PendingHubSwap, resolve_lazy_swap_edge};
 use crate::pipeline::route_calls::{estimate_hop_calls, packed_calls_fit_executor};
@@ -915,7 +915,7 @@ fn collect_cycles_dfs_single_start(
             budget: &SharedDeadlineGuard,
             global_cap: &SharedCycleCap,
             cycles: &mut Vec<FoundCycle>,
-            seen: &mut rustc_hash::FxHashSet<u64>,
+            seen: &mut rustc_hash::FxHashSet<CycleEdges>,
             pin_touched: bool,
         ) {
             if budget.tick() || cycles.len() >= max_cycles || global_cap.is_full() {
@@ -1041,8 +1041,8 @@ fn collect_cycles_dfs_single_start(
                 if !pin_touch && score > LOG_WEIGHT_PRUNE_THRESHOLD {
                     return;
                 }
-                let fp = cycle_key(path);
-                if seen.contains(&fp) {
+                let edges = CycleEdges::from(path.as_slice());
+                if seen.contains(&edges) {
                     return;
                 }
                 // Reserve half the shared cap for pin-touch closes during obs search
@@ -1054,8 +1054,7 @@ fn collect_cycles_dfs_single_start(
                 if !global_cap.try_claim() {
                     return;
                 }
-                seen.insert(fp);
-                let edges: CycleEdges = CycleEdges::from(path.as_slice());
+                seen.insert(edges.clone());
                 cycles.push(FoundCycle {
                     start_token: start,
                     edges,
@@ -1465,58 +1464,12 @@ fn collect_cycles_dfs_parallel(
     merged
 }
 
-/// Merge parallel DFS shards, keeping the best score per cycle key.
 fn merge_shard_cycles(shard_cycles: &[Vec<FoundCycle>]) -> Vec<FoundCycle> {
-    use std::collections::hash_map::Entry;
-
-    use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
-
-    let total: usize = shard_cycles.iter().map(Vec::len).sum();
-    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
-    best.reserve(total);
-    for cycle in shard_cycles.iter().flat_map(|s| s.iter()) {
-        let key = cycle_key(&cycle.edges);
-        match best.entry(key) {
-            Entry::Occupied(mut e) => {
-                if cycle_prefers_candidate(cycle, e.get()) {
-                    *e.get_mut() = cycle.clone();
-                }
-            }
-            Entry::Vacant(e) => {
-                e.insert(cycle.clone());
-            }
-        }
-    }
-    let mut out: Vec<FoundCycle> = best.into_values().collect();
-    out.sort_unstable_by(compare_cycle_score);
-    out
+    dedupe_cycles_by_edges(shard_cycles.iter().flat_map(|shard| shard.iter().cloned()))
 }
 
-/// Final merge that consumes shards — vacant inserts move, no clone on first win.
 fn merge_shard_cycles_owned(shard_cycles: Vec<Vec<FoundCycle>>) -> Vec<FoundCycle> {
-    use std::collections::hash_map::Entry;
-
-    use crate::pipeline::types::{compare_cycle_score, cycle_prefers_candidate};
-
-    let total: usize = shard_cycles.iter().map(Vec::len).sum();
-    let mut best: rustc_hash::FxHashMap<u64, FoundCycle> = rustc_hash::FxHashMap::default();
-    best.reserve(total);
-    for cycle in shard_cycles.into_iter().flatten() {
-        let key = cycle_key(&cycle.edges);
-        match best.entry(key) {
-            Entry::Occupied(mut e) => {
-                if cycle_prefers_candidate(&cycle, e.get()) {
-                    *e.get_mut() = cycle;
-                }
-            }
-            Entry::Vacant(e) => {
-                e.insert(cycle);
-            }
-        }
-    }
-    let mut out: Vec<FoundCycle> = best.into_values().collect();
-    out.sort_unstable_by(compare_cycle_score);
-    out
+    dedupe_cycles_by_edges(shard_cycles.into_iter().flatten())
 }
 
 #[must_use]
@@ -1618,6 +1571,7 @@ pub fn apply_protocol_diverse_selection(
     cycles: Vec<FoundCycle>,
     max_cycles: usize,
 ) -> Vec<FoundCycle> {
+    let cycles = dedupe_cycles_by_edges(cycles);
     if max_cycles == 0 || cycles.is_empty() {
         return vec![];
     }
@@ -1651,8 +1605,6 @@ pub fn apply_protocol_diverse_selection(
     }
 
     let mut selected: Vec<FoundCycle> = Vec::with_capacity(cap);
-    let mut seen: rustc_hash::FxHashSet<u64> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(cap, rustc_hash::FxBuildHasher);
 
     while selected.len() < cap && active_len > 0 {
         let mut i = 0;
@@ -1663,23 +1615,15 @@ pub fn apply_protocol_diverse_selection(
             }
             let slot = active[i];
             let g = &mut groups[slot];
-            let mut took = false;
-            while let Some(cycle) = g.pop() {
-                let key = cycle_key(&cycle.edges);
-                if !seen.insert(key) {
-                    continue; // duplicate edge set — drop, keep popping for a unique
-                }
+            if let Some(cycle) = g.pop() {
                 selected.push(cycle);
-                took = true;
                 progressed = true;
-                break;
             }
             if g.is_empty() {
                 // Compact active list (order among remaining slots is stable enough).
                 active_len -= 1;
                 active[i] = active[active_len];
             } else {
-                debug_assert!(took, "non-empty group must yield a unique cycle or empty");
                 i += 1;
             }
         }
@@ -2036,6 +1980,22 @@ mod tests {
             // Distinct non-zero ratios so compare_cycle_score ranks by ratio.
             cycle_ratio: U256::from(1_000_000_000_000_000_000u64) + U256::from(ratio),
         }
+    }
+
+    #[test]
+    fn shard_merges_keep_distinct_cycles_and_best_duplicate() {
+        let worse = ranked_cycle(1, ProtocolType::UniswapV2, 100, -1.0);
+        let better = ranked_cycle(1, ProtocolType::UniswapV2, 200, -2.0);
+        let distinct = ranked_cycle(2, ProtocolType::UniswapV2, 150, -1.5);
+        let shards = vec![vec![worse], vec![better.clone(), distinct.clone()]];
+
+        let borrowed = merge_shard_cycles(&shards);
+        assert_eq!(borrowed.len(), 2);
+        assert_eq!(borrowed[0].cycle_ratio, better.cycle_ratio);
+
+        let owned = merge_shard_cycles_owned(shards);
+        assert_eq!(owned.len(), 2);
+        assert_eq!(owned[0].cycle_ratio, better.cycle_ratio);
     }
 
     #[test]

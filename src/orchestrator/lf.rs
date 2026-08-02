@@ -11,11 +11,11 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 use crate::config::AppConfig;
 use crate::core::constants::{HOP_CAP, POLYGON_HUB_TOKENS, is_polygon_hub_token};
 use crate::core::math::fixed_point::ONE;
-use crate::core::types::{PoolIndex, TokenIndex};
+use crate::core::types::{CycleEdges, PoolIndex, TokenIndex};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::pipeline::arena::StateArena;
-use crate::pipeline::cycle_filter::{ProbeContext, cycle_key};
+use crate::pipeline::cycle_filter::ProbeContext;
 use crate::pipeline::cycle_finder::CYCLE_ENUM_PATCH_BUDGET;
 use crate::pipeline::cycle_search::{find_cycles_for_mode, find_cycles_for_mode_with_budget};
 use crate::pipeline::graph::{
@@ -133,14 +133,11 @@ fn pin_cycles_touching_pools(
     pinned.truncate(max_cycles);
     let pin_kept = pinned.len();
     if !pins_only {
-        let mut seen: rustc_hash::FxHashSet<u64> = pinned
-            .iter()
-            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-            .collect();
+        let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+            pinned.iter().map(|c| c.edges.clone()).collect();
         let fill = finalize_enumerated_cycles(rest, max_cycles.saturating_sub(pinned.len()));
         for cycle in fill {
-            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-            if seen.insert(key) {
+            if seen.insert(cycle.edges.clone()) {
                 pinned.push(cycle);
                 if pinned.len() >= max_cycles {
                     break;
@@ -1023,14 +1020,11 @@ fn run_lf_cpu_work(mut work: LfCpuWork) -> LfCpuResult {
                 .filter(|c| c.len() > diversified.len())
         {
             let pin_first = diversified.len();
-            let mut seen: rustc_hash::FxHashSet<u64> = diversified
-                .iter()
-                .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-                .collect();
+            let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+                diversified.iter().map(|c| c.edges.clone()).collect();
             let mut merged = diversified;
             for cycle in prior.iter() {
-                let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-                if seen.insert(key) {
+                if seen.insert(cycle.edges.clone()) {
                     merged.push(cycle.clone());
                     if merged.len() >= work.max_paths {
                         break;
@@ -1549,15 +1543,12 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     if hard.len() < MIN_POST_RATIO_SNAP && pre_rescore.len() > hard.len() {
         // Rescore DEAD-marked most of the universe (live: 272→11). Restore
         // pre-rescore cycles so the cache does not shrink to pin dust.
-        let mut seen: rustc_hash::FxHashSet<u64> = hard
-            .iter()
-            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-            .collect();
+        let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+            hard.iter().map(|c| c.edges.clone()).collect();
         let mut structural: Vec<_> = pre_rescore
             .into_iter()
             .filter(|c| {
-                let key = crate::pipeline::cycle_filter::cycle_key(&c.edges);
-                seen.insert(key)
+                seen.insert(c.edges.clone())
                     && c.score < crate::pipeline::cycle_finder::DEAD_EDGE_LOG_WEIGHT
                     && !c.cycle_ratio.is_zero()
             })
@@ -1605,14 +1596,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             );
         } else {
             live_held.truncate(32);
-            let mut seen: rustc_hash::FxHashSet<u64> = live_held
-                .iter()
-                .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-                .collect();
+            let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+                live_held.iter().map(|c| c.edges.clone()).collect();
             let mut merged = live_held;
             for cycle in capped {
-                let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-                if seen.insert(key) {
+                if seen.insert(cycle.edges.clone()) {
                     merged.push(cycle);
                     if merged.len() >= max_paths {
                         break;
@@ -1838,11 +1826,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
                     exclusive_obs,
                 );
                 if !outcome.cycles.is_empty() {
-                    let mut seen: FxHashSet<u64> =
-                        capped.iter().map(|c| cycle_key(&c.edges)).collect();
+                    let mut seen: FxHashSet<CycleEdges> =
+                        capped.iter().map(|c| c.edges.clone()).collect();
                     let before = capped.len();
                     for cycle in outcome.cycles {
-                        if !seen.insert(cycle_key(&cycle.edges)) {
+                        if !seen.insert(cycle.edges.clone()) {
                             continue;
                         }
                         capped.push(cycle);
@@ -1899,14 +1887,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
         live_for_rates = live_unpriced_backup;
     }
     if !live_for_rates.is_empty() {
-        let mut seen: rustc_hash::FxHashSet<u64> = live_for_rates
-            .iter()
-            .map(|c| crate::pipeline::cycle_filter::cycle_key(&c.edges))
-            .collect();
+        let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+            live_for_rates.iter().map(|c| c.edges.clone()).collect();
         let mut merged = live_for_rates;
         for cycle in capped {
-            let key = crate::pipeline::cycle_filter::cycle_key(&cycle.edges);
-            if seen.insert(key) {
+            if seen.insert(cycle.edges.clone()) {
                 merged.push(cycle);
                 if merged.len() >= max_paths {
                     break;

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use crate::core::types::{FoundCycle, TokenIndex};
+use crate::core::types::{CycleEdges, FoundCycle, TokenIndex};
 use crate::pipeline::deadline::DeadlineGuard;
 use crate::pipeline::negative_cycle::collect_negative_cycles_from_source;
 use crate::pipeline::types::CycleSearchPass;
@@ -58,7 +58,7 @@ pub fn find_cycles_bellman_ford_multi_pass_with_adj(
         return Vec::new();
     }
     let mut all = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut seen: rustc_hash::FxHashSet<CycleEdges> = rustc_hash::FxHashSet::default();
 
     let token_count = adj.len();
 

@@ -1,6 +1,6 @@
+use crate::core::constants::HOP_CAP;
 use crate::core::math::fixed_point::ONE;
 use crate::core::types::{CycleEdges, Edge, FoundCycle, TokenIndex};
-use crate::pipeline::cycle_filter::cycle_key;
 use crate::pipeline::cycle_finder::clamp_fee_bps;
 use crate::pipeline::route_calls::{estimate_packed_route_calls, packed_calls_fit_executor};
 use crate::pipeline::spot_price::{hop_penalty, min_profitable_cycle_ratio, mul_ratio_saturating};
@@ -47,7 +47,7 @@ pub fn collect_negative_cycles_from_source(
     adj: &[Vec<WeightedEdge>],
     max_hops: u32,
     max_cycles: usize,
-    found_keys: &mut rustc_hash::FxHashSet<u64>,
+    found_keys: &mut rustc_hash::FxHashSet<CycleEdges>,
     cycles: &mut Vec<FoundCycle>,
     dist: &mut [f64],
     dist_ratio: &mut [U256],
@@ -60,6 +60,7 @@ pub fn collect_negative_cycles_from_source(
     visited_gen: &mut u32,
     should_stop: &mut impl FnMut() -> bool,
 ) {
+    let max_hops = max_hops.min(HOP_CAP);
     let n = dist.len();
     let src = source.0 as usize;
     if src >= n {
@@ -183,6 +184,9 @@ pub fn collect_negative_cycles_from_source(
             let mut product_ratio = ONE;
             let mut trace = Some(cycle_start);
             while let Some(t) = trace {
+                if cycle_edges.len() >= max_hops as usize {
+                    break;
+                }
                 let t_idx = t.0 as usize;
                 if t_idx >= pred_edge.len() {
                     break;
@@ -198,9 +202,6 @@ pub fn collect_negative_cycles_from_source(
                 if trace == Some(cycle_start) {
                     break;
                 }
-                if cycle_edges.len() > max_hops as usize {
-                    break;
-                }
             }
             cycle_edges.reverse();
             let Some(route_calls) = is_simple_cycle(&cycle_edges) else {
@@ -212,8 +213,7 @@ pub fn collect_negative_cycles_from_source(
             {
                 continue;
             }
-            let key = cycle_key(&cycle_edges);
-            if !found_keys.insert(key) {
+            if !found_keys.insert(cycle_edges.clone()) {
                 continue;
             }
 
@@ -243,6 +243,7 @@ pub fn collect_negative_cycles_from_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::constants::HOP_CAP;
     use crate::core::types::{PoolIndex, ProtocolType};
     use crate::pipeline::bellman_ford::find_cycles_bellman_ford_multi_pass_with_adj;
     use crate::pipeline::types::CycleSearchPass;
@@ -289,5 +290,58 @@ mod tests {
         );
         assert!(found.iter().any(|c| c.hop_count == 3));
         assert!(found.iter().all(|c| c.cycle_ratio > ONE));
+    }
+
+    #[test]
+    fn cycle_reconstruction_enforces_hop_cap_before_spilling() {
+        let token_count = HOP_CAP as usize + 1;
+        let ratio = 1_100_000_000_000_000_000u64;
+        let mut adj = vec![Vec::new(); token_count];
+        for token_in in 0..token_count {
+            adj[token_in].push(we(
+                token_in as u32,
+                token_in as u32,
+                ((token_in + 1) % token_count) as u32,
+                -0.01,
+                ratio,
+            ));
+        }
+
+        let mut found_keys = rustc_hash::FxHashSet::default();
+        let mut cycles = Vec::new();
+        let mut dist = vec![f64::INFINITY; token_count];
+        let mut dist_ratio = vec![ONE; token_count];
+        let mut pred_node = (0..token_count)
+            .map(|token| Some(TokenIndex(((token + token_count - 1) % token_count) as u32)))
+            .collect::<Vec<_>>();
+        let mut pred_edge = (0..token_count)
+            .map(|token| Some(adj[(token + token_count - 1) % token_count][0]))
+            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        let mut next_active = Vec::new();
+        let mut in_next = vec![false; token_count];
+        let mut visited_scratch = vec![0; token_count];
+        let mut visited_gen = 0;
+
+        collect_negative_cycles_from_source(
+            TokenIndex(0),
+            &adj,
+            HOP_CAP + 1,
+            16,
+            &mut found_keys,
+            &mut cycles,
+            &mut dist,
+            &mut dist_ratio,
+            &mut pred_node,
+            &mut pred_edge,
+            &mut active,
+            &mut next_active,
+            &mut in_next,
+            &mut visited_scratch,
+            &mut visited_gen,
+            &mut || false,
+        );
+
+        assert!(cycles.is_empty());
     }
 }

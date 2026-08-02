@@ -1438,7 +1438,7 @@ fn pyth_fields_to_quote(
 
 #[must_use]
 pub fn token_usd_to_matic_rate_per_unit(token_usd: f64, matic_usd: f64) -> U256 {
-    if !(token_usd > 0.0 && matic_usd > 0.0) {
+    if !(token_usd.is_finite() && matic_usd.is_finite() && token_usd > 0.0 && matic_usd > 0.0) {
         return U256::ZERO;
     }
     // Use u128 intermediates to reduce f64 rounding loss before integer division.
@@ -1522,6 +1522,19 @@ mod tests {
     fn normalize_pyth_feed_id_strips_0x_and_lowercases() {
         assert_eq!(normalize_pyth_feed_id("0xAaBbCc"), "aabbcc");
         assert_eq!(normalize_pyth_feed_id("AABBCC"), "aabbcc");
+    }
+
+    #[test]
+    fn token_usd_rate_rejects_non_finite_prices() {
+        assert_eq!(
+            token_usd_to_matic_rate_per_unit(f64::INFINITY, 1.0),
+            U256::ZERO
+        );
+        assert_eq!(
+            token_usd_to_matic_rate_per_unit(1.0, f64::INFINITY),
+            U256::ZERO
+        );
+        assert_eq!(token_usd_to_matic_rate_per_unit(f64::NAN, 1.0), U256::ZERO);
     }
 
     #[test]

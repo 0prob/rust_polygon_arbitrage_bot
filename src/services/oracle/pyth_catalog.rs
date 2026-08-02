@@ -38,16 +38,7 @@ pub async fn search_pyth_feeds(
     api_key: Option<&str>,
     query: &str,
 ) -> anyhow::Result<Vec<PythFeedCandidate>> {
-    let base = hermes_base.trim_end_matches('/');
-    let encoded: String = query
-        .chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => "%20".to_string(),
-            _ => format!("%{:02X}", c as u8),
-        })
-        .collect();
-    let url = format!("{base}/v2/price_feeds?query={encoded}");
+    let url = pyth_catalog_url(hermes_base, query)?;
     let mut request = http.get(url).timeout(ORACLE_HTTP_TIMEOUT);
     if let Some(auth) = pyth_authorization(api_key) {
         request = request.header(reqwest::header::AUTHORIZATION, auth);
@@ -75,6 +66,16 @@ pub async fn search_pyth_feeds(
             }
         })
         .collect())
+}
+
+fn pyth_catalog_url(hermes_base: &str, query: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/v2/price_feeds",
+        hermes_base.trim_end_matches('/')
+    ))
+    .context("invalid pyth catalog URL")?;
+    url.query_pairs_mut().append_pair("query", query);
+    Ok(url)
 }
 
 #[must_use]
@@ -173,5 +174,15 @@ mod tests {
         let candidates = [cand("Crypto.WFRAGSOL/USD"), cand("Crypto.SOL/USD")];
         let best = pick_best_usd_candidate(&candidates).expect("usd");
         assert_eq!(best.symbol, "Crypto.SOL/USD");
+    }
+
+    #[test]
+    fn catalog_url_encodes_utf8_query() {
+        let url = pyth_catalog_url("https://hermes.example/", "café token")
+            .expect("catalog URL");
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![("query".into(), "café token".into())]
+        );
     }
 }

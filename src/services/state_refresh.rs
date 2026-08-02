@@ -1028,6 +1028,13 @@ impl StateRefreshService {
                 };
                 rpc_head_ms = rpc_head_ms.saturating_add(now_ms().saturating_sub(head_started));
             }
+            if pinned_block.is_none() {
+                crate::warn!(
+                    "state RPC head unavailable (url_index={idx}) — skipping unpinned refresh"
+                );
+                self.rpc.deprioritize_state_url(url);
+                continue;
+            }
             last_pinned_block = pinned_block;
             let fetch_started = now_ms();
             let pace = crate::infra::rpc_budget::effective_batch_pace_ms(

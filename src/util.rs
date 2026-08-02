@@ -115,11 +115,10 @@ pub fn hf_worker_threads() -> usize {
     (total / 2).max(1)
 }
 
-/// LF graph/cycle search pool — remaining workers (minimum 1).
 #[must_use]
 pub fn lf_worker_threads() -> usize {
     let total = rayon_worker_threads();
-    total.saturating_sub(hf_worker_threads()).max(1)
+    total.saturating_sub(hf_worker_threads())
 }
 
 #[inline]
@@ -154,7 +153,11 @@ pub fn cpu_pool() -> &'static rayon::ThreadPool {
 /// Dedicated pool for LF graph build and cycle enumeration.
 #[must_use]
 pub fn lf_cpu_pool() -> &'static rayon::ThreadPool {
-    &LF_CPU_POOL
+    if lf_worker_threads() == 0 {
+        cpu_pool()
+    } else {
+        &LF_CPU_POOL
+    }
 }
 
 /// Sync entry into [`cpu_pool`] via `install` (blocks the caller).
@@ -312,12 +315,16 @@ mod tests {
 
     #[test]
     fn hf_and_lf_pools_partition_workers() {
-        let total = rayon_worker_threads().max(2);
+        let total = rayon_worker_threads();
         let hf = hf_worker_threads();
         let lf = lf_worker_threads();
         assert!(hf >= 1);
-        assert!(lf >= 1);
         assert_eq!(hf + lf, total);
+        if lf == 0 {
+            assert!(std::ptr::eq(cpu_pool(), lf_cpu_pool()));
+        } else {
+            assert!(lf >= 1);
+        }
     }
 
     #[test]
