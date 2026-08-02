@@ -62,6 +62,7 @@ where
     let mut redraw = tokio::time::interval(REDRAW_INTERVAL);
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut needs_redraw = true;
+    let mut snapshot_branch_open = true;
 
     loop {
         tokio::select! {
@@ -95,10 +96,10 @@ where
                     needs_redraw = false;
                 }
             }
-            changed = snapshot_rx.changed() => {
-                if changed.is_ok()
-                    && let Some(snapshot) = snapshot_rx.borrow().clone()
-                {
+            changed = snapshot_rx.changed(), if snapshot_branch_open => {
+                if changed.is_err() {
+                    snapshot_branch_open = false;
+                } else if let Some(snapshot) = snapshot_rx.borrow().clone() {
                     app.set_snapshot(snapshot);
                     needs_redraw = true;
                 }

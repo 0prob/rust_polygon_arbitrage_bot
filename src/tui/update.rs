@@ -177,6 +177,7 @@ pub struct RuntimeSnapshotInput {
 pub struct RouteBuildCache {
     pub generation: u64,
     pub gas_gwei: Option<f64>,
+    pub matic_usd: f64,
     /// `Arc<Vec<_>>` so the TUI can `Arc::make_mut` for status overlays.
     pub opportunities: Arc<Vec<RouteSummary>>,
     /// Cached graph body keyed by `graph_generation` (indexer fields patched each poll).
@@ -189,10 +190,22 @@ impl Default for RouteBuildCache {
         Self {
             generation: 0,
             gas_gwei: None,
+            matic_usd: 0.0,
             opportunities: Arc::new(Vec::new()),
             graph_generation: 0,
             graph: None,
         }
+    }
+}
+
+impl RouteBuildCache {
+    pub(crate) fn needs_rebuild(
+        &self,
+        generation: u64,
+        gas_gwei: Option<f64>,
+        matic_usd: f64,
+    ) -> bool {
+        self.generation != generation || self.gas_gwei != gas_gwei || self.matic_usd != matic_usd
     }
 }
 
@@ -568,6 +581,7 @@ pub fn build_route_cache(
     RouteBuildCache {
         generation: snapshot.generation,
         gas_gwei,
+        matic_usd,
         opportunities: Arc::new(opportunities),
         graph_generation: 0,
         graph: None,
@@ -892,13 +906,23 @@ fn kv(key: impl Into<String>, value: impl Into<String>, severity: Severity) -> K
 
 #[cfg(test)]
 mod tests {
-    use super::{build_routes, format_amount};
+    use super::{RouteBuildCache, build_routes, format_amount};
     use crate::core::types::{CycleEdges, Edge, FoundCycle, PoolState, ProtocolType, V2PoolState};
     use crate::pipeline::arena::StateArena;
     use crate::services::hf_snapshot::HfSnapshot;
     use alloy::primitives::{Address, U256};
     use rustc_hash::FxHashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn route_cache_rebuilds_when_matic_usd_changes() {
+        let cache = RouteBuildCache {
+            generation: 7,
+            gas_gwei: Some(30.0),
+            ..RouteBuildCache::default()
+        };
+        assert!(cache.needs_rebuild(7, Some(30.0), 0.08));
+    }
 
     #[test]
     fn format_amount_preserves_fractional_leading_zeroes() {

@@ -1454,7 +1454,7 @@ pub fn token_usd_to_matic_rate_per_unit(token_usd: f64, matic_usd: f64) -> U256 
     // Use u128 intermediates to reduce f64 rounding loss before integer division.
     let token_micro = (token_usd * 1e18).round() as u128;
     let matic_micro = (matic_usd * 1e18).round() as u128;
-    if matic_micro == 0 {
+    if token_micro == u128::MAX || matic_micro == 0 || matic_micro == u128::MAX {
         return U256::ZERO;
     }
     let whole_matic_wei = (U256::from(token_micro) * RATE_PRECISION) / U256::from(matic_micro);
@@ -1545,6 +1545,12 @@ mod tests {
             U256::ZERO
         );
         assert_eq!(token_usd_to_matic_rate_per_unit(f64::NAN, 1.0), U256::ZERO);
+    }
+
+    #[test]
+    fn token_usd_rate_rejects_unrepresentable_prices() {
+        assert_eq!(token_usd_to_matic_rate_per_unit(f64::MAX, 1.0), U256::ZERO);
+        assert_eq!(token_usd_to_matic_rate_per_unit(1.0, f64::MAX), U256::ZERO);
     }
 
     #[test]

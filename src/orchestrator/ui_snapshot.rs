@@ -199,39 +199,37 @@ async fn build_ui_snapshot(
         .snapshot()
         .map(|fee| u256_to_f64(fee.base_fee + fee.priority_fee) / 1e9);
 
-    // Hot-cache + route sims only when generation/gas change; otherwise reuse cache.
-    let display_arena =
-        if snap.generation != route_cache.generation || route_cache.gas_gwei != gas_gwei {
-            let hot_pools = hot_pool_addresses(&snap);
-            let mut display_arena = snap.arena.clone();
-            display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
-            let arena = display_arena.clone();
-            let snap_arc = Arc::clone(&snap);
-            let slippage_bps = ctx.config.execution.slippage_bps;
-            let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
-            let matic = matic_usd;
-            let prev_graph_generation = route_cache.graph_generation;
-            let prev_graph = route_cache.graph.take();
-            // CPU-bound route sims — rayon pool, not tokio spawn_blocking (tokio docs).
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            crate::util::cpu_pool().spawn(move || {
-                let _ = tx.send(build_route_cache(
-                    &snap_arc,
-                    &arena,
-                    matic,
-                    gas_gwei,
-                    slippage_bps,
-                    safety_multiplier_bps,
-                ));
-            });
-            *route_cache = rx.await.context("route cache build task failed")?;
-            // Route rebuild must not drop the graph COW cache.
-            route_cache.graph_generation = prev_graph_generation;
-            route_cache.graph = prev_graph;
-            display_arena
-        } else {
-            snap.arena.clone()
-        };
+    let display_arena = if route_cache.needs_rebuild(snap.generation, gas_gwei, matic_usd) {
+        let hot_pools = hot_pool_addresses(&snap);
+        let mut display_arena = snap.arena.clone();
+        display_arena.apply_hot_cache(&ctx.cache, &hot_pools);
+        let arena = display_arena.clone();
+        let snap_arc = Arc::clone(&snap);
+        let slippage_bps = ctx.config.execution.slippage_bps;
+        let safety_multiplier_bps = ctx.config.execution.profit_safety_multiplier_bps;
+        let matic = matic_usd;
+        let prev_graph_generation = route_cache.graph_generation;
+        let prev_graph = route_cache.graph.take();
+        // CPU-bound route sims — rayon pool, not tokio spawn_blocking (tokio docs).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crate::util::cpu_pool().spawn(move || {
+            let _ = tx.send(build_route_cache(
+                &snap_arc,
+                &arena,
+                matic,
+                gas_gwei,
+                slippage_bps,
+                safety_multiplier_bps,
+            ));
+        });
+        *route_cache = rx.await.context("route cache build task failed")?;
+        // Route rebuild must not drop the graph COW cache.
+        route_cache.graph_generation = prev_graph_generation;
+        route_cache.graph = prev_graph;
+        display_arena
+    } else {
+        snap.arena.clone()
+    };
 
     let graph = graph_snapshot_for_poll(
         route_cache,

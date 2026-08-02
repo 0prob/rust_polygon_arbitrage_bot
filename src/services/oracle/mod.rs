@@ -584,7 +584,12 @@ pub(crate) fn rates_diverge_bps(a: U256, b: U256) -> u64 {
         return 0;
     }
     let delta = hi - lo;
-    u64::try_from((delta * U256::from(10_000u64) / hi).min(U256::from(10_000u64))).unwrap_or(10_000)
+    u64::try_from(
+        crate::core::math::mul_div_floor(delta, U256::from(10_000u64), hi)
+            .unwrap_or(U256::from(10_000u64))
+            .min(U256::from(10_000u64)),
+    )
+    .unwrap_or(10_000)
 }
 
 fn build_token_to_matic_rates(
@@ -895,6 +900,7 @@ mod tests {
             2_000
         );
         assert_eq!(rates_diverge_bps(U256::from(100u64), U256::from(100u64)), 0);
+        assert_eq!(rates_diverge_bps(U256::MAX, U256::ZERO), 10_000);
     }
 
     #[test]
