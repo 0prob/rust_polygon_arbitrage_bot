@@ -4,6 +4,7 @@ use alloy::primitives::U256;
 use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
+use crate::core::types::{CycleEdges, Edge};
 use crate::pipeline::types::MinimalSimResult;
 
 /// Sized for zero-profit memos + multi-amount Brent ladders. Live hit_rate≈24%
@@ -13,10 +14,10 @@ const ROUTE_SIM_CACHE_SHARDS: usize = 16;
 const ROUTE_SIM_CACHE_SHARD_CAPACITY: usize = ROUTE_SIM_CACHE_CAPACITY / ROUTE_SIM_CACHE_SHARDS;
 const ROUTE_SIM_LOG_INTERVAL: u64 = 10_000;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct RouteSimKey {
     route_state_revision: u64,
-    route_fp: u64,
+    route_edges: CycleEdges,
     amount: U256,
 }
 
@@ -73,11 +74,12 @@ impl RouteSimCache {
         &self,
         route_state_revision: u64,
         route_fp: u64,
+        route_edges: &[Edge],
         amount: U256,
     ) -> Option<MinimalSimResult> {
         let key = RouteSimKey {
             route_state_revision,
-            route_fp,
+            route_edges: CycleEdges::from_slice(route_edges),
             amount,
         };
         if let Some(entry) = self.entries[Self::shard_index(route_fp)]
@@ -96,6 +98,7 @@ impl RouteSimCache {
         &self,
         route_state_revision: u64,
         route_fp: u64,
+        route_edges: &[Edge],
         amount: U256,
         sim: MinimalSimResult,
     ) {
@@ -109,7 +112,7 @@ impl RouteSimCache {
             if entries.len() >= ROUTE_SIM_CACHE_SHARD_CAPACITY {
                 let target = ROUTE_SIM_CACHE_SHARD_CAPACITY / 2;
                 let drop_n = entries.len().saturating_sub(target);
-                let victims: Vec<RouteSimKey> = entries.keys().copied().take(drop_n).collect();
+                let victims: Vec<RouteSimKey> = entries.keys().take(drop_n).cloned().collect();
                 for key in victims {
                     entries.remove(&key);
                 }
@@ -124,7 +127,7 @@ impl RouteSimCache {
         entries.insert(
             RouteSimKey {
                 route_state_revision,
-                route_fp,
+                route_edges: CycleEdges::from_slice(route_edges),
                 amount,
             },
             sim,
@@ -174,6 +177,20 @@ impl RouteSimCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+
+    fn route_edges(pool: u32) -> CycleEdges {
+        CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(pool),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }])
+    }
 
     #[test]
     fn route_state_revision_partitions_entries() {
@@ -181,6 +198,7 @@ mod tests {
         cache.insert(
             7,
             11,
+            &route_edges(11),
             U256::from(1u8),
             MinimalSimResult {
                 profit: U256::ZERO,
@@ -199,11 +217,40 @@ mod tests {
             amount_out: U256::ONE,
             total_gas: 1,
         };
-        cache.insert(1, 10, U256::from(100u64), sim);
-        cache.insert(2, 10, U256::from(100u64), sim);
-        assert!(cache.get(1, 10, U256::from(100u64)).is_some());
-        assert!(cache.get(2, 10, U256::from(100u64)).is_some());
+        let edges = route_edges(10);
+        cache.insert(1, 10, &edges, U256::from(100u64), sim);
+        cache.insert(2, 10, &edges, U256::from(100u64), sim);
+        assert!(cache.get(1, 10, &edges, U256::from(100u64)).is_some());
+        assert!(cache.get(2, 10, &edges, U256::from(100u64)).is_some());
         assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn colliding_fingerprints_do_not_alias_distinct_routes() {
+        let cache = RouteSimCache::new();
+        let a = route_edges(1);
+        let b = route_edges(2);
+        let amount = U256::from(100u64);
+        let sim_a = MinimalSimResult {
+            profit: U256::from(1u8),
+            amount_out: U256::from(101u64),
+            total_gas: 1,
+        };
+        let sim_b = MinimalSimResult {
+            profit: U256::from(2u8),
+            amount_out: U256::from(102u64),
+            total_gas: 2,
+        };
+        cache.insert(7, 0, &a, amount, sim_a);
+        cache.insert(7, 0, &b, amount, sim_b);
+        assert_eq!(
+            cache.get(7, 0, &a, amount).expect("route a").profit,
+            sim_a.profit
+        );
+        assert_eq!(
+            cache.get(7, 0, &b, amount).expect("route b").profit,
+            sim_b.profit
+        );
     }
 
     #[test]
@@ -228,14 +275,15 @@ mod tests {
             amount_out: U256::ONE,
             total_gas: 1,
         };
+        let edges = route_edges(0);
         for i in 0..ROUTE_SIM_CACHE_CAPACITY {
-            cache.insert(1, i as u64, U256::from(i as u64), sim);
+            cache.insert(1, i as u64, &edges, U256::from(i as u64), sim);
         }
         assert_eq!(cache.entry_count(), ROUTE_SIM_CACHE_CAPACITY);
-        cache.insert(2, 0, U256::from(0u8), sim);
+        cache.insert(2, 0, &edges, U256::from(0u8), sim);
         // Stale revision-1 entries dropped; new revision-2 entry present.
-        assert!(cache.get(2, 0, U256::from(0u8)).is_some());
-        assert!(cache.get(1, 0, U256::from(0u64)).is_none());
+        assert!(cache.get(2, 0, &edges, U256::from(0u8)).is_some());
+        assert!(cache.get(1, 0, &edges, U256::from(0u64)).is_none());
         assert!(cache.entry_count() < ROUTE_SIM_CACHE_CAPACITY);
     }
 
@@ -249,13 +297,14 @@ mod tests {
         };
         // Fill one shard with distinct amounts under the same revision.
         let fp = 0u64;
+        let edges = route_edges(0);
         for i in 0..ROUTE_SIM_CACHE_SHARD_CAPACITY {
-            cache.insert(7, fp, U256::from(i as u64 + 1), sim);
+            cache.insert(7, fp, &edges, U256::from(i as u64 + 1), sim);
         }
         assert_eq!(cache.entry_count(), ROUTE_SIM_CACHE_SHARD_CAPACITY);
         // Next insert must not wipe the whole shard.
-        cache.insert(7, fp, U256::from(u64::MAX), sim);
-        assert!(cache.get(7, fp, U256::from(u64::MAX)).is_some());
+        cache.insert(7, fp, &edges, U256::from(u64::MAX), sim);
+        assert!(cache.get(7, fp, &edges, U256::from(u64::MAX)).is_some());
         let n = cache.entry_count();
         assert!(n > ROUTE_SIM_CACHE_SHARD_CAPACITY / 2);
         assert!(n <= ROUTE_SIM_CACHE_SHARD_CAPACITY / 2 + 1);

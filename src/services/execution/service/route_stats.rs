@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use super::ExecutionService;
+use crate::core::types::{CycleEdges, Edge};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct RouteStats {
@@ -31,7 +32,6 @@ pub(super) enum RouteFailureKind {
 }
 
 impl RouteFailureKind {
-    /// Stable on-disk tag (must match `replay_route_stats`).
     pub(super) const fn as_tag(self) -> &'static str {
         match self {
             Self::DryRun => "DryRun",
@@ -39,6 +39,56 @@ impl RouteFailureKind {
             Self::Timeout => "Timeout",
             Self::Revert => "Revert",
             Self::RealizedLoss => "RealizedLoss",
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RouteStatsEvent {
+    Success,
+    DryRunPass,
+    Failure(RouteFailureKind),
+    AdaptiveFlashCap(u64),
+}
+
+const ROUTE_STATS_RECORD_VERSION: &str = "v1";
+
+fn encode_cycle_edges(edges: &[Edge]) -> String {
+    edges
+        .iter()
+        .map(|edge| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                edge.pool_index.0,
+                edge.token_in.0,
+                edge.token_out.0,
+                edge.token_in_idx,
+                edge.token_out_idx,
+                edge.protocol as u8,
+                edge.fee_bps,
+                u8::from(edge.zero_for_one),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn encode_route_event(edges: &[Edge], fingerprint: u64, event: RouteStatsEvent) -> String {
+    let encoded_edges = encode_cycle_edges(edges);
+    match event {
+        RouteStatsEvent::Success => {
+            format!("{ROUTE_STATS_RECORD_VERSION} {fingerprint} {encoded_edges} s")
+        }
+        RouteStatsEvent::DryRunPass => {
+            format!("{ROUTE_STATS_RECORD_VERSION} {fingerprint} {encoded_edges} d")
+        }
+        RouteStatsEvent::Failure(kind) => format!(
+            "{ROUTE_STATS_RECORD_VERSION} {fingerprint} {encoded_edges} f {}",
+            kind.as_tag()
+        ),
+        RouteStatsEvent::AdaptiveFlashCap(cap) => {
+            format!("{ROUTE_STATS_RECORD_VERSION} {fingerprint} {encoded_edges} c {cap}")
         }
     }
 }
@@ -166,69 +216,28 @@ fn route_stats_writer_loop(path: PathBuf, rx: mpsc::Receiver<RouteStatsMsg>) {
 }
 
 impl ExecutionService {
-    pub(super) fn write_route_event(&self, line: String) {
-        self.route_stats_writer.enqueue(line);
+    pub(super) fn write_route_event(
+        &self,
+        edges: &[Edge],
+        fingerprint: u64,
+        event: RouteStatsEvent,
+    ) {
+        self.route_stats_writer
+            .enqueue(encode_route_event(edges, fingerprint, event));
     }
 
-    pub(super) fn replay_route_stats(path: &std::path::Path) -> FxHashMap<u64, RouteStats> {
-        let Ok(file) = std::fs::File::open(path) else {
-            return FxHashMap::default();
-        };
-        let mut stats = FxHashMap::default();
-        let mut reader = BufReader::with_capacity(64 * 1024, file);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Err(e) => {
-                    crate::warn!(
-                        "route stats replay stopped on IO error at {}: {e}",
-                        path.display()
-                    );
-                    break;
-                }
-                Ok(_) => {
-                    let mut parts = line.split_whitespace();
-                    let Some(fp_str) = parts.next() else {
-                        continue;
-                    };
-                    let Ok(fp) = fp_str.parse::<u64>() else {
-                        continue;
-                    };
-                    let Some(tag) = parts.next() else {
-                        continue;
-                    };
-                    let entry: &mut RouteStats = stats.entry(fp).or_default();
-                    match tag {
-                        "s" => entry.successes += 1,
-                        "d" => entry.dry_run_successes += 1,
-                        "c" => {
-                            entry.adaptive_flash_loan_usd =
-                                parts.next().and_then(|value| value.parse().ok())
-                        }
-                        "f" => {
-                            entry.failures += 1;
-                            match parts.next() {
-                                Some("DryRun") => entry.dry_run_failures += 1,
-                                Some("Submit") => entry.submit_failures += 1,
-                                Some("Timeout") => entry.receipt_timeouts += 1,
-                                Some("Revert") => entry.reverts += 1,
-                                Some("RealizedLoss") => entry.realized_losses += 1,
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    pub(super) fn replay_route_stats(path: &std::path::Path) -> FxHashMap<CycleEdges, RouteStats> {
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+            crate::warn!(
+                "route stats replay disabled: arena indexes are process-local; starting route learning fresh"
+            );
         }
-        stats
+        FxHashMap::default()
     }
 
-    pub(super) fn record_route_failure(&self, fp: u64, kind: RouteFailureKind) {
+    pub(super) fn record_route_failure(&self, edges: &[Edge], fp: u64, kind: RouteFailureKind) {
         let mut all = self.route_stats.write();
-        let stats = all.entry(fp).or_default();
+        let stats = all.entry(CycleEdges::from_slice(edges)).or_default();
         stats.failures += 1;
         match kind {
             RouteFailureKind::DryRun => stats.dry_run_failures += 1,
@@ -238,20 +247,62 @@ impl ExecutionService {
             RouteFailureKind::RealizedLoss => stats.realized_losses += 1,
         }
         drop(all);
-        self.write_route_event(format!("{} f {}", fp, kind.as_tag()));
+        self.write_route_event(edges, fp, RouteStatsEvent::Failure(kind));
     }
 
-    pub(super) fn record_route_success(&self, fp: u64) {
-        self.route_stats.write().entry(fp).or_default().successes += 1;
-        self.write_route_event(format!("{} s", fp));
-    }
-
-    pub(super) fn record_route_dry_run_pass(&self, fp: u64) {
+    pub(super) fn record_route_success(&self, edges: &[Edge], fp: u64) {
         self.route_stats
             .write()
-            .entry(fp)
+            .entry(CycleEdges::from_slice(edges))
+            .or_default()
+            .successes += 1;
+        self.write_route_event(edges, fp, RouteStatsEvent::Success);
+    }
+
+    pub(super) fn record_route_dry_run_pass(&self, edges: &[Edge], fp: u64) {
+        self.route_stats
+            .write()
+            .entry(CycleEdges::from_slice(edges))
             .or_default()
             .dry_run_successes += 1;
-        self.write_route_event(format!("{fp} d"));
+        self.write_route_event(edges, fp, RouteStatsEvent::DryRunPass);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+
+    #[test]
+    fn replay_never_binds_process_local_route_indexes() {
+        let path = std::env::temp_dir().join(format!(
+            "rpbot-route-stats-v1-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let route = CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(7),
+            token_in: TokenIndex(11),
+            token_out: TokenIndex(13),
+            token_in_idx: 2,
+            token_out_idx: 3,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]);
+        std::fs::write(
+            &path,
+            encode_route_event(&route, 99, RouteStatsEvent::Success),
+        )
+        .expect("write route stats fixture");
+
+        let saved = ExecutionService::replay_route_stats(&path);
+        assert!(saved.is_empty());
+
+        let _ = std::fs::remove_file(path);
     }
 }

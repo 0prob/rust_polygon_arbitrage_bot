@@ -27,15 +27,14 @@ use crate::pipeline::sim_sanity::{
     check_sim_sanity_for_dispatch, min_economic_amount_in,
 };
 use crate::pipeline::types::OptimizationResult;
-use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
+use crate::services::execution::gas_oracle::RouteGasLookup;
 use crate::services::execution::profit::{ProfitEvalContext, brent_score_matic_from_sim};
 
 /// Resolve simulated hop gas the same way probe ranking does before Brent scoring.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteGasCosting<'a> {
     pub lookup: &'a RouteGasLookup,
-    pub oracle: &'a GasOracle,
-    pub fingerprint: u64,
+    pub edges: &'a [Edge],
     /// True for Direct `batchSwap` all-in seeds — skip global sim_scale uplift.
     pub calibrated_seed: bool,
 }
@@ -46,10 +45,10 @@ impl RouteGasCosting<'_> {
     pub fn resolve(self, simulated_gas: u32) -> u32 {
         if self.calibrated_seed {
             self.lookup
-                .route_gas_observed_or_seed(self.oracle, self.fingerprint, simulated_gas)
+                .route_gas_observed_or_seed(self.edges, simulated_gas)
         } else {
             self.lookup
-                .route_gas_or_heuristic(self.oracle, self.fingerprint, simulated_gas)
+                .route_gas_or_heuristic(self.edges, simulated_gas)
         }
     }
 }
@@ -1007,7 +1006,7 @@ pub fn optimize_cycle(
             return brent_score_matic_from_sim(sim, amount, profit_ctx);
         }
         if let Some((cache, route_state_revision, route_fp)) = route_sim_cache
-            && let Some(cached) = cache.get(route_state_revision, route_fp, amount)
+            && let Some(cached) = cache.get(route_state_revision, route_fp, edges, amount)
         {
             record_brent_cache_route();
             let mut cached = cached;
@@ -1031,7 +1030,7 @@ pub fn optimize_cycle(
                 // Memoize before reject branches — zero-profit was ~95% of evals and
                 // was re-walked on every golden revisit / worker (route cache hit≈0).
                 if let Some((cache, route_state_revision, route_fp)) = route_sim_cache {
-                    cache.insert(route_state_revision, route_fp, amount, sim);
+                    cache.insert(route_state_revision, route_fp, edges, amount, sim);
                 }
                 let mut sim = sim;
                 if let Some(costing) = route_gas {
@@ -1135,7 +1134,7 @@ pub fn optimize_cycle(
     } else {
         let mut raw = route_sim_cache
             .and_then(|(cache, route_state_revision, route_fp)| {
-                cache.get(route_state_revision, route_fp, optimal)
+                cache.get(route_state_revision, route_fp, edges, optimal)
             })
             .or_else(|| {
                 simulate_route_minimal_with_caps(

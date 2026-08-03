@@ -1372,7 +1372,7 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
     if state_provider.is_some() {
         let tick_pools = collect_v3_pool_addresses(&arena, cycles_arc.as_ref());
         let v4_tick_pools = collect_v4_tick_targets(cycles_arc.as_ref(), pool_metas.as_ref());
-        let state_block = ctx.refresh.last_state_block();
+        let state_block = ctx.refresh.last_state_block().await;
         let pinned_block = (state_block > 0).then_some(state_block);
         // Only hydrate pools missing ticks — arena sync now preserves CL ticks
         // when sqrt_price/liquidity/tick are unchanged, so most LF passes skip RPC.
@@ -2287,10 +2287,11 @@ pub async fn run_lf_tick(ctx: &LfContext, shutdown: &watch::Receiver<bool>) -> a
             routing_graph.as_ref(),
         ),
     );
+    let (state_block, state_hash) = ctx.refresh.last_state_provenance().await;
     ctx.snapshots
         .publish(crate::services::hf_snapshot::HfSnapshot {
-            state_block: ctx.refresh.last_state_block(),
-            state_hash: ctx.refresh.last_state_hash(),
+            state_block,
+            state_hash,
             cycles: capped.into_iter().map(Arc::new).collect(),
             token_to_matic_rates: rates,
             token_decimals: decimals,

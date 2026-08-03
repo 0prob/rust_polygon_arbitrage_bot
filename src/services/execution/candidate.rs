@@ -2,7 +2,7 @@ use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use rustc_hash::FxHashMap;
 
 use crate::core::types::{
-    EvaluatedRoute, FlashLoanSource, PoolIndex, ProtocolType, RouteSimulationResult,
+    CycleEdges, EvaluatedRoute, FlashLoanSource, PoolIndex, ProtocolType, RouteSimulationResult,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::PoolMeta;
@@ -20,6 +20,8 @@ use crate::services::execution::profit::on_chain_min_profit_from_assessment;
 #[derive(Debug, Clone)]
 pub struct CandidateExecution {
     pub route_fingerprint: u64,
+    /// Full ordered route identity for correctness-critical admission gates.
+    pub route_edges: CycleEdges,
     pub calldata: Bytes,
     pub target_address: Address,
     pub value: U256,
@@ -250,6 +252,7 @@ pub fn build_execution_candidate(
 
     Ok(CandidateExecution {
         route_fingerprint: config.route_fingerprint,
+        route_edges: evaluated.cycle.edges.clone(),
         calldata: built.data,
         target_address: built.to,
         value: built.value,

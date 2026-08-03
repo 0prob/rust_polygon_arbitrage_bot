@@ -4,17 +4,22 @@ use rpbot::config::CycleFinderMode;
 use rpbot::core::constants::MIN_HOP_TOKEN_BALANCE;
 use rpbot::core::math::uniswap_v2::simulate_v2_swap;
 use rpbot::core::math::uniswap_v3::simulate_v3_swap;
-use rpbot::core::types::{Edge, PoolState, ProtocolType, V2PoolState, V3PoolState, V3Tick};
+use rpbot::core::types::{
+    CycleEdges, Edge, PoolIndex, PoolState, ProtocolType, TokenIndex, V2PoolState, V3PoolState,
+    V3Tick,
+};
 use rpbot::pipeline::arena::StateArena;
 use rpbot::pipeline::cycle_search::find_cycles_for_mode;
 use rpbot::pipeline::graph::{build_graph, pool_meta_from_pair, rescore_graph_in_place};
 use rpbot::pipeline::local_sim::simulate_route_minimal;
 use rpbot::pipeline::ternary::optimize_cycle;
 use rpbot::pipeline::types::{CycleSearchPass, PoolMeta, RoutingGraph};
+use rpbot::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
 use rpbot::test_support::FixtureBuilder;
 use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn bench_swaps(c: &mut Criterion) {
     let mut group = c.benchmark_group("swap");
@@ -300,6 +305,65 @@ fn bench_active_market_search_and_gas(c: &mut Criterion) {
     gas_group.throughput(Throughput::Elements(fixture.route.len() as u64));
     gas_group.bench_function("estimate_route_gas_4hop", |b| {
         b.iter(|| rpbot::pipeline::local_sim::estimate_route_gas(black_box(&fixture.route)));
+    });
+
+    let oracle = GasOracle::new(Duration::from_secs(1));
+    let lookup_routes: Vec<CycleEdges> = (0..64)
+        .map(|pool_index| {
+            CycleEdges::from_slice(&[Edge {
+                pool_index: PoolIndex(pool_index),
+                token_in: TokenIndex(0),
+                token_out: TokenIndex(1),
+                token_in_idx: 0,
+                token_out_idx: 1,
+                protocol: ProtocolType::UniswapV2,
+                fee_bps: 30,
+                zero_for_one: true,
+            }])
+        })
+        .collect();
+    let populated_oracle = GasOracle::new(Duration::from_secs(1));
+    for route in lookup_routes.iter().step_by(2) {
+        populated_oracle.record_route_gas(route.as_slice(), 200_000);
+    }
+    gas_group.throughput(Throughput::Elements(lookup_routes.len() as u64));
+    gas_group.bench_function("route_lookup_64", |b| {
+        b.iter_with_large_drop(|| {
+            RouteGasLookup::for_routes(
+                black_box(&oracle),
+                black_box(&lookup_routes)
+                    .iter()
+                    .map(|route| route.as_slice()),
+            )
+        });
+    });
+    gas_group.bench_function("route_lookup_64_with_staging", |b| {
+        b.iter_with_large_drop(|| {
+            let staged: Vec<&[Edge]> = black_box(&lookup_routes)
+                .iter()
+                .map(|route| route.as_slice())
+                .collect();
+            RouteGasLookup::for_routes(black_box(&oracle), staged)
+        });
+    });
+    gas_group.bench_function("route_lookup_64_populated", |b| {
+        b.iter_with_large_drop(|| {
+            RouteGasLookup::for_routes(
+                black_box(&populated_oracle),
+                black_box(&lookup_routes)
+                    .iter()
+                    .map(|route| route.as_slice()),
+            )
+        });
+    });
+    gas_group.bench_function("route_lookup_64_populated_with_staging", |b| {
+        b.iter_with_large_drop(|| {
+            let staged: Vec<&[Edge]> = black_box(&lookup_routes)
+                .iter()
+                .map(|route| route.as_slice())
+                .collect();
+            RouteGasLookup::for_routes(black_box(&populated_oracle), staged)
+        });
     });
     gas_group.finish();
 }

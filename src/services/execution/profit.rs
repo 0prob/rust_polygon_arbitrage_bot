@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::constants::BPS_SCALE;
-use crate::core::types::{FlashLoanSource, ProfitAssessment, TokenIndex};
+use crate::core::types::{Edge, FlashLoanSource, ProfitAssessment, TokenIndex};
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::types::MinimalSimResult;
 use crate::services::execution::gas_oracle::{GasOracle, RouteGasLookup};
@@ -452,13 +452,12 @@ pub enum AssessmentGas<'a> {
     /// HF eval: per-tick prefetch table, then oracle fallback (applies global sim_scale).
     TickRoute {
         lookup: &'a RouteGasLookup,
-        oracle: &'a GasOracle,
-        route_fp: u64,
+        edges: &'a [Edge],
     },
-    /// Dispatch / capped re-opt: direct oracle lookup by route fingerprint.
+    /// Dispatch / capped re-opt: direct oracle lookup by exact route edges.
     Route {
         oracle: &'a GasOracle,
-        route_fp: u64,
+        edges: &'a [Edge],
     },
     /// Live-calibrated all-in seed (Direct `batchSwap` / pure-DODO flash) — observed
     /// or seed, no sim_scale. Global scale is trained on mixed-route underestimates
@@ -466,7 +465,7 @@ pub enum AssessmentGas<'a> {
     CalibratedSeed {
         lookup: Option<&'a RouteGasLookup>,
         oracle: &'a GasOracle,
-        route_fp: u64,
+        edges: &'a [Edge],
     },
 }
 
@@ -476,19 +475,18 @@ pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 
     match gas {
         AssessmentGas::TickRoute {
             lookup,
-            oracle,
-            route_fp,
-        } => lookup.route_gas_or_heuristic(oracle, *route_fp, simulated_gas),
-        AssessmentGas::Route { oracle, route_fp } => {
-            oracle.route_gas_or_heuristic(*route_fp, simulated_gas)
+            edges,
+        } => lookup.route_gas_or_heuristic(edges, simulated_gas),
+        AssessmentGas::Route { oracle, edges } => {
+            oracle.route_gas_or_heuristic(edges, simulated_gas)
         }
         AssessmentGas::CalibratedSeed {
             lookup,
             oracle,
-            route_fp,
+            edges,
         } => match lookup {
-            Some(lookup) => lookup.route_gas_observed_or_seed(oracle, *route_fp, simulated_gas),
-            None => oracle.route_gas_observed_or_seed(*route_fp, simulated_gas),
+            Some(lookup) => lookup.route_gas_observed_or_seed(edges, simulated_gas),
+            None => oracle.route_gas_observed_or_seed(edges, simulated_gas),
         },
     }
 }
@@ -496,10 +494,9 @@ pub fn assessment_gas_units(simulated_gas: u32, gas: &AssessmentGas<'_>) -> u32 
 /// HF/dispatch gas resolution: Direct `batchSwap` / pure-DODO flash seeds skip global sim_scale.
 #[must_use]
 pub fn assessment_gas_for_edges<'a>(
-    edges: &[crate::core::types::Edge],
+    edges: &'a [crate::core::types::Edge],
     lookup: Option<&'a RouteGasLookup>,
     oracle: &'a GasOracle,
-    route_fp: u64,
 ) -> AssessmentGas<'a> {
     if crate::pipeline::route_calls::balancer_direct_batch_eligible(edges)
         || crate::pipeline::route_calls::dodo_flash_batch_eligible(edges)
@@ -507,16 +504,15 @@ pub fn assessment_gas_for_edges<'a>(
         AssessmentGas::CalibratedSeed {
             lookup,
             oracle,
-            route_fp,
+            edges,
         }
     } else if let Some(lookup) = lookup {
         AssessmentGas::TickRoute {
             lookup,
-            oracle,
-            route_fp,
+            edges,
         }
     } else {
-        AssessmentGas::Route { oracle, route_fp }
+        AssessmentGas::Route { oracle, edges }
     }
 }
 
@@ -922,6 +918,7 @@ fn rejected_arithmetic(input: &AssessProfitInput, reason: &str) -> ProfitAssessm
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
 
     fn input() -> AssessProfitInput {
         AssessProfitInput {
@@ -1429,8 +1426,6 @@ mod safety_tests {
 
     #[test]
     fn calibrated_seed_assessment_skips_sim_scale() {
-        use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
-
         let oracle = crate::services::execution::gas_oracle::GasOracle::default();
         oracle.record_sim_observed(100_000, 150_000); // → 1.125×
         let bal_edge = Edge {
@@ -1444,7 +1439,7 @@ mod safety_tests {
             protocol: ProtocolType::BalancerV2,
         };
         let edges = [bal_edge, bal_edge];
-        let gas = assessment_gas_for_edges(&edges, None, &oracle, 1);
+        let gas = assessment_gas_for_edges(&edges, None, &oracle);
         assert_eq!(assessment_gas_units(220_000, &gas), 220_000);
         // Pure DODO flash also takes calibrated seed (no sim_scale).
         let dodo_edge = Edge {
@@ -1452,7 +1447,7 @@ mod safety_tests {
             ..bal_edge
         };
         let dodo_edges = [dodo_edge, dodo_edge];
-        let dodo_gas = assessment_gas_for_edges(&dodo_edges, None, &oracle, 3);
+        let dodo_gas = assessment_gas_for_edges(&dodo_edges, None, &oracle);
         assert_eq!(
             assessment_gas_units(crate::core::constants::GAS_DODO_FLASH_BATCH, &dodo_gas),
             crate::core::constants::GAS_DODO_FLASH_BATCH
@@ -1462,23 +1457,33 @@ mod safety_tests {
             protocol: ProtocolType::UniswapV2,
             ..bal_edge
         };
-        let mixed = assessment_gas_for_edges(&[v2, v2], None, &oracle, 2);
+        let mixed_edges = [v2, v2];
+        let mixed = assessment_gas_for_edges(&mixed_edges, None, &oracle);
         assert_eq!(assessment_gas_units(200_000, &mixed), 225_000);
     }
 
     #[test]
-    fn route_and_tick_route_gas_match_for_single_fingerprint() {
+    fn route_and_tick_route_gas_match_for_single_route() {
         let oracle = crate::services::execution::gas_oracle::GasOracle::default();
-        oracle.record_route_gas(0xABCD, 250_000);
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [0xABCD]);
+        let edges = [Edge {
+            pool_index: PoolIndex(0xABCD),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        oracle.record_route_gas(&edges, 250_000);
+        let lookup = RouteGasLookup::for_routes(&oracle, [edges.as_slice()]);
         let tick = AssessmentGas::TickRoute {
             lookup: &lookup,
-            oracle: &oracle,
-            route_fp: 0xABCD,
+            edges: &edges,
         };
         let route = AssessmentGas::Route {
             oracle: &oracle,
-            route_fp: 0xABCD,
+            edges: &edges,
         };
         let tick_gas = assessment_gas_units(100_000, &tick);
         let route_gas = assessment_gas_units(100_000, &route);
@@ -1493,15 +1498,24 @@ mod safety_tests {
         for _ in 0..8 {
             oracle.record_sim_observed(100_000, 150_000);
         }
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [0xBEEF]);
+        let edges = [Edge {
+            pool_index: PoolIndex(0xBEEF),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }];
+        let lookup = RouteGasLookup::for_routes(&oracle, [edges.as_slice()]);
         let tick = AssessmentGas::TickRoute {
             lookup: &lookup,
-            oracle: &oracle,
-            route_fp: 0xBEEF,
+            edges: &edges,
         };
         let route = AssessmentGas::Route {
             oracle: &oracle,
-            route_fp: 0xBEEF,
+            edges: &edges,
         };
         let tick_gas = assessment_gas_units(100_000, &tick);
         let route_gas = assessment_gas_units(100_000, &route);

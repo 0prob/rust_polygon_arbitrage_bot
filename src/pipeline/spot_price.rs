@@ -275,15 +275,10 @@ pub fn compute_edge_log_weight(fee_bps: u32) -> f64 {
 
 #[derive(Debug, Clone, Default)]
 pub struct SpotTable {
-    ratios: rustc_hash::FxHashMap<u64, U256>,
+    ratios: rustc_hash::FxHashMap<Edge, U256>,
 }
 
 impl SpotTable {
-    #[inline]
-    fn key(edge: &Edge) -> u64 {
-        crate::pipeline::cycle_filter::edge_hop_key(edge)
-    }
-
     #[must_use]
     pub fn new(pool_count: usize) -> Self {
         Self::with_capacity(pool_count.saturating_mul(4))
@@ -314,12 +309,12 @@ impl SpotTable {
 
     #[must_use]
     pub fn get_ratio(&self, edge: &Edge) -> Option<U256> {
-        self.ratios.get(&Self::key(edge)).copied()
+        self.ratios.get(edge).copied()
     }
 
     pub fn set_ratio(&mut self, edge: &Edge, ratio: U256) {
         if !ratio.is_zero() {
-            self.ratios.insert(Self::key(edge), ratio);
+            self.ratios.insert(*edge, ratio);
         }
     }
 

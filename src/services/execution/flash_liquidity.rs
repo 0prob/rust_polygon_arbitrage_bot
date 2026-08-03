@@ -1618,14 +1618,13 @@ fn reoptimize_capped(
     profit_ctx.hop_count = input.evaluated.cycle.edge_hops();
     profit_ctx.profit_priority_alpha_bps = input.profit_priority_alpha_bps;
     profit_ctx.charged_priority_fee_per_gas = charged_priority_from_oracle(input.gas_oracle);
-    let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_fingerprints(
+    let route_gas = crate::services::execution::gas_oracle::RouteGasLookup::for_routes(
         input.gas_oracle,
-        [input.route_fingerprint],
+        [input.evaluated.cycle.edges.as_slice()],
     );
     let route_gas_costing = RouteGasCosting {
         lookup: &route_gas,
-        oracle: input.gas_oracle,
-        fingerprint: input.route_fingerprint,
+        edges: &input.evaluated.cycle.edges,
         calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(
             &input.evaluated.cycle.edges,
         ) || crate::pipeline::route_calls::dodo_flash_batch_eligible(
@@ -1669,7 +1668,6 @@ fn reoptimize_capped(
             &input.evaluated.cycle.edges,
             None,
             input.gas_oracle,
-            input.route_fingerprint,
         ),
         thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
@@ -1802,7 +1800,6 @@ fn reassess_route(
             &input.evaluated.cycle.edges,
             None,
             input.gas_oracle,
-            input.route_fingerprint,
         ),
         thresholds: prepare_profit_thresholds(input),
         token_to_matic_rates: input.token_to_matic_rates,
@@ -1830,7 +1827,6 @@ fn reuse_or_reassess(
             input.evaluated.result.total_gas,
             input.gas_price,
             input.gas_oracle,
-            input.route_fingerprint,
             &input.evaluated.cycle.edges,
         )
     {
@@ -1856,7 +1852,6 @@ fn assessment_gas_matches(
     simulated_gas: u32,
     gas_price: U256,
     gas_oracle: &crate::services::execution::gas_oracle::GasOracle,
-    route_fp: u64,
     edges: &[crate::core::types::Edge],
 ) -> bool {
     // Must use the same units as assess_route_from_sim (observed/scaled/calibrated), not raw
@@ -1865,7 +1860,7 @@ fn assessment_gas_matches(
     let units = crate::services::execution::profit::assessment_gas_units(
         simulated_gas,
         &crate::services::execution::profit::assessment_gas_for_edges(
-            edges, None, gas_oracle, route_fp,
+            edges, None, gas_oracle,
         ),
     );
     match U256::from(units).checked_mul(gas_price) {
@@ -1975,13 +1970,27 @@ mod tests {
 
     #[test]
     fn assessment_gas_matches_uses_observed_units_not_raw_sim() {
+        use crate::core::types::{CycleEdges, Edge, PoolIndex, ProtocolType};
         use crate::services::execution::gas_oracle::GasOracle;
 
         let oracle = GasOracle::new(std::time::Duration::from_secs(1));
         let raw_sim = 200_000u32;
         let observed = 280_000u32; // dry-run learned
-        let fp = 42u64;
-        oracle.record_route_gas(fp, observed);
+        let edges = CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(42),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]);
+        let other_edges = CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(99),
+            ..edges[0]
+        }]);
+        oracle.record_route_gas(&edges, observed);
         let price = U256::from(100u64);
         let assessment = ProfitAssessment {
             should_execute: true,
@@ -2006,23 +2015,19 @@ mod tests {
             assessment.gas_cost_wei
         );
         // Non-Direct edges → observed/scaled path (not calibrated seed).
-        let edges: &[crate::core::types::Edge] = &[];
         assert!(assessment_gas_matches(
             &assessment,
             raw_sim,
             price,
             &oracle,
-            fp,
-            edges,
+            &edges,
         ));
-        // Wrong fp falls back to heuristic (raw at scale 1×) → mismatch.
         assert!(!assessment_gas_matches(
             &assessment,
             raw_sim,
             price,
             &oracle,
-            99,
-            edges,
+            &other_edges,
         ));
     }
 

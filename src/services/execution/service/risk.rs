@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, FixedBytes, U256};
 
 use super::ExecutionService;
-use super::route_stats::RouteFailureKind;
+use super::route_stats::{RouteFailureKind, RouteStatsEvent};
 use super::{
     ADAPTIVE_FLASH_CAP_START_DIVISOR, BATCH_QUERY_FAIL_QUARANTINE,
     CHRONIC_DUST_AVAILABLE_MATIC_WEI, CHRONIC_HIGH_COVER_BPS, CHRONIC_MID_BAND_QUARANTINE,
@@ -18,18 +18,42 @@ use super::{
     STRUCTURAL_DRY_RUN_QUARANTINE,
 };
 use crate::config::AppConfig;
+use crate::core::types::{CycleEdges, Edge};
 
 impl ExecutionService {
-    pub fn any_quarantined(&self, fingerprints: &[u64]) -> bool {
+    pub fn any_quarantined(&self, routes: &[CycleEdges]) -> bool {
         let q = self.quarantine.read();
         let now = Instant::now();
-        fingerprints
+        routes
             .iter()
-            .any(|fp| q.get(fp).is_some_and(|expiry| now < *expiry))
+            .any(|edges| q.get(edges).is_some_and(|expiry| now < *expiry))
     }
 
-    pub fn is_route_quarantined(&self, fingerprint: u64) -> bool {
-        self.any_quarantined(&[fingerprint])
+    pub fn is_route_quarantined(&self, edges: &[Edge]) -> bool {
+        self.any_quarantined(&[CycleEdges::from_slice(edges)])
+    }
+
+    #[inline]
+    pub(crate) fn for_each_edge_rotation(edges: &[Edge], mut visit: impl FnMut(&[Edge])) {
+        let _ = Self::any_edge_rotation(edges, |rotation| {
+            visit(rotation);
+            false
+        });
+    }
+
+    #[inline]
+    fn any_edge_rotation(edges: &[Edge], mut predicate: impl FnMut(&[Edge]) -> bool) -> bool {
+        if edges.is_empty() {
+            return false;
+        }
+        let mut rotated = CycleEdges::from_slice(edges);
+        for _ in 0..edges.len() {
+            if predicate(&rotated) {
+                return true;
+            }
+            rotated.rotate_left(1);
+        }
+        false
     }
 
     /// True when any start-rotation of `edges` is quarantined.
@@ -37,42 +61,26 @@ impl ExecutionService {
     /// current fp lets Aave-rotated starts leak back into probe_kept (live iter13:
     /// assess in=1 quarantine=1 ×224 after single-fp re-check).
     #[must_use]
-    pub fn cycle_edges_quarantined(&self, edges: &[crate::core::types::Edge]) -> bool {
-        let fps = Self::edge_rotation_fps(edges);
-        !fps.is_empty() && self.any_quarantined(&fps)
-    }
-
-    fn edge_rotation_fps(
-        edges: &[crate::core::types::Edge],
-    ) -> smallvec::SmallVec<[u64; crate::core::constants::HOP_CAP_USIZE]> {
-        let n = edges.len();
-        let mut fps =
-            smallvec::SmallVec::<[u64; crate::core::constants::HOP_CAP_USIZE]>::with_capacity(n);
-        if n == 0 {
-            return fps;
-        }
-        let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
-        for _ in 0..n {
-            fps.push(super::super::candidate::hash_cycle_edges(&rotated));
-            rotated.rotate_left(1);
-        }
-        fps
+    pub fn cycle_edges_quarantined(&self, edges: &[Edge]) -> bool {
+        let q = self.quarantine.read();
+        let now = Instant::now();
+        Self::any_edge_rotation(edges, |rotation| {
+            q.get(rotation).is_some_and(|expiry| now < *expiry)
+        })
     }
 
     /// Claim exclusive assess/Brent for this edge set (all rotations). Fails when
     /// quarantined or another tick already claimed — stops concurrent assess_q spam.
     #[must_use]
-    pub fn try_claim_route_assess(&self, edges: &[crate::core::types::Edge]) -> bool {
-        let fps = Self::edge_rotation_fps(edges);
-        if fps.is_empty() || self.any_quarantined(&fps) {
+    pub fn try_claim_route_assess(&self, edges: &[Edge]) -> bool {
+        if edges.is_empty() || self.cycle_edges_quarantined(edges) {
             return false;
         }
         let mut map = self.assess_inflight.write();
         let now = Instant::now();
-        if fps
-            .iter()
-            .any(|fp| map.get(fp).is_some_and(|exp| *exp > now))
-        {
+        if Self::any_edge_rotation(edges, |rotation| {
+            map.get(rotation).is_some_and(|exp| *exp > now)
+        }) {
             return false;
         }
         static CLAIMS: AtomicU32 = AtomicU32::new(0);
@@ -80,9 +88,9 @@ impl ExecutionService {
             map.retain(|_, exp| *exp > now);
         }
         let until = now + ROUTE_ASSESS_CLAIM_TTL;
-        for fp in fps {
-            map.insert(fp, until);
-        }
+        Self::for_each_edge_rotation(edges, |rotation| {
+            map.insert(CycleEdges::from_slice(rotation), until);
+        });
         true
     }
 
@@ -94,14 +102,14 @@ impl ExecutionService {
 
     /// Insert route quarantine and amortize expired-entry prune (live: 700+ cools/run
     /// left stale fps forever → larger maps + slower `any_quarantined` on every select).
-    pub(super) fn quarantine_insert(&self, fingerprint: u64, until: Instant) {
+    pub(super) fn quarantine_insert(&self, edges: &[Edge], until: Instant) {
         let mut q = self.quarantine.write();
         static INSERTS: AtomicU32 = AtomicU32::new(0);
         if INSERTS.fetch_add(1, Ordering::Relaxed).is_multiple_of(32) {
             let now = Instant::now();
             q.retain(|_, exp| *exp > now);
         }
-        q.insert(fingerprint, until);
+        q.insert(CycleEdges::from_slice(edges), until);
     }
 
     pub(super) fn route_cooldown(&self, config: &AppConfig) -> Duration {
@@ -112,11 +120,11 @@ impl ExecutionService {
         }
     }
 
-    pub fn is_route_on_cooldown(&self, fingerprint: u64, config: &AppConfig) -> bool {
+    pub fn is_route_on_cooldown(&self, edges: &[Edge], config: &AppConfig) -> bool {
         let cooldown = self.route_cooldown(config);
         let last = self.last_submit.read();
         let now = Instant::now();
-        last.get(&fingerprint)
+        last.get(edges)
             .is_some_and(|t| now.saturating_duration_since(*t) < cooldown)
     }
 
@@ -161,8 +169,8 @@ impl ExecutionService {
     }
 
     /// Longer cooldown when vault `queryBatchSwap` disagrees with local sim.
-    pub fn quarantine_batch_query_failure(&self, fingerprint: u64) {
-        self.quarantine_insert(fingerprint, Instant::now() + BATCH_QUERY_FAIL_QUARANTINE);
+    pub fn quarantine_batch_query_failure(&self, edges: &[Edge], fingerprint: u64) {
+        self.quarantine_insert(edges, Instant::now() + BATCH_QUERY_FAIL_QUARANTINE);
         self.prepare_skip_counts.write().remove(&fingerprint);
     }
 
@@ -170,23 +178,26 @@ impl ExecutionService {
     /// Uses `ROUTE_COOLDOWN` — batch-query's 600s emptied the HF window (live: selected=0).
     /// Never shortens an existing longer cooldown (underwater 600s was getting
     /// clobbered to 30s by rotation cools).
-    pub fn quarantine_stale_route(&self, fingerprint: u64) {
+    pub fn quarantine_stale_route(&self, edges: &[Edge]) {
         let until = Instant::now() + ROUTE_COOLDOWN;
         let mut q = self.quarantine.write();
-        if q.get(&fingerprint).is_none_or(|exp| *exp < until) {
-            q.insert(fingerprint, until);
+        if q.get(edges).is_none_or(|exp| *exp < until) {
+            q.insert(CycleEdges::from_slice(edges), until);
         }
     }
 
     /// Cool probe-only routes that never clear the ≥1 start-token dispatch floor.
     /// Returns true when a new cool-down was applied (no refresh of an active cool).
-    pub fn quarantine_probe_below_dispatch_floor(&self, fingerprint: u64) -> bool {
+    pub fn quarantine_probe_below_dispatch_floor(&self, edges: &[Edge]) -> bool {
         let now = Instant::now();
         let mut q = self.quarantine.write();
-        if q.get(&fingerprint).is_some_and(|exp| *exp > now) {
+        if q.get(edges).is_some_and(|exp| *exp > now) {
             return false;
         }
-        q.insert(fingerprint, now + PROBE_BELOW_FLOOR_QUARANTINE);
+        q.insert(
+            CycleEdges::from_slice(edges),
+            now + PROBE_BELOW_FLOOR_QUARANTINE,
+        );
         true
     }
 
@@ -213,7 +224,7 @@ impl ExecutionService {
     pub fn cycle_has_quarantined_token(
         &self,
         arena: &crate::pipeline::arena::StateArena,
-        edges: &[crate::core::types::Edge],
+        edges: &[Edge],
     ) -> bool {
         let q = self.direct_token_quarantine.read();
         if q.is_empty() {
@@ -236,12 +247,18 @@ impl ExecutionService {
         *counts.entry(fingerprint).or_insert(0) += 1;
     }
 
-    pub(super) fn quarantine_route(&self, fp: u64, now: Instant, kind: RouteFailureKind) {
-        self.record_route_failure(fp, kind);
+    pub(super) fn quarantine_route(
+        &self,
+        edges: &[Edge],
+        fp: u64,
+        now: Instant,
+        kind: RouteFailureKind,
+    ) {
+        self.record_route_failure(edges, fp, kind);
         // Lock order: fail_counts → quarantine (always acquire in this order).
         let count = {
             let mut fc = self.fail_counts.write();
-            let count = fc.entry(fp).or_insert(0);
+            let count = fc.entry(CycleEdges::from_slice(edges)).or_insert(0);
             *count += 1;
             *count
         };
@@ -250,18 +267,18 @@ impl ExecutionService {
         } else {
             ROUTE_COOLDOWN
         };
-        self.quarantine_insert(fp, now + cooldown);
+        self.quarantine_insert(edges, now + cooldown);
     }
 
-    pub(super) fn quarantine_route_soft(&self, fp: u64, now: Instant) {
-        self.quarantine_insert(fp, now + ROUTE_COOLDOWN);
+    pub(super) fn quarantine_route_soft(&self, edges: &[Edge], now: Instant) {
+        self.quarantine_insert(edges, now + ROUTE_COOLDOWN);
     }
 
     /// Soft-quarantine routes that win best-eval while covering ≪ gas (dust arbs).
     /// Returns the applied TTL when a *new* cooldown was set (not on refresh / strike).
     pub fn quarantine_chronic_gas_underwater(
         &self,
-        fingerprint: u64,
+        edges: &[Edge],
         gas_cover_bps: u64,
         available_matic_wei: U256,
     ) -> Option<Duration> {
@@ -284,14 +301,14 @@ impl ExecutionService {
         if self
             .quarantine
             .read()
-            .get(&fingerprint)
+            .get(edges)
             .is_some_and(|expiry| now < *expiry)
         {
             return None;
         }
         let strikes = {
             let mut map = self.underwater_strikes.write();
-            let entry = map.entry(fingerprint).or_insert((0, now));
+            let entry = map.entry(CycleEdges::from_slice(edges)).or_insert((0, now));
             if now.saturating_duration_since(entry.1) > CHRONIC_UNDERWATER_STRIKE_WINDOW {
                 *entry = (0, now);
             }
@@ -324,7 +341,7 @@ impl ExecutionService {
         if strikes < strikes_needed {
             return None;
         }
-        self.underwater_strikes.write().remove(&fingerprint);
+        self.underwater_strikes.write().remove(edges);
         // TTL tiers:
         //   wei-dust (<0.001 MATIC)                    → 1h
         //   near-miss (≥500 bps + ≥0.01)               → 30s
@@ -339,15 +356,15 @@ impl ExecutionService {
         } else {
             CHRONIC_UNDERWATER_QUARANTINE
         };
-        self.quarantine_insert(fingerprint, now + ttl);
+        self.quarantine_insert(edges, now + ttl);
         Some(ttl)
     }
 
     /// Extend quarantine to `until` without shortening an existing longer cool.
-    pub fn quarantine_extend_until(&self, fingerprint: u64, until: Instant) {
+    pub fn quarantine_extend_until(&self, edges: &[Edge], until: Instant) {
         let mut q = self.quarantine.write();
-        if q.get(&fingerprint).is_none_or(|exp| *exp < until) {
-            q.insert(fingerprint, until);
+        if q.get(edges).is_none_or(|exp| *exp < until) {
+            q.insert(CycleEdges::from_slice(edges), until);
         }
     }
 
@@ -361,9 +378,9 @@ impl ExecutionService {
             .is_some_and(|expiry| Instant::now() < expiry)
     }
 
-    pub(super) fn clear_fail_count(&self, fp: u64) {
-        self.fail_counts.write().remove(&fp);
-        self.record_route_success(fp);
+    pub(super) fn clear_fail_count(&self, edges: &[Edge], fp: u64) {
+        self.fail_counts.write().remove(edges);
+        self.record_route_success(edges, fp);
     }
 
     /// Learned minimum-profit uplift. With fewer than three outcomes there is
@@ -371,16 +388,16 @@ impl ExecutionService {
     ///
     /// `failures` already counts every bad outcome once. Hard kinds (revert /
     /// realized loss) get **+1 weight** (2× total); timeouts get **+½**.
-    pub fn route_risk_multiplier_bps(&self, fp: u64) -> u64 {
+    pub fn route_risk_multiplier_bps(&self, edges: &[Edge]) -> u64 {
         let stats = self.route_stats.read();
-        Self::risk_multiplier_bps_from_stats(stats.get(&fp))
+        Self::risk_multiplier_bps_from_stats(stats.get(edges))
     }
 
     /// Single read-lock snapshot of learned risk + adaptive flash USD for the HF prepare path.
     #[must_use]
-    pub fn route_learning_snapshot(&self, fp: u64, configured_max_usd: u64) -> (u64, u64) {
+    pub fn route_learning_snapshot(&self, edges: &[Edge], configured_max_usd: u64) -> (u64, u64) {
         let stats = self.route_stats.read();
-        let entry = stats.get(&fp);
+        let entry = stats.get(edges);
         let risk_bps = Self::risk_multiplier_bps_from_stats(entry);
         let flash_usd = Self::adaptive_flash_loan_usd_from_stats(entry, configured_max_usd);
         (risk_bps, flash_usd)
@@ -426,20 +443,21 @@ impl ExecutionService {
     }
 
     #[must_use]
-    pub fn adaptive_flash_loan_usd(&self, fp: u64, configured_max_usd: u64) -> u64 {
+    pub fn adaptive_flash_loan_usd(&self, edges: &[Edge], configured_max_usd: u64) -> u64 {
         let stats = self.route_stats.read();
-        Self::adaptive_flash_loan_usd_from_stats(stats.get(&fp), configured_max_usd)
+        Self::adaptive_flash_loan_usd_from_stats(stats.get(edges), configured_max_usd)
     }
 
     pub(super) fn promote_adaptive_flash_loan_cap(
         &self,
+        edges: &[Edge],
         fp: u64,
         configured_max_usd: u64,
     ) -> Option<(u64, u64)> {
         let mut stats = self.route_stats.write();
         let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
         let current = stats
-            .get(&fp)
+            .get(edges)
             .and_then(|stats| stats.adaptive_flash_loan_usd)
             .unwrap_or(initial)
             .min(configured_max_usd);
@@ -447,9 +465,12 @@ impl ExecutionService {
         if next == current {
             return None;
         }
-        stats.entry(fp).or_default().adaptive_flash_loan_usd = Some(next);
+        stats
+            .entry(CycleEdges::from_slice(edges))
+            .or_default()
+            .adaptive_flash_loan_usd = Some(next);
         drop(stats);
-        self.write_route_event(format!("{fp} c {next}"));
+        self.write_route_event(edges, fp, RouteStatsEvent::AdaptiveFlashCap(next));
         Some((current, next))
     }
 
@@ -457,13 +478,14 @@ impl ExecutionService {
     /// Floor is the conservative start (`configured/4`) so we do not collapse to zero.
     pub(super) fn demote_adaptive_flash_loan_cap(
         &self,
+        edges: &[Edge],
         fp: u64,
         configured_max_usd: u64,
     ) -> Option<(u64, u64)> {
         let mut stats = self.route_stats.write();
         let initial = Self::adaptive_flash_cap_initial(configured_max_usd);
         let current = stats
-            .get(&fp)
+            .get(edges)
             .and_then(|s| s.adaptive_flash_loan_usd)
             .unwrap_or(initial)
             .min(configured_max_usd);
@@ -471,9 +493,51 @@ impl ExecutionService {
         if next >= current {
             return None;
         }
-        stats.entry(fp).or_default().adaptive_flash_loan_usd = Some(next);
+        stats
+            .entry(CycleEdges::from_slice(edges))
+            .or_default()
+            .adaptive_flash_loan_usd = Some(next);
         drop(stats);
-        self.write_route_event(format!("{fp} c {next}"));
+        self.write_route_event(edges, fp, RouteStatsEvent::AdaptiveFlashCap(next));
         Some((current, next))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+
+    fn edge(pool: u32, token_in: u32, token_out: u32) -> Edge {
+        Edge {
+            pool_index: PoolIndex(pool),
+            token_in: TokenIndex(token_in),
+            token_out: TokenIndex(token_out),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }
+    }
+
+    #[test]
+    fn edge_rotation_visitor_preserves_order_and_empty_behavior() {
+        let edges = CycleEdges::from_slice(&[edge(1, 1, 2), edge(2, 2, 3), edge(3, 3, 1)]);
+        let mut rotations = Vec::new();
+        ExecutionService::for_each_edge_rotation(&edges, |rotation| {
+            rotations.push(CycleEdges::from_slice(rotation));
+        });
+
+        assert_eq!(rotations.len(), edges.len());
+        for (offset, rotation) in rotations.iter().enumerate() {
+            for (index, edge) in rotation.iter().enumerate() {
+                assert_eq!(*edge, edges[(offset + index) % edges.len()]);
+            }
+        }
+
+        let mut empty_visits = 0;
+        ExecutionService::for_each_edge_rotation(&[], |_| empty_visits += 1);
+        assert_eq!(empty_visits, 0);
     }
 }

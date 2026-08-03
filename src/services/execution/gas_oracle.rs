@@ -13,6 +13,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use crate::core::types::{CycleEdges, Edge};
 use crate::infra::rpc::RpcPool;
 
 use super::gas::{
@@ -20,7 +21,7 @@ use super::gas::{
 };
 
 const ROUTE_GAS_HISTORY: usize = 256;
-/// Cap sim→observed uplift for cold heuristics (unseen fingerprints).
+/// Cap sim→observed uplift for cold heuristics (unseen routes).
 /// 3.0× let BAL/mixed underestimates (live 1.87M vs 720k) train a global scale that
 /// re-inflated every V2/V3 near-miss (~2× gas phantom). Per-route `record_route_gas`
 /// still learns outliers; 1.5× is enough for mild hop-seed underestimates.
@@ -31,11 +32,11 @@ const MIN_SIM_SCALE_BPS: u32 = 10_000;
 /// accurate dry-runs can pull a poisoned scale back toward 1.0× (prior clamp at
 /// 10k left scale sticky at 1.4–1.5× forever).
 const MIN_OBS_RATIO_BPS: u32 = 8_000;
-/// Ratios above this are protocol/route outliers — teach fingerprint only, not global EMA.
+/// Ratios above this are protocol/route outliers — teach that route only, not global EMA.
 const GLOBAL_SCALE_OUTLIER_BPS: u32 = 18_000;
 const SNAPSHOT_LOG_CHANGE_BPS: u64 = 500;
 
-/// Prefetch observed route gas for an HF tick's fingerprints (always — was gated at 48,
+/// Prefetch observed route gas for an HF tick's routes (always — was gated at 48,
 /// so small ticks paid a mutex per route on the hot path).
 pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 1;
 
@@ -43,29 +44,30 @@ pub const ROUTE_GAS_CACHE_MIN_ROUTES: usize = 1;
 #[derive(Clone, Debug)]
 pub struct RouteGasLookup {
     scale_bps: u64,
-    observed: FxHashMap<u64, u32>,
+    observed: FxHashMap<CycleEdges, u32>,
 }
 
 impl RouteGasLookup {
-    /// Build a tick-local observed-gas map for `fingerprints` (one mutex pass).
-    pub fn for_fingerprints(
+    /// Build a tick-local observed-gas map for `routes` (one mutex pass).
+    pub fn for_routes<'a>(
         oracle: &GasOracle,
-        fingerprints: impl IntoIterator<Item = u64>,
+        routes: impl IntoIterator<Item = &'a [Edge]>,
     ) -> Self {
-        let fps: Vec<u64> = fingerprints.into_iter().collect();
+        let routes = routes.into_iter();
         let scale_bps = oracle.sim_scale_bps().max(10_000);
-        if fps.is_empty() {
+        let (lower, upper) = routes.size_hint();
+        if upper == Some(0) {
             return Self {
                 scale_bps,
                 observed: FxHashMap::default(),
             };
         }
-        let mut observed =
-            FxHashMap::with_capacity_and_hasher(fps.len().min(ROUTE_GAS_HISTORY), FxBuildHasher);
+        let capacity = upper.unwrap_or(lower).min(ROUTE_GAS_HISTORY);
+        let mut observed = FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher);
         let history = oracle.route_gas.lock();
-        for fp in fps {
-            if let Some(&gas) = history.map.get(&fp) {
-                observed.insert(fp, gas);
+        for edges in routes {
+            if let Some(&gas) = history.map.get(edges) {
+                observed.insert(CycleEdges::from_slice(edges), gas);
             }
         }
         Self {
@@ -80,18 +82,13 @@ impl RouteGasLookup {
     }
 
     #[cfg(test)]
-    pub(crate) fn observed_gas(&self, route_fp: u64) -> Option<u32> {
-        self.observed.get(&route_fp).copied()
+    pub(crate) fn observed_gas(&self, edges: &[Edge]) -> Option<u32> {
+        self.observed.get(edges).copied()
     }
 
     /// Prefer prefetched observed gas; otherwise scaled heuristic (lock-free after build).
-    pub fn route_gas_or_heuristic(
-        &self,
-        _oracle: &GasOracle,
-        route_fp: u64,
-        heuristic: u32,
-    ) -> u32 {
-        if let Some(&gas) = self.observed.get(&route_fp) {
+    pub fn route_gas_or_heuristic(&self, edges: &[Edge], heuristic: u32) -> u32 {
+        if let Some(&gas) = self.observed.get(edges) {
             return gas;
         }
         scaled_simulated_gas(heuristic, self.scale_bps)
@@ -102,20 +99,20 @@ impl RouteGasLookup {
     /// Use for all-in calibrated seeds ([`crate::core::constants::balancer_direct_batch_gas`])
     /// so mixed-route underestimates cannot re-inflate Direct near-miss gas.
     #[must_use]
-    pub fn route_gas_observed_or_seed(&self, _oracle: &GasOracle, route_fp: u64, seed: u32) -> u32 {
-        if let Some(&gas) = self.observed.get(&route_fp) {
+    pub fn route_gas_observed_or_seed(&self, edges: &[Edge], seed: u32) -> u32 {
+        if let Some(&gas) = self.observed.get(edges) {
             return gas;
         }
         seed
     }
 }
 
-/// Bounded route-fp → observed gas with FIFO eviction (≤[`ROUTE_GAS_HISTORY`]).
+/// Bounded route → observed gas with FIFO eviction (≤[`ROUTE_GAS_HISTORY`]).
 /// One mutex — 256 entries do not need DashMap sharding (docs warn on `iter`/`len`).
 #[derive(Debug)]
 struct RouteGasHistory {
-    map: FxHashMap<u64, u32>,
-    order: VecDeque<u64>,
+    map: FxHashMap<CycleEdges, u32>,
+    order: VecDeque<CycleEdges>,
 }
 
 #[derive(Debug)]
@@ -150,13 +147,13 @@ impl GasOracle {
         }
     }
 
-    pub fn observed_route_gas(&self, route_fp: u64) -> Option<u32> {
-        self.route_gas.lock().map.get(&route_fp).copied()
+    pub fn observed_route_gas(&self, edges: &[Edge]) -> Option<u32> {
+        self.route_gas.lock().map.get(edges).copied()
     }
 
-    /// Prefer dry-run / on-chain gas for this route fingerprint, else scaled heuristic.
-    pub fn route_gas_or_heuristic(&self, route_fp: u64, heuristic: u32) -> u32 {
-        if let Some(observed) = self.observed_route_gas(route_fp) {
+    /// Prefer dry-run / on-chain gas for this route, else scaled heuristic.
+    pub fn route_gas_or_heuristic(&self, edges: &[Edge], heuristic: u32) -> u32 {
+        if let Some(observed) = self.observed_route_gas(edges) {
             return observed;
         }
         let scale = self.sim_scale_bps.load(Ordering::Relaxed).max(10_000) as u64;
@@ -166,8 +163,8 @@ impl GasOracle {
     /// Prefer dry-run / on-chain gas; else return `seed` without global sim_scale.
     /// For live-calibrated Direct batch seeds — see [`RouteGasLookup::route_gas_observed_or_seed`].
     #[must_use]
-    pub fn route_gas_observed_or_seed(&self, route_fp: u64, seed: u32) -> u32 {
-        self.observed_route_gas(route_fp).unwrap_or(seed)
+    pub fn route_gas_observed_or_seed(&self, edges: &[Edge], seed: u32) -> u32 {
+        self.observed_route_gas(edges).unwrap_or(seed)
     }
 
     /// Current global sim→observed gas scale in bps (10_000 = 1.0×).
@@ -175,23 +172,24 @@ impl GasOracle {
         self.sim_scale_bps.load(Ordering::Relaxed).max(10_000) as u64
     }
 
-    /// Record on-chain or dry-run gas for a route fingerprint.
+    /// Record on-chain or dry-run gas for an exact ordered route.
     ///
     /// Updates use mild EMA + LRU touch so hot routes are not FIFO-evicted while
-    /// cold fingerprints sit at the tail (live: re-hit fps lost after 256 inserts).
-    pub fn record_route_gas(&self, route_fp: u64, gas: u32) {
+    /// cold routes sit at the tail (live: re-hit routes lost after 256 inserts).
+    pub fn record_route_gas(&self, edges: &[Edge], gas: u32) {
         if gas == 0 {
             return;
         }
+        let route = CycleEdges::from_slice(edges);
         let mut hist = self.route_gas.lock();
-        if let Some(entry) = hist.map.get_mut(&route_fp) {
+        if let Some(entry) = hist.map.get_mut(&route) {
             // 75% prior + 25% observation — dampens estimate_gas thrash.
             let blended = (u64::from(*entry).saturating_mul(3) + u64::from(gas)) / 4;
             *entry = u32::try_from(blended).unwrap_or(u32::MAX).max(1);
-            // LRU: move to back so active fps survive the 256-cap.
-            if let Some(pos) = hist.order.iter().position(|&fp| fp == route_fp) {
+            // LRU: move to back so active routes survive the 256-cap.
+            if let Some(pos) = hist.order.iter().position(|known| known == &route) {
                 hist.order.remove(pos);
-                hist.order.push_back(route_fp);
+                hist.order.push_back(route);
             }
             return;
         }
@@ -201,8 +199,8 @@ impl GasOracle {
             };
             hist.map.remove(&old);
         }
-        hist.map.insert(route_fp, gas);
-        hist.order.push_back(route_fp);
+        hist.map.insert(route.clone(), gas);
+        hist.order.push_back(route);
     }
 
     #[cfg(test)]
@@ -213,7 +211,7 @@ impl GasOracle {
     /// Calibrate heuristic gas from estimate_gas / dry-run observations.
     ///
     /// Extreme ratios (BAL/callback underestimates) are ignored for the **global**
-    /// scale — those routes already get an accurate fingerprint via
+    /// scale — those routes already get an accurate observation via
     /// [`Self::record_route_gas`]. Blending them here starved V2/V3 cold edges.
     ///
     /// Sub-1.0× observations are blended (floor [`MIN_OBS_RATIO_BPS`]) so scale can
@@ -453,25 +451,47 @@ fn fee_changed_by_at_least(previous: U256, current: U256) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{PoolIndex, ProtocolType, TokenIndex};
+
+    fn route(pool_index: u32) -> CycleEdges {
+        CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(pool_index),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }])
+    }
 
     #[test]
     fn route_gas_lookup_prefetches_observed_gas() {
         let oracle = GasOracle::new(Duration::from_secs(1));
-        oracle.record_route_gas(7, 500_000);
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [7u64, 8, 9]);
-        assert_eq!(lookup.observed_gas(7), Some(500_000));
-        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 7, 100_000), 500_000);
-        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 99, 100_000), 100_000);
+        let observed = route(7);
+        let unobserved = route(8);
+        oracle.record_route_gas(&observed, 500_000);
+        let lookup =
+            RouteGasLookup::for_routes(&oracle, [observed.as_slice(), unobserved.as_slice()]);
+        assert_eq!(lookup.observed_gas(&observed), Some(500_000));
+        assert_eq!(lookup.route_gas_or_heuristic(&observed, 100_000), 500_000);
+        assert_eq!(lookup.route_gas_or_heuristic(&unobserved, 100_000), 100_000);
     }
 
     #[test]
     fn route_gas_lookup_does_not_read_observations_added_after_snapshot() {
         let oracle = GasOracle::new(Duration::from_secs(1));
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [7u64]);
-        oracle.record_route_gas(99, 190_000);
-        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 99, 100_000), 100_000);
+        let prefetched = route(7);
+        let added_later = route(99);
+        let lookup = RouteGasLookup::for_routes(&oracle, [prefetched.as_slice()]);
+        oracle.record_route_gas(&added_later, 190_000);
         assert_eq!(
-            lookup.route_gas_observed_or_seed(&oracle, 99, 220_000),
+            lookup.route_gas_or_heuristic(&added_later, 100_000),
+            100_000
+        );
+        assert_eq!(
+            lookup.route_gas_observed_or_seed(&added_later, 220_000),
             220_000
         );
     }
@@ -509,20 +529,26 @@ mod tests {
         oracle.record_sim_observed(100_000, 150_000);
         assert_eq!(oracle.sim_scale_bps(), 11_250);
         let direct_seed = 220_000u32; // balancer_direct_batch_gas(2)
+        let unseen = route(99);
         // Scaled path re-inflates; calibrated path must not.
-        assert_eq!(oracle.route_gas_or_heuristic(99, direct_seed), 247_500);
+        assert_eq!(oracle.route_gas_or_heuristic(&unseen, direct_seed), 247_500);
         assert_eq!(
-            oracle.route_gas_observed_or_seed(99, direct_seed),
+            oracle.route_gas_observed_or_seed(&unseen, direct_seed),
             direct_seed
         );
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64]);
+        let prefetched = route(1);
+        let lookup = RouteGasLookup::for_routes(&oracle, [prefetched.as_slice()]);
         assert_eq!(
-            lookup.route_gas_observed_or_seed(&oracle, 99, direct_seed),
+            lookup.route_gas_observed_or_seed(&unseen, direct_seed),
             direct_seed
         );
         // Observed still wins over seed.
-        oracle.record_route_gas(7, 210_000);
-        assert_eq!(oracle.route_gas_observed_or_seed(7, direct_seed), 210_000);
+        let observed = route(7);
+        oracle.record_route_gas(&observed, 210_000);
+        assert_eq!(
+            oracle.route_gas_observed_or_seed(&observed, direct_seed),
+            210_000
+        );
     }
 
     #[test]
@@ -532,16 +558,19 @@ mod tests {
 
         // 75% prior (1.0x) + 25% observation (1.5x) → 1.125×.
         assert_eq!(oracle.sim_scale_bps(), 11_250);
-        assert_eq!(oracle.route_gas_or_heuristic(99, 100_000), 112_500);
+        assert_eq!(oracle.route_gas_or_heuristic(&route(99), 100_000), 112_500);
     }
 
     #[test]
     fn route_gas_lookup_prefetches_even_small_batches() {
         let oracle = GasOracle::new(Duration::from_secs(1));
-        oracle.record_route_gas(1, 250_000);
-        let lookup = RouteGasLookup::for_fingerprints(&oracle, [1u64, 2]);
-        assert_eq!(lookup.observed_gas(1), Some(250_000));
-        assert_eq!(lookup.route_gas_or_heuristic(&oracle, 1, 100_000), 250_000);
+        let observed = route(1);
+        let unobserved = route(2);
+        oracle.record_route_gas(&observed, 250_000);
+        let lookup =
+            RouteGasLookup::for_routes(&oracle, [observed.as_slice(), unobserved.as_slice()]);
+        assert_eq!(lookup.observed_gas(&observed), Some(250_000));
+        assert_eq!(lookup.route_gas_or_heuristic(&observed, 100_000), 250_000);
     }
 
     #[test]
@@ -554,33 +583,42 @@ mod tests {
     }
 
     #[test]
-    fn route_gas_history_is_bounded_and_updates_existing_fingerprint() {
+    fn route_gas_history_is_bounded_and_updates_existing_route() {
         let oracle = GasOracle::new(Duration::from_secs(1));
-        for fp in 0..ROUTE_GAS_HISTORY as u64 {
-            oracle.record_route_gas(fp, 100 + fp as u32);
+        for pool in 0..ROUTE_GAS_HISTORY as u32 {
+            oracle.record_route_gas(&route(pool), 100 + pool);
         }
         assert_eq!(oracle.route_gas_tracked(), ROUTE_GAS_HISTORY);
-        // Touch fp=0: EMA + LRU refresh (not last-write only, not FIFO-sticky).
-        oracle.record_route_gas(0, 9_999);
-        let after_touch = oracle.observed_route_gas(0).expect("hot fp");
+        let hot = route(0);
+        oracle.record_route_gas(&hot, 9_999);
+        let after_touch = oracle.observed_route_gas(&hot).expect("hot route");
         assert!(
             after_touch > 100 && after_touch < 9_999,
             "EMA blend prior+obs, got {after_touch}"
         );
-        oracle.record_route_gas(ROUTE_GAS_HISTORY as u64, 42);
+        let added = route(ROUTE_GAS_HISTORY as u32);
+        oracle.record_route_gas(&added, 42);
         assert!(oracle.route_gas_tracked() <= ROUTE_GAS_HISTORY);
+        assert_eq!(oracle.observed_route_gas(&added), Some(42));
         assert_eq!(
-            oracle.observed_route_gas(ROUTE_GAS_HISTORY as u64),
-            Some(42)
-        );
-        // Hot fp=0 must survive eviction of the FIFO head (was: update left order[0]=0).
-        assert_eq!(
-            oracle.observed_route_gas(0),
+            oracle.observed_route_gas(&hot),
             Some(after_touch),
-            "LRU touch must keep active fingerprint under cap pressure"
+            "LRU touch must keep active route under cap pressure"
         );
-        // Oldest untouched (fp=1) is the eviction victim.
-        assert!(oracle.observed_route_gas(1).is_none());
+        assert!(oracle.observed_route_gas(&route(1)).is_none());
+    }
+
+    #[test]
+    fn forced_fingerprint_collision_does_not_alias_route_gas() {
+        let oracle = GasOracle::new(Duration::from_secs(1));
+        let first = (0xfeed_u64, route(1));
+        let second = (0xfeed_u64, route(2));
+        assert_eq!(first.0, second.0);
+        oracle.record_route_gas(&first.1, 210_000);
+        oracle.record_route_gas(&second.1, 410_000);
+        let lookup = RouteGasLookup::for_routes(&oracle, [first.1.as_slice(), second.1.as_slice()]);
+        assert_eq!(lookup.route_gas_or_heuristic(&first.1, 100_000), 210_000);
+        assert_eq!(lookup.route_gas_or_heuristic(&second.1, 100_000), 410_000);
     }
 
     #[test]

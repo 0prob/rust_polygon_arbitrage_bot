@@ -30,8 +30,7 @@ use crate::services::execution::flash_liquidity::{
     collect_flash_tokens_for_cycle, route_is_balancer_only,
 };
 use crate::services::execution::{
-    ExecutionService, GasOracle, compute_assessment_gas_price, hash_cycle_edges,
-    rotate_cycle_to_start,
+    ExecutionService, GasOracle, compute_assessment_gas_price, rotate_cycle_to_start,
 };
 use crate::services::hf_snapshot::SnapshotStore;
 
@@ -572,24 +571,16 @@ fn quarantine_edge_rotations_for(
         return;
     }
     let until = Instant::now() + ttl;
-    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
-    for _ in 0..n {
-        execution.quarantine_extend_until(hash_cycle_edges(&rotated), until);
-        rotated.rotate_left(1);
-    }
+    ExecutionService::for_each_edge_rotation(edges, |rotated| {
+        execution.quarantine_extend_until(rotated, until);
+    });
 }
 
 /// Soft `ROUTE_COOLDOWN` on all start-rotations (structural / probe-below-floor).
 fn quarantine_all_edge_rotations(execution: &ExecutionService, edges: &[crate::core::types::Edge]) {
-    let n = edges.len();
-    if n == 0 {
-        return;
-    }
-    let mut rotated = crate::core::types::CycleEdges::from_slice(edges);
-    for _ in 0..n {
-        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
-        rotated.rotate_left(1);
-    }
+    ExecutionService::for_each_edge_rotation(edges, |rotated| {
+        execution.quarantine_stale_route(rotated);
+    });
 }
 
 /// Whether a positive-net assess reject should get the sticky 300s cool.
@@ -2060,7 +2051,7 @@ pub async fn run_hf_tick(
     if log_hf_summary {
         crate::info!(
             "hf eval input: stream_triggered={stream_triggered} snap_generation={selection_generation} state_generation={evaluation_state_generation} state_block={} hot_pools={} hot_cache_drop={hot_cache_dropped} gas_snapshot_age_ms={gas_snapshot_age_ms:?}",
-            ctx.refresh.last_state_block(),
+            ctx.refresh.last_state_block().await,
             hot_pools.len(),
         );
     }
@@ -2482,7 +2473,7 @@ pub async fn run_hf_tick(
             && result.sim.amount_in >= economic_floor
             && input_matic >= U256::from(5u128 * 10u128.pow(16))
         {
-            let observed_gas = ctx.gas_oracle.observed_route_gas(result.route_fingerprint);
+            let observed_gas = ctx.gas_oracle.observed_route_gas(&result.cycle.edges);
             best_gross_diag = Some(BestEvalDiag {
                 fp: result.route_fingerprint,
                 hops: result.cycle.edge_hops(),
@@ -2503,7 +2494,6 @@ pub async fn run_hf_tick(
                             &result.cycle.edges,
                             None,
                             ctx.gas_oracle.as_ref(),
-                            result.route_fingerprint,
                         ),
                     )
                 }),
@@ -2560,7 +2550,7 @@ pub async fn run_hf_tick(
     let mut dispatch_state_block = if snap_state_block > 0 {
         snap_state_block
     } else {
-        ctx.refresh.last_state_block()
+        ctx.refresh.last_state_block().await
     };
     let mut dispatch_state_hash = snap_state_hash;
     let verify_started = now_ms();
@@ -2591,8 +2581,8 @@ pub async fn run_hf_tick(
             skip_dispatch_refresh = prefetch_ok || resim_refreshed;
             if resim_refreshed {
                 dispatch_state_generation = resim_generation;
-                dispatch_state_block = ctx.refresh.last_state_block();
-                dispatch_state_hash = ctx.refresh.last_state_hash();
+                (dispatch_state_block, dispatch_state_hash) =
+                    ctx.refresh.last_state_provenance().await;
                 if dispatch_state_block == 0 {
                     crate::warn!("dropping refreshed routes: state refresh has no pinned block");
                     profitable.clear();
@@ -2699,7 +2689,7 @@ pub async fn run_hf_tick(
                 if positive_net_sticky_cool_eligible(reason, net, gas_cost)
                     && ctx
                         .execution
-                        .quarantine_probe_below_dispatch_floor(near.route_fingerprint)
+                        .quarantine_probe_below_dispatch_floor(&near.cycle.edges)
                 {
                     quarantine_all_edge_rotations(&ctx.execution, &near.cycle.edges);
                     crate::info!(
@@ -2713,7 +2703,7 @@ pub async fn run_hf_tick(
                     // Cap cover at 9999 so chronic high-cover band applies (3 strikes).
                     let available = gas_cost.saturating_add(net);
                     if let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
-                        near.route_fingerprint,
+                        &near.cycle.edges,
                         9_999,
                         available,
                     ) {
@@ -2733,7 +2723,7 @@ pub async fn run_hf_tick(
                     .gas_cost_wei
                     .saturating_sub(diag.gas_shortfall_matic_wei);
                 if let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
-                    diag.fp,
+                    &diag.edges,
                     diag.gas_cover_bps,
                     available_matic,
                 ) {
@@ -2791,7 +2781,7 @@ pub async fn run_hf_tick(
                 // after sticky cool) — cool it so near_net stops filling the window.
                 if let Some(ref edges) = cover_peak_edges
                     && let Some(ttl) = ctx.execution.quarantine_chronic_gas_underwater(
-                        cover_peak_fp,
+                        edges,
                         cover_max_bps,
                         cover_peak_avail,
                     )
@@ -3119,7 +3109,10 @@ mod tests {
         assert!(after >= HF_PROBE_HYDRATE_MAX_BUDGET);
         let (work, hydrate) = reserve_hydrate_budget(after);
         assert_eq!(hydrate, HF_PROBE_HYDRATE_MAX_BUDGET);
-        assert!(!work.is_zero(), "pool/work budget must remain after cold flash");
+        assert!(
+            !work.is_zero(),
+            "pool/work budget must remain after cold flash"
+        );
         assert_eq!(cold + work + hydrate, stage);
     }
 

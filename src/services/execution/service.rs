@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use crate::config::AppConfig;
 use crate::config::WalletSecrets;
-use crate::core::types::FlashLoanSource;
+use crate::core::types::{CycleEdges, FlashLoanSource};
 use crate::infra::rpc::RpcPool;
 use crate::orchestrator::ui_hook::SharedUiHook;
 use crate::services::execution::candidate::CandidateExecution;
@@ -138,20 +138,19 @@ const ADAPTIVE_FLASH_CAP_START_DIVISOR: u64 = 4;
 
 #[derive(Debug)]
 pub struct ExecutionService {
-    last_submit: RwLock<FxHashMap<u64, Instant>>,
+    last_submit: RwLock<FxHashMap<CycleEdges, Instant>>,
     last_global_submit: Mutex<Option<Instant>>,
     /// Cached `(fetched_at, latest_nonce, pending_nonce)` for mempool gate RPC coalescing.
     mempool_nonce_cache: Mutex<Option<(Instant, u64, u64)>>,
-    quarantine: RwLock<FxHashMap<u64, Instant>>,
+    quarantine: RwLock<FxHashMap<CycleEdges, Instant>>,
     /// Short exclusive claim while a tick runs Brent/assess on a route (all rotations).
-    assess_inflight: RwLock<FxHashMap<u64, Instant>>,
+    assess_inflight: RwLock<FxHashMap<CycleEdges, Instant>>,
     route_hash_quarantine: RwLock<FxHashMap<FixedBytes<32>, Instant>>,
     /// Direct (`executeArbDirect`) start tokens that failed zero-realized confirm.
     direct_token_quarantine: RwLock<FxHashMap<Address, Instant>>,
-    /// Underwater best-eval strike counts: fp → (strikes, last_strike_at).
-    underwater_strikes: RwLock<FxHashMap<u64, (u32, Instant)>>,
+    underwater_strikes: RwLock<FxHashMap<CycleEdges, (u32, Instant)>>,
     global_quarantine_until: Mutex<Option<Instant>>,
-    fail_counts: RwLock<FxHashMap<u64, u32>>,
+    fail_counts: RwLock<FxHashMap<CycleEdges, u32>>,
     nonce: RwLock<Option<(Address, Arc<NonceManager>)>>,
     pub flash_liquidity: Arc<FlashLiquidityCache>,
     pnl: Mutex<PnlState>,
@@ -160,7 +159,7 @@ pub struct ExecutionService {
     pub consecutive_fails: AtomicU32,
     /// When set, [`Self::record_realized`] trips a 1h global quarantine on breach.
     max_daily_loss_matic_wei: Option<U256>,
-    route_stats: RwLock<FxHashMap<u64, RouteStats>>,
+    route_stats: RwLock<FxHashMap<CycleEdges, RouteStats>>,
     _route_stats_path: PathBuf,
     last_near_miss_log: Mutex<Option<Instant>>,
     last_dispatch_log: Mutex<Option<(u64, U256)>>,
@@ -513,7 +512,7 @@ impl ExecutionService {
             return outcome;
         }
 
-        let risk_multiplier = self.route_risk_multiplier_bps(fp);
+        let risk_multiplier = self.route_risk_multiplier_bps(&candidate.route_edges);
         let learned_floor = candidate
             .min_profit_matic_wei
             .saturating_mul(U256::from(risk_multiplier))
@@ -575,7 +574,7 @@ impl ExecutionService {
             );
         }
 
-        if let Some(expiry) = self.quarantine.read().get(&fp)
+        if let Some(expiry) = self.quarantine.read().get(&candidate.route_edges)
             && now < *expiry
         {
             crate::info!(
@@ -615,7 +614,7 @@ impl ExecutionService {
         }
 
         let route_cooldown = self.route_cooldown(config);
-        if let Some(last) = self.last_submit.read().get(&fp)
+        if let Some(last) = self.last_submit.read().get(&candidate.route_edges)
             && now.saturating_duration_since(*last) < route_cooldown
         {
             crate::info!(
@@ -673,9 +672,9 @@ impl ExecutionService {
                 self.quarantine_direct_token_zero_realized(candidate.profit_token);
             }
             if sim_fidelity_miss {
-                self.quarantine_route_soft(fp, now);
+                self.quarantine_route_soft(&candidate.route_edges, now);
             } else {
-                self.quarantine_route(fp, now, RouteFailureKind::DryRun);
+                self.quarantine_route(&candidate.route_edges, fp, now, RouteFailureKind::DryRun);
             }
             if matches!(
                 dry.decoded_revert,
@@ -695,7 +694,10 @@ impl ExecutionService {
                     // Upgrade fp cool to structural TTL so mixed Aave phantoms
                     // stop crowding Direct profitable candidates.
                     // transferAll-zero / mid-hop underfund are sim-fidelity (soft cool).
-                    self.quarantine_insert(fp, now + STRUCTURAL_DRY_RUN_QUARANTINE);
+                    self.quarantine_insert(
+                        &candidate.route_edges,
+                        now + STRUCTURAL_DRY_RUN_QUARANTINE,
+                    );
                 }
                 // FoT / nonstandard ERC20 TransferFailed: cool the *failing* token.
                 // Live bug: hop-2 TransferFailed on long-tail token quarantined
@@ -737,7 +739,11 @@ impl ExecutionService {
             if candidate.adaptive_flash_cap_bound
                 && flash_size_failure_reason(&reason)
                 && let Some((previous, next)) =
-                    self.demote_adaptive_flash_loan_cap(fp, candidate.adaptive_flash_loan_usd_limit)
+                    self.demote_adaptive_flash_loan_cap(
+                        &candidate.route_edges,
+                        fp,
+                        candidate.adaptive_flash_loan_usd_limit,
+                    )
             {
                 crate::info!(
                     "flash cap demoted: fp={fp} usd={previous}->{next} after size dry-run fail"
@@ -766,7 +772,7 @@ impl ExecutionService {
             return outcome;
         }
 
-        let prior_observed_gas = gas_oracle.observed_route_gas(fp);
+        let prior_observed_gas = gas_oracle.observed_route_gas(&candidate.route_edges);
         let gas_used = submit_gas_basis(
             prior_observed_gas,
             gas_oracle.sim_scale_bps(),
@@ -774,7 +780,7 @@ impl ExecutionService {
             dry.gas_used,
         );
         if gas_used == 0 {
-            self.quarantine_route(fp, now, RouteFailureKind::DryRun);
+            self.quarantine_route(&candidate.route_edges, fp, now, RouteFailureKind::DryRun);
             let outcome = ExecutionOutcome::DryRunFailed {
                 reason: "dry-run passed but gas estimate is zero".into(),
             };
@@ -830,7 +836,7 @@ impl ExecutionService {
             gas_oracle.record_sim_observed(candidate.simulated_gas, gas_used);
             if gas_used > 0 {
                 gas_oracle.record_route_gas(
-                    candidate.route_fingerprint,
+                    &candidate.route_edges,
                     u32::try_from(gas_used).unwrap_or(u32::MAX),
                 );
             }
@@ -846,7 +852,7 @@ impl ExecutionService {
         } {
             Ok(g) => g,
             Err(e) => {
-                self.quarantine_route(fp, now, RouteFailureKind::DryRun);
+                self.quarantine_route(&candidate.route_edges, fp, now, RouteFailureKind::DryRun);
                 let outcome = ExecutionOutcome::DryRunFailed {
                     reason: format!("{e:#}"),
                 };
@@ -953,10 +959,12 @@ impl ExecutionService {
         }
 
         // Sim+profit gate passed — lower learned risk floor for this fingerprint.
-        self.record_route_dry_run_pass(fp);
+        self.record_route_dry_run_pass(&candidate.route_edges, fp);
 
         if config.is_dry_run() {
-            self.last_submit.write().insert(fp, now);
+            self.last_submit
+                .write()
+                .insert(candidate.route_edges.clone(), now);
             let outcome = ExecutionOutcome::DryRunPassed { gas_used };
             if let Some(ui_hook) = ui_hook {
                 ui_hook.on_execution_outcome(&outcome, fp);
@@ -1196,10 +1204,15 @@ impl ExecutionService {
                 self.consecutive_fails.fetch_add(1, Ordering::Relaxed);
                 match action {
                     SubmitAction::ResyncAndRetry => {
-                        self.quarantine_route_soft(fp, now);
+                        self.quarantine_route_soft(&candidate.route_edges, now);
                     }
                     _ => {
-                        self.quarantine_route(fp, now, RouteFailureKind::Submit);
+                        self.quarantine_route(
+                            &candidate.route_edges,
+                            fp,
+                            now,
+                            RouteFailureKind::Submit,
+                        );
                     }
                 }
                 let outcome = ExecutionOutcome::SubmitFailed {
@@ -1235,7 +1248,7 @@ impl ExecutionService {
             }
             ReceiptPollOutcome::RpcFailure(reason) => {
                 nonce_mgr.mark_stale(nonce);
-                self.quarantine_route_soft(fp, now);
+                self.quarantine_route_soft(&candidate.route_edges, now);
                 let outcome = ExecutionOutcome::SubmitFailed {
                     reason: format!("receipt RPC failed; transaction fate unknown: {reason}"),
                 };
@@ -1323,7 +1336,7 @@ impl ExecutionService {
                 }
             }
 
-            self.quarantine_route(fp, now, RouteFailureKind::Timeout);
+            self.quarantine_route(&candidate.route_edges, fp, now, RouteFailureKind::Timeout);
             let outcome = ExecutionOutcome::ReceiptTimeout {
                 tx_hash: tx_hash_str.to_string(),
             };
@@ -1430,10 +1443,12 @@ impl ExecutionService {
         ui_hook: Option<&SharedUiHook>,
     ) -> ExecutionOutcome {
         nonce_mgr.confirm(nonce);
-        self.last_submit.write().insert(fp, now);
+        self.last_submit
+            .write()
+            .insert(candidate.route_edges.clone(), now);
 
         if !receipt.success {
-            self.quarantine_route(fp, now, RouteFailureKind::Revert);
+            self.quarantine_route(&candidate.route_edges, fp, now, RouteFailureKind::Revert);
             let gas_cost = receipt
                 .effective_gas_price
                 .and_then(|price| U256::from(receipt.gas_used).checked_mul(U256::from(price)))
@@ -1461,7 +1476,10 @@ impl ExecutionService {
                     receipt.gas_used.saturating_mul(110) / 100
                 };
                 gas_oracle.record_sim_observed(candidate.simulated_gas, teach_gas);
-                gas_oracle.record_route_gas(fp, u32::try_from(teach_gas).unwrap_or(u32::MAX));
+                gas_oracle.record_route_gas(
+                    &candidate.route_edges,
+                    u32::try_from(teach_gas).unwrap_or(u32::MAX),
+                );
             }
             let revert_detail = receipt.logs.first().map(|l| format!("{:.?}", l.topics()));
             crate::info!(
@@ -1486,7 +1504,10 @@ impl ExecutionService {
         // gas can stop at any hop and would bias future limits downward.
         if receipt.gas_used > 0 {
             gas_oracle.record_sim_observed(candidate.simulated_gas, receipt.gas_used);
-            gas_oracle.record_route_gas(fp, u32::try_from(receipt.gas_used).unwrap_or(u32::MAX));
+            gas_oracle.record_route_gas(
+                &candidate.route_edges,
+                u32::try_from(receipt.gas_used).unwrap_or(u32::MAX),
+            );
         }
 
         let parsed_profit = parse_transfer_profit(
@@ -1498,7 +1519,12 @@ impl ExecutionService {
             crate::error!(
                 "confirmed transaction had no effective_gas_price; refusing PnL attribution: fp={fp}, hash={tx_hash_str}"
             );
-            self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+            self.quarantine_route(
+                &candidate.route_edges,
+                fp,
+                now,
+                RouteFailureKind::RealizedLoss,
+            );
             return ExecutionOutcome::Confirmed {
                 tx_hash: tx_hash_str.to_string(),
                 gas_used: receipt.gas_used,
@@ -1509,7 +1535,12 @@ impl ExecutionService {
             U256::from(receipt.gas_used).checked_mul(U256::from(effective_gas_price))
         else {
             crate::error!("receipt gas cost overflow; refusing PnL attribution: fp={fp}");
-            self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+            self.quarantine_route(
+                &candidate.route_edges,
+                fp,
+                now,
+                RouteFailureKind::RealizedLoss,
+            );
             return ExecutionOutcome::Confirmed {
                 tx_hash: tx_hash_str.to_string(),
                 gas_used: receipt.gas_used,
@@ -1527,10 +1558,11 @@ impl ExecutionService {
         if let Some(profit_matic_wei) = profit_matic_wei {
             self.record_realized(profit_matic_wei, gas_cost);
             if profit_matic_wei >= gas_cost {
-                self.clear_fail_count(fp);
+                self.clear_fail_count(&candidate.route_edges, fp);
                 if profit_matic_wei > gas_cost
                     && candidate.adaptive_flash_cap_bound
                     && let Some((previous, next)) = self.promote_adaptive_flash_loan_cap(
+                        &candidate.route_edges,
                         fp,
                         candidate.adaptive_flash_loan_usd_limit,
                     )
@@ -1540,12 +1572,17 @@ impl ExecutionService {
                     );
                 }
             } else {
-                self.quarantine_route(fp, now, RouteFailureKind::RealizedLoss);
+                self.quarantine_route(
+                    &candidate.route_edges,
+                    fp,
+                    now,
+                    RouteFailureKind::RealizedLoss,
+                );
             }
         } else {
             // Attribution unknown — do not book a phantom gas-only loss (trips breaker /
             // daily-loss on confirmed wins). Soft-cool the route for a retry window.
-            self.quarantine_route_soft(fp, now);
+            self.quarantine_route_soft(&candidate.route_edges, now);
         }
         if parsed_profit.is_none() {
             crate::error!(
@@ -1723,7 +1760,21 @@ fn required_operator_balance(
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+    use crate::core::types::{Edge, PoolIndex, ProtocolType, TokenIndex};
     use crate::services::execution::candidate::CandidateExecution;
+
+    fn test_route(id: u64) -> CycleEdges {
+        CycleEdges::from_slice(&[Edge {
+            pool_index: PoolIndex(id as u32),
+            token_in: TokenIndex(0),
+            token_out: TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }])
+    }
 
     #[test]
     fn already_known_submit_error_keeps_nonce_stale() {
@@ -1737,124 +1788,170 @@ mod safety_tests {
     fn chronic_underwater_quarantine_needs_repeated_strikes() {
         let exec = ExecutionService::default();
         let fp = 0xdead_beef_u64;
+        let route = test_route(fp);
         let thick = U256::from(10u128.pow(17)); // 0.1 MATIC — needs 3 strikes
         // Near-zero cover never strikes (cascade guard).
         assert!(
-            exec.quarantine_chronic_gas_underwater(fp, 10, thick)
+            exec.quarantine_chronic_gas_underwater(&route, 10, thick)
                 .is_none()
         );
-        assert!(!exec.is_route_quarantined(fp));
+        assert!(!exec.is_route_quarantined(&route));
         assert!(
-            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+            exec.quarantine_chronic_gas_underwater(&route, 350, thick)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+            exec.quarantine_chronic_gas_underwater(&route, 350, thick)
                 .is_none()
         );
-        assert!(!exec.is_route_quarantined(fp));
+        assert!(!exec.is_route_quarantined(&route));
         assert!(
-            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+            exec.quarantine_chronic_gas_underwater(&route, 350, thick)
                 .is_some()
         );
-        assert!(exec.is_route_quarantined(fp));
+        assert!(exec.is_route_quarantined(&route));
         // Already quarantined — no re-apply signal.
         assert!(
-            exec.quarantine_chronic_gas_underwater(fp, 350, thick)
+            exec.quarantine_chronic_gas_underwater(&route, 350, thick)
                 .is_none()
         );
         // One-shot diversion (different fp) stays selectable.
+        let one_shot = test_route(0xcafe);
         assert!(
-            exec.quarantine_chronic_gas_underwater(0xcafe_u64, 200, thick)
+            exec.quarantine_chronic_gas_underwater(&one_shot, 200, thick)
                 .is_none()
         );
-        assert!(!exec.is_route_quarantined(0xcafe_u64));
+        assert!(!exec.is_route_quarantined(&one_shot));
         // Sub-100 cover with real MATIC still chronic-cools (live: 42/65 best-evals).
         let low_fp = 0x1042_u64;
+        let low_route = test_route(low_fp);
         assert!(
-            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+            exec.quarantine_chronic_gas_underwater(&low_route, 42, thick)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+            exec.quarantine_chronic_gas_underwater(&low_route, 42, thick)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(low_fp, 42, thick)
+            exec.quarantine_chronic_gas_underwater(&low_route, 42, thick)
                 .is_some()
         );
         // Wei-dust (<0.001 MATIC) cools on first strike with 1h.
         let dust_fp = 0xd057_u64;
+        let dust_route = test_route(dust_fp);
         let dust_avail = U256::from(100u64);
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(dust_fp, 1024, dust_avail),
+            exec.quarantine_chronic_gas_underwater(&dust_route, 1024, dust_avail),
             Some(std::time::Duration::from_secs(3600))
         );
         // Thin absolute + weak cover: first-strike but 600s (not 1h) — iter26 1h
         // rotation cools emptied the HF window (peak cover 575, no ge_1000).
         let thin_fp = 0x7e17_u64;
+        let thin_route = test_route(thin_fp);
         let thin_avail = U256::from(35u128 * 10u128.pow(15)); // 0.035 MATIC
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(thin_fp, 380, thin_avail),
+            exec.quarantine_chronic_gas_underwater(&thin_route, 380, thin_avail),
             Some(std::time::Duration::from_secs(600))
         );
         // Near-miss cover (≥500) at same avail: 1-strike + 30s sticky cool.
         let miss_fp = 0x2661_u64;
+        let miss_route = test_route(miss_fp);
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(miss_fp, 2_661, thin_avail),
+            exec.quarantine_chronic_gas_underwater(&miss_route, 2_661, thin_avail),
             Some(std::time::Duration::from_secs(30))
         );
-        assert!(exec.is_route_quarantined(miss_fp));
+        assert!(exec.is_route_quarantined(&miss_route));
         // Mid-cover with avail in [0.001, 0.01): 90s mid-band (iter36 — was 30s
         // and monopolized HF vs real ≥0.01 near-misses).
         let mid_fp = 0x0524_u64;
+        let mid_route = test_route(mid_fp);
         let mid_avail = U256::from(7u128 * 10u128.pow(15)); // 0.007 MATIC
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(mid_fp, 524, mid_avail),
+            exec.quarantine_chronic_gas_underwater(&mid_route, 524, mid_avail),
             Some(std::time::Duration::from_secs(90))
         );
-        assert!(exec.is_route_quarantined(mid_fp));
+        assert!(exec.is_route_quarantined(&mid_route));
         // Cover≥break-even (10_000) with real MATIC escapes chronic.
         let near_fp = 0x9ea5_u64;
+        let near_route = test_route(near_fp);
         let near_avail = U256::from(15u128 * 10u128.pow(16)); // 0.15 MATIC
         assert!(
-            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+            exec.quarantine_chronic_gas_underwater(&near_route, 20_000, near_avail)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+            exec.quarantine_chronic_gas_underwater(&near_route, 20_000, near_avail)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(near_fp, 20_000, near_avail)
+            exec.quarantine_chronic_gas_underwater(&near_route, 20_000, near_avail)
                 .is_none()
         );
-        assert!(!exec.is_route_quarantined(near_fp));
+        assert!(!exec.is_route_quarantined(&near_route));
         // Half-cover with real MATIC (≥dust) also 1-strike + 30s.
         let half_fp = 0xba1b_a1b0_u64;
+        let half_route = test_route(half_fp);
         let half_avail = U256::from(14u128 * 10u128.pow(16)); // 0.14 MATIC
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(half_fp, 5_068, half_avail),
+            exec.quarantine_chronic_gas_underwater(&half_route, 5_068, half_avail),
             Some(std::time::Duration::from_secs(30))
         );
-        assert!(exec.is_route_quarantined(half_fp));
+        assert!(exec.is_route_quarantined(&half_route));
         // High-cover near-miss (≥7500) needs 3 strikes — do not kill on first look.
         let hi_fp = 0xd0d0_8672_u64;
+        let hi_route = test_route(hi_fp);
         let hi_avail = U256::from(8u128 * 10u128.pow(16)); // 0.08 MATIC
         assert!(
-            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail)
+            exec.quarantine_chronic_gas_underwater(&hi_route, 8_672, hi_avail)
                 .is_none()
         );
         assert!(
-            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail)
+            exec.quarantine_chronic_gas_underwater(&hi_route, 8_672, hi_avail)
                 .is_none()
         );
-        assert!(!exec.is_route_quarantined(hi_fp));
+        assert!(!exec.is_route_quarantined(&hi_route));
         assert_eq!(
-            exec.quarantine_chronic_gas_underwater(hi_fp, 8_672, hi_avail),
+            exec.quarantine_chronic_gas_underwater(&hi_route, 8_672, hi_avail),
             Some(std::time::Duration::from_secs(30))
         );
-        assert!(exec.is_route_quarantined(hi_fp));
+        assert!(exec.is_route_quarantined(&hi_route));
+    }
+
+    #[test]
+    fn colliding_fingerprints_do_not_share_execution_route_gates() {
+        let exec = ExecutionService::default();
+        let first = test_route(1);
+        let second = test_route(2);
+        let colliding_fp = 0xfeed_u64;
+        let now = Instant::now();
+
+        exec.quarantine_route(&first, colliding_fp, now, RouteFailureKind::DryRun);
+        assert!(exec.is_route_quarantined(&first));
+        assert!(!exec.is_route_quarantined(&second));
+
+        exec.quarantine.write().clear();
+        exec.last_submit.write().insert(first.clone(), now);
+        let config = AppConfig::default();
+        assert!(exec.is_route_on_cooldown(&first, &config));
+        assert!(!exec.is_route_on_cooldown(&second, &config));
+
+        assert!(exec.try_claim_route_assess(&first));
+        assert!(exec.try_claim_route_assess(&second));
+
+        exec.route_stats.write().insert(
+            first.clone(),
+            RouteStats {
+                successes: 1,
+                failures: 3,
+                adaptive_flash_loan_usd: Some(50_000),
+                ..RouteStats::default()
+            },
+        );
+        assert_eq!(exec.route_risk_multiplier_bps(&first), 25_000);
+        assert_eq!(exec.route_risk_multiplier_bps(&second), 10_000);
+        assert_eq!(exec.adaptive_flash_loan_usd(&first, 50_000), 50_000);
+        assert_eq!(exec.adaptive_flash_loan_usd(&second, 50_000), 12_500);
     }
 
     #[test]
@@ -2001,6 +2098,7 @@ mod safety_tests {
     fn realized_profit_zero_fails_reassess() {
         let candidate = CandidateExecution {
             route_fingerprint: 8,
+            route_edges: CycleEdges::new(),
             calldata: Default::default(),
             target_address: Address::repeat_byte(8),
             value: U256::ZERO,
@@ -2044,6 +2142,7 @@ mod safety_tests {
     fn realized_profit_short_circuits_modeled_slippage_and_flash_fee() {
         let candidate = CandidateExecution {
             route_fingerprint: 7,
+            route_edges: CycleEdges::new(),
             calldata: Default::default(),
             target_address: Address::repeat_byte(7),
             value: U256::ZERO,
@@ -2090,6 +2189,7 @@ mod safety_tests {
     fn dry_run_reassess_uses_observed_gas_not_submit_limit() {
         let candidate = CandidateExecution {
             route_fingerprint: 9,
+            route_edges: CycleEdges::new(),
             calldata: Default::default(),
             target_address: Address::repeat_byte(9),
             value: U256::ZERO,
@@ -2154,8 +2254,10 @@ mod safety_tests {
     #[test]
     fn learned_failure_rate_raises_profit_floor() {
         let service = ExecutionService::new();
+        let failed_route = test_route(7);
+        let unseen_route = test_route(8);
         service.route_stats.write().insert(
-            7,
+            failed_route.clone(),
             RouteStats {
                 successes: 1,
                 failures: 3,
@@ -2163,15 +2265,16 @@ mod safety_tests {
                 ..RouteStats::default()
             },
         );
-        assert_eq!(service.route_risk_multiplier_bps(7), 25_000);
-        assert_eq!(service.route_risk_multiplier_bps(8), 10_000);
+        assert_eq!(service.route_risk_multiplier_bps(&failed_route), 25_000);
+        assert_eq!(service.route_risk_multiplier_bps(&unseen_route), 10_000);
     }
 
     #[test]
     fn odd_timeout_count_applies_half_weight() {
         let service = ExecutionService::new();
+        let route = test_route(9);
         service.route_stats.write().insert(
-            9,
+            route.clone(),
             RouteStats {
                 successes: 2,
                 failures: 1,
@@ -2181,8 +2284,8 @@ mod safety_tests {
         );
         // attempts=3, weighted_half=2*1 + 1 = 3 → 10_000 + 30_000/3 = 20_000
         // (old integer /2 truncated the +½ and yielded 16_666)
-        assert_eq!(service.route_risk_multiplier_bps(9), 20_000);
-        let (risk, flash) = service.route_learning_snapshot(9, 50_000);
+        assert_eq!(service.route_risk_multiplier_bps(&route), 20_000);
+        let (risk, flash) = service.route_learning_snapshot(&route, 50_000);
         assert_eq!(risk, 20_000);
         assert_eq!(flash, 12_500);
     }
@@ -2190,8 +2293,9 @@ mod safety_tests {
     #[test]
     fn dry_run_pass_does_not_reduce_risk_floor_without_mined_receipt() {
         let service = ExecutionService::new();
+        let route = test_route(11);
         service.route_stats.write().insert(
-            11,
+            route.clone(),
             RouteStats {
                 successes: 0,
                 failures: 4,
@@ -2199,12 +2303,12 @@ mod safety_tests {
                 ..RouteStats::default()
             },
         );
-        let elevated = service.route_risk_multiplier_bps(11);
+        let elevated = service.route_risk_multiplier_bps(&route);
         assert!(elevated > 10_000);
         for _ in 0..4 {
-            service.record_route_dry_run_pass(11);
+            service.record_route_dry_run_pass(&route, 11);
         }
-        let cooled = service.route_risk_multiplier_bps(11);
+        let cooled = service.route_risk_multiplier_bps(&route);
         assert_eq!(cooled, elevated);
     }
 
@@ -2219,18 +2323,22 @@ mod safety_tests {
                 .as_nanos()
         ));
         let service = ExecutionService::with_route_stats_path(path.clone());
-        assert_eq!(service.adaptive_flash_loan_usd(7, 50_000), 12_500);
+        let route = test_route(7);
+        assert_eq!(service.adaptive_flash_loan_usd(&route, 50_000), 12_500);
         assert_eq!(
-            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            service.promote_adaptive_flash_loan_cap(&route, 7, 50_000),
             Some((12_500, 25_000))
         );
-        assert_eq!(service.adaptive_flash_loan_usd(7, 50_000), 25_000);
+        assert_eq!(service.adaptive_flash_loan_usd(&route, 50_000), 25_000);
         assert_eq!(
-            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            service.promote_adaptive_flash_loan_cap(&route, 7, 50_000),
             Some((25_000, 50_000))
         );
-        assert_eq!(service.promote_adaptive_flash_loan_cap(7, 50_000), None);
-        assert_eq!(service.adaptive_flash_loan_usd(7, 10_000), 10_000);
+        assert_eq!(
+            service.promote_adaptive_flash_loan_cap(&route, 7, 50_000),
+            None
+        );
+        assert_eq!(service.adaptive_flash_loan_usd(&route, 10_000), 10_000);
         drop(service);
         let _ = std::fs::remove_file(path);
     }
@@ -2246,25 +2354,29 @@ mod safety_tests {
                 .as_nanos()
         ));
         let service = ExecutionService::with_route_stats_path(path.clone());
+        let route = test_route(9);
         assert_eq!(
-            service.promote_adaptive_flash_loan_cap(9, 50_000),
+            service.promote_adaptive_flash_loan_cap(&route, 9, 50_000),
             Some((12_500, 25_000))
         );
         assert_eq!(
-            service.promote_adaptive_flash_loan_cap(9, 50_000),
+            service.promote_adaptive_flash_loan_cap(&route, 9, 50_000),
             Some((25_000, 50_000))
         );
         assert_eq!(
-            service.demote_adaptive_flash_loan_cap(9, 50_000),
+            service.demote_adaptive_flash_loan_cap(&route, 9, 50_000),
             Some((50_000, 25_000))
         );
         assert_eq!(
-            service.demote_adaptive_flash_loan_cap(9, 50_000),
+            service.demote_adaptive_flash_loan_cap(&route, 9, 50_000),
             Some((25_000, 12_500))
         );
         // Floor at configured/4 — further demote is a no-op.
-        assert_eq!(service.demote_adaptive_flash_loan_cap(9, 50_000), None);
-        assert_eq!(service.adaptive_flash_loan_usd(9, 50_000), 12_500);
+        assert_eq!(
+            service.demote_adaptive_flash_loan_cap(&route, 9, 50_000),
+            None
+        );
+        assert_eq!(service.adaptive_flash_loan_usd(&route, 50_000), 12_500);
         assert!(flash_size_failure_reason(
             "execution reverted: BAL#528 (insufficient Balancer flash-loan balance)"
         ));
@@ -2280,6 +2392,7 @@ mod safety_tests {
         let cache = StateCache::new(8, std::time::Duration::from_secs(60));
         let mut candidate = CandidateExecution {
             route_fingerprint: 1,
+            route_edges: CycleEdges::new(),
             calldata: Default::default(),
             target_address: Address::ZERO,
             value: U256::ZERO,
@@ -2326,7 +2439,7 @@ mod safety_tests {
     }
 
     #[test]
-    fn route_stats_appends_events_and_replays() {
+    fn route_stats_appends_exact_events_without_replaying_process_local_indexes() {
         let path = std::env::temp_dir().join(format!(
             "rpbot-route-stats-{}-{}.log",
             std::process::id(),
@@ -2337,25 +2450,31 @@ mod safety_tests {
         ));
         let service = ExecutionService::with_route_stats_path(path.clone());
         service.route_stats.write().clear();
+        let route = test_route(7);
+        let colliding_route = test_route(8);
+        let colliding_fp = 7;
 
         for _ in 0..100 {
-            service.record_route_success(7);
+            service.record_route_success(&route, colliding_fp);
         }
-        service.record_route_dry_run_pass(7);
-        service.record_route_failure(7, RouteFailureKind::DryRun);
+        service.record_route_dry_run_pass(&route, colliding_fp);
+        service.record_route_failure(&route, colliding_fp, RouteFailureKind::DryRun);
+        service.record_route_failure(
+            &colliding_route,
+            colliding_fp,
+            RouteFailureKind::Submit,
+        );
         assert_eq!(
-            service.promote_adaptive_flash_loan_cap(7, 50_000),
+            service.promote_adaptive_flash_loan_cap(&route, colliding_fp, 50_000),
             Some((12_500, 25_000))
         );
         service.route_stats_writer.flush();
 
+        let contents = std::fs::read_to_string(&path).expect("read route stats events");
+        assert!(contents.contains("v1 7 7:"));
+        assert!(contents.contains("v1 7 8:"));
         let saved = ExecutionService::replay_route_stats(&path);
-        let stats = saved.get(&7).expect("saved route");
-        assert_eq!(stats.successes, 100);
-        assert_eq!(stats.dry_run_successes, 1);
-        assert_eq!(stats.failures, 1);
-        assert_eq!(stats.dry_run_failures, 1);
-        assert_eq!(stats.adaptive_flash_loan_usd, Some(25_000));
+        assert!(saved.is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2448,13 +2567,22 @@ mod safety_tests {
                 .as_nanos()
         ));
         let service = ExecutionService::with_route_stats_path(path.clone());
-        let fp = 42u64;
-        assert!(!service.is_route_quarantined(fp));
-        assert!(service.quarantine_probe_below_dispatch_floor(fp));
-        assert!(service.is_route_quarantined(fp));
+        let route = CycleEdges::from_slice(&[crate::core::types::Edge {
+            pool_index: crate::core::types::PoolIndex(42),
+            token_in: crate::core::types::TokenIndex(0),
+            token_out: crate::core::types::TokenIndex(1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: crate::core::types::ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        }]);
+        assert!(!service.is_route_quarantined(&route));
+        assert!(service.quarantine_probe_below_dispatch_floor(&route));
+        assert!(service.is_route_quarantined(&route));
         // Second call within TTL is a no-op (already cool until ≥300s).
-        assert!(!service.quarantine_probe_below_dispatch_floor(fp));
-        assert!(service.is_route_quarantined(fp));
+        assert!(!service.quarantine_probe_below_dispatch_floor(&route));
+        assert!(service.is_route_quarantined(&route));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -442,12 +442,13 @@ mod tests {
     use alloy::primitives::{Bytes, FixedBytes, U256};
 
     use super::*;
-    use crate::core::types::FlashLoanSource;
+    use crate::core::types::{CycleEdges, FlashLoanSource};
 
     #[test]
     fn simulation_tx_does_not_inherit_candidate_gas_limit() {
         let candidate = CandidateExecution {
             route_fingerprint: 1,
+            route_edges: CycleEdges::new(),
             calldata: Bytes::from_static(&[1, 2, 3, 4]),
             target_address: Address::repeat_byte(1),
             value: U256::ZERO,

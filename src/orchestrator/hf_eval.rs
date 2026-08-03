@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::core::types::{
-    FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
+    CycleEdges, FlashLoanSource, FoundCycle, ProfitAssessment, RouteSimulationResult, TokenIndex,
 };
 use crate::pipeline::arena::StateArena;
 use crate::pipeline::cycle_filter::graph_negative_rescue_cap;
@@ -197,12 +197,14 @@ struct ProbeRankPartial {
     profitable: Vec<(u64, U256, Arc<FoundCycle>)>,
     rescue: Vec<(u64, Arc<FoundCycle>)>,
     near_net: Vec<(u64, U256, Arc<FoundCycle>)>,
-    seeds: FxHashMap<u64, (U256, MinimalSimResult)>,
+    seeds: ProbeSeedMap,
     skip: SkipCounters,
     minimal_sim_reasons: MinimalSimReasonCounts,
     flash_diag: Option<String>,
     flash_loan: FlashLoanDiagnostics,
 }
+
+type ProbeSeedMap = FxHashMap<CycleEdges, (U256, MinimalSimResult)>;
 
 impl ProbeRankPartial {
     fn merge(mut self, other: Self) -> Self {
@@ -354,7 +356,7 @@ fn minimal_rank_probe(
             return;
         }
         let sim = route_sim_cache
-            .and_then(|(cache, revision, fp)| cache.get(revision, fp, amount))
+            .and_then(|(cache, revision, fp)| cache.get(revision, fp, &cycle.edges, amount))
             .or_else(|| {
                 let sim = simulate_route_minimal_with_caps(
                     arena,
@@ -363,7 +365,7 @@ fn minimal_rank_probe(
                     shallow_caps.as_ref(),
                 )?;
                 if let Some((cache, revision, fp)) = route_sim_cache {
-                    cache.insert(revision, fp, amount, sim);
+                    cache.insert(revision, fp, &cycle.edges, amount, sim);
                 }
                 Some(sim)
             });
@@ -495,8 +497,10 @@ fn select_probe_survivors(
         b.1.cmp(&a.1)
             .then_with(|| compare_cycle_execution(&a.2, &b.2))
     });
+    let mut seen = rustc_hash::FxHashSet::<CycleEdges>::default();
     let mut kept: Vec<(u64, Arc<FoundCycle>)> = profitable
         .into_iter()
+        .filter(|(_, _, cycle)| seen.insert(cycle.edges.clone()))
         .take(max_keep)
         .map(|(fp, _, cycle)| (fp, cycle))
         .collect();
@@ -504,7 +508,12 @@ fn select_probe_survivors(
     if kept.len() < max_keep {
         rescue.sort_by(|a, b| compare_cycle_execution(&a.1, &b.1));
         let remaining = max_keep - kept.len();
-        kept.extend(rescue.into_iter().take(rescue_cap.min(remaining)));
+        kept.extend(
+            rescue
+                .into_iter()
+                .filter(|(_, cycle)| seen.insert(cycle.edges.clone()))
+                .take(rescue_cap.min(remaining)),
+        );
     }
     kept
 }
@@ -706,25 +715,20 @@ fn rank_one_cycle_probe(
                     let nosim_fails: Vec<_> = attempt_failures.iter().flatten().copied().collect();
                     let shallow_only = matches!(reject, MinimalProbeReject::NoSimulation)
                         && !nosim_fails.is_empty()
-                        && nosim_fails
-                            .iter()
-                            .all(|f| {
-                                matches!(
-                                    f,
-                                    local_sim::MinimalSimFailure::ShallowCl { .. }
-                                        | local_sim::MinimalSimFailure::ClSynthetic { .. }
-                                )
-                            });
-                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
-                    for _ in 0..n {
-                        let fp_rot = hash_cycle_edges(&rotated);
+                        && nosim_fails.iter().all(|f| {
+                            matches!(
+                                f,
+                                local_sim::MinimalSimFailure::ShallowCl { .. }
+                                    | local_sim::MinimalSimFailure::ClSynthetic { .. }
+                            )
+                        });
+                    ExecutionService::for_each_edge_rotation(&cycle.edges, |rotated| {
                         if shallow_only {
-                            execution.quarantine_probe_below_dispatch_floor(fp_rot);
+                            execution.quarantine_probe_below_dispatch_floor(rotated);
                         } else {
-                            execution.quarantine_stale_route(fp_rot);
+                            execution.quarantine_stale_route(rotated);
                         }
-                        rotated.rotate_left(1);
-                    }
+                    });
                 }
             }
             if should_rescue_probe_reject(reject, &attempt_failures) {
@@ -754,11 +758,9 @@ fn rank_one_cycle_probe(
             if matches!(reason, FlashRejectReason::ZeroLiquidity) && flash_ctx.start_fresh {
                 let n = cycle.edges.len();
                 if n > 0 {
-                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
-                    for _ in 0..n {
-                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
-                        rotated.rotate_left(1);
-                    }
+                    ExecutionService::for_each_edge_rotation(&cycle.edges, |rotated| {
+                        execution.quarantine_stale_route(rotated);
+                    });
                 }
             }
         }
@@ -805,10 +807,10 @@ fn rank_one_cycle_probe(
     // Direct batch seeds are live-calibrated all-in; do not apply mixed-route sim_scale.
     ranked_probe.total_gas = assessment_gas_units(
         probe.total_gas,
-        &assessment_gas_for_edges(&cycle.edges, Some(route_gas), gas_oracle, fp),
+        &assessment_gas_for_edges(&cycle.edges, Some(route_gas), gas_oracle),
     );
     let net_matic = net_profit_matic_from_sim(&ranked_probe, probe_amount, &ctx);
-    out.seeds.insert(fp, (probe_amount, probe));
+    out.seeds.insert(cycle.edges.clone(), (probe_amount, probe));
     if net_matic.is_zero() {
         let hop_count = cycle.edges.len();
         if !probe.profit.is_zero()
@@ -829,11 +831,9 @@ fn rank_one_cycle_probe(
             if probe_amount < economic_floor || cover_matic.is_zero() {
                 let n = cycle.edges.len();
                 if n > 0 {
-                    let mut rotated = crate::core::types::CycleEdges::from_slice(&cycle.edges);
-                    for _ in 0..n {
-                        execution.quarantine_stale_route(hash_cycle_edges(&rotated));
-                        rotated.rotate_left(1);
-                    }
+                    ExecutionService::for_each_edge_rotation(&cycle.edges, |rotated| {
+                        execution.quarantine_stale_route(rotated);
+                    });
                 }
             } else {
                 out.near_net.push((fp, cover_matic, Arc::clone(&cycle)));
@@ -865,10 +865,7 @@ fn rank_one_cycle_probe(
     out
 }
 
-type RankedProbeSeeds = (
-    Vec<(u64, Arc<FoundCycle>)>,
-    FxHashMap<u64, (U256, MinimalSimResult)>,
-);
+type RankedProbeSeeds = (Vec<(u64, Arc<FoundCycle>)>, ProbeSeedMap);
 
 #[allow(clippy::too_many_arguments)]
 pub fn rank_cycles_by_probe_net(
@@ -986,7 +983,8 @@ pub fn rank_cycles_by_probe_net(
     // Rescue must not run before near_net: when profitable is empty, admitting rescue_cap
     // first crowded out cover-ranked near-misses and produced probe_kept>0 with evaluated=0.
     let mut kept = select_probe_survivors(profitable_ranked, Vec::new(), max_keep, 0);
-    let mut seen: rustc_hash::FxHashSet<u64> = kept.iter().map(|(fp, _)| *fp).collect();
+    let mut seen: rustc_hash::FxHashSet<CycleEdges> =
+        kept.iter().map(|(_, cycle)| cycle.edges.clone()).collect();
     let near_net_count = near_net.len();
     if kept.len() < max_keep && !scanned.is_empty() {
         if near_net_count > 0 {
@@ -1013,7 +1011,7 @@ pub fn rank_cycles_by_probe_net(
                 {
                     continue;
                 }
-                if seen.insert(fp)
+                if seen.insert(cycle.edges.clone())
                     && cycle_flash_evaluable(
                         &cycle,
                         arena,
@@ -1046,7 +1044,7 @@ pub fn rank_cycles_by_probe_net(
                 if execution.cycle_edges_quarantined(&cycle.edges) {
                     continue;
                 }
-                if seen.insert(fp) {
+                if seen.insert(cycle.edges.clone()) {
                     kept.push((fp, cycle));
                 }
             }
@@ -1079,9 +1077,10 @@ pub fn rank_cycles_by_probe_net(
                 }
                 let cycle = Arc::new(cycle);
                 let fp = hash_cycle_edges(&cycle.edges);
+                let route_edges = cycle.edges.clone();
                 if execution.cycle_edges_quarantined(&cycle.edges)
                     || execution.cycle_has_quarantined_token(arena, &cycle.edges)
-                    || !seen.insert(fp)
+                    || !seen.insert(route_edges.clone())
                 {
                     continue;
                 }
@@ -1096,14 +1095,14 @@ pub fn rank_cycles_by_probe_net(
                         // Same dust reject as near_net — below-floor seeds only feed
                         // AmountBelowEconomicFloor / zero-at-floor Brent loops.
                         if amount < economic_floor {
-                            seen.remove(&fp);
+                            seen.remove(&route_edges);
                             continue;
                         }
-                        probe_seeds.insert(fp, (amount, sim));
+                        probe_seeds.insert(route_edges, (amount, sim));
                         kept.push((fp, cycle));
                     }
                     _ => {
-                        seen.remove(&fp);
+                        seen.remove(&route_edges);
                     }
                 }
             }
@@ -1341,7 +1340,7 @@ fn load(c: &AtomicU32) -> u32 {
 pub fn evaluate_cycles_parallel(
     cycles: &[(u64, Arc<FoundCycle>)],
     input: &HfEvalInput<'_>,
-    probe_seeds: &FxHashMap<u64, (U256, MinimalSimResult)>,
+    probe_seeds: &ProbeSeedMap,
 ) -> Vec<HfEvalResult> {
     let stats = EvalFailStats::default();
     let in_count = cycles.len();
@@ -1392,12 +1391,12 @@ pub async fn rescore_rank_and_evaluate_async(
             // Gas-aware score primary among profitable (not raw ratio).
             cycles[..probe_window].sort_by(|a, b| compare_cycle_execution(a.as_ref(), b.as_ref()));
         }
-        let route_gas = RouteGasLookup::for_fingerprints(
+        let route_gas = RouteGasLookup::for_routes(
             &input.gas_oracle,
             cycles
                 .iter()
                 .take(probe_window)
-                .map(|c| hash_cycle_edges(&c.as_ref().edges)),
+                .map(|c| c.as_ref().edges.as_slice()),
         );
         let (cycles, probe_seeds) = rank_cycles_by_probe_net(
             &input.arena,
@@ -1453,7 +1452,7 @@ fn probe_fallback_amounts(
     input: &HfEvalInput<'_>,
     probe_seed: Option<(U256, MinimalSimResult)>,
 ) -> Vec<U256> {
-    let flash_cap = flash_cap_for_cycle(input, cycle, hash_cycle_edges(&cycle.edges));
+    let flash_cap = flash_cap_for_cycle(input, cycle);
     let dec = flash_cap.token_decimals;
     let rate = flash_cap.token_to_matic_rate;
     let mut amounts = Vec::with_capacity(5);
@@ -1642,7 +1641,7 @@ fn build_brent_probe_seeds(
             return;
         }
         let sim = route_sim_cache
-            .and_then(|(cache, revision, fp)| cache.get(revision, fp, amount))
+            .and_then(|(cache, revision, fp)| cache.get(revision, fp, &cycle.edges, amount))
             .or_else(|| {
                 let sim = simulate_route_minimal_with_caps(
                     arena,
@@ -1651,7 +1650,7 @@ fn build_brent_probe_seeds(
                     shallow_caps.as_ref(),
                 )?;
                 if let Some((cache, revision, fp)) = route_sim_cache {
-                    cache.insert(revision, fp, amount, sim);
+                    cache.insert(revision, fp, &cycle.edges, amount, sim);
                 }
                 Some(sim)
             });
@@ -1681,7 +1680,7 @@ fn evaluate_one(
     fp: u64,
     cycle: &Arc<FoundCycle>,
     input: &HfEvalInput<'_>,
-    probe_seeds: &FxHashMap<u64, (U256, MinimalSimResult)>,
+    probe_seeds: &ProbeSeedMap,
     stats: &EvalFailStats,
 ) -> Option<HfEvalResult> {
     // Cycles from rank_cycles_by_probe_net are already dispatch-ready (Aave start rotation).
@@ -1713,7 +1712,9 @@ fn evaluate_one(
         inc(&stats.flash);
         return None;
     }
-    let probe_seed = probe_seeds.get(&fp).map(|(amount, sim)| (*amount, *sim));
+    let probe_seed = probe_seeds
+        .get(&cycle.edges)
+        .map(|(amount, sim)| (*amount, *sim));
     let base_slippage = input.slippage_bps;
     let start_decimals =
         resolve_token_decimals_for_index(cycle.start_token, input.arena, input.token_decimals);
@@ -1763,8 +1764,7 @@ fn evaluate_one(
     profit_ctx.charged_priority_fee_per_gas = input.charged_priority_fee_per_gas;
     let route_gas_costing = RouteGasCosting {
         lookup: input.route_gas,
-        oracle: input.gas_oracle,
-        fingerprint: fp,
+        edges: &cycle.edges,
         calibrated_seed: crate::pipeline::route_calls::balancer_direct_batch_eligible(&cycle.edges)
             || crate::pipeline::route_calls::dodo_flash_batch_eligible(&cycle.edges),
     };
@@ -1786,7 +1786,7 @@ fn evaluate_one(
 
     let max_flash_usd = input
         .execution
-        .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd);
+        .adaptive_flash_loan_usd(&cycle.edges, input.max_flash_loan_usd);
     let route_cache = Some((
         input.execution.route_sim_cache.as_ref(),
         route_state_revision,
@@ -1925,11 +1925,12 @@ fn evaluate_one(
     }
     let slippage_bps =
         effective_slippage_bps_for_flash(input.slippage_bps, hop_count, depth_bps, flash_source);
-    let mut assessment =
-        assess_route_for_cycle(input, &sim, cycle, fp, slippage_bps, flash_source)?;
+    let mut assessment = assess_route_for_cycle(input, &sim, cycle, slippage_bps, flash_source)?;
     if probe_only
         && assessment.reject_reason.as_deref() == Some(DISPATCH_BELOW_ECONOMIC_FLOOR)
-        && input.execution.quarantine_probe_below_dispatch_floor(fp)
+        && input
+            .execution
+            .quarantine_probe_below_dispatch_floor(&cycle.edges)
     {
         crate::info!(
             "hf probe-dispatch blocked (quarantined 300s): fp={fp} input={} floor={}",
@@ -1949,7 +1950,7 @@ fn evaluate_one(
         );
     }
 
-    let adaptive_flash_cap_bound = flash_cap_for_cycle(input, cycle, fp)
+    let adaptive_flash_cap_bound = flash_cap_for_cycle(input, cycle)
         .cap_wei()
         .is_some_and(|cap| opt.optimal_input == cap);
 
@@ -1989,7 +1990,6 @@ pub fn reassess_hf_eval_result(
         input,
         &result.sim,
         &result.cycle,
-        result.route_fingerprint,
         result.effective_slippage_bps,
         flash_source,
     )
@@ -1999,11 +1999,10 @@ fn assess_route_for_cycle(
     input: &HfEvalInput<'_>,
     sim: &RouteSimulationResult,
     cycle: &FoundCycle,
-    fp: u64,
     slippage_bps: u64,
     flash_source: FlashLoanSource,
 ) -> Option<ProfitAssessment> {
-    let risk_bps = input.execution.route_risk_multiplier_bps(fp);
+    let risk_bps = input.execution.route_risk_multiplier_bps(&cycle.edges);
     let thresholds = route_profit_thresholds(
         required_profit_matic_wei(
             input.min_profit_matic,
@@ -2027,7 +2026,7 @@ fn assess_route_for_cycle(
         hop_count: cycle.edge_hops(),
         slippage_bps,
         flash_source,
-        gas: assessment_gas_for_edges(&cycle.edges, Some(input.route_gas), input.gas_oracle, fp),
+        gas: assessment_gas_for_edges(&cycle.edges, Some(input.route_gas), input.gas_oracle),
         thresholds,
         token_to_matic_rates: input.token_to_matic_rates,
         token_decimals: input.token_decimals,
@@ -2090,15 +2089,11 @@ fn apply_dispatch_gate(
     assessment
 }
 
-fn flash_cap_for_cycle(
-    input: &HfEvalInput<'_>,
-    cycle: &FoundCycle,
-    fp: u64,
-) -> FlashBorrowCapParams {
+fn flash_cap_for_cycle(input: &HfEvalInput<'_>, cycle: &FoundCycle) -> FlashBorrowCapParams {
     FlashBorrowCapParams {
         max_flash_loan_usd: input
             .execution
-            .adaptive_flash_loan_usd(fp, input.max_flash_loan_usd),
+            .adaptive_flash_loan_usd(&cycle.edges, input.max_flash_loan_usd),
         token_decimals: resolve_token_decimals_for_index(
             cycle.start_token,
             input.arena,
@@ -2120,7 +2115,7 @@ fn validate_optimized_sim(
     optimal_input: U256,
     search_low: U256,
 ) -> bool {
-    let flash_cap = flash_cap_for_cycle(input, cycle, hash_cycle_edges(&cycle.edges));
+    let flash_cap = flash_cap_for_cycle(input, cycle);
     let token_to_matic_rate = flash_cap.token_to_matic_rate;
     let token_decimals = flash_cap.token_decimals;
 
@@ -2158,8 +2153,19 @@ mod tests {
         }
     }
 
-    fn arc_cycle(id: u32) -> Arc<FoundCycle> {
-        Arc::new(cycle(id))
+    fn arc_edge_cycle(id: u32) -> Arc<FoundCycle> {
+        let mut cycle = cycle(id);
+        cycle.edges.push(Edge {
+            pool_index: crate::core::types::PoolIndex(id),
+            token_in: TokenIndex(id),
+            token_out: TokenIndex(id + 1),
+            token_in_idx: 0,
+            token_out_idx: 1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+            zero_for_one: true,
+        });
+        Arc::new(cycle)
     }
 
     #[test]
@@ -2224,9 +2230,9 @@ mod tests {
     #[test]
     fn profitable_probe_routes_fill_full_cap_before_rescues() {
         let profitable = (0..8)
-            .map(|id| (u64::from(id), U256::from(100u32 - id), arc_cycle(id)))
+            .map(|id| (u64::from(id), U256::from(100u32 - id), arc_edge_cycle(id)))
             .collect();
-        let kept = select_probe_survivors(profitable, vec![(99, arc_cycle(99))], 8, 2);
+        let kept = select_probe_survivors(profitable, vec![(99, arc_edge_cycle(99))], 8, 2);
         assert_eq!(kept.len(), 8);
         assert!(
             kept.iter()
@@ -2236,7 +2242,7 @@ mod tests {
 
     #[test]
     fn probe_survivor_keeps_shared_cycle() {
-        let cycle = arc_cycle(1);
+        let cycle = arc_edge_cycle(1);
         let kept = select_probe_survivors(
             vec![(1, U256::from(100u8), Arc::clone(&cycle))],
             Vec::new(),
@@ -2245,6 +2251,26 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&kept[0].1, &cycle));
+    }
+
+    #[test]
+    fn probe_survivors_use_full_edges_when_fingerprints_collide() {
+        let first = arc_edge_cycle(1);
+        let second = arc_edge_cycle(2);
+        let duplicate = Arc::clone(&first);
+        let kept = select_probe_survivors(
+            vec![
+                (0, U256::from(100u8), first),
+                (0, U256::from(90u8), second),
+                (1, U256::from(80u8), duplicate),
+            ],
+            Vec::new(),
+            3,
+            0,
+        );
+
+        assert_eq!(kept.len(), 2);
+        assert_ne!(kept[0].1.edges, kept[1].1.edges);
     }
 
     #[test]
@@ -2257,15 +2283,15 @@ mod tests {
     #[test]
     fn rescue_routes_only_backfill_unused_capacity() {
         let profitable = vec![
-            (1, U256::from(100u8), arc_cycle(1)),
-            (2, U256::from(90u8), arc_cycle(2)),
+            (1, U256::from(100u8), arc_edge_cycle(1)),
+            (2, U256::from(90u8), arc_edge_cycle(2)),
         ];
         let kept = select_probe_survivors(
             profitable,
             vec![
-                (10, arc_cycle(10)),
-                (11, arc_cycle(11)),
-                (12, arc_cycle(12)),
+                (10, arc_edge_cycle(10)),
+                (11, arc_edge_cycle(11)),
+                (12, arc_edge_cycle(12)),
             ],
             4,
             2,
@@ -2280,9 +2306,9 @@ mod tests {
         let kept = select_probe_survivors(
             Vec::new(),
             vec![
-                (10, arc_cycle(10)),
-                (11, arc_cycle(11)),
-                (12, arc_cycle(12)),
+                (10, arc_edge_cycle(10)),
+                (11, arc_edge_cycle(11)),
+                (12, arc_edge_cycle(12)),
             ],
             4,
             2,

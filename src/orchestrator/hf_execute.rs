@@ -423,17 +423,17 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             !ctx.execution.cycle_edges_quarantined(&r.cycle.edges)
                 && !ctx
                     .execution
-                    .is_route_on_cooldown(r.route_fingerprint, &ctx.config)
+                    .is_route_on_cooldown(&r.cycle.edges, &ctx.config)
         })
         .collect();
     if profitable.is_empty() {
         return;
     }
 
-    let mut seen_fp = rustc_hash::FxHashSet::default();
+    let mut seen_edges = rustc_hash::FxHashSet::default();
     let profitable: Vec<_> = profitable
         .into_iter()
-        .filter(|r| seen_fp.insert(r.route_fingerprint))
+        .filter(|r| seen_edges.insert(r.cycle.edges.clone()))
         .collect();
 
     let mut flash_seen = rustc_hash::FxHashSet::default();
@@ -455,13 +455,13 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             Ok((fetched, generation)) => {
                 dispatch_state_generation = generation;
                 if fetched {
-                    let tick_block = ctx.refresh.last_state_block();
+                    let (tick_block, tick_hash) = ctx.refresh.last_state_provenance().await;
                     if tick_block == 0 {
                         crate::warn!("dispatch aborted: refreshed route state has no pinned block");
                         return;
                     }
                     dispatch_state_block = tick_block;
-                    dispatch_state_hash = ctx.refresh.last_state_hash();
+                    dispatch_state_hash = tick_hash;
                     enrich_dispatch_cl_ticks(
                         ctx.rpc.as_ref(),
                         arena,
@@ -732,7 +732,7 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     let log_prepare_skip = ctx.execution.should_log_prepare_skip(fp);
     let (risk_multiplier_bps, adaptive_flash_usd) = ctx
         .execution
-        .route_learning_snapshot(fp, max_flash_loan_usd);
+        .route_learning_snapshot(&evaluated.cycle.edges, max_flash_loan_usd);
     let Some(prepared) = prepare_evaluated_route(&PrepareDispatchInput {
         evaluated: &evaluated,
         arena,
@@ -830,7 +830,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
             skipped.record("prepare_balancer");
             record_balancer_prepare_skip();
             record_balancer_batch_reject(BalancerBatchReject::MaxInRatio);
-            ctx.execution.quarantine_batch_query_failure(fp);
+            ctx.execution
+                .quarantine_batch_query_failure(&prepared.evaluated.cycle.edges, fp);
             if log_prepare_skip {
                 crate::info!("balancer: prepare_skip fp={fp} reason=max_in_ratio");
             } else {
@@ -857,7 +858,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 skipped.record("prepare_balancer");
                 record_balancer_prepare_skip();
                 record_balancer_batch_reject(reason);
-                ctx.execution.quarantine_batch_query_failure(fp);
+                ctx.execution
+                    .quarantine_batch_query_failure(&prepared.evaluated.cycle.edges, fp);
                 if log_prepare_skip {
                     crate::info!(
                         "balancer: prepare_skip fp={fp} reason={reason:?} modeled={}",
@@ -904,7 +906,8 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
                 crate::warn!("dispatch build failed: fp={fp}: {e:#}");
                 skipped.record("build");
                 // Structural encode rejects (phantom V2 tokens, zfo, …) won't heal next tick.
-                ctx.execution.quarantine_batch_query_failure(fp);
+                ctx.execution
+                    .quarantine_batch_query_failure(&prepared.evaluated.cycle.edges, fp);
                 return None;
             }
         };
@@ -2079,9 +2082,9 @@ pub(crate) async fn refresh_and_resim_profitable(
         }
     }
     let refresh_ms = crate::util::now_ms().saturating_sub(refresh_started);
-    let route_gas = RouteGasLookup::for_fingerprints(
+    let route_gas = RouteGasLookup::for_routes(
         reassess.gas_oracle.as_ref(),
-        profitable.iter().map(|r| r.route_fingerprint),
+        profitable.iter().map(|r| r.cycle.edges.as_slice()),
     );
     let eval = reassess.as_eval_input(&route_gas);
     let flash = reassess.flash_liquidity.load();
@@ -2226,13 +2229,13 @@ pub(crate) async fn filter_balancer_onchain_verified<
     for result in need_onchain_verify {
         let fp = result.route_fingerprint;
         let Some(start_token) = arena.token_address(result.cycle.start_token) else {
-            execution.quarantine_batch_query_failure(fp);
+            execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
             record_balancer_batch_reject(BalancerBatchReject::MissingStartToken);
             crate::debug!("balancer: batch_filter fp={fp} reject=missing_start_token");
             continue;
         };
         if execution.cycle_has_quarantined_token(arena, &result.cycle.edges) {
-            execution.quarantine_batch_query_failure(fp);
+            execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
             record_balancer_batch_reject(BalancerBatchReject::ZeroRealized);
             crate::debug!(
                 "balancer: batch_filter fp={fp} reject=token_quarantined start={start_token}"
@@ -2247,7 +2250,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
         ) {
             Ok(h) => h,
             Err(reason) => {
-                execution.quarantine_batch_query_failure(fp);
+                execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
                 record_balancer_batch_reject(BalancerBatchReject::CalldataBuildFailed);
                 crate::debug!(
                     "balancer: batch_filter fp={fp} reject=calldata_build reason={reason} modeled={} net_matic={}",
@@ -2260,7 +2263,7 @@ pub(crate) async fn filter_balancer_onchain_verified<
         if !crate::services::execution::balancer_verify::balancer_batch_within_max_in_ratio(
             arena, &hops,
         ) {
-            execution.quarantine_batch_query_failure(fp);
+            execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
             record_balancer_batch_reject(BalancerBatchReject::MaxInRatio);
             crate::debug!(
                 "balancer: batch_filter fp={fp} reject=max_in_ratio modeled={} net_matic={}",
@@ -2278,9 +2281,9 @@ pub(crate) async fn filter_balancer_onchain_verified<
     }
 
     let jobs_n = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
-    let route_gas = RouteGasLookup::for_fingerprints(
+    let route_gas = RouteGasLookup::for_routes(
         reassess.gas_oracle.as_ref(),
-        jobs.iter().map(|job| job.result.route_fingerprint),
+        jobs.iter().map(|job| job.result.cycle.edges.as_slice()),
     );
     // JoinSet matches pool_fetch/rpc concurrency — true runtime tasks, not local Stream poll.
     let mut tasks = JoinSet::new();
@@ -2358,7 +2361,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             accepted.sim.profitable = true;
             let assessment = reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
             if !assessment.should_execute {
-                execution.quarantine_batch_query_failure(fp);
+                execution.quarantine_batch_query_failure(&accepted.cycle.edges, fp);
                 record_balancer_batch_reject(BalancerBatchReject::ReassessAfterOnChain);
                 crate::debug!(
                     "balancer: batch_filter fp={fp} reject=reassess_after_on_chain on_chain={on_chain_profit} net_matic={}",
@@ -2367,7 +2370,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 return None;
             }
             let Some(min_profit) = on_chain_min_profit_from_assessment(&assessment) else {
-                execution.quarantine_batch_query_failure(fp);
+                execution.quarantine_batch_query_failure(&accepted.cycle.edges, fp);
                 record_balancer_batch_reject(BalancerBatchReject::BuildDecodeFailed);
                 return None;
             };
@@ -2385,7 +2388,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             {
                 Ok(v) => v,
                 Err(reason) => {
-                    execution.quarantine_batch_query_failure(fp);
+                    execution.quarantine_batch_query_failure(&accepted.cycle.edges, fp);
                     // Only FoT-cool the start token on semantic zero/transfer failure.
                     // Live poison: RPC "header not found" / timeout was recorded as
                     // zero_realized and blackholed a proven Direct profit token for 30m
@@ -2417,7 +2420,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
                 let reassessment =
                     reassess_hf_eval_result(&accepted, eval, FlashLoanSource::Direct)?;
                 if !reassessment.should_execute {
-                    execution.quarantine_batch_query_failure(fp);
+                    execution.quarantine_batch_query_failure(&accepted.cycle.edges, fp);
                     record_balancer_batch_reject(BalancerBatchReject::ReassessAfterOnChain);
                     crate::debug!(
                         "balancer: batch_filter fp={fp} reject=reassess_after_realized query={on_chain_profit} realized={realized}"
@@ -2434,7 +2437,7 @@ async fn verify_balancer_batch_job<P: Provider<Ethereum>>(
             Some(accepted)
         }
         BatchQueryVerdict::Rejected(reason) => {
-            execution.quarantine_batch_query_failure(fp);
+            execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
             record_balancer_batch_reject(reason);
             let modeled = result.sim.profit;
             let net_matic = result.assessment.net_profit_after_gas_matic_wei;
@@ -2544,18 +2547,19 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
                 // Structural cool: stale balances / wrong pool kind / math drift.
                 // Cool every start-rotation so the same pools do not re-enter as a
                 // different fingerprint (same pattern as underwater cool).
-                execution.quarantine_batch_query_failure(fp);
+                execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
                 let n = result.cycle.edges.len();
                 if n > 1 {
-                    let mut rotated =
-                        crate::core::types::CycleEdges::from_slice(&result.cycle.edges);
-                    for _ in 0..n {
-                        let rfp = crate::services::execution::candidate::hash_cycle_edges(&rotated);
-                        if rfp != fp {
-                            execution.quarantine_batch_query_failure(rfp);
-                        }
-                        rotated.rotate_left(1);
-                    }
+                    crate::services::execution::ExecutionService::for_each_edge_rotation(
+                        &result.cycle.edges,
+                        |rotated| {
+                            let rfp =
+                                crate::services::execution::candidate::hash_cycle_edges(rotated);
+                            if rfp != fp {
+                                execution.quarantine_batch_query_failure(rotated, rfp);
+                            }
+                        },
+                    );
                 }
                 crate::info!(
                     "hf near-miss-verify: fp={fp} route={route} modeled={modeled} on_chain={on_chain} retain_bps={retain_bps} net_matic={} sim_overstate quarantined (+rotations)",
@@ -2569,7 +2573,7 @@ pub(crate) async fn probe_near_miss_balancer<P: Provider<Ethereum>>(
             }
         }
         BatchQueryOutcome::NonPositiveDelta(delta) => {
-            execution.quarantine_batch_query_failure(fp);
+            execution.quarantine_batch_query_failure(&result.cycle.edges, fp);
             crate::info!(
                 "hf near-miss-verify: fp={fp} route={route} phantom sim modeled={modeled} vault_delta={delta} quarantined",
             );

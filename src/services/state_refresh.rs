@@ -12,6 +12,7 @@ use alloy::sol_types::SolCall;
 use anyhow::Context;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
 use crate::config::AppConfig;
@@ -58,6 +59,33 @@ pub struct PoolRefreshResult {
     pub attempted: bool,
     /// Requested pools that resolved in the discovery index.
     pub matched: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StateProvenance {
+    block: u64,
+    hash: Option<B256>,
+}
+
+#[must_use]
+fn refreshed_state_provenance(
+    prior: StateProvenance,
+    block: u64,
+    fetched_hash: Option<B256>,
+) -> StateProvenance {
+    StateProvenance {
+        block,
+        hash: if block == prior.block && prior.hash.is_some() {
+            prior.hash
+        } else {
+            fetched_hash
+        },
+    }
+}
+
+#[must_use]
+fn should_resolve_state_head(pinned_block: Option<u64>, updated: usize) -> bool {
+    pinned_block.is_none() || updated == 0
 }
 
 impl PoolRefreshResult {
@@ -114,8 +142,7 @@ pub struct StateRefreshService {
     indexer_stale: AtomicBool,
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
-    last_state_block: AtomicU64,
-    last_state_hash: RwLock<Option<B256>>,
+    serialized_state_refresh: AsyncMutex<StateProvenance>,
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
     fetch_never_scan_offset: AtomicUsize,
@@ -155,8 +182,7 @@ impl StateRefreshService {
             indexer_stale: AtomicBool::new(false),
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
-            last_state_block: AtomicU64::new(0),
-            last_state_hash: RwLock::new(None),
+            serialized_state_refresh: AsyncMutex::new(StateProvenance::default()),
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
             fetch_never_scan_offset: AtomicUsize::new(0),
@@ -262,17 +288,19 @@ impl StateRefreshService {
         self.last_indexer_block.load(Ordering::Relaxed)
     }
 
-    pub fn last_state_block(&self) -> u64 {
-        self.last_state_block.load(Ordering::Acquire)
+    pub async fn last_state_block(&self) -> u64 {
+        self.serialized_state_refresh.lock().await.block
     }
 
-    pub fn last_state_hash(&self) -> Option<B256> {
-        *self.last_state_hash.read()
+    #[must_use]
+    pub async fn last_state_provenance(&self) -> (u64, Option<B256>) {
+        let state = *self.serialized_state_refresh.lock().await;
+        (state.block, state.hash)
     }
 
     #[inline]
-    fn chain_head_fallback(&self, indexer_block: u64) -> u64 {
-        let state_block = self.last_state_block();
+    async fn chain_head_fallback(&self, indexer_block: u64) -> u64 {
+        let state_block = self.last_state_block().await;
         if state_block > 0 {
             state_block.max(indexer_block)
         } else {
@@ -309,12 +337,12 @@ impl StateRefreshService {
         let head = if let Some(source) = progress.source_block.filter(|b| *b > 0) {
             source
         } else if let Ok(provider) = self.rpc.connect_state() {
-            provider
-                .get_block_number()
-                .await
-                .unwrap_or_else(|_| self.chain_head_fallback(progress.last_processed_block))
+            match provider.get_block_number().await {
+                Ok(block) => block,
+                Err(_) => self.chain_head_fallback(progress.last_processed_block).await,
+            }
         } else {
-            self.chain_head_fallback(progress.last_processed_block)
+            self.chain_head_fallback(progress.last_processed_block).await
         };
 
         let lag = head.saturating_sub(progress.last_processed_block);
@@ -969,6 +997,7 @@ impl StateRefreshService {
         address_index: Arc<FxHashMap<Address, usize>>,
         initial_addrs: Option<Vec<Address>>,
     ) -> anyhow::Result<PoolRefreshResult> {
+        let mut last_state = self.serialized_state_refresh.lock().await;
         let matched = initial_addrs.as_ref().map_or(pools.len(), Vec::len);
         let candidates = self.rpc.state_url_candidates();
         if candidates.is_empty() {
@@ -979,12 +1008,8 @@ impl StateRefreshService {
             });
         }
 
-        let cached_block = {
-            let cached = self.last_state_block();
-            (cached > 0).then_some(cached)
-        };
-        let prior_block = self.last_state_block.load(Ordering::Acquire);
-        let prior_hash = *self.last_state_hash.read();
+        let mut state_provenance = *last_state;
+        let cached_block = (state_provenance.block > 0).then_some(state_provenance.block);
 
         let mut total_updated = 0usize;
         let mut fetch_attempted = false;
@@ -993,9 +1018,9 @@ impl StateRefreshService {
         let mut fetch_ms = 0u64;
         let mut hash_ms = 0u64;
         let mut rpc_attempts = 0usize;
-        // Always resolve head on the first working URL so pool state is not pinned
-        // to a stale block. Fallback URLs re-query head. Skip block-hash RPC when
-        // the pinned block is unchanged and we already have a hash.
+        // Resolve a fresh head until an endpoint updates state. After a partial update,
+        // fallback endpoints must use that same block or the cache becomes heterogeneous.
+        // Skip block-hash RPC when the pinned block is unchanged and already has a hash.
         let mut last_pinned_block = cached_block;
         let mut pinned_block: Option<u64> = None;
         // After a partial/rate-limited attempt, retry only still-needed addresses
@@ -1013,7 +1038,7 @@ impl StateRefreshService {
             };
             rpc_attempts += 1;
             let provider_for_hash = provider.clone();
-            if pinned_block.is_none() || idx > 0 {
+            if should_resolve_state_head(pinned_block, total_updated) {
                 let head_started = now_ms();
                 pinned_block = match timeout(RPC_HEAD_TIMEOUT, provider.get_block_number()).await {
                     Ok(Ok(n)) => Some(n),
@@ -1079,9 +1104,9 @@ impl StateRefreshService {
             fetch_attempted |= fetch_result.attempted;
             if updated > 0 {
                 if let Some(block) = pinned_block {
-                    self.last_state_block.store(block, Ordering::Release);
-                    let need_hash = prior_hash.is_none() || block != prior_block;
-                    if need_hash {
+                    let need_hash =
+                        state_provenance.hash.is_none() || block != state_provenance.block;
+                    let pinned_hash = if need_hash {
                         let hash_started = now_ms();
                         let pinned_hash = provider_for_hash
                             .get_block(BlockId::Number(BlockNumberOrTag::Number(block)))
@@ -1090,10 +1115,13 @@ impl StateRefreshService {
                             .flatten()
                             .map(|b| b.header.hash);
                         hash_ms = hash_ms.saturating_add(now_ms().saturating_sub(hash_started));
-                        if let Some(hash) = pinned_hash {
-                            *self.last_state_hash.write() = Some(hash);
-                        }
-                    }
+                        pinned_hash
+                    } else {
+                        None
+                    };
+                    state_provenance =
+                        refreshed_state_provenance(state_provenance, block, pinned_hash);
+                    *last_state = state_provenance;
                 }
                 if idx > 0 {
                     crate::info!(
@@ -1311,15 +1339,21 @@ fn bootstrap_cursor_block(keyset_created: i32, pool_created_max: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        REFRESH_BATCH_SCALE_FULL_BPS, REFRESH_BATCH_SCALE_MIN_BPS, apply_refresh_batch_scale,
-        dedupe_sorted_addresses, next_refresh_batch_scale_bps, refresh_batch_for,
-        replace_discovered_pool,
+        REFRESH_BATCH_SCALE_FULL_BPS, REFRESH_BATCH_SCALE_MIN_BPS, StateProvenance,
+        StateRefreshService, apply_refresh_batch_scale, dedupe_sorted_addresses,
+        next_refresh_batch_scale_bps, refresh_batch_for, refreshed_state_provenance,
+        replace_discovered_pool, should_resolve_state_head,
     };
     use crate::config::AppConfig;
     use crate::core::types::ProtocolType;
+    use crate::infra::rpc::RpcPool;
     use crate::services::discovery::DiscoveredPool;
+    use crate::services::state_cache::StateCache;
     use alloy::primitives::Address;
+    use alloy::primitives::B256;
     use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn keeps_bootstrap_batch_until_routable_set_is_warm() {
@@ -1347,6 +1381,59 @@ mod tests {
         assert_eq!(
             next_refresh_batch_scale_bps(full, 20_000, 4_500),
             REFRESH_BATCH_SCALE_MIN_BPS
+        );
+    }
+
+    #[test]
+    fn advancing_block_without_hash_clears_old_provenance_hash() {
+        let prior = StateProvenance {
+            block: 10,
+            hash: Some(B256::repeat_byte(1)),
+        };
+        let refreshed = refreshed_state_provenance(prior, 11, None);
+        assert_eq!(refreshed.block, 11);
+        assert_eq!(refreshed.hash, None);
+    }
+
+    #[test]
+    fn partial_refresh_keeps_one_block_across_provider_fallbacks() {
+        assert!(should_resolve_state_head(None, 0));
+        assert!(should_resolve_state_head(Some(10), 0));
+        assert!(!should_resolve_state_head(Some(10), 1));
+    }
+
+    #[tokio::test]
+    async fn service_refresh_transaction_waits_for_prior_refresh() {
+        let config = Arc::new(AppConfig::default());
+        let cache = Arc::new(StateCache::default());
+        let rpc = Arc::new(RpcPool::from_config(config.as_ref()));
+        let refresh = Arc::new(
+            StateRefreshService::new(config, cache, rpc).expect("state refresh service builds"),
+        );
+        let mut in_flight = refresh.serialized_state_refresh.lock().await;
+        let queued_refresh = Arc::clone(&refresh);
+        let mut queued = tokio::spawn(async move {
+            queued_refresh.refresh_pool_states(1).await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err()
+        );
+        *in_flight = StateProvenance {
+            block: 100,
+            hash: Some(B256::repeat_byte(1)),
+        };
+        drop(in_flight);
+        queued
+            .await
+            .expect("queued refresh task completes")
+            .expect("queued refresh succeeds");
+
+        assert_eq!(
+            refresh.last_state_provenance().await,
+            (100, Some(B256::repeat_byte(1)))
         );
     }
 
