@@ -379,6 +379,7 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let a_idx = n_fetched;
     let fee_idx = n_fetched + 1;
     let rates_idx = n_fetched + 2;
+    let offpeg_idx = n_fetched + 3;
     let a_raw = decode_u256(results.get(a_idx)?.as_ref()?)?;
     let fee = decode_curve_fee(results, fee_idx)?;
     let rates = decode_curve_stored_rates(plan, results, n_fetched, rates_idx)?;
@@ -389,6 +390,19 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     // Storing unscaled A under-amplifies ~100× → local dy ≫ get_dy (dry-run min_dy reverts).
     const A_PRECISION: u64 = 100;
     let a = a_raw.checked_mul(U256::from(A_PRECISION))?;
+    let d = crate::core::math::curve::curve_stable_cache_d(&balances, &rates, a);
+    // NG pools expose `offpeg_fee_multiplier()`; classic pools do not (static fee).
+    let offpeg = results
+        .get(offpeg_idx)
+        .and_then(|r| r.as_ref())
+        .and_then(decode_u256);
+    let offpeg_fee_multiplier = if curve_pool_requires_stored_rates(plan.pool.pool_type.as_deref()) {
+        Some(
+            offpeg.unwrap_or(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER),
+        )
+    } else {
+        None
+    };
     Some(PoolState::Curve(CurvePoolState {
         balances,
         a,
@@ -396,7 +410,8 @@ fn decode_curve_stable(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
         rates,
         n_coins: n_fetched as u8,
         gamma: None,
-        d: None,
+        d,
+        offpeg_fee_multiplier,
     }))
 }
 
@@ -439,6 +454,7 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
     let precisions =
         decode_curve_precisions_words(results.get(precisions_idx)?.as_ref()?, n_fetched)?;
     let rates = decode_curve_crypto_rates(n_fetched, &price_scales, &precisions)?;
+    let d = crate::core::math::curve_crypto::curve_crypto_cache_d(&balances, &rates, a, gamma);
     Some(PoolState::Curve(CurvePoolState {
         balances,
         a,
@@ -446,7 +462,8 @@ fn decode_curve_crypto(plan: &PoolFetchPlan, results: &[Option<Bytes>]) -> Optio
         rates,
         n_coins: n_fetched as u8,
         gamma: Some(gamma),
-        d: None,
+        d,
+        offpeg_fee_multiplier: None,
     }))
 }
 
@@ -804,6 +821,67 @@ mod tests {
         assert_eq!(state.n_coins, 3);
         assert_eq!(state.balances.len(), 3);
         assert_eq!(state.rates, vec![ONE; 3]);
+    }
+
+    #[test]
+    fn decode_curve_stable_ng_uses_fetched_offpeg_and_classic_is_none() {
+        let mk_plan = |pool_type: &str| PoolFetchPlan {
+            pool: super::super::plans::FetchPoolInfo {
+                address: Address::ZERO,
+                protocol: ProtocolType::CurveStable,
+                tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+                fee_bps: 4,
+                tick_spacing: None,
+                pool_id: None,
+                pool_type: Some(pool_type.into()),
+                protocol_label: None,
+            },
+            calls: Vec::new(),
+            kinds: vec![
+                CallKind::CurveBalance(0),
+                CallKind::CurveBalance(1),
+                CallKind::CurveA,
+                CallKind::CurveFee,
+                CallKind::CurveRates,
+                CallKind::CurveOffpegFee,
+            ],
+        };
+        let mk_results =
+            |offpeg: Option<u64>| -> Vec<Option<Bytes>> {
+                let rates = ICurvePool::stored_ratesCall::abi_encode_returns(&vec![ONE; 2]);
+                vec![
+                    Some(Bytes::copy_from_slice(&abi_word(1_000))),
+                    Some(Bytes::copy_from_slice(&abi_word(2_000))),
+                    Some(Bytes::copy_from_slice(&abi_word(100))),
+                    Some(Bytes::copy_from_slice(&abi_word(1_000_000))),
+                    Some(Bytes::from(rates)),
+                    offpeg.map(|o| Bytes::copy_from_slice(&abi_word(o))),
+                ]
+            };
+
+        let ng = mk_plan("stable_ng");
+        let Some(PoolState::Curve(ng_state)) = decode_plan(&ng, &mk_results(Some(33_000_000_000)))
+        else {
+            panic!("NG pool should decode");
+        };
+        assert_eq!(ng_state.offpeg_fee_multiplier, Some(U256::from(33_000_000_000u64)));
+
+        // Fetched offpeg missing → default 2e10 (contract factory default).
+        let Some(PoolState::Curve(ng_default)) = decode_plan(&ng, &mk_results(None)) else {
+            panic!("NG pool without offpeg should fall back");
+        };
+        assert_eq!(
+            ng_default.offpeg_fee_multiplier,
+            Some(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER)
+        );
+
+        // Classic pool → offpeg absent entirely → static-fee marker.
+        let classic = mk_plan("stable");
+        let Some(PoolState::Curve(classic_state)) = decode_plan(&classic, &mk_results(Some(1)))
+        else {
+            panic!("classic pool should decode");
+        };
+        assert_eq!(classic_state.offpeg_fee_multiplier, None);
     }
 
     #[test]

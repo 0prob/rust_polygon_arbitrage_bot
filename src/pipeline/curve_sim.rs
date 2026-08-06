@@ -147,6 +147,7 @@ mod tests {
             n_coins: 2,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: None,
         };
         assert!(
             curve_hop_amount_out(

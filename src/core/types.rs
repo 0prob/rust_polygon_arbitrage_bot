@@ -135,7 +135,11 @@ pub struct CurvePoolState {
     pub rates: Vec<U256>,
     pub n_coins: u8,
     pub gamma: Option<U256>,
+    /// Pre-computed D invariant for this balance snapshot (see `curve_stable_cache_d`).
     pub d: Option<U256>,
+    /// Stable-NG `offpeg_fee_multiplier` (1e10 denom); `None` = classic
+    /// CurveStableSwap (static fee scaled by N/(4·(N−1))).
+    pub offpeg_fee_multiplier: Option<U256>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

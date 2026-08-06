@@ -263,6 +263,7 @@ sol! {
         function gamma() external view returns (uint256);
         function price_scale() external view returns (uint256);
         function stored_rates() external view returns (uint256[]);
+        function offpeg_fee_multiplier() external view returns (uint256);
     }
 
     #[sol(rpc)]

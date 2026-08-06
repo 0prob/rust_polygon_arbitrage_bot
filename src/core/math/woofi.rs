@@ -48,7 +48,9 @@ fn calc_quote_amount_sell_base(
         base.base_dec,
         base.price_dec,
     );
-    if !base.max_notional_swap.is_zero() && notional_swap > base.max_notional_swap {
+    // WooPPV2 enforces `notionalSwap <= maxNotionalSwap` unconditionally, so a
+    // zero cap rejects every positive swap (not "no cap").
+    if notional_swap > base.max_notional_swap {
         return U256::ZERO;
     }
 
@@ -59,7 +61,7 @@ fn calc_quote_amount_sell_base(
         base.price_dec,
         base.base_dec,
     );
-    if !base.max_gamma.is_zero() && gamma > base.max_gamma {
+    if gamma > base.max_gamma {
         return U256::ZERO;
     }
     if !has_positive_swap_factor(gamma, spread) {
@@ -91,12 +93,12 @@ fn calc_base_amount_sell_quote(
         return U256::ZERO;
     }
 
-    if !base.max_notional_swap.is_zero() && quote_amount > base.max_notional_swap {
+    if quote_amount > base.max_notional_swap {
         return U256::ZERO;
     }
 
     let gamma = (quote_amount * base.coeff) / base.quote_dec;
-    if !base.max_gamma.is_zero() && gamma > base.max_gamma {
+    if gamma > base.max_gamma {
         return U256::ZERO;
     }
     if !has_positive_swap_factor(gamma, spread) {
@@ -130,7 +132,8 @@ fn woofi_fee_rate_to_bps(fee_rate: U256) -> u32 {
 }
 
 /// Active-leg WooFi `feeRate` (1e5 denom) → edge `fee_bps` for graph ranking.
-/// Base→base sums both legs (matches two `apply_woofi_fee` charges in sim).
+/// Base→base is a single WooPPV2 `_swapBaseToBase` call that charges ONE fee at
+/// the higher of the two legs' rates (matches the single `apply_woofi_fee` in sim).
 #[must_use]
 pub fn woofi_fee_bps_from_edge(
     state: &WoofiPoolState,
@@ -150,7 +153,7 @@ pub fn woofi_fee_bps_from_edge(
     } else {
         let sell = woofi_fee_rate_to_bps(state.base_states.get(tin)?.fee_rate);
         let buy = woofi_fee_rate_to_bps(state.base_states.get(tout)?.fee_rate);
-        sell.saturating_add(buy)
+        sell.max(buy)
     };
     Some(total.min(9_999))
 }
@@ -215,13 +218,19 @@ pub fn get_woofi_amount_out(
     if amount_in > sell.reserve || sell.reserve.is_zero() {
         return U256::ZERO;
     }
-    let quote_gross = calc_quote_amount_sell_base(sell, amount_in, None);
-    let quote_amount = apply_woofi_fee(quote_gross, sell.fee_rate);
-    if quote_amount.is_zero() || quote_amount > state.quote_reserve {
+    // WooPPV2._swapBaseToBase is a single swap (not two quote legs): it applies
+    // ONE fee at max(feeRate1, feeRate2) and runs BOTH legs on the shared spread
+    // max(spread1, spread2)/2. The intermediate quote debit (`reserve - gross`)
+    // Obeys `gross <= quote_reserve`, so the reserve guard runs on the gross,
+    // pre-fee quote — not the post-fee amount.
+    let spread = sell.spread.max(buy.spread) / U256::from(2u64);
+    let fee_rate = sell.fee_rate.max(buy.fee_rate);
+    let quote_gross = calc_quote_amount_sell_base(sell, amount_in, Some(spread));
+    if quote_gross.is_zero() || quote_gross > state.quote_reserve {
         return U256::ZERO;
     }
-    let quote_after_buy_fee = apply_woofi_fee(quote_amount, buy.fee_rate);
-    let base_out = calc_base_amount_sell_quote(buy, quote_after_buy_fee, None);
+    let quote_amount = apply_woofi_fee(quote_gross, fee_rate);
+    let base_out = calc_base_amount_sell_quote(buy, quote_amount, Some(spread));
     if buy.reserve.is_zero() || base_out > buy.reserve {
         return U256::ZERO;
     }
@@ -243,8 +252,10 @@ mod tests {
             quote_dec: U256::from(10u128.pow(6)),
             price_dec: U256::from(10u128.pow(8)),
             fee_rate: U256::ZERO,
-            max_gamma: U256::ZERO,
-            max_notional_swap: U256::ZERO,
+            // Live WooPPs run with a positive maxGamma and an effectively
+            // unbounded maxNotionalSwap; 0 on-chain means "reject all swaps".
+            max_gamma: ONE,
+            max_notional_swap: U256::from(u128::MAX),
         }
     }
 
@@ -266,7 +277,7 @@ mod tests {
         };
         assert_eq!(woofi_fee_bps_from_edge(&state, 0, 2), Some(2)); // sell base→quote
         assert_eq!(woofi_fee_bps_from_edge(&state, 2, 1), Some(5)); // quote→buy
-        assert_eq!(woofi_fee_bps_from_edge(&state, 0, 1), Some(7)); // base→base
+        assert_eq!(woofi_fee_bps_from_edge(&state, 0, 1), Some(5)); // base→base: single max
     }
 
     #[test]
@@ -341,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn base_to_base_matches_two_official_quote_legs() {
+    fn base_to_base_matches_single_woopp_swap_with_max_fee_and_shared_spread() {
         let mut sell = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
         sell.spread = U256::from(1_000_000_000_000_000u64);
         sell.fee_rate = U256::from(25u64);
@@ -349,10 +360,13 @@ mod tests {
         buy.spread = U256::from(3_000_000_000_000_000u64);
         buy.fee_rate = U256::from(75u64);
         let amount_in = U256::from(10u64) * U256::from(10u128.pow(18));
-        let quote_gross = calc_quote_amount_sell_base(&sell, amount_in, None);
-        let quote_after_fee = apply_woofi_fee(quote_gross, sell.fee_rate);
-        let expected =
-            calc_base_amount_sell_quote(&buy, apply_woofi_fee(quote_after_fee, buy.fee_rate), None);
+        // WooPPV2._swapBaseToBase: one fee at max(fee1,fee2)=75, both legs run on
+        // the shared spread max(spread1,spread2)/2 = 1.5e15.
+        let spread = sell.spread.max(buy.spread) / U256::from(2u64);
+        let fee_rate = sell.fee_rate.max(buy.fee_rate);
+        let gross = calc_quote_amount_sell_base(&sell, amount_in, Some(spread));
+        let quoted = apply_woofi_fee(gross, fee_rate);
+        let expected = calc_base_amount_sell_quote(&buy, quoted, Some(spread));
         let state = WoofiPoolState {
             tokens: vec![
                 Address::with_last_byte(1),
@@ -366,7 +380,51 @@ mod tests {
 
         let out = get_woofi_amount_out(&state, amount_in, false, false, Some(0), Some(1));
 
+        // Matches the single-swap contract model exactly.
         assert_eq!(out, expected);
+        assert!(!out.is_zero());
+        // A double-fee / per-leg-spread model would quote a strictly smaller amount.
+        let wrong = {
+            let g = calc_quote_amount_sell_base(&state.base_states[0], amount_in, None);
+            let a = apply_woofi_fee(g, state.base_states[0].fee_rate);
+            let b = apply_woofi_fee(a, state.base_states[1].fee_rate);
+            calc_base_amount_sell_quote(&state.base_states[1], b, None)
+        };
+        assert!(out > wrong, "single-fee model must beat the old two-fee model");
+    }
+
+    #[test]
+    fn zero_leg_caps_reject_positive_swap() {
+        // A zero maxGamma (or maxNotionalSwap) on WooPPV2 means EVERY swap for
+        // that token reverts — it must not be treated as "unlimited".
+        let mut base = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
+        base.coeff = U256::from(100_000_000_000_000u64);
+        base.max_gamma = U256::ZERO;
+        let state = WoofiPoolState {
+            tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+            quote_reserve: U256::from(1_000_000u64) * U256::from(10u128.pow(6)),
+            base_states: vec![base],
+            fee: U256::ZERO,
+        };
+        let amount = U256::from(10u64) * U256::from(10u128.pow(18));
+        assert_eq!(
+            get_woofi_amount_out(&state, amount, false, true, Some(0), None),
+            U256::ZERO
+        );
+
+        // A zero maxNotionalSwap likewise caps every trade.
+        let mut base2 = base_state(U256::from(1_000_000u64) * U256::from(10u128.pow(18)));
+        base2.max_notional_swap = U256::ZERO;
+        let state2 = WoofiPoolState {
+            tokens: vec![Address::with_last_byte(1), Address::with_last_byte(2)],
+            quote_reserve: U256::from(1_000_000u64) * U256::from(10u128.pow(6)),
+            base_states: vec![base2],
+            fee: U256::ZERO,
+        };
+        assert_eq!(
+            get_woofi_amount_out(&state2, amount, false, true, Some(0), None),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -427,7 +485,7 @@ mod proptests {
                 price_dec: U256::from(10u128.pow(8)),
                 fee_rate,
                 max_gamma,
-                max_notional_swap: U256::ZERO,
+                max_notional_swap: U256::from(u128::MAX),
             };
 
             let state = WoofiPoolState {

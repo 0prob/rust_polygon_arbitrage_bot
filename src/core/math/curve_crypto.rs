@@ -64,6 +64,36 @@ fn compute_k0(xp: &[U256], d: U256, n: U256) -> U256 {
     k0
 }
 
+/// Pre-compute the crypto invariant D at decode time so the quote hot path
+/// skips `newton_d`. Mirrors the exact `ann`/`xp` construction used by
+/// [`try_curve_crypto_amount_out`]; returns `None` when it would fail there too.
+#[must_use]
+pub(crate) fn curve_crypto_cache_d(
+    balances: &[U256],
+    rates: &[U256],
+    a: U256,
+    gamma: U256,
+) -> Option<U256> {
+    if a.is_zero() || gamma.is_zero() || balances.len() != rates.len() {
+        return None;
+    }
+    let n = U256::from(balances.len());
+    if n.lt(&U256::from(2u8)) {
+        return None;
+    }
+    let xp: CurveXp = balances
+        .iter()
+        .zip(rates.iter())
+        .map(|(b, r)| (*b * *r) / ONE)
+        .collect();
+    let result = curve_crypto_newton_d(a * n * A_MULTIPLIER, gamma, &xp);
+    if result.converged && !result.value.is_zero() {
+        Some(result.value)
+    } else {
+        None
+    }
+}
+
 pub fn curve_crypto_newton_d(ann: U256, gamma: U256, xp: &[U256]) -> NewtonResult {
     let n = U256::from(xp.len());
     if xp.len() < 2 || ann.is_zero() || gamma.is_zero() || xp.iter().any(U256::is_zero) {
@@ -322,13 +352,19 @@ pub fn try_curve_crypto_amount_out(
     if token_in_idx >= xp.len() || token_out_idx >= xp.len() {
         return Err(CurveCryptoReject::InvalidIndices);
     }
-    let d_result = curve_crypto_newton_d(ann, gamma, &xp);
-    if !d_result.converged {
-        return Err(CurveCryptoReject::NewtonD);
-    }
+    let d = match state.d.filter(|d| !d.is_zero()) {
+        Some(d) => d,
+        None => {
+            let d_result = curve_crypto_newton_d(ann, gamma, &xp);
+            if !d_result.converged {
+                return Err(CurveCryptoReject::NewtonD);
+            }
+            d_result.value
+        }
+    };
     let input_xp = (amount_in * rates[token_in_idx]) / ONE;
     xp[token_in_idx] += input_xp;
-    let y_result = curve_crypto_newton_y(ann, gamma, &xp, d_result.value, token_out_idx);
+    let y_result = curve_crypto_newton_y(ann, gamma, &xp, d, token_out_idx);
     if !y_result.converged {
         return Err(CurveCryptoReject::NewtonY);
     }
@@ -384,6 +420,7 @@ mod tests {
             n_coins: 0,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: None,
         };
         assert_eq!(
             get_curve_crypto_amount_out(&state, U256::ZERO, 0, 1),
@@ -404,6 +441,7 @@ mod tests {
             n_coins: 2,
             gamma: Some(U256::from(10_000u64)),
             d: None,
+            offpeg_fee_multiplier: None,
         };
         let out = get_curve_crypto_amount_out(&state, U256::from(10_000u64) * ONE, 0, 1);
         assert!(out > U256::ZERO);
@@ -424,11 +462,42 @@ mod tests {
             n_coins: 2,
             gamma: Some(U256::from(1_300_000_000_000u64)),
             d: None,
+            offpeg_fee_multiplier: None,
         };
 
         let out = get_curve_crypto_amount_out(&state, U256::from(8_305u64), 0, 1);
         assert!(out > U256::from(3_900_000u64), "out={out}");
         assert!(out <= U256::from(3_926_799u64), "out={out}");
+    }
+
+    /// The decode-time D cache must not change the quote: honouring `state.d`
+    /// must give the same output as recomputing the invariant from scratch.
+    #[test]
+    fn cached_d_preserves_quote_output() {
+        let base = CurvePoolState {
+            balances: vec![
+                U256::from(1_000_000u64) * ONE,
+                U256::from(1_000_000u64) * ONE,
+            ],
+            a: U256::from(5_000u64),
+            fee: U256::from(1_000u64),
+            rates: vec![ONE, ONE],
+            n_coins: 2,
+            gamma: Some(U256::from(10_000u64)),
+            d: None,
+            offpeg_fee_multiplier: None,
+        };
+        let cached =
+            curve_crypto_cache_d(&base.balances, &base.rates, base.a, base.gamma.expect("gamma"))
+                .expect("cache");
+        assert!(!cached.is_zero());
+        let with_cache = CurvePoolState { d: Some(cached), ..base.clone() };
+        let ain = U256::from(10_000u64) * ONE;
+        assert_eq!(
+            try_curve_crypto_amount_out(&with_cache, ain, 0, 1).expect("cached"),
+            try_curve_crypto_amount_out(&base, ain, 0, 1).expect("fresh"),
+            "cached D must not alter the quote"
+        );
     }
 }
 
@@ -470,6 +539,7 @@ mod proptests {
                 n_coins: 2,
                 gamma: Some(gamma),
                 d: None,
+                offpeg_fee_multiplier: None,
             };
             let out = get_curve_crypto_amount_out(&state, amount_in, 0, 1);
             if !out.is_zero() {

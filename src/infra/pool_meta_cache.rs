@@ -14,6 +14,12 @@ struct PoolMetaData {
     balancer_pool_ids: FxHashMap<Address, String>,
     #[serde(default)]
     woofi_meta: FxHashMap<Address, WoofiMetaEntry>,
+    /// ERC20 decimals per token address (immutable) — shared by all Woofi pools.
+    #[serde(default)]
+    token_decimals: FxHashMap<Address, u8>,
+    /// Wooracle price decimals per (wooracle, base) token.
+    #[serde(default)]
+    wooracle_price_dec: FxHashMap<Address, FxHashMap<Address, u8>>,
 }
 
 /// Coalesce burst hydration writes (Woofi/Balancer sweeps) before hitting disk.
@@ -91,6 +97,35 @@ impl PoolMetaCache {
                 wooracle: format!("{wooracle:#x}"),
             },
         );
+        self.persist();
+    }
+
+    pub fn token_decimals(&self, addr: &Address) -> Option<u8> {
+        self.inner.read().token_decimals.get(addr).copied()
+    }
+
+    pub fn set_token_decimals(&self, addr: &Address, decimals: u8) {
+        self.inner.write().token_decimals.insert(*addr, decimals);
+        self.persist();
+    }
+
+    /// Oracle price decimals for a base token in the pool's wooracle.
+    pub fn wooracle_price_dec(&self, wooracle: &Address, base: &Address) -> Option<u8> {
+        self.inner
+            .read()
+            .wooracle_price_dec
+            .get(wooracle)
+            .and_then(|m| m.get(base))
+            .copied()
+    }
+
+    pub fn set_wooracle_price_dec(&self, wooracle: &Address, base: &Address, decimals: u8) {
+        self.inner
+            .write()
+            .wooracle_price_dec
+            .entry(*wooracle)
+            .or_default()
+            .insert(*base, decimals);
         self.persist();
     }
 

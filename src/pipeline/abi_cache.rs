@@ -90,6 +90,7 @@ cached_view_call!(DODO_PMM_STATE, IDodoPoolState::getPMMStateForCallCall {});
 cached_view_call!(CURVE_A, ICurvePool::ACall {});
 cached_view_call!(CURVE_FEE, ICurvePool::feeCall {});
 cached_view_call!(CURVE_STORED_RATES, ICurvePool::stored_ratesCall {});
+cached_view_call!(CURVE_OFFPEG_FEE, ICurvePool::offpeg_fee_multiplierCall {});
 cached_view_call!(CURVE_GAMMA, ICurvePool::gammaCall {});
 // Twocrypto / 2-coin crypto: no-arg `price_scale()`.
 cached_view_call!(CURVE_PRICE_SCALE, ICurvePool::price_scaleCall {});

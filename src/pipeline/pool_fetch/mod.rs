@@ -49,6 +49,26 @@ struct WoofiMeta {
     wooracle: Address,
 }
 
+/// Phase-2 decode plan for one Woofi pool. Positions into the shared `phase2`
+/// multicall results; decimals are `Option` so cached values skip their call.
+struct WoofiSpan {
+    meta_idx: usize,
+    quote_reserve_pos: usize,
+    quote_dec: Option<u8>,
+    quote_dec_pos: Option<usize>,
+    tokens: Vec<WoofiTokenFetch>,
+}
+
+struct WoofiTokenFetch {
+    addr: Address,
+    base_infos_pos: usize,
+    state_pos: usize,
+    base_dec: Option<u8>,
+    base_dec_pos: Option<usize>,
+    price_dec: Option<u8>,
+    price_dec_pos: Option<usize>,
+}
+
 #[derive(Default)]
 struct WoofiFetchResult {
     states: Vec<(Address, Option<PoolState>)>,
@@ -167,40 +187,81 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
     }
 
     let mut phase2 = Vec::new();
-    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(metas.len());
+    let mut spans: Vec<WoofiSpan> = Vec::with_capacity(metas.len());
     for (meta_idx, meta) in metas.iter().enumerate() {
-        let start = phase2.len();
         // Quote reserve: indexer rows often omit the quote token from `tokens`.
+        let quote_reserve_pos = phase2.len();
         phase2.push(MulticallItem {
             target: meta.address,
             data: encode_call(&IWoofiPool::tokenInfosCall { base: meta.quote }),
         });
-        phase2.push(MulticallItem {
-            target: meta.quote,
-            data: ERC20_DECIMALS.clone(),
-        });
+        // ERC20 / oracle decimals are immutable; reuse cached values and drop the
+        // multicall items once known (cuts phase2 from 4→2 calls per base token).
+        let quote_dec = meta_cache.token_decimals(&meta.quote);
+        let quote_dec_pos = if quote_dec.is_some() {
+            None
+        } else {
+            let pos = phase2.len();
+            phase2.push(MulticallItem {
+                target: meta.quote,
+                data: ERC20_DECIMALS.clone(),
+            });
+            Some(pos)
+        };
+        let mut tokens = Vec::with_capacity(meta.tokens.len());
         for token in &meta.tokens {
             if *token == meta.quote {
                 continue;
             }
+            let base_infos_pos = phase2.len();
             phase2.push(MulticallItem {
                 target: meta.address,
                 data: encode_call(&IWoofiPool::tokenInfosCall { base: *token }),
             });
+            let state_pos = phase2.len();
             phase2.push(MulticallItem {
                 target: meta.wooracle,
                 data: encode_call(&IWooracle::stateCall { base: *token }),
             });
-            phase2.push(MulticallItem {
-                target: *token,
-                data: ERC20_DECIMALS.clone(),
-            });
-            phase2.push(MulticallItem {
-                target: meta.wooracle,
-                data: encode_call(&IWooracle::decimalsCall { base: *token }),
+            let base_dec = meta_cache.token_decimals(token);
+            let base_dec_pos = if base_dec.is_some() {
+                None
+            } else {
+                let pos = phase2.len();
+                phase2.push(MulticallItem {
+                    target: *token,
+                    data: ERC20_DECIMALS.clone(),
+                });
+                Some(pos)
+            };
+            let price_dec = meta_cache.wooracle_price_dec(&meta.wooracle, token);
+            let price_dec_pos = if price_dec.is_some() {
+                None
+            } else {
+                let pos = phase2.len();
+                phase2.push(MulticallItem {
+                    target: meta.wooracle,
+                    data: encode_call(&IWooracle::decimalsCall { base: *token }),
+                });
+                Some(pos)
+            };
+            tokens.push(WoofiTokenFetch {
+                addr: *token,
+                base_infos_pos,
+                state_pos,
+                base_dec,
+                base_dec_pos,
+                price_dec,
+                price_dec_pos,
             });
         }
-        spans.push((meta_idx, start, phase2.len()));
+        spans.push(WoofiSpan {
+            meta_idx,
+            quote_reserve_pos,
+            quote_dec,
+            quote_dec_pos,
+            tokens,
+        });
     }
 
     let phase2_results = match execute_multicall_at_chunked(
@@ -225,54 +286,81 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
         owners.into_iter().map(|addr| (addr, None)).collect();
     let mut resolved = rustc_hash::FxHashMap::default();
 
-    for (meta_idx, start, _end) in spans {
-        let meta = &metas[meta_idx];
+    for span in spans {
+        let meta = &metas[span.meta_idx];
         let mut base_states = Vec::new();
         let mut state_tokens = Vec::new();
         let mut quote_reserve = U256::ZERO;
-        let mut cursor = start;
-        if let Some(quote_bytes) = phase2_results.get(cursor).and_then(|r| r.as_ref())
+        if let Some(quote_bytes) = phase2_results
+            .get(span.quote_reserve_pos)
+            .and_then(|r| r.as_ref())
             && let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(quote_bytes)
         {
             quote_reserve = U256::from(info.reserve);
         }
-        cursor += 1;
-        let quote_dec = phase2_results
-            .get(cursor)
-            .and_then(|r| r.as_ref())
-            .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok());
-        cursor += 1;
-        for token_addr in meta.tokens.iter().filter(|t| **t != meta.quote) {
-            let base = phase2_results.get(cursor).and_then(|r| r.as_ref());
-            let oracle = phase2_results.get(cursor + 1).and_then(|r| r.as_ref());
-            let base_dec = phase2_results
-                .get(cursor + 2)
+        let quote_dec = match span.quote_dec {
+            Some(d) => Some(d),
+            None => span.quote_dec_pos.and_then(|pos| {
+                phase2_results
+                    .get(pos)
+                    .and_then(|r| r.as_ref())
+                    .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok())
+            }),
+        };
+        for tf in span.tokens {
+            let Some(info_bytes) = phase2_results
+                .get(tf.base_infos_pos)
                 .and_then(|r| r.as_ref())
-                .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok());
-            let price_dec = phase2_results
-                .get(cursor + 3)
-                .and_then(|r| r.as_ref())
-                .and_then(|bytes| IWooracle::decimalsCall::abi_decode_returns(bytes).ok());
-            cursor += 4;
-            let Some(info_bytes) = base else { continue };
+            else {
+                continue;
+            };
             let Ok(info) = IWoofiPool::tokenInfosCall::abi_decode_returns(info_bytes) else {
                 continue;
             };
             if !info.enabled {
                 continue;
             }
-            let Some(oracle_bytes) = oracle else { continue };
+            let Some(oracle_bytes) = phase2_results
+                .get(tf.state_pos)
+                .and_then(|r| r.as_ref())
+            else {
+                continue;
+            };
             let Ok(oracle_state) = IWooracle::stateCall::abi_decode_returns(oracle_bytes) else {
                 continue;
             };
             if !oracle_state.woFeasible {
                 continue;
             }
+            let base_dec = match tf.base_dec {
+                Some(d) => Some(d),
+                None => tf.base_dec_pos.and_then(|pos| {
+                    phase2_results
+                        .get(pos)
+                        .and_then(|r| r.as_ref())
+                        .and_then(|bytes| IERC20Metadata::decimalsCall::abi_decode_returns(bytes).ok())
+                }),
+            };
+            let price_dec = match tf.price_dec {
+                Some(d) => Some(d),
+                None => tf.price_dec_pos.and_then(|pos| {
+                    phase2_results
+                        .get(pos)
+                        .and_then(|r| r.as_ref())
+                        .and_then(|bytes| IWooracle::decimalsCall::abi_decode_returns(bytes).ok())
+                }),
+            };
             let (Some(base_dec), Some(quote_dec), Some(price_dec)) =
                 (base_dec, quote_dec, price_dec)
             else {
                 continue;
             };
+            if tf.base_dec.is_none() {
+                meta_cache.set_token_decimals(&tf.addr, base_dec);
+            }
+            if tf.price_dec.is_none() {
+                meta_cache.set_wooracle_price_dec(&meta.wooracle, &tf.addr, price_dec);
+            }
             base_states.push(WoofiBaseTokenState {
                 price: U256::from(oracle_state.price),
                 spread: U256::from(oracle_state.spread),
@@ -285,7 +373,7 @@ async fn fetch_woofi_pools_batched<P: Provider<Ethereum> + Clone + Send + 'stati
                 max_gamma: U256::from(info.maxGamma),
                 max_notional_swap: U256::from(info.maxNotionalSwap),
             });
-            state_tokens.push(*token_addr);
+            state_tokens.push(tf.addr);
         }
         let state = if quote_reserve.is_zero() || base_states.is_empty() {
             None

@@ -13,8 +13,9 @@ const MAX_ITERATIONS: u32 = 128;
 /// Safety buffer on Curve dy (5e6 / 1e10 = 0.05%).
 /// Covers multicall→exec drift after NG `_dynamic_fee` (2e10 offpeg default).
 pub(crate) const CURVE_OUTPUT_BUFFER: U256 = U256::from_limbs([5_000_000, 0, 0, 0]);
-/// Stable-NG example `offpeg_fee_multiplier` (2e10). Used when `stored_rates` are present.
-const DEFAULT_OFFPEG_FEE_MULTIPLIER: U256 = U256::from_limbs([20_000_000_000, 0, 0, 0]);
+/// Stable-NG example `offpeg_fee_multiplier` (2e10). Decode fallback when the
+/// live `offpeg_fee_multiplier()` call is unavailable.
+pub(crate) const DEFAULT_OFFPEG_FEE_MULTIPLIER: U256 = U256::from_limbs([20_000_000_000, 0, 0, 0]);
 
 /// Convert Curve `fee()` (1e10 denom) to edge `fee_bps`.
 #[must_use]
@@ -49,6 +50,18 @@ fn dynamic_fee(xpi: U256, xpj: U256, fee: U256, offpeg_mult: U256) -> U256 {
 }
 
 type CurveXp = SmallVec<[U256; MAX_POOL_TOKENS]>;
+
+/// Pre-compute the stable-pool invariant D for a decode-time snapshot so quote
+/// hot paths skip the `get_d` loop. Mirrors exactly what
+/// [`try_curve_stable_amount_out`] would compute (same `to_xp` + `get_d`).
+#[must_use]
+pub(crate) fn curve_stable_cache_d(
+    balances: &[U256],
+    rates: &[U256],
+    a: U256,
+) -> Option<U256> {
+    get_d(&to_xp(balances, rates)?, a)
+}
 
 fn get_d(xp: &[U256], a: U256) -> Option<U256> {
     if a.is_zero() || xp.len() < 2 || xp.iter().any(U256::is_zero) {
@@ -206,13 +219,20 @@ pub fn try_curve_stable_amount_out(
     if dy.is_zero() {
         return Err(CurveStableReject::ZeroOut);
     }
-    // NG get_dy: fee from average xp; plain StableSwap keeps static fee (no rates).
-    let fee = if state.rates.is_empty() {
-        state.fee
-    } else {
-        let xpi_avg = (xp[token_in_idx] + x) / TWO_U256;
-        let xpj_avg = (xp[token_out_idx] + y) / TWO_U256;
-        dynamic_fee(xpi_avg, xpj_avg, state.fee, DEFAULT_OFFPEG_FEE_MULTIPLIER)
+    // NG `_get_dy` uses `_dynamic_fee(avg_xp_i, avg_xp_j, fee)` with the live
+    // `offpeg_fee_multiplier`; classic CurveStableSwap charges a static fee
+    // scaled by N/(4·(N−1)). `offpeg_fee_multiplier: None` marks a classic pool.
+    let n_coins = U256::from(state.balances.len());
+    let fee = match state.offpeg_fee_multiplier {
+        Some(offpeg) => {
+            let xpi_avg = (xp[token_in_idx] + x) / TWO_U256;
+            let xpj_avg = (xp[token_out_idx] + y) / TWO_U256;
+            dynamic_fee(xpi_avg, xpj_avg, state.fee, offpeg)
+        }
+        None => {
+            let static_fee = state.fee * n_coins;
+            static_fee / (U256::from(4u8) * (n_coins - U256::from(1u8)))
+        }
     };
     let fee_amount = (dy * fee) / CURVE_FEE_DENOMINATOR;
     let dy_after_fee = dy.saturating_sub(fee_amount);
@@ -267,6 +287,40 @@ mod tests {
         assert!(skewed <= fee * U256::from(2u8), "skewed={skewed}");
     }
 
+    /// Classic CurveStableSwap charges `fee * N / (4 * (N - 1))` — half the
+    /// pool `fee()` for 2-coin pools — while StableSwapNG uses `fee()` directly.
+    #[test]
+    fn classic_two_coin_charges_half_static_fee() {
+        let fee = U256::from(50_000_000u64); // 0.5% → classic 0.25%, NG 0.5%.
+        let classic = CurvePoolState {
+            balances: vec![
+                U256::from(1_000_000u64) * ONE,
+                U256::from(1_000_000u64) * ONE,
+            ],
+            a: U256::from(1_000u64),
+            fee,
+            rates: vec![ONE, ONE],
+            n_coins: 2,
+            gamma: None,
+            d: None,
+            offpeg_fee_multiplier: None,
+        };
+        let ng = CurvePoolState {
+            offpeg_fee_multiplier: Some(DEFAULT_OFFPEG_FEE_MULTIPLIER),
+            ..classic.clone()
+        };
+        let ain = U256::from(10_000u64) * ONE;
+        let out_classic = try_curve_stable_amount_out(&classic, ain, 0, 1).expect("classic");
+        let out_ng = try_curve_stable_amount_out(&ng, ain, 0, 1).expect("ng");
+        // Bear: classic's lower fee must yield a strictly higher output.
+        assert!(out_classic > out_ng);
+        // Measured fee gap is half the pool fee (~25 bps for 0.5% fee).
+        let classic_fee_bps = ((out_classic - out_ng) * U256::from(10_000u64)) / out_ng;
+        let half_fee_bps = (fee * U256::from(5_000u64)) / CURVE_FEE_DENOMINATOR;
+        assert!(classic_fee_bps > U256::from(20u64), "gap only {classic_fee_bps} bps");
+        assert!(classic_fee_bps <= half_fee_bps + U256::from(5u64), "gap too wide");
+    }
+
     #[test]
     fn test_zero_amount_returns_zero() {
         let state = CurvePoolState {
@@ -277,6 +331,7 @@ mod tests {
             n_coins: 0,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: None,
         };
         assert_eq!(
             get_curve_stable_amount_out(&state, U256::ZERO, 0, 1),
@@ -297,6 +352,7 @@ mod tests {
             n_coins: 2,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: Some(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER),
         };
         let out = get_curve_stable_amount_out(&state, U256::from(10_000u64) * ONE, 0, 1);
         assert!(out > U256::ZERO);
@@ -316,6 +372,7 @@ mod tests {
             n_coins: 2,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: Some(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER),
         };
 
         let out = get_curve_stable_amount_out(&state, U256::from(152_587_890_625_000u64), 1, 0);
@@ -337,6 +394,7 @@ mod tests {
             n_coins: 2,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: Some(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER),
         };
         let out = get_curve_stable_amount_out(&state, U256::from(100_000_000_000_000_000u64), 1, 0);
         let onchain = U256::from(100_751_662_013_279_075u64);
@@ -361,6 +419,7 @@ mod tests {
             n_coins: 2,
             gamma: None,
             d: None,
+            offpeg_fee_multiplier: Some(crate::core::math::curve::DEFAULT_OFFPEG_FEE_MULTIPLIER),
         };
         let ain = U256::from(397_790_001_835_358_637u128);
         let out = try_curve_stable_amount_out(&state, ain, 1, 0).expect("quote");
@@ -397,6 +456,7 @@ mod proptests {
                 n_coins: 2,
                 gamma: None,
                 d: None,
+                offpeg_fee_multiplier: None,
             };
 
             let out = get_curve_stable_amount_out(&state, amount_in, 0, 1);
@@ -423,6 +483,7 @@ mod proptests {
                 n_coins: 2,
                 gamma: None,
                 d: None,
+                offpeg_fee_multiplier: None,
             };
             let out = get_curve_stable_amount_out(&state, amount_in, 0, 0);
             prop_assert!(out.is_zero());
