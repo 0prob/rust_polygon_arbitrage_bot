@@ -1203,10 +1203,16 @@ fn select_cycles_for_rescore(
         // the live bypass so WSS-touched zero_profit cannot fill the probe window
         // (live: active_selected=50 inactive=0 with 187 actives). Skip 1-hop
         // stubs (tests / incomplete cycles) — need a closed path to judge profit.
+        // Also catch dust-only phantoms: gross>0 at micro but ==0 at economic
+        // floor. The rank ladder skips sub-floor amounts for non-tickless routes,
+        // so these can never `kept` — they refill every tick and read ZeroProfit,
+        // crowding the probe window (live: ~2/2 probe-evaluated rejected as
+        // ZeroProfit while spot graph claimed ratio=5.6e-7 / score=4e41).
+        // Tickless CL is exempt: its ladder probes a spot-cap trade below floor.
         if ready.edges.len() >= 2
-            && let Some(micro) =
+            && !crate::orchestrator::hf_execute::cycle_has_tickless_cl(arena, ready.as_ref())
+            && let Some(_) =
                 crate::pipeline::local_sim::simulate_route_minimal(arena, &ready.edges, micro_probe)
-            && micro.profit.is_zero()
         {
             let floor_zero = crate::pipeline::local_sim::simulate_route_minimal(
                 arena,
@@ -3227,6 +3233,42 @@ mod tests {
         })
     }
 
+    /// Two-hop V2 loop token0→token1→token0 with an asymmetric closing pool
+    /// (reserve0=2e15 > reserve1=1e15): micro probe (1e12) profits, the economic
+    /// floor (1e17) exhausts token1 (`V2ReserveExhausted`).
+    fn dust_cycle() -> Arc<FoundCycle> {
+        Arc::new(FoundCycle {
+            start_token: TokenIndex(0),
+            edges: CycleEdges::from_slice(&[
+                Edge {
+                    pool_index: PoolIndex(0),
+                    token_in: TokenIndex(0),
+                    token_out: TokenIndex(1),
+                    token_in_idx: 0,
+                    token_out_idx: 1,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: true,
+                },
+                Edge {
+                    pool_index: PoolIndex(1),
+                    token_in: TokenIndex(1),
+                    token_out: TokenIndex(0),
+                    token_in_idx: 1,
+                    token_out_idx: 0,
+                    protocol: ProtocolType::UniswapV2,
+                    fee_bps: 30,
+                    zero_for_one: false,
+                },
+            ]),
+            hop_count: 2,
+            log_weight: 0.0,
+            cumulative_fee_bps: 60,
+            score: 0.0,
+            cycle_ratio: U256::ZERO,
+        })
+    }
+
     fn v2_state() -> Arc<PoolState> {
         // Reserves must clear default-18-dec micro probe (1e12) and economic floor.
         Arc::new(PoolState::V2(V2PoolState {
@@ -3296,7 +3338,7 @@ mod tests {
             &arena,
             &[],
             &partial_cache,
-            &ExecutionService::default(),
+            &crate::services::execution::service::test_harness(),
             &rates,
             &decimals,
             3,
@@ -3351,7 +3393,7 @@ mod tests {
             &arena,
             &[],
             &partial_cache,
-            &ExecutionService::default(),
+            &crate::services::execution::service::test_harness(),
             &rates,
             &decimals,
             1,
@@ -3360,6 +3402,50 @@ mod tests {
 
         assert_eq!(selected.cycles.len(), 1);
         assert_eq!(selected.cycles[0].score, 4.0);
+    }
+
+    #[test]
+    fn dust_only_profit_cycle_is_quarantined_at_select() {
+        // Closing pool has a token1 reserve (1e15) that clears the 18-dec micro
+        // probe (1e12) but is exhausted by the economic floor (1e17 @ 1:1 rate).
+        // Profit at micro is dust-only: the rank ladder skips sub-floor amounts,
+        // so this cycle could only ever read `ZeroProfit` — quarantine at select.
+        let mut arena = arena_with_edge_tokens();
+        for (id, reserve) in [(0u8, 1u64), (1, 0)] {
+            let mut state = (*v2_state()).clone();
+            if reserve == 0 {
+                // Hop 1 (zero_for_one=false) inputs token1 → reserve1 gates the
+                // floor probe; reserve0 > reserve1 gives a positive micro edge so
+                // old code (which required micro.profit==0) passed it through.
+                let PoolState::V2(ref mut s) = state else {
+                    unreachable!("v2_state");
+                };
+                s.reserve0 = U256::from(2_000_000_000_000_000u64); // 2e15
+                s.reserve1 = U256::from(1_000_000_000_000_000u64); // 1e15
+            }
+            let address = Address::from([id; 20]);
+            arena.register_pool(address, Arc::new(state));
+            let _ = address;
+        }
+        let partial_cache = PartialPoolCache::new();
+        let cycles = vec![dust_cycle()];
+        let rates = one_to_one_rates();
+        let decimals = FxHashMap::default();
+        let exec = crate::services::execution::service::test_harness();
+        let selected = select_cycles_for_rescore(
+            &cycles,
+            &arena,
+            &[],
+            &partial_cache,
+            &exec,
+            &rates,
+            &decimals,
+            4,
+            0,
+        );
+
+        assert_eq!(selected.micro_dead_skipped, 1);
+        assert!(selected.cycles.is_empty());
     }
 
     #[test]
@@ -3399,7 +3485,7 @@ mod tests {
             &arena,
             &[],
             &partial_cache,
-            &ExecutionService::default(),
+            &crate::services::execution::service::test_harness(),
             &rates,
             &decimals,
             12,

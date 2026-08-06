@@ -1062,7 +1062,7 @@ pub(crate) struct ProbeTickHydrateStats {
     pub cycles_tickless_after: usize,
 }
 
-fn cycle_has_tickless_cl(arena: &StateArena, cycle: &FoundCycle) -> bool {
+pub(crate) fn cycle_has_tickless_cl(arena: &StateArena, cycle: &FoundCycle) -> bool {
     for edge in &cycle.edges {
         match (arena.pool_state(edge.pool_index), edge.protocol) {
             (Some(PoolState::V3(s)), crate::core::types::ProtocolType::UniswapV3)

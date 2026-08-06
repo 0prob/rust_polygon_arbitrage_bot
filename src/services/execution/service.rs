@@ -179,6 +179,23 @@ impl Default for ExecutionService {
     }
 }
 
+/// Test-only constructor that never touches the live `.rpbot-route-stats.json`.
+/// Unit tests previously used `Default`, which wrote synthetic single-edge
+/// `test_route(11)` records into the operator's live route-learning file
+/// (440× `v1 11 11:0:1:0:1:0:30:1 d` pollution).
+#[cfg(test)]
+pub(crate) fn test_harness() -> ExecutionService {
+    let path = std::env::temp_dir().join(format!(
+        "rpbot-route-stats-test-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    ExecutionService::with_route_stats_path(path)
+}
+
 impl ExecutionService {
     /// Build using centralized config (prefers execution.route_stats_path over ROUTE_STATS_PATH env).
     pub fn from_config(config: &AppConfig) -> Self {
@@ -1786,7 +1803,7 @@ mod safety_tests {
 
     #[test]
     fn chronic_underwater_quarantine_needs_repeated_strikes() {
-        let exec = ExecutionService::default();
+        let exec = test_harness();
         let fp = 0xdead_beef_u64;
         let route = test_route(fp);
         let thick = U256::from(10u128.pow(17)); // 0.1 MATIC — needs 3 strikes
@@ -1920,7 +1937,7 @@ mod safety_tests {
 
     #[test]
     fn colliding_fingerprints_do_not_share_execution_route_gates() {
-        let exec = ExecutionService::default();
+        let exec = test_harness();
         let first = test_route(1);
         let second = test_route(2);
         let colliding_fp = 0xfeed_u64;
@@ -2024,7 +2041,7 @@ mod safety_tests {
 
     #[test]
     fn realized_loss_updates_pnl_and_breaker() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         service.record_realized(U256::from(1u8), U256::from(10u8));
         assert_eq!(service.pnl_snapshot().1, -9);
         assert_eq!(service.total_losses.load(Ordering::Relaxed), 1);
@@ -2033,7 +2050,7 @@ mod safety_tests {
 
     #[test]
     fn realized_profit_is_net_of_gas_and_resets_breaker() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         service.record_realized(U256::ZERO, U256::from(1u8));
         service.record_realized(U256::from(20u8), U256::from(5u8));
         assert_eq!(service.pnl_snapshot().1, 14);
@@ -2043,7 +2060,7 @@ mod safety_tests {
 
     #[test]
     fn break_even_realized_is_neutral_not_loss() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         service.record_realized(U256::from(10u8), U256::from(10u8));
         assert_eq!(service.pnl_snapshot().1, 0);
         assert_eq!(service.total_trades.load(Ordering::Relaxed), 0);
@@ -2053,7 +2070,7 @@ mod safety_tests {
 
     #[test]
     fn daily_loss_limit_trips_on_record_realized() {
-        let mut service = ExecutionService::new();
+        let mut service = test_harness();
         service.max_daily_loss_matic_wei = Some(U256::from(5u8));
         service.record_realized(U256::ZERO, U256::from(5u8));
         assert!(service.global_is_quarantined());
@@ -2061,7 +2078,7 @@ mod safety_tests {
 
     #[test]
     fn daily_pnl_resets_on_utc_day_boundary() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         service.record_realized(U256::from(20u8), U256::from(5u8));
         {
             let mut pnl = service.pnl.lock();
@@ -2253,7 +2270,7 @@ mod safety_tests {
 
     #[test]
     fn learned_failure_rate_raises_profit_floor() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         let failed_route = test_route(7);
         let unseen_route = test_route(8);
         service.route_stats.write().insert(
@@ -2271,7 +2288,7 @@ mod safety_tests {
 
     #[test]
     fn odd_timeout_count_applies_half_weight() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         let route = test_route(9);
         service.route_stats.write().insert(
             route.clone(),
@@ -2292,7 +2309,7 @@ mod safety_tests {
 
     #[test]
     fn dry_run_pass_does_not_reduce_risk_floor_without_mined_receipt() {
-        let service = ExecutionService::new();
+        let service = test_harness();
         let route = test_route(11);
         service.route_stats.write().insert(
             route.clone(),
