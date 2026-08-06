@@ -142,7 +142,10 @@ pub struct StateRefreshService {
     indexer_stale: AtomicBool,
     last_indexer_block: AtomicU64,
     last_indexer_check_ms: AtomicU64,
-    serialized_state_refresh: AsyncMutex<StateProvenance>,
+    /// Published (block, hash) — fast sync lock so hot-path readers never block on RPC.
+    state_provenance: RwLock<StateProvenance>,
+    /// Single-flights `refresh_pools_impl` transactions; holds no data itself.
+    refresh_txn: AsyncMutex<()>,
     routable_pool_count: AtomicUsize,
     routable_pool_count_generation: AtomicU64,
     fetch_never_scan_offset: AtomicUsize,
@@ -182,7 +185,8 @@ impl StateRefreshService {
             indexer_stale: AtomicBool::new(false),
             last_indexer_block: AtomicU64::new(0),
             last_indexer_check_ms: AtomicU64::new(0),
-            serialized_state_refresh: AsyncMutex::new(StateProvenance::default()),
+            state_provenance: RwLock::new(StateProvenance::default()),
+            refresh_txn: AsyncMutex::new(()),
             routable_pool_count: AtomicUsize::new(0),
             routable_pool_count_generation: AtomicU64::new(0),
             fetch_never_scan_offset: AtomicUsize::new(0),
@@ -288,19 +292,20 @@ impl StateRefreshService {
         self.last_indexer_block.load(Ordering::Relaxed)
     }
 
-    pub async fn last_state_block(&self) -> u64 {
-        self.serialized_state_refresh.lock().await.block
+    #[must_use]
+    pub fn last_state_block(&self) -> u64 {
+        self.state_provenance.read().block
     }
 
     #[must_use]
-    pub async fn last_state_provenance(&self) -> (u64, Option<B256>) {
-        let state = *self.serialized_state_refresh.lock().await;
+    pub fn last_state_provenance(&self) -> (u64, Option<B256>) {
+        let state = *self.state_provenance.read();
         (state.block, state.hash)
     }
 
     #[inline]
-    async fn chain_head_fallback(&self, indexer_block: u64) -> u64 {
-        let state_block = self.last_state_block().await;
+    fn chain_head_fallback(&self, indexer_block: u64) -> u64 {
+        let state_block = self.last_state_block();
         if state_block > 0 {
             state_block.max(indexer_block)
         } else {
@@ -339,10 +344,10 @@ impl StateRefreshService {
         } else if let Ok(provider) = self.rpc.connect_state() {
             match provider.get_block_number().await {
                 Ok(block) => block,
-                Err(_) => self.chain_head_fallback(progress.last_processed_block).await,
+                Err(_) => self.chain_head_fallback(progress.last_processed_block),
             }
         } else {
-            self.chain_head_fallback(progress.last_processed_block).await
+            self.chain_head_fallback(progress.last_processed_block)
         };
 
         let lag = head.saturating_sub(progress.last_processed_block);
@@ -997,7 +1002,10 @@ impl StateRefreshService {
         address_index: Arc<FxHashMap<Address, usize>>,
         initial_addrs: Option<Vec<Address>>,
     ) -> anyhow::Result<PoolRefreshResult> {
-        let mut last_state = self.serialized_state_refresh.lock().await;
+        // Single-flights concurrent refreshes; the transaction's RPC calls never hold
+        // `state_provenance`'s lock, so `last_state_block`/`last_state_provenance` (read
+        // from the HF hot path) never block on this call's network round-trips.
+        let _txn = self.refresh_txn.lock().await;
         let matched = initial_addrs.as_ref().map_or(pools.len(), Vec::len);
         let candidates = self.rpc.state_url_candidates();
         if candidates.is_empty() {
@@ -1008,7 +1016,7 @@ impl StateRefreshService {
             });
         }
 
-        let mut state_provenance = *last_state;
+        let mut state_provenance = *self.state_provenance.read();
         let cached_block = (state_provenance.block > 0).then_some(state_provenance.block);
 
         let mut total_updated = 0usize;
@@ -1121,7 +1129,7 @@ impl StateRefreshService {
                     };
                     state_provenance =
                         refreshed_state_provenance(state_provenance, block, pinned_hash);
-                    *last_state = state_provenance;
+                    *self.state_provenance.write() = state_provenance;
                 }
                 if idx > 0 {
                     crate::info!(
@@ -1410,31 +1418,42 @@ mod tests {
         let refresh = Arc::new(
             StateRefreshService::new(config, cache, rpc).expect("state refresh service builds"),
         );
-        let mut in_flight = refresh.serialized_state_refresh.lock().await;
+        let in_flight = refresh.refresh_txn.lock().await;
         let queued_refresh = Arc::clone(&refresh);
-        let mut queued = tokio::spawn(async move {
-            queued_refresh.refresh_pool_states(1).await
-        });
+        let mut queued = tokio::spawn(async move { queued_refresh.refresh_pool_states(1).await });
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut queued)
                 .await
-                .is_err()
+                .is_err(),
+            "second refresh must wait for the in-flight transaction lock"
         );
-        *in_flight = StateProvenance {
-            block: 100,
-            hash: Some(B256::repeat_byte(1)),
-        };
         drop(in_flight);
         queued
             .await
             .expect("queued refresh task completes")
             .expect("queued refresh succeeds");
+    }
 
+    #[tokio::test]
+    async fn state_provenance_reads_do_not_block_on_in_flight_refresh() {
+        let config = Arc::new(AppConfig::default());
+        let cache = Arc::new(StateCache::default());
+        let rpc = Arc::new(RpcPool::from_config(config.as_ref()));
+        let refresh = Arc::new(
+            StateRefreshService::new(config, cache, rpc).expect("state refresh service builds"),
+        );
+        *refresh.state_provenance.write() = StateProvenance {
+            block: 100,
+            hash: Some(B256::repeat_byte(1)),
+        };
+        let _in_flight = refresh.refresh_txn.lock().await;
+        // Readers must stay instant even while a transaction holds `refresh_txn`.
         assert_eq!(
-            refresh.last_state_provenance().await,
+            refresh.last_state_provenance(),
             (100, Some(B256::repeat_byte(1)))
         );
+        assert_eq!(refresh.last_state_block(), 100);
     }
 
     #[test]

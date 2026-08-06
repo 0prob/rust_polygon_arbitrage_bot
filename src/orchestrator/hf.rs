@@ -2051,7 +2051,7 @@ pub async fn run_hf_tick(
     if log_hf_summary {
         crate::info!(
             "hf eval input: stream_triggered={stream_triggered} snap_generation={selection_generation} state_generation={evaluation_state_generation} state_block={} hot_pools={} hot_cache_drop={hot_cache_dropped} gas_snapshot_age_ms={gas_snapshot_age_ms:?}",
-            ctx.refresh.last_state_block().await,
+            ctx.refresh.last_state_block(),
             hot_pools.len(),
         );
     }
@@ -2550,7 +2550,7 @@ pub async fn run_hf_tick(
     let mut dispatch_state_block = if snap_state_block > 0 {
         snap_state_block
     } else {
-        ctx.refresh.last_state_block().await
+        ctx.refresh.last_state_block()
     };
     let mut dispatch_state_hash = snap_state_hash;
     let verify_started = now_ms();
@@ -2582,7 +2582,7 @@ pub async fn run_hf_tick(
             if resim_refreshed {
                 dispatch_state_generation = resim_generation;
                 (dispatch_state_block, dispatch_state_hash) =
-                    ctx.refresh.last_state_provenance().await;
+                    ctx.refresh.last_state_provenance();
                 if dispatch_state_block == 0 {
                     crate::warn!("dropping refreshed routes: state refresh has no pinned block");
                     profitable.clear();

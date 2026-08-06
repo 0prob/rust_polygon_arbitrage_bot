@@ -450,12 +450,18 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     let pools_refreshed = if !refresh_required {
         false
     } else {
-        match refresh_route_pools_into_arena(&ctx.refresh, &ctx.cache, arena, &dispatch_pools).await
+        match Box::pin(refresh_route_pools_into_arena(
+            &ctx.refresh,
+            &ctx.cache,
+            arena,
+            &dispatch_pools,
+        ))
+        .await
         {
             Ok((fetched, generation)) => {
                 dispatch_state_generation = generation;
                 if fetched {
-                    let (tick_block, tick_hash) = ctx.refresh.last_state_provenance().await;
+                    let (tick_block, tick_hash) = ctx.refresh.last_state_provenance();
                     if tick_block == 0 {
                         crate::warn!("dispatch aborted: refreshed route state has no pinned block");
                         return;
@@ -2056,7 +2062,7 @@ pub(crate) async fn refresh_and_resim_profitable(
     let mut state_generation = cache.generation();
     let refresh_started = crate::util::now_ms();
     if !pools.is_empty() {
-        match refresh_route_pools_into_arena(refresh, cache, arena, &pools).await {
+        match Box::pin(refresh_route_pools_into_arena(refresh, cache, arena, &pools)).await {
             Ok((fetched, generation)) => {
                 state_generation = generation;
                 pools_refreshed = fetched;
