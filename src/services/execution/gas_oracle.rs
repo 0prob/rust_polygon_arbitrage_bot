@@ -62,17 +62,26 @@ impl RouteGasLookup {
                 observed: FxHashMap::default(),
             };
         }
-        let capacity = upper.unwrap_or(lower).min(ROUTE_GAS_HISTORY);
-        let mut observed = FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher);
         let history = oracle.route_gas.lock();
+        if history.map.is_empty() {
+            return Self {
+                scale_bps,
+                observed: FxHashMap::default(),
+            };
+        }
+        let mut observed: Option<FxHashMap<CycleEdges, u32>> = None;
         for edges in routes {
             if let Some(&gas) = history.map.get(edges) {
-                observed.insert(CycleEdges::from_slice(edges), gas);
+                let map = observed.get_or_insert_with(|| {
+                    let capacity = upper.unwrap_or(lower).min(ROUTE_GAS_HISTORY);
+                    FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher)
+                });
+                map.insert(CycleEdges::from_slice(edges), gas);
             }
         }
         Self {
             scale_bps,
-            observed,
+            observed: observed.unwrap_or_default(),
         }
     }
 

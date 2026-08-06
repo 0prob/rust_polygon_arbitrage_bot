@@ -13,6 +13,8 @@ pub fn get_amount_out(
     fee_numerator: U256,
     fee_denominator: U256,
 ) -> U256 {
+    // Fast-path for standard trades where U256 multiplication will not overflow:
+    // amount_in_with_fee fits in U256 if amount_in fits in 128 bits and fee_numerator <= 10000.
     if amount_in.is_zero()
         || reserve_in.is_zero()
         || reserve_out.is_zero()
@@ -23,9 +25,15 @@ pub fn get_amount_out(
         return U256::ZERO;
     }
 
-    // U512 widening prevents silent overflow on deep pools with large reserves.
-    // amount_in * fee_numerator * reserve_out can exceed U256::MAX for
-    // high-liquidity pairs (e.g. WMATIC/USDC with 10^18+ balances).
+    // Fast-path: if amounts fit in u128, u256 math cannot overflow (128 + 128 + 14 bits <= 256).
+    if (amount_in | reserve_in | reserve_out).as_limbs()[2..] == [0, 0] {
+        let amount_in_with_fee = amount_in * fee_numerator;
+        let numerator = amount_in_with_fee * reserve_out;
+        let denominator = (reserve_in * fee_denominator) + amount_in_with_fee;
+        return numerator / denominator;
+    }
+
+    // U512 widening fallback prevents overflow on ultra-deep pools with large reserves.
     let amount_in_with_fee = U512::from(amount_in) * U512::from(fee_numerator);
     let numerator = amount_in_with_fee * U512::from(reserve_out);
     let den_part = U512::from(reserve_in) * U512::from(fee_denominator);
