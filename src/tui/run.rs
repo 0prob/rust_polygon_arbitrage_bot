@@ -153,6 +153,6 @@ fn draw_frame(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn draw_frame_blocking(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
+pub(crate) fn draw_frame_blocking(terminal: &mut TerminalGuard, app: &App) -> anyhow::Result<()> {
     tokio::task::block_in_place(|| draw_frame(terminal, app))
 }

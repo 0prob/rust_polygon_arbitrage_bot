@@ -10,6 +10,16 @@ where
         .any(|arg| matches!(arg.as_ref(), "-h" | "--help"))
 }
 
+pub fn demo_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_ref(), "--demo" | "-d"))
+}
+
 pub fn print_help(bin_name: &str) -> io::Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     // Keep help self-contained: no dotenv / log / network side effects.
@@ -19,9 +29,11 @@ pub fn print_help(bin_name: &str) -> io::Result<()> {
 
 Usage:
   {bin_name}
+  {bin_name} --demo
   {bin_name} -h | --help
 
 Options:
+  --demo, -d    Run in mock demo mode for screen recording / preview
   -h, --help    Show this help and exit
 
 Config:

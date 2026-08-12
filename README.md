@@ -19,12 +19,22 @@ Polygon mainnet MEV arbitrage bot. Discovers pools from an Envio/HyperIndex inde
 - **Execution** — Dry-run simulation or live submit via Huff `ArbExecutor`; optional MEV-protected `PRIVATE_RPC_URL` and/or bloXroute (`BLOXROUTE_AUTH_HEADER`), profit-scaled priority fees, nonce management, route cooldown/quarantine, receipt polling.
 - **TUI dashboard** (optional) — Ratatui UI behind `--features tui`; headless `rpbot` is the production path.
 
+## Terminal UI Demo
+
+![rpbot TUI Demo](assets/tui_demo.gif)
+
+Run the interactive dashboard or preview demo mode (cycles through tabs every 5s):
+
+```bash
+cargo run --release --features tui --bin tui -- --demo
+```
+
 ## Binaries
 
 | Binary | Purpose |
 |---|---|
 | `rpbot` | Main bot (default, headless) |
-| `tui` | Optional terminal dashboard (`cargo run --release --features tui --bin tui`) |
+| `tui` | Terminal dashboard (`cargo run --release --features tui --bin tui`, supports `--demo`) |
 
 ## Prerequisites
 
