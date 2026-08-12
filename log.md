@@ -4,6 +4,10 @@ Chronological ledger of ingestion, compilation, and lint actions.
 
 ---
 
+## 2026-08-13 — Source sync
+
+Updated `wiki/oracle-pricing.md` to match the current curated auto-feed queue and scan trigger in `src/services/oracle/auto_feeds.rs`.
+
 ## 2026-07-30 — Initialization
 
 **Action:** scaffold + initial compile  

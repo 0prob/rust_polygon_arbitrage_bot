@@ -38,7 +38,7 @@ cargo run --release --features tui --bin tui -- --demo
 
 ## Prerequisites
 
-- **Rust nightly** — crate uses edition 2024 (verify with `rustc --version`).
+- **Rust nightly 2026-07-20** — pinned by `rust-toolchain.toml` (verify with `rustc --version`).
 - **Polygon RPC** — archival endpoint recommended for pool-state reads (`STATE_RPC_URL` / `POLYGON_RPC_URLS`); separate `EXECUTION_RPC` for HF `eth_call` / gas / receipts.
 - **Envio indexer** — PostgreSQL from [`0prob/polygon_envio_hyperindex`](https://github.com/0prob/polygon_envio_hyperindex) (`PG_URL`; code default `postgres://postgres@localhost:5433/envio-dev`).
 - **Live execution** — deployed Huff executor from [`0prob/solidity_and_huff_evm_contract`](https://github.com/0prob/solidity_and_huff_evm_contract) (Foundry + `huffc`; `OWNER` + `PRIVATE_KEY` for deploy).
@@ -94,7 +94,7 @@ cargo run --release --features tui --bin tui
 cargo build --profile release-fast     # thinner LTO, faster link for local iteration
 ```
 
-Unmapped tokens accumulate at runtime; every 20 **new** addresses trigger a Hermes USD-spot scan. Verified feeds are registered and persisted to `target/run-logs/oracle-auto-feeds.json` (override with `RPBOT_ORACLE_AUTO_FEEDS`); misses are marked `no_feed` so they are not rescanned.
+Allow-listed unmapped tokens trigger a background Hermes USD-spot scan immediately (up to 20 per batch, with a 30s fallback tick). Verified feeds are registered and persisted to `target/run-logs/oracle-auto-feeds.json` (override with `RPBOT_ORACLE_AUTO_FEEDS`); misses are marked `no_feed` so they are not rescanned.
 
 Help: `cargo run -- --help` (or `rpbot --help` after build). Concurrent `rpbot`/`tui` processes are killed at startup unless `RPBOT_ALLOW_MULTIPLE` is set.
 
@@ -106,6 +106,8 @@ cargo test
 cargo bench --bench routing        # v2/v3 swap, route sim, graph rescore, cycle find, optimize
 cargo build --profile release-fast # near-prod binary without full fat LTO wall time
 ```
+
+The health check requires the Python packages `psycopg2` and `websockets`.
 
 | Feature | Default | Notes |
 |---|---|---|
