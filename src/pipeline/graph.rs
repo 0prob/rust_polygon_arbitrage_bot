@@ -1052,14 +1052,6 @@ pub fn count_eligible_pools_missing_from_graph_with_gate(
         .count()
 }
 
-pub fn count_eligible_pools_missing_from_graph(
-    arena: &StateArena,
-    pools: &[PoolMeta],
-    graph: &RoutingGraph,
-) -> usize {
-    count_eligible_pools_missing_from_graph_with_gate(arena, pools, graph, None)
-}
-
 #[must_use]
 pub fn has_missing_eligible_pools(
     arena: &StateArena,

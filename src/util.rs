@@ -171,16 +171,6 @@ where
     cpu_pool().install(f)
 }
 
-/// Sync entry into [`lf_cpu_pool`] via `install` (blocks the caller).
-/// Prefer [`lf_cpu_pool`]`.spawn` from async code — see [`run_cpu`].
-pub fn run_lf_cpu<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R + Send,
-    R: Send,
-{
-    lf_cpu_pool().install(f)
-}
-
 // Powers of two as f64 (exactly representable for integer powers of two).
 const F64_2_POW_64: f64 = 18446744073709551616.0;
 const F64_2_POW_128: f64 = F64_2_POW_64 * F64_2_POW_64;

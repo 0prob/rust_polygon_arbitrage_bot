@@ -913,17 +913,6 @@ impl StateRefreshService {
         Arc::clone(&self.discovery_state.read().token_decimals)
     }
 
-    /// Register tradable cached pools into a fresh arena without scanning the full
-    /// discovery set (~263k) on every LF pass.
-    pub fn sync_routable_arena(
-        &self,
-        arena: &mut crate::pipeline::arena::StateArena,
-        decimal_hints: Option<&FxHashMap<Address, u8>>,
-    ) -> Vec<crate::pipeline::types::PoolMeta> {
-        self.sync_routable_arena_gated(arena, decimal_hints, false)
-            .metas
-    }
-
     /// `freeze_append`: skip new arena membership while graph attach catch-up runs.
     pub fn sync_routable_arena_gated(
         &self,

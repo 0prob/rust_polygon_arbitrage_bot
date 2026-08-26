@@ -1283,23 +1283,6 @@ pub fn probe_insane_gross_phantom(
     )
 }
 
-#[must_use]
-pub fn micro_probe_insane_gross_phantom(
-    arena: &StateArena,
-    edges: &[Edge],
-    micro_probe: U256,
-    token_decimals: u8,
-    token_to_matic_rate: U256,
-) -> bool {
-    probe_insane_gross_phantom(
-        arena,
-        edges,
-        micro_probe,
-        token_decimals,
-        token_to_matic_rate,
-    )
-}
-
 /// Rank probe now starts at economic floor (except tickless CL spot-cap). Cycles
 /// that already fail amount-dependent liquidity there never `kept` — prune at HF
 /// select so micro-only survivors stop crowding empties as `v2_reserve` /
@@ -1322,26 +1305,6 @@ pub fn economic_floor_liquidity_dead(
         | Some(fail @ MinimalSimFailure::V2ReserveExhausted { .. }) => Some(fail),
         _ => None,
     }
-}
-
-/// Balancer routes where even `economic_floor` trips vault `MAX_IN_RATIO` produce
-/// Brent `bal_bounds_fail` (live: 100% of `bounds_fail`). Prune before select.
-#[must_use]
-pub fn balancer_economic_floor_max_in_dead(
-    arena: &StateArena,
-    edges: &[Edge],
-    economic_floor: U256,
-) -> bool {
-    if !edges
-        .iter()
-        .any(|edge| edge.protocol == ProtocolType::BalancerV2)
-    {
-        return false;
-    }
-    matches!(
-        economic_floor_liquidity_dead(arena, edges, economic_floor),
-        Some(MinimalSimFailure::BalancerMaxInRatio { .. })
-    )
 }
 
 fn cl_hop_tickless(state: &PoolState) -> bool {
@@ -1681,15 +1644,6 @@ pub fn route_hop_fidelity_reject_profiled(
     None
 }
 
-/// Post-refresh resim must stay profitable; hop outputs may improve but not erode past the cap.
-#[must_use]
-pub fn route_resim_fidelity_ok(
-    baseline: &RouteSimulationResult,
-    refreshed: &RouteSimulationResult,
-) -> bool {
-    route_resim_fidelity_reject(baseline, refreshed).is_none()
-}
-
 #[must_use]
 pub fn route_resim_fidelity_reject(
     baseline: &RouteSimulationResult,
@@ -1802,15 +1756,6 @@ fn walk_route_hops(
     }
 
     Some((current, total_gas))
-}
-
-/// First hop index `i` where `edges[i].token_out != edges[i+1].token_in`.
-#[inline]
-#[must_use]
-pub fn first_hop_continuity_break(edges: &[Edge]) -> Option<usize> {
-    edges
-        .windows(2)
-        .position(|pair| pair[0].token_out != pair[1].token_in)
 }
 
 /// Address-aware continuity — TokenIndex inequality false-positives aliases.
@@ -2011,7 +1956,7 @@ mod tests {
 
     #[test]
     fn heal_cycle_edge_protocols_rewrites_v2_tag_on_v3_state() {
-        use crate::core::types::{FoundCycle, V3PoolState, V3Tick};
+        use crate::core::types::FoundCycle;
         use std::sync::Arc;
 
         let mut arena = StateArena::default();
@@ -2019,21 +1964,7 @@ mod tests {
         let t1 = arena.register_token(Address::from([2u8; 20]));
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
-            Arc::new(PoolState::V3(V3PoolState {
-                sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000_000_000_000_000u128,
-                tick: 0,
-                fee: U256::from(3000u32),
-                tick_spacing: 60,
-                unlocked: true,
-                fee_protocol: 0,
-                observation_cardinality: 1,
-                ticks: Arc::from(vec![V3Tick {
-                    tick: -60_000,
-                    liquidity_gross: 1,
-                    liquidity_net: 0,
-                }]),
-            })),
+            Arc::new(crate::test_support::v3_pool_state_fixture()),
         );
         let cycle = Arc::new(FoundCycle {
             start_token: t0,
@@ -2146,7 +2077,7 @@ mod tests {
 
     #[test]
     fn heal_cycle_edge_protocols_realigns_stale_zfo() {
-        use crate::core::types::{FoundCycle, V3PoolState, V3Tick};
+        use crate::core::types::FoundCycle;
         use std::sync::Arc;
 
         let mut arena = StateArena::default();
@@ -2154,21 +2085,7 @@ mod tests {
         let t1 = arena.register_token(Address::from([2u8; 20]));
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
-            Arc::new(PoolState::V3(V3PoolState {
-                sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000_000_000_000_000u128,
-                tick: 0,
-                fee: U256::from(3000u32),
-                tick_spacing: 60,
-                unlocked: true,
-                fee_protocol: 0,
-                observation_cardinality: 1,
-                ticks: Arc::from(vec![V3Tick {
-                    tick: -60_000,
-                    liquidity_gross: 1,
-                    liquidity_net: 0,
-                }]),
-            })),
+            Arc::new(crate::test_support::v3_pool_state_fixture()),
         );
         let cycle = Arc::new(FoundCycle {
             start_token: t0,
@@ -2809,7 +2726,7 @@ mod tests {
 
     #[test]
     fn v3_route_gas_does_not_double_count_base_cost() {
-        use crate::core::types::{V3PoolState, V3Tick};
+        
         use std::sync::Arc;
 
         let mut arena = StateArena::default();
@@ -2817,21 +2734,7 @@ mod tests {
         let t1 = arena.register_token(Address::from([2u8; 20]));
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
-            Arc::new(PoolState::V3(V3PoolState {
-                sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000_000_000_000_000u128,
-                tick: 0,
-                fee: U256::from(3000u32),
-                tick_spacing: 60,
-                unlocked: true,
-                fee_protocol: 0,
-                observation_cardinality: 1,
-                ticks: Arc::from(vec![V3Tick {
-                    tick: -60_000,
-                    liquidity_gross: 1,
-                    liquidity_net: 0,
-                }]),
-            })),
+            Arc::new(crate::test_support::v3_pool_state_fixture()),
         );
         let edge = Edge {
             pool_index: pool,

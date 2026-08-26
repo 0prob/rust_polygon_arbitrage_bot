@@ -615,15 +615,6 @@ fn probe_assess_input(
     }
 }
 
-#[must_use]
-pub fn net_profit_after_gas_from_sim(
-    sim: &MinimalSimResult,
-    amount_in: U256,
-    ctx: &ProfitEvalContext,
-) -> U256 {
-    assess_profit(&probe_assess_input(sim, amount_in, ctx)).net_profit_after_gas
-}
-
 /// MATIC-denominated net after gas + priority uplift (probe ranking).
 #[must_use]
 pub fn net_profit_matic_from_sim(

@@ -290,15 +290,6 @@ fn atomic_sim_verdict_for_cycle(
     }
 }
 
-pub fn prefilter_cycles_by_atomic_sim_with_context(
-    arena: &StateArena,
-    cycles: Vec<FoundCycle>,
-    max_keep: usize,
-    ctx: Option<&ProbeContext<'_>>,
-) -> (Vec<FoundCycle>, PrefilterDiagnostics) {
-    prefilter_cycles_by_atomic_sim_with_context_and_diag(arena, cycles, max_keep, ctx)
-}
-
 pub fn prefilter_cycles_by_atomic_sim_with_context_and_diag(
     arena: &StateArena,
     cycles: Vec<FoundCycle>,

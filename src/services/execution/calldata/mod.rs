@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn v3_hop_rejects_tokens_absent_from_pool_meta() {
-        use crate::core::types::{V3PoolState, V3Tick};
+        
 
         let mut arena = StateArena::default();
         let t0 = arena.register_token(Address::from([1u8; 20]));
@@ -828,21 +828,7 @@ mod tests {
         let foreign = arena.register_token(Address::from([9u8; 20]));
         let pool = arena.register_pool(
             Address::from([3u8; 20]),
-            Arc::new(PoolState::V3(V3PoolState {
-                sqrt_price_x96: U256::from(1u128 << 96),
-                liquidity: 1_000_000_000_000_000_000u128,
-                tick: 0,
-                fee: U256::from(3000u32),
-                tick_spacing: 60,
-                unlocked: true,
-                fee_protocol: 0,
-                observation_cardinality: 1,
-                ticks: Arc::from(vec![V3Tick {
-                    tick: -60_000,
-                    liquidity_gross: 1,
-                    liquidity_net: 0,
-                }]),
-            })),
+            Arc::new(crate::test_support::v3_pool_state_fixture()),
         );
         let meta = PoolMeta {
             pool_index: pool,

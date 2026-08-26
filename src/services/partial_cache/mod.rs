@@ -376,10 +376,6 @@ impl PartialPoolCache {
         }
     }
 
-    pub fn apply_log(&self, pool: Address, topic0: B256, data: &[u8], now_ms: u64) -> bool {
-        self.apply_log_notify(pool, topic0, data, now_ms, true)
-    }
-
     /// Apply a decoded pool log. When `wake_hf` is false, state/activity still
     /// update for stream-target ranking but HF is not notified (topic-wide
     /// Sync/Swap spam outside the interest set was thrashing empty HF ticks).
@@ -507,10 +503,6 @@ impl PartialPoolCache {
             self.dirty.lock().extend(retry);
         }
         flushed
-    }
-
-    pub fn tracked_addresses(&self) -> Vec<Address> {
-        self.pools.iter().map(|e| *e.key()).collect()
     }
 
     /// Pools patched since the last flush — small vs the full WSS target set.

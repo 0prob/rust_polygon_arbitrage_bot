@@ -8,10 +8,7 @@ use crate::core::types::PoolState;
 use crate::pipeline::arena::StateArena;
 use crate::services::execution::calldata::CalldataHop;
 use crate::services::execution::calldata::approvals::encode_approve_if_needed;
-use crate::services::execution::calldata::encoders::shared::to_v3_state;
-use crate::services::execution::quote::{
-    derive_tight_v3_price_limit, quote_hop_for_execution, resolve_v3_fee_pips_for_hop,
-};
+use crate::services::execution::calldata::encoders::shared::resolve_cl_swap_limit;
 
 /// Encode a Uniswap V4 hop into executor calls.
 ///
@@ -28,8 +25,6 @@ pub fn encode_v4_hop(
     full_range_limit: bool,
     prequoted_out: Option<U256>,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
-    use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
-
     let pool_manager: Address = UNISWAP_V4_POOL_MANAGER;
     let (fee, tick_spacing, hooks) = v4_static_fields(arena, hop);
 
@@ -40,35 +35,16 @@ pub fn encode_v4_hop(
         anyhow::bail!("v4 zero_for_one must match sorted currency0 (token_in < token_out)");
     }
 
-    let pool_state = arena
-        .pool_state(hop.edge.pool_index)
-        .ok_or_else(|| anyhow::anyhow!("missing pool state for v4 hop"))?;
-    let v3 = to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not v4 state"))?;
-
-    let quoted_out = match prequoted_out.filter(|q| !q.is_zero()) {
-        Some(q) => q,
-        None => quote_hop_for_execution(arena, hop)
-            .ok_or_else(|| anyhow::anyhow!("v4 execution quote unavailable"))?,
-    };
-    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
-    let sqrt_limit = if full_range_limit {
-        if hop.edge.zero_for_one {
-            MIN_SQRT_RATIO + U256::ONE
-        } else {
-            MAX_SQRT_RATIO_EXCLUSIVE
-        }
-    } else {
-        derive_tight_v3_price_limit(
-            &v3,
-            hop.amount_in,
-            quoted_out,
-            hop.edge.zero_for_one,
-            hop.edge.fee_bps,
-            slippage_bps,
-            Some(fee_pips),
-            true,
-        )?
-    };
+    let sqrt_limit = resolve_cl_swap_limit(
+        arena,
+        hop,
+        slippage_bps,
+        full_range_limit,
+        prequoted_out,
+        true,
+        "v4",
+    )?
+    .sqrt_limit;
 
     let (pool_key, zero_for_one) =
         build_v4_pool_key(hop.token_in, hop.token_out, fee, tick_spacing, hooks)?;

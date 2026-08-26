@@ -521,6 +521,31 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     .ok()
     .and_then(Result::ok);
 
+    let dispatch_params = DispatchPassParams {
+        operator,
+        executor,
+        min_profit_matic,
+        dispatch_state_generation,
+        state_block: dispatch_state_block,
+        state_hash: dispatch_state_hash,
+        pools_refreshed,
+        flash_policy,
+        gas_price,
+        brent_iters,
+        base_slippage_bps,
+        min_profit_roi_bps,
+        max_flash_loan_usd,
+        matic_usd,
+        deadline_secs,
+        chain_head_hint,
+    };
+
+    let dispatch_lookups = DispatchLookups {
+        pool_metas_by_pool,
+        token_to_matic_rates,
+        token_decimals,
+    };
+
     let mut queue = PriorityDispatchQueue::new(ctx.config.pipeline.hf_max_dispatch);
     for evaluated in profitable {
         queue.push(evaluated);
@@ -538,26 +563,9 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
             arena_ref,
             evaluated,
             sim_provider,
-            operator,
-            executor,
-            min_profit_matic,
-            pool_metas_by_pool,
-            token_to_matic_rates,
-            token_decimals,
-            dispatch_state_generation,
-            dispatch_state_block,
-            dispatch_state_hash,
-            pools_refreshed,
-            flash_policy,
-            gas_price,
-            brent_iters,
-            base_slippage_bps,
-            min_profit_roi_bps,
-            max_flash_loan_usd,
-            matic_usd,
-            deadline_secs,
+            &dispatch_params,
+            dispatch_lookups,
             &skipped,
-            chain_head_hint,
         )
         .await
         else {
@@ -588,21 +596,16 @@ async fn dispatch_with_provider<P: Provider<Ethereum> + Clone + Send + 'static>(
     log_balancer_prepare_gate_summary(dispatch_candidates);
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
-    ctx: &HfContext,
-    arena: &StateArena,
-    mut evaluated: HfEvalResult,
-    sim_provider: &P,
+/// Loop-invariant inputs for one dispatch pass.
+///
+/// Derived once in [`dispatch_with_provider`] before the candidate loop and shared
+/// by every candidate, so the execution floor, gas basis, and state-snapshot
+/// identity travel as one value instead of sixteen positional arguments.
+#[derive(Clone, Copy)]
+struct DispatchPassParams {
     operator: alloy::primitives::Address,
     executor: alloy::primitives::Address,
     min_profit_matic: U256,
-    pool_metas_by_pool: &FxHashMap<
-        crate::core::types::PoolIndex,
-        &crate::pipeline::types::PoolMeta,
-    >,
-    token_to_matic_rates: &rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
-    token_decimals: &rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
     dispatch_state_generation: u64,
     state_block: u64,
     state_hash: Option<B256>,
@@ -615,9 +618,50 @@ async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
     max_flash_loan_usd: u64,
     matic_usd: f64,
     deadline_secs: u64,
-    skipped: &Arc<SkipCounts>,
     chain_head_hint: Option<u64>,
+}
+
+/// Borrowed lookup tables shared by every candidate in a dispatch pass.
+#[derive(Clone, Copy)]
+struct DispatchLookups<'a, 'm> {
+    pool_metas_by_pool:
+        &'a FxHashMap<crate::core::types::PoolIndex, &'m crate::pipeline::types::PoolMeta>,
+    token_to_matic_rates: &'a rustc_hash::FxHashMap<crate::core::types::TokenIndex, U256>,
+    token_decimals: &'a rustc_hash::FxHashMap<alloy::primitives::Address, u8>,
+}
+
+async fn dispatch_one_candidate<P: Provider<Ethereum> + Clone + Send + 'static>(
+    ctx: &HfContext,
+    arena: &StateArena,
+    mut evaluated: HfEvalResult,
+    sim_provider: &P,
+    params: &DispatchPassParams,
+    lookups: DispatchLookups<'_, '_>,
+    skipped: &Arc<SkipCounts>,
 ) -> Option<ExecutionOutcome> {
+    let DispatchLookups {
+        pool_metas_by_pool,
+        token_to_matic_rates,
+        token_decimals,
+    } = lookups;
+    let &DispatchPassParams {
+        operator,
+        executor,
+        min_profit_matic,
+        dispatch_state_generation,
+        state_block,
+        state_hash,
+        pools_refreshed,
+        flash_policy,
+        gas_price,
+        brent_iters,
+        base_slippage_bps,
+        min_profit_roi_bps,
+        max_flash_loan_usd,
+        matic_usd,
+        deadline_secs,
+        chain_head_hint,
+    } = params;
     let fp = evaluated.route_fingerprint;
     let balancer_batch_verified = evaluated.balancer_batch_verified;
 

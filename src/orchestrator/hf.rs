@@ -713,17 +713,9 @@ fn sample_proto_mismatch(
     stage: &'static str,
 ) {
     use crate::pipeline::types::pool_meta_at;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    let now = now_ms();
-    let prev = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 2_000 {
-        return;
-    }
-    if LAST_MS
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    if !crate::log::every_ms(&LAST_MS, 2_000) {
         return;
     }
     if let Some((hop, expected, actual)) =
@@ -806,17 +798,9 @@ fn sample_proto_mismatch(
 }
 
 fn sample_multi_realign_fail(arena: &crate::pipeline::arena::StateArena, cycle: &FoundCycle) {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    let now = now_ms();
-    let prev = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 2_000 {
-        return;
-    }
-    if LAST_MS
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    if !crate::log::every_ms(&LAST_MS, 2_000) {
         return;
     }
     for (hop, edge) in cycle.edges.iter().enumerate() {
@@ -866,17 +850,9 @@ fn sample_hop_break(
     cycle: &FoundCycle,
     break_at: usize,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
-    let now = now_ms();
-    let prev = LAST_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 2_000 {
-        return;
-    }
-    if LAST_MS
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    if !crate::log::every_ms(&LAST_MS, 2_000) {
         return;
     }
     let Some(prev_e) = cycle.edges.get(break_at) else {
@@ -1493,13 +1469,7 @@ pub async fn run_hf_tick(
         // 47 dropped_events storms, only 2 stream tick-end lines survived).
         static STREAM_FILTER_LOG_AT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
-        let now = now_ms();
-        let prev = STREAM_FILTER_LOG_AT.load(Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 2_000
-            && STREAM_FILTER_LOG_AT
-                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
+        if crate::log::every_ms(&STREAM_FILTER_LOG_AT, 2_000) {
             crate::info!(
                 "hf cycle filter: snap={snap_cycle_count} selected={} stream_triggered=1 active_candidates={activity_candidates} active_selected={activity_selected} inactive_selected={inactive_selected} hot_pools={}",
                 cycles.len(),
@@ -1542,13 +1512,7 @@ pub async fn run_hf_tick(
             .count();
         if overlap == 0 && dirty_in_universe == 0 {
             static SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
-            let now = now_ms();
-            let prev = SKIP_LOG_AT.load(Ordering::Relaxed);
-            if now.saturating_sub(prev) >= 5_000
-                && SKIP_LOG_AT
-                    .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
+            if crate::log::every_ms(&SKIP_LOG_AT, 5_000) {
                 crate::info!(
                     "hf tick skipped: stream wake with no active cycles (selected={} dirty={} sel_hot={} dirty_in_sel={} dirty_in_uni=0)",
                     cycles.len(),
@@ -1598,13 +1562,7 @@ pub async fn run_hf_tick(
             drop(snap);
             if prefer.is_empty() {
                 static SKIP_UNI_AT: AtomicU64 = AtomicU64::new(0);
-                let now = now_ms();
-                let prev = SKIP_UNI_AT.load(Ordering::Relaxed);
-                if now.saturating_sub(prev) >= 5_000
-                    && SKIP_UNI_AT
-                        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
+                if crate::log::every_ms(&SKIP_UNI_AT, 5_000) {
                     crate::info!(
                         "hf tick skipped: dirty_in_uni={dirty_in_universe} but no snap cycle touches dirty (selected={} dirty={})",
                         cycles.len(),
@@ -2164,13 +2122,7 @@ pub async fn run_hf_tick(
         );
         crate::orchestrator::hf_execute::ProbeTickHydrateStats::default()
     } else if probe_tick_budget.is_zero() || probe_pool_cap == 0 {
-        let now = now_ms();
-        let last = HYDRATE_SKIP_LOG_AT.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= 5_000
-            && HYDRATE_SKIP_LOG_AT
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
+        if crate::log::every_ms(&HYDRATE_SKIP_LOG_AT, 5_000) {
             crate::info!(
                 "hf probe-tick hydrate skipped: floor={}ms budget={}ms residual_prep={}ms cap={probe_pool_cap} (need ≥{}ms)",
                 hydrate_floor.as_millis(),
@@ -2279,13 +2231,7 @@ pub async fn run_hf_tick(
     if stuck_tickless > 0 {
         // Stream ticks can drain the same stuck set every ~100ms — rate-limit noise.
         static TICKLESS_SKIP_LOG_AT: AtomicU64 = AtomicU64::new(0);
-        let now = crate::util::now_ms();
-        let last = TICKLESS_SKIP_LOG_AT.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= HF_SUMMARY_INTERVAL_MS
-            && TICKLESS_SKIP_LOG_AT
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
+        if crate::log::every_ms(&TICKLESS_SKIP_LOG_AT, HF_SUMMARY_INTERVAL_MS) {
             crate::info!(
                 "hf skip cooldown-stuck tickless cycles: removed={stuck_tickless} (pre={} post={stuck_after_hydrate}) remaining={}",
                 stuck_before_hydrate,

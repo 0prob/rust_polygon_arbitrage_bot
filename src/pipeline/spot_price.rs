@@ -107,16 +107,6 @@ pub fn mul_ratio_saturating(a: U256, b: U256) -> U256 {
     mul_ratio(a, b).unwrap_or(U256::MAX)
 }
 
-/// True when `current * edge_ratio / ONE` strictly improves `best` (overflow ⇒ true).
-#[inline]
-#[must_use]
-pub fn ratio_product_improves(current: U256, edge_ratio: U256, best: U256) -> bool {
-    match mul_ratio(current, edge_ratio) {
-        Some(r) => r > best,
-        None => true,
-    }
-}
-
 #[inline]
 fn simulated_edge_ratio(out: U256, probe: U256) -> Option<U256> {
     if out.is_zero() || probe.is_zero() {
@@ -327,21 +317,6 @@ impl SpotTable {
             .unwrap_or(0.0)
     }
 
-    #[must_use]
-    pub fn get_opt(&self, edge: &Edge) -> Option<f64> {
-        let spot = self.get(edge);
-        (spot > 0.0).then_some(spot)
-    }
-
-    pub fn get_or_compute_ratio(&mut self, arena: &StateArena, edge: &Edge) -> U256 {
-        if let Some(r) = self.get_ratio(edge) {
-            return r;
-        }
-        let r = compute_edge_ratio(arena, edge);
-        self.set_ratio(edge, r);
-        r
-    }
-
     /// Read-only ratio: table hit, else live compute (no insert — safe for parallel rescore).
     #[inline]
     #[must_use]
@@ -350,14 +325,6 @@ impl SpotTable {
             .filter(|r| !r.is_zero())
             .unwrap_or_else(|| compute_edge_ratio(arena, edge))
     }
-}
-
-#[must_use]
-pub fn edge_log_weight_from_spot(spot_price: f64, fee_bps: u32) -> f64 {
-    if spot_price <= 0.0 || !spot_price.is_finite() {
-        return compute_edge_log_weight(fee_bps);
-    }
-    -spot_price.ln()
 }
 
 /// Marginal output/input ratio at `probe` (fee-inclusive where applicable).
@@ -379,11 +346,6 @@ pub fn edge_ratio_from_state(state: &PoolState, edge: &Edge, probe: U256) -> U25
             simulated_edge_ratio(out, probe).unwrap_or(U256::ZERO)
         }
     }
-}
-
-#[must_use]
-pub fn compute_spot_price(arena: &StateArena, edge: &Edge) -> f64 {
-    spot_ratio_to_f64(Some(compute_edge_ratio(arena, edge)))
 }
 
 #[must_use]
@@ -435,10 +397,6 @@ pub fn gas_log_penalty_for_cycle(
         return 0.0;
     }
     (drag_f64 / rate_f64).ln_1p()
-}
-
-pub fn rescore_cycles_with_table(arena: &StateArena, table: &SpotTable, cycles: &mut [FoundCycle]) {
-    rescore_cycles_with_table_and_gas(arena, table, cycles, None, None, None, None);
 }
 
 #[allow(clippy::too_many_arguments)]

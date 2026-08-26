@@ -5,12 +5,9 @@ use alloy::sol_types::SolCall;
 use crate::abis::{ExecutorCall, IUniswapV3Pool};
 use crate::pipeline::arena::StateArena;
 use crate::services::execution::calldata::CalldataHop;
-use crate::services::execution::quote::{
-    derive_tight_v3_price_limit, pool_tokens_from_hop, quote_hop_for_execution,
-    resolve_v3_fee_pips_for_hop,
-};
+use crate::services::execution::quote::pool_tokens_from_hop;
 
-use super::shared::{to_v3_state, v3_callback_protocol_id};
+use super::shared::{ClSwapLimit, resolve_cl_swap_limit, v3_callback_protocol_id};
 
 /// Encode a Uniswap V3 (or SushiSwap V3) hop into executor calls.
 ///
@@ -31,37 +28,18 @@ pub fn encode_v3_hop(
     full_range_limit: bool,
     prequoted_out: Option<U256>,
 ) -> anyhow::Result<Vec<ExecutorCall>> {
-    use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
-
-    let pool_state = arena
-        .pool_state(hop.edge.pool_index)
-        .ok_or_else(|| anyhow::anyhow!("missing pool state for v3 hop"))?;
-    let v3 = to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not v3/v4 state"))?;
-
-    let quoted_out = match prequoted_out.filter(|q| !q.is_zero()) {
-        Some(q) => q,
-        None => quote_hop_for_execution(arena, hop)
-            .ok_or_else(|| anyhow::anyhow!("v3 execution quote unavailable"))?,
-    };
-    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
-    let sqrt_limit = if full_range_limit {
-        if hop.edge.zero_for_one {
-            MIN_SQRT_RATIO + U256::ONE
-        } else {
-            MAX_SQRT_RATIO_EXCLUSIVE
-        }
-    } else {
-        derive_tight_v3_price_limit(
-            &v3,
-            hop.amount_in,
-            quoted_out,
-            hop.edge.zero_for_one,
-            hop.edge.fee_bps,
-            slippage_bps,
-            Some(fee_pips),
-            false,
-        )?
-    };
+    let ClSwapLimit {
+        fee_pips,
+        sqrt_limit,
+    } = resolve_cl_swap_limit(
+        arena,
+        hop,
+        slippage_bps,
+        full_range_limit,
+        prequoted_out,
+        false,
+        "v3",
+    )?;
 
     let (token0, token1) = pool_tokens_from_hop(hop);
     let proto_id = v3_callback_protocol_id(hop.protocol_label.as_deref());

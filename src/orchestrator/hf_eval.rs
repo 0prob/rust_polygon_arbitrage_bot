@@ -1111,18 +1111,7 @@ pub fn rank_cycles_by_probe_net(
         if kept.len() < scanned.len() {
             static LAST_PROBE_BACKFILL_LOG_MS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
-            let now = crate::util::now_ms();
-            let prev = LAST_PROBE_BACKFILL_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-            if now.saturating_sub(prev) >= 2_000
-                && LAST_PROBE_BACKFILL_LOG_MS
-                    .compare_exchange(
-                        prev,
-                        now,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
+            if crate::log::every_ms(&LAST_PROBE_BACKFILL_LOG_MS, 2_000) {
                 crate::info!(
                     "probe rank backfill: kept={} scanned={} skip_rate={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={near_net_count} rescue={rescue_len} had_net={had_net_ranked}",
                     kept.len(),
@@ -1162,18 +1151,7 @@ pub fn rank_cycles_by_probe_net(
         // Empty ranks used to be debug-only; rate-limit INFO so probe_kept=0 ticks are visible.
         static LAST_EMPTY_PROBE_RANK_LOG_MS: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
-        let now = crate::util::now_ms();
-        let prev = LAST_EMPTY_PROBE_RANK_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 2_000
-            && LAST_EMPTY_PROBE_RANK_LOG_MS
-                .compare_exchange(
-                    prev,
-                    now,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-        {
+        if crate::log::every_ms(&LAST_EMPTY_PROBE_RANK_LOG_MS, 2_000) {
             crate::info!(
                 "probe rank empty: scanned={} skip_rate={} skip_flash={} skip_flash_source={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} rescue={rescue_len} sample={sample}",
                 scanned.len(),
@@ -1225,18 +1203,7 @@ pub fn rank_cycles_by_probe_net(
         // flooding INFO (was ~70% of orchestrator log volume in live runs).
         static LAST_PROBE_RANK_LOG_MS: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
-        let now = crate::util::now_ms();
-        let prev = LAST_PROBE_RANK_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 2_000
-            && LAST_PROBE_RANK_LOG_MS
-                .compare_exchange(
-                    prev,
-                    now,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-        {
+        if crate::log::every_ms(&LAST_PROBE_RANK_LOG_MS, 2_000) {
             crate::info!(
                 "route probe rank: kept={} scanned={} skip_rate={} skip_flash={} skip_probe={} minimal_sim={} (no_sim={} zero_profit={} sanity={}) reasons(invalid={} missing={} non_tradable={} cl_tickless={} cl_cap={} shallow_cl={} v2={} mismatch={} math={} unsupported={} bal_max_in={} zero_out={} sanity(ratio={} matic={} floor={} dec={} pin={})) skip_net={} near_net={}",
                 kept.len(),

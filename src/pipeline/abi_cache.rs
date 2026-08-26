@@ -22,12 +22,6 @@ pub fn decode_abi_word(bytes: &[u8]) -> Option<U256> {
     }
 }
 
-#[inline]
-#[must_use]
-pub fn decode_abi_u128(bytes: &[u8]) -> Option<u128> {
-    decode_abi_word(bytes).map(|v| v.as_limbs()[0] as u128)
-}
-
 /// `extsload(bytes32)` — selector + slot without full `abi_encode` allocation.
 #[inline]
 #[must_use]

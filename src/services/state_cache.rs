@@ -198,11 +198,6 @@ impl StateCache {
         self.len() == 0
     }
 
-    /// Whether any cached row exists (including expired), for fetch target scans.
-    pub fn has_any_entry(&self, address: &Address) -> bool {
-        self.inner.read().contains_key(address)
-    }
-
     #[must_use]
     pub fn missing_addresses<I>(&self, addresses: I) -> FxHashSet<Address>
     where
@@ -230,19 +225,6 @@ impl StateCache {
 
     pub fn get_arc(&self, address: &Address) -> Option<Arc<PoolState>> {
         self.lookup_pool_state(address)
-    }
-
-    /// Tradable, unexpired pool states keyed by address. One read-lock pass over
-    /// the cache (~tens of thousands) instead of per-pool lookups over discovery.
-    pub fn tradable_snapshot(&self) -> Vec<(Address, Arc<PoolState>)> {
-        let guard = self.inner.read();
-        guard
-            .iter()
-            .filter(|(_, entry)| {
-                entry.updated_at.elapsed() <= self.ttl && entry.state.is_tradable()
-            })
-            .map(|(address, entry)| (*address, Arc::clone(&entry.state)))
-            .collect()
     }
 
     /// Tradable pools sorted by discovery index in one read-lock pass.

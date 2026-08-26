@@ -419,12 +419,6 @@ impl FoundCycle {
         u32::try_from(self.edges.len()).unwrap_or(self.hop_count)
     }
 
-    /// Prefer `edges.len()`; keep `hop_count` in sync when present.
-    #[inline]
-    #[must_use]
-    pub fn hops_consistent(&self) -> bool {
-        self.hop_count as usize == self.edges.len()
-    }
 }
 
 #[derive(Debug, Clone)]

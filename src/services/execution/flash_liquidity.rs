@@ -257,20 +257,6 @@ impl FlashLiquidityCache {
     }
 
     #[must_use]
-    pub fn with_addresses(balancer_vault: Address, aave_pool: Address) -> Self {
-        Self {
-            inner: ArcSwap::from_pointee(FlashLiquiditySnapshot::default()),
-            ttl: CACHE_TTL,
-            balancer_vault,
-            aave_pool,
-            hot_tokens: Mutex::new(FxHashSet::default()),
-            aave_inactive_pins: Mutex::new(FxHashSet::default()),
-            aave_reserves: Mutex::new(None),
-            refresh_inflight: AtomicBool::new(false),
-        }
-    }
-
-    #[must_use]
     pub fn ttl(&self) -> Duration {
         self.ttl
     }
@@ -349,13 +335,6 @@ impl FlashLiquidityCache {
     pub fn snapshot(&self, token: Address) -> TokenFlashLiquidity {
         let snap = self.inner.load();
         snap.token_liquidity(token, self.ttl)
-    }
-
-    /// Batch-read flash liquidity from the current published snapshot.
-    #[must_use]
-    pub fn snapshots_for(&self, tokens: &[Address]) -> Vec<TokenFlashLiquidity> {
-        let snap = self.inner.load();
-        snap.tokens_liquidity(tokens, self.ttl)
     }
 
     #[must_use]
@@ -799,14 +778,6 @@ fn route_uses_balancer_vault_swap(cycle: &FoundCycle) -> bool {
         .edges
         .iter()
         .any(|e| e.protocol == ProtocolType::BalancerV2)
-}
-
-#[must_use]
-pub fn cycle_has_dodo_pool(arena: &StateArena, cycle: &FoundCycle) -> bool {
-    cycle
-        .edges
-        .iter()
-        .any(|edge| matches!(arena.pool_state(edge.pool_index), Some(PoolState::Dodo(_))))
 }
 
 /// Return a DODO pool that can lend the cycle start token through the executor's

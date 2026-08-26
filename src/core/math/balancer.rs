@@ -50,16 +50,6 @@ pub fn balancer_fee_bps_from_pool(fee: U256) -> Option<u32> {
 const DEFAULT_AMP_PRECISION: U256 = U256::from_limbs([1000, 0, 0, 0]);
 const MAX_ITERATIONS: u32 = 255;
 
-#[must_use]
-pub fn balancer_swap_fee_from_pool_meta_fee(fee: u64) -> U256 {
-    let raw = U256::from(fee);
-    if raw < U256::from(10_000) {
-        raw * U256::from(100_000_000_000_000u64)
-    } else {
-        raw
-    }
-}
-
 fn resolve_swap_fee(fee: U256) -> U256 {
     if !fee.is_zero() && fee < ONE {
         fee

@@ -36,6 +36,73 @@ pub fn to_v3_state(state: &PoolState) -> Option<V3PoolState> {
     }
 }
 
+/// Concentrated-liquidity swap inputs shared by the V3 and V4 encoders.
+pub struct ClSwapLimit {
+    pub fee_pips: u32,
+    pub sqrt_limit: U256,
+}
+
+/// Resolve pool state, execution quote, fee pips, and sqrt price limit for a CL hop.
+///
+/// `full_range_limit`: intermediate hops must fully consume `amount_in` so the next
+/// hop's chain_in is funded — tight limits + stale slot0 partial-fill → mid-hop
+/// TransferFailed. Last hop keeps a tight limit.
+///
+/// `prequoted_out`: reuse `encode_route`'s chain_in sizing quote when present, which
+/// avoids a second CL walk per hop. A zero prequote falls back to a fresh quote.
+///
+/// `allow_zero_pool_fee` selects the V4 convention in [`derive_tight_v3_price_limit`].
+pub fn resolve_cl_swap_limit(
+    arena: &StateArena,
+    hop: &CalldataHop,
+    slippage_bps: u64,
+    full_range_limit: bool,
+    prequoted_out: Option<U256>,
+    allow_zero_pool_fee: bool,
+    label: &str,
+) -> anyhow::Result<ClSwapLimit> {
+    use crate::core::math::tick_math::{MAX_SQRT_RATIO_EXCLUSIVE, MIN_SQRT_RATIO};
+    use crate::services::execution::quote::{
+        derive_tight_v3_price_limit, resolve_v3_fee_pips_for_hop,
+    };
+
+    let pool_state = arena
+        .pool_state(hop.edge.pool_index)
+        .ok_or_else(|| anyhow::anyhow!("missing pool state for {label} hop"))?;
+    let state =
+        to_v3_state(pool_state).ok_or_else(|| anyhow::anyhow!("pool is not {label} state"))?;
+
+    let quoted_out = match prequoted_out.filter(|q| !q.is_zero()) {
+        Some(q) => q,
+        None => quote_hop_for_execution(arena, hop)
+            .ok_or_else(|| anyhow::anyhow!("{label} execution quote unavailable"))?,
+    };
+    let fee_pips = resolve_v3_fee_pips_for_hop(arena, hop);
+    let sqrt_limit = if full_range_limit {
+        if hop.edge.zero_for_one {
+            MIN_SQRT_RATIO + U256::ONE
+        } else {
+            MAX_SQRT_RATIO_EXCLUSIVE
+        }
+    } else {
+        derive_tight_v3_price_limit(
+            &state,
+            hop.amount_in,
+            quoted_out,
+            hop.edge.zero_for_one,
+            hop.edge.fee_bps,
+            slippage_bps,
+            Some(fee_pips),
+            allow_zero_pool_fee,
+        )?
+    };
+
+    Ok(ClSwapLimit {
+        fee_pips,
+        sqrt_limit,
+    })
+}
+
 pub fn resolve_balancer_pool_id(
     pool_address: Address,
     pool_id: Option<FixedBytes<32>>,
@@ -69,19 +136,6 @@ pub fn v3_callback_protocol_id(label: Option<&str>) -> u8 {
         3
     } else {
         1
-    }
-}
-
-// ponytail: lookup table if new protocol variants become frequent
-#[must_use]
-pub fn v2_callback_protocol_id(label: Option<&str>) -> u8 {
-    let Some(l) = label else { return 7 };
-    if ic(l, "sushiswap_v2") || ic(l, "sushi_v2") {
-        8
-    } else if ic(l, "quickswap_v2") || ic(l, "quick_v2") {
-        9
-    } else {
-        7
     }
 }
 
